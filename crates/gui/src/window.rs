@@ -107,12 +107,12 @@ struct Handler<H: WindowHandler> {
     /// Where the input method was last told it may type.
     ime: Option<ImeTarget>,
     /// Carries the accessibility adapter's requests into the event loop.
-    proxy: EventLoopProxy<accesskit_winit::Event>,
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 /// Open a window titled `title` and run `handler` until it closes.
 pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
-    let event_loop = match EventLoop::<accesskit_winit::Event>::with_user_event().build() {
+    let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(el) => el,
         Err(e) => {
             eprintln!("failed to create event loop: {e}");
@@ -128,6 +128,11 @@ pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
         ime: None,
         proxy: event_loop.create_proxy(),
     };
+    let mail = event_loop.create_proxy();
+    crate::mailbox::wake_with(std::sync::Arc::new(move || {
+        // A closed loop has no window left to wake.
+        mail.send_event(UserEvent::Mail).ok();
+    }));
     if let Err(e) = event_loop.run_app(&mut handler) {
         eprintln!("event loop error: {e}");
         std::process::exit(1);
@@ -163,7 +168,21 @@ impl<H: WindowHandler> Handler<H> {
     }
 }
 
-impl<H: WindowHandler> ApplicationHandler<accesskit_winit::Event> for Handler<H> {
+/// What reaches the event loop from elsewhere: the accessibility adapter,
+/// or a mailbox that something was sent to.
+#[derive(Debug)]
+pub(crate) enum UserEvent {
+    Access(accesskit_winit::Event),
+    Mail,
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Access(event)
+    }
+}
+
+impl<H: WindowHandler> ApplicationHandler<UserEvent> for Handler<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Hidden until the accessibility adapter is attached, which it must
         // be before the window first shows.
@@ -283,7 +302,11 @@ impl<H: WindowHandler> ApplicationHandler<accesskit_winit::Event> for Handler<H>
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: accesskit_winit::Event) {
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        let UserEvent::Access(event) = event else {
+            // Mail: `about_to_wait` delivers it, as it runs due timers.
+            return;
+        };
         match event.window_event {
             accesskit_winit::WindowEvent::InitialTreeRequested => self.tell_access(self.scale()),
             accesskit_winit::WindowEvent::ActionRequested(request) => self.send(Input::Act(request)),

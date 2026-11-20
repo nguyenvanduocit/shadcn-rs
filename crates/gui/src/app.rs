@@ -20,6 +20,7 @@ use crate::heap;
 use crate::inspect::{self, Footprint, FrameReport, LayoutDiff, Spread, Timings, ms};
 use crate::interact::{self, ImeTarget, Interaction, Outcome};
 use crate::layout::{Frame, LayoutError, layout};
+use crate::mailbox;
 use crate::motion::Motion;
 use crate::overlay::{Overlay, paint_hud, paint_overlay};
 use crate::paint::Painter;
@@ -320,10 +321,11 @@ impl<C: FnMut() -> Element> Pipeline<C> {
     /// Run due timers and say whether a frame is due.
     fn idle(&mut self) -> Wake {
         let timers = clock::run_due_timers();
+        let mail = mailbox::deliver();
         let changed = reactive::take_changed();
         self.stale |= changed;
         Wake {
-            redraw: timers || changed || std::mem::take(&mut self.dirty),
+            redraw: timers || mail || changed || std::mem::take(&mut self.dirty),
             animating: self.animating,
             next_timer: clock::next_deadline(),
         }
@@ -643,6 +645,8 @@ impl<C: FnMut() -> Element> Scenario<C> {
     }
 
     fn render(&mut self) -> Result<FrameReport, ScenarioError> {
+        // What other threads sent before this frame is in it, as in a window.
+        mailbox::deliver();
         let report = self.pipeline.draw(&mut self.pixmap, self.scale)?;
         self.reports.push(report.clone());
         Ok(report)
