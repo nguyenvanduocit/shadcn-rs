@@ -1,6 +1,7 @@
 //! A native GUI framework in Rust: fine-grained reactive state, an element tree
 //! styled with Tailwind's vocabulary, Taffy layout, cosmic-text text, and a
-//! tiny-skia CPU painter shown through softbuffer.
+//! scene of primitives painted on the GPU (wgpu), or on the CPU (tiny-skia)
+//! headless and where no GPU answers.
 
 pub mod access;
 pub mod app;
@@ -11,6 +12,7 @@ pub mod color;
 pub mod computed;
 pub mod context;
 mod convert;
+pub mod cpu;
 pub mod devtools;
 pub mod edit;
 mod effects;
@@ -18,6 +20,7 @@ pub mod element;
 pub mod events;
 pub mod focus;
 pub mod geometry;
+pub mod gpu;
 pub mod heap;
 pub mod icon;
 pub mod image;
@@ -31,6 +34,7 @@ pub mod paint;
 mod placement;
 pub mod process;
 pub mod reactive;
+pub mod scene;
 pub mod scroll;
 pub mod shape;
 pub mod style;

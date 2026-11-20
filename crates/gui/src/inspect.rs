@@ -278,7 +278,11 @@ pub struct Timings {
     /// Running the component to produce the element tree.
     pub build: Duration,
     pub layout: Duration,
+    /// Recording the scene and handing it to the renderer.
     pub paint: Duration,
+    /// Waiting for the display to take a frame (a GPU window waits for the
+    /// next vertical blank): the frame's pace, not work, so not in [`Self::total`].
+    pub vsync: Duration,
 }
 
 impl Timings {
@@ -394,10 +398,11 @@ impl fmt::Display for FrameReport {
         )?;
         writeln!(
             f,
-            "  time     build {}  layout {}  paint {}",
+            "  time     build {}  layout {}  paint {}  vsync {}",
             ms(self.timings.build),
             ms(self.timings.layout),
-            ms(self.timings.paint)
+            ms(self.timings.paint),
+            ms(self.timings.vsync)
         )?;
         writeln!(f, "  layout   {}", self.diff)?;
         write!(f, "  holds    {}", self.footprint)

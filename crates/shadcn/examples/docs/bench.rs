@@ -383,6 +383,7 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
             build: median(&steady, |r| r.timings.build),
             layout: median(&steady, |r| r.timings.layout),
             paint: median(&steady, |r| r.timings.paint),
+            vsync: median(&steady, |r| r.timings.vsync),
         },
         allocations,
         rest,

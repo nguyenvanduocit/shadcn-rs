@@ -11,6 +11,7 @@ The code in this repository is MIT (`LICENSE`). It ships, or follows, the work b
 | shadcn-vue: the components and demos `crates/shadcn` ports and the verdict compares against | `crates/shadcn` | MIT | below |
 | Geist (variable, Latin subset) | `site/public/fonts/Geist.woff2` | SIL Open Font License 1.1 | `site/public/fonts/LICENSE-Geist.txt` |
 | shadcn-vue's home page: the landing page's layout and styles | `site/public/` | MIT | below |
+| GPUI (Zed): the rounded-box signed distance and the blurred rounded box (Raph Levien's approximation) its shaders draw quads and shadows with | `crates/gui/src/gpu/shaders.wgsl` | Apache-2.0 | `crates/gui/src/gpu/LICENSE-GPUI` |
 
 The Rust crates this workspace depends on carry their own licences; `cargo deny check licenses` (`deny.toml`) lists the
 ones allowed.

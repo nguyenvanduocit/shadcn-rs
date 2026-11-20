@@ -1,30 +1,24 @@
-//! Painting a node's [`Effects`]: a gradient background, text that shows the
-//! background through its glyphs, and a mask and filters over everything the
-//! node and its children paint (a group, painted aside and composited).
-
-use tiny_skia::{
-    BlendMode, FillRule, GradientStop, IntRect, Paint, Pixmap, PixmapPaint, Point, PremultipliedColorU8, Rect, Shader,
-    SpreadMode, Transform,
-};
+//! A node's [`Effects`] as the scene records them: a gradient background,
+//! text that shows the background through its glyphs, and the group a
+//! mask, filters, opacity or a transform make of a node and its children.
+//!
+//! [`Effects`]: crate::style::Effects
 
 use crate::color::Color;
-use crate::convert::{f32_to_i32, i32_to_f32, u32_to_f32, unit_to_u8};
+use crate::convert::f32_to_i32;
 use crate::geometry::Bounds;
 use crate::layout::FrameNode;
-use crate::style::{Axis, BackgroundClip, BackgroundImage, Direction, Filter, LinearGradient, MaskImage, ResolvedText};
+use crate::scene::{Gradient, Item, PixelRect};
+use crate::style::{Axis, BackgroundClip, BackgroundImage, Direction, LinearGradient, MaskImage, ResolvedText};
 use crate::text::{Paragraph, Target, TextSystem};
-
-/// Colour stops added between two stops, so tiny-skia's sRGB interpolation
-/// follows the OKLab one CSS asks for.
-const OKLAB_STEPS: u8 = 8;
 
 /// Pixels per `ch` for `t`: the advance of its `0`.
 fn ch(text: &mut TextSystem, t: &ResolvedText) -> f32 {
     text.measure("0", t, None).0
 }
 
-/// `gradient` painting `tile`, its `currentColor` being `current`.
-fn shader(g: &LinearGradient, tile: Bounds, current: Color, ch: f32) -> Option<Shader<'static>> {
+/// `g` placed over `tile`, its `currentColor` being `current`.
+pub(crate) fn gradient(g: &LinearGradient, tile: Bounds, current: Color, ch: f32) -> Option<Gradient> {
     let (sin, cos) = g.angle.to_radians().sin_cos();
     let dir = (sin, -cos);
     let length = (tile.width * sin).abs() + (tile.height * cos).abs();
@@ -40,28 +34,18 @@ fn shader(g: &LinearGradient, tile: Bounds, current: Color, ch: f32) -> Option<S
         .collect();
     let (&(first, _), &(last, last_color)) = (stops.first()?, stops.last()?);
     if last - first < 1e-3 {
-        return Some(Shader::SolidColor(last_color.to_skia()));
+        return Some(Gradient::Solid(last_color));
     }
     let line_start = (
         dir.0.mul_add(-length / 2.0, tile.x + tile.width / 2.0),
         dir.1.mul_add(-length / 2.0, tile.y + tile.height / 2.0),
     );
-    let point = |p: f32| Point::from_xy(dir.0.mul_add(p, line_start.0), dir.1.mul_add(p, line_start.1));
-    let offset = |p: f32| (p - first) / (last - first);
-    let mut skia = Vec::new();
-    for pair in stops.windows(2) {
-        if let [(p0, c0), (p1, c1)] = pair {
-            for k in 0..OKLAB_STEPS {
-                let t = f32::from(k) / f32::from(OKLAB_STEPS);
-                skia.push(GradientStop::new(
-                    offset((p1 - p0).mul_add(t, *p0)),
-                    c0.mix_oklab(*c1, t).to_skia(),
-                ));
-            }
-        }
-    }
-    skia.push(GradientStop::new(1.0, last_color.to_skia()));
-    tiny_skia::LinearGradient::new(point(first), point(last), skia, SpreadMode::Pad, Transform::identity())
+    let point = |p: f32| (dir.0.mul_add(p, line_start.0), dir.1.mul_add(p, line_start.1));
+    Some(Gradient::Linear {
+        start: point(first),
+        end: point(last),
+        stops: stops.iter().map(|&(p, c)| ((p - first) / (last - first), c)).collect(),
+    })
 }
 
 /// Where the background tile sits in `node`'s padding box.
@@ -79,14 +63,6 @@ fn tile(img: &BackgroundImage, node: &FrameNode, ch: f32) -> Bounds {
     }
 }
 
-fn shader_paint(shader: Shader<'_>) -> Paint<'_> {
-    Paint {
-        shader,
-        anti_alias: true,
-        ..Paint::default()
-    }
-}
-
 /// The background image of `node` when it paints its box (not its text).
 pub(crate) fn box_background(node: &FrameNode) -> Option<&BackgroundImage> {
     let img = node.look.effects.background_image.as_ref()?;
@@ -99,8 +75,8 @@ pub(crate) fn text_background(node: &FrameNode) -> Option<&BackgroundImage> {
     (img.clip == BackgroundClip::Text).then_some(img)
 }
 
-/// Paint `img` over `node`'s border box, inside its rounded corners.
-pub(crate) fn paint_background(
+/// Record `img` over `node`'s border box, inside its rounded corners.
+pub(crate) fn record_background(
     target: &mut Target<'_>,
     node: &FrameNode,
     img: &BackgroundImage,
@@ -108,44 +84,44 @@ pub(crate) fn paint_background(
 ) {
     let ch = ch(text, &node.look.text);
     let tile = tile(img, node, ch);
-    let Some(shader) = shader(&img.gradient, tile, node.look.text.color, ch) else {
+    let Some(gradient) = gradient(&img.gradient, tile, node.look.text.color, ch) else {
         return;
     };
-    let scale = target.scale;
-    let Some(path) = crate::paint::rrect(node.bounds.snapped(scale).intersect(&tile), node.look.radius) else {
-        return;
-    };
-    target.pixmap.fill_path(
-        &path,
-        &shader_paint(shader),
-        FillRule::Winding,
-        Transform::from_scale(scale, scale),
-        target.clip,
-    );
+    target.items.push(Item::Gradient {
+        bounds: node.bounds.snapped(target.scale).intersect(&tile),
+        radius: node.look.radius,
+        gradient,
+        clip: target.clip,
+    });
 }
 
 /// `rect` in physical pixels, grown to whole pixels and kept inside `size`.
-fn physical_rect(rect: Bounds, scale: f32, size: (u32, u32)) -> Option<IntRect> {
+fn physical_rect(rect: Bounds, scale: f32, size: (u32, u32)) -> Option<PixelRect> {
     let (w, h) = (
         i32::try_from(size.0).unwrap_or(i32::MAX),
         i32::try_from(size.1).unwrap_or(i32::MAX),
     );
-    IntRect::from_ltrb(
+    let (l, t) = (
         f32_to_i32((rect.x * scale).floor()).clamp(0, w),
         f32_to_i32((rect.y * scale).floor()).clamp(0, h),
+    );
+    let (r, b) = (
         f32_to_i32((rect.right() * scale).ceil()).clamp(0, w),
         f32_to_i32((rect.bottom() * scale).ceil()).clamp(0, h),
-    )
+    );
+    let width = u32::try_from(r.checked_sub(l)?).ok().filter(|&w| w > 0)?;
+    let height = u32::try_from(b.checked_sub(t)?).ok().filter(|&h| h > 0)?;
+    Some(PixelRect {
+        x: l,
+        y: t,
+        width,
+        height,
+    })
 }
 
-/// The offset that paints logical pixels into a pixmap whose origin is `rect`'s.
-fn into_rect(rect: IntRect, scale: f32) -> Transform {
-    Transform::from_row(scale, 0.0, 0.0, scale, -i32_to_f32(rect.x()), -i32_to_f32(rect.y()))
-}
-
-/// Paint `node`'s text with `img` showing through its glyphs, in place of
+/// Record `node`'s text with `img` showing through its glyphs, in place of
 /// the text's own colour.
-pub(crate) fn paint_text_through(
+pub(crate) fn record_text_through(
     target: &mut Target<'_>,
     node: &FrameNode,
     img: &BackgroundImage,
@@ -156,14 +132,7 @@ pub(crate) fn paint_text_through(
 ) {
     let area = node.content_box;
     let scale = target.scale;
-    let size = (target.pixmap.width(), target.pixmap.height());
-    let Some(rect) = physical_rect(node.bounds.outset(t.line_height), scale, size) else {
-        return;
-    };
-    let (Some(mut glyphs), Some(mut fill)) = (
-        Pixmap::new(rect.width(), rect.height()),
-        Pixmap::new(rect.width(), rect.height()),
-    ) else {
+    let Some(region) = physical_rect(node.bounds.outset(t.line_height), scale, target.size) else {
         return;
     };
     // Glyph coverage only: the text's colour shows nowhere.
@@ -171,55 +140,34 @@ pub(crate) fn paint_text_through(
         color: Color::WHITE,
         ..*t
     };
-    let (dx, dy) = (i32_to_f32(rect.x()) / scale, i32_to_f32(rect.y()) / scale);
+    let mut mask = Vec::new();
     text.draw(
         &mut Target {
-            pixmap: &mut glyphs,
+            items: &mut mask,
             scale,
+            size: target.size,
             clip: None,
-            visible: None,
         },
         p,
         &shape,
         width,
-        (area.x - dx, area.y - dy),
+        (area.x, area.y),
         1.0,
     );
     let ch = ch(text, t);
     let tile = tile(img, node, ch);
-    let to_fill = into_rect(rect, scale);
-    if let Some(bg) = node.look.background.filter(|c| !c.is_transparent())
-        && let Some(r) = Rect::from_xywh(node.bounds.x, node.bounds.y, node.bounds.width, node.bounds.height)
-    {
-        let mut paint = Paint::default();
-        paint.set_color(bg.to_skia());
-        fill.fill_rect(r, &paint, to_fill, None);
-    }
     let shown = node.bounds.intersect(&tile);
-    if let Some(shader) = shader(&img.gradient, tile, t.color, ch)
-        && let Some(r) = Rect::from_xywh(shown.x, shown.y, shown.width, shown.height)
-    {
-        fill.fill_rect(r, &shader_paint(shader), to_fill, None);
-    }
-    fill.draw_pixmap(
-        0,
-        0,
-        glyphs.as_ref(),
-        &PixmapPaint {
-            blend_mode: BlendMode::DestinationIn,
-            ..PixmapPaint::default()
-        },
-        Transform::identity(),
-        None,
-    );
-    target.pixmap.draw_pixmap(
-        rect.x(),
-        rect.y(),
-        fill.as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        target.clip,
-    );
+    target.items.push(Item::TextThrough {
+        region,
+        mask,
+        background: node
+            .look
+            .background
+            .filter(|c| !c.is_transparent())
+            .map(|c| (node.bounds, c)),
+        fill: gradient(&img.gradient, tile, t.color, ch).map(|g| (g, shown)),
+        clip: target.clip,
+    });
 }
 
 /// The mask over `node`'s painting this frame, a scroll fade resolved
@@ -256,7 +204,7 @@ pub(crate) fn grouped(node: &FrameNode) -> bool {
 
 /// The physical region a group of `node` covers: its border box under a mask
 /// (which clips to it), else the box with its ring and shadows.
-pub(crate) fn group_region(node: &FrameNode, scale: f32, size: (u32, u32)) -> Option<IntRect> {
+pub(crate) fn group_region(node: &FrameNode, scale: f32, size: (u32, u32)) -> Option<PixelRect> {
     let reach = if node.look.effects.mask.is_some() {
         0.0
     } else {
@@ -277,7 +225,7 @@ fn reach(node: &FrameNode) -> f32 {
 
 /// The physical region the nodes of a subtree paint, `nodes[0]` its root:
 /// every box with its ring and shadows, inside the clips set within it.
-pub(crate) fn subtree_region(nodes: &[FrameNode], scale: f32, size: (u32, u32)) -> Option<IntRect> {
+pub(crate) fn subtree_region(nodes: &[FrameNode], scale: f32, size: (u32, u32)) -> Option<PixelRect> {
     let outer = nodes.first()?.clip;
     let painted = nodes.iter().filter(|n| !n.look.invisible).map(|n| {
         let b = n.bounds.outset(reach(n));
@@ -298,92 +246,7 @@ pub(crate) fn subtree_region(nodes: &[FrameNode], scale: f32, size: (u32, u32)) 
     physical_rect(union, scale, size)
 }
 
-/// Clear `region` of `layer`, ready for a group to paint into.
-pub(crate) fn clear(layer: &mut Pixmap, region: IntRect) {
-    let rect = region.to_rect();
-    let paint = Paint {
-        blend_mode: BlendMode::Clear,
-        ..Paint::default()
-    };
-    layer.fill_rect(rect, &paint, Transform::identity(), None);
-}
-
-/// Mask and filter what `node`'s group painted in `region` of `layer`, and
-/// draw it onto `into` scaled and turned as the node is, through `clip`.
-pub(crate) fn composite(
-    layer: &Pixmap,
-    region: IntRect,
-    node: &FrameNode,
-    scale: f32,
-    into: &mut Pixmap,
-    clip: Option<&tiny_skia::Mask>,
-) {
-    let Some(mut group) = layer.clone_rect(region) else {
-        return;
-    };
-    // The whole group, in the logical pixels the mask's shader is placed in.
-    let all = Rect::from_xywh(
-        i32_to_f32(region.x()) / scale,
-        i32_to_f32(region.y()) / scale,
-        u32_to_f32(region.width()) / scale,
-        u32_to_f32(region.height()) / scale,
-    );
-    if let Some(g) = mask(node)
-        && let Some(shader) = shader(&g, node.bounds, node.look.text.color, 0.0)
-        && let Some(all) = all
-    {
-        let paint = Paint {
-            blend_mode: BlendMode::DestinationIn,
-            ..shader_paint(shader)
-        };
-        group.fill_rect(all, &paint, into_rect(region, scale), None);
-    }
-    for f in &node.look.effects.filters {
-        for px in group.pixels_mut() {
-            *px = filter(*f, *px);
-        }
-    }
-    let t = node.look.transform;
-    let opacity = node.look.opacity;
-    let (transform, paint) = if t.is_identity() {
-        (
-            Transform::identity(),
-            PixmapPaint {
-                opacity,
-                ..PixmapPaint::default()
-            },
-        )
-    } else {
-        let (ox, oy) = (
-            (node.bounds.x + t.origin.0) * scale,
-            (node.bounds.y + t.origin.1) * scale,
-        );
-        (
-            Transform::from_translate(ox, oy)
-                .pre_rotate(t.rotate)
-                .pre_scale(t.scale, t.scale)
-                .pre_translate(-ox, -oy),
-            PixmapPaint {
-                opacity,
-                quality: tiny_skia::FilterQuality::Bilinear,
-                ..PixmapPaint::default()
-            },
-        )
-    };
-    into.draw_pixmap(region.x(), region.y(), group.as_ref(), &paint, transform, clip);
-}
-
-/// One premultiplied pixel through `f`, in sRGB as browsers apply CSS filters.
-fn filter(f: Filter, px: PremultipliedColorU8) -> PremultipliedColorU8 {
-    let a = f32::from(px.alpha()) / 255.0;
-    let [r, g, b] = [px.red(), px.green(), px.blue()].map(|v| f32::from(v) / 255.0);
-    let [r, g, b] = match f {
-        Filter::Brightness(k) => [r * k, g * k, b * k],
-        Filter::Grayscale(amount) => {
-            let lum = 0.0722_f32.mul_add(b, 0.2126_f32.mul_add(r, 0.7152 * g));
-            [r, g, b].map(|c| (lum - c).mul_add(amount, c))
-        }
-    };
-    let [r, g, b] = [r, g, b].map(|c| unit_to_u8(c.clamp(0.0, a)));
-    PremultipliedColorU8::from_rgba(r, g, b, px.alpha()).unwrap_or(px)
+/// The mask gradient over `node`'s group, placed over its border box.
+pub(crate) fn mask_gradient(node: &FrameNode) -> Option<Gradient> {
+    gradient(&mask(node)?, node.bounds, node.look.text.color, 0.0)
 }

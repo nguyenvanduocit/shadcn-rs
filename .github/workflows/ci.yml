@@ -8,6 +8,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # The runner has no GPU: headless frames are painted by the CPU renderer.
+    env:
+      GUI_RENDERER: cpu
     steps:
       - uses: actions/checkout@v7
       # Installs the compiler rust-toolchain.toml pins.

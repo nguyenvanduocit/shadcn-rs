@@ -4,8 +4,11 @@
 
 - **`crates/gui`**: the framework. A retained element tree rebuilt from signals each frame, laid out by
   [Taffy](https://github.com/DioxusLabs/taffy) with Tailwind-named styles, text set by
-  [cosmic-text](https://github.com/pop-os/cosmic-text) to match Chrome's, painted on the CPU by
-  [tiny-skia](https://github.com/linebender/tiny-skia) into a [winit](https://github.com/rust-windowing/winit) window.
+  [cosmic-text](https://github.com/pop-os/cosmic-text) to match Chrome's, recorded as a scene of primitives and drawn
+  on the GPU by [wgpu](https://github.com/gfx-rs/wgpu) (as GPUI draws: signed-distance quads, analytic shadows, glyph
+  atlases) into a [winit](https://github.com/rust-windowing/winit) window, or headless and read back. Where no GPU
+  answers (CI), the same scene is painted on the CPU by [tiny-skia](https://github.com/linebender/tiny-skia); the two
+  are held to the same pixels.
   CSS transitions and keyframes, gradients, masks and filters, right-to-left text, Lucide icons, and a headless
   `Scenario` that drives an app by script and writes each frame as a PNG and a report.
 - **`crates/shadcn`**: every component of shadcn-vue's `new-york-v4` registry ported to `gui`, with the same look
@@ -35,17 +38,18 @@ works as it does.
 
 ## Using it
 
-The crates are not on crates.io yet. Depend on them from Git, pinned to a commit, and copy the root `Cargo.toml`'s
+The crates are not on crates.io yet. Depend on them from Git, pinned to a release tag, and copy the root `Cargo.toml`'s
 `[patch.crates-io]` entry for cosmic-text into your workspace (Cargo applies only the root's patches):
 
 ```toml
 [dependencies]
-gui = { git = "https://github.com/nguyenvanduocit/shadcn-rs", rev = "<commit>" }
-shadcn = { git = "https://github.com/nguyenvanduocit/shadcn-rs", rev = "<commit>" }
+gui = { git = "https://github.com/nguyenvanduocit/shadcn-rs", tag = "v0.1.0" }
+shadcn = { git = "https://github.com/nguyenvanduocit/shadcn-rs", tag = "v0.1.0" }
 ```
 
-Rust 1.99.1, pinned by `rust-toolchain.toml`. Built and judged on macOS; Linux and Windows build through winit and
-softbuffer.
+Rust 1.99.1, pinned by `rust-toolchain.toml`. Built and judged on macOS (Metal); Linux (Vulkan or GL) and Windows
+(DX12) build through winit and wgpu. Windows and headless scenarios (`docs --shots`, `--verdict`, `--bench`) paint on
+the GPU; `GUI_RENDERER=cpu` paints them on the CPU (a window through softbuffer), as happens where no GPU answers.
 
 ## Checking it
 

@@ -48,6 +48,11 @@ impl<K: Eq + Hash, V> FrameCache<K, V> {
         self.frame = frame.saturating_add(1);
     }
 
+    /// The value under `key`, if held, without marking it used.
+    pub(crate) fn peek(&self, key: &K) -> Option<&V> {
+        self.entries.get(key).map(|e| &e.value)
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }

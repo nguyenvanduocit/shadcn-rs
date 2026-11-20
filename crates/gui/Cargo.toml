@@ -1,6 +1,6 @@
 [package]
 name = "gui"
-version = "0.0.0"
+version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -26,3 +26,9 @@ stats_alloc = "0.1.10"
 taffy = "0.15"
 tiny-skia = "0.12"
 winit = "0.30"
+# The GPU renderer: wgpu (Metal on macOS, Vulkan or GL on Linux, DX12 on
+# Windows), etagere to pack glyphs and icons into atlas pages as GPUI does,
+# pollster to wait on the adapter and on read-backs.
+wgpu = "30"
+etagere = "0.3"
+pollster = "0.4"

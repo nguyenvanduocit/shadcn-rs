@@ -215,7 +215,7 @@ impl IconCache {
     }
 }
 
-fn rasterise(icon: Icon, size: u32, color: Color, stroke_width: f32) -> Option<Pixmap> {
+pub(crate) fn rasterise(icon: Icon, size: u32, color: Color, stroke_width: f32) -> Option<Pixmap> {
     let [r, g, b, _] = color.to_rgba8();
     let svg = icon
         .svg()

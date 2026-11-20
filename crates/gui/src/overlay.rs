@@ -1,13 +1,11 @@
 //! The debug overlay: outlines every box, highlights what the last frame
 //! changed and labels the node under the pointer.
 
-use tiny_skia::Pixmap;
-
 use crate::color::Color;
-use crate::convert::u32_to_f32;
 use crate::geometry::Bounds;
 use crate::inspect::{Change, LayoutDiff, describe};
 use crate::layout::FrameNode;
+use crate::scene::Scene;
 use crate::style::{FontFamily, ResolvedText};
 use crate::text::{Target, TextSystem};
 
@@ -79,14 +77,15 @@ fn stroke(target: &mut Target<'_>, b: Bounds, width: f32, color: Color) {
     );
 }
 
-/// Paint `overlay` on top of an already painted frame.
-pub fn paint_overlay(pixmap: &mut Pixmap, scale: f32, text: &mut TextSystem, overlay: &Overlay<'_>) {
-    let viewport = (u32_to_f32(pixmap.width()) / scale, u32_to_f32(pixmap.height()) / scale);
+/// Record `overlay`, to paint on top of a frame `size` physical pixels at `scale`.
+pub fn record_overlay(size: (u32, u32), scale: f32, text: &mut TextSystem, overlay: &Overlay<'_>) -> Scene {
+    let mut scene = Scene::new(size, scale, None);
+    let viewport = scene.logical_size();
     let mut target = Target {
-        pixmap,
+        items: &mut scene.items,
         scale,
+        size,
         clip: None,
-        visible: None,
     };
     for n in overlay.nodes {
         stroke(&mut target, n.bounds, 1.0, Color::hex(OUTLINE).opacity(0.3));
@@ -126,16 +125,18 @@ pub fn paint_overlay(pixmap: &mut Pixmap, scale: f32, text: &mut TextSystem, ove
     ] {
         x = chip(&mut target, text, name, (x, y), viewport, Some(Color::hex(color)));
     }
+    scene
 }
 
-/// Paint `lines` on chips stacked in the window's top-right corner (the frame HUD).
-pub fn paint_hud(pixmap: &mut Pixmap, scale: f32, text: &mut TextSystem, lines: &[String]) {
-    let viewport = (u32_to_f32(pixmap.width()) / scale, u32_to_f32(pixmap.height()) / scale);
+/// Record `lines` on chips stacked in the window's top-right corner (the frame HUD).
+pub fn record_hud(size: (u32, u32), scale: f32, text: &mut TextSystem, lines: &[String]) -> Scene {
+    let mut scene = Scene::new(size, scale, None);
+    let viewport = scene.logical_size();
     let mut target = Target {
-        pixmap,
+        items: &mut scene.items,
         scale,
+        size,
         clip: None,
-        visible: None,
     };
     let step = label_text().line_height + LABEL_PAD;
     // The label face is monospaced: lines padded to one length make one block.
@@ -152,6 +153,7 @@ pub fn paint_hud(pixmap: &mut Pixmap, scale: f32, text: &mut TextSystem, lines: 
         );
         y += step;
     }
+    scene
 }
 
 /// Draw `s` on a dark chip at `at`, kept inside the window; returns the x past it.

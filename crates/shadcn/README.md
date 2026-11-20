@@ -102,6 +102,15 @@ slower one is measured twice more and the fastest kept, since a whole run can
 land on an efficiency core, and a page still slower fails the run. So run
 `bench.sh <pages>` before a change and again after it.
 
+Everything is painted on the GPU (ADR-0011): windows, and headless frames as
+well. A measuring scenario (`bench.sh`) waits for each frame to be drawn and
+reads nothing back, so it measures what a window costs. `docs --shots` and
+`--verdict` read every frame back, so the verdict judges the GPU's pixels.
+`GUI_RENDERER=cpu` paints on the CPU (tiny-skia) instead, as happens where no
+GPU answers (CI); the two renderers are held to the same pixels. The HUD's
+and `perf`'s `vsync` is the time a GPU window waits for the display to take
+the next frame. It is not counted in `paint`.
+
 Two more headless views of the same numbers:
 
 - `docs --shots <dir> <page>` (and any app's `Scenario`) write each

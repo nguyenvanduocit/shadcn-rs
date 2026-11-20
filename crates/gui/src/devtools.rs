@@ -1267,7 +1267,11 @@ pub fn perf_of<'a>(reports: impl IntoIterator<Item = &'a FrameReport>) -> String
         "{}\n",
         line("layout", Spread::of(reports.iter().map(|r| r.timings.layout)))
     ));
-    out.push_str(&line("paint", Spread::of(reports.iter().map(|r| r.timings.paint))));
+    out.push_str(&format!(
+        "{}\n",
+        line("paint", Spread::of(reports.iter().map(|r| r.timings.paint)))
+    ));
+    out.push_str(&line("vsync", Spread::of(reports.iter().map(|r| r.timings.vsync))));
     let heaps: Vec<heap::Heap> = reports.iter().filter_map(|r| r.footprint.heap).collect();
     if !heaps.is_empty() {
         let n = Spread::of(heaps.iter().map(|h| h.allocations));
@@ -1915,14 +1919,9 @@ impl Attached {
         due
     }
 
-    /// A frame was drawn: log it and answer what waited for it. `overlay`
-    /// paints the debug overlay on a copy of the pixels.
-    pub(crate) fn drawn(
-        &mut self,
-        report: &FrameReport,
-        pixmap: &tiny_skia::Pixmap,
-        overlay: &mut dyn FnMut(&mut tiny_skia::Pixmap),
-    ) {
+    /// A frame was drawn: log it and answer what waited for it. `capture`
+    /// reads the frame's pixels back, the debug overlay over them when asked.
+    pub(crate) fn drawn(&mut self, report: &FrameReport, capture: &mut dyn FnMut(bool) -> Option<tiny_skia::Pixmap>) {
         self.log.push(report.clone());
         for (req, what, shot) in self.waiting.drain(..) {
             let mut answer = String::new();
@@ -1930,12 +1929,11 @@ impl Attached {
                 answer.push_str(&format!("{what}\n"));
             }
             if let Some((path, with_overlay)) = shot {
-                let mut copy = pixmap.clone();
-                if with_overlay {
-                    overlay(&mut copy);
-                }
-                match save(&copy, &path) {
-                    Ok(()) => {
+                let saved = capture(with_overlay)
+                    .ok_or_else(|| "the frame could not be read back".to_owned())
+                    .and_then(|copy| save(&copy, &path).map(|()| copy));
+                match saved {
+                    Ok(copy) => {
                         answer.push_str(&format!(
                             "wrote {} ({}x{})\n",
                             path.display(),

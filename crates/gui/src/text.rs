@@ -11,15 +11,14 @@ use std::ops::Range;
 
 use cosmic_text::{
     Attrs, Buffer, CacheKey, Cursor, Ellipsize, EllipsizeHeightLimit, Family, FontSystem, Metrics, Shaping,
-    Style as FontStyle, SwashCache, SwashContent, Weight, Wrap,
+    Style as FontStyle, SwashCache, Weight, Wrap,
 };
-use tiny_skia::{Mask, Pixmap, PixmapPaint, Transform};
 
 use crate::cache::FrameCache;
 use crate::color::Color;
 use crate::convert::{f32_to_u32, i32_to_f32, u32_to_f32};
 use crate::geometry::Bounds;
-use crate::inspect::Raster;
+use crate::scene::{Clip, Item};
 use crate::style::{Edges, FontFamily, ResolvedText, TextAlign, WrapStyle};
 
 /// Subdivisions of a pixel lengths are kept in (Blink's `LayoutUnit`).
@@ -278,24 +277,11 @@ struct Shaped {
     primary: Option<(f32, f32)>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct GlyphKey {
-    glyph: CacheKey,
-    rgba: [u8; 4],
-}
-
-struct GlyphImage {
-    pixmap: Pixmap,
-    left: i32,
-    top: i32,
-}
-
 /// Fonts, shaped text and rasterised glyphs, kept across frames.
 pub struct TextSystem {
     fonts: FontSystem,
     swash: SwashCache,
     shaped: FrameCache<ShapeKey, Shaped>,
-    glyphs: FrameCache<GlyphKey, Option<GlyphImage>>,
 }
 
 impl Default for TextSystem {
@@ -328,7 +314,6 @@ impl TextSystem {
             fonts: FontSystem::new_with_locale_and_db("en-US".to_owned(), db),
             swash: SwashCache::new(),
             shaped: FrameCache::default(),
-            glyphs: FrameCache::default(),
         }
     }
 
@@ -494,7 +479,7 @@ impl TextSystem {
         let runs = p.runs;
         let run_of = |metadata: usize| untag(metadata).0.and_then(|i| runs.get(i));
         let scale = target.scale;
-        let mut placed: Vec<(GlyphKey, i32, i32, Color)> = Vec::new();
+        let mut placed: Vec<Item> = Vec::new();
         let mut lines: Vec<(Bounds, Color)> = Vec::new();
         let mut backgrounds: Vec<Background> = Vec::new();
         let Shaped {
@@ -504,8 +489,9 @@ impl TextSystem {
         // A long paragraph in a scroll container: only the lines in view
         // cost anything. A line's ink may reach past its box (accents, tall
         // scripts), so it counts as shown a line's height either side.
+        let visible = target.clip.map(|c| c.bounds);
         let shown = |line: &cosmic_text::LayoutRun<'_>| {
-            target.visible.is_none_or(|v| {
+            visible.is_none_or(|v| {
                 let top = origin.1 + line.line_top - line.line_height;
                 let bottom = origin.1 + line.line_top + line.line_height * 2.0;
                 bottom >= v.y && top <= v.bottom()
@@ -520,15 +506,13 @@ impl TextSystem {
                 let dx = run.filter(|_| first).map_or(0.0, |r| r.padding.left);
                 let color = run.map_or(t.color, |r| r.text.color).opacity(opacity);
                 let phys = glyph.physical(((origin.0 + dx) * scale, device), scale);
-                placed.push((
-                    GlyphKey {
-                        glyph: phys.cache_key,
-                        rgba: color.to_rgba8(),
-                    },
-                    phys.x,
-                    phys.y,
+                placed.push(Item::Glyph {
+                    key: phys.cache_key,
+                    x: phys.x,
+                    y: phys.y,
                     color,
-                ));
+                    clip: target.clip,
+                });
             }
             for group in groups(&line) {
                 let style = run_of(group.metadata).map_or(t, |r| &r.text);
@@ -589,52 +573,38 @@ impl TextSystem {
             };
             target.fill_rounded(b, bg.radius, bg.color);
         }
-        for (key, x, y, color) in placed {
-            let fonts = &mut self.fonts;
-            let swash = &mut self.swash;
-            let image = self
-                .glyphs
-                .get_or_insert_with(key, || glyph_image(fonts, swash, key, color));
-            if let Some(g) = image {
-                target.pixmap.draw_pixmap(
-                    x.saturating_add(g.left),
-                    y.saturating_sub(g.top),
-                    g.pixmap.as_ref(),
-                    &PixmapPaint::default(),
-                    Transform::identity(),
-                    target.clip,
-                );
-            }
-        }
+        target.items.extend(placed);
         for (b, color) in lines {
             target.fill_rect(b, color);
         }
     }
 
-    /// Forget the shaped text and glyphs the last frames did not draw; call once per frame.
+    /// Forget the shaped text the last frames did not draw; call once per frame.
     pub fn end_frame(&mut self) {
         self.shaped.end_frame();
-        self.glyphs.end_frame();
     }
 
-    /// Paragraphs shaped and glyph images held.
-    pub(crate) fn footprint(&self) -> (usize, Raster) {
-        (
-            self.shaped.len(),
-            Raster::of(self.glyphs.values().flatten().map(|g| &g.pixmap)),
-        )
+    /// Paragraphs shaped.
+    pub(crate) fn footprint(&self) -> usize {
+        self.shaped.len()
+    }
+
+    /// The coverage (or colour, for a colour glyph) of the glyph `key`, as
+    /// swash rasterises it; a renderer caches what it makes of it.
+    pub fn raster(&mut self, key: CacheKey) -> Option<cosmic_text::SwashImage> {
+        self.swash.get_image_uncached(&mut self.fonts, key)
     }
 }
 
-/// Where a frame is painted: the pixmap, its scale and the current clip.
+/// Where a frame's primitives are recorded: the scene's items, its scale
+/// and the clip that applies.
 pub struct Target<'a> {
-    pub pixmap: &'a mut Pixmap,
+    pub items: &'a mut Vec<Item>,
     /// Physical pixels per logical pixel.
     pub scale: f32,
-    pub clip: Option<&'a Mask>,
-    /// The box `clip` keeps (logical pixels), when it is set: text lines
-    /// wholly outside it are not drawn, as the mask would drop their pixels.
-    pub visible: Option<Bounds>,
+    /// The physical size painted.
+    pub size: (u32, u32),
+    pub clip: Option<Clip>,
 }
 
 impl Target<'_> {
@@ -644,28 +614,21 @@ impl Target<'_> {
             self.fill_rect(b, color);
             return;
         }
-        if let Some(path) = crate::paint::rrect(b, crate::style::Corners::all(radius)) {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(color.to_skia());
-            paint.anti_alias = true;
-            self.pixmap.fill_path(
-                &path,
-                &paint,
-                tiny_skia::FillRule::Winding,
-                Transform::from_scale(self.scale, self.scale),
-                self.clip,
-            );
-        }
+        self.items.push(Item::RoundedRect {
+            bounds: b,
+            radius: crate::style::Corners::all(radius),
+            color,
+            clip: self.clip,
+        });
     }
 
     /// Fill a logical-pixel rectangle with a solid colour.
     pub fn fill_rect(&mut self, b: Bounds, color: Color) {
-        if let Some(rect) = tiny_skia::Rect::from_xywh(b.x, b.y, b.width, b.height) {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(color.to_skia());
-            self.pixmap
-                .fill_rect(rect, &paint, Transform::from_scale(self.scale, self.scale), self.clip);
-        }
+        self.items.push(Item::Rect {
+            bounds: b,
+            color,
+            clip: self.clip,
+        });
     }
 }
 
@@ -838,38 +801,6 @@ fn balance(buffer: &mut Buffer, fonts: &mut FontSystem, width: f32) -> f32 {
     buffer.set_size(Some(fits), None);
     buffer.shape_until_scroll(fonts, false);
     fits
-}
-
-fn glyph_image(fonts: &mut FontSystem, swash: &mut SwashCache, key: GlyphKey, color: Color) -> Option<GlyphImage> {
-    let image = swash.get_image_uncached(fonts, key.glyph)?;
-    let (w, h) = (image.placement.width, image.placement.height);
-    let mut pixmap = Pixmap::new(w.max(1), h.max(1))?;
-    let [r, g, b, a] = color.to_rgba8();
-    match image.content {
-        SwashContent::Mask => {
-            for (px, &coverage) in pixmap.pixels_mut().iter_mut().zip(image.data.iter()) {
-                let alpha = mul_u8(coverage, a);
-                *px = tiny_skia::ColorU8::from_rgba(r, g, b, alpha).premultiply();
-            }
-        }
-        SwashContent::Color | SwashContent::SubpixelMask => {
-            let (rgba, _) = image.data.as_chunks::<4>();
-            for (px, &[cr, cg, cb, ca]) in pixmap.pixels_mut().iter_mut().zip(rgba) {
-                *px = tiny_skia::ColorU8::from_rgba(cr, cg, cb, mul_u8(ca, a)).premultiply();
-            }
-        }
-    }
-    Some(GlyphImage {
-        pixmap,
-        left: image.placement.left,
-        top: image.placement.top,
-    })
-}
-
-/// `a * b / 255`, rounded.
-fn mul_u8(a: u8, b: u8) -> u8 {
-    let p = u16::from(a).saturating_mul(u16::from(b));
-    u8::try_from(p.saturating_add(127) / 255).unwrap_or(u8::MAX)
 }
 
 /// The byte offset where line `line` (0-based, split on `\n`) starts.

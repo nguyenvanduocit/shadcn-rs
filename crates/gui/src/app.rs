@@ -13,23 +13,84 @@ use crate::access;
 use crate::clock;
 use crate::color::Color;
 use crate::convert::u32_to_f32;
+use crate::cpu::{CpuRenderer, PixmapRenderer};
 use crate::devtools::{self, Attached};
 use crate::edit::Preedit;
 use crate::element::{Element, IntoElement};
 use crate::events::{ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
+use crate::gpu::GpuRenderer;
 use crate::heap;
 use crate::inspect::{self, Footprint, FrameReport, LayoutDiff, Spread, Timings, ms};
 use crate::interact::{self, ImeTarget, Interaction, Outcome};
 use crate::layout::{Frame, LayoutError, layout};
 use crate::mailbox;
 use crate::motion::Motion;
-use crate::overlay::{Overlay, paint_hud, paint_overlay};
+use crate::overlay::{Overlay, record_hud, record_overlay};
 use crate::paint::Painter;
 use crate::reactive;
+use crate::scene::{Held, Renderer, Scene};
 use crate::scroll::ScrollHandle;
 use crate::style::Cursor;
 use crate::text::TextSystem;
 use crate::window::{self, Input, Wake, WindowHandler};
+
+/// The GPU renderer headless frames are painted with, as a window's are;
+/// `None` (the CPU renderer) under `GUI_RENDERER=cpu` or with no GPU, as on CI.
+fn headless_gpu() -> Option<Box<GpuRenderer>> {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if std::env::var("GUI_RENDERER").is_ok_and(|v| v == "cpu") {
+        return None;
+    }
+    match GpuRenderer::headless() {
+        Ok(gpu) => Some(Box::new(gpu)),
+        Err(e) => {
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!("GPU renderer unavailable ({e}); painting on the CPU");
+            }
+            None
+        }
+    }
+}
+
+/// The GPU painting a frame's scenes aside and reading them back into a pixmap.
+struct ReadBack<'a> {
+    gpu: &'a mut GpuRenderer,
+    pixmap: &'a mut Pixmap,
+    /// The frame's scenes so far, one over the other.
+    scene: Option<Scene>,
+    /// Read the pixels back; else only wait for the GPU to draw them.
+    read: bool,
+}
+
+impl Renderer for ReadBack<'_> {
+    fn render(&mut self, scene: &Scene, text: &mut TextSystem) {
+        let whole = match self.scene.take() {
+            Some(mut s) => {
+                s.append(scene.clone());
+                s
+            }
+            None => scene.clone(),
+        };
+        if !self.read {
+            self.gpu.draw_and_wait(scene, text);
+        } else if let Some(pixels) = self.gpu.capture(&whole, text) {
+            *self.pixmap = pixels;
+        }
+        self.scene = Some(whole);
+    }
+
+    fn end_frame(&mut self) {
+        self.gpu.end_frame();
+    }
+
+    fn held(&self) -> Held {
+        self.gpu.held()
+    }
+
+    fn capture(&mut self, scene: &Scene, text: &mut TextSystem) -> Option<Pixmap> {
+        self.gpu.capture(scene, text)
+    }
+}
 
 /// What the debug tools do while the app runs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,6 +116,12 @@ pub struct Pipeline<C> {
     component: C,
     text: TextSystem,
     painter: Painter,
+    /// Paints headless frames, the overlay and the HUD into pixmaps.
+    cpu: CpuRenderer,
+    /// What the renderer that painted the last frame holds.
+    held: Held,
+    /// The last frame's scene, without the overlay.
+    scene: Scene,
     interaction: Interaction,
     frame: Frame,
     /// The changes of the last frame that changed something.
@@ -89,6 +156,9 @@ impl<C: FnMut() -> Element> Pipeline<C> {
             component,
             text: TextSystem::new(),
             painter: Painter::default(),
+            cpu: CpuRenderer::default(),
+            held: Held::default(),
+            scene: Scene::default(),
             interaction: Interaction::default(),
             frame: Frame::default(),
             diff: LayoutDiff::default(),
@@ -238,14 +308,60 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         Ok((frame, again))
     }
 
-    /// Build, lay out and paint one frame at `scale`, then the overlay when shown.
+    /// Build, lay out and paint one frame into `pixmap` at `scale`, then
+    /// the overlay when shown, on the CPU.
     pub fn draw(&mut self, pixmap: &mut Pixmap, scale: f32) -> Result<FrameReport, LayoutError> {
-        let size = (u32_to_f32(pixmap.width()) / scale, u32_to_f32(pixmap.height()) / scale);
-        if size != self.size {
+        let size = (pixmap.width(), pixmap.height());
+        let mut cpu = std::mem::take(&mut self.cpu);
+        let mut renderer = PixmapRenderer {
+            renderer: &mut cpu,
+            pixmap,
+        };
+        let report = self.draw_with(&mut renderer, size, scale);
+        self.end_frame(&mut renderer);
+        self.cpu = cpu;
+        report
+    }
+
+    /// Build, lay out and paint one frame into `pixmap` at `scale` on `gpu`
+    /// (read back when `read`, else only waited for), or on the CPU without one.
+    fn draw_headless(
+        &mut self,
+        pixmap: &mut Pixmap,
+        scale: f32,
+        gpu: Option<&mut GpuRenderer>,
+        read: bool,
+    ) -> Result<FrameReport, LayoutError> {
+        let Some(gpu) = gpu else {
+            return self.draw(pixmap, scale);
+        };
+        let size = (pixmap.width(), pixmap.height());
+        let mut target = ReadBack {
+            gpu,
+            pixmap,
+            scene: None,
+            read,
+        };
+        let report = self.draw_with(&mut target, size, scale);
+        self.end_frame(&mut target);
+        report
+    }
+
+    /// Build, lay out and record one frame `size` physical pixels at
+    /// `scale`, and paint it, then the overlay when shown, with `renderer`;
+    /// the caller ends the renderer's frame.
+    pub fn draw_with(
+        &mut self,
+        renderer: &mut dyn Renderer,
+        size: (u32, u32),
+        scale: f32,
+    ) -> Result<FrameReport, LayoutError> {
+        let logical = (u32_to_f32(size.0) / scale, u32_to_f32(size.1) / scale);
+        if logical != self.size {
             if self.frames > 0 {
-                self.causes.push(format!("resize {:.0}x{:.0}", size.0, size.1));
+                self.causes.push(format!("resize {:.0}x{:.0}", logical.0, logical.1));
             }
-            self.size = size;
+            self.size = logical;
         }
         let heap_before = heap::now();
         clock::begin_frame();
@@ -253,8 +369,10 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         self.stale = false;
         let (frame, timings) = self.lay_out()?;
         let t2 = Instant::now();
-        self.painter.paint(&frame, &mut self.text, pixmap, scale, Color::WHITE);
+        let scene = self.painter.record(&frame, &mut self.text, size, scale, Color::WHITE);
+        renderer.render(&scene, &mut self.text);
         let t3 = Instant::now();
+        let vsync = renderer.waited();
         self.text.end_frame();
         self.animating = clock::take_frame_request();
 
@@ -269,9 +387,12 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         // The boxes under a resting pointer may have changed.
         self.dirty = self.interaction.rehover(&self.frame, &mut self.text).redraw;
 
+        self.scene = scene;
         if self.overlay {
-            self.paint_overlay(pixmap, scale);
+            let overlay = self.overlay_scene(size, scale);
+            renderer.render(&overlay, &mut self.text);
         }
+        self.held = renderer.held();
         let mut footprint = self.footprint();
         footprint.heap = heap::now().zip(heap_before).map(|(after, before)| after.since(before));
         Ok(FrameReport {
@@ -279,7 +400,8 @@ impl<C: FnMut() -> Element> Pipeline<C> {
             causes,
             reactive: reactive::take_trace(),
             timings: Timings {
-                paint: t3.duration_since(t2),
+                paint: t3.duration_since(t2).saturating_sub(vsync),
+                vsync,
                 ..timings
             },
             diff,
@@ -295,11 +417,16 @@ impl<C: FnMut() -> Element> Pipeline<C> {
     /// What the pipeline holds now, the heap as it stands.
     #[must_use]
     pub fn footprint(&self) -> Footprint {
-        let (shaped, glyphs) = self.text.footprint();
-        let (icons, shadows, images, layers) = self.painter.footprint();
+        let Held {
+            glyphs,
+            icons,
+            shadows,
+            images,
+            layers,
+        } = self.held;
         Footprint {
             nodes: self.frame.nodes.len(),
-            shaped,
+            shaped: self.text.footprint(),
             glyphs,
             icons,
             shadows,
@@ -310,8 +437,15 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         }
     }
 
-    /// Paint the overlay for the last frame on top of `pixmap`.
-    pub fn paint_overlay(&mut self, pixmap: &mut Pixmap, scale: f32) {
+    /// End `renderer`'s frame, and note what it holds after letting go of
+    /// what the last frames did not use.
+    pub fn end_frame(&mut self, renderer: &mut dyn Renderer) {
+        renderer.end_frame();
+        self.held = renderer.held();
+    }
+
+    /// The overlay for the last frame, `size` physical pixels at `scale`.
+    fn overlay_scene(&mut self, size: (u32, u32), scale: f32) -> Scene {
         let hovered = self
             .interaction
             .pointer()
@@ -322,12 +456,34 @@ impl<C: FnMut() -> Element> Pipeline<C> {
             diff: &self.diff,
             hovered,
         };
-        paint_overlay(pixmap, scale, &mut self.text, &overlay);
+        record_overlay(size, scale, &mut self.text, &overlay)
+    }
+
+    /// Paint the overlay for the last frame on top of `pixmap`.
+    pub fn paint_overlay(&mut self, pixmap: &mut Pixmap, scale: f32) {
+        let scene = self.overlay_scene((pixmap.width(), pixmap.height()), scale);
+        self.cpu.render(&scene, &mut self.text, pixmap);
     }
 
     /// Paint `lines` as the frame HUD on top of `pixmap`.
     pub fn paint_hud(&mut self, pixmap: &mut Pixmap, scale: f32, lines: &[String]) {
-        paint_hud(pixmap, scale, &mut self.text, lines);
+        let scene = record_hud((pixmap.width(), pixmap.height()), scale, &mut self.text, lines);
+        self.cpu.render(&scene, &mut self.text, pixmap);
+    }
+
+    /// Paint `lines` as the frame HUD with `renderer`, over the last frame.
+    fn render_hud(&mut self, renderer: &mut dyn Renderer, lines: &[String]) {
+        let scene = record_hud(self.scene.size, self.scene.scale, &mut self.text, lines);
+        renderer.render(&scene, &mut self.text);
+    }
+
+    /// The last frame read back from `renderer`, the overlay over it when asked.
+    fn capture(&mut self, renderer: &mut dyn Renderer, overlay: bool) -> Option<Pixmap> {
+        let mut scene = self.scene.clone();
+        if overlay {
+            scene.append(self.overlay_scene(scene.size, scene.scale));
+        }
+        renderer.capture(&scene, &mut self.text)
     }
 
     /// Run due timers and say whether a frame is due.
@@ -514,10 +670,13 @@ fn short_causes(causes: &[String]) -> String {
 }
 
 impl<C: FnMut() -> Element> WindowHandler for Live<C> {
-    fn draw(&mut self, pixmap: &mut Pixmap, scale: f32) {
-        let report = match self.pipeline.draw(pixmap, scale) {
+    fn draw(&mut self, renderer: &mut dyn Renderer, size: (u32, u32), scale: f32) {
+        let report = match self.pipeline.draw_with(renderer, size, scale) {
             Ok(report) => report,
-            Err(e) => return eprintln!("frame failed: {e}"),
+            Err(e) => {
+                self.pipeline.end_frame(renderer);
+                return eprintln!("frame failed: {e}");
+            }
         };
         self.history.push(&report);
         if self.log && report.changed() {
@@ -525,13 +684,14 @@ impl<C: FnMut() -> Element> WindowHandler for Live<C> {
         }
         if let Some(attached) = &mut self.attached {
             let pipeline = &mut self.pipeline;
-            attached.drawn(&report, pixmap, &mut |copy| pipeline.paint_overlay(copy, scale));
+            attached.drawn(&report, &mut |overlay| pipeline.capture(renderer, overlay));
         }
         if self.hud {
             let components = self.pipeline.frame().nodes.iter().filter(|n| n.name.is_some()).count();
             let lines = self.history.lines(&report, components);
-            self.pipeline.paint_hud(pixmap, scale, &lines);
+            self.pipeline.render_hud(renderer, &lines);
         }
+        self.pipeline.end_frame(renderer);
     }
 
     fn input(&mut self, input: Input) -> bool {
@@ -707,6 +867,9 @@ pub struct Scenario<C> {
     step: u32,
     trace: String,
     reports: Vec<FrameReport>,
+    /// Paints the frames on the GPU and reads them back; `None` (no
+    /// adapter, or `GUI_RENDERER=cpu`) paints them on the CPU.
+    gpu: Option<Box<GpuRenderer>>,
 }
 
 impl<C: FnMut() -> Element> Scenario<C> {
@@ -740,6 +903,7 @@ impl<C: FnMut() -> Element> Scenario<C> {
             step: 0,
             trace: String::new(),
             reports: Vec::new(),
+            gpu: headless_gpu(),
         })
     }
 
@@ -800,7 +964,11 @@ impl<C: FnMut() -> Element> Scenario<C> {
     fn render(&mut self) -> Result<FrameReport, ScenarioError> {
         // What other threads sent before this frame is in it, as in a window.
         mailbox::deliver();
-        let report = self.pipeline.draw(&mut self.pixmap, self.scale)?;
+        // A scenario that writes no frames only measures them.
+        let read = self.dir.is_some();
+        let report = self
+            .pipeline
+            .draw_headless(&mut self.pixmap, self.scale, self.gpu.as_deref_mut(), read)?;
         self.reports.push(report.clone());
         Ok(report)
     }
@@ -1018,7 +1186,7 @@ pub fn snapshot(view: impl IntoElement, path: &Path, width: u32, height: u32) ->
     clock::script(Duration::ZERO);
     let (pw, ph) = (width.saturating_mul(2), height.saturating_mul(2));
     let mut pixmap = Pixmap::new(pw, ph).ok_or(ScenarioError::Size(pw, ph))?;
-    pipeline.draw(&mut pixmap, 2.0)?;
+    pipeline.draw_headless(&mut pixmap, 2.0, headless_gpu().as_deref_mut(), true)?;
     save(&pixmap, path)
 }
 

@@ -1,5 +1,6 @@
-//! The native window: winit for events, softbuffer to show a CPU-painted
-//! pixmap. Positions handed on are logical pixels; the pixmap is physical.
+//! The native window: winit for events, a renderer to show its frames (the
+//! GPU, or the CPU through softbuffer where no GPU answers). Positions
+//! handed on are logical pixels; the surface is physical.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -15,11 +16,15 @@ use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::convert::f64_to_f32;
+use crate::cpu::CpuRenderer;
 use crate::edit::Preedit;
 use crate::events::{ImeEvent, KeyEvent, Modifiers};
+use crate::gpu::GpuRenderer;
 use crate::interact::ImeTarget;
 use crate::interact::LINE_SCROLL;
+use crate::scene::{Held, Renderer, Scene};
 use crate::style::Cursor;
+use crate::text::TextSystem;
 
 /// How often an animating window repaints.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -69,8 +74,9 @@ pub struct Wake {
 
 /// What runs inside the window.
 pub trait WindowHandler {
-    /// Paint one frame; `scale` is physical pixels per logical pixel.
-    fn draw(&mut self, pixmap: &mut Pixmap, scale: f32);
+    /// Paint one frame `size` physical pixels with `renderer` and end its
+    /// frame; `scale` is physical pixels per logical pixel.
+    fn draw(&mut self, renderer: &mut dyn Renderer, size: (u32, u32), scale: f32);
     /// React to `input`; return `true` when the window must be redrawn.
     fn input(&mut self, input: Input) -> bool;
     /// The cursor to show where the pointer is.
@@ -88,13 +94,120 @@ struct WindowState {
     window: Arc<Window>,
     /// Tells the platform's accessibility API what the window shows.
     access: accesskit_winit::Adapter,
+    renderer: WindowRenderer,
+}
+
+/// How the window shows its frames: the GPU, unless none answers (or
+/// `GUI_RENDERER=cpu` asks for the CPU).
+enum WindowRenderer {
+    Gpu(Box<GpuRenderer>),
+    Soft(Box<SoftRenderer>),
+}
+
+impl WindowRenderer {
+    fn new(window: &Arc<Window>) -> Result<Self, String> {
+        let cpu = std::env::var("GUI_RENDERER").is_ok_and(|v| v == "cpu");
+        if !cpu {
+            match GpuRenderer::for_window(Arc::clone(window)) {
+                Ok(gpu) => return Ok(Self::Gpu(Box::new(gpu))),
+                Err(e) => eprintln!("GPU renderer unavailable ({e}); painting on the CPU"),
+            }
+        }
+        SoftRenderer::new(window).map(|s| Self::Soft(Box::new(s)))
+    }
+
+    /// Make the surface `size`; false when nothing can be drawn at it.
+    fn resize(&mut self, size: (u32, u32)) -> bool {
+        match self {
+            Self::Gpu(g) => {
+                if size.0 == 0 || size.1 == 0 {
+                    return false;
+                }
+                g.resize(size);
+                true
+            }
+            Self::Soft(s) => s.resize(size),
+        }
+    }
+
+    fn renderer(&mut self) -> &mut dyn Renderer {
+        match self {
+            Self::Gpu(g) => g.as_mut(),
+            Self::Soft(s) => s.as_mut(),
+        }
+    }
+}
+
+/// The CPU renderer shown through softbuffer.
+struct SoftRenderer {
     #[expect(
         dead_code,
         reason = "held as a keep-alive: the surface is valid only while its context lives"
     )]
     context: Context<Arc<Window>>,
     surface: Surface<Arc<Window>, Arc<Window>>,
+    cpu: CpuRenderer,
     pixmap: Option<Pixmap>,
+}
+
+impl SoftRenderer {
+    fn new(window: &Arc<Window>) -> Result<Self, String> {
+        let context = Context::new(Arc::clone(window)).map_err(|e| format!("softbuffer context: {e}"))?;
+        let surface = Surface::new(&context, Arc::clone(window)).map_err(|e| format!("softbuffer surface: {e}"))?;
+        Ok(Self {
+            context,
+            surface,
+            cpu: CpuRenderer::default(),
+            pixmap: None,
+        })
+    }
+
+    /// Make the surface and the pixmap `size`; false when it cannot be.
+    fn resize(&mut self, size: (u32, u32)) -> bool {
+        let (Some(w), Some(h)) = (NonZeroU32::new(size.0), NonZeroU32::new(size.1)) else {
+            return false;
+        };
+        if let Err(e) = self.surface.resize(w, h) {
+            eprintln!("surface resize: {e}");
+            return false;
+        }
+        if !self.pixmap.as_ref().is_some_and(|p| (p.width(), p.height()) == size) {
+            self.pixmap = Pixmap::new(size.0, size.1);
+        }
+        self.pixmap.is_some()
+    }
+}
+
+impl Renderer for SoftRenderer {
+    fn render(&mut self, scene: &Scene, text: &mut TextSystem) {
+        if let Some(pixmap) = self.pixmap.as_mut() {
+            self.cpu.render(scene, text, pixmap);
+        }
+    }
+
+    fn end_frame(&mut self) {
+        self.cpu.end_frame();
+        let Some(pixmap) = self.pixmap.as_ref() else { return };
+        match self.surface.buffer_mut() {
+            Ok(mut buf) => {
+                for (dst, src) in buf.iter_mut().zip(pixmap.pixels()) {
+                    *dst = u32::from_be_bytes([0, src.red(), src.green(), src.blue()]);
+                }
+                if let Err(e) = buf.present() {
+                    eprintln!("present: {e}");
+                }
+            }
+            Err(e) => eprintln!("buffer_mut: {e}"),
+        }
+    }
+
+    fn held(&self) -> Held {
+        self.cpu.held()
+    }
+
+    fn capture(&mut self, scene: &Scene, text: &mut TextSystem) -> Option<Pixmap> {
+        self.cpu.capture(scene, text)
+    }
 }
 
 struct Handler<H: WindowHandler> {
@@ -198,18 +311,10 @@ impl<H: WindowHandler> ApplicationHandler<UserEvent> for Handler<H> {
                 return;
             }
         };
-        let context = match Context::new(Arc::clone(&window)) {
-            Ok(ctx) => ctx,
+        let renderer = match WindowRenderer::new(&window) {
+            Ok(r) => r,
             Err(e) => {
-                eprintln!("softbuffer context: {e}");
-                event_loop.exit();
-                return;
-            }
-        };
-        let surface = match Surface::new(&context, Arc::clone(&window)) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("softbuffer surface: {e}");
+                eprintln!("{e}");
                 event_loop.exit();
                 return;
             }
@@ -220,9 +325,7 @@ impl<H: WindowHandler> ApplicationHandler<UserEvent> for Handler<H> {
         self.state = Some(WindowState {
             window,
             access,
-            context,
-            surface,
-            pixmap: None,
+            renderer,
         });
     }
 
@@ -373,32 +476,9 @@ impl<H: WindowHandler> Handler<H> {
         let app = &mut self.app;
         let Some(state) = self.state.as_mut() else { return };
         let size = state.window.inner_size();
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.width), NonZeroU32::new(size.height)) else {
-            return;
-        };
-        if let Err(e) = state.surface.resize(w, h) {
-            eprintln!("surface resize: {e}");
-            return;
-        }
-        let fits = state
-            .pixmap
-            .as_ref()
-            .is_some_and(|p| p.width() == size.width && p.height() == size.height);
-        if !fits {
-            state.pixmap = Pixmap::new(size.width, size.height);
-        }
-        let Some(pixmap) = state.pixmap.as_mut() else { return };
-        app.draw(pixmap, scale);
-        match state.surface.buffer_mut() {
-            Ok(mut buf) => {
-                for (dst, src) in buf.iter_mut().zip(pixmap.pixels()) {
-                    *dst = u32::from_be_bytes([0, src.red(), src.green(), src.blue()]);
-                }
-                if let Err(e) = buf.present() {
-                    eprintln!("present: {e}");
-                }
-            }
-            Err(e) => eprintln!("buffer_mut: {e}"),
+        let size = (size.width, size.height);
+        if state.renderer.resize(size) {
+            app.draw(state.renderer.renderer(), size, scale);
         }
     }
 }
