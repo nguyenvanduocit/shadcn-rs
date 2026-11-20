@@ -62,6 +62,16 @@ pub struct KeyEvent {
     pub modifiers: Modifiers,
 }
 
+/// What an input method does to the focused text input (winit's `Ime`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImeEvent {
+    /// Composing: show this text at the caret; empty ends the composition
+    /// with nothing typed.
+    Preedit(crate::edit::Preedit),
+    /// Composed: type this text.
+    Commit(String),
+}
+
 impl KeyEvent {
     /// Whether this is the named key `k`.
     #[must_use]

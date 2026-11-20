@@ -12,11 +12,12 @@ use tiny_skia::Pixmap;
 use crate::clock;
 use crate::color::Color;
 use crate::convert::u32_to_f32;
+use crate::edit::Preedit;
 use crate::element::{Element, IntoElement};
-use crate::events::{Key, KeyEvent, Modifiers, NamedKey};
+use crate::events::{ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
 use crate::heap;
 use crate::inspect::{self, Footprint, FrameReport, LayoutDiff, Spread, Timings, ms};
-use crate::interact::{self, Interaction, Outcome};
+use crate::interact::{self, ImeTarget, Interaction, Outcome};
 use crate::layout::{Frame, LayoutError, layout};
 use crate::motion::Motion;
 use crate::overlay::{Overlay, paint_hud, paint_overlay};
@@ -121,6 +122,11 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         self.interaction.cursor(&self.frame)
     }
 
+    /// Where an input method may type in the last frame, if anywhere.
+    pub fn ime_target(&mut self) -> Option<ImeTarget> {
+        self.interaction.ime_target(&self.frame, &mut self.text)
+    }
+
     /// Route `input` to the last frame's nodes, laid out again first when a
     /// signal was written or the wheel scrolled since.
     pub fn input(&mut self, input: Input) -> Outcome {
@@ -140,6 +146,7 @@ impl<C: FnMut() -> Element> Pipeline<C> {
                 out
             }
             Input::Key(ev) => self.interaction.key(f, t, &ev),
+            Input::Ime(ev) => self.interaction.ime(f, &ev),
             Input::Modifiers(m) => {
                 self.interaction.set_modifiers(m);
                 Outcome::default()
@@ -439,6 +446,10 @@ impl<C: FnMut() -> Element> WindowHandler for Live<C> {
 
     fn cursor(&self) -> Cursor {
         self.pipeline.cursor()
+    }
+
+    fn ime_target(&mut self) -> Option<ImeTarget> {
+        self.pipeline.ime_target()
     }
 
     fn idle(&mut self) -> Wake {
@@ -757,6 +768,20 @@ impl<C: FnMut() -> Element> Scenario<C> {
                 modifiers: Modifiers::default(),
             }));
         }
+    }
+
+    /// Compose `text` in the focused input as an input method does (a Telex
+    /// syllable before it is done), its caret at the end.
+    pub fn compose(&mut self, text: &str) -> Outcome {
+        self.pipeline.input(Input::Ime(ImeEvent::Preedit(Preedit {
+            text: text.to_owned(),
+            cursor: Some((text.len(), text.len())),
+        })))
+    }
+
+    /// End a composition by typing `text`, as an input method commits it.
+    pub fn commit(&mut self, text: &str) -> Outcome {
+        self.pipeline.input(Input::Ime(ImeEvent::Commit(text.to_owned())))
     }
 
     /// Press a named key with `modifiers`.

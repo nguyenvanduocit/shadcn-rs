@@ -205,20 +205,28 @@ pub struct InputMode {
 }
 
 impl InputMode {
-    /// `edit` as the input shows it.
-    pub(crate) fn shown(self, edit: TextEdit) -> TextEdit {
+    /// `edit` as the input shows it, and the range of what an input method
+    /// is composing there. A password takes no composition: the window offers
+    /// it no input method, as a browser does.
+    pub(crate) fn shown(self, edit: &TextEdit) -> (TextEdit, Option<(usize, usize)>) {
         match self.input_type {
-            InputType::Text => edit,
-            InputType::Password => edit.masked(),
+            InputType::Text => edit.composed(),
+            InputType::Password => (edit.masked(), None),
         }
     }
 
     /// Where an offset `at` in what the input shows of `edit` falls in its value.
     pub(crate) fn value_offset(self, edit: &TextEdit, at: usize) -> usize {
         match self.input_type {
-            InputType::Text => at,
+            InputType::Text => edit.uncomposed(at),
             InputType::Password => edit.unmasked(at),
         }
+    }
+
+    /// Whether the input takes text from an input method: it is edited and
+    /// its value shows as typed.
+    pub(crate) fn composes(self) -> bool {
+        !self.read_only && self.input_type == InputType::Text
     }
 }
 

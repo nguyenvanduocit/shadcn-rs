@@ -8,14 +8,16 @@ use std::time::{Duration, Instant};
 use softbuffer::{Context, Surface};
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::{LogicalPosition, LogicalSize};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
 use crate::convert::f64_to_f32;
-use crate::events::{KeyEvent, Modifiers};
+use crate::edit::Preedit;
+use crate::events::{ImeEvent, KeyEvent, Modifiers};
+use crate::interact::ImeTarget;
 use crate::interact::LINE_SCROLL;
 use crate::style::Cursor;
 
@@ -49,6 +51,8 @@ pub enum Input {
         dy: f32,
     },
     Key(KeyEvent),
+    /// An input method composed or committed text.
+    Ime(ImeEvent),
     Modifiers(Modifiers),
 }
 
@@ -69,6 +73,9 @@ pub trait WindowHandler {
     fn input(&mut self, input: Input) -> bool;
     /// The cursor to show where the pointer is.
     fn cursor(&self) -> Cursor;
+    /// Where an input method may type, after the last frame; `None` turns
+    /// the input method off.
+    fn ime_target(&mut self) -> Option<ImeTarget>;
     /// Called when the event queue is empty: run due work and say when to wake.
     fn idle(&mut self) -> Wake;
 }
@@ -91,6 +98,8 @@ struct Handler<H: WindowHandler> {
     /// Last pointer position, in logical pixels.
     cursor: (f32, f32),
     modifiers: Modifiers,
+    /// Where the input method was last told it may type.
+    ime: Option<ImeTarget>,
 }
 
 /// Open a window titled `title` and run `handler` until it closes.
@@ -108,6 +117,7 @@ pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
         state: None,
         cursor: (0.0, 0.0),
         modifiers: Modifiers::default(),
+        ime: None,
     };
     if let Err(e) = event_loop.run_app(&mut handler) {
         eprintln!("event loop error: {e}");
@@ -240,7 +250,16 @@ impl<H: WindowHandler> ApplicationHandler for Handler<H> {
                     modifiers: self.modifiers,
                 }));
             }
-            WindowEvent::RedrawRequested => self.redraw(scale),
+            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
+                self.send(Input::Ime(ImeEvent::Preedit(Preedit { text, cursor })));
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => self.send(Input::Ime(ImeEvent::Commit(text))),
+            // Another input source was chosen mid-composition: what it held is gone.
+            WindowEvent::Ime(Ime::Disabled) => self.send(Input::Ime(ImeEvent::Preedit(Preedit::default()))),
+            WindowEvent::RedrawRequested => {
+                self.redraw(scale);
+                self.follow_ime();
+            }
             _ => {}
         }
     }
@@ -265,6 +284,32 @@ impl<H: WindowHandler> ApplicationHandler for Handler<H> {
 }
 
 impl<H: WindowHandler> Handler<H> {
+    /// Tell the platform's input method where it may type: on while an
+    /// input that takes composed text has focus, its candidates at the
+    /// caret, and started afresh when focus moves to another input so a
+    /// composition never carries over.
+    fn follow_ime(&mut self) {
+        let target = self.app.ime_target();
+        let Some(state) = self.state.as_ref() else { return };
+        if target == self.ime {
+            return;
+        }
+        let moved = target.map(|t| t.field) != self.ime.map(|t| t.field);
+        if moved && self.ime.is_some() {
+            state.window.set_ime_allowed(false);
+        }
+        if let Some(t) = target {
+            if moved {
+                state.window.set_ime_allowed(true);
+            }
+            state.window.set_ime_cursor_area(
+                LogicalPosition::new(t.caret.x, t.caret.y),
+                LogicalSize::new(t.caret.width, t.caret.height),
+            );
+        }
+        self.ime = target;
+    }
+
     fn redraw(&mut self, scale: f32) {
         let app = &mut self.app;
         let Some(state) = self.state.as_mut() else { return };

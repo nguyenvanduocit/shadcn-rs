@@ -16,6 +16,18 @@ pub struct TextEdit {
     pub caret: usize,
     /// The other end of the selection; equal to `caret` when nothing is selected.
     pub anchor: usize,
+    /// What an input method is composing at the caret, not yet part of `text`.
+    pub preedit: Option<Preedit>,
+}
+
+/// Text an input method is composing (macOS's marked text, a Telex syllable,
+/// kana before conversion): shown at the caret, underlined, and part of the
+/// value only once the input method commits it, as a browser's composition.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Preedit {
+    pub text: String,
+    /// The input method's caret in `text`, a byte range; `None` hides it.
+    pub cursor: Option<(usize, usize)>,
 }
 
 impl TextEdit {
@@ -27,6 +39,7 @@ impl TextEdit {
             text,
             caret: end,
             anchor: end,
+            preedit: None,
         }
     }
 
@@ -158,6 +171,7 @@ impl TextEdit {
             text: BULLET.to_string().repeat(self.text.chars().count()),
             caret: bullets(self.caret),
             anchor: bullets(self.anchor),
+            preedit: None,
         }
     }
 
@@ -166,6 +180,61 @@ impl TextEdit {
     pub fn unmasked(&self, at: usize) -> usize {
         let nth = at.checked_div(BULLET.len_utf8()).unwrap_or(0);
         self.text.char_indices().nth(nth).map_or(self.text.len(), |(i, _)| i)
+    }
+
+    /// Show `preedit` at the caret in place of the selection; an empty one
+    /// ends the composition with nothing typed.
+    pub fn compose(&mut self, preedit: Preedit) {
+        if preedit.text.is_empty() {
+            self.preedit = None;
+            return;
+        }
+        self.delete_selection();
+        self.preedit = Some(preedit);
+    }
+
+    /// End the composition with `s`, typed as a key types it.
+    pub fn commit(&mut self, s: &str) {
+        self.preedit = None;
+        self.insert(s);
+    }
+
+    /// The edit as it shows while composing: the preedit inside the text at
+    /// the caret, the caret where the input method puts it, and the byte
+    /// range the preedit takes there.
+    #[must_use]
+    pub fn composed(&self) -> (Self, Option<(usize, usize)>) {
+        let Some(p) = &self.preedit else {
+            return (self.clone(), None);
+        };
+        let (start, end) = (self.caret, self.caret.saturating_add(p.text.len()));
+        let mut text = self.text.clone();
+        text.insert_str(start, &p.text);
+        let caret = p
+            .cursor
+            .map_or(end, |(_, to)| start.saturating_add(to.min(p.text.len())));
+        let shown = Self {
+            text,
+            caret,
+            anchor: caret,
+            preedit: None,
+        };
+        (shown, Some((start, end)))
+    }
+
+    /// Where an offset `at` in [`Self::composed`] falls in this text: inside
+    /// the preedit is the caret, past it moves back by its length.
+    #[must_use]
+    pub fn uncomposed(&self, at: usize) -> usize {
+        let Some(p) = &self.preedit else { return at };
+        let end = self.caret.saturating_add(p.text.len());
+        if at <= self.caret {
+            at
+        } else if at < end {
+            self.caret
+        } else {
+            at.saturating_sub(p.text.len())
+        }
     }
 
     /// Put the caret at `at` (clamped to a char boundary), as a click does.

@@ -92,7 +92,10 @@ pub enum Content {
         radius: Corners,
     },
     Input {
+        /// What the input shows: its value with any composition in it.
         edit: TextEdit,
+        /// The byte range of `edit.text` an input method is composing.
+        preedit: Option<(usize, usize)>,
         placeholder: String,
         placeholder_color: Color,
         selection_color: Color,
@@ -518,7 +521,7 @@ impl<'e> Builder<'e, '_> {
             Element::Input(n) => self.tree.new_leaf_with_context(
                 taffy_style,
                 Measure::Input {
-                    content: n.kind.field.edit.get().text,
+                    content: n.kind.mode.shown(&n.kind.field.edit.get()).0.text,
                     text,
                     multiline: n.kind.multiline,
                 },
@@ -1051,16 +1054,20 @@ fn place(b: &Builder<'_, '_>, first: usize, origin: (f32, f32), frame: &mut Fram
                 source: source.clone(),
                 radius: node.style.radius.resolve(node.text.radius),
             },
-            Pending::Input(input) => Content::Input {
-                edit: input.mode.shown(input.field.edit.get()),
-                placeholder: input.placeholder.clone(),
-                placeholder_color: input.placeholder_color.unwrap_or(node.text.color.opacity(0.5)),
-                selection_color: input.selection_color.unwrap_or(Color::hex(0x0003_66d6).opacity(0.3)),
-                text: node.text,
-                focused: node.focused,
-                multiline: input.multiline,
-                mode: input.mode,
-            },
+            Pending::Input(input) => {
+                let (edit, preedit) = input.mode.shown(&input.field.edit.get());
+                Content::Input {
+                    edit,
+                    preedit,
+                    placeholder: input.placeholder.clone(),
+                    placeholder_color: input.placeholder_color.unwrap_or(node.text.color.opacity(0.5)),
+                    selection_color: input.selection_color.unwrap_or(Color::hex(0x0003_66d6).opacity(0.3)),
+                    text: node.text,
+                    focused: node.focused,
+                    multiline: input.multiline,
+                    mode: input.mode,
+                }
+            }
         };
         let frame_index = frame.nodes.len();
         frame.nodes.push(FrameNode {

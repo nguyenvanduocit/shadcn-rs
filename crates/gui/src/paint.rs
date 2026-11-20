@@ -480,6 +480,7 @@ impl Painter {
             }
             Content::Input {
                 edit,
+                preedit,
                 placeholder,
                 placeholder_color,
                 selection_color,
@@ -523,6 +524,20 @@ impl Painter {
                     );
                 } else {
                     text.draw(&mut clip_target, edit.text.as_str(), &line_t, width, origin, 1.0);
+                }
+                // What an input method is composing is underlined, as a
+                // browser marks a composition, until it is committed.
+                if let Some((from, to)) = *preedit {
+                    for r in text.selection(&edit.text, &line_t, width, from, to) {
+                        let b = Bounds {
+                            x: origin.0 + r.x,
+                            y: origin.1 + r.y + r.height - 1.0,
+                            width: r.width,
+                            height: 1.0,
+                        }
+                        .intersect(&area.outset(1.0));
+                        clip_target.fill_rect(b, t.color);
+                    }
                 }
                 let on = (clock::frame_time() / BLINK).floor().rem_euclid(2.0) < 1.0;
                 if *focused && on && !mode.read_only {

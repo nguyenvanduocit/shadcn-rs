@@ -4,8 +4,9 @@
 
 use std::collections::HashSet;
 
+use crate::edit::TextField;
 use crate::element::{InputMode, InputType};
-use crate::events::{ClickEvent, DragEvent, DragPhase, Key, KeyEvent, Modifiers, NamedKey};
+use crate::events::{ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
 use crate::focus::{self, FocusId};
 use crate::geometry::{Bounds, NodePath};
 use crate::layout::{Content, Frame, UiState, input_text};
@@ -31,6 +32,17 @@ pub struct Interaction {
     pointer: Option<(f32, f32)>,
     press: Option<Press>,
     modifiers: Modifiers,
+    /// The field an input method is composing in, so its composition goes
+    /// when focus leaves it.
+    composing: Option<TextField>,
+}
+
+/// Where an input method types: the focused input's caret, in window
+/// coordinates, and the input it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ImeTarget {
+    pub field: FocusId,
+    pub caret: Bounds,
 }
 
 /// What an input did.
@@ -517,6 +529,62 @@ impl Interaction {
         Outcome::default()
     }
 
+    /// Apply what an input method did to the focused text input.
+    pub fn ime(&mut self, frame: &Frame, ev: &ImeEvent) -> Outcome {
+        let Some(i) = focus::focused().and_then(|id| focused_node(frame, id)) else {
+            return Outcome::default();
+        };
+        let Some((.., mode, multiline)) = Self::input_geometry(frame, i) else {
+            return Outcome::default();
+        };
+        let Some(field) = frame
+            .behaviour(i)
+            .and_then(|b| b.field.clone())
+            .filter(|_| mode.composes())
+        else {
+            return Outcome::default();
+        };
+        let mut e = field.edit.get();
+        match ev {
+            ImeEvent::Preedit(p) => e.compose(p.clone()),
+            ImeEvent::Commit(s) if multiline => e.commit(s),
+            ImeEvent::Commit(s) => e.commit(&s.replace(['\n', '\r'], " ")),
+        }
+        self.composing = e.preedit.is_some().then(|| field.clone());
+        field.edit.set(e);
+        Outcome::by(format!("ime -> edit {}", label(frame, i)))
+    }
+
+    /// Where an input method may type now: the focused input's caret when
+    /// that input takes composed text. A composition left in an input that
+    /// lost focus is dropped, as a browser ends it on blur.
+    pub fn ime_target(&mut self, frame: &Frame, text: &mut TextSystem) -> Option<ImeTarget> {
+        let focused = focus::focused();
+        if let Some(field) = self.composing.take_if(|f| Some(f.focus.id()) != focused) {
+            field.edit.update(|mut e| {
+                e.preedit = None;
+                e
+            });
+        }
+        let id = focused?;
+        let i = focused_node(frame, id)?;
+        let (content, t, area, caret_at, mode, multiline) = Self::input_geometry(frame, i)?;
+        if !mode.composes() {
+            return None;
+        }
+        let it = input_text(text, &content, &t, area, multiline, caret_at);
+        let caret = text.caret(&content, &it.t, it.width, caret_at);
+        Some(ImeTarget {
+            field: id,
+            caret: Bounds {
+                x: it.origin.0 + caret.x,
+                y: it.origin.1 + caret.y,
+                width: 1.0,
+                height: caret.height,
+            },
+        })
+    }
+
     /// Move focus to the next (or previous) focusable node of the top layer that has one.
     fn tab(&mut self, frame: &Frame, back: bool) -> Outcome {
         let focusable: Vec<(usize, FocusId)> = frame
@@ -713,5 +781,58 @@ mod tests {
         .unwrap();
         let dump = crate::inspect::dump(&frame.nodes);
         assert!(dump.contains("•••") && !dump.contains("s3c"), "{dump}");
+    }
+
+    #[test]
+    fn an_input_method_composes_at_the_caret_and_types_only_what_it_commits() {
+        let (field, other) = (TextField::new("xin chào "), TextField::new(""));
+        let root = crate::element::div()
+            .child(text_input(&field).w_px(200.0))
+            .child(text_input(&other).w_px(200.0))
+            .into_element();
+        let mut text = TextSystem::new();
+        let mut ui = Interaction::default();
+        let frame = |ui: &mut Interaction, text: &mut TextSystem| {
+            ui.sync_focus();
+            layout(
+                &root,
+                400.0,
+                100.0,
+                ui.state(),
+                &mut crate::motion::Motion::default(),
+                text,
+            )
+            .unwrap()
+        };
+        let preedit = |s: &str| {
+            ImeEvent::Preedit(crate::edit::Preedit {
+                text: s.to_owned(),
+                cursor: Some((s.len(), s.len())),
+            })
+        };
+        field.focus.focus();
+        let f = frame(&mut ui, &mut text);
+        ui.ime(&f, &preedit("viet"));
+        let f = frame(&mut ui, &mut text);
+        ui.ime(&f, &preedit("việt"));
+        assert_eq!(field.text(), "xin chào ", "a composition is not yet the value");
+        let f = frame(&mut ui, &mut text);
+        let dump = crate::inspect::dump(&f.nodes);
+        assert!(dump.contains("xin chào việt"), "{dump}");
+        assert_eq!(ui.ime_target(&f, &mut text).map(|t| t.field), Some(field.focus.id()));
+        ui.ime(&f, &ImeEvent::Commit("việt".to_owned()));
+        assert_eq!(field.text(), "xin chào việt");
+
+        let f = frame(&mut ui, &mut text);
+        ui.ime(&f, &preedit("nam"));
+        other.focus.focus();
+        let f = frame(&mut ui, &mut text);
+        assert_eq!(
+            ui.ime_target(&f, &mut text).map(|t| t.field),
+            Some(other.focus.id()),
+            "the input method follows focus"
+        );
+        assert_eq!(field.edit.get().preedit, None, "focus leaving drops the composition");
+        assert_eq!(field.text(), "xin chào việt");
     }
 }

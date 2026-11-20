@@ -39,12 +39,12 @@ pub use app::{DebugTools, RunOptions, Scenario, ScenarioError, run, snapshot};
 pub use color::Color;
 pub use computed::Computed;
 pub use context::{provide, use_context};
-pub use edit::{TextEdit, TextField};
+pub use edit::{Preedit, TextEdit, TextField};
 pub use element::{
     Deferred, Div, Element, ElementKey, IconElement, Image, InputMode, InputType, IntoElement, Placement, Shapes, Side,
     SideAlign, Span, Text, TextInput, View, deferred, div, icon, image, key_of, shapes, span, text, text_input,
 };
-pub use events::{ClickEvent, DragEvent, DragPhase, Key, KeyEvent, Modifiers, NamedKey};
+pub use events::{ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
 pub use focus::FocusHandle;
 pub use geometry::Bounds;
 pub use icon::Icon;
