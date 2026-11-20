@@ -141,7 +141,7 @@ fn next(script: Script, id: u64, steps: Rc<Vec<Step>>, i: usize) {
 
 /// A collapsible row that opens and closes with its step (Vue's
 /// `openState[id] ?? running`) until the reader opens or closes it.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Follow {
     pub open: Signal<bool>,
     /// What [`Follow::follow`] last set; `open` differing from it means the

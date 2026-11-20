@@ -44,8 +44,12 @@ pub struct Painter {
     images: FrameCache<ImageKey, Option<ScaledImage>>,
     blink: Option<clock::TimerId>,
     /// Window-sized pixmaps groups paint aside into (see [`effects`]), kept
-    /// for the next frame.
+    /// for the next frame: as many as the last two frames had in use at once.
     layers: Vec<Pixmap>,
+    /// Layers in use now (a group inside a group holds two).
+    layers_out: usize,
+    /// The most in use at once this frame, and in the frame before.
+    layers_peak: (usize, usize),
 }
 
 fn push_rrect(pb: &mut PathBuilder, b: Bounds, r: Corners) {
@@ -193,6 +197,12 @@ impl Painter {
         self.icons.end_frame();
         self.shadows.end_frame();
         self.images.end_frame();
+        // Keep the layers the last two frames needed at once, as the caches
+        // keep what the last two frames drew: a dialog's nested groups do not
+        // hold window-sized pixmaps after it has gone.
+        let (now, before) = self.layers_peak;
+        self.layers.truncate(now.max(before));
+        self.layers_peak = (0, now);
     }
 
     /// The icon, shadow, scaled image and group-layer images held.
@@ -282,6 +292,8 @@ impl Painter {
         let Some(mut layer) = self.layers.pop().or_else(|| Pixmap::new(size.0, size.1)) else {
             return false;
         };
+        self.layers_out = self.layers_out.saturating_add(1);
+        self.layers_peak.0 = self.layers_peak.0.max(self.layers_out);
         effects::clear(&mut layer, region);
         let children = subtree.start.saturating_add(1)..subtree.end;
         let blinking = self.paint_node(node, &mut layer, text, clips, inner)
@@ -289,6 +301,7 @@ impl Painter {
         let outer = if transformed { clips.get(node) } else { None };
         effects::composite(&layer, region, node, clips.scale, pixmap, outer);
         self.layers.push(layer);
+        self.layers_out = self.layers_out.saturating_sub(1);
         blinking
     }
 
@@ -309,14 +322,16 @@ impl Painter {
             return false;
         }
         clips.prepare(node);
+        let clip = if lifted == Some(node.clip) {
+            None
+        } else {
+            clips.get(node)
+        };
         let mut target = Target {
             pixmap,
             scale: clips.scale,
-            clip: if lifted == Some(node.clip) {
-                None
-            } else {
-                clips.get(node)
-            },
+            visible: clip.and(node.clip),
+            clip,
         };
         self.paint_box(&mut target, node, text);
         self.paint_content(&mut target, node, text)
@@ -497,6 +512,7 @@ impl Painter {
                     pixmap: target.pixmap,
                     scale: target.scale,
                     clip: target.clip,
+                    visible: target.visible,
                 };
                 if *focused && edit.has_selection() {
                     let (from, to) = edit.selection();

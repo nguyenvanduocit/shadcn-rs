@@ -47,13 +47,13 @@ pub type DemoStates = HashMap<(&'static str, &'static str), DemoState>;
 /// The doc's first paragraph split as the module docs open, `Badge
 /// (`ui/badge`): a small label…`: the registry item, and the sentence after
 /// it, capitalised; the other paragraphs follow as notes.
-struct Doc {
-    registry: Option<String>,
-    lead: String,
-    notes: Vec<String>,
+pub(super) struct Doc {
+    pub(super) registry: Option<String>,
+    pub(super) lead: String,
+    pub(super) notes: Vec<String>,
 }
 
-fn parse_doc(doc: &str) -> Doc {
+pub(super) fn parse_doc(doc: &str) -> Doc {
     let mut paragraphs = doc
         .split("\n\n")
         .map(|p| p.lines().map(str::trim).collect::<Vec<_>>().join(" "))

@@ -10,6 +10,7 @@
 
 mod catalog;
 mod component;
+mod export;
 mod fidelity;
 mod intro;
 mod lift;
@@ -39,6 +40,8 @@ use self::catalog::{Catalog, Route};
 use self::component::DemoStates;
 use self::fidelity::Verdicts;
 use crate::{Host, Render, pages};
+
+pub use self::export::export;
 
 /// The page column's widest: a 768px demo in its preview's padding and border.
 const CONTENT_WIDTH: f32 = 820.0;
@@ -494,18 +497,23 @@ impl Docs {
     }
 }
 
-/// Open the docs in a window, with the frame HUD shown when `hud`.
-pub fn run(hud: bool) -> ! {
+/// Open the docs in a window with the debug tools `debug` turns on.
+pub fn run(debug: gui::DebugTools) -> ! {
     gui::provide(Host::Docs);
     let mut docs = Docs::new(Route::Introduction);
     let options = RunOptions {
-        debug: gui::DebugTools {
-            hud,
-            ..gui::DebugTools::default()
-        },
+        debug,
         ..RunOptions::default()
     };
     gui::run("shadcn-rs docs", move || docs.render(), options)
+}
+
+/// The docs as a page's render function, opened at the introduction: what
+/// `--inspect docs` drives headless.
+pub fn app() -> Render {
+    gui::provide(Host::Docs);
+    let mut docs = Docs::new(Route::Introduction);
+    Box::new(move || docs.render())
 }
 
 /// The platform's shortcut modifier held alone.

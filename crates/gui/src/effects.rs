@@ -177,6 +177,7 @@ pub(crate) fn paint_text_through(
             pixmap: &mut glyphs,
             scale,
             clip: None,
+            visible: None,
         },
         p,
         &shape,

@@ -1,3 +1,6 @@
+//! A test run as an agent's step shows it: how many passed, failed and were
+//! skipped, a step per suite, and each failing test's error.
+
 use gui::prelude::*;
 use gui::{Div, Icon, ScenarioError, Signal, div, icon};
 use shadcn::{

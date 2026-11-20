@@ -1,3 +1,6 @@
+//! An error's stack as an agent's step shows it: the error line, a link per
+//! frame of the app's own code, and the library frames folded away.
+
 use gui::prelude::*;
 use gui::{Div, Icon, ScenarioError, Signal, div, icon, text};
 use shadcn::{

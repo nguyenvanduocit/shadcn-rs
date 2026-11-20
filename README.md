@@ -24,7 +24,13 @@ crates/shadcn/verdict/run.sh button              # a score from 0 to 100 per dem
 crates/shadcn/bench.sh button card               # steady frame times, memory held, leaks; compared with the last run
 ```
 
-`crates/shadcn/README.md` explains how a component is ported, judged and measured. `docs/adr/` records why `gui`
+And debugged from the command line, headless or attached to the running app, by a person or an agent:
+
+```sh
+cargo run -p shadcn --example docs -- --inspect dialog -e 'click "Open Dialog"' -e a11y -e perf
+```
+
+`crates/shadcn/README.md` explains how a component is ported, judged, measured and debugged. `docs/adr/` records why `gui`
 works as it does.
 
 ## Using it
@@ -38,7 +44,24 @@ gui = { git = "https://github.com/nguyenvanduocit/shadcn-rs", rev = "<commit>" }
 shadcn = { git = "https://github.com/nguyenvanduocit/shadcn-rs", rev = "<commit>" }
 ```
 
-Rust 1.99 (`rust-toolchain.toml`). Built and judged on macOS; Linux and Windows build through winit and softbuffer.
+Rust 1.99.1, pinned by `rust-toolchain.toml`. Built and judged on macOS; Linux and Windows build through winit and
+softbuffer.
+
+## Checking it
+
+CI (`.github/workflows/ci.yml`) runs, and a change should pass before it lands:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny check                                 # advisories, licences, bans, sources (deny.toml)
+```
+
+The workspace lints (root `Cargo.toml`) deny, outside tests, whatever can panic or silently change a value: `unwrap`,
+`expect`, indexing, unchecked arithmetic, `as` casts, ignored results, and `unsafe` code. A finding that is right where it
+stands is kept with `#[expect(lint, reason = "…")]` at its line. A decision about how `gui` works gets an ADR in
+`docs/adr/`.
 
 ## Licence
 

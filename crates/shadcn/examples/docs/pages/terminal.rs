@@ -1,3 +1,6 @@
+//! The commands an agent runs and what they print, each folded under its
+//! command line and open while it runs, until the reader opens or closes it.
+
 use gui::prelude::*;
 use gui::{Div, Icon, ScenarioError, Signal, div, icon};
 use shadcn::{

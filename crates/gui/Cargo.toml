@@ -17,6 +17,8 @@ accesskit = "0.25"
 accesskit_winit = "0.34"
 arboard = { version = "3", default-features = false }
 cosmic-text = "0.19"
+cpu-time = "1"
+memory-stats = "1"
 png = "0.18.1"
 resvg = "0.50"
 softbuffer = "0.4"

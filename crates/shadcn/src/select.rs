@@ -26,8 +26,9 @@ use crate::motion::popper;
 use crate::theme::theme;
 
 /// What a select or a combobox holds: one value (`Option<String>`), or
-/// several (`Vec<String>`, reka's `multiple`); the default is none.
-pub trait SelectModel: Clone + Default + 'static {
+/// several (`Vec<String>`, reka's `multiple`); the default is none. The
+/// devtools show it as `{:?}` prints it.
+pub trait SelectModel: Clone + Default + std::fmt::Debug + 'static {
     /// Whether picking an item closes the list; with several it stays open
     /// for the next pick.
     const CLOSES_ON_PICK: bool;

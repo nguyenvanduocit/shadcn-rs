@@ -18,7 +18,7 @@ const WINDOW: NodeId = NodeId(0);
 
 /// A node's identity across frames: its path, so a screen reader's place
 /// survives a frame that rebuilds everything.
-fn id_of(path: &NodePath) -> NodeId {
+pub(crate) fn id_of(path: &NodePath) -> NodeId {
     let mut h = DefaultHasher::new();
     path.hash(&mut h);
     NodeId(h.finish().max(1))

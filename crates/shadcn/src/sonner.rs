@@ -136,6 +136,19 @@ struct Shown {
     running: Option<(TimerId, Instant)>,
 }
 
+/// What the devtools show of a toast on screen: its id, kind, title and
+/// time left; the rest holds closures.
+impl std::fmt::Debug for Shown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Toast")
+            .field("id", &self.id.0)
+            .field("kind", &self.toast.kind)
+            .field("title", &self.toast.title)
+            .field("left", &self.left)
+            .finish()
+    }
+}
+
 /// The toasts on screen, newest first (`<Toaster />` with vue-sonner's `toast`).
 #[derive(Clone)]
 pub struct Toaster {

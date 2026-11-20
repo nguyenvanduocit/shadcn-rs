@@ -13,6 +13,7 @@ use crate::access;
 use crate::clock;
 use crate::color::Color;
 use crate::convert::u32_to_f32;
+use crate::devtools::{self, Attached};
 use crate::edit::Preedit;
 use crate::element::{Element, IntoElement};
 use crate::events::{ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
@@ -38,9 +39,15 @@ pub struct DebugTools {
     pub log: bool,
     /// Start with the overlay shown (F12 toggles it either way).
     pub overlay: bool,
-    /// Start with the frame HUD shown: frame time, frames per second and
-    /// what the app holds (F10 toggles it either way).
+    /// Start with the frame HUD shown: what updated and how long it took,
+    /// CPU and memory, the tree and the reactive graph (F10 toggles it
+    /// either way).
     pub hud: bool,
+    /// Listen for devtools commands on a local socket
+    /// ([`devtools::socket_path`]), so `gui::devtools::request` (the docs'
+    /// `--attach`) inspects and drives the running app. Setting
+    /// `GUI_DEVTOOLS=1` (or a socket path) in the environment does the same.
+    pub attach: bool,
 }
 
 /// Turns a component into frames and routes input back into it.
@@ -280,6 +287,11 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         })
     }
 
+    /// The changes of the last frame that changed something.
+    pub(crate) fn last_diff(&self) -> &LayoutDiff {
+        &self.diff
+    }
+
     /// What the pipeline holds now, the heap as it stands.
     #[must_use]
     pub fn footprint(&self) -> Footprint {
@@ -378,40 +390,127 @@ struct Live<C> {
     log: bool,
     hud: bool,
     history: History,
+    /// The devtools listening on a socket, when attached.
+    attached: Option<Attached>,
 }
 
 /// How many frames the HUD's percentile looks back over.
 const HISTORY: usize = 120;
 
-/// The last frames' times, for the HUD.
-#[derive(Default)]
+/// What the HUD shows across frames: the last frames' times, the last
+/// update's cause, and the CPU share.
 struct History {
     frames: VecDeque<(Instant, Duration)>,
+    /// The last frame that had a cause: its number, causes and signals written.
+    update: Option<(u64, String, usize)>,
+    cpu: crate::process::CpuMeter,
+    /// When the HUD was last painted.
+    painted: Instant,
 }
 
+impl Default for History {
+    fn default() -> Self {
+        Self {
+            frames: VecDeque::new(),
+            update: None,
+            cpu: crate::process::CpuMeter::default(),
+            painted: Instant::now(),
+        }
+    }
+}
+
+/// How often the HUD paints while nothing else draws a frame.
+const HUD_REFRESH: Duration = Duration::from_secs(1);
+
 impl History {
-    fn push(&mut self, took: Duration) {
+    fn push(&mut self, report: &FrameReport) {
         if self.frames.len() == HISTORY {
             self.frames.pop_front();
         }
-        self.frames.push_back((Instant::now(), took));
+        self.frames.push_back((Instant::now(), report.timings.total()));
+        if !report.causes.is_empty() {
+            self.update = Some((
+                report.number,
+                short_causes(&report.causes),
+                report.reactive.writes.len(),
+            ));
+        }
     }
 
-    /// The HUD's first line: this frame's time and its stages, the recent
-    /// frames' 95th percentile, and the frames drawn in the last second.
-    fn line(&self, t: Timings) -> String {
+    /// The HUD, read at a glance (the devtools say the rest): how long
+    /// frames take; what updated last; CPU and memory; the tree and the graph.
+    fn lines(&mut self, report: &FrameReport, components: usize) -> [String; 4] {
+        self.painted = Instant::now();
+        let t = report.timings;
         let spread = Spread::of(self.frames.iter().map(|&(_, took)| took));
         let second = Duration::from_secs(1);
         let fps = self.frames.iter().filter(|(at, _)| at.elapsed() < second).count();
-        format!(
-            "F10  frame {}  p95 {}  {fps} fps  build {}  layout {}  paint {}",
-            ms(t.total()),
-            ms(spread.p95),
-            ms(t.build),
-            ms(t.layout),
-            ms(t.paint)
-        )
+        let update = match &self.update {
+            Some((n, causes, writes)) => format!("update #{n}  {causes}  {writes} writes"),
+            None => "update  none yet".to_owned(),
+        };
+        let usage = crate::process::usage();
+        let cpu = self
+            .cpu
+            .sample()
+            .map_or_else(|| "cpu  ?".to_owned(), |p| format!("cpu {p:.0}%"));
+        let resident = usage.resident.map_or_else(|| "?".to_owned(), inspect::bytes);
+        let heap = heap::now().map_or_else(|| "not counted".to_owned(), |h| inspect::bytes(h.live));
+        let f = &report.footprint;
+        let g = f.graph;
+        [
+            format!(
+                "F10  frame {}  p95 {}  {fps} fps  b/l/p {}/{}/{}",
+                ms(t.total()),
+                ms(spread.p95),
+                tenths(t.build),
+                tenths(t.layout),
+                tenths(t.paint)
+            ),
+            update,
+            format!(
+                "{cpu}  memory {resident}  heap {heap}  images {}",
+                inspect::bytes(u64::try_from(f.raster_bytes()).unwrap_or(u64::MAX))
+            ),
+            format!(
+                "{} nodes  {components} components  {} signals  {} computed  {} effects",
+                f.nodes, g.signals, g.computeds, g.effects
+            ),
+        ]
     }
+}
+
+/// Milliseconds to a tenth, unit left out: the HUD's stage times.
+fn tenths(d: Duration) -> String {
+    format!("{:.1}", d.as_secs_f64() * 1000.0)
+}
+
+/// A frame's causes, short enough for the HUD: `click sidebar-menu-button`
+/// for `click (38,569) -> 0/0/1 sidebar-menu-button: Div #f5f5f5`.
+fn short_causes(causes: &[String]) -> String {
+    const MAX: usize = 36;
+    let short: Vec<String> = causes
+        .iter()
+        .map(|c| match c.split_once(" -> ") {
+            Some((how, target)) => {
+                let verb = how.split_whitespace().next().unwrap_or(how);
+                // The target is `PATH DESCRIPTION`: keep the name, or what it is.
+                let what = target.split_once(' ').map_or(target, |(_, d)| d);
+                let what = what.split_once(':').map_or(what, |(name, _)| name);
+                format!("{verb} {what}")
+            }
+            None => c.clone(),
+        })
+        .collect();
+    let joined = short.join("; ");
+    if joined.chars().count() <= MAX {
+        return joined;
+    }
+    joined
+        .chars()
+        .take(MAX.saturating_sub(1))
+        .chain(std::iter::once('…'))
+        .collect()
 }
 
 impl<C: FnMut() -> Element> WindowHandler for Live<C> {
@@ -420,13 +519,17 @@ impl<C: FnMut() -> Element> WindowHandler for Live<C> {
             Ok(report) => report,
             Err(e) => return eprintln!("frame failed: {e}"),
         };
-        self.history.push(report.timings.total());
+        self.history.push(&report);
         if self.log && report.changed() {
             eprintln!("{report}\n");
         }
+        if let Some(attached) = &mut self.attached {
+            let pipeline = &mut self.pipeline;
+            attached.drawn(&report, pixmap, &mut |copy| pipeline.paint_overlay(copy, scale));
+        }
         if self.hud {
-            let [caches, graph] = report.footprint.lines();
-            let lines = [self.history.line(report.timings), caches, graph];
+            let components = self.pipeline.frame().nodes.iter().filter(|n| n.name.is_some()).count();
+            let lines = self.history.lines(&report, components);
             self.pipeline.paint_hud(pixmap, scale, &lines);
         }
     }
@@ -467,7 +570,25 @@ impl<C: FnMut() -> Element> WindowHandler for Live<C> {
     }
 
     fn idle(&mut self) -> Wake {
-        self.pipeline.idle()
+        let mut wake = self.pipeline.idle();
+        if let Some(attached) = &mut self.attached
+            && attached.run(&mut self.pipeline)
+        {
+            // What a command wrote shows in the frame it waits for.
+            self.pipeline.stale |= reactive::take_changed();
+            wake.redraw = true;
+        }
+        // The HUD's CPU and memory move while nothing else does: it paints
+        // again once a second.
+        if self.hud && !wake.redraw && !wake.animating {
+            let due = self.history.painted.checked_add(HUD_REFRESH);
+            if due.is_none_or(|due| due <= Instant::now()) {
+                wake.redraw = true;
+            } else {
+                wake.next_timer = wake.next_timer.into_iter().chain(due).min();
+            }
+        }
+        wake
     }
 }
 
@@ -477,7 +598,11 @@ impl<C: FnMut() -> Element> WindowHandler for Live<C> {
 /// what the debug tools do from the start.
 pub fn run(title: &str, component: impl FnMut() -> Element + 'static, options: RunOptions) -> ! {
     let debug = options.debug;
-    let mut pipeline = Pipeline::new(component, debug.log);
+    let attached = (debug.attach || std::env::var_os("GUI_DEVTOOLS").is_some())
+        .then(attach)
+        .flatten();
+    // The devtools' reports name the signals each frame wrote and read.
+    let mut pipeline = Pipeline::new(component, debug.log || attached.is_some());
     if debug.overlay {
         pipeline.toggle_overlay();
     }
@@ -489,8 +614,36 @@ pub fn run(title: &str, component: impl FnMut() -> Element + 'static, options: R
             log: debug.log,
             hud: debug.hud,
             history: History::default(),
+            attached,
         },
     )
+}
+
+/// Listen for devtools commands; `None` (and a line on stderr) when the
+/// socket cannot be made or the platform has none.
+fn attach() -> Option<Attached> {
+    #[cfg(unix)]
+    {
+        let attached = Attached::default();
+        let inbox = std::rc::Rc::clone(&attached.inbox);
+        let to_ui = crate::mailbox::mailbox(move |req: devtools::Request| inbox.borrow_mut().push_back(req));
+        let path = devtools::socket_path();
+        match devtools::listen(&path, to_ui) {
+            Ok(()) => {
+                eprintln!("devtools: listening on {}", path.display());
+                Some(attached)
+            }
+            Err(e) => {
+                eprintln!("devtools: cannot listen on {}: {e}", path.display());
+                None
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        eprintln!("devtools: attaching needs a Unix socket; run the devtools headless instead");
+        None
+    }
 }
 
 // ── Scenario ─────────────────────────────────────────────────────────────────
@@ -673,6 +826,27 @@ impl<C: FnMut() -> Element> Scenario<C> {
         Ok(report)
     }
 
+    /// The pipeline under the scenario, for the devtools.
+    pub(crate) fn pipeline(&self) -> &Pipeline<C> {
+        &self.pipeline
+    }
+
+    /// The pipeline under the scenario, for the devtools.
+    pub(crate) fn pipeline_mut(&mut self) -> &mut Pipeline<C> {
+        &mut self.pipeline
+    }
+
+    /// Make the window `width`×`height` logical pixels; the next frame lays
+    /// out at that size.
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), ScenarioError> {
+        let (pw, ph) = (
+            crate::text::physical(u32_to_f32(width), self.scale),
+            crate::text::physical(u32_to_f32(height), self.scale),
+        );
+        self.pixmap = Pixmap::new(pw, ph).ok_or(ScenarioError::Size(pw, ph))?;
+        Ok(())
+    }
+
     /// The report of every frame drawn since the last call, in order; the
     /// scenario keeps none after it.
     pub fn take_reports(&mut self) -> Vec<FrameReport> {
@@ -846,4 +1020,68 @@ pub fn snapshot(view: impl IntoElement, path: &Path, width: u32, height: u32) ->
     let mut pixmap = Pixmap::new(pw, ph).ok_or(ScenarioError::Size(pw, ph))?;
     pipeline.draw(&mut pixmap, 2.0)?;
     save(&pixmap, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::element::{div, text};
+    use crate::styled::Styled;
+
+    #[test]
+    fn group_layers_are_given_back_once_no_group_paints() {
+        let show = crate::reactive::Signal::new(true);
+        let shown = show.clone();
+        let mut s = Scenario::measuring(
+            move || {
+                let groups = shown.get().then(|| {
+                    // A faded box inside a faded box: two layers at once.
+                    div().opacity(0.5).child(div().opacity(0.5).child(text("nested")))
+                });
+                div().size_full().child(groups).into_element()
+            },
+            200,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        s.frame("groups").expect("a frame");
+        assert_eq!(s.footprint().layers.count, 2, "two groups paint at once");
+        s.act("hide", || show.set(false));
+        s.frame("gone").expect("a frame");
+        assert_eq!(s.footprint().layers.count, 2, "the frame before still used them");
+        s.frame("still gone").expect("a frame");
+        assert_eq!(
+            s.footprint().layers.count,
+            0,
+            "nothing painted as a group for two frames"
+        );
+    }
+
+    #[test]
+    fn the_hud_names_the_last_update_in_short() {
+        assert_eq!(
+            short_causes(&["click (38,569) -> 0/0/1 sidebar-menu-button: Div #f5f5f5".to_owned()]),
+            "click sidebar-menu-button"
+        );
+        assert_eq!(short_causes(&["resize 800x600".to_owned()]), "resize 800x600");
+    }
+
+    #[test]
+    fn the_hud_is_four_lines_that_fit_a_small_window() {
+        let mut s = Scenario::measuring(|| div().size_full().child(text("hello")).into_element(), 480, 320, 1.0)
+            .expect("a scenario");
+        let report = s.frame("one").expect("a frame");
+        let mut history = History::default();
+        history.push(&report);
+        let lines = history.lines(&report, 0);
+        for line in &lines {
+            assert!(line.chars().count() <= 64, "{line:?} is too long for the HUD");
+        }
+        if let Some(path) = std::env::var_os("GUI_HUD_PNG") {
+            let mut pixmap = s.pixmap().clone();
+            s.pipeline.paint_hud(&mut pixmap, 1.0, &lines);
+            pixmap.save_png(path).expect("written");
+        }
+    }
 }

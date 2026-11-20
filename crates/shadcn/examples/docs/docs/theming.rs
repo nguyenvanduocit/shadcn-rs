@@ -9,7 +9,7 @@ use super::prose::{h1, h2, inline, lead, paragraph};
 
 /// Every token of `t`, named as shadcn names it. The pattern names every
 /// field, so a token added to [`Theme`] fails to build until it shows here.
-fn tokens(t: Theme) -> Vec<(String, Color)> {
+pub(super) fn tokens(t: Theme) -> Vec<(String, Color)> {
     let Theme {
         dark: _,
         background,
@@ -87,7 +87,7 @@ fn tokens(t: Theme) -> Vec<(String, Color)> {
 }
 
 /// `c` as CSS writes shadcn's tokens: `oklch(L C H)`, with `/ A%` when translucent.
-fn oklch(c: Color) -> String {
+pub(super) fn oklch(c: Color) -> String {
     let [l, a, b] = c.to_oklab();
     let chroma = a.hypot(b);
     let hue = if chroma < 0.0005 {

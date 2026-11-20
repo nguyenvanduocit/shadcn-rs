@@ -86,6 +86,7 @@ pub fn paint_overlay(pixmap: &mut Pixmap, scale: f32, text: &mut TextSystem, ove
         pixmap,
         scale,
         clip: None,
+        visible: None,
     };
     for n in overlay.nodes {
         stroke(&mut target, n.bounds, 1.0, Color::hex(OUTLINE).opacity(0.3));
@@ -134,6 +135,7 @@ pub fn paint_hud(pixmap: &mut Pixmap, scale: f32, text: &mut TextSystem, lines: 
         pixmap,
         scale,
         clip: None,
+        visible: None,
     };
     let step = label_text().line_height + LABEL_PAD;
     // The label face is monospaced: lines padded to one length make one block.

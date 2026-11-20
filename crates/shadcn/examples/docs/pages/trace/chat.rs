@@ -17,7 +17,7 @@ use shadcn::{
 use super::{output, sources_trace, step};
 
 /// What a tool call has come to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Call {
     Running,
     Output(&'static str),
@@ -25,7 +25,7 @@ enum Call {
 }
 
 /// One part of a message, as the AI SDK streams it.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Part {
     Text(String),
     Reasoning { text: String, streaming: bool },
@@ -33,7 +33,7 @@ enum Part {
     Source { title: &'static str },
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Msg {
     id: String,
     user: bool,

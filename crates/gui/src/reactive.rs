@@ -6,8 +6,10 @@
 //!   sees intermediate state from a batch of writes.
 //! - Single-threaded (UI thread). No Send/Sync.
 
+use std::any::{Any, TypeId};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::rc::{Rc, Weak};
 
 pub(crate) type NodeId = u64;
@@ -34,6 +36,8 @@ thread_local! {
     pub(crate) static COMPUTEDS: Cell<usize> = const { Cell::new(0) };
     /// Subscriptions held: an effect or computed value on a source it read.
     static SUBSCRIPTIONS: Cell<usize> = const { Cell::new(0) };
+    /// The labeled signals, for the devtools to read and write by label.
+    static PROBES: RefCell<Vec<Box<dyn Probe>>> = const { RefCell::new(Vec::new()) };
 }
 
 type Count = std::thread::LocalKey<Cell<usize>>;
@@ -229,14 +233,26 @@ struct SignalInner<T> {
 /// writing it schedules all subscribers for re-run.
 pub struct Signal<T>(Rc<SignalInner<T>>);
 
+impl<T: Clone + fmt::Debug + 'static> Signal<T> {
+    /// A signal that traces and debug reports show by `label` instead of its
+    /// id, and whose value the devtools read ([`probes`]) and, for a plain
+    /// value (a number, `bool`, `char` or `String`), write.
+    pub fn labeled(label: &'static str, value: T) -> Self {
+        let signal = Self::create(value, Some(label));
+        let probe: Box<dyn Probe> = Box::new(Rc::downgrade(&signal.0));
+        PROBES.with(|p| {
+            let mut p = p.borrow_mut();
+            // Forget the signals dropped since, so the list follows what lives.
+            p.retain(|probe| probe.alive());
+            p.push(probe);
+        });
+        signal
+    }
+}
+
 impl<T: Clone + 'static> Signal<T> {
     pub fn new(value: T) -> Self {
         Self::create(value, None)
-    }
-
-    /// A signal that traces and debug reports show by `label` instead of its id.
-    pub fn labeled(label: &'static str, value: T) -> Self {
-        Self::create(value, Some(label))
     }
 
     fn create(value: T, label: Option<&'static str>) -> Self {
@@ -319,10 +335,152 @@ impl<T> Drop for SignalInner<T> {
     }
 }
 
+/// Its label (or id) and value, read without subscribing anything.
+impl<T: fmt::Debug> fmt::Debug for Signal<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let me = SignalRef {
+            id: self.0.id,
+            label: self.0.label,
+        };
+        write!(f, "Signal({me}: {:?})", self.0.value.borrow())
+    }
+}
+
 impl<T> Clone for Signal<T> {
     fn clone(&self) -> Self {
         Self(Rc::clone(&self.0))
     }
+}
+
+// --- Probes ---
+
+/// A labeled signal as the devtools see it, whatever its type.
+trait Probe {
+    fn alive(&self) -> bool;
+    fn snapshot(&self) -> Option<SignalValue>;
+    /// Write `text`, parsed as the signal's type; `None` when it is gone.
+    fn write(&self, text: &str) -> Option<Result<(), String>>;
+}
+
+impl<T: Clone + fmt::Debug + 'static> Probe for Weak<SignalInner<T>> {
+    fn alive(&self) -> bool {
+        self.strong_count() > 0
+    }
+
+    fn snapshot(&self) -> Option<SignalValue> {
+        let inner = self.upgrade()?;
+        let value = format!("{:?}", inner.value.borrow());
+        let subscribers = inner.subs.borrow().len();
+        Some(SignalValue {
+            id: inner.id,
+            label: inner.label.unwrap_or_default(),
+            type_name: std::any::type_name::<T>(),
+            value,
+            subscribers,
+        })
+    }
+
+    fn write(&self, text: &str) -> Option<Result<(), String>> {
+        let inner = self.upgrade()?;
+        Some(parse_as::<T>(text).map(|value| Signal(inner).set(value)))
+    }
+}
+
+/// `text` as a `T`, for the plain types a command line can spell.
+fn parse_as<T: 'static>(text: &str) -> Result<T, String> {
+    fn parsed<V: std::str::FromStr<Err: fmt::Display> + 'static>(text: &str) -> Result<Box<dyn Any>, String> {
+        text.parse::<V>()
+            .map(|v| -> Box<dyn Any> { Box::new(v) })
+            .map_err(|e| format!("{text:?} is not a {}: {e}", std::any::type_name::<V>()))
+    }
+    let t = TypeId::of::<T>();
+    let value = if t == TypeId::of::<String>() {
+        // Quoted as the value is shown, or bare.
+        let bare = text.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(text);
+        let value: Box<dyn Any> = Box::new(bare.to_owned());
+        Ok(value)
+    } else if t == TypeId::of::<bool>() {
+        parsed::<bool>(text)
+    } else if t == TypeId::of::<char>() {
+        parsed::<char>(text)
+    } else if t == TypeId::of::<i32>() {
+        parsed::<i32>(text)
+    } else if t == TypeId::of::<i64>() {
+        parsed::<i64>(text)
+    } else if t == TypeId::of::<u8>() {
+        parsed::<u8>(text)
+    } else if t == TypeId::of::<u16>() {
+        parsed::<u16>(text)
+    } else if t == TypeId::of::<u32>() {
+        parsed::<u32>(text)
+    } else if t == TypeId::of::<u64>() {
+        parsed::<u64>(text)
+    } else if t == TypeId::of::<usize>() {
+        parsed::<usize>(text)
+    } else if t == TypeId::of::<f32>() {
+        parsed::<f32>(text)
+    } else if t == TypeId::of::<f64>() {
+        parsed::<f64>(text)
+    } else {
+        Err(format!(
+            "a {} cannot be written from the command line (numbers, bool, char and String can)",
+            std::any::type_name::<T>()
+        ))
+    }?;
+    value
+        .downcast::<T>()
+        .map(|b| *b)
+        .map_err(|_| "the parsed value has another type".to_owned())
+}
+
+/// A labeled signal's value at one moment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SignalValue {
+    pub id: u64,
+    pub label: &'static str,
+    pub type_name: &'static str,
+    /// Its value as `{:?}` prints it.
+    pub value: String,
+    /// Effects and computed values that read it in their last run.
+    pub subscribers: usize,
+}
+
+/// Every labeled signal alive on this thread, oldest first.
+#[must_use]
+pub fn probes() -> Vec<SignalValue> {
+    PROBES.with(|p| p.borrow().iter().filter_map(|probe| probe.snapshot()).collect())
+}
+
+/// Write `text` into the labeled signal `id` as a click would: subscribers
+/// run and the next frame shows it. `Err` names why not (gone, a type the
+/// command line cannot spell, a value that does not parse).
+pub fn write_probe(id: u64, text: &str) -> Result<(), String> {
+    // Parse and write outside the borrow: the write runs effects, which may
+    // label new signals.
+    let probe = PROBES.with(|p| {
+        p.borrow()
+            .iter()
+            .position(|probe| probe.snapshot().is_some_and(|v| v.id == id))
+    });
+    let Some(at) = probe else {
+        return Err(format!("no labeled signal #{id}"));
+    };
+    let taken = PROBES.with(|p| {
+        let mut p = p.borrow_mut();
+        (at < p.len()).then(|| p.remove(at))
+    });
+    let Some(probe) = taken else {
+        return Err(format!("no labeled signal #{id}"));
+    };
+    let result = probe
+        .write(text)
+        .unwrap_or_else(|| Err(format!("signal #{id} was dropped")));
+    PROBES.with(|p| {
+        let mut p = p.borrow_mut();
+        let at = at.min(p.len());
+        p.insert(at, probe);
+    });
+    result
 }
 
 // --- Effect ---

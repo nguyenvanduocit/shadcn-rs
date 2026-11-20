@@ -10,7 +10,15 @@
 //! says (`crates/shadcn/verdict/run.sh` runs both steps around the browser);
 //! `-- --bench [page…] [--budget=MS --frames=N --json=PATH --baseline=PATH]` times each page and checks
 //! it gives back what a pointer walk takes ([`bench`]); `-- --hud` opens the
-//! docs with the frame HUD (F10 toggles it).
+//! docs with the frame HUD (F10 toggles it); `-- --export <file>` writes the
+//! docs as JSON for the website (`site/`, [`docs::export`]).
+//!
+//! The devtools ([`gui::devtools`], `help` lists their commands):
+//! `-- --inspect <page|docs> [--size=WxH --scale=N] [-e CMD]…` drives a page
+//! (or the whole docs) headless, running each `-e` command, or each line of
+//! stdin; `-- --serve [--hud]` opens the docs listening for commands, and
+//! `-- --attach [--socket=PATH] [CMD…]` sends commands (or stdin's lines) to
+//! the newest app listening.
 
 mod bench;
 mod docs;
@@ -224,6 +232,111 @@ fn verdicts(dir: &std::path::Path, only: &[String], tolerance: verdict::Toleranc
     Ok(failed == 0)
 }
 
+/// The commands given as `-e CMD` (each one line), or else stdin's lines.
+fn commands(args: &[String]) -> Result<Vec<String>, String> {
+    let mut given = Vec::new();
+    let mut words = args.iter();
+    while let Some(w) = words.next() {
+        if w == "-e" {
+            given.push(words.next().ok_or("-e needs a command")?.clone());
+        }
+    }
+    if !given.is_empty() {
+        return Ok(given);
+    }
+    std::io::stdin()
+        .lines()
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())
+}
+
+/// `--inspect`: a headless devtools session on a page, or the whole docs;
+/// `Ok(false)` when a command failed.
+fn inspect(args: &[String]) -> Result<bool, String> {
+    let mut rest = args.iter().filter(|a| !a.starts_with("--")).peekable();
+    let mut target = None;
+    // The first word that is not a flag, nor a command after `-e`.
+    while let Some(w) = rest.next() {
+        if w == "-e" {
+            rest.next();
+            continue;
+        }
+        target = Some(w.clone());
+        break;
+    }
+    let target = target.ok_or("--inspect: name a page (see `--demos`) or `docs`")?;
+    let flag = |key: &str| {
+        args.iter().find_map(|a| {
+            a.strip_prefix("--")
+                .and_then(|f| f.strip_prefix(key))
+                .and_then(|v| v.strip_prefix('='))
+        })
+    };
+    let whole = target == "docs";
+    let (mut w, mut h) = if whole { (1440, 900) } else { (960, 640) };
+    if let Some(size) = flag("size") {
+        let (sw, sh) = size.split_once('x').ok_or("--size is WxH")?;
+        w = sw.parse().map_err(|_| "--size is WxH")?;
+        h = sh.parse().map_err(|_| "--size is WxH")?;
+    }
+    let scale = flag("scale")
+        .map_or(Ok(2.0), str::parse::<f32>)
+        .map_err(|_| "--scale is a number")?;
+    let render = if whole {
+        docs::app()
+    } else {
+        let page = pages::ALL
+            .iter()
+            .find(|p| p.name == target)
+            .ok_or_else(|| format!("no page {target:?}"))?;
+        (page.render)()
+    };
+    let scenario = Scenario::measuring(render, w, h, scale).map_err(|e| e.to_string())?;
+    let mut session = gui::devtools::Session::new(scenario).map_err(|e| e.to_string())?;
+    let lines = commands(args)?;
+    session
+        .run_script(lines, &mut std::io::stdout().lock())
+        .map_err(|e| e.to_string())
+}
+
+/// `--attach`: send commands to a running app; `Ok(false)` when one failed.
+fn attach(args: &[String]) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        let socket = match args.iter().find_map(|a| a.strip_prefix("--socket=")) {
+            Some(path) => PathBuf::from(path),
+            None => gui::devtools::listening()
+                .into_iter()
+                .next()
+                .ok_or("no app is listening; start one with `docs --serve` (or GUI_DEVTOOLS=1)")?,
+        };
+        let words: Vec<String> = args.iter().filter(|a| !a.starts_with("--socket=")).cloned().collect();
+        let lines = if words.is_empty() || words.first().is_some_and(|w| w == "-e") {
+            commands(&words)?
+        } else {
+            // `--attach tree --depth=2`: the words are one command.
+            vec![words.iter().map(|w| quote(w)).collect::<Vec<_>>().join(" ")]
+        };
+        let answer = gui::devtools::request(&socket, &lines).map_err(|e| format!("{}: {e}", socket.display()))?;
+        print!("{answer}");
+        Ok(!answer.lines().any(|l| l.starts_with("error: ")))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = args;
+        Err("attaching needs a Unix socket; use --inspect".to_owned())
+    }
+}
+
+/// A word quoted when it holds a space, so a command rebuilt from the shell's words splits back the same.
+fn quote(word: &str) -> String {
+    if word.contains(char::is_whitespace) || word.is_empty() {
+        format!("\"{}\"", word.replace('\\', "\\\\").replace('"', "\\\""))
+    } else {
+        word.to_owned()
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dark = args.iter().any(|a| a == "--dark");
@@ -299,7 +412,43 @@ fn main() {
                 }
             }
         }
-        Some((flag, _)) if flag == "--hud" => docs::run(true),
-        _ => docs::run(false),
+        Some((flag, tail)) if flag == "--export" => {
+            let Some(path) = tail.first() else {
+                eprintln!("usage: docs --export <docs.json>");
+                std::process::exit(2);
+            };
+            if let Err(e) = docs::export(std::path::Path::new(path)) {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
+        Some((flag, tail)) if flag == "--inspect" => match inspect(tail) {
+            Ok(true) => {}
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!(
+                    "{e}\nusage: docs --inspect <page|docs> [--size=WxH --scale=N] [-e CMD]… (else commands from stdin; `help` lists them)"
+                );
+                std::process::exit(2);
+            }
+        },
+        Some((flag, tail)) if flag == "--attach" => match attach(tail) {
+            Ok(true) => {}
+            Ok(false) => std::process::exit(1),
+            Err(e) => {
+                eprintln!("{e}\nusage: docs --attach [--socket=PATH] [CMD]… (else commands from stdin)");
+                std::process::exit(2);
+            }
+        },
+        Some((flag, tail)) if flag == "--serve" => docs::run(gui::DebugTools {
+            attach: true,
+            hud: tail.iter().any(|a| a == "--hud"),
+            ..gui::DebugTools::default()
+        }),
+        Some((flag, _)) if flag == "--hud" => docs::run(gui::DebugTools {
+            hud: true,
+            ..gui::DebugTools::default()
+        }),
+        _ => docs::run(gui::DebugTools::default()),
     }
 }

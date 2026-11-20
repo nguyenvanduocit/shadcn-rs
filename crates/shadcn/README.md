@@ -55,6 +55,14 @@ Each step writes `NN-step.png` (2× scale), `NN-step.overlay.png` (boxes and
 what changed) and `NN-step.txt` (frame report and layout tree). Read the PNGs
 and compare with the shadcn docs page for the component.
 
+Some pages show no single component but what shadcn-vue's docs build from
+several: the agent pieces (chat, thread, reasoning, plan, tool, subagent,
+terminal, stack trace, test results, prompt input, markdown), the form
+libraries' demos (`form_formisch`, `form_tanstack`, `form_vee`,
+`form_cards`, `form_stepper`), file tree, scroll fade and typography. A
+page's lead in the docs is its component module's `//!` doc, or the page's
+own when it has no module, so every page starts with one.
+
 ## The docs
 
 ```sh
@@ -103,13 +111,75 @@ Two more headless views of the same numbers:
   `sample <pid> 8 -file /tmp/page.sample` ("Sort by top of stack").
 
 In a window, `cargo run --release -p shadcn --example docs -- --hud` (or F10
-in any `gui` window) shows the same per frame. ADR-0008 records what is
-measured and why.
+in any `gui` window) shows a four-line HUD: the frame time, its p95, frames
+per second and build/layout/paint; the last update (its cause and signal
+writes); CPU and memory (resident, heap, cached images); nodes, components
+and the reactive graph. ADR-0008 records what is measured and why.
+
+## Debugging it: the devtools
+
+Everything a frame holds is read, measured and driven from the command line
+(`gui::devtools`, ADR-0010), so a person or an agent debugs an app as text.
+Headless, on a page or the whole docs:
+
+```sh
+D="cargo run -q --release -p shadcn --example docs --"
+$D --inspect dialog -e 'click "Open Dialog"' -e a11y -e 'press esc' -e perf
+$D --inspect docs < script.txt              # one command per line; `#` comments
+$D --inspect button -e help                 # every command
+```
+
+Attached to a running app (`docs --serve`, or any `gui` app with
+`DebugTools.attach` or `GUI_DEVTOOLS=1`), over a local socket:
+
+```sh
+$D --serve &                                # prints the socket it listens on
+$D --attach components                      # the newest app listening
+$D --attach -e 'click Button' -e 'screenshot /tmp/now.png' -e memory
+```
+
+| | Commands |
+|---|---|
+| Inspect | `tree [SEL] [--depth=N]`, `components`, `node SEL`, `find TEXT`, `at X Y`, `a11y`, `focus`, `signals [FILTER]`, `signal ID\|LABEL`, `set ID\|LABEL VALUE`, `graph` |
+| Measure | `report [N]`, `perf`, `memory`, `diff`, `bench [N]` and `monkey [N]` (headless) |
+| Act | `click`, `rclick`, `hover`, `leave`, `reveal`, `drag`, `wheel DY [SEL]`, `type TEXT`, `press KEYS…` (`enter`, `shift+tab`, `cmd+k`), `activate`, `focus SEL`, `setvalue SEL TEXT` |
+| Frames | `frame`, `screenshot PATH [--overlay]`, and headless `wait MS`, `rest`, `size W H` |
+
+`monkey [N] [--seed=S]` (headless) sends N seeded random clicks, keys, text,
+scrolls and waits, and after each one checks for a panic, a failed layout, a slow
+frame and what the heap kept. `click`, `hover` and `drag` scroll their node into
+view first, as `reveal SEL` does.
+
+### Stress scenes
+
+`examples/stress` pushes `gui` further than any gallery page does: a 5 000-row
+table (60 000 nodes), a 1 600-entry tree and 120 nested boxes, 2 500 buttons,
+5 000 signals with a chain of 2 000 computed values and 500 effects, a thread
+sending 5 000 messages through a mailbox, 30 toasts at once, 60 KB of text in
+five scripts, keyed shuffles, 300 cards mounted and unmounted, and an admin
+dashboard. Each scene runs its script, 30 steady frames and its cycle (the
+heap must give back what a round takes, measured after two warm-up rounds),
+then the monkey:
+
+```sh
+cargo run --release -p shadcn --example stress -- --run [scene…] [--cycles=4 --monkey=150]
+cargo run --release -p shadcn --example stress -- --inspect table -e 'click Amount' -e perf
+cargo run --release -p shadcn --example stress -- --window dashboard   # HUD + devtools socket
+```
+
+A selector (`SEL`) is a path (`@0/2/k7`), a name (`#button`, `#button:2`), a
+point (`120,48`) or text (exact, else contained). Each action draws the next
+frame and prints its report: what handled it, the signals written and read,
+the times, and every node added, removed, moved or repainted. Values of
+signals made with `Signal::labeled` are read; numbers, `bool`, `char` and
+`String` are written. A failed command prints `error: …` and makes the run
+exit with 1.
 
 ## Judging it against shadcn-vue
 
 Wrap each shadcn-vue demo a page reproduces in `demo("<File>.vue", …)` (the
-file in `apps/v4/components/demo/`), one for one, then:
+file in `apps/v4/components/demo/`), one for one (`docs --demos [page…]`
+lists them), then:
 
 ```sh
 crates/shadcn/verdict/run.sh button          # or several pages; --dark for dark

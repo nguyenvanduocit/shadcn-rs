@@ -530,7 +530,7 @@ enum Step {
 }
 
 /// What the agent is doing: idle, about to reply, replying.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
     Ready,
     Submitted,
@@ -538,7 +538,7 @@ enum Status {
 }
 
 /// A part of the agent's turn, shaped like AI SDK UI message parts.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum Part {
     /// The thought so far; open while it runs unless the reader chose.
     Reasoning {
@@ -555,7 +555,7 @@ enum Part {
     Text(String),
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Turn {
     id: String,
     user: bool,

@@ -501,7 +501,17 @@ impl TextSystem {
             buffer, shift, primary, ..
         } = self.shape(p, t, width);
         let origin = (origin.0 + shift, origin.1);
-        for line in buffer.layout_runs() {
+        // A long paragraph in a scroll container: only the lines in view
+        // cost anything. A line's ink may reach past its box (accents, tall
+        // scripts), so it counts as shown a line's height either side.
+        let shown = |line: &cosmic_text::LayoutRun<'_>| {
+            target.visible.is_none_or(|v| {
+                let top = origin.1 + line.line_top - line.line_height;
+                let bottom = origin.1 + line.line_top + line.line_height * 2.0;
+                bottom >= v.y && top <= v.bottom()
+            })
+        };
+        for line in buffer.layout_runs().filter(|l| shown(l)) {
             let device = baseline(origin.1, &line, *primary, scale);
             let base = device / scale;
             for glyph in line.glyphs {
@@ -622,6 +632,9 @@ pub struct Target<'a> {
     /// Physical pixels per logical pixel.
     pub scale: f32,
     pub clip: Option<&'a Mask>,
+    /// The box `clip` keeps (logical pixels), when it is set: text lines
+    /// wholly outside it are not drawn, as the mask would drop their pixels.
+    pub visible: Option<Bounds>,
 }
 
 impl Target<'_> {

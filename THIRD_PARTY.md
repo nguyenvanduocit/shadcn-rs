@@ -9,6 +9,8 @@ The code in this repository is MIT (`LICENSE`). It ships, or follows, the work b
 | Lucide icons (lucide-static 1.77.0; some derived from Feather) | `crates/gui/assets/icons/` | ISC, and MIT for the Feather icons | `crates/gui/assets/icons/LICENSE` |
 | shadcn/ui: the components' design, styles and demo content | `crates/shadcn` | MIT | below |
 | shadcn-vue: the components and demos `crates/shadcn` ports and the verdict compares against | `crates/shadcn` | MIT | below |
+| Geist (variable, Latin subset) | `site/public/fonts/Geist.woff2` | SIL Open Font License 1.1 | `site/public/fonts/LICENSE-Geist.txt` |
+| shadcn-vue's home page: the landing page's layout and styles | `site/public/` | MIT | below |
 
 The Rust crates this workspace depends on carry their own licences; `cargo deny check licenses` (`deny.toml`) lists the
 ones allowed.

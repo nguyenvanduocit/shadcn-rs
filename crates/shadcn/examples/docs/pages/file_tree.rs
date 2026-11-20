@@ -1,3 +1,6 @@
+//! A project's files as a tree: folders that fold open and closed
+//! (`collapsible`) and ghost-button rows, one file selected.
+
 use std::collections::HashMap;
 
 use gui::prelude::*;

@@ -1,3 +1,7 @@
+//! shadcn's `scroll-fade` utilities: a scrolling list or row whose edges fade
+//! out where more content waits, on every side (`scroll-fade-t`, `-b`, `-s`,
+//! `-e`) and right to left.
+
 use gui::prelude::*;
 use gui::{Div, ScenarioError, Text, div, text};
 use shadcn::theme;
