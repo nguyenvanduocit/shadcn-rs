@@ -1,0 +1,137 @@
+use std::time::Duration;
+
+use gui::prelude::*;
+use gui::{ScenarioError, div};
+use shadcn::{
+    ButtonSize, ButtonVariant, DialogState, Toast, ToastKind, Toaster, button, dialog_content, dialog_description,
+    dialog_header, dialog_title, dialog_trigger, toaster,
+};
+
+use crate::{Render, Shot, demo, motion_frames, page};
+
+/// The toast `SonnerDemo.vue` and `SonnerWithDialogDemo.vue` raise.
+fn event_created() -> Toast {
+    Toast::new(ToastKind::Default, "Event has been created")
+        .description("Sunday, December 03, 2023 at 9:00 AM")
+        .action("Undo", || {})
+}
+
+pub fn render() -> Render {
+    let toasts = Toaster::new();
+    let with_dialog = DialogState::new();
+    Box::new(move || {
+        let outline = |label: &str| button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned());
+        let on = |f: fn(&Toaster)| {
+            let toasts = toasts.clone();
+            move |_: &gui::ClickEvent| f(&toasts)
+        };
+        let types = div()
+            .flex()
+            .flex_wrap()
+            .gap(2.0)
+            .child(outline("Default").on_click(on(|t| {
+                t.toast("Event has been created");
+            })))
+            .child(outline("Success").on_click(on(|t| {
+                t.success("Event has been created");
+            })))
+            .child(outline("Info").on_click(on(|t| {
+                t.info("Be at the area 10 minutes before the event time");
+            })))
+            .child(outline("Warning").on_click(on(|t| {
+                t.warning("Event start time cannot be earlier than 8am");
+            })))
+            .child(outline("Error").on_click(on(|t| {
+                t.error("Event has not been created");
+            })))
+            .child(outline("Promise").on_click(on(|t| {
+                // `toast.promise`: loading until the work settles, 2s later.
+                let id = t.loading("Loading...");
+                let t = t.clone();
+                gui::clock::after(Duration::from_secs(2), move || {
+                    t.update(id, Toast::new(ToastKind::Success, "Event has been created"));
+                });
+            })));
+        page(
+            "Sonner",
+            div()
+                .flex_col()
+                .gap(8.0)
+                .child(demo(
+                    "SonnerDemo.vue",
+                    outline("Show Toast").on_click(on(|t| {
+                        t.show(event_created());
+                    })),
+                ))
+                .child(demo("SonnerTypesDemo.vue", types))
+                .child(demo(
+                    "SonnerWithDialogDemo.vue",
+                    // A press on a toast is no press outside the dialog: the
+                    // toaster's layer is above it, so the dialog stays open.
+                    div()
+                        .flex()
+                        .child(dialog_trigger(&with_dialog, outline("Dialog with toast")))
+                        .child(dialog_content(&with_dialog, |c| {
+                            c.max_w(112.0)
+                                .child(
+                                    dialog_header()
+                                        .child(dialog_title("Vue Sonner Toast"))
+                                        .child(dialog_description("Dialog with toast")),
+                                )
+                                .child(
+                                    div().grid().gap(4.0).child(
+                                        button(ButtonVariant::Default, ButtonSize::Sm)
+                                            .px(3.0)
+                                            .on_click(on(|t| {
+                                                t.show(event_created());
+                                            }))
+                                            .child("Toast"),
+                                    ),
+                                )
+                        })),
+                ))
+                .child(toaster(&toasts)),
+        )
+    })
+}
+
+/// Let `ms` pass, running the timers that come due.
+fn wait(s: &mut Shot, ms: u64) {
+    s.wait(Duration::from_millis(ms));
+}
+
+pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
+    s.frame("default")?;
+    s.click_text("Show Toast")?;
+    s.frame("one toast")?;
+    for kind in ["Success", "Info", "Warning", "Error"] {
+        s.click_text(kind)?;
+        s.settle()?;
+    }
+    s.hover(20.0, 600.0);
+    s.frame("stack of three")?;
+    s.hover(780.0, 600.0);
+    s.frame("hover spreads them")?;
+    s.hover(20.0, 600.0);
+    s.click_text("Promise")?;
+    s.frame("loading")?;
+    wait(s, 2100);
+    s.frame("promise settled")?;
+    wait(s, 4100);
+    s.frame("all expired")?;
+    s.click_text("Show Toast")?;
+    s.settle()?;
+    s.click_text("Undo")?;
+    s.frame("action dismissed it")?;
+    motion_frames(s, "another toast", &[0, 100, 200, 400], |s| s.click_text("Show Toast"))?;
+    // Gone again before the dialog: the action dismisses it, sinking out.
+    motion_frames(s, "dismissed", &[0, 100, 200, 400], |s| s.click_text("Undo"))?;
+    s.click_text("Dialog with toast")?;
+    s.settle()?;
+    s.click_text("Toast")?;
+    s.frame("toast over the dialog")?;
+    let (x, y) = s.locate("Event has been created")?;
+    s.click(x, y);
+    s.frame("pressing the toast keeps the dialog")?;
+    Ok(())
+}

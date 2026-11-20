@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "jsx": "preserve",
+    "skipLibCheck": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["./.shadcn-vue/apps/v4/*"] },
+    "types": ["vite/client"]
+  },
+  "include": ["main.ts", "vite.config.ts", ".shadcn-vue/apps/v4/**/*.ts", ".shadcn-vue/apps/v4/**/*.vue"]
+}

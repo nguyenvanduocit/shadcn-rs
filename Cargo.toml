@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99"
+license = "MIT"
+repository = "https://github.com/nguyenvanduocit/shadcn-rs"
+publish = false
+
+# The compiler only helps while nothing bypasses it: these hold for every crate, each of which takes
+# them with `[lints] workspace = true`. Outside tests, code that can panic or silently change a value does not compile: an index is
+# `get`, arithmetic is `checked_*`/`saturating_*`, a cast is `From`/`TryFrom`, an ignored result is handled. A finding that
+# is right where it stands is kept with `#[expect(lint, reason = "...")]` at its line, which warns once it no longer applies.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+let_underscore_must_use = "deny"
+mem_forget = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+# A clone whose value is never used after it: the rule against `clone()` added only to satisfy the borrow checker, which
+# clippy keeps in its nursery group, off by default.
+redundant_clone = "deny"
+
+# Line tables keep a panic's backtrace and a profiler's samples readable at a fraction of full debug info's size.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+debug = "line-tables-only"
+
+# cosmic-text 0.19.0 starts a line-clamped paragraph's last line at the space
+# before its first word; upstream fixed it after the release (c5d3205, "fix
+# ellipsize on last line"). Back to crates.io at the next release (ADR-0006).
+# A workspace that depends on `gui` carries this patch too: Cargo applies only
+# the root workspace's.
+[patch.crates-io]
+cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "c5d32054ad0f284873e344e0ea87902d9dc2bca8" }

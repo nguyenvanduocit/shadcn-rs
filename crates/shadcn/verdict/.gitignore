@@ -1,0 +1,4 @@
+# The pinned shadcn-vue sources and the photos its demos show (fetch.sh), and npm's install.
+.shadcn-vue/
+.photos/
+node_modules/

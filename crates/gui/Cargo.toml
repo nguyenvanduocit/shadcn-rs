@@ -1,0 +1,22 @@
+[package]
+name = "gui"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arboard = { version = "3", default-features = false }
+cosmic-text = "0.19"
+png = "0.18.1"
+resvg = "0.50"
+softbuffer = "0.4"
+stats_alloc = "0.1.10"
+taffy = "0.15"
+tiny-skia = "0.12"
+winit = "0.30"

@@ -1,0 +1,5 @@
+# One compiler for every machine and CI: the lints and their findings are the same everywhere.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

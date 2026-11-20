@@ -1,0 +1,39 @@
+# What `cargo deny check` holds for every dependency: no known vulnerability, a licence we may ship, one registry.
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    # ferroni, the pure-Rust Oniguruma behind code highlighting (ADR-0002).
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    # clipboard-win and error-code, arboard's Windows clipboard.
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "OFL-1.1",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# shadcn's path dependency on gui has no version, and needs none.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# cosmic-text's fix for a line-clamped last line, unreleased (ADR-0006).
+allow-git = ["https://github.com/pop-os/cosmic-text"]

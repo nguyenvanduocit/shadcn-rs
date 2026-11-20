@@ -1,0 +1,22 @@
+[package]
+name = "shadcn"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+gui = { path = "../gui" }
+# Shiki's tokens and GitHub themes for code blocks, in Rust (ADR-0002).
+irosashi = "0.3.1"
+
+[dev-dependencies]
+# The gallery's Markdown, as shadcn-vue's docs render agent replies (comark).
+pulldown-cmark = { version = "0.13", default-features = false }
+# The gallery's verdict crops and compares frames; same version as gui's.
+tiny-skia = "0.12"
