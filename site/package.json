@@ -1,0 +1,13 @@
+{
+  "name": "shadcn-rs-site",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build.mjs",
+    "deploy": "bun build.mjs && wrangler deploy"
+  },
+  "devDependencies": {
+    "marked": "^16.0.0",
+    "shiki": "^3.0.0"
+  }
+}

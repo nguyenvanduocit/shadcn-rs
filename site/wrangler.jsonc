@@ -1,0 +1,15 @@
+// shadcn-rs.aiocean.io on Cloudflare Workers Static Assets: no Worker code, the pages are files.
+// `bun run build` writes dist/ (build.mjs: the landing page in public/, and the docs rendered from `docs --export` and
+// the last verdict runs); `bun run deploy` builds and ships it. The custom_domain route makes the deploy create the DNS
+// record. The layout is shadcn-vue's own site (apps/v4 at d1bf1b3) with this project's words.
+{
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "shadcn-rs-site",
+  "compatibility_date": "2026-11-20",
+  "assets": {
+    "directory": "./dist",
+    "html_handling": "drop-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "routes": [{ "pattern": "shadcn-rs.aiocean.io", "custom_domain": true }]
+}

@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>shadcn-rs: shadcn/ui as a native desktop GUI in Rust</title>
+<meta name="description" content="Every component of shadcn-vue's new-york-v4 registry, ported to Rust on a small GUI framework of its own. The same look and behaviour, painted on the GPU, without a browser. Open Source. Open Code.">
+<meta property="og:title" content="shadcn/ui as a Native Desktop GUI in Rust">
+<meta property="og:description" content="Every component of shadcn-vue's new-york-v4 registry, ported to Rust on a small GUI framework of its own. The same look and behaviour, painted on the GPU, without a browser.">
+<meta property="og:image" content="https://shadcn-rs.aiocean.io/shots/docs-light.webp">
+<meta property="og:url" content="https://shadcn-rs.aiocean.io/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preload" href="/fonts/Geist.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="/style.css">
+<script>
+  (() => {
+    const saved = localStorage.getItem("theme");
+    const dark = saved ? saved === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+    document.documentElement.classList.add(dark ? "dark" : "light");
+  })();
+</script>
+</head>
+<body>
+<div data-slot="layout" class="layout">
+
+  <header class="site-header">
+    <div class="container-wrapper px-6">
+      <div class="header-row">
+        <nav class="main-nav">
+          <a class="btn btn-ghost btn-icon logo" href="/" aria-label="shadcn-rs">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="M2 12a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 12"/><path d="M2 17a1 1 0 0 0 .58.91l8.6 3.91a2 2 0 0 0 1.65 0l8.58-3.9A1 1 0 0 0 22 17"/></svg>
+          </a>
+          <a class="btn btn-ghost btn-sm" href="/">Home</a>
+          <a class="btn btn-ghost btn-sm" href="https://github.com/nguyenvanduocit/shadcn-rs/blob/master/crates/shadcn/README.md">Docs</a>
+          <a class="btn btn-ghost btn-sm" href="https://github.com/nguyenvanduocit/shadcn-rs/tree/master/crates/shadcn/src">Components</a>
+          <a class="btn btn-ghost btn-sm" href="https://github.com/nguyenvanduocit/shadcn-rs/tree/master/crates/gui/src">Framework</a>
+          <a class="btn btn-ghost btn-sm" href="https://github.com/nguyenvanduocit/shadcn-rs/tree/master/docs/adr">Decisions</a>
+        </nav>
+        <div class="header-actions">
+          <a class="btn btn-ghost btn-sm github" href="https://github.com/nguyenvanduocit/shadcn-rs" target="_blank" rel="noreferrer">
+            <svg viewBox="0 0 438.549 438.549"><path fill="currentColor" d="M409.132 114.573c-19.608-33.596-46.205-60.194-79.798-79.8-33.598-19.607-70.277-29.408-110.063-29.408-39.781 0-76.472 9.804-110.063 29.408-33.596 19.605-60.192 46.204-79.8 79.8C9.803 148.168 0 184.854 0 224.63c0 47.78 13.94 90.745 41.827 128.906 27.884 38.164 63.906 64.572 108.063 79.227 5.14.954 8.945.283 11.419-1.996 2.475-2.282 3.711-5.14 3.711-8.562 0-.571-.049-5.708-.144-15.417a2549.81 2549.81 0 01-.144-25.406l-6.567 1.136c-4.187.767-9.469 1.092-15.846 1-6.374-.089-12.991-.757-19.842-1.999-6.854-1.231-13.229-4.086-19.13-8.559-5.898-4.473-10.085-10.328-12.56-17.556l-2.855-6.57c-1.903-4.374-4.899-9.233-8.992-14.559-4.093-5.331-8.232-8.945-12.419-10.848l-1.999-1.431c-1.332-.951-2.568-2.098-3.711-3.429-1.142-1.331-1.997-2.663-2.568-3.997-.572-1.335-.098-2.43 1.427-3.289 1.525-.859 4.281-1.276 8.28-1.276l5.708.853c3.807.763 8.516 3.042 14.133 6.851 5.614 3.806 10.229 8.754 13.846 14.842 4.38 7.806 9.657 13.754 15.846 17.847 6.184 4.093 12.419 6.136 18.699 6.136 6.28 0 11.704-.476 16.274-1.423 4.565-.952 8.848-2.383 12.847-4.285 1.713-12.758 6.377-22.559 13.988-29.41-10.848-1.14-20.601-2.857-29.264-5.14-8.658-2.286-17.605-5.996-26.835-11.14-9.235-5.137-16.896-11.516-22.985-19.126-6.09-7.614-11.088-17.61-14.987-29.979-3.901-12.374-5.852-26.648-5.852-42.826 0-23.035 7.52-42.637 22.557-58.817-7.044-17.318-6.379-36.732 1.997-58.24 5.52-1.715 13.706-.428 24.554 3.853 10.85 4.283 18.794 7.952 23.84 10.994 5.046 3.041 9.089 5.618 12.135 7.708 17.705-4.947 35.976-7.421 54.818-7.421s37.117 2.474 54.823 7.421l10.849-6.849c7.419-4.57 16.18-8.758 26.262-12.565 10.088-3.805 17.802-4.853 23.134-3.138 8.562 21.509 9.325 40.922 2.279 58.24 15.036 16.18 22.559 35.787 22.559 58.817 0 16.178-1.958 30.497-5.853 42.966-3.9 12.471-8.941 22.457-15.125 29.979-6.191 7.521-13.901 13.85-23.131 18.986-9.232 5.14-18.182 8.85-26.84 11.136-8.662 2.286-18.415 4.004-29.263 5.146 9.894 8.562 14.842 22.077 14.842 40.539v60.237c0 3.422 1.19 6.279 3.572 8.562 2.379 2.279 6.136 2.95 11.276 1.995 44.163-14.653 80.185-41.062 108.068-79.226 27.88-38.161 41.825-81.126 41.825-128.906-.01-39.771-9.818-76.454-29.414-110.049z"/></svg>
+            <span class="stars" id="stars"><span class="skeleton"></span></span>
+          </a>
+          <span class="separator"></span>
+          <button class="btn btn-ghost btn-icon" id="mode" title="Toggle theme">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path stroke="none" d="M0 0h24v24H0z" fill="none"/><path d="M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0"/><path d="M12 3l0 18"/><path d="M12 9l4.65 -4.65"/><path d="M12 14.3l7.37 -7.37"/><path d="M12 19.6l8.85 -8.85"/></svg>
+            <span class="sr-only">Toggle theme</span>
+          </button>
+          <span class="separator hide-sm"></span>
+          <a class="btn btn-primary btn-sm btn-31 hide-sm" href="https://github.com/nguyenvanduocit/shadcn-rs#using-it">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19h8"/><path d="m4 17 6-6-6-6"/></svg>
+            Install
+          </a>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="page-header">
+      <div class="container-wrapper">
+        <div class="container header-stack">
+          <a class="badge" href="/docs/decisions/0011">
+            <span class="new-dot" title="New"></span>
+            Now painted on the GPU: 0.47 ms a frame
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m12 5 7 7-7 7"/></svg>
+          </a>
+          <h1>shadcn/ui as a Native Desktop GUI in Rust</h1>
+          <p class="description">Every component of shadcn-vue's new-york-v4 registry, ported to Rust on a small GUI framework of its own.
+            The same look and behaviour, painted on the GPU into a native window, without a browser. 389 demos scored against
+            shadcn-vue: 99 / 100. Open Source. Open Code.</p>
+          <div class="page-actions">
+            <a class="btn btn-primary btn-sm btn-31" href="/docs/installation">
+              Get Started
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12l14 0"/><path d="M13 18l6 -6"/><path d="M13 6l6 6"/></svg>
+            </a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="container-wrapper demo-wrapper">
+      <div class="container demo-container">
+        <section class="mobile-shot">
+          <img class="only-light" src="/shots/docs-light.webp" width="1400" height="875" alt="The shadcn-rs docs app, light theme">
+          <img class="only-dark" src="/shots/docs-dark.webp" width="1400" height="875" alt="The shadcn-rs docs app, dark theme">
+        </section>
+        <section class="theme-container desktop-demo">
+          <div data-slot="demo" class="cards-demo">
+            <div class="cards-grid">
+              <div class="col">
+                <figure class="cell clip"><img class="only-light" src="/cards/CardDemo.webp" alt="Login card"><img class="only-dark" src="/cards/CardDemo-dark.webp" alt="Login card"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/PlanDemo.webp" alt="An agent's plan, four of four steps done"><img class="only-dark" src="/cards/PlanDemo-dark.webp" alt="An agent's plan"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/FormDemo.webp" alt="Profile form"><img class="only-dark" src="/cards/FormDemo-dark.webp" alt="Profile form"></figure>
+              </div>
+              <div class="col col-lg">
+                <figure class="cell clip"><img class="only-light" src="/cards/ChartDemo.webp" alt="Bar chart card"><img class="only-dark" src="/cards/ChartDemo-dark.webp" alt="Bar chart card"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/ReasoningDemo.webp" alt="Reasoning, thought for 5 seconds"><img class="only-dark" src="/cards/ReasoningDemo-dark.webp" alt="Reasoning"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/CalendarRangeDemo.webp" alt="Range calendar over two months"><img class="only-dark" src="/cards/CalendarRangeDemo-dark.webp" alt="Range calendar"></figure>
+              </div>
+              <div class="col col-1400">
+                <figure class="cell clip"><img class="only-light" src="/cards/QuestionnaireCardDemo.webp" alt="Questionnaire card"><img class="only-dark" src="/cards/QuestionnaireCardDemo-dark.webp" alt="Questionnaire card"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/ToolDemo.webp" alt="An agent's tool calls"><img class="only-dark" src="/cards/ToolDemo-dark.webp" alt="An agent's tool calls"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/ItemVariantDemo.webp" alt="Item variants"><img class="only-dark" src="/cards/ItemVariantDemo-dark.webp" alt="Item variants"></figure>
+              </div>
+              <div class="col col-md">
+                <figure class="cell frame center"><img class="only-light" src="/cards/CalendarDemo.webp" alt="Calendar" style="max-width:259px"><img class="only-dark" src="/cards/CalendarDemo-dark.webp" alt="Calendar" style="max-width:258px"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/MessageDemo.webp" alt="Chat messages"><img class="only-dark" src="/cards/MessageDemo-dark.webp" alt="Chat messages"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/TabsDemo.webp" alt="Tabs with an account form"><img class="only-dark" src="/cards/TabsDemo-dark.webp" alt="Tabs with an account form"></figure>
+              </div>
+              <div class="col col-1900">
+                <figure class="cell clip"><img class="only-light" src="/cards/CodeBlockDemo.webp" alt="Highlighted code block"><img class="only-dark" src="/cards/CodeBlockDemo-dark.webp" alt="Highlighted code block"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/TestResultsDemo.webp" alt="Test results"><img class="only-dark" src="/cards/TestResultsDemo-dark.webp" alt="Test results"></figure>
+                <figure class="cell frame"><img class="only-light" src="/cards/AttachmentStatesDemo.webp" alt="Attachments in five states"><img class="only-dark" src="/cards/AttachmentStatesDemo-dark.webp" alt="Attachments"></figure>
+                <figure class="cell clip"><img class="only-light" src="/cards/EmptyOutlineDemo.webp" alt="Empty state"><img class="only-dark" src="/cards/EmptyOutlineDemo-dark.webp" alt="Empty state"></figure>
+              </div>
+            </div>
+            <div class="fade-top"></div>
+            <div class="fade-bottom"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container-wrapper px-4">
+      <div class="footer-row">
+        <div class="footer-text">
+          Every component above was rendered by shadcn-rs, not by a browser. Built by
+          <a href="https://aiocean.io" target="_blank" rel="noreferrer">aiocean</a>. The source code is available on
+          <a href="https://github.com/nguyenvanduocit/shadcn-rs" target="_blank" rel="noreferrer">GitHub</a>.
+        </div>
+      </div>
+    </div>
+  </footer>
+
+</div>
+<script src="/main.js" defer></script>
+</body>
+</html>
