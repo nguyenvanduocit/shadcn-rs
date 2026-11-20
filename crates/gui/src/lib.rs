@@ -2,6 +2,7 @@
 //! styled with Tailwind's vocabulary, Taffy layout, cosmic-text text, and a
 //! tiny-skia CPU painter shown through softbuffer.
 
+pub mod access;
 pub mod app;
 mod cache;
 pub mod clipboard;
@@ -41,8 +42,9 @@ pub use computed::Computed;
 pub use context::{provide, use_context};
 pub use edit::{Preedit, TextEdit, TextField};
 pub use element::{
-    Deferred, Div, Element, ElementKey, IconElement, Image, InputMode, InputType, IntoElement, Placement, Shapes, Side,
-    SideAlign, Span, Text, TextInput, View, deferred, div, icon, image, key_of, shapes, span, text, text_input,
+    Deferred, Div, Element, ElementKey, IconElement, Image, InputMode, InputType, IntoElement, Placement, Role,
+    Semantics, Shapes, Side, SideAlign, Span, Text, TextInput, Toggled, View, deferred, div, icon, image, key_of,
+    shapes, span, text, text_input,
 };
 pub use events::{ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
 pub use focus::FocusHandle;

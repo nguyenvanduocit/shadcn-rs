@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use tiny_skia::Pixmap;
 
+use crate::access;
 use crate::clock;
 use crate::color::Color;
 use crate::convert::u32_to_f32;
@@ -122,6 +123,12 @@ impl<C: FnMut() -> Element> Pipeline<C> {
         self.interaction.cursor(&self.frame)
     }
 
+    /// What a screen reader is told about the last frame, laid out at `scale`.
+    #[must_use]
+    pub fn access_tree(&self, scale: f32, title: &str) -> accesskit::TreeUpdate {
+        access::tree(&self.frame, crate::focus::focused(), scale, title)
+    }
+
     /// Where an input method may type in the last frame, if anywhere.
     pub fn ime_target(&mut self) -> Option<ImeTarget> {
         self.interaction.ime_target(&self.frame, &mut self.text)
@@ -147,6 +154,7 @@ impl<C: FnMut() -> Element> Pipeline<C> {
             }
             Input::Key(ev) => self.interaction.key(f, t, &ev),
             Input::Ime(ev) => self.interaction.ime(f, &ev),
+            Input::Act(request) => self.interaction.act(f, &request),
             Input::Modifiers(m) => {
                 self.interaction.set_modifiers(m);
                 Outcome::default()
@@ -450,6 +458,10 @@ impl<C: FnMut() -> Element> WindowHandler for Live<C> {
 
     fn ime_target(&mut self) -> Option<ImeTarget> {
         self.pipeline.ime_target()
+    }
+
+    fn access_tree(&self, scale: f32, title: &str) -> accesskit::TreeUpdate {
+        self.pipeline.access_tree(scale, title)
     }
 
     fn idle(&mut self) -> Wake {

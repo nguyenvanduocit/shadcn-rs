@@ -616,6 +616,7 @@ pub fn dropdown_menu_content(menu: &MenuState) -> Div {
     menu.content(popper(
         menu_box(&t)
             .named("dropdown-menu-content")
+            .role(gui::Role::Menu)
             .overflow_y_scroll()
             .shadow_md(),
         Origin::Anchor,
@@ -638,7 +639,9 @@ pub fn dropdown_menu_radio_group() -> Div {
 #[must_use]
 pub fn dropdown_menu_item(menu: &MenuState, id: &str, item: MenuItem, on_select: impl Fn() + 'static) -> Div {
     let t = theme();
-    let d = menu_row(&t, item, menu.is_highlighted(id)).named("dropdown-menu-item");
+    let d = menu_row(&t, item, menu.is_highlighted(id))
+        .named("dropdown-menu-item")
+        .role(gui::Role::MenuItem);
     menu.item(d, id, item.disabled, on_select)
 }
 
@@ -653,6 +656,8 @@ pub fn dropdown_menu_checkbox_item(menu: &MenuState, label: &str, checked: &Sign
     let on = checked.get();
     let d = menu_row(&t, item, menu.is_highlighted(label))
         .named("dropdown-menu-checkbox-item")
+        .role(gui::Role::MenuItemCheckBox)
+        .aria_checked(on)
         .pl(8.0)
         .pr(2.0)
         .child(menu_indicator(on.then(menu_check)))
@@ -684,6 +689,8 @@ pub fn dropdown_menu_radio_item(
     let chosen = group.get() == value;
     let d = menu_row(&t, item, highlighted)
         .named("dropdown-menu-radio-item")
+        .role(gui::Role::MenuItemRadio)
+        .aria_checked(chosen)
         .pl(8.0)
         .pr(2.0)
         .child(menu_indicator(chosen.then(|| menu_dot(dot))))

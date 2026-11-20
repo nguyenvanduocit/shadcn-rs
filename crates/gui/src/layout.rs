@@ -14,7 +14,7 @@ use taffy::{AvailableSpace, NodeId, TaffyTree};
 
 use crate::color::Color;
 use crate::edit::{TextEdit, TextField};
-use crate::element::{Common, Deferred, Element, ElementKey, Handler, Handlers, InputMode, Placement};
+use crate::element::{Common, Deferred, Element, ElementKey, Handler, Handlers, InputMode, Placement, Semantics};
 use crate::events::ClickEvent;
 use crate::focus::{FocusHandle, FocusId};
 use crate::geometry::{Bounds, NodePath, PathSeg};
@@ -151,6 +151,7 @@ pub struct Behaviour {
     pub(crate) spans: Vec<SpanTarget>,
     /// Holds this scroll container's offset.
     pub(crate) scroll: Option<ScrollHandle>,
+    pub(crate) semantics: Semantics,
 }
 
 /// A span of a text node that takes clicks or sets the cursor.
@@ -553,6 +554,7 @@ impl<'e> Builder<'e, '_> {
                 field,
                 spans: span_targets,
                 scroll: common.scroll.clone(),
+                semantics: common.semantics.clone(),
             },
             style,
             text,

@@ -137,6 +137,7 @@ pub fn drawer_content(state: &DrawerState, build: impl FnOnce(Div) -> Div) -> El
     };
     let base = div()
         .named("drawer-content")
+        .role(gui::Role::Dialog)
         .bg(t.background)
         .absolute()
         .flex_col()

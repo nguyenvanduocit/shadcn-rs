@@ -37,6 +37,12 @@ pub fn checkbox_state(state: CheckedState, on_change: impl Fn(bool) + 'static) -
     let t = theme();
     let base = div()
         .named("checkbox")
+        .role(gui::Role::CheckBox)
+        .aria_checked(match state {
+            CheckedState::Checked => gui::Toggled::True,
+            CheckedState::Indeterminate => gui::Toggled::Mixed,
+            CheckedState::Unchecked => gui::Toggled::False,
+        })
         .transition_shadow()
         .flex()
         .items_center()

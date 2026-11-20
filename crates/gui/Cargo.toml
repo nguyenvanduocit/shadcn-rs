@@ -11,6 +11,10 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# What a screen reader is told about each frame (AccessKit), and its adapter
+# to the platform's accessibility API through the winit window.
+accesskit = "0.25"
+accesskit_winit = "0.34"
 arboard = { version = "3", default-features = false }
 cosmic-text = "0.19"
 png = "0.18.1"

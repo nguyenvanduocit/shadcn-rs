@@ -10,7 +10,7 @@ use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::ModifiersState;
 use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
 
@@ -53,6 +53,8 @@ pub enum Input {
     Key(KeyEvent),
     /// An input method composed or committed text.
     Ime(ImeEvent),
+    /// Assistive technology asked a node to act (press, focus, set its value).
+    Act(accesskit::ActionRequest),
     Modifiers(Modifiers),
 }
 
@@ -76,12 +78,16 @@ pub trait WindowHandler {
     /// Where an input method may type, after the last frame; `None` turns
     /// the input method off.
     fn ime_target(&mut self) -> Option<ImeTarget>;
+    /// What a screen reader is told about the last frame, at `scale`.
+    fn access_tree(&self, scale: f32, title: &str) -> accesskit::TreeUpdate;
     /// Called when the event queue is empty: run due work and say when to wake.
     fn idle(&mut self) -> Wake;
 }
 
 struct WindowState {
     window: Arc<Window>,
+    /// Tells the platform's accessibility API what the window shows.
+    access: accesskit_winit::Adapter,
     #[expect(
         dead_code,
         reason = "held as a keep-alive: the surface is valid only while its context lives"
@@ -100,11 +106,13 @@ struct Handler<H: WindowHandler> {
     modifiers: Modifiers,
     /// Where the input method was last told it may type.
     ime: Option<ImeTarget>,
+    /// Carries the accessibility adapter's requests into the event loop.
+    proxy: EventLoopProxy<accesskit_winit::Event>,
 }
 
 /// Open a window titled `title` and run `handler` until it closes.
 pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
-    let event_loop = match EventLoop::new() {
+    let event_loop = match EventLoop::<accesskit_winit::Event>::with_user_event().build() {
         Ok(el) => el,
         Err(e) => {
             eprintln!("failed to create event loop: {e}");
@@ -118,6 +126,7 @@ pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
         cursor: (0.0, 0.0),
         modifiers: Modifiers::default(),
         ime: None,
+        proxy: event_loop.create_proxy(),
     };
     if let Err(e) = event_loop.run_app(&mut handler) {
         eprintln!("event loop error: {e}");
@@ -154,11 +163,14 @@ impl<H: WindowHandler> Handler<H> {
     }
 }
 
-impl<H: WindowHandler> ApplicationHandler for Handler<H> {
+impl<H: WindowHandler> ApplicationHandler<accesskit_winit::Event> for Handler<H> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Hidden until the accessibility adapter is attached, which it must
+        // be before the window first shows.
         let attrs = WindowAttributes::default()
             .with_title(self.title.clone())
-            .with_inner_size(LogicalSize::new(1280.0, 820.0));
+            .with_inner_size(LogicalSize::new(1280.0, 820.0))
+            .with_visible(false);
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -183,9 +195,12 @@ impl<H: WindowHandler> ApplicationHandler for Handler<H> {
                 return;
             }
         };
+        let access = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
+        window.set_visible(true);
         window.request_redraw();
         self.state = Some(WindowState {
             window,
+            access,
             context,
             surface,
             pixmap: None,
@@ -193,6 +208,9 @@ impl<H: WindowHandler> ApplicationHandler for Handler<H> {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        if let Some(state) = self.state.as_mut() {
+            state.access.process_event(&state.window, &event);
+        }
         let scale = self.scale();
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
@@ -259,8 +277,17 @@ impl<H: WindowHandler> ApplicationHandler for Handler<H> {
             WindowEvent::RedrawRequested => {
                 self.redraw(scale);
                 self.follow_ime();
+                self.tell_access(scale);
             }
             _ => {}
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: accesskit_winit::Event) {
+        match event.window_event {
+            accesskit_winit::WindowEvent::InitialTreeRequested => self.tell_access(self.scale()),
+            accesskit_winit::WindowEvent::ActionRequested(request) => self.send(Input::Act(request)),
+            accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
         }
     }
 
@@ -284,6 +311,15 @@ impl<H: WindowHandler> ApplicationHandler for Handler<H> {
 }
 
 impl<H: WindowHandler> Handler<H> {
+    /// Give the accessibility adapter the frame's tree; it asks for it only
+    /// while assistive technology listens, so otherwise this costs nothing.
+    fn tell_access(&mut self, scale: f32) {
+        let (app, title) = (&self.app, self.title.as_str());
+        if let Some(state) = self.state.as_mut() {
+            state.access.update_if_active(|| app.access_tree(scale, title));
+        }
+    }
+
     /// Tell the platform's input method where it may type: on while an
     /// input that takes composed text has focus, its candidates at the
     /// caret, and started afresh when focus moves to another input so a

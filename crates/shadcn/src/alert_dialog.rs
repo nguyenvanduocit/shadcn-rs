@@ -20,7 +20,15 @@ pub fn alert_dialog_content(state: &DialogState, build: impl FnOnce(Div) -> Div)
     if !state.is_open() {
         return Element::Empty;
     }
-    centred_modal(state, build(centred_surface().named("alert-dialog-content")), false)
+    centred_modal(
+        state,
+        build(
+            centred_surface()
+                .named("alert-dialog-content")
+                .role(gui::Role::AlertDialog),
+        ),
+        false,
+    )
 }
 
 #[must_use]

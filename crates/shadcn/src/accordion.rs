@@ -154,6 +154,7 @@ pub fn accordion_trigger(state: &AccordionState, value: &str, label: impl IntoEl
     let (click_value, key_value) = (value.to_owned(), value.to_owned());
     let trigger = div()
         .named("accordion-trigger")
+        .aria_expanded(open)
         .track_focus(state.focus_handle(value))
         .flex()
         .flex_1()

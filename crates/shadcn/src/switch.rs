@@ -26,6 +26,8 @@ pub fn switch(checked: &Signal<bool>) -> Div {
     };
     div()
         .named("switch")
+        .role(gui::Role::Switch)
+        .aria_checked(on)
         .inline_flex()
         .h_px(18.4)
         .w(8.0)

@@ -37,6 +37,8 @@ pub fn toggle_variants(variant: ToggleVariant, size: ToggleSize, on: bool) -> Di
     let t = theme();
     let d = div()
         .named("toggle")
+        .role(gui::Role::Button)
+        .aria_checked(on)
         .transition_props(Properties::COLOR | Properties::SHADOW)
         .inline_flex()
         .items_center()

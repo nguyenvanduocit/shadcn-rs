@@ -113,6 +113,7 @@ pub fn tabs_list() -> Div {
     let t = theme();
     div()
         .named("tabs-list")
+        .role(gui::Role::TabList)
         .bg(t.muted)
         .text_color(t.muted_foreground)
         .inline_flex()
@@ -133,6 +134,8 @@ pub fn tabs_trigger(state: &TabsState, value: &str) -> Div {
     let (click_value, key_value) = (value.to_owned(), value.to_owned());
     div()
         .named("tabs-trigger")
+        .role(gui::Role::Tab)
+        .aria_selected(active)
         .transition_props(Properties::COLOR | Properties::SHADOW)
         .track_focus(state.focus_handle(value))
         .text_color(if t.dark { t.muted_foreground } else { t.foreground })
@@ -168,5 +171,7 @@ pub fn tabs_trigger(state: &TabsState, value: &str) -> Div {
 /// it); fill it through `.map(|c| c.child(…))`.
 #[must_use]
 pub fn tabs_content(state: &TabsState, value: &str) -> Option<Div> {
-    state.is_active(value).then(|| div().named("tabs-content").flex_1())
+    state
+        .is_active(value)
+        .then(|| div().named("tabs-content").role(gui::Role::TabPanel).flex_1())
 }

@@ -41,6 +41,7 @@ pub fn sheet_content(state: &DialogState, side: SheetSide, build: impl FnOnce(Di
     };
     let base = div()
         .named("sheet-content")
+        .role(gui::Role::Dialog)
         .animate(slide(Animation::enter(), off).duration(0.5))
         .animate_out(slide(Animation::exit(), off).duration(0.3))
         .transition()

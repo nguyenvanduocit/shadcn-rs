@@ -156,6 +156,7 @@ pub(crate) fn corner_close(state: &DialogState) -> Div {
             .focusable()
             .hover(|s| s.opacity(1.0))
             .focus(move |s| s.opacity(1.0).ring(2.0, t.ring))
+            .aria_label("Close")
             .child(icon(Icon::X)),
     )
 }
@@ -168,7 +169,7 @@ pub fn dialog_content(state: &DialogState, build: impl FnOnce(Div) -> Div) -> El
     if !state.is_open() {
         return Element::Empty;
     }
-    let content = build(centred_surface().named("dialog-content")).child(corner_close(state));
+    let content = build(centred_surface().named("dialog-content").role(gui::Role::Dialog)).child(corner_close(state));
     centred_modal(state, content, true)
 }
 

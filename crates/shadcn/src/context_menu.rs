@@ -70,6 +70,7 @@ pub fn context_menu_content(menu: &MenuState) -> Div {
     menu.content(popper(
         menu_box(&t)
             .named("context-menu-content")
+            .role(gui::Role::Menu)
             .overflow_y_scroll()
             .shadow_md(),
         Origin::CENTER,
@@ -91,7 +92,9 @@ pub fn context_menu_radio_group() -> Div {
 #[must_use]
 pub fn context_menu_item(menu: &MenuState, id: &str, item: MenuItem, on_select: impl Fn() + 'static) -> Div {
     let t = theme();
-    let d = menu_row(&t, item, menu.is_highlighted(id)).named("context-menu-item");
+    let d = menu_row(&t, item, menu.is_highlighted(id))
+        .named("context-menu-item")
+        .role(gui::Role::MenuItem);
     menu.item(d, id, item.disabled, on_select)
 }
 

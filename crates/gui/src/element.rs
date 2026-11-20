@@ -82,7 +82,25 @@ pub struct Common {
     pub(crate) pass_through: bool,
     /// Holds this scroll container's offset.
     pub(crate) scroll: Option<ScrollHandle>,
+    /// What a screen reader is told this node is.
+    pub(crate) semantics: Semantics,
 }
+
+/// What a node is to assistive technology, as the ARIA attributes say it on
+/// the web: its role, its name, and its state. A node that sets no role
+/// takes the one its content implies (`crate::access`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Semantics {
+    pub role: Option<Role>,
+    pub label: Option<String>,
+    pub checked: Option<Toggled>,
+    pub selected: Option<bool>,
+    pub expanded: Option<bool>,
+    /// Left out of what a screen reader reads, with its subtree.
+    pub hidden: bool,
+}
+
+pub use accesskit::{Role, Toggled};
 
 /// One node kind plus what all kinds share.
 #[derive(Clone)]
@@ -534,6 +552,49 @@ impl<K> Node<K> {
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.common.disabled = disabled;
+        self
+    }
+
+    /// What this node is to a screen reader (`role="…"`).
+    #[must_use]
+    pub fn role(mut self, role: Role) -> Self {
+        self.common.semantics.role = Some(role);
+        self
+    }
+
+    /// Its name to a screen reader when its content does not say it (`aria-label`).
+    #[must_use]
+    pub fn aria_label(mut self, label: impl Into<String>) -> Self {
+        self.common.semantics.label = Some(label.into());
+        self
+    }
+
+    /// Checked, unchecked or mixed, for a checkbox, switch or radio
+    /// (`aria-checked`), and pressed or not for a toggle button (`aria-pressed`).
+    #[must_use]
+    pub fn aria_checked(mut self, checked: impl Into<Toggled>) -> Self {
+        self.common.semantics.checked = Some(checked.into());
+        self
+    }
+
+    /// The chosen one of its set, for a tab or an option (`aria-selected`).
+    #[must_use]
+    pub fn aria_selected(mut self, selected: bool) -> Self {
+        self.common.semantics.selected = Some(selected);
+        self
+    }
+
+    /// Whether what it controls is open, for a disclosure or menu trigger (`aria-expanded`).
+    #[must_use]
+    pub fn aria_expanded(mut self, expanded: bool) -> Self {
+        self.common.semantics.expanded = Some(expanded);
+        self
+    }
+
+    /// Leave this node and its subtree out of what a screen reader reads (`aria-hidden`).
+    #[must_use]
+    pub fn aria_hidden(mut self) -> Self {
+        self.common.semantics.hidden = true;
         self
     }
 

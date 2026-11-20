@@ -133,6 +133,7 @@ pub fn tags_input_item_delete(state: &TagsInputState, tag: &str) -> Div {
         .cursor_pointer()
         .focusable()
         .on_click(move |_| remove.remove(&tag))
+        .aria_label("Remove")
         .child(icon(Icon::X))
 }
 

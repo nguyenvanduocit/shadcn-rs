@@ -4,6 +4,9 @@
 
 use std::collections::HashSet;
 
+use accesskit::{Action, ActionData, ActionRequest};
+
+use crate::access;
 use crate::edit::TextField;
 use crate::element::{InputMode, InputType};
 use crate::events::{ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
@@ -514,19 +517,58 @@ impl Interaction {
         let activates = ev.is(NamedKey::Enter) || ev.is(NamedKey::Space) || ev.text.as_deref() == Some(" ");
         if activates
             && let Some(i) = focused
-            && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.click.clone())
-            && let Some(n) = frame.nodes.get(i)
+            && Self::press(frame, i, ev.modifiers)
         {
-            let (x, y) = (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0);
-            f(&ClickEvent {
-                x,
-                y,
-                bounds: n.bounds,
-                modifiers: ev.modifiers,
-            });
             return Outcome::by(format!("key {:?} pressed {}", ev.key, label(frame, i)));
         }
         Outcome::default()
+    }
+
+    /// Run the click handler of the node at `i` as a click at its centre
+    /// does, for a press that is not the pointer's; whether it had one.
+    fn press(frame: &Frame, i: usize, modifiers: Modifiers) -> bool {
+        let (Some(f), Some(n)) = (
+            frame.behaviour(i).and_then(|b| b.handlers.click.clone()),
+            frame.nodes.get(i),
+        ) else {
+            return false;
+        };
+        f(&ClickEvent {
+            x: n.bounds.x + n.bounds.width / 2.0,
+            y: n.bounds.y + n.bounds.height / 2.0,
+            bounds: n.bounds,
+            modifiers,
+        });
+        true
+    }
+
+    /// Do what assistive technology asks of a node: press it, focus it, or
+    /// set a text input's value.
+    pub fn act(&mut self, frame: &Frame, request: &ActionRequest) -> Outcome {
+        let Some(i) = access::target(frame, request.target_node) else {
+            return Outcome::default();
+        };
+        let Some(b) = frame.behaviour(i).filter(|b| !b.disabled) else {
+            return Outcome::default();
+        };
+        let done = match (request.action, &request.data) {
+            (Action::Click, _) => Self::press(frame, i, Modifiers::default()),
+            (Action::Focus, _) => b.focus.is_some_and(|h| {
+                focus::set_focus(Some(h.id()), true);
+                self.state.focused = Some(h.id());
+                true
+            }),
+            (Action::SetValue, Some(ActionData::Value(v))) => b.field.as_ref().is_some_and(|f| {
+                f.set_text(v.as_ref());
+                true
+            }),
+            _ => false,
+        };
+        if done {
+            Outcome::by(format!("{:?} -> {}", request.action, label(frame, i)))
+        } else {
+            Outcome::default()
+        }
     }
 
     /// Apply what an input method did to the focused text input.

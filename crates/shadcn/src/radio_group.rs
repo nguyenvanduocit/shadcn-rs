@@ -79,6 +79,8 @@ pub fn radio_group_item(state: &RadioGroupState, value: &str) -> Div {
     let owned = value.to_owned();
     div()
         .named("radio-group-item")
+        .role(gui::Role::RadioButton)
+        .aria_checked(checked)
         .transition_props(Properties::COLOR | Properties::SHADOW)
         .relative()
         .flex()
