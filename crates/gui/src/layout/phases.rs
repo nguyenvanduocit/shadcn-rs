@@ -8,23 +8,28 @@
 use crate::app::Scenario;
 use crate::color::Color;
 use crate::element::{IntoElement, div, text, text_bound};
+use crate::prelude::*;
 use crate::reactive::{self, Phase, RenderNode, Signal};
-use crate::styled::Styled;
 
 /// A 50 x 50 grid of buttons, each lit on hover, as the stress `grid` scene.
 fn grid(n: usize) -> crate::element::Element {
     div()
-        .flex_col()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
         .children((0..n).map(|r| {
-            div().flex_row().children((0..n).map(move |c| {
-                div()
-                    .w_px(12.0)
-                    .h_px(8.0)
-                    .bg(Color::hex(0xf4f4f5))
-                    .hover(|s| s.bg(Color::hex(0x18181b)))
-                    .on_click(|_| {})
-                    .child(text(format!("{r},{c}")).text_size(4.0, 6.0))
-            }))
+            div()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Row)
+                .children((0..n).map(move |c| {
+                    let i = crate::interact::Interaction::new();
+                    div()
+                        .interaction(i)
+                        .width(12.0)
+                        .height(8.0)
+                        .background(move || Color::hex(if i.hovered() { 0x18181b } else { 0xf4f4f5 }))
+                        .on_click(|_| {})
+                        .child(text(format!("{r},{c}")).text_size(4.0).line_height(6.0))
+                }))
         }))
         .into_element()
 }
@@ -78,11 +83,12 @@ fn a_paint_binding_records_its_chunk_alone() {
     let mut s = Scenario::measuring(
         move || {
             div()
-                .flex_col()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .children((0..40).map(move |i| {
-                    let row = div().h_px(10.0).child(text(format!("row {i}")));
+                    let row = div().height(10.0).child(text(format!("row {i}")));
                     if i == 17 {
-                        row.bind(move |st| st.bg(colour.get()))
+                        row.background(move || colour.get())
                     } else {
                         row
                     }
@@ -108,20 +114,119 @@ fn a_paint_binding_records_its_chunk_alone() {
     assert_eq!(r.paint.visited, 1, "and no clean subtree is walked: {}", r.paint);
 }
 
+/// A row of the list in the bound-content tests: row 17 holds `bound`.
+fn rows_with(bound: impl Fn() -> crate::element::Element + 'static) -> crate::element::Element {
+    let bound = std::rc::Rc::new(bound);
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .children((0..40).map(move |i| {
+            let row = div().height(20.0);
+            if i == 17 {
+                row.child(bound())
+            } else {
+                row.child(text(format!("row {i}")))
+            }
+        }))
+        .into_element()
+}
+
+#[test]
+fn an_icon_stroke_binding_records_its_chunk_alone() {
+    let width = Signal::new(2.0_f32);
+    let mut s = Scenario::measuring(
+        move || {
+            rows_with(move || {
+                crate::element::icon(crate::icon::Icon::Check)
+                    .stroke_width(move || width.get())
+                    .into_element()
+            })
+        },
+        300,
+        900,
+        1.0,
+    )
+    .unwrap();
+    s.check_cold(false);
+    s.settle().unwrap();
+    s.take_reports();
+    s.act("stroke", || width.set(1.5));
+    let r = s.frame("thinner").unwrap();
+    assert!(r.rendered.is_empty(), "no component renders: {:?}", r.rendered);
+    assert_eq!(r.visits.resolved, 1, "the icon alone resolves: {}", r.visits);
+    assert_eq!(r.layout.misses, 0, "a stroke lays out nothing");
+    assert_eq!(r.paint.recorded, 1, "its chunk alone records: {}", r.paint);
+    let strokes: Vec<f32> = s
+        .pipeline()
+        .frame()
+        .nodes
+        .iter()
+        .filter_map(|n| match n.content {
+            crate::layout::Content::Icon { stroke_width, .. } => Some(stroke_width),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(strokes, [1.5]);
+}
+
+#[test]
+fn an_input_colour_binding_records_its_chunk_alone() {
+    let colour = Signal::new(Color::hex(0x71717a));
+    let field = crate::edit::TextField::new("");
+    let mut s = Scenario::measuring(
+        move || {
+            rows_with(move || {
+                crate::element::text_input(&field)
+                    .width(100.0)
+                    .height(20.0)
+                    .placeholder("search")
+                    .placeholder_color(move || colour.get())
+                    .selection_color(move || colour.get().opacity(0.3))
+                    .into_element()
+            })
+        },
+        300,
+        900,
+        1.0,
+    )
+    .unwrap();
+    s.check_cold(false);
+    s.settle().unwrap();
+    s.take_reports();
+    s.act("colour", || colour.set(Color::hex(0x18181b)));
+    let r = s.frame("coloured").unwrap();
+    assert!(r.rendered.is_empty(), "no component renders: {:?}", r.rendered);
+    assert_eq!(r.visits.resolved, 1, "the input alone resolves: {}", r.visits);
+    assert_eq!(r.layout.misses, 0, "a colour lays out nothing");
+    assert_eq!(r.paint.recorded, 1, "its chunk alone records: {}", r.paint);
+    let colours: Vec<(Color, Color)> = s
+        .pipeline()
+        .frame()
+        .nodes
+        .iter()
+        .filter_map(|n| match &n.content {
+            crate::layout::Content::Input {
+                placeholder_color,
+                selection_color,
+                ..
+            } => Some((*placeholder_color, *selection_color)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(colours, [(Color::hex(0x18181b), Color::hex(0x18181b).opacity(0.3))]);
+}
+
 #[test]
 fn a_layout_binding_lays_out_and_renders_nothing() {
     let width = Signal::new(40.0_f32);
     let mut s = Scenario::measuring(
         move || {
             div()
-                .flex_col()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .children((0..40).map(move |i| {
-                    let row = div().h_px(10.0).child(text(format!("row {i}")));
-                    if i == 17 {
-                        row.bind(move |st| st.w_px(width.get()))
-                    } else {
-                        row
-                    }
+                    let row = div().height(10.0).child(text(format!("row {i}")));
+                    if i == 17 { row.width(move || width.get()) } else { row }
                 }))
                 .into_element()
         },
@@ -151,9 +256,10 @@ fn accessibility_sends_and_reads_only_the_node_that_changed() {
     let mut s = Scenario::measuring(
         move || {
             div()
-                .flex_col()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .children((0..200).map(move |i| {
-                    let row = div().h_px(10.0).on_click(|_| {});
+                    let row = div().height(10.0).on_click(|_| {});
                     if i == 17 {
                         row.child(text_bound(move || label.get()))
                     } else {
@@ -226,12 +332,7 @@ fn a_signal_written_after_a_later_phase_read_it_is_reported() {
 fn a_late_write_in_a_frame_shows_in_its_report() {
     let seen = Signal::labeled("seen width", 0.0_f32);
     let mut s = Scenario::measuring(
-        move || {
-            div()
-                .bind(move |st| st.w_px(40.0 + seen.get()))
-                .h_px(10.0)
-                .into_element()
-        },
+        move || div().width(move || 40.0 + seen.get()).height(10.0).into_element(),
         300,
         100,
         1.0,

@@ -11,7 +11,7 @@ use gui::{
     Bind, Color, FocusHandle, Key, Members, Model, NamedKey, UseModel, component, div, provide, use_context, use_model,
 };
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
@@ -62,7 +62,7 @@ impl RadioGroupContext {
 pub fn radio_group() -> Part<RadioGroupProps> {
     Part::new(
         RadioGroupProps::default(),
-        div().named("radio-group").grid().gap(3.0),
+        div().named("radio-group").display(Display::Grid).gap(12.0),
         |p| {
             component(p, |cx| {
                 let props = cx.props();
@@ -126,29 +126,38 @@ pub struct RadioGroupItemProps {
 #[must_use]
 pub fn radio_group_item(value: impl Into<String>) -> Part<RadioGroupItemProps> {
     let t = theme();
+    let i = Interaction::new();
     let root = div()
         .named("radio-group-item")
+        .interaction(i)
         .role(gui::Role::RadioButton)
-        .transition_props(Properties::COLOR | Properties::SHADOW)
-        .relative()
-        .flex()
-        .items_center()
-        .justify_center()
-        .aspect_square()
-        .size(4.0)
-        .shrink_0()
-        .rounded_full()
-        .border()
+        .transition(Properties::COLOR | Properties::SHADOW)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .aspect_ratio(1.0)
+        .size(16.0)
+        .flex_shrink(0.0)
+        .radius(9999.0)
+        .border(1.0)
         .border_color(t.input)
         .text_color(t.primary)
-        .bg(if t.dark {
+        .background(if t.dark {
             t.input.opacity(0.3)
         } else {
             Color::TRANSPARENT
         })
-        .shadow_xs()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed())
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .focus_ring_on(i, &t)
+        .dim_disabled(i, 0.5)
+        .cursor_disabled(i)
         // WAI-ARIA: Enter does not check a radio, only Space does.
         .on_key_down(|ev| ev.is(NamedKey::Enter));
     Part::new(RadioGroupItemProps { value: value.into() }, root, |p| {
@@ -175,9 +184,9 @@ pub fn radio_group_item(value: impl Into<String>) -> Part<RadioGroupItemProps> {
                             div()
                                 .named("radio-group-indicator")
                                 .pass_through()
-                                .size_px(22.0 / 3.0)
-                                .rounded_full()
-                                .bg(t.primary),
+                                .size(22.0 / 3.0)
+                                .radius(9999.0)
+                                .background(t.primary),
                         )
                     })
                     .into_element()

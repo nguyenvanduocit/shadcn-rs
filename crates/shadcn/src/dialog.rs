@@ -15,13 +15,13 @@
 //! ```ignore
 //! dialog()
 //!     .child(dialog_trigger(button(ButtonVariant::Outline, ButtonSize::Default).child("Open")))
-//!     .child(dialog_content().max_w_px(425.0).child(dialog_header().child(dialog_title("Edit profile"))))
+//!     .child(dialog_content().max_width(425.0).child(dialog_header().child(dialog_title("Edit profile"))))
 //! ```
 
 use gui::focus::{self, FocusId};
 use gui::prelude::*;
 use gui::{
-    Animation, Bind, Color, Div, Element, FocusHandle, Icon, Length, Model, NamedKey, Placement, Signal, Text,
+    Animation, Bind, Color, Div, Element, FocusHandle, Icon, Length, Model, NamedKey, Positioning, Signal, Text,
     UseModel, component, deferred, div, icon, on_mounted, on_unmounted, provide, text, use_context, use_model, watch,
 };
 
@@ -101,9 +101,11 @@ impl Part<DialogProps> {
 }
 
 /// Make `trigger` open the dialog when pressed (`DialogTrigger as-child`).
+/// Give `trigger` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn dialog_trigger(trigger: Div) -> Part<()> {
-    Part::new((), trigger, |p| {
+pub fn dialog_trigger(trigger: impl Into<Div>) -> Part<()> {
+    Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let dialog = DialogContext::find();
@@ -136,9 +138,11 @@ pub fn dialog_trigger(trigger: Div) -> Part<()> {
 }
 
 /// Make `close` close the dialog when pressed (`DialogClose as-child`).
+/// Give `close` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn dialog_close(close: Div) -> Part<()> {
-    Part::new((), close, |p| {
+pub fn dialog_close(close: impl Into<Div>) -> Part<()> {
+    Part::new((), close.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let dialog = DialogContext::find();
@@ -161,9 +165,9 @@ pub fn dialog_overlay() -> Div {
     crate::motion::fade(
         div()
             .named("dialog-overlay")
-            .absolute()
+            .position(Position::Absolute)
             .inset(0.0)
-            .bg(Color::BLACK.opacity(0.8)),
+            .background(Color::BLACK.opacity(0.8)),
     )
 }
 
@@ -293,14 +297,17 @@ pub(crate) fn return_focus(open: impl Fn() -> bool + 'static, take: bool, trigge
 pub(crate) fn modal_layer(dialog: DialogContext, look: ModalLook, content: Div) -> Element {
     let t = theme();
     let frame = if look.centred {
-        div().flex().items_center().justify_center()
+        div()
+            .display(Display::Flex)
+            .align_items(Align::Center)
+            .justify_content(Justify::Center)
     } else {
         div()
     };
     let overlay = dialog_overlay().when_some(look.overlay_ms, Div::duration_ms);
     let root = frame
         .named("dialog-portal")
-        .size_full()
+        .size(pct(100.0))
         .text_color(t.foreground)
         .on_key_down(move |e| {
             let escape = e.is(NamedKey::Escape);
@@ -313,24 +320,26 @@ pub(crate) fn modal_layer(dialog: DialogContext, look: ModalLook, content: Div) 
             o.on_mouse_down(move |_| dialog.set_open(false))
         }))
         .child(content);
-    deferred(Placement::Fill, root).into_element()
+    deferred(Positioning::Fill, root).into_element()
 }
 
 /// The close button in a modal's top-right corner: an X at 70% opacity.
 fn corner_close(dialog: DialogContext) -> Div {
     let t = theme();
+    let i = Interaction::new();
+    let ring = Ring::new(2.0, t.ring);
     div()
         .named("dialog-close")
-        .absolute()
-        .top(4.0)
-        .right(4.0)
-        .rounded_xs()
-        .opacity(0.7)
-        .transition_opacity()
-        .cursor_pointer()
+        .interaction(i)
+        .position(Position::Absolute)
+        .top(16.0)
+        .right(16.0)
+        .radius(2.0)
+        .opacity(move || if i.hovered() || i.focused() { 1.0 } else { 0.7 })
+        .transition(Properties::OPACITY)
+        .cursor(Cursor::Pointer)
         .focusable()
-        .hover(|s| s.opacity(1.0))
-        .focus(move |s| s.opacity(1.0).ring(2.0, t.ring))
+        .ring(move || i.focused().then_some(ring))
         .aria_label("Close")
         .on_click(move |_| dialog.set_open(false))
         .child(icon(Icon::X))
@@ -364,44 +373,54 @@ impl Part<ModalContentProps> {
 pub(crate) fn centred_surface() -> Div {
     let t = theme();
     div()
-        .animate(Animation::enter().fade(0.0).zoom(0.95))
-        .animate_out(Animation::exit().fade(0.0).zoom(0.95))
+        .animation(Animation::enter().fade(0.0).zoom(0.95))
+        .exit_animation(Animation::exit().fade(0.0).zoom(0.95))
         .duration_ms(200.0)
-        .bg(t.background)
-        .grid()
+        .background(t.background)
+        .display(Display::Grid)
         // `w-full max-w-[calc(100%-2rem)] sm:max-w-lg`: the window less
         // 1rem a side, at most 32rem (where the window is narrower than
         // `sm`, the calc is the smaller of the two, as in CSS).
-        .w_len(Length::Calc {
+        .width(Length::Calc {
             fraction: 1.0,
             px: -32.0,
         })
-        .gap(4.0)
-        .rounded_lg()
-        .border()
+        .gap(16.0)
+        .radius(10.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(6.0)
-        .shadow_lg()
-        .max_w(128.0)
+        .padding(24.0)
+        .shadow(crate::popover::LIFTED_SHADOW)
+        .max_width(512.0)
 }
 
 #[must_use]
 pub fn dialog_header() -> Div {
-    div().named("dialog-header").flex_col().gap(2.0).text_left()
+    div()
+        .named("dialog-header")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .text_align(TextAlign::Left)
 }
 
 #[must_use]
 pub fn dialog_footer() -> Div {
-    div().named("dialog-footer").flex_row().gap(2.0).justify_end()
+    div()
+        .named("dialog-footer")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Row)
+        .gap(8.0)
+        .justify_content(Justify::End)
 }
 
 #[must_use]
 pub fn dialog_title(title: impl Into<String>) -> Text {
     text(title)
         .named("dialog-title")
-        .text_lg()
-        .leading_none()
-        .font_semibold()
+        .text_size(18.0)
+        .line_height(LineHeight::Relative(1.0))
+        .font_weight(600)
 }
 
 #[must_use]
@@ -410,7 +429,8 @@ pub fn dialog_description(description: impl Into<String>) -> Text {
     text(description)
         .named("dialog-description")
         .text_color(t.muted_foreground)
-        .text_sm()
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 #[cfg(test)]
@@ -421,30 +441,31 @@ mod tests {
     /// A page with a focusable box, `before`, and a dialog opened by `open`,
     /// with a trigger when `trigger` holds; its content focuses `inner`.
     fn page(open: Signal<bool>, before: FocusHandle, inner: FocusHandle, trigger: Signal<bool>) -> Scenario {
-        let mut s = Scenario::measuring(
-            move || {
-                div()
-                    .flex_col()
-                    .child(div().named("before").w_px(40.0).h_px(20.0).track_focus(before))
-                    .child(
-                        dialog()
-                            .open(open)
-                            .child(
-                                trigger.get().then(|| {
-                                    dialog_trigger(div().named("trigger").w_px(80.0).h_px(20.0).child("Open"))
-                                }),
-                            )
-                            .child(
-                                dialog_content().child(div().named("inner").w_px(40.0).h_px(20.0).track_focus(inner)),
-                            ),
-                    )
-                    .into_element()
-            },
-            400,
-            300,
-            1.0,
-        )
-        .expect("a scenario");
+        let mut s =
+            Scenario::measuring(
+                move || {
+                    div()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .child(div().named("before").width(40.0).height(20.0).track_focus(before))
+                        .child(
+                            dialog()
+                                .open(open)
+                                .child(trigger.get().then(|| {
+                                    dialog_trigger(div().named("trigger").width(80.0).height(20.0).child("Open"))
+                                }))
+                                .child(
+                                    dialog_content()
+                                        .child(div().named("inner").width(40.0).height(20.0).track_focus(inner)),
+                                ),
+                        )
+                        .into_element()
+                },
+                400,
+                300,
+                1.0,
+            )
+            .expect("a scenario");
         s.settle().expect("settled");
         s
     }

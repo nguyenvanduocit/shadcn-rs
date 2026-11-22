@@ -51,68 +51,116 @@ pub fn render() -> Render {
         page(
             "Scroll Fade",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "ScrollFadeDemo.vue",
-                    frame()
-                        .mx_auto()
-                        .w_full()
-                        .max_w_px(320.0)
-                        .child(rows(numbered(12)).scroll_fade().h(72.0)),
+                    frame().margin_x(Length::Auto).width(pct(100.0)).max_width(320.0).child(
+                        rows(numbered(12))
+                            .mask(ScrollFade {
+                                axis: Axis::Vertical,
+                                start: true,
+                                end: true,
+                                size: None,
+                            })
+                            .height(288.0),
+                    ),
                 ))
                 .child(demo(
                     "ScrollFadeEdgeDemo.vue",
                     div()
-                        .mx_auto()
-                        .flex_col()
-                        .max_w_px(320.0)
-                        .min_w_px(0.0)
-                        .gap(6.0)
+                        .margin_x(Length::Auto)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .max_width(320.0)
+                        .min_width(0.0)
+                        .gap(24.0)
                         .child(labelled(
-                            frame().child(rows(TASKS.map(String::from)).scroll_fade_t().h(36.0)),
+                            frame().child(
+                                rows(TASKS.map(String::from))
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: true,
+                                        end: false,
+                                        size: None,
+                                    })
+                                    .height(144.0),
+                            ),
                             "scroll-fade-t",
                         ))
                         .child(labelled(
-                            frame().child(rows(TASKS.map(String::from)).scroll_fade_b().h(36.0)),
+                            frame().child(
+                                rows(TASKS.map(String::from))
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: false,
+                                        end: true,
+                                        size: None,
+                                    })
+                                    .height(144.0),
+                            ),
                             "scroll-fade-b",
                         ))
                         .child(labelled(
-                            frame().child(tags(TEAMS.iter().take(8), Tag::Pill).scroll_fade_s()),
+                            frame().child(tags(TEAMS.iter().take(8), Tag::Pill).mask(ScrollFade {
+                                axis: Axis::Horizontal,
+                                start: true,
+                                end: false,
+                                size: None,
+                            })),
                             "scroll-fade-s",
                         ))
                         .child(labelled(
-                            frame().child(tags(TEAMS.iter().take(8), Tag::Pill).scroll_fade_e()),
+                            frame().child(tags(TEAMS.iter().take(8), Tag::Pill).mask(ScrollFade {
+                                axis: Axis::Horizontal,
+                                start: false,
+                                end: true,
+                                size: None,
+                            })),
                             "scroll-fade-e",
                         )),
                 ))
                 .child(demo(
                     "ScrollFadeHorizontalDemo.vue",
-                    frame()
-                        .mx_auto()
-                        .w_full()
-                        .max_w_px(320.0)
-                        .child(tags(TEAMS.iter(), Tag::Chip).scroll_fade_x()),
+                    frame().margin_x(Length::Auto).width(pct(100.0)).max_width(320.0).child(
+                        tags(TEAMS.iter(), Tag::Chip).mask(ScrollFade {
+                            axis: Axis::Horizontal,
+                            start: true,
+                            end: true,
+                            size: None,
+                        }),
+                    ),
                 ))
                 .child(demo(
                     "ScrollFadeRTLDemo.vue",
                     div()
-                        .mx_auto()
-                        .grid()
-                        .w_full()
-                        .max_w_px(512.0)
-                        .gap(6.0)
-                        .grid_cols(2)
+                        .margin_x(Length::Auto)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(512.0)
+                        .gap(24.0)
+                        .grid_columns(Tracks::repeat(2, Track::Fr(1.0)))
                         .child(labelled(
                             frame()
-                                .dir_ltr()
-                                .child(tags(TEAMS.iter().take(10), Tag::Chip).scroll_fade_x()),
+                                .direction(Direction::Ltr)
+                                .child(tags(TEAMS.iter().take(10), Tag::Chip).mask(ScrollFade {
+                                    axis: Axis::Horizontal,
+                                    start: true,
+                                    end: true,
+                                    size: None,
+                                })),
                             "dir=\"ltr\"",
                         ))
                         .child(labelled(
                             frame()
-                                .dir_rtl()
-                                .child(tags(RTL_TEAMS.iter(), Tag::Chip).scroll_fade_x()),
+                                .direction(Direction::Rtl)
+                                .child(tags(RTL_TEAMS.iter(), Tag::Chip).mask(ScrollFade {
+                                    axis: Axis::Horizontal,
+                                    start: true,
+                                    end: true,
+                                    size: None,
+                                })),
                             "dir=\"rtl\"",
                         )),
                 ))
@@ -120,31 +168,73 @@ pub fn render() -> Render {
                     "ScrollFadeNoneDemo.vue",
                     column()
                         .child(labelled(
-                            frame().child(rows(numbered(8)).scroll_fade().h(48.0)),
+                            frame().child(
+                                rows(numbered(8))
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: true,
+                                        end: true,
+                                        size: None,
+                                    })
+                                    .height(192.0),
+                            ),
                             "scroll-fade",
                         ))
                         .child(labelled(
-                            frame().child(rows(numbered(8)).scroll_fade().scroll_fade_none().h(48.0)),
+                            frame().child(
+                                rows(numbered(8))
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: true,
+                                        end: true,
+                                        size: None,
+                                    })
+                                    .mask(None)
+                                    .height(192.0),
+                            ),
                             "scroll-fade scroll-fade-none",
                         )),
                 ))
                 .child(demo(
                     "ScrollFadeOverflowDemo.vue",
                     frame()
-                        .mx_auto()
-                        .w_full()
-                        .max_w_px(320.0)
-                        .child(rows(numbered(3)).scroll_fade()),
+                        .margin_x(Length::Auto)
+                        .width(pct(100.0))
+                        .max_width(320.0)
+                        .child(rows(numbered(3)).mask(ScrollFade {
+                            axis: Axis::Vertical,
+                            start: true,
+                            end: true,
+                            size: None,
+                        })),
                 ))
                 .child(demo(
                     "ScrollFadeSizeDemo.vue",
                     column()
                         .child(labelled(
-                            frame().child(rows(numbered(8)).scroll_fade().scroll_fade_size(4.0).h(48.0)),
+                            frame().child(
+                                rows(numbered(8))
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: true,
+                                        end: true,
+                                        size: Some(16.0),
+                                    })
+                                    .height(192.0),
+                            ),
                             "scroll-fade-4",
                         ))
                         .child(labelled(
-                            frame().child(rows(numbered(8)).scroll_fade().scroll_fade_size(24.0).h(48.0)),
+                            frame().child(
+                                rows(numbered(8))
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: true,
+                                        end: true,
+                                        size: Some(96.0),
+                                    })
+                                    .height(192.0),
+                            ),
                             "scroll-fade-24",
                         )),
                 )),
@@ -160,34 +250,49 @@ fn numbered(n: usize) -> Vec<String> {
 /// `overflow-hidden rounded-2xl border`: the card a list scrolls in.
 fn frame() -> Div {
     div()
-        .overflow_hidden()
-        .rounded_2xl()
-        .border()
+        .overflow(Overflow::Hidden)
+        .radius(18.0)
+        .border(1.0)
         .border_color(theme().border)
 }
 
 /// `mx-auto flex w-full max-w-xs min-w-0 flex-col gap-6`.
 fn column() -> Div {
     div()
-        .mx_auto()
-        .flex_col()
-        .w_full()
-        .max_w_px(320.0)
-        .min_w_px(0.0)
-        .gap(6.0)
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(320.0)
+        .min_width(0.0)
+        .gap(24.0)
 }
 
 /// A scrolling list of `rounded-lg bg-muted px-3 py-2.5 text-sm` rows
 /// (`scrollbar-none overflow-y-auto` around `flex flex-col gap-1.5 p-1.5`).
 fn rows(labels: impl IntoIterator<Item = String>) -> Div {
     let t = theme();
-    div().scrollbar_none().overflow_y_scroll().child(
-        div().flex_col().gap(1.5).p(1.5).children(
-            labels
-                .into_iter()
-                .map(|label| div().rounded_lg().bg(t.muted).px(3.0).py(2.5).text_sm().child(label)),
-        ),
-    )
+    div()
+        .scrollbar_hidden(true)
+        .overflow_y(Overflow::Scroll)
+        .overflow_x(Overflow::Hidden)
+        .child(
+            div()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(6.0)
+                .padding(6.0)
+                .children(labels.into_iter().map(|label| {
+                    div()
+                        .radius(10.0)
+                        .background(t.muted)
+                        .padding_x(12.0)
+                        .padding_y(10.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .child(label)
+                })),
+        )
 }
 
 /// How a demo draws its tags.
@@ -203,34 +308,51 @@ enum Tag {
 /// (`scrollbar-none overflow-x-auto` around `flex w-max gap-1.5 p-1.5`).
 fn tags<'a>(labels: impl IntoIterator<Item = &'a &'a str>, look: Tag) -> Div {
     let t = theme();
-    div().scrollbar_none().overflow_x_scroll().child(
-        // `w-max` in block flow: an inline flex row of tags that do not
-        // shrink is exactly as wide as they are.
-        div()
-            .inline_flex()
-            .gap(1.5)
-            .p(1.5)
-            .children(labels.into_iter().map(|&label| {
-                let tag = div().shrink_0().bg(t.muted).py(2.5).text_sm().child(label);
-                match look {
-                    Tag::Pill => tag.rounded_xl().px(4.0),
-                    Tag::Chip => tag.rounded_lg().px(3.0),
-                }
-            })),
-    )
+    div()
+        .scrollbar_hidden(true)
+        .overflow_x(Overflow::Scroll)
+        .overflow_y(Overflow::Hidden)
+        .child(
+            // `w-max` in block flow: an inline flex row of tags that do not
+            // shrink is exactly as wide as they are.
+            div()
+                .display(Display::Flex)
+                .inline(true)
+                .gap(6.0)
+                .padding(6.0)
+                .children(labels.into_iter().map(|&label| {
+                    let tag = div()
+                        .flex_shrink(0.0)
+                        .background(t.muted)
+                        .padding_y(10.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .child(label);
+                    match look {
+                        Tag::Pill => tag.radius(14.0).padding_x(16.0),
+                        Tag::Chip => tag.radius(10.0).padding_x(12.0),
+                    }
+                })),
+        )
 }
 
 /// `content` over the utility it shows (`flex flex-col gap-3`).
 fn labelled(content: Div, label: &str) -> Div {
-    div().flex_col().gap(3.0).child(content).child(caption(label))
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
+        .child(content)
+        .child(caption(label))
 }
 
 /// `<p class="text-center font-mono text-xs text-muted-foreground">`.
 fn caption(label: &str) -> Text {
     text(label)
-        .text_center()
-        .font_mono()
-        .text_xs()
+        .text_align(TextAlign::Center)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(12.0)
+        .line_height(16.0)
         .text_color(theme().muted_foreground)
 }
 

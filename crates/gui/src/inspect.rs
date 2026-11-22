@@ -273,10 +273,10 @@ fn updated(was: &FrameNode, now: &FrameNode) -> Option<Change> {
 #[must_use]
 pub fn describe(node: &FrameNode) -> String {
     let what = match &node.content {
-        Content::Text { content, .. } => format!("Text {:?}", clip(content)),
+        Content::Text { content, .. } => format!("Text {:?}", clip(&crate::text::readable(content))),
         Content::Icon { icon, .. } => format!("Icon {}", icon.name()),
         Content::Input { edit, .. } => format!("Input {:?}", clip(&edit.text)),
-        Content::Shapes(shapes) => format!("Shapes x{}", shapes.len()),
+        Content::Figures(shapes) => format!("Figures x{}", shapes.len()),
         Content::Drawn(_) => "Drawing".to_owned(),
         Content::Image { source, .. } => {
             let (w, h) = source.size();
@@ -335,7 +335,7 @@ pub fn find_text<'a>(nodes: &'a [FrameNode], text: &str) -> Option<&'a FrameNode
     nodes.iter().find(|r| match &r.content {
         Content::Text { content, .. } => content == text,
         Content::Input { edit, placeholder, .. } => edit.text == text || (edit.text.is_empty() && placeholder == text),
-        Content::Icon { .. } | Content::Shapes(_) | Content::Drawn(_) | Content::Image { .. } | Content::None => false,
+        Content::Icon { .. } | Content::Figures(_) | Content::Drawn(_) | Content::Image { .. } | Content::None => false,
     })
 }
 
@@ -420,6 +420,16 @@ pub struct Footprint {
     /// What the thread that built this frame allocated while building it
     /// (ADR-0023): the frame's allocation budget is judged by it.
     pub thread: Option<ThreadHeap>,
+    /// What that thread allocated of it before paint recorded the frame:
+    /// taking the input state in, running the bindings, laying out.
+    pub built: Option<ThreadHeap>,
+    /// What recording the frame's paint allocated of it: the display
+    /// lists of the chunks recorded again and the commit that carries them.
+    pub recorded: Option<ThreadHeap>,
+    /// What handing the commit to its target allocated on this thread:
+    /// the render thread's link sends it; a headless target composes and
+    /// draws it here, the render thread's work in an app.
+    pub committed: Option<ThreadHeap>,
 }
 
 impl Footprint {
@@ -755,7 +765,7 @@ mod tests {
     use crate::text::TextSystem;
 
     fn card(key: u64, label: &str) -> Element {
-        div().key(key).h_px(40.0).child(text(label)).into_element()
+        div().key(key).height(40.0).child(text(label)).into_element()
     }
 
     fn frame(cards: Vec<Element>) -> Vec<FrameNode> {

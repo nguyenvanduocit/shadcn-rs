@@ -7,7 +7,8 @@
 //! held, and lays out again only what changed, Taffy's algorithms reading
 //! the tree through its low-level traits ([`engine`]). Interactive state
 //! from the last frame (hover, press, focus, scroll offsets) is applied
-//! first, as style refinements and offsets. [`Deferred`] subtrees are laid
+//! first: each node's [`Interaction`](crate::Interaction) flags written
+//! before its bindings run, and its scroll offsets. [`Deferred`] subtrees are laid
 //! out afterwards, each on a layer of its own (a root of its own), placed
 //! against their anchor and kept inside the window.
 
@@ -39,7 +40,7 @@ pub const STACK: usize = 64 << 20;
 
 use crate::color::Color;
 use crate::edit::{TextEdit, TextField};
-use crate::element::{Common, Deferred, Element, ElementKey, Handler, Handlers, InputMode, Placement, Semantics};
+use crate::element::{Common, Deferred, Element, ElementKey, Handler, Handlers, InputMode, Positioning, Semantics};
 use crate::events::ClickEvent;
 use crate::focus::{FocusHandle, FocusId};
 use crate::geometry::{Bounds, NodePath, PathSeg};
@@ -48,10 +49,10 @@ use crate::motion::Motion;
 use crate::placement::{EDGE_MARGIN, fitted_height, over, placed, position};
 use crate::scroll::{ScrollChild, ScrollHandle, ScrollLayout};
 use crate::style::{
-    Corners, Cursor, Direction, Display, Edges, Effects, Length, Opened, Overflow, Painted, Position, ResolvedText,
-    Ring, Shadow, Style, TextAlign,
+    ContentStyle, Corners, Cursor, Direction, Display, Edges, Effects, Length, Overflow, Painted, Position,
+    ResolvedText, Ring, Style, TextAlign,
 };
-use crate::text::{Paragraph, Run, TextSystem};
+use crate::text::{InlineSlot, Paragraph, Run, TextSystem};
 
 /// A node of the retained tree.
 pub type Node = engine::Node<BoxStyle, Leaf>;
@@ -62,9 +63,14 @@ pub struct Look {
     pub background: Option<Color>,
     pub border: Edges<f32>,
     pub border_color: Option<Color>,
-    pub radius: Corners,
-    pub shadows: Vec<Shadow>,
+    /// Its shape as asked; paint resolves its radii against the box it
+    /// paints (`Shape::used`).
+    pub shape: crate::shape::Shape,
+    pub shadows: crate::style::Shadows,
     pub ring: Option<Ring>,
+    pub decoration: crate::shape::Decoration,
+    /// How far past its border box it takes the pointer.
+    pub hit_slop: Edges<f32>,
     /// Its own opacity (CSS `opacity`): below 1 it and its children paint
     /// aside as one group, composited at it, so an ancestor's is not theirs.
     pub opacity: f32,
@@ -72,8 +78,9 @@ pub struct Look {
     pub effects: Effects,
     /// The scale and turn its painting takes, with its children's.
     pub transform: Painted,
-    /// The inherited text properties the effects resolve against
-    /// (`currentColor`, the `ch` unit).
+    /// The content provided to the node that its effects resolve against
+    /// (`currentColor`, the `ch` unit); without effects, its shape alone
+    /// (no colour).
     pub text: ResolvedText,
 }
 
@@ -86,13 +93,18 @@ pub enum Content {
         text: ResolvedText,
         /// Parts of `content` styled on their own; empty when it has one style.
         runs: Vec<Run>,
+        /// The boxes of its atomic inlines ([`crate::Text::child`]) in its
+        /// lines, each on a [`crate::text::OBJECT`] of `content`: its
+        /// children, which paint themselves. [`crate::text::readable`]
+        /// gives `content` without them.
+        boxes: Vec<InlineSlot>,
     },
     Icon {
         icon: Icon,
         color: Color,
         stroke_width: f32,
     },
-    Shapes(Vec<crate::shape::Shape>),
+    Figures(Vec<crate::figure::Figure>),
     /// A picture laid into the content box when painted.
     Drawn(crate::chunk::Drawing),
     Image {
@@ -139,7 +151,7 @@ pub struct Moving {
     pub curves: std::sync::Arc<crate::motion::Curves>,
     pub transform: crate::style::Transform,
     pub above: (f32, f32),
-    pub(crate) opened: crate::style::Opened,
+    pub(crate) opened: Option<crate::placement::Placement>,
 }
 
 impl PartialEq for Moving {
@@ -178,6 +190,8 @@ pub struct FrameNode {
     pub clip: Option<Bounds>,
     /// The corner radii of that clip (the clipping ancestor's inner corners).
     pub clip_radius: Corners,
+    /// Those corners' curve (the clipping ancestor's [`crate::Shape::curve`]).
+    pub clip_curve: f32,
     /// The node whose padding box set `clip`: the clip property's owner.
     pub clipper: Option<usize>,
     /// 0 for the main tree; each deferred subtree is one higher than the last.
@@ -203,6 +217,8 @@ pub struct Behaviour {
     /// Holds this scroll container's offset.
     pub(crate) scroll: Option<ScrollHandle>,
     pub(crate) semantics: Semantics,
+    /// Where hit testing and focus write what they do to the node.
+    pub(crate) interaction: Option<crate::interact::Interaction>,
 }
 
 /// A span of a text node that takes clicks or sets the cursor.
@@ -264,7 +280,9 @@ pub(crate) struct Changed {
 /// last rebuilt (nodes came, went or moved, and every index may be another).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Changes {
-    /// Rebuilds so far, and log entries dropped before `log` (a reader past them reads everything).
+    /// Which rebuild of which frame it describes, unique in the thread: a
+    /// new one at each rebuild, and when log entries are dropped before
+    /// `log` (a reader past them reads everything). 0 for a frame never built.
     epoch: u64,
     pub(crate) log: Vec<Changed>,
 }
@@ -281,15 +299,29 @@ pub(crate) struct ReadAt {
 impl Changes {
     /// The frame was rebuilt: what readers held of it by index means nothing.
     pub(crate) fn rebuilt(&mut self) {
-        self.epoch = self.epoch.wrapping_add(1);
+        thread_local! {
+            static EPOCHS: Cell<u64> = const { Cell::new(0) };
+        }
+        self.epoch = EPOCHS.with(|e| {
+            let next = e.get().wrapping_add(1).max(1);
+            e.set(next);
+            next
+        });
         self.log.clear();
     }
 
     /// Keep the log no longer than the frame it describes, twice over: a
-    /// reader that fell further behind reads the whole frame.
+    /// reader that fell further behind reads the whole frame. It holds room
+    /// for that many at once, so logging a change (a hover's repaint)
+    /// allocates nothing while the frame keeps its size.
     pub(crate) fn trim(&mut self, nodes: usize) {
-        if self.log.len() > nodes.saturating_mul(2).saturating_add(64) {
+        let most = nodes.saturating_mul(2).saturating_add(64);
+        if self.log.len() > most {
             self.rebuilt();
+        }
+        if self.log.capacity() < most {
+            self.log
+                .reserve_exact(most.saturating_add(1).saturating_sub(self.log.len()));
         }
     }
 
@@ -312,9 +344,16 @@ impl Frame {
         self.behaviour.get(i).map(|b| &**b)
     }
 
+    /// Which build of which frame its node indices are of: the same while
+    /// nodes are only written in place, another once they came, went or
+    /// moved (in any frame of the thread).
+    pub(crate) fn epoch(&self) -> u64 {
+        self.changes.epoch
+    }
+
     /// The boxes of the nodes that act on the pointer (a click, press, drag
-    /// or hover handler, a cursor of their own, focus or a text field), in
-    /// paint order: where a hover can change what the screen shows.
+    /// or hover handler, a cursor of their own, focus, a text field or an
+    /// [`Interaction`](crate::Interaction) their look reads), in paint order: where a hover can change what the screen shows.
     #[must_use]
     pub fn pointer_targets(&self) -> Vec<Bounds> {
         self.nodes
@@ -329,7 +368,8 @@ impl Frame {
                         || h.hover.is_some()
                         || b.cursor.is_some()
                         || b.focus.is_some()
-                        || b.field.is_some())
+                        || b.field.is_some()
+                        || b.interaction.is_some())
             })
             .map(|(n, _)| n.bounds)
             .collect()
@@ -378,7 +418,7 @@ enum Pending {
     Text { content: String, runs: Vec<Run> },
     Icon { icon: Icon, stroke_width: f32 },
     Input(Box<PendingInput>),
-    Shapes(Vec<crate::shape::Shape>),
+    Figures(Vec<crate::figure::Figure>),
     Drawn(crate::chunk::Drawing),
     Image(crate::image::ImageSource),
 }
@@ -393,57 +433,47 @@ struct PendingInput {
 }
 
 /// A closure bound to signals (ADR-0013's bindings by phase), run with a
-/// tracker of its own: it runs again only when what it read changed or the
-/// element was built anew, and its change dirties its node alone.
-struct Tracked<K: ?Sized, T> {
-    scope: crate::reactive::Scope,
+/// tracker of its own: it runs again only when what it read changed, the
+/// closure is another one, or the input `E` it runs over changed; its
+/// change dirties its node alone.
+struct Tracked<K: ?Sized, T, E = ()> {
     node: crate::reactive::RenderNode,
-    dirty: Rc<Cell<bool>>,
-    memo: Option<(Rc<K>, T)>,
+    memo: Option<(Rc<K>, E, T)>,
 }
 
-impl<K: ?Sized, T: Clone> Tracked<K, T> {
-    fn new(parent: crate::reactive::Scope, marks: &Marks, u: u32) -> Self {
-        let scope = parent.run(crate::reactive::Scope::new);
-        let dirty = Rc::new(Cell::new(false));
-        let mark = Rc::clone(&dirty);
-        let marks = Rc::clone(marks);
-        let node = scope.run(|| {
-            crate::reactive::RenderNode::new(move || {
-                mark.set(true);
-                if let Ok(mut m) = marks.try_borrow_mut() {
-                    m.push((u, need::RESOLVE));
-                }
-                crate::component::frame_due();
-            })
-        });
+impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
+    fn new(marks: &Marks, u: u32) -> Self {
         Self {
-            scope,
-            node,
-            dirty,
+            node: tracker(&resolve_mark(marks, u)),
             memo: None,
         }
     }
 
-    fn get(&mut self, f: &Rc<K>, run: impl FnOnce() -> T) -> T {
-        if let Some((g, v)) = &self.memo
+    fn get_over(&mut self, f: &Rc<K>, input: &E, run: impl FnOnce() -> T) -> T {
+        if let Some((g, e, v)) = &self.memo
             && Rc::ptr_eq(g, f)
-            && !self.dirty.get()
+            && e == input
+            && !self.node.is_marked()
         {
             return v.clone();
         }
-        self.dirty.set(false);
         crate::component::count_binding();
         let v = self.node.track(run);
-        self.memo = Some((Rc::clone(f), v.clone()));
+        self.memo = Some((Rc::clone(f), input.clone(), v.clone()));
         v
     }
 }
 
-impl<K: ?Sized, T> Drop for Tracked<K, T> {
+impl<K: ?Sized, T: Clone> Tracked<K, T> {
+    fn get(&mut self, f: &Rc<K>, run: impl FnOnce() -> T) -> T {
+        self.get_over(f, &(), run)
+    }
+}
+
+impl<K: ?Sized, T, E> Drop for Tracked<K, T, E> {
     fn drop(&mut self) {
         if !std::thread::panicking() {
-            self.scope.dispose();
+            self.node.dispose();
         }
     }
 }
@@ -513,7 +543,156 @@ impl Drop for Tracker {
     }
 }
 
-type StyleBinding = Tracked<dyn Fn(Style) -> Style, Style>;
+/// A node's bound style (ADR-0022): each bound setter's closure runs under
+/// a tracker of its own, so a signal one of them read changing runs that
+/// one again and replays the others from what they last gave (a binding
+/// that reads `focus_visible` does not run on hover). The style is the
+/// fixed style with every write replayed over it in the order it was set;
+/// it is kept, keyed by the writes and the fixed style they replay over (a
+/// node restyled through [`Element::style_mut`] shares its writes with the
+/// node it was cloned from), until one of them or a closure's value changes.
+struct StyleBinding {
+    /// The mark its trackers share: node `u` needs its resolve.
+    mark: crate::reactive::Mark,
+    /// One per write, for those that are bound: what its closure read, and
+    /// what it gave.
+    runs: Vec<Option<BoundRun>>,
+    /// What the replay itself read (a parent's restyle may read signals).
+    replay: BoundRun,
+    /// The writes, the fixed style and the style replayed, as last resolved.
+    memo: Option<(Rc<Vec<crate::value::Op>>, Style, Style)>,
+}
+
+/// One closure's subscription and the value it last gave.
+struct BoundRun {
+    node: crate::reactive::RenderNode,
+    slot: Option<Box<dyn std::any::Any>>,
+}
+
+impl BoundRun {
+    fn new(mark: &crate::reactive::Mark) -> Self {
+        Self {
+            node: tracker(mark),
+            slot: None,
+        }
+    }
+}
+
+impl Drop for BoundRun {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            self.node.dispose();
+        }
+    }
+}
+
+/// A binding's tracker, owned by the binding that holds it (disposed when
+/// it drops), not by a scope of its own: a scope per bound node would cost
+/// an arena node and its list for nothing.
+fn tracker(mark: &crate::reactive::Mark) -> crate::reactive::RenderNode {
+    crate::reactive::detached(|| crate::reactive::RenderNode::marking(mark))
+}
+
+/// What a tracker of node `u`'s resolve runs when something it read
+/// changed: it asks for that resolve. Whether it changed is the tracker's
+/// own flag ([`crate::reactive::RenderNode::is_marked`]), so one mark serves
+/// every tracker of the node.
+fn resolve_mark(marks: &Marks, u: u32) -> crate::reactive::Mark {
+    let marks = Rc::clone(marks);
+    Rc::new(move || {
+        if let Ok(mut m) = marks.try_borrow_mut() {
+            m.push((u, need::RESOLVE));
+        }
+        crate::component::frame_due();
+    })
+}
+
+impl StyleBinding {
+    fn new(marks: &Marks, u: u32) -> Self {
+        let mark = resolve_mark(marks, u);
+        Self {
+            replay: BoundRun::new(&mark),
+            mark,
+            runs: Vec::new(),
+            memo: None,
+        }
+    }
+
+    /// Every tracker it holds.
+    fn nodes(&self) -> impl Iterator<Item = crate::reactive::RenderNode> + '_ {
+        self.runs
+            .iter()
+            .flatten()
+            .map(|r| r.node)
+            .chain(std::iter::once(self.replay.node))
+    }
+
+    /// `base` with `ops` replayed over it: the closures whose reads changed
+    /// (all of them for other writes) run again, alone.
+    fn get(&mut self, ops: &Rc<Vec<crate::value::Op>>, base: &Style) -> Style {
+        let same_ops = self.memo.as_ref().is_some_and(|(o, ..)| Rc::ptr_eq(o, ops));
+        if !same_ops {
+            // Trackers past the writes, or of a write no longer bound,
+            // keep reading nothing.
+            for (k, run) in self.runs.iter_mut().enumerate() {
+                if let Some(r) = run
+                    && ops.get(k).and_then(crate::value::Op::bound).is_none()
+                {
+                    r.node.track(|| ());
+                }
+            }
+        }
+        let mut ran = false;
+        for (k, op) in ops.iter().enumerate() {
+            let Some(b) = op.bound() else { continue };
+            if self.runs.len() <= k {
+                self.runs.resize_with(k.saturating_add(1), || None);
+            }
+            let Some(slot) = self.runs.get_mut(k) else { continue };
+            let run = slot.get_or_insert_with(|| BoundRun::new(&self.mark));
+            if !same_ops || run.node.is_marked() || run.slot.is_none() {
+                crate::component::count_binding();
+                let held = &mut run.slot;
+                run.node.track(|| b.eval(held));
+                ran = true;
+            }
+        }
+        if !ran
+            && !self.replay.node.is_marked()
+            && let Some((_, b, out)) = &self.memo
+            && same_ops
+            && b == base
+        {
+            return out.clone();
+        }
+        let runs = &self.runs;
+        let out = self.replay.node.track(|| {
+            let mut s = base.clone();
+            for (k, op) in ops.iter().enumerate() {
+                match (
+                    op.bound(),
+                    runs.get(k).and_then(Option::as_ref).and_then(|r| r.slot.as_deref()),
+                ) {
+                    (Some(b), Some(v)) => b.write(v, &mut s),
+                    _ => op.apply(&mut s),
+                }
+            }
+            s
+        });
+        match &mut self.memo {
+            Some((o, b, v)) => {
+                if !Rc::ptr_eq(o, ops) {
+                    *o = Rc::clone(ops);
+                }
+                b.clone_from(base);
+                v.clone_from(&out);
+            }
+            None => self.memo = Some((Rc::clone(ops), base.clone(), out.clone())),
+        }
+        out
+    }
+}
+
 type TextBinding = Tracked<dyn Fn() -> String, String>;
 type DrawBinding = Tracked<dyn Fn() -> crate::chunk::Drawing, crate::chunk::Drawing>;
 
@@ -523,10 +702,22 @@ struct Extra {
     path: NodePath,
     kind: u8,
     name: Option<&'static str>,
-    /// What placing and paint read of its resolved style (refinements and
+    /// What placing and paint read of its resolved style (bindings and
     /// motion applied); the layout half is the node's own style.
     style: PaintStyle,
+    /// The content it holds or passes on: what was provided to it with
+    /// what it provides itself ([`ContentStyle`]).
     text: ResolvedText,
+    /// What it provides itself, as last resolved, and what each of its
+    /// spans does: a provider above it changing only what paints (a
+    /// hover colour) is applied from these without resolving it.
+    provides: ContentStyle,
+    span_content: Vec<ContentStyle>,
+    /// One per span, made for a span that binds a property.
+    span_bindings: Vec<Option<StyleBinding>>,
+    /// What each span's bindings gave it at the last resolve (`None` for
+    /// a span that binds nothing); empty when no span binds.
+    span_styles: Vec<Option<Style>>,
     opacity: f32,
     invisible: bool,
     /// Its translation is moving this pass ([`Motion::sample`]): paint
@@ -537,7 +728,6 @@ struct Extra {
     curves: Option<std::sync::Arc<crate::motion::Curves>>,
     content: Pending,
     behaviour: Rc<Behaviour>,
-    focused: bool,
     layer: usize,
     /// Boxed: few nodes bind, and a binding keeps a whole style.
     style_binding: Option<Box<StyleBinding>>,
@@ -587,6 +777,47 @@ impl Drop for Extra {
     }
 }
 
+impl Extra {
+    /// Its background image or mask may paint `currentColor`.
+    fn effects_read_color(&self) -> bool {
+        self.style.effects.background_image.is_some() || self.style.effects.mask.is_some()
+    }
+
+    /// Its frame node shows what of its content only paints (the colour,
+    /// underline, line-through): its text, icon or input draws in it, its
+    /// effects read `currentColor`, or its scrollbar thumb is the colour faded.
+    fn paints_content(&self) -> bool {
+        matches!(
+            self.content,
+            Pending::Text { .. } | Pending::Icon { .. } | Pending::Input(_)
+        ) || self.effects_read_color()
+            || ((self.style.overflow_x == Overflow::Scroll || self.style.overflow_y == Overflow::Scroll)
+                && !self.style.scrollbar_hidden)
+    }
+
+    /// Take a new `inherit` that differs from the one it has only in what
+    /// paints (see [`Inherit::paints_as`]), from what it and its spans
+    /// provide, without resolving it: only its frame node is written again,
+    /// and only when it shows what changed.
+    fn repaint_content(&mut self, inherit: &Inherit) {
+        let text = self.text.painted_as(&inherit.text.provide(&self.provides));
+        let mut changed = text != self.text;
+        if let Pending::Text { runs, .. } = &mut self.content {
+            for (r, own) in runs.iter_mut().zip(&self.span_content) {
+                let t = r.text.painted_as(&text.provide(own));
+                changed |= t != r.text;
+                r.text = t;
+            }
+        }
+        self.text = text;
+        self.mine.text = text;
+        self.inherit = Some(*inherit);
+        if changed && self.paints_content() {
+            self.own |= need::PLACE;
+        }
+    }
+}
+
 /// No slot: the parent of a root.
 const NO_SLOT: u32 = u32::MAX;
 
@@ -597,13 +828,15 @@ struct PaintStyle {
     position: Position,
     overflow_x: Overflow,
     overflow_y: Overflow,
-    scrollbar_none: bool,
+    scrollbar_hidden: bool,
     background: Option<Color>,
     border_color: Option<Color>,
     border_widths: Edges<f32>,
-    radius: Corners<crate::style::Radius>,
-    shadows: Vec<Shadow>,
+    shape: crate::shape::Shape,
+    shadows: crate::style::Shadows,
     ring: Option<Ring>,
+    decoration: crate::shape::Decoration,
+    hit_slop: Edges<f32>,
     transform: crate::style::Transform,
     effects: Effects,
 }
@@ -615,13 +848,15 @@ impl PaintStyle {
             position: style.position,
             overflow_x: style.overflow_x,
             overflow_y: style.overflow_y,
-            scrollbar_none: style.scrollbar_none,
+            scrollbar_hidden: style.scrollbar_hidden,
             background: style.background,
             border_color: style.border_color,
             border_widths: style.border_widths,
-            radius: style.radius,
+            shape: style.shape,
             shadows: style.shadows,
             ring: style.ring,
+            decoration: style.decoration,
+            hit_slop: style.hit_slop,
             transform: style.transform,
             effects: style.effects,
         }
@@ -633,13 +868,23 @@ impl PaintStyle {
     }
 }
 
-/// What a node passes to its children.
+/// What a node passes to its children: the content provided to them
+/// ([`ContentStyle`], with the direction, which alone flows to every node),
+/// whether they are seen, how they are laid out.
 #[derive(Clone, Copy, PartialEq)]
 struct Inherit {
     text: ResolvedText,
     invisible: bool,
     /// It lays its children out in block flow.
     block: bool,
+}
+
+impl Inherit {
+    /// The two differ in what paints alone (a provider's colour): a node
+    /// taking `other` for `self` lays out as it did.
+    fn paints_as(&self, other: &Self) -> bool {
+        self.invisible == other.invisible && self.block == other.block && self.text.shape() == other.text.shape()
+    }
 }
 
 struct LayerTodo {
@@ -659,8 +904,6 @@ struct LayerRoot {
 /// The interactive state the last pass read, to mark what changed since.
 #[derive(Default)]
 struct Seen {
-    hovered: HashSet<NodePath>,
-    active: HashSet<NodePath>,
     scroll: HashMap<NodePath, (f32, f32)>,
     scroll_generation: HashMap<NodePath, u64>,
     focused: Option<FocusId>,
@@ -671,8 +914,6 @@ struct Seen {
 impl Seen {
     fn of(state: &UiState) -> Self {
         Self {
-            hovered: state.hovered.clone(),
-            active: state.active.clone(),
             scroll: state.scroll.clone(),
             scroll_generation: state.scroll_generation.clone(),
             focused: state.focused,
@@ -682,9 +923,7 @@ impl Seen {
     }
 
     fn same_as(&self, state: &UiState) -> bool {
-        self.hovered == state.hovered
-            && self.active == state.active
-            && self.scroll == state.scroll
+        self.scroll == state.scroll
             && self.scroll_generation == state.scroll_generation
             && self.focused == state.focused
             && self.focus_visible == state.focus_visible
@@ -700,6 +939,9 @@ pub struct Visits {
     pub resolved: u64,
     /// Nodes walked by the patch without resolving them again.
     pub walked: u64,
+    /// Of those, nodes that took a provider's new colour (what of the
+    /// content only paints) without resolving ([`ContentStyle`]).
+    pub repainted: u64,
     /// Frame nodes written again.
     pub placed: u64,
     /// Passes that rebuilt the whole frame (nodes came, went or moved
@@ -711,8 +953,8 @@ impl std::fmt::Display for Visits {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "resolved {}  walked {}  placed {}  rebuilt {}",
-            self.resolved, self.walked, self.placed, self.rebuilt
+            "resolved {}  walked {} (repainted {})  placed {}  rebuilt {}",
+            self.resolved, self.walked, self.repainted, self.placed, self.rebuilt
         )
     }
 }
@@ -721,6 +963,7 @@ impl Visits {
     pub fn add(&mut self, o: Self) {
         self.resolved = self.resolved.saturating_add(o.resolved);
         self.walked = self.walked.saturating_add(o.walked);
+        self.repainted = self.repainted.saturating_add(o.repainted);
         self.placed = self.placed.saturating_add(o.placed);
         self.rebuilt = self.rebuilt.saturating_add(o.rebuilt);
     }
@@ -733,7 +976,7 @@ struct LayerMemo {
     part: Option<Bounds>,
     viewport: (f32, f32),
     origin: (f32, f32),
-    placed: Opened,
+    placed: Option<crate::placement::Placement>,
 }
 
 /// The layout tree kept across frames (ADR-0014): the window's root and each
@@ -752,6 +995,11 @@ pub struct LayoutTree {
     /// container tells its handle which child holds focus (a virtual list
     /// keeps that row built, ADR-0021).
     focused: Option<NodePath>,
+    /// The layer the focused node is in: focus within a node is focus at
+    /// or below it in the same layer, as the frame's parents link them.
+    focused_layer: usize,
+    /// The root's path, made once: a pass allocates nothing for it.
+    root_path: NodePath,
     /// The frame as laid out, kept and written in place (ADR-0013).
     frame: Frame,
     /// What signal writes marked since the last pass.
@@ -797,7 +1045,7 @@ fn kind_of(el: &Element) -> u8 {
         Element::Text(_) => 2,
         Element::Icon(_) => 3,
         Element::Input(_) => 4,
-        Element::Shapes(_) => 5,
+        Element::Figures(_) => 5,
         Element::Image(_) => 6,
         Element::Deferred(_) => 7,
         Element::Component(_) => 8,
@@ -858,6 +1106,8 @@ impl LayoutTree {
             stats: Stats::default(),
             visits: Visits::default(),
             focused: None,
+            focused_layer: 0,
+            root_path: NodePath::new([PathSeg::Index(0)].into()),
             frame: Frame::default(),
             marks: Rc::default(),
             probe: crate::reactive::detached(|| crate::reactive::RenderNode::new(|| {})),
@@ -888,6 +1138,24 @@ impl LayoutTree {
     #[must_use]
     pub fn frame(&self) -> &Frame {
         &self.frame
+    }
+
+    /// The index in the frame of the node holding focus `id`.
+    pub(crate) fn focus_index(&self, id: FocusId) -> Option<usize> {
+        let holds = |i: usize| {
+            self.frame
+                .behaviour(i)
+                .and_then(|b| b.focus)
+                .is_some_and(|f| f.id() == id)
+        };
+        let placed = self
+            .by_focus
+            .get(&id)
+            .and_then(|&u| self.extra(u))
+            .and_then(|e| usize::try_from(e.index).ok())
+            .filter(|&i| holds(i));
+        // A node not placed in this frame yet (or no longer): the frame's own word.
+        placed.or_else(|| (0..self.frame.nodes.len()).find(|&i| holds(i)))
     }
 
     /// Whether a node at `path` is in the tree.
@@ -1012,28 +1280,7 @@ impl LayoutTree {
     }
 
     /// Mark `need` on the node at `path`, or on its nearest ancestor in the
-    /// tree when it is not (a node a hover hides or shows).
-    /// Node `path`'s hover (or, `active`, press) changed: only a node that
-    /// refines its style by it resolves again.
-    fn mark_pointer(&mut self, path: &NodePath, active: bool) {
-        if let Some(&u) = self.by_path.get(path) {
-            let refines = self.extra(u).is_none_or(|e| {
-                e.element.common().is_none_or(|c| {
-                    if active {
-                        c.states.active.is_some()
-                    } else {
-                        c.states.hover.is_some()
-                    }
-                })
-            });
-            if refines {
-                self.mark(u, need::RESOLVE);
-            }
-            return;
-        }
-        self.mark_path(path, need::RESOLVE);
-    }
-
+    /// tree when it is not.
     fn mark_path(&mut self, path: &NodePath, need: u8) {
         if let Some(&u) = self.by_path.get(path) {
             self.mark(u, need);
@@ -1082,22 +1329,15 @@ impl LayoutTree {
             self.seen = Some(Seen::of(state));
             return;
         };
-        if seen.hovered != state.hovered {
-            for p in seen.hovered.symmetric_difference(&state.hovered) {
-                self.mark_pointer(p, false);
-            }
-            seen.hovered.clone_from(&state.hovered);
-        }
-        if seen.active != state.active {
-            for p in seen.active.symmetric_difference(&state.active) {
-                self.mark_pointer(p, true);
-            }
-            seen.active.clone_from(&state.active);
-        }
+        // Hover, press and focus reach the nodes' styles through their
+        // `Interaction`s' signals, which hit testing and focus write. What
+        // focus moving changes here is placed: an input's frame node says
+        // whether it holds focus (its caret), and the scroll containers
+        // above the nodes it left and came to keep it in view.
         if seen.focused != state.focused || seen.focus_visible != state.focus_visible {
             for f in [seen.focused, state.focused].into_iter().flatten() {
                 if let Some(&u) = self.by_focus.get(&f) {
-                    self.mark(u, need::RESOLVE);
+                    self.mark(u, need::PLACE);
                     self.mark_scrollers_above(u);
                 }
             }
@@ -1163,11 +1403,13 @@ impl LayoutTree {
                 self.mark_path(p, need::RESOLVE);
             }
         }
-        self.focused = state
+        let found = state
             .focused
             .and_then(|f| self.by_focus.get(&f))
-            .and_then(|&u| self.extra(u))
-            .map(|e| e.path.clone());
+            .and_then(|&u| self.extra(u));
+        let (layer, path) = found.map_or((0, None), |e| (e.layer, Some(e.path.clone())));
+        self.focused_layer = layer;
+        self.focused = path;
         let mut frame = std::mem::take(&mut self.frame);
         frame.viewport = viewport;
         // A pass that rebuilds starts from the frame as it was, for what the
@@ -1179,7 +1421,7 @@ impl LayoutTree {
             invisible: false,
             block: true,
         };
-        let path = NodePath::new([PathSeg::Index(0)].into());
+        let path = self.root_path.clone();
         let resized = self.size != (width, height);
         self.size = (width, height);
         let old = self.root.take();
@@ -1287,9 +1529,9 @@ impl LayoutTree {
             else {
                 continue;
             };
-            let placement = t.deferred.placement;
+            let placement = t.deferred.positioning;
             let part_at = match placement {
-                Placement::Over { anchor_part, .. } => frame_bounds_by_key(&frame, &t.anchor, anchor_part),
+                Positioning::Over { anchor_part, .. } => frame_bounds_by_key(&frame, &t.anchor, anchor_part),
                 _ => None,
             };
             let reuse = memo.filter(|m| {
@@ -1332,6 +1574,10 @@ impl LayoutTree {
                 }
             }
             self.place(&mut frame, &mut node, origin, opened, moved, state, motion, text, write);
+            // What a look in the layer reads: how it was placed.
+            if let Some(report) = t.deferred.placed {
+                crate::reactive::untracked(|| report.set(opened));
+            }
             self.layers.push(LayerRoot {
                 path: t.path,
                 node,
@@ -1413,18 +1659,18 @@ impl LayoutTree {
     fn place_layer(
         &mut self,
         node: &mut Node,
-        placement: Placement,
+        placement: Positioning,
         anchor: Option<Bounds>,
         part_at: Option<Bounds>,
         viewport: Bounds,
         text: &mut TextSystem,
-    ) -> ((f32, f32), Opened) {
+    ) -> ((f32, f32), Option<crate::placement::Placement>) {
         let (width, height) = (viewport.width, viewport.height);
         let mut base = self
             .extra(node.user)
             .and_then(|e| e.base.as_deref().cloned())
             .unwrap_or_default();
-        if placement == Placement::Fill {
+        if placement == Positioning::Fill {
             base.size = taffy::Size {
                 width: Len::Px(width),
                 height: Len::Px(height),
@@ -1452,7 +1698,7 @@ impl LayoutTree {
         let mut size = lay(self, node, base.clone());
         // At least as wide as the anchor, and still as wide as its own min
         // width asks: the width laid out so far already holds that.
-        if let (Placement::Anchored { match_width: true, .. }, Some(a)) = (placement, anchor)
+        if let (Positioning::Anchored { match_width: true, .. }, Some(a)) = (placement, anchor)
             && a.width > size.0
         {
             let mut s = base.clone();
@@ -1460,7 +1706,7 @@ impl LayoutTree {
             size = lay(self, node, s);
         }
         let origin = match (placement, anchor) {
-            (Placement::Over { part, .. }, Some(a)) => {
+            (Positioning::Over { part, .. }, Some(a)) => {
                 let anchor_part = part_at.unwrap_or(a);
                 let part = self.bounds_by_key(node, part).unwrap_or_default();
                 let o = over(a, anchor_part, part, size, viewport);
@@ -1595,13 +1841,16 @@ impl LayoutTree {
             name: None,
             style: PaintStyle::default(),
             text: inherit.text,
+            provides: ContentStyle::default(),
+            span_content: Vec::new(),
+            span_bindings: Vec::new(),
+            span_styles: Vec::new(),
             opacity: 1.0,
             invisible: false,
             translating: false,
             curves: None,
             content: Pending::None,
             behaviour: Rc::default(),
-            focused: false,
             layer,
             style_binding: None,
             text_binding: None,
@@ -1663,6 +1912,21 @@ impl LayoutTree {
             }
             return self.walk(pass, node, el, common);
         }
+        // A provider above changed only what paints (its colour on hover):
+        // the node takes it from what it provides itself, unresolved, and
+        // passes it on to its children the same way. Only the text, icons
+        // and inputs that show it are written again; nothing lays out.
+        if !force
+            && own & need::RESOLVE == 0
+            && let Some(ex) = self.extra_mut(u)
+            && el.ptr_eq(&ex.element)
+            && ex.layer == layer
+            && ex.inherit.as_ref().is_some_and(|i| i.paints_as(inherit))
+        {
+            ex.repaint_content(inherit);
+            self.visits.repainted = self.visits.repainted.saturating_add(1);
+            return self.walk(pass, node, el, common);
+        }
         self.visits.resolved = self.visits.resolved.saturating_add(1);
         let mut ex = self.take_extra(u)?;
         let mut tracker = std::mem::take(&mut ex.resolve);
@@ -1675,12 +1939,16 @@ impl LayoutTree {
             self.put_extra(u, ex);
             return None;
         };
-        let mine_changed = ex.mine != r.mine || ex.inherit.is_none();
+        // What it passes on changed: a change of what paints alone reaches
+        // its children unresolved (above), any other resolves them.
+        let mine_changed = ex.inherit.is_none() || !ex.mine.paints_as(&r.mine);
         ex.mine = r.mine;
         ex.element = el.clone();
         ex.inherit = Some(*inherit);
         let visit = !common.joins.is_empty()
-            || matches!(el, Element::Div(d) if d.kind.iter().any(|c| matches!(c, Element::Deferred(_))));
+            || el
+                .kids()
+                .is_some_and(|k| k.iter().any(|c| matches!(c, Element::Deferred(_))));
         ex.own = (ex.own & !(need::RESOLVE | need::VISIT)) | need::PLACE;
         if visit {
             ex.own |= need::VISIT;
@@ -1700,9 +1968,9 @@ impl LayoutTree {
         let mine = ex.mine;
         self.put_extra(u, ex);
 
-        let (structure, children) = match el {
-            Element::Div(div) => self.patch_children(pass, node, &div.kind, &path, &mine, layer, force || mine_changed),
-            _ => {
+        let (structure, children) = match el.kids() {
+            Some(kids) => self.patch_children(pass, node, kids, &path, &mine, layer, force || mine_changed),
+            None => {
                 let gone = !node.children.is_empty();
                 for c in std::mem::take(&mut node.children) {
                     self.release(c);
@@ -1710,8 +1978,39 @@ impl LayoutTree {
                 (gone, engine::Change::None)
             }
         };
+        let objects = self.lay_objects(node, el);
         self.sum_below(node);
-        Some(node.settle(r.style_changed, r.leaf_changed || structure, children))
+        Some(node.settle(r.style_changed, r.leaf_changed || structure || objects, children))
+    }
+
+    /// Set which of a paragraph's atomic inlines took space (are its
+    /// node's children) in its leaf; whether that changed.
+    fn lay_objects(&self, node: &mut Node, el: &Element) -> bool {
+        let Element::Text(t) = el else { return false };
+        let Some(Leaf::Text { objects, .. }) = &mut node.leaf else {
+            return false;
+        };
+        let segs: Vec<PathSeg> = node
+            .children
+            .iter()
+            .filter_map(|c| self.extra(c.user).and_then(|e| e.path.0.last().copied()))
+            .collect();
+        let laid: Vec<leaf::Object> = t
+            .kind
+            .children
+            .iter()
+            .zip(&t.kind.objects)
+            .enumerate()
+            .map(|(i, (kid, &at))| leaf::Object {
+                at,
+                laid: segs.contains(&kid.key().map_or(PathSeg::Index(i), PathSeg::Key)),
+            })
+            .collect();
+        if *objects == laid {
+            return false;
+        }
+        *objects = laid;
+        true
     }
 
     /// Let go of `node`, a child of `parent` that now takes no space, keeping
@@ -1722,7 +2021,7 @@ impl LayoutTree {
             e.resolve
                 .0
                 .into_iter()
-                .chain(e.style_binding.as_ref().map(|b| b.node))
+                .chain(e.style_binding.iter().flat_map(|b| b.nodes()))
                 .collect()
         });
         if !reads.is_empty() && parent != NO_SLOT {
@@ -1765,7 +2064,7 @@ impl LayoutTree {
         for join in &common.joins {
             join();
         }
-        let Element::Div(div) = el else {
+        let Some(all) = el.kids() else {
             return Some(engine::Change::None);
         };
         let Some((path, mine, layer)) = self.extra(node.user).map(|e| (e.path.clone(), e.mine, e.layer)) else {
@@ -1774,7 +2073,7 @@ impl LayoutTree {
         let mut at = 0_usize;
         let mut reach = engine::Change::None;
         let mut gone: Vec<usize> = Vec::new();
-        for (i, kid) in div.kind.iter().enumerate() {
+        for (i, kid) in all.iter().enumerate() {
             if let Element::Deferred(d) = kid {
                 let seg = kid.key().map_or(PathSeg::Index(i), PathSeg::Key);
                 pass.todo.push_back(LayerTodo {
@@ -1807,6 +2106,7 @@ impl LayoutTree {
                 self.hide(node.user, n);
             }
         }
+        let structure = self.lay_objects(node, el) || structure;
         self.sum_below(node);
         if !structure && reach == engine::Change::None {
             return Some(engine::Change::None);
@@ -1828,7 +2128,7 @@ impl LayoutTree {
         ex: &mut Extra,
     ) -> Option<Resolved> {
         let u = node.user;
-        let (mut style, focused) = self.resolve(pass.state, el, common, ex, u);
+        let (mut style, focused) = self.resolve(pass.state, el, common, ex, u, layer);
         if style.display == Display::None {
             return None;
         }
@@ -1840,7 +2140,13 @@ impl LayoutTree {
         ex.curves = sampled.curves;
         ex.motion |= sampled.kept;
         ex.measures = sampled.measures;
-        let text = inherit.text.inherit(&style.text);
+        // The content provided to it with what it provides itself, in its
+        // direction (which alone flows to every node).
+        let text = ResolvedText {
+            direction: style.direction.unwrap_or(inherit.text.direction),
+            ..inherit.text.provide(&style.content)
+        };
+        ex.provides = style.content;
         let invisible = inherit.invisible || style.invisible;
         if matches!(el, Element::Input(_)) && style.cursor.is_none() {
             style.cursor = Some(Cursor::Text);
@@ -1876,58 +2182,129 @@ impl LayoutTree {
             }
         };
 
-        // What it holds.
+        // What it holds. A span's bound properties replay here, under
+        // the paragraph's own trackers: a signal they read resolves the
+        // paragraph, not the instance that built it.
+        // Into the buffer it kept from its last resolve: a span's colour
+        // changing allocates nothing for it.
+        let mut bound_spans = std::mem::take(&mut ex.span_styles);
+        bound_spans.clear();
+        match el {
+            Element::Text(n) if n.kind.spans.iter().any(|sp| !sp.bindings.is_empty()) => {
+                ex.span_bindings.resize_with(n.kind.spans.len(), || None);
+                let styles = n.kind.spans.iter().zip(ex.span_bindings.iter_mut()).map(|(sp, b)| {
+                    // A span that no longer binds drops its trackers:
+                    // what its old closures read resolves nothing.
+                    let Some(ops) = sp.bindings.ops() else {
+                        *b = None;
+                        return None;
+                    };
+                    Some(
+                        b.get_or_insert_with(|| StyleBinding::new(&self.marks, u))
+                            .get(ops, &sp.style),
+                    )
+                });
+                bound_spans.extend(styles);
+            }
+            _ => ex.span_bindings.clear(),
+        }
+        ex.span_content.clear();
         let runs: Vec<Run> = match el {
             Element::Text(n) => n
                 .kind
                 .spans
                 .iter()
-                .map(|sp| Run {
-                    range: sp.range.clone(),
-                    text: text.inherit(&sp.style.text),
-                    background: sp.style.background,
-                    radius: sp.style.radius.top_left.resolve(text.radius),
-                    padding: sp.style.padding,
+                .enumerate()
+                .map(|(k, sp)| {
+                    let own = match bound_spans.get(k).and_then(Option::as_ref) {
+                        Some(st) => st,
+                        None => &sp.style,
+                    };
+                    ex.span_content.push(own.content);
+                    Run {
+                        range: sp.range.clone(),
+                        text: text.provide(&own.content),
+                        background: own.background,
+                        radius: own.shape.radii().top_left.max(0.0),
+                        padding: own.padding,
+                    }
                 })
                 .collect(),
             _ => Vec::new(),
         };
+        // The spans that act on the pointer, each with its cursor (a bound
+        // one as its binding gave it).
+        fn acting<'a>(
+            spans: &'a [crate::element::SpanSpec],
+            bound: &'a [Option<Style>],
+        ) -> impl Iterator<Item = (usize, Option<Cursor>)> + 'a {
+            spans.iter().enumerate().filter_map(|(k, sp)| {
+                let cursor = bound
+                    .get(k)
+                    .and_then(Option::as_ref)
+                    .map_or(sp.style.cursor, |st| st.cursor);
+                (sp.click.is_some() || cursor.is_some()).then_some((k, cursor))
+            })
+        }
+        // Resolved again from the element it was built from (a binding
+        // changed), it acts as it did unless its cursor or a bound span's
+        // changed: the behaviour stands, and nothing is allocated for it.
+        let same = el.ptr_eq(&ex.element)
+            && ex.behaviour.cursor == style.cursor
+            && match el {
+                Element::Text(n) if !bound_spans.is_empty() => acting(&n.kind.spans, &bound_spans)
+                    .map(|(k, cursor)| (n.kind.spans.get(k).map(|sp| sp.range.start), cursor))
+                    .eq(ex.behaviour.spans.iter().map(|t| (Some(t.range.start), t.cursor))),
+                _ => true,
+            };
         let spans: Vec<SpanTarget> = match el {
-            Element::Text(n) => n
-                .kind
-                .spans
-                .iter()
-                .filter(|sp| sp.click.is_some() || sp.style.cursor.is_some())
-                .map(|sp| SpanTarget {
-                    range: sp.range.clone(),
-                    click: sp.click.clone(),
-                    cursor: sp.style.cursor,
-                    boxes: Vec::new(),
+            Element::Text(_) if same => Vec::new(),
+            Element::Text(n) => acting(&n.kind.spans, &bound_spans)
+                .filter_map(|(k, cursor)| {
+                    let sp = n.kind.spans.get(k)?;
+                    Some(SpanTarget {
+                        range: sp.range.clone(),
+                        click: sp.click.clone(),
+                        cursor,
+                        boxes: Vec::new(),
+                    })
                 })
                 .collect(),
             _ => Vec::new(),
         };
+        ex.span_styles = bound_spans;
         let (content, leaf) = match el {
             Element::Text(n) => {
                 let content = match &n.kind.bound {
                     Some(f) => ex
                         .text_binding
-                        .get_or_insert_with(|| Box::new(Tracked::new(self.scope, &self.marks, u)))
+                        .get_or_insert_with(|| Box::new(Tracked::new(&self.marks, u)))
                         .get(f, || f()),
                     None => n.kind.content.clone(),
+                };
+                // Which inlines took space is known once its children are
+                // patched (`lay_objects`); until then as it was.
+                let objects = match &node.leaf {
+                    Some(Leaf::Text { objects, .. }) if !n.kind.objects.is_empty() => objects.clone(),
+                    _ => Vec::new(),
                 };
                 (
                     Pending::Text {
                         content: content.clone(),
                         runs: runs.clone(),
                     },
-                    Some(Leaf::Text { content, text, runs }),
+                    Some(Leaf::Text {
+                        content,
+                        text,
+                        runs,
+                        objects,
+                    }),
                 )
             }
             Element::Icon(n) => (
                 Pending::Icon {
                     icon: n.kind.icon,
-                    stroke_width: n.kind.stroke_width,
+                    stroke_width: style.stroke_width,
                 },
                 None,
             ),
@@ -1935,8 +2312,8 @@ impl LayoutTree {
                 Pending::Input(Box::new(PendingInput {
                     field: n.kind.field,
                     placeholder: n.kind.placeholder.clone(),
-                    placeholder_color: n.kind.placeholder_color,
-                    selection_color: n.kind.selection_color,
+                    placeholder_color: style.placeholder_color,
+                    selection_color: style.selection_color,
                     multiline: n.kind.multiline,
                     mode: n.kind.mode,
                 })),
@@ -1946,12 +2323,12 @@ impl LayoutTree {
                     multiline: n.kind.multiline,
                 }),
             ),
-            Element::Shapes(n) => (Pending::Shapes(n.kind.clone()), None),
+            Element::Figures(n) => (Pending::Figures(n.kind.clone()), None),
             Element::Drawn(n) => {
                 let f = &n.kind.make;
                 let d = ex
                     .draw_binding
-                    .get_or_insert_with(|| Box::new(Tracked::new(self.scope, &self.marks, u)))
+                    .get_or_insert_with(|| Box::new(Tracked::new(&self.marks, u)))
                     .get(f, || f());
                 (Pending::Drawn(d), None)
             }
@@ -1980,26 +2357,29 @@ impl LayoutTree {
         };
         let focus = focus_of(common, &ex.path).filter(|_| !common.disabled);
         ex.focus_id = focus.map(|h| h.id());
-        ex.behaviour = Rc::new(Behaviour {
-            handlers: common.handlers.clone(),
-            focus,
-            disabled: common.disabled,
-            pass_through: common.pass_through,
-            cursor: style.cursor,
-            field,
-            spans,
-            scroll: common.scroll.clone(),
-            semantics: common.semantics.clone(),
-        });
-        ex.fresh_behaviour = true;
+        if !same {
+            ex.behaviour = Rc::new(Behaviour {
+                handlers: common.handlers.clone(),
+                focus,
+                disabled: common.disabled,
+                pass_through: common.pass_through,
+                cursor: style.cursor,
+                field,
+                spans,
+                scroll: common.scroll.clone(),
+                semantics: common.semantics.clone(),
+                interaction: common.interaction,
+            });
+            ex.fresh_behaviour = true;
+        }
         ex.name = common.name;
         ex.text = text;
         ex.opacity = style.opacity;
         ex.invisible = invisible;
         ex.content = content;
-        ex.focused = focused;
         if focused {
             self.focused = Some(ex.path.clone());
+            self.focused_layer = layer;
         }
         ex.layer = layer;
         let mine = Inherit {
@@ -2173,51 +2553,49 @@ impl LayoutTree {
         (structure, reach)
     }
 
-    fn resolve(&self, state: &UiState, el: &Element, common: &Common, ex: &mut Extra, u: u32) -> (Style, bool) {
-        let mut style = match &common.states.bound {
-            Some(f) => {
+    fn resolve(
+        &self,
+        state: &UiState,
+        el: &Element,
+        common: &Common,
+        ex: &mut Extra,
+        u: u32,
+        layer: usize,
+    ) -> (Style, bool) {
+        let path = &ex.path;
+        let enabled = !common.disabled;
+        let focused = focus_of(common, path).is_some_and(|h| Some(h.id()) == state.focused);
+        // What the node's `Interaction` holds, as the window's input state
+        // has it, before its bindings read it: a handle a render made
+        // starts as the node is, and one the node keeps changes only where
+        // its node did (disabled). Hit testing and focus write the rest.
+        if let Some(i) = common.interaction {
+            let (focused, focus_visible, focus_within) = crate::interact::focus_flags(
+                path,
+                layer,
+                focused,
+                matches!(el, Element::Input(_)),
+                self.focused.as_ref().map(|f| (f, self.focused_layer)),
+                state.focus_visible,
+            );
+            i.write(crate::interact::Flags {
+                hovered: enabled && state.hovered.contains(path),
+                pressed: enabled && state.active.contains(path),
+                focused,
+                focus_visible,
+                focus_within,
+                disabled: !enabled,
+            });
+        }
+        let style = match common.bindings.ops() {
+            Some(ops) => {
                 let base = &common.style;
                 ex.style_binding
-                    .get_or_insert_with(|| Box::new(Tracked::new(self.scope, &self.marks, u)))
-                    .get(f, || f(base.clone()))
+                    .get_or_insert_with(|| Box::new(StyleBinding::new(&self.marks, u)))
+                    .get(ops, base)
             }
             None => common.style.clone(),
         };
-        let path = &ex.path;
-        let is_input = matches!(el, Element::Input(_));
-        if let Element::Div(d) = el
-            && d.kind.iter().any(|c| matches!(c, Element::Icon(_)))
-            && let Some(f) = &common.states.has_icon
-        {
-            style = f(style);
-        }
-        let enabled = !common.disabled;
-        let focused = focus_of(common, path).is_some_and(|h| Some(h.id()) == state.focused);
-        // The refinement first, the path's lookup only when there is one.
-        if enabled
-            && let Some(f) = &common.states.hover
-            && state.hovered.contains(path)
-        {
-            style = f(style);
-        }
-        if enabled
-            && let Some(f) = &common.states.active
-            && state.active.contains(path)
-        {
-            style = f(style);
-        }
-        if focused && let Some(f) = &common.states.focus {
-            style = f(style);
-        }
-        if focused
-            && (state.focus_visible || is_input)
-            && let Some(f) = &common.states.focus_visible
-        {
-            style = f(style);
-        }
-        if !enabled && let Some(f) = &common.states.disabled {
-            style = f(style);
-        }
         (style, focused)
     }
 }
@@ -2242,6 +2620,7 @@ struct Placed {
     /// The clip its children paint inside, its corners, and the node that set it.
     clip: Option<Bounds>,
     clip_radius: Corners,
+    clip_curve: f32,
     clipper: Option<usize>,
     /// It lays its children out in block flow, right to left: the content
     /// box's right edge its in-flow children keep their margin to.
@@ -2283,7 +2662,7 @@ fn location(rtl_block: Option<f32>, position: Position, l: &Layout) -> (f32, f32
 struct From<'p> {
     parent: Option<&'p Placed>,
     origin: (f32, f32),
-    opened: Opened,
+    opened: Option<crate::placement::Placement>,
 }
 
 impl LayoutTree {
@@ -2297,7 +2676,7 @@ impl LayoutTree {
         frame: &mut Frame,
         root: &mut Node,
         origin: (f32, f32),
-        opened: Opened,
+        opened: Option<crate::placement::Placement>,
         moved: bool,
         state: &UiState,
         motion: &mut Motion,
@@ -2455,9 +2834,9 @@ impl LayoutTree {
         let parent = from.parent;
         let opened = from.opened;
         let (x, y) = location(parent.and_then(|p| p.rtl_block), ex.style.position, l);
-        let (base, above, clip, clip_radius, clipper) = parent
-            .map_or((from.origin, (0.0, 0.0), None, Corners::default(), None), |p| {
-                (p.origin, p.offset, p.clip, p.clip_radius, p.clipper)
+        let (base, above, clip, clip_radius, clip_curve, clipper) = parent
+            .map_or((from.origin, (0.0, 0.0), None, Corners::default(), 1.0, None), |p| {
+                (p.origin, p.offset, p.clip, p.clip_radius, p.clip_curve, p.clipper)
             });
         let shift = ex.style.transform.offset((l.size.width, l.size.height), opened);
         // A moving translation is a transform of the property tree (ADR-0016),
@@ -2490,8 +2869,9 @@ impl LayoutTree {
             .inset(l.border.top, l.border.right, l.border.bottom, l.border.left)
             .inset(l.padding.top, l.padding.right, l.padding.bottom, l.padding.left);
         let rtl = ex.text.direction == Direction::Rtl;
-        let rtl_block =
-            (ex.style.display == Display::Block && rtl).then_some(l.size.width - l.padding.right - l.border.right);
+        // A paragraph's children are where its lines put them.
+        let rtl_block = (ex.style.display == Display::Block && rtl && node.leaf.is_none())
+            .then_some(l.size.width - l.padding.right - l.border.right);
 
         let scrolls = ex.style.overflow_x == Overflow::Scroll || ex.style.overflow_y == Overflow::Scroll;
         let mut scroll = None;
@@ -2547,7 +2927,7 @@ impl LayoutTree {
                     applied: (0.0, 0.0),
                     max,
                     generation,
-                    thumb: if ex.style.scrollbar_none {
+                    thumb: if ex.style.scrollbar_hidden {
                         Color::TRANSPARENT
                     } else {
                         ex.text.color.opacity(0.25)
@@ -2575,8 +2955,8 @@ impl LayoutTree {
         if let Some(s) = &mut scroll {
             s.applied = applied;
         }
-        let (child_clip, child_radius, child_clipper) = if ex.style.clips() {
-            let r = ex.style.radius.resolve(ex.text.radius);
+        let (child_clip, child_radius, child_curve, child_clipper) = if ex.style.clips() {
+            let r = ex.style.shape.used(bounds.width, bounds.height);
             let inner = Corners {
                 top_left: (r.top_left - l.border.top.max(l.border.left)).max(0.0),
                 top_right: (r.top_right - l.border.top.max(l.border.right)).max(0.0),
@@ -2586,10 +2966,11 @@ impl LayoutTree {
             (
                 Some(clip.map_or(padding_box, |c| c.intersect(&padding_box))),
                 inner,
+                ex.style.shape.curve(),
                 Some(index),
             )
         } else {
-            (clip, clip_radius, clipper)
+            (clip, clip_radius, clip_curve, clipper)
         };
 
         let content = match &ex.content {
@@ -2598,17 +2979,23 @@ impl LayoutTree {
                 content: content.clone(),
                 text: ex.text,
                 runs: runs.clone(),
+                boxes: match &node.leaf {
+                    Some(Leaf::Text { objects, .. }) if !objects.is_empty() => {
+                        leaf::slots(objects, node.inline_boxes())
+                    }
+                    _ => Vec::new(),
+                },
             },
             Pending::Icon { icon, stroke_width } => Content::Icon {
                 icon: *icon,
                 color: ex.text.color,
                 stroke_width: *stroke_width,
             },
-            Pending::Shapes(shapes) => Content::Shapes(shapes.clone()),
+            Pending::Figures(shapes) => Content::Figures(shapes.clone()),
             Pending::Drawn(d) => Content::Drawn(d.clone()),
             Pending::Image(source) => Content::Image {
                 source: source.clone(),
-                radius: ex.style.radius.resolve(ex.text.radius),
+                radius: ex.style.shape.used(bounds.width, bounds.height),
             },
             Pending::Input(input) => {
                 let (edit, preedit) = input.mode.shown(&input.field.edit.get());
@@ -2619,7 +3006,7 @@ impl LayoutTree {
                     placeholder_color: input.placeholder_color.unwrap_or(ex.text.color.opacity(0.5)),
                     selection_color: input.selection_color.unwrap_or(Color::hex(0x0003_66d6).opacity(0.3)),
                     text: ex.text,
-                    focused: ex.focused,
+                    focused: ex.focus_id.is_some() && ex.focus_id == state.focused,
                     multiline: input.multiline,
                     mode: input.mode,
                 }
@@ -2642,6 +3029,7 @@ impl LayoutTree {
             }),
             clip,
             clip_radius,
+            clip_curve,
             clipper,
             layer: ex.layer,
             parent: parent.map(|p| p.index),
@@ -2649,14 +3037,23 @@ impl LayoutTree {
                 background: ex.style.background,
                 border: ex.style.border_widths,
                 border_color: ex.style.border_color,
-                radius: ex.style.radius.resolve(ex.text.radius),
+                shape: ex.style.shape,
                 shadows: ex.style.shadows.clone(),
                 ring: ex.style.ring,
+                decoration: ex.style.decoration.clone(),
+                hit_slop: ex.style.hit_slop,
                 opacity: ex.opacity,
                 invisible: ex.invisible,
                 effects: ex.style.effects.clone(),
                 transform: ex.style.transform.painted(bounds, opened),
-                text: ex.text,
+                // Its effects alone read the colour (`currentColor`): a box
+                // without them keeps none, and a provider's colour
+                // changing above it repaints only what reads it.
+                text: if ex.effects_read_color() {
+                    ex.text
+                } else {
+                    ex.text.shape()
+                },
             },
             content,
             scroll,
@@ -2667,6 +3064,7 @@ impl LayoutTree {
             offset: (offset.0 + applied.0, offset.1 + applied.1),
             clip: child_clip,
             clip_radius: child_radius,
+            clip_curve: child_curve,
             clipper: child_clipper,
             rtl_block,
         };
@@ -2682,11 +3080,17 @@ fn locate_spans_at(frame: &mut Frame, i: usize, text: &mut TextSystem) {
     if behaviour.spans.is_empty() {
         return;
     }
-    let Content::Text { content, text: t, runs } = &node.content else {
+    let Content::Text {
+        content,
+        text: t,
+        runs,
+        boxes,
+    } = &node.content
+    else {
         return;
     };
     let area = node.content_box;
-    let p = Paragraph::new(content, runs);
+    let p = Paragraph { content, runs, boxes };
     for span in &mut Rc::make_mut(behaviour).spans {
         span.boxes = text
             .selection(p, t, text_width(t, &area), span.range.start, span.range.end)
@@ -2798,6 +3202,7 @@ mod phases;
 mod tests {
     use super::*;
     use crate::element::{IntoElement, Side, SideAlign, deferred, div, text};
+    use crate::prelude::*;
     use crate::styled::Styled;
 
     fn frame(root: impl IntoElement) -> Frame {
@@ -2820,11 +3225,11 @@ mod tests {
     fn flex_row_places_children_side_by_side_with_gap() {
         let f = frame(
             div()
-                .flex()
-                .gap(2.0)
-                .p(4.0)
-                .child(div().named("a").size(10.0))
-                .child(div().named("b").size(10.0)),
+                .display(Display::Flex)
+                .gap(8.0)
+                .padding(16.0)
+                .child(div().named("a").size(40.0))
+                .child(div().named("b").size(40.0)),
         );
         let (a, b) = (find(&f, "a").bounds, find(&f, "b").bounds);
         assert_eq!((a.x, a.y, a.width), (16.0, 16.0, 40.0));
@@ -2833,7 +3238,7 @@ mod tests {
 
     #[test]
     fn text_wraps_inside_a_narrow_box() {
-        let f = frame(div().child(div().named("box").w_px(60.0).child(text("several words that wrap"))));
+        let f = frame(div().child(div().named("box").width(60.0).child(text("several words that wrap"))));
         let b = find(&f, "box").bounds;
         assert!(b.height >= 48.0, "at least two 24px lines: {b}");
     }
@@ -2843,11 +3248,11 @@ mod tests {
         let f = frame(
             div().child(
                 div()
-                    .flex()
-                    .items_start()
-                    .w_px(20.0)
+                    .display(Display::Flex)
+                    .align_items(Align::Start)
+                    .width(20.0)
                     .child(div().named("prefix").child(text("https://")))
-                    .child(div().named("rest").flex_1()),
+                    .child(div().named("rest").flex(Flex::grow(1.0))),
             ),
         );
         let b = find(&f, "prefix").bounds;
@@ -2859,17 +3264,24 @@ mod tests {
     fn a_deferred_layer_opens_below_its_anchor_and_stays_on_screen() {
         let f = frame(
             div()
-                .p(2.0)
-                .child(div().named("anchor").ml(80.0).w_px(60.0).h_px(20.0).child(deferred(
-                    Placement::Anchored {
-                        side: Side::Bottom,
-                        align: SideAlign::Start,
-                        offset: 4.0,
-                        match_width: false,
-                        fit_height: false,
-                    },
-                    div().named("menu").w_px(200.0).h_px(50.0),
-                ))),
+                .padding(8.0)
+                .child(
+                    div()
+                        .named("anchor")
+                        .margin_left(320.0)
+                        .width(60.0)
+                        .height(20.0)
+                        .child(deferred(
+                            Positioning::Anchored {
+                                side: Side::Bottom,
+                                align: SideAlign::Start,
+                                offset: 4.0,
+                                match_width: false,
+                                fit_height: false,
+                            },
+                            div().named("menu").width(200.0).height(50.0),
+                        )),
+                ),
         );
         let anchor = find(&f, "anchor").bounds;
         let menu = find(&f, "menu");
@@ -2891,9 +3303,10 @@ mod tests {
                 .child(
                     div()
                         .named("list")
-                        .h_px(100.0)
-                        .overflow_y_scroll()
-                        .children((0..10).map(|i| div().named(if i == 0 { "first" } else { "item" }).h_px(40.0))),
+                        .height(100.0)
+                        .overflow_y(Overflow::Scroll)
+                        .overflow_x(Overflow::Hidden)
+                        .children((0..10).map(|i| div().named(if i == 0 { "first" } else { "item" }).height(40.0))),
                 )
                 .into_element()
         };
@@ -2919,9 +3332,10 @@ mod tests {
                 .child(
                     div()
                         .named("list")
-                        .h_px(100.0)
-                        .overflow_y_scroll()
-                        .children((0..10).map(|i| div().named(if i == 0 { "first" } else { "item" }).h_px(40.0))),
+                        .height(100.0)
+                        .overflow_y(Overflow::Scroll)
+                        .overflow_x(Overflow::Hidden)
+                        .children((0..10).map(|i| div().named(if i == 0 { "first" } else { "item" }).height(40.0))),
                 )
                 .into_element()
         };
@@ -2974,11 +3388,13 @@ mod tests {
 
     fn spec(r: &mut Rng, depth: usize) -> Spec {
         if depth == 0 || r.below(4) == 0 {
+            // A paragraph, now and then holding elements in its lines.
+            let inline = if depth > 0 && r.below(3) == 0 { r.below(3) } else { 0 };
             return Spec {
                 look: u8::try_from(r.below(8)).unwrap(),
                 key: None,
                 text: Some(words(r)),
-                kids: Vec::new(),
+                kids: (0..inline).map(|_| spec(r, depth - 1)).collect(),
             };
         }
         Spec {
@@ -2996,35 +3412,47 @@ mod tests {
 
     fn built(s: &Spec, keyed: bool) -> Element {
         if let Some(t) = &s.text {
-            let d = div().child(text(t.clone()));
+            let mut seen = HashSet::new();
+            let p = s.kids.iter().fold(text(t.clone()), |p, k| {
+                p.child(built(k, k.key.is_none_or(|key| seen.insert(key))))
+                    .span(" and more")
+            });
+            let d = div().child(p);
             return match s.look % 4 {
-                0 => d.w_px(50.0),
-                1 => d.flex_1(),
-                2 => d.p(1.0),
+                0 => d.width(50.0),
+                1 => d.flex(Flex::grow(1.0)),
+                2 => d.padding(4.0),
                 _ => d,
             }
             .into_element();
         }
         let mut d = match s.look % 8 {
-            0 => div().flex(),
-            1 => div().flex_col(),
-            2 => div().grid().grid_cols(2),
-            3 => div().flex().flex_wrap(),
-            4 => div().block(),
-            5 => div().absolute().top(1.0).left(2.0),
-            6 => div().flex_col().h_px(60.0).overflow_y_scroll(),
+            0 => div().display(Display::Flex),
+            1 => div().display(Display::Flex).flex_direction(FlexDirection::Column),
+            2 => div()
+                .display(Display::Grid)
+                .grid_columns(Tracks::repeat(2, Track::Fr(1.0))),
+            3 => div().display(Display::Flex).flex_wrap(true),
+            4 => div().display(Display::Block),
+            5 => div().position(Position::Absolute).top(4.0).left(8.0),
+            6 => div()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .height(60.0)
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden),
             _ => div(),
         };
         d = match (s.look / 8) % 6 {
-            0 => d.p(2.0),
-            1 => d.gap(1.0).items_center(),
-            2 => d.ml_auto(),
-            3 => d.w_px(120.0),
-            4 => d.justify_between().h_px(40.0),
-            _ => d.max_w_calc(1.0, -20.0),
+            0 => d.padding(8.0),
+            1 => d.gap(4.0).align_items(Align::Center),
+            2 => d.margin_left(Length::Auto),
+            3 => d.width(120.0),
+            4 => d.justify_content(Justify::Between).height(40.0),
+            _ => d.max_width(Length::calc(1.0, -20.0)),
         };
         if s.look >= 60 {
-            d = d.hidden();
+            d = d.display(Display::None);
         }
         if let (Some(k), true) = (s.key, keyed) {
             d = d.key(k);
@@ -3047,7 +3475,7 @@ mod tests {
         match r.below(7) {
             0 => s.look = u8::try_from(r.below(64)).unwrap(),
             1 if s.text.is_some() => s.text = Some(words(r)),
-            2 if s.text.is_none() => {
+            2 => {
                 let at = r.below(s.kids.len() as u64 + 1);
                 s.kids.insert(at, spec(r, 2));
             }
@@ -3071,7 +3499,7 @@ mod tests {
         let mut ts = TextSystem::new();
         let state = UiState::default();
         for step in 0..40 {
-            let el = div().w_full().child(element(&s)).into_element();
+            let el = div().width(pct(100.0)).child(element(&s)).into_element();
             let width = if step % 13 == 12 { 300.0 } else { 400.0 };
             let warm = tree.layout(&el, width, 300.0, &state, &mut Motion::default(), &mut ts);
             let cold = layout(&el, width, 300.0, &state, &mut Motion::default(), &mut ts);
@@ -3116,9 +3544,9 @@ mod tests {
         let mut tree = LayoutTree::new();
         let mut ts = TextSystem::new();
         let el = div()
-            .flex()
+            .display(Display::Flex)
             .child(div().child(text("hello")))
-            .child(div().w_px(10.0))
+            .child(div().width(10.0))
             .into_element();
         let state = UiState::default();
         tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
@@ -3129,17 +3557,29 @@ mod tests {
     /// A table-like tree big enough to be laid out in parallel jobs.
     fn rows(n: usize, tall: usize) -> Element {
         div()
-            .flex_col()
-            .w_px(900.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(900.0)
             .children((0..n).map(|i| {
-                div().grid().grid_cols(4).gap(1.0).children((0..4).map(|c| {
-                    let words = if i == tall {
-                        "a much longer cell that wraps over lines"
-                    } else {
-                        WORDS[(i + c) % 8]
-                    };
-                    div().p(1.0).child(text(format!("{words} {i}.{c}")))
-                }))
+                div()
+                    .display(Display::Grid)
+                    .grid_columns(Tracks::repeat(4, Track::Fr(1.0)))
+                    .gap(4.0)
+                    .children((0..4).map(|c| {
+                        let words = if i == tall {
+                            "a much longer cell that wraps over lines"
+                        } else {
+                            WORDS[(i + c) % 8]
+                        };
+                        let p = text(format!("{words} {i}.{c}"));
+                        // A cell holding an element in its line.
+                        let p = if c == 3 {
+                            p.child(div().width(12.0).height(30.0).child(text("x"))).span(" y")
+                        } else {
+                            p
+                        };
+                        div().padding(4.0).child(p)
+                    }))
             }))
             .into_element()
     }
@@ -3196,5 +3636,144 @@ mod tests {
         }
         // The parallel schedule did run jobs on the pool.
         assert!(jobs > 0 || engine::pool().current_num_threads() < 2);
+    }
+
+    // ── Atomic inlines in a paragraph ───────────────────────────────────────
+
+    /// A paragraph's first baseline and its one line's height, alone.
+    fn strut() -> (f32, f32) {
+        let mut ts = TextSystem::new();
+        let t = crate::style::ResolvedText::root(Color::BLACK);
+        let m = ts.metrics("ab", &t, None);
+        (m.first_baseline.expect("a line"), m.height)
+    }
+
+    fn near(a: f32, b: f32, what: &str) {
+        assert!((a - b).abs() < 1.0, "{what}: {a} is not {b}");
+    }
+
+    #[test]
+    fn a_box_with_a_baseline_sits_on_it_hangs_below_and_grows_the_line() {
+        let (ascent, line) = strut();
+        // A 60px box whose own first line is at its top: its baseline is
+        // the strut's, so it starts at the line's top and hangs 60 - ascent
+        // below the baseline, past the strut's descent.
+        let f = frame(
+            div().width(300.0).child(
+                text("ab ")
+                    .named("p")
+                    .child(div().named("box").width(30.0).height(60.0).child(text("x")))
+                    .span(" cd"),
+            ),
+        );
+        let (p, b) = (find(&f, "p").bounds, find(&f, "box").bounds);
+        assert!(line < 60.0);
+        near(p.height, 60.0, "the line holds the box above and below its baseline");
+        near(b.y - p.y, 0.0, "its baseline on the line's, at the strut's ascent");
+        assert_eq!(b.height, 60.0);
+        let ab = TextSystem::new()
+            .measure("ab ", &crate::style::ResolvedText::root(Color::BLACK), None)
+            .0;
+        near(b.x - p.x, ab, "after the text before it");
+        assert!(ascent > 0.0);
+    }
+
+    #[test]
+    fn a_line_holding_only_a_box_takes_the_strut_and_the_box() {
+        let (ascent, line) = strut();
+        let descent = line - ascent;
+        let only = |h: f32| {
+            let f = frame(
+                div()
+                    .width(300.0)
+                    .child(text("").named("p").child(div().named("box").width(20.0).height(h))),
+            );
+            (find(&f, "p").bounds, find(&f, "box").bounds)
+        };
+        // No line box in it: its bottom edge on the baseline.
+        let (p, b) = only(10.0);
+        near(p.height, ascent.max(10.0) + descent, "a short box: the strut");
+        near(b.y - p.y + b.height, ascent, "its bottom on the baseline");
+        let (p, b) = only(40.0);
+        near(
+            p.height,
+            40.0 + descent,
+            "a tall box above the baseline, the strut's descent below",
+        );
+        near(b.y - p.y, 0.0, "at the line's top");
+    }
+
+    #[test]
+    fn a_box_wraps_with_the_words_around_it() {
+        let para = |w: f32| {
+            let f = frame(
+                div().child(
+                    div().width(w).child(
+                        text("several words before ")
+                            .named("p")
+                            .child(div().named("box").width(40.0).height(10.0)),
+                    ),
+                ),
+            );
+            (find(&f, "p").bounds, find(&f, "box").bounds)
+        };
+        let (wide, at_wide) = para(390.0);
+        let (narrow, at_narrow) = para(150.0);
+        assert!(
+            at_wide.x - wide.x > 100.0,
+            "on the first line after the words: {at_wide}"
+        );
+        assert!(
+            narrow.height > wide.height,
+            "two lines when narrow: {narrow} {at_narrow} vs {wide} {at_wide}"
+        );
+        assert!(at_narrow.y > at_wide.y, "moved down a line: {at_narrow} vs {at_wide}");
+    }
+
+    #[test]
+    fn an_inline_box_sizes_to_fit_and_is_a_node_below_its_paragraph() {
+        let f = frame(
+            div().width(300.0).child(
+                text("see ")
+                    .named("p")
+                    .child(div().named("chip").padding(4.0).child(text("host")))
+                    .span(" here"),
+            ),
+        );
+        let (p, chip) = (find(&f, "p"), find(&f, "chip"));
+        let host = TextSystem::new()
+            .measure("host", &crate::style::ResolvedText::root(Color::BLACK), None)
+            .0;
+        near(chip.bounds.width, host + 8.0, "shrunk to fit its content, not the line");
+        let pi = f.nodes.iter().position(|n| n.name == Some("p")).unwrap();
+        assert_eq!(chip.parent, Some(pi), "the chip is the paragraph's child");
+        let Content::Text { content, boxes, .. } = &p.content else {
+            panic!("a paragraph")
+        };
+        assert_eq!(boxes.len(), 1);
+        assert_eq!(crate::text::readable(content), "see  here");
+    }
+
+    #[test]
+    fn a_changed_inline_box_lays_out_as_a_cold_tree() {
+        let mut tree = LayoutTree::new();
+        let mut ts = TextSystem::new();
+        let state = UiState::default();
+        for w in [20.0, 80.0, 200.0, 20.0] {
+            let el = div()
+                .width(240.0)
+                .child(
+                    text("some words around ")
+                        .child(div().named("box").width(w).height(w / 2.0).child(text("in")))
+                        .span(" a box"),
+                )
+                .into_element();
+            let warm = exact(tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts));
+            let cold = exact(&layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts));
+            assert!(
+                warm == cold,
+                "a {w}px box: the retained tree differs from a cold layout"
+            );
+        }
     }
 }

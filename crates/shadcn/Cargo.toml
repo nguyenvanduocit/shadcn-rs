@@ -23,7 +23,15 @@ irosashi = "0.3.1"
 dhat = { version = "0.3", optional = true }
 
 [features]
+default = ["lucide"]
 dhat-heap = ["dep:dhat"]
+# The icon libraries `Theme.icons` selects from (`shadcn::icons`), as shadcn-vue's icon loader lists them. Each carries
+# only the glyphs of the icon roles, under `assets/icons/<library>/` (licences in THIRD_PARTY.md and deny.toml).
+lucide = []
+tabler = []
+hugeicons = []
+phosphor = []
+remixicon = []
 
 [dev-dependencies]
 # The stress example's `--a11y` feeds each update to the tree a platform

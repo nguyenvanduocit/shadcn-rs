@@ -7,6 +7,11 @@ The code in this repository is MIT (`LICENSE`). It ships, or follows, the work b
 | Inter 4.001 | `crates/gui/assets/Inter.ttf` | SIL Open Font License 1.1 | `crates/gui/assets/LICENSE-Inter.txt` |
 | Geist Mono 1.900 | `crates/gui/assets/GeistMono.ttf` | SIL Open Font License 1.1 | `crates/gui/assets/LICENSE-GeistMono.txt` |
 | Lucide icons (lucide-static 1.77.0; some derived from Feather) | `crates/gui/assets/icons/` | ISC, and MIT for the Feather icons | `crates/gui/assets/icons/LICENSE` |
+| Lucide icons, the glyphs of shadcn's icon roles (lucide-static 1.77.0; some derived from Feather), feature `lucide` | `crates/shadcn/assets/icons/lucide/` | ISC, and MIT for the Feather icons | `crates/shadcn/assets/icons/lucide/LICENSE` |
+| Tabler Icons, outline (@tabler/icons 3.52.0), feature `tabler` | `crates/shadcn/assets/icons/tabler/` | MIT | `crates/shadcn/assets/icons/tabler/LICENSE` |
+| Hugeicons, free stroke set (@hugeicons/core-free-icons 4.4.0, its icon data written as SVG), feature `hugeicons` | `crates/shadcn/assets/icons/hugeicons/` | MIT | `crates/shadcn/assets/icons/hugeicons/LICENSE` |
+| Phosphor Icons, regular (@phosphor-icons/core 2.1.1), feature `phosphor` | `crates/shadcn/assets/icons/phosphor/` | MIT | `crates/shadcn/assets/icons/phosphor/LICENSE` |
+| Remix Icon, line (remixicon 4.8.0, the last release under Apache-2.0; from 4.9.0 it has its own, restrictive licence), feature `remixicon` | `crates/shadcn/assets/icons/remixicon/` | Apache-2.0 | `crates/shadcn/assets/icons/remixicon/LICENSE` |
 | shadcn/ui: the components' design, styles and demo content | `crates/shadcn` | MIT | below |
 | shadcn-vue: the components and demos `crates/shadcn` ports and the verdict compares against | `crates/shadcn` | MIT | below |
 | Geist (variable, Latin subset) | `site/public/fonts/Geist.woff2` | SIL Open Font License 1.1 | `site/public/fonts/LICENSE-Geist.txt` |
@@ -15,7 +20,8 @@ The code in this repository is MIT (`LICENSE`). It ships, or follows, the work b
 | HarfBuzz hb-gpu (Behdad Esfahbod): its Slug fragment shader, ported to the curve text shader | `crates/gui/src/gpu/slug.wgsl` | HarfBuzz's "Old MIT" | below, and at the top of the file |
 
 The Rust crates this workspace depends on carry their own licences; `cargo deny check licenses` (`deny.toml`) lists the
-ones allowed.
+ones allowed. `deny.toml` also clarifies `shadcn`'s licence as `MIT AND ISC AND Apache-2.0`, its code and the icon
+libraries it ships, tied to the hashes of their licence files, so `cargo deny` checks those licences too.
 
 ## shadcn/ui
 

@@ -129,7 +129,11 @@ pub fn resizable_panel_group(direction: Orientation) -> Part<ResizableProps> {
         direction,
         layout: Bind::default(),
     };
-    let root = div().named("resizable-panel-group").flex().h_full().w_full();
+    let root = div()
+        .named("resizable-panel-group")
+        .display(Display::Flex)
+        .height(pct(100.0))
+        .width(pct(100.0));
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -144,10 +148,9 @@ pub fn resizable_panel_group(direction: Orientation) -> Part<ResizableProps> {
                 let drag = ctx.clone();
                 props
                     .with(|p| {
-                        p.slot
-                            .0
-                            .clone()
-                            .when(p.props.direction == Orientation::Vertical, Styled::flex_col)
+                        p.slot.0.clone().when(p.props.direction == Orientation::Vertical, |e| {
+                            e.display(Display::Flex).flex_direction(FlexDirection::Column)
+                        })
                     })
                     .on_drag(move |e| drag.on_drag(e))
                     .into_element()
@@ -198,10 +201,10 @@ pub fn resizable_panel(index: usize) -> Part<ResizableIndex> {
     // gui's `overflow_hidden` clips without that, so the zero minimum is stated.
     let root = div()
         .named("resizable-panel")
-        .overflow_hidden()
-        .min_w_px(0.0)
-        .min_h_px(0.0)
-        .flex_1();
+        .overflow(Overflow::Hidden)
+        .min_width(0.0)
+        .min_height(0.0)
+        .flex(Flex::grow(1.0));
     Part::new(ResizableIndex { index }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -266,65 +269,72 @@ fn handle(ctx: &ResizableContext, index: usize, with_handle: bool) -> Div {
         true
     };
     // `focus-visible:ring-1 ring-offset-1`: a 1px gap in the background, then the ring.
-    let ring = move |s: gui::Style| {
-        s.shadow(Shadow {
+    let ring = Shadows::from([
+        Shadow {
             x: 0.0,
             y: 0.0,
             blur: 0.0,
             spread: 2.0,
             color: t.ring,
-        })
-        .shadow(Shadow {
+        },
+        Shadow {
             x: 0.0,
             y: 0.0,
             blur: 0.0,
             spread: 1.0,
             color: t.background,
-        })
-    };
+        },
+    ]);
     let cursor = if vertical {
         Cursor::ResizeRow
     } else {
         Cursor::ResizeColumn
     };
     // `after:`: the grab area, 4px across the line.
-    let grab = div().absolute().cursor(cursor);
+    let grab = div().position(Position::Absolute).cursor(cursor);
     let grab = if vertical {
-        grab.left(0.0).w_full().top_len(px(-GRAB)).h(1.0)
+        grab.left(0.0).width(pct(100.0)).top(px(-GRAB)).height(4.0)
     } else {
-        grab.top(0.0).bottom(0.0).left_len(px(0.5 - GRAB)).w(1.0)
+        grab.top(0.0).bottom(0.0).left(px(0.5 - GRAB)).width(4.0)
     };
     let d = div()
         .named("resizable-handle")
-        .bg(t.border)
-        .relative()
-        .flex()
-        .items_center()
-        .justify_center()
-        .shrink_0()
+        .background(t.border)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .flex_shrink(0.0)
         .cursor(cursor)
         .focusable()
         .on_key_down(on_key)
         .on_mouse_down(move |_| pressed.set(Some(index)))
-        .focus_visible(ring)
+        .with_interaction(|mut d, i| {
+            let base = d.style_mut().shadows.clone();
+            d.shadow(move || if i.focus_visible() { ring.clone() } else { base.clone() })
+        })
         .child(grab);
-    let d = if vertical { d.h_px(1.0).w_full() } else { d.w_px(1.0) };
+    let d = if vertical {
+        d.height(1.0).width(pct(100.0))
+    } else {
+        d.width(1.0)
+    };
     d.when(with_handle, |d| {
         d.child(
             div()
                 .named("resizable-grip")
-                .bg(t.border)
-                .flex()
-                .h(4.0)
-                .w(3.0)
-                .shrink_0()
-                .items_center()
-                .justify_center()
-                .rounded_xs()
-                .border()
+                .background(t.border)
+                .display(Display::Flex)
+                .height(16.0)
+                .width(12.0)
+                .flex_shrink(0.0)
+                .align_items(Align::Center)
+                .justify_content(Justify::Center)
+                .radius(2.0)
+                .border(1.0)
                 .border_color(t.border)
                 .when(vertical, |g| g.rotate(90.0))
-                .child(icon(Icon::GripVertical).size(2.5)),
+                .child(icon(Icon::GripVertical).size(10.0)),
         )
     })
 }

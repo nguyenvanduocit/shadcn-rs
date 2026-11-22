@@ -42,11 +42,26 @@ pub fn render() -> Render {
     Box::new(move || {
         let t = theme();
         let palette = command()
-            .rounded_lg()
-            .border()
+            .radius(10.0)
+            .border(1.0)
             .border_color(t.border)
-            .shadow_md()
-            .min_w_px(450.0)
+            .shadow([
+                Shadow {
+                    x: 0.0,
+                    y: 4.0,
+                    blur: 6.0,
+                    spread: -1.0,
+                    color: gui::Color::BLACK.opacity(0.1),
+                },
+                Shadow {
+                    x: 0.0,
+                    y: 2.0,
+                    blur: 4.0,
+                    spread: -2.0,
+                    color: gui::Color::BLACK.opacity(0.1),
+                },
+            ])
+            .min_width(450.0)
             .child(command_input("Type a command or search..."))
             .child(
                 command_list(Rc::clone(&sections), move |item, row| match find(&item.value) {
@@ -64,11 +79,17 @@ pub fn render() -> Render {
             );
         page(
             "Command",
-            div().flex_col().gap(6.0).child(demo("CommandDemo.vue", palette)).child(
-                text_bound(move || format!("Last command: {}.", last.get()))
-                    .text_sm()
-                    .text_color(t.muted_foreground),
-            ),
+            div()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
+                .child(demo("CommandDemo.vue", palette))
+                .child(
+                    text_bound(move || format!("Last command: {}.", last.get()))
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .text_color(t.muted_foreground),
+                ),
         )
     })
 }

@@ -16,12 +16,13 @@ use gui::clock::{TimerId, after, cancel};
 use gui::prelude::*;
 use gui::style::Calc;
 use gui::{
-    Animation, Bind, Div, Element, Icon, Members, Model, NamedKey, Placement, Properties, Side, SideAlign, Signal,
+    Animation, Bind, Div, Element, Icon, Members, Model, NamedKey, Positioning, Properties, Side, SideAlign, Signal,
     UseModel, component, div, icon, provide, text, use_context, use_model,
 };
 
+use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
-use crate::theme::{Theme, theme};
+use crate::theme::{Colors, theme};
 
 /// reka's `delayDuration`: how long the pointer rests on a trigger before its panel opens.
 const OPEN_DELAY: Duration = Duration::from_millis(200);
@@ -29,8 +30,8 @@ const OPEN_DELAY: Duration = Duration::from_millis(200);
 const CLOSE_DELAY: Duration = Duration::from_millis(150);
 
 /// How far a panel slides in when the pointer moves to it from another
-/// trigger (`slide-in-from-right-52`).
-const SWITCH_SLIDE: f32 = 52.0 * gui::styled::UNIT;
+/// trigger (`slide-in-from-right-52`), in pixels.
+const SWITCH_SLIDE: f32 = 208.0;
 
 /// What [`navigation_menu`] is given: the open item's value (reka's
 /// `modelValue`; `None`: every panel closed).
@@ -122,7 +123,7 @@ impl NavigationContext {
             return enter;
         };
         let (from, to) = (self.index(&from), self.index(value));
-        enter.slide_x(Calc::px(if to > from { SWITCH_SLIDE } else { -SWITCH_SLIDE }))
+        enter.slide(Slide::X(Calc::px(if to > from { SWITCH_SLIDE } else { -SWITCH_SLIDE })))
     }
 
     fn pointer_enters(&self, value: &str) {
@@ -155,11 +156,11 @@ impl NavigationContext {
 pub fn navigation_menu() -> Part<NavigationMenuProps> {
     let root = div()
         .named("navigation-menu")
-        .relative()
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center();
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex(Flex::grow(1.0))
+        .align_items(Align::Center)
+        .justify_content(Justify::Center);
     Part::new(NavigationMenuProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -186,11 +187,11 @@ pub fn navigation_menu() -> Part<NavigationMenuProps> {
 pub fn navigation_menu_list() -> Div {
     div()
         .named("navigation-menu-list")
-        .flex()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .gap(1.0)
+        .display(Display::Flex)
+        .flex(Flex::grow(1.0))
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(4.0)
 }
 
 /// What an item and its trigger and content read: the item's value.
@@ -210,22 +211,26 @@ pub fn navigation_menu_item(value: &str) -> Part<NavigationMenuItemProps> {
     let props = NavigationMenuItemProps {
         value: value.to_owned(),
     };
-    Part::new(props, div().named("navigation-menu-item").relative(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let nav = use_context::<NavigationContext>();
-            let value = props.with_untracked(|p| p.props.value.clone());
-            provide(NavigationItem(value.clone()));
-            move || {
-                let root = props.with(|p| p.slot.0.clone());
-                match &nav {
-                    Some(n) => root.member(&n.items, value.clone()),
-                    None => root,
+    Part::new(
+        props,
+        div().named("navigation-menu-item").position(Position::Relative),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let nav = use_context::<NavigationContext>();
+                let value = props.with_untracked(|p| p.props.value.clone());
+                provide(NavigationItem(value.clone()));
+                move || {
+                    let root = props.with(|p| p.slot.0.clone());
+                    match &nav {
+                        Some(n) => root.member(&n.items, value.clone()),
+                        None => root,
+                    }
+                    .into_element()
                 }
-                .into_element()
-            }
-        })
-    })
+            })
+        },
+    )
 }
 
 /// `navigationMenuTriggerStyle`: `inline-flex h-9 w-max items-center
@@ -240,23 +245,32 @@ pub fn navigation_menu_trigger_style(open: bool) -> Div {
 /// [`navigation_menu_trigger_style`] on `d`.
 fn trigger_look(d: Div, open: bool) -> Div {
     let t = theme();
-    d.inline_flex()
-        .h(9.0)
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .bg(if open { t.accent.opacity(0.5) } else { t.background })
+    d.display(Display::Flex)
+        .inline(true)
+        .height(36.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(8.0)
+        .background(if open { t.accent.opacity(0.5) } else { t.background })
         .when(open, |d| d.text_color(t.accent_foreground))
-        .px(4.0)
-        .py(2.0)
-        .text_sm()
-        .font_medium()
-        .transition_props(Properties::COLOR | Properties::SHADOW)
+        .padding_x(16.0)
+        .padding_y(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .transition(Properties::COLOR | Properties::SHADOW)
         .focusable()
-        .hover(move |s| s.bg(t.accent).text_color(t.accent_foreground))
-        .focus(move |s| s.bg(t.accent).text_color(t.accent_foreground))
-        .focus_visible(move |s| s.ring(3.0, t.ring.opacity(0.5)))
-        .disabled_style(|s| s.opacity(0.5))
+        .with_interaction(|d, i| lit(d, i, &t, Ring::new(3.0, t.ring.opacity(0.5))).dim_disabled(i, 0.5))
+}
+
+/// `hover:bg-accent hover:text-accent-foreground focus:bg-accent
+/// focus:text-accent-foreground`, and `ring` while focus shows.
+fn lit(mut d: Div, i: Interaction, t: &Colors, ring: Ring) -> Div {
+    let on = move || i.hovered() || i.focused();
+    let base = d.style_mut().ring;
+    d.background_while(on, t.accent)
+        .text_color_while(on, t.accent_foreground)
+        .ring(move || if i.focus_visible() { Some(ring) } else { base })
 }
 
 /// The item's trigger, labelled `label`, with a chevron turning over while
@@ -267,7 +281,7 @@ pub fn navigation_menu_trigger(label: &str) -> Part<()> {
     let root = div()
         .named("navigation-menu-trigger")
         // `w-max`: the trigger is as wide as its label on one line.
-        .child(text(label.to_owned()).whitespace_nowrap());
+        .child(text(label.to_owned()).nowrap(true));
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -306,11 +320,11 @@ pub fn navigation_menu_trigger(label: &str) -> Part<()> {
                     })
                     .child(
                         icon(Icon::ChevronDown)
-                            .relative()
-                            .top_len(gui::px(1.0))
-                            .ml(1.0)
-                            .size(3.0)
-                            .transition()
+                            .position(Position::Relative)
+                            .top(gui::px(1.0))
+                            .margin_left(4.0)
+                            .size(12.0)
+                            .transition(Properties::DEFAULT)
                             .duration_ms(300.0)
                             .when(open, |i| i.rotate(180.0)),
                     )
@@ -328,15 +342,30 @@ pub fn navigation_menu_content() -> Part<()> {
     let t = theme();
     let root = div()
         .named("navigation-menu-content")
-        .p(2.0)
-        .pr(2.5)
-        .bg(t.popover)
+        .padding(8.0)
+        .padding_right(10.0)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .overflow_hidden()
-        .rounded_md()
-        .border()
+        .overflow(Overflow::Hidden)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .shadow_sm();
+        .shadow([
+            Shadow {
+                x: 0.0,
+                y: 1.0,
+                blur: 3.0,
+                spread: 0.0,
+                color: gui::Color::BLACK.opacity(0.1),
+            },
+            Shadow {
+                x: 0.0,
+                y: 1.0,
+                blur: 2.0,
+                spread: -1.0,
+                color: gui::Color::BLACK.opacity(0.1),
+            },
+        ]);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -350,7 +379,7 @@ pub fn navigation_menu_content() -> Part<()> {
                     return Element::Empty;
                 }
                 let root = props.with(|p| p.slot.0.clone());
-                let placement = Placement::Anchored {
+                let placement = Positioning::Anchored {
                     side: Side::Bottom,
                     align: SideAlign::Start,
                     offset: 6.0,
@@ -362,8 +391,8 @@ pub fn navigation_menu_content() -> Part<()> {
                 // also slides it toward the side the pointer went (`to-start`, `to-end`),
                 // which is known only after it has left.
                 let panel = root
-                    .animate(nav.opening(&value))
-                    .animate_out(Animation::exit().fade(0.0).zoom(0.95))
+                    .animation(nav.opening(&value))
+                    .exit_animation(Animation::exit().fade(0.0).zoom(0.95))
                     .duration_ms(200.0)
                     .on_hover(move |inside| {
                         if inside {
@@ -394,20 +423,22 @@ pub fn navigation_menu_link(active: bool, on_click: impl Fn() + 'static) -> Div 
     let t = theme();
     link_look(div(), &t, active)
         .named("navigation-menu-link")
-        .transition_props(Properties::COLOR | Properties::SHADOW)
+        .transition(Properties::COLOR | Properties::SHADOW)
         .on_click(move |_| on_click())
 }
 
-fn link_look(d: Div, t: &Theme, active: bool) -> Div {
+fn link_look(d: Div, t: &Colors, active: bool) -> Div {
     let t = *t;
-    d.flex_col()
-        .gap(1.0)
-        .rounded_sm()
-        .p(2.0)
-        .text_sm()
+    d.display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(4.0)
+        .radius(6.0)
+        .padding(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
         .focusable()
-        .when(active, |d| d.bg(t.accent.opacity(0.5)).text_color(t.accent_foreground))
-        .hover(move |s| s.bg(t.accent).text_color(t.accent_foreground))
-        .focus(move |s| s.bg(t.accent).text_color(t.accent_foreground))
-        .focus_visible(move |s| s.ring(4.0, t.ring.opacity(if t.dark { 0.2 } else { 0.1 })))
+        .when(active, |d| {
+            d.background(t.accent.opacity(0.5)).text_color(t.accent_foreground)
+        })
+        .with_interaction(|d, i| lit(d, i, &t, Ring::new(4.0, t.ring.opacity(if t.dark { 0.2 } else { 0.1 }))))
 }

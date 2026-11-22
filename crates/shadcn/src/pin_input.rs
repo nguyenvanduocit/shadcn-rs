@@ -12,6 +12,7 @@ use gui::{
     provide, use_context, use_model,
 };
 
+use crate::focus::StateLook;
 use crate::input_otp::{OtpSlotProps, fake_caret, otp_slot, otp_slot_state};
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
@@ -150,10 +151,10 @@ pub fn pin_input() -> Part<PinInputProps> {
     };
     let root = div()
         .named("pin-input")
-        .flex()
-        .items_center()
-        .gap(2.0)
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed());
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .with_interaction(|d, i| d.dim_disabled(i, 0.5).cursor_disabled(i));
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -199,9 +200,9 @@ pub fn pin_input_slot(index: usize) -> Part<OtpSlotProps> {
     let t = theme();
     let root = otp_slot(&t)
         .named("pin-input-slot")
-        .transition_all()
-        .text_center()
-        .cursor_text();
+        .transition(Properties::ALL)
+        .text_align(TextAlign::Center)
+        .cursor(Cursor::Text);
     Part::new(OtpSlotProps { index, invalid: false }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -213,7 +214,8 @@ pub fn pin_input_slot(index: usize) -> Part<OtpSlotProps> {
                     return root.into_element();
                 };
                 let t = theme();
-                let focused = focus.is_focused();
+                // Bound: focus renders nothing.
+                let focused = move || focus.is_focused();
                 let char = ctx.value.with(|v| v.get(slot.index).copied().flatten());
                 let members = ctx.slots.clone();
                 otp_slot_state(root, &t, focused, slot.invalid)
@@ -221,7 +223,7 @@ pub fn pin_input_slot(index: usize) -> Part<OtpSlotProps> {
                     .member(&members, (slot.index, focus))
                     .on_key_down(move |ev| ctx.key(slot.index, ev))
                     .when_some(char, |d, c| d.child(c.to_string()))
-                    .when(focused && char.is_none(), |d| d.child(fake_caret(&t)))
+                    .when(char.is_none(), |d| d.child(fake_caret(&t, focused)))
                     .into_element()
             }
         })
@@ -232,5 +234,5 @@ pub fn pin_input_slot(index: usize) -> Part<OtpSlotProps> {
 #[must_use]
 pub fn pin_input_separator() -> Div {
     // No `size-*` on it in shadcn: lucide's own 24px.
-    div().named("pin-input-separator").child(icon(Icon::Minus).size(6.0))
+    div().named("pin-input-separator").child(icon(Icon::Minus).size(24.0))
 }

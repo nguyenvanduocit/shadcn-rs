@@ -19,8 +19,8 @@ use std::time::Duration;
 
 use gui::prelude::*;
 use gui::{
-    Bind, Color, Div, Element, FocusHandle, Model, NamedKey, Path, PathBuilder, Placement, Side, SideAlign, Signal,
-    component, deferred, div, provide, px, relative, shapes, use_context, use_model, watch,
+    Bind, Color, Div, Element, FocusHandle, Model, NamedKey, Path, PathBuilder, Positioning, Side, SideAlign, Signal,
+    component, deferred, div, figures, provide, px, use_context, use_model, watch,
 };
 
 use gui::style::Origin;
@@ -49,16 +49,20 @@ struct TooltipContext {
 /// arrives, until told otherwise.
 #[must_use]
 pub fn tooltip() -> Part<TooltipProps> {
-    Part::new(TooltipProps::default(), div().named("tooltip").inline_flex(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            provide(TooltipContext {
-                intent: HoverIntent::new(use_model(props, |p| &p.props.open)),
-                props,
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        TooltipProps::default(),
+        div().named("tooltip").display(Display::Flex).inline(true),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                provide(TooltipContext {
+                    intent: HoverIntent::new(use_model(props, |p| &p.props.open)),
+                    props,
+                });
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 impl Part<TooltipProps> {
@@ -91,9 +95,11 @@ impl Part<TooltipProps> {
 /// Make `trigger` show the tooltip while the pointer rests on it, or while
 /// it holds focus reached by keyboard; pressing it hides the tooltip
 /// (`TooltipTrigger as-child`).
+/// Give `trigger` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn tooltip_trigger(trigger: Div) -> Part<()> {
-    Part::new((), trigger, |p| {
+pub fn tooltip_trigger(trigger: impl Into<Div>) -> Part<()> {
+    Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let tip = use_context::<TooltipContext>();
@@ -156,13 +162,14 @@ pub fn tooltip_content() -> Part<TooltipContentProps> {
     // `animate-in fade-in-0 zoom-in-95`, closing as a popper's content does.
     let root = popper(div(), Origin::CENTER)
         .named("tooltip-content")
-        .bg(t.foreground)
+        .background(t.foreground)
         .text_color(t.background)
-        .rounded_md()
-        .px(3.0)
-        .py(1.5)
-        .text_xs()
-        .text_balance();
+        .radius(8.0)
+        .padding_x(12.0)
+        .padding_y(6.0)
+        .text_size(12.0)
+        .line_height(16.0)
+        .text_wrap(WrapStyle::Balance);
     let props = TooltipContentProps {
         side: Side::Top,
         align: SideAlign::Center,
@@ -190,7 +197,7 @@ pub fn tooltip_content() -> Part<TooltipContentProps> {
                     })
                     .child(tooltip_arrow(p.side, t.foreground));
                 deferred(
-                    Placement::Anchored {
+                    Positioning::Anchored {
                         side: p.side,
                         align: p.align,
                         offset: 4.0,
@@ -209,25 +216,25 @@ pub fn tooltip_content() -> Part<TooltipContentProps> {
 /// translate-y-[calc(-50%_-_2px)]`): a 10px square turned to a diamond whose
 /// centre sits 2px inside the edge facing the trigger, so half a diamond
 /// points out of the tooltip.
-fn tooltip_arrow(side: Side, color: Color) -> gui::Shapes {
+fn tooltip_arrow(side: Side, color: Color) -> gui::Figures {
     const SQUARE: f32 = 10.0;
     const RADIUS: f32 = 2.0;
     const INSET: f32 = 2.0;
     let half_diagonal = SQUARE * FRAC_1_SQRT_2;
     let box_size = half_diagonal * 2.0;
     let out = px(INSET - half_diagonal);
-    // Back by half its box, on Tailwind's scale, to centre it on the edge.
-    let shift = half_diagonal / gui::styled::UNIT;
-    let arrow = shapes(vec![diamond(SQUARE / 2.0, RADIUS, half_diagonal).fill(color)])
+    // Back by half its box, to centre it on the edge.
+    let shift = half_diagonal;
+    let arrow = figures(vec![diamond(SQUARE / 2.0, RADIUS, half_diagonal).fill(color)])
         .named("tooltip-arrow")
         .pass_through()
-        .absolute()
-        .size_px(box_size);
+        .position(Position::Absolute)
+        .size(box_size);
     match side {
-        Side::Top => arrow.bottom_len(out).left_len(relative(0.5)).ml(-shift),
-        Side::Bottom => arrow.top_len(out).left_len(relative(0.5)).ml(-shift),
-        Side::Left => arrow.right_len(out).top_len(relative(0.5)).mt(-shift),
-        Side::Right => arrow.left_len(out).top_len(relative(0.5)).mt(-shift),
+        Side::Top => arrow.bottom(out).left(pct(50.0)).margin_left(-shift),
+        Side::Bottom => arrow.top(out).left(pct(50.0)).margin_left(-shift),
+        Side::Left => arrow.right(out).top(pct(50.0)).margin_top(-shift),
+        Side::Right => arrow.left(out).top(pct(50.0)).margin_top(-shift),
     }
 }
 

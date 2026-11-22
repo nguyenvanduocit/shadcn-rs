@@ -30,7 +30,7 @@ fn output(code: &str, variant: CodeBlockVariant) -> Div {
         wrap: true,
         ..CodeBlockContentProps::default()
     };
-    code_block(p).child(code_block_content(p, c, code_block_lines(code)).max_h(64.0))
+    code_block(p).child(code_block_content(p, c, code_block_lines(code)).max_height(256.0))
 }
 
 fn ran(open: &Signal<bool>, title: &str, code: &str) -> Element {
@@ -75,7 +75,7 @@ fn folding(open: &Signal<bool>, status: Option<TraceStatus>, line: Div, content:
 /// opens a site in a new tab.
 fn links() -> Div {
     trace()
-        .max_w(96.0)
+        .max_width(384.0)
         .child(link_to(Icon::FileText, "Read apps/v4/lib/docs.ts"))
         .child(link("Install Astro | docs.astro.build"))
 }
@@ -108,7 +108,7 @@ impl Folds {
     /// `TraceStepsDemo.vue`: a running investigation and the steps under it.
     fn steps(&self) -> Div {
         let running = Some(TraceStatus::Running);
-        div().w_full().max_w(96.0).child(folding(
+        div().width(pct(100.0)).max_width(384.0).child(folding(
             &self.steps,
             running,
             trace_line(running).child(trace_title("Looking into the slow deploy")),
@@ -120,7 +120,7 @@ impl Folds {
                             None,
                             step(None, icon(Icon::Search), "Searched for the checkout build log"),
                             |c| {
-                                c.flex().flex_wrap().gap(1.5).children(
+                                c.display(Display::Flex).flex_wrap(true).gap(6.0).children(
                                     ["vercel.com", "github.com"].map(|site| badge(BadgeVariant::Secondary).child(site)),
                                 )
                             },
@@ -141,13 +141,13 @@ impl Folds {
     /// thinking, what it said, and the file it read.
     fn turn(&self) -> Div {
         let error = Some(TraceStatus::Error);
-        div().w_full().max_w(96.0).child(folding(
+        div().width(pct(100.0)).max_width(384.0).child(folding(
             &self.turn,
             error,
             trace_line(error).child(trace_title("Worked for 2m 4s, 1 command failed")),
             |c| {
-                c.flex_col()
-                    .gap(2.0)
+                c.display(Display::Flex).flex_direction(FlexDirection::Column)
+                    .gap(8.0)
                     .child(
                         trace()
                             .child(folding(
@@ -269,27 +269,34 @@ fn commit(open: &Signal<bool>) -> Div {
     let files = CHANGED.iter().map(|f| {
         let glyph = if f.added { Icon::FilePlus } else { Icon::FilePen };
         let title = format!("{} {}", if f.added { "Added" } else { "Edited" }, f.path);
-        let line = step(None, icon(glyph), &title)
-            .child(trace_description(format!("+{} \u{2212}{}", f.additions, f.deletions)).font_mono());
+        let line = step(None, icon(glyph), &title).child(
+            trace_description(format!("+{} \u{2212}{}", f.additions, f.deletions)).font_family(FontFamily::GEIST_MONO),
+        );
         let p = CodeBlockProps::default();
         sheet().child(opener(line)).child(
             sheet_content(SheetSide::Right)
                 .child(
                     sheet_header()
-                        .child(sheet_title(f.path).font_mono())
+                        .child(sheet_title(f.path).font_family(FontFamily::GEIST_MONO))
                         .child(sheet_description(format!(
                             "{} additions, {} deletions",
                             f.additions, f.deletions
                         ))),
                 )
-                .child(code_block(p).mx(6.0).mb(6.0).w_auto().child(code_block_content(
-                    p,
-                    CodeBlockContentProps::default(),
-                    diff_lines(f.diff),
-                ))),
+                .child(
+                    code_block(p)
+                        .margin_x(24.0)
+                        .margin_bottom(24.0)
+                        .width(Length::Auto)
+                        .child(code_block_content(
+                            p,
+                            CodeBlockContentProps::default(),
+                            diff_lines(f.diff),
+                        )),
+                ),
         )
     });
-    trace().max_w(96.0).child(
+    trace().max_width(384.0).child(
         trace_collapsible()
             .model(Model::bind(*open))
             .child(trace_collapsible_trigger(
@@ -307,7 +314,7 @@ fn commit(open: &Signal<bool>) -> Div {
 /// `TraceDialogDemo.vue`: a web search that opens its results in a dialog.
 fn searched() -> Div {
     const TITLE: &str = "Searched the web for cache keys";
-    trace().max_w(96.0).child(
+    trace().max_width(384.0).child(
         dialog().child(opener(step(None, icon(Icon::Globe), TITLE))).child(
             dialog_content()
                 .child(
@@ -327,7 +334,7 @@ fn searched() -> Div {
 /// `TraceSheetDemo.vue`: explored files listed in a sheet.
 fn explored() -> Div {
     const TITLE: &str = "Explored 4 files";
-    trace().max_w(96.0).child(
+    trace().max_width(384.0).child(
         sheet()
             .child(opener(step(None, icon(Icon::FolderSearch), TITLE)))
             .child(
@@ -338,15 +345,23 @@ fn explored() -> Div {
                             .child(sheet_description("Files read while preparing the response.")),
                     )
                     .child(
-                        div().flex_col().gap(2.0).px(6.0).font_mono().text_xs().children(
-                            [
-                                "apps/v4/lib/docs.ts",
-                                "apps/v4/lib/components.ts",
-                                "apps/v4/nuxt.config.ts",
-                                "apps/v4/package.json",
-                            ]
-                            .map(text),
-                        ),
+                        div()
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .gap(8.0)
+                            .padding_x(24.0)
+                            .font_family(FontFamily::GEIST_MONO)
+                            .text_size(12.0)
+                            .line_height(16.0)
+                            .children(
+                                [
+                                    "apps/v4/lib/docs.ts",
+                                    "apps/v4/lib/components.ts",
+                                    "apps/v4/nuxt.config.ts",
+                                    "apps/v4/package.json",
+                                ]
+                                .map(text),
+                            ),
                     ),
             ),
     )
@@ -359,7 +374,7 @@ fn sources(open: &Signal<bool>) -> Div {
         "create-astro | npmjs.com",
         "Settings: minimumReleaseAge | pnpm.io",
     ];
-    div().w_full().max_w(96.0).child(
+    div().width(pct(100.0)).max_width(384.0).child(
         trace_collapsible()
             .model(Model::bind(*open))
             .child(trace_collapsible_trigger(
@@ -385,11 +400,12 @@ pub fn render() -> Render {
         let opened = demo(
             "TraceOpenDemo.vue",
             div()
-                .flex_col()
-                .w_full()
-                .max_w(96.0)
-                .items_start()
-                .gap(4.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .width(pct(100.0))
+                .max_width(384.0)
+                .align_items(Align::Start)
+                .gap(16.0)
                 .child(ran(&node, "Ran node --version", "$ node --version\nv24.18.0"))
                 .child(ran(&pnpm, "Ran pnpm --version", "$ pnpm --version\n10.33.4"))
                 .child(
@@ -404,15 +420,16 @@ pub fn render() -> Render {
         );
         let collapsible = demo(
             "TraceCollapsibleDemo.vue",
-            div()
-                .w_full()
-                .max_w(96.0)
-                .child(ran(&lone, "Ran node --version", "$ node --version\nv24.18.0")),
+            div().width(pct(100.0)).max_width(384.0).child(ran(
+                &lone,
+                "Ran node --version",
+                "$ node --version\nv24.18.0",
+            )),
         );
         let status = demo(
             "TraceStatusDemo.vue",
             trace()
-                .max_w(96.0)
+                .max_width(384.0)
                 .child(step(None, icon(Icon::CircleCheck), "Ran pnpm install"))
                 .child(step(
                     Some(TraceStatus::Error),
@@ -425,14 +442,14 @@ pub fn render() -> Render {
         let described = demo(
             "TraceDescriptionDemo.vue",
             trace()
-                .max_w(96.0)
+                .max_width(384.0)
                 .child(
                     step(
                         None,
                         icon(Icon::FilePen),
                         "Edited components/settings/NotificationPreferencesForm.vue",
                     )
-                    .child(trace_description("+48 \u{2212}12").font_mono()),
+                    .child(trace_description("+48 \u{2212}12").font_family(FontFamily::GEIST_MONO)),
                 )
                 .child(step(None, icon(Icon::Terminal), "Ran pnpm test").child(trace_description("14s")))
                 .child(step(None, icon(Icon::Search), "Searched for useChat").child(trace_description("8 results"))),
@@ -440,13 +457,13 @@ pub fn render() -> Render {
         let single = demo(
             "TraceStaticDemo.vue",
             trace()
-                .max_w(96.0)
+                .max_width(384.0)
                 .child(step(None, icon(Icon::GitBranch), "Created branch fix/frozen-lockfile")),
         );
         let group = demo(
             "TraceGroupDemo.vue",
             trace()
-                .max_w(96.0)
+                .max_width(384.0)
                 .child(step(None, icon(Icon::Search), "Searched for minimumReleaseAge"))
                 .child(step(None, icon(Icon::FileText), "Read pnpm-workspace.yaml"))
                 .child(step(None, icon(Icon::Terminal), "Ran pnpm install")),
@@ -454,8 +471,9 @@ pub fn render() -> Render {
         page(
             "Trace",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(opened)
                 .child(collapsible)
                 .child(status)

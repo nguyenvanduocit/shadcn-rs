@@ -26,7 +26,7 @@ pub fn render() -> Render {
         };
 
         let content = context_menu_content()
-            .w(52.0)
+            .width(208.0)
             .child(item("Back", MenuItem::INSET).child(context_menu_shortcut("⌘[")))
             .child(
                 item(
@@ -44,7 +44,7 @@ pub fn render() -> Render {
                     .child(context_menu_sub_trigger("More Tools", MenuItem::INSET))
                     .child(
                         context_menu_sub_content()
-                            .w(44.0)
+                            .width(176.0)
                             .child(item("Save Page...", MenuItem::INSET).child(context_menu_shortcut("⇧⌘S")))
                             .child(with_icon(Icon::Plus, "Create Shortcut...", MenuItem::default()))
                             .child(item("Name Window...", MenuItem::INSET))
@@ -71,22 +71,24 @@ pub fn render() -> Render {
             );
 
         let area = div()
-            .flex()
-            .h_px(150.0)
-            .w_px(300.0)
-            .items_center()
-            .justify_center()
-            .rounded_md()
+            .display(Display::Flex)
+            .height(150.0)
+            .width(300.0)
+            .align_items(Align::Center)
+            .justify_content(Justify::Center)
+            .radius(8.0)
             // `border-dashed`: gui strokes borders solid only.
-            .border()
+            .border(1.0)
             .border_color(t.border)
-            .text_sm()
+            .text_size(14.0)
+            .line_height(20.0)
             .child("Right click here");
         page(
             "Context Menu",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo(
                     "ContextMenuDemo.vue",
                     context_menu().child(context_menu_trigger(area)).child(content),
@@ -100,7 +102,8 @@ pub fn render() -> Render {
                             person.get()
                         )
                     })
-                    .text_sm()
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground),
                 ),
         )

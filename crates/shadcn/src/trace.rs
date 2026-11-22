@@ -10,7 +10,7 @@ use gui::prelude::*;
 use gui::{Animation, Div, Element, Icon, Text, component, div, icon, text};
 
 use crate::collapsible::{CollapsibleContext, CollapsibleProps, collapsible};
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::part::Part;
 use crate::theme::theme;
 
@@ -31,10 +31,11 @@ pub enum TraceStatus {
 pub fn trace() -> Div {
     div()
         .named("trace")
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .gap(8.0)
         .text_color(theme().muted_foreground)
 }
 
@@ -44,14 +45,15 @@ pub fn trace_line(status: Option<TraceStatus>) -> Div {
     let t = theme();
     div()
         .named("trace-line")
-        .flex()
-        .self_start()
-        .max_w_full()
-        .min_w(0.0)
-        .items_center()
-        .gap(2.0)
-        .text_sm()
-        .transition_colors()
+        .display(Display::Flex)
+        .align_self(Align::Start)
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .transition(Properties::COLORS)
         .when(status == Some(TraceStatus::Error), |d| d.text_color(t.destructive))
         .when(status == Some(TraceStatus::Pending), |d| d.opacity(0.6))
 }
@@ -65,16 +67,18 @@ pub fn trace_action(failed: bool, line: impl IntoElement) -> Div {
     let t = theme();
     div()
         .named("trace-action")
-        .flex()
-        .self_start()
-        .max_w_full()
-        .min_w(0.0)
-        .rounded_md()
-        .text_left()
+        .display(Display::Flex)
+        .align_self(Align::Start)
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .radius(8.0)
+        .text_align(TextAlign::Left)
         .focusable()
-        .cursor_pointer()
-        .when(!failed, |d| d.hover(move |s| s.text_color(t.foreground)))
-        .focus_visible(move |s| focus_ring(s, &t))
+        .cursor(Cursor::Pointer)
+        .with_interaction(|d, i| {
+            d.when(!failed, |d| d.text_color_while(move || i.hovered(), t.foreground))
+                .focus_ring_on(i, &t)
+        })
         .child(line)
 }
 
@@ -83,11 +87,11 @@ pub fn trace_action(failed: bool, line: impl IntoElement) -> Div {
 pub fn trace_icon(child: impl IntoElement) -> Div {
     div()
         .named("trace-icon")
-        .flex()
-        .size(4.0)
-        .shrink_0()
-        .items_center()
-        .justify_center()
+        .display(Display::Flex)
+        .size(16.0)
+        .flex_shrink(0.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
         .child(child)
 }
 
@@ -95,13 +99,18 @@ pub fn trace_icon(child: impl IntoElement) -> Div {
 /// Vue's `[[data-slot=trace-title]~&]:-ml-1` pulls it 4px towards the title.
 #[must_use]
 pub fn trace_end_icon(child: impl IntoElement) -> Div {
-    trace_icon(child).ml(-1.0)
+    trace_icon(child).margin_left(-4.0)
 }
 
 /// What the step did, cut to one line.
 #[must_use]
 pub fn trace_title(title: impl Into<String>) -> Text {
-    text(title).named("trace-title").truncate()
+    text(title)
+        .named("trace-title")
+        .truncate(true)
+        .nowrap(true)
+        .overflow_x(Overflow::Hidden)
+        .min_width(0.0)
 }
 
 /// A detail after the title (a duration, a count), fainter.
@@ -109,8 +118,8 @@ pub fn trace_title(title: impl Into<String>) -> Text {
 pub fn trace_description(description: impl Into<String>) -> Text {
     text(description)
         .named("trace-description")
-        .flex_none()
-        .tabular_nums()
+        .flex(Flex::NONE)
+        .tabular_nums(true)
         .text_color(theme().muted_foreground.opacity(0.7))
 }
 
@@ -121,9 +130,10 @@ pub fn trace_description(description: impl Into<String>) -> Text {
 pub fn trace_collapsible() -> Part<CollapsibleProps> {
     collapsible()
         .map_root(|d| d.named("trace-collapsible"))
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
 }
 
 /// The step's `line` and a chevron that turns down while open; pressing it
@@ -134,19 +144,21 @@ pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<(
     let control = div()
         .named("trace-collapsible-trigger")
         .focusable()
-        .flex()
-        .self_start()
-        .max_w_full()
-        .min_w(0.0)
-        .items_center()
-        .gap(1.0)
-        .rounded_md()
-        .cursor_pointer()
-        .text_left()
-        .transition_colors()
+        .display(Display::Flex)
+        .align_self(Align::Start)
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .align_items(Align::Center)
+        .gap(4.0)
+        .radius(8.0)
+        .cursor(Cursor::Pointer)
+        .text_align(TextAlign::Left)
+        .transition(Properties::COLORS)
         .text_color(if failed { t.destructive } else { t.muted_foreground })
-        .when(!failed, |d| d.hover(move |s| s.text_color(t.foreground)))
-        .focus_visible(move |s| focus_ring(s, &t))
+        .with_interaction(|d, i| {
+            d.when(!failed, |d| d.text_color_while(move || i.hovered(), t.foreground))
+                .focus_ring_on(i, &t)
+        })
         .child(line);
     Part::new((), control, |p| {
         component(p, |cx| {
@@ -163,7 +175,7 @@ pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<(
                     .on_click(move |_| ctx.toggle())
                     .child(
                         trace_icon(icon(Icon::ChevronRight))
-                            .transition_transform()
+                            .transition(Properties::TRANSFORM)
                             .rotate(if open { 90.0 } else { 0.0 }),
                     )
                     .into_element()
@@ -179,16 +191,16 @@ pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<(
 pub fn trace_collapsible_content() -> Part<()> {
     let t = theme();
     let ruled = div()
-        .min_w(0.0)
-        .mt(2.0)
-        .mb(1.0)
+        .min_width(0.0)
+        .margin_top(8.0)
+        .margin_bottom(4.0)
         // `ml-[calc(--spacing(2)-1px)]`: the rule under the icon's centre.
-        .ml(1.75)
-        .border_l()
+        .margin_left(7.0)
+        .border_left(1.0)
         .border_color(t.border)
-        .pr(1.0)
-        .pl(4.0)
-        .leading_relaxed()
+        .padding_right(4.0)
+        .padding_left(16.0)
+        .line_height(LineHeight::Relative(1.625))
         .text_color(t.muted_foreground);
     Part::new((), ruled, |p| {
         component(p, |cx| {
@@ -200,10 +212,10 @@ pub fn trace_collapsible_content() -> Part<()> {
                 }
                 div()
                     .named("trace-collapsible-content")
-                    .min_w(0.0)
-                    .overflow_hidden()
-                    .animate(Animation::accordion_down().after_mount())
-                    .animate_out(Animation::accordion_up())
+                    .min_width(0.0)
+                    .overflow(Overflow::Hidden)
+                    .animation(Animation::accordion_down().after_mount())
+                    .exit_animation(Animation::accordion_up())
                     .duration_ms(200.0)
                     .child(props.with(|p| p.slot.0.clone()))
                     .into_element()

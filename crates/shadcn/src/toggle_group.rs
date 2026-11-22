@@ -9,9 +9,10 @@
 
 use std::rc::Rc;
 
+use gui::Color;
 use gui::prelude::*;
 use gui::{
-    Bind, Callback, Div, Element, FocusHandle, Members, Model, NamedKey, Radius, Signal, Slot, component, div, provide,
+    Bind, Callback, Div, Element, FocusHandle, Members, Model, NamedKey, Signal, Slot, component, div, provide,
     use_context, use_model,
 };
 
@@ -109,7 +110,11 @@ fn root<M: SelectModel>() -> Part<ToggleGroupProps<M>> {
     };
     Part::new(
         props,
-        div().named("toggle-group").flex().items_center().rounded_md(),
+        div()
+            .named("toggle-group")
+            .display(Display::Flex)
+            .align_items(Align::Center)
+            .radius(8.0),
         |p| {
             component(p, |cx| {
                 let props = cx.props();
@@ -124,11 +129,16 @@ fn root<M: SelectModel>() -> Part<ToggleGroupProps<M>> {
                 move || {
                     let (look, root) = props.with(|p| (p.props.look, p.slot.0.clone()));
                     let keys = ctx.clone();
-                    root.gap(look.spacing)
-                        .when(
-                            look.spacing == 0.0 && look.variant == ToggleVariant::Outline,
-                            Styled::shadow_xs,
-                        )
+                    root.gap(look.spacing * 4.0)
+                        .when(look.spacing == 0.0 && look.variant == ToggleVariant::Outline, |e| {
+                            e.shadow(Shadow {
+                                x: 0.0,
+                                y: 1.0,
+                                blur: 2.0,
+                                spread: 0.0,
+                                color: Color::BLACK.opacity(0.05),
+                            })
+                        })
                         .on_key_down(move |ev| match &ev.key {
                             gui::Key::Named(NamedKey::ArrowRight | NamedKey::ArrowDown) => keys.move_focus(1),
                             gui::Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowUp) => keys.move_focus(-1),
@@ -263,20 +273,22 @@ impl IntoElement for ToggleGroupItem {
                     let (value, chosen, after) = (p.value.clone(), Rc::clone(&g.value), p.on_click.clone());
                     let d = toggle_variants(look.variant, look.size, g.value.holds(&p.value))
                         .named("toggle-group-item")
-                        .w_auto()
-                        .min_w(0.0)
-                        .shrink_0()
-                        .px(3.0)
+                        .width(Length::Auto)
+                        .min_width(0.0)
+                        .flex_shrink(0.0)
+                        .padding_x(12.0)
                         .track_focus(focus)
                         .member(&g.items, (p.value.clone(), focus))
                         .disabled(look.disabled || p.disabled)
                         .when(joined, |d| {
-                            d.rounded_none()
-                                .shadow_none()
-                                .when(first, |d| d.rounded_l(Radius::MD))
-                                .when(last, |d| d.rounded_r(Radius::MD))
+                            d.radius(0.0)
+                                .shadow(Shadows::new())
+                                .when(first, |d| d.radius_left(8.0))
+                                .when(last, |d| d.radius_right(8.0))
                                 // `border-l-0` except the first: neighbours share one rule.
-                                .when(outline && !first, |d| d.border_0().border_t().border_r().border_b())
+                                .when(outline && !first, |d| {
+                                    d.border(0.0).border_top(1.0).border_right(1.0).border_bottom(1.0)
+                                })
                         })
                         .on_click(move |_| {
                             chosen.flip(&value);

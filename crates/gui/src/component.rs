@@ -615,7 +615,7 @@ fn short_name<S>() -> &'static str {
 
 /// An instance's place in the tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Place {
+struct InstanceKey {
     path: u64,
     type_id: TypeId,
 }
@@ -648,7 +648,7 @@ struct Instance {
     raw: Option<Element>,
     /// `raw` with every placeholder replaced by its instance's output.
     output: Option<Element>,
-    children: HashMap<Place, Id>,
+    children: HashMap<InstanceKey, Id>,
     /// Its output as its parent's fallthrough styled it: the output it was
     /// made from, the fallthrough, and the result, so a clean instance
     /// gives back the same styled node.
@@ -1088,8 +1088,8 @@ fn resolve(id: Id) -> Element {
     let Some(raw) = raw else {
         return Element::Empty;
     };
-    let before: HashMap<Place, Id> = with_tree(|t| t.get(id).map(|i| i.children.clone()).unwrap_or_default());
-    let mut seen: HashMap<Place, Id> = HashMap::with_capacity(before.len());
+    let before: HashMap<InstanceKey, Id> = with_tree(|t| t.get(id).map(|i| i.children.clone()).unwrap_or_default());
+    let mut seen: HashMap<InstanceKey, Id> = HashMap::with_capacity(before.len());
     let out = expand(id, &raw, 0, &before, &mut seen).unwrap_or_else(|| raw.clone());
     for (slot, child) in &before {
         if seen.get(slot) != Some(child) {
@@ -1122,12 +1122,12 @@ fn expand(
     parent: Id,
     raw: &Element,
     path: u64,
-    before: &HashMap<Place, Id>,
-    seen: &mut HashMap<Place, Id>,
+    before: &HashMap<InstanceKey, Id>,
+    seen: &mut HashMap<InstanceKey, Id>,
 ) -> Option<Element> {
     match raw {
         Element::Component(c) => {
-            let slot = Place {
+            let slot = InstanceKey {
                 path,
                 type_id: c.type_id,
             };
@@ -1167,28 +1167,26 @@ fn expand(
                 None => out,
             })
         }
-        Element::Div(r) => {
+        // A box's children and a paragraph's atomic inlines alike.
+        Element::Div(_) | Element::Text(_) => {
+            let all = raw.kids()?;
             let mut kids: Option<Vec<Element>> = None;
-            for (i, rc) in r.kind.iter().enumerate() {
+            for (i, rc) in all.iter().enumerate() {
                 let step = child_step(rc, i);
                 if let Some(new) = expand(parent, rc, path_step(path, step), before, seen)
-                    && let Some(at) = kids.get_or_insert_with(|| r.kind.clone()).get_mut(i)
+                    && let Some(at) = kids.get_or_insert_with(|| all.to_vec()).get_mut(i)
                 {
                     *at = new;
                 }
             }
-            kids.map(|kind| {
-                Element::Div(Rc::new(crate::element::Node {
-                    common: r.common.clone(),
-                    kind,
-                }))
-            })
+            kids.map(|kids| raw.with_kids(kids))
         }
         // A layer adds no step: what moves between its place in the flow and
         // a floating layer keeps its instances (Vue's `Teleport`).
         Element::Deferred(r) => expand(parent, &r.child, path, before, seen).map(|child| {
             Element::Deferred(Rc::new(crate::element::Deferred {
-                placement: r.placement,
+                positioning: r.positioning,
+                placed: r.placed,
                 child,
             }))
         }),

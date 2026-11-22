@@ -14,14 +14,14 @@ pub fn render() -> Render {
             demo(
                 "AspectRatioDemo.vue",
                 aspect_ratio(16.0 / 9.0)
-                    .bg(t.muted)
-                    .rounded_lg()
+                    .background(t.muted)
+                    .radius(10.0)
                     .child(source.clone().map(|s| {
                         image(s)
-                            .size_full()
-                            .rounded_lg()
+                            .size(pct(100.0))
+                            .radius(10.0)
                             // `dark:brightness-[0.2] dark:grayscale`.
-                            .when(t.dark, |i| i.brightness(0.2).grayscale())
+                            .when(t.dark, |i| i.filters([Filter::Brightness(0.2), Filter::Grayscale(1.0)]))
                     })),
             ),
         )

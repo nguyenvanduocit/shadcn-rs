@@ -11,7 +11,7 @@ use gui::style::Calc;
 use gui::{Bind, Color, Div, Element, Model, Slot, component, div, use_model};
 
 use crate::checkbox::Class;
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 /// A switch (`<Switch>`): off and kept by itself until given a value. A
@@ -119,33 +119,43 @@ fn look(on: bool) -> Div {
         (false, true) => t.foreground,
         (true, true) => t.primary_foreground,
     };
+    let i = Interaction::new();
     div()
         .named("switch")
+        .interaction(i)
         .role(gui::Role::Switch)
         .aria_checked(on)
-        .inline_flex()
-        .h_px(18.4)
-        .w(8.0)
-        .shrink_0()
-        .items_center()
-        .rounded_full()
-        .border()
+        .display(Display::Flex)
+        .inline(true)
+        .height(18.4)
+        .width(32.0)
+        .flex_shrink(0.0)
+        .align_items(Align::Center)
+        .radius(9999.0)
+        .border(1.0)
         .border_color(Color::TRANSPARENT)
-        .shadow_xs()
-        .bg(track)
-        .transition_all()
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .background(track)
+        .transition(Properties::ALL)
         .focusable()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed())
+        .focus_ring_on(i, &t)
+        .dim_disabled(i, 0.5)
+        .cursor_disabled(i)
         .child(
             div()
                 .named("switch-thumb")
                 .pass_through()
-                .block()
-                .size(4.0)
-                .rounded_full()
-                .bg(thumb)
-                .transition_transform()
+                .display(Display::Block)
+                .size(16.0)
+                .radius(9999.0)
+                .background(thumb)
+                .transition(Properties::TRANSFORM)
                 // `translate-x-[calc(100%-2px)]`: the thumb's width less 2px.
                 .when(on, |d| {
                     d.translate_x(Calc {

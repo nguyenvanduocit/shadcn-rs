@@ -51,7 +51,8 @@ fn a_binding_changes_the_frame_without_rendering() {
                     move || {
                         div()
                             .named("box")
-                            .bind(move |st| st.w(if wide.get() { 40.0 } else { 10.0 }).bg(Color::BLACK))
+                            .width(move || if wide.get() { 160.0 } else { 40.0 })
+                            .background(Color::BLACK)
                             .child(text_bound(move || label.get()))
                             .into_element()
                     }
@@ -128,7 +129,7 @@ fn content_moved_onto_a_layer_and_back_keeps_its_instances() {
                         // at the same place (Vue's `Teleport`).
                         let content = div().key(7).child(counter(gui::Bind::default(), bump));
                         if floating.get() {
-                            gui::deferred(gui::Placement::Fill, content).into_element()
+                            gui::deferred(gui::Positioning::Fill, content).into_element()
                         } else {
                             content.into_element()
                         }
@@ -214,13 +215,13 @@ fn a_parent_restyles_a_components_root_through_every_render() {
                         move || {
                             div()
                                 .named("own")
-                                .w(10.0)
+                                .width(40.0)
                                 .child(text(format!("n {}", n.get())))
                                 .into_element()
                         }
                     })
                     .into_element()
-                    .restyle(|st| st.w(30.0)),
+                    .restyle(|st| st.width(120.0)),
                 )
                 .into_element()
         },
@@ -247,4 +248,110 @@ fn a_parent_restyles_a_components_root_through_every_render() {
     assert_eq!(r.rendered.len(), 1, "{:?}", r.rendered);
     assert_eq!(texts(&s), ["n 1"]);
     assert_eq!(width(&s), Some(120.0), "a new output keeps the parent's style");
+}
+
+fn own_width(s: &Scenario) -> Option<f32> {
+    s.last()
+        .nodes
+        .iter()
+        .find(|n| n.name == Some("own"))
+        .map(|n| n.bounds.width)
+}
+
+#[test]
+fn a_parent_restyle_wins_over_a_property_the_root_bound() {
+    let w = Signal::new(40.0_f32);
+    let mut s = Scenario::measuring(
+        move || {
+            div()
+                .child(
+                    component((), move |_| {
+                        move || div().named("own").width(move || w.get()).height(10.0).into_element()
+                    })
+                    .into_element()
+                    .restyle(|st| st.width(120.0)),
+                )
+                .into_element()
+        },
+        400,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.frame("first").expect("a frame");
+    assert_eq!(own_width(&s), Some(120.0), "the parent's width wins over the bound one");
+    s.act("write", || w.set(60.0));
+    s.frame("bound value moved").expect("a frame");
+    assert_eq!(
+        own_width(&s),
+        Some(120.0),
+        "and keeps winning when the binding runs again"
+    );
+}
+
+#[test]
+fn a_new_parent_restyle_reaches_a_clean_root_with_bindings() {
+    let wide = Signal::new(false);
+    let h = Signal::new(20.0_f32);
+    let mut s = Scenario::measuring(
+        move || {
+            let wide = wide.get();
+            div()
+                .child(
+                    component((), move |_| {
+                        move || div().named("own").height(move || h.get()).into_element()
+                    })
+                    .into_element()
+                    .restyle(move |st| st.width(if wide { 200.0 } else { 50.0 })),
+                )
+                .into_element()
+        },
+        400,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.frame("first").expect("a frame");
+    assert_eq!(own_width(&s), Some(50.0));
+    s.act("widen", || wide.set(true));
+    s.frame("parent rendered").expect("a frame");
+    assert_eq!(
+        own_width(&s),
+        Some(200.0),
+        "the parent's new restyle reaches the clean root"
+    );
+    s.act("narrow", || wide.set(false));
+    s.frame("narrowed").expect("a frame");
+    assert_eq!(own_width(&s), Some(50.0));
+}
+
+#[test]
+fn a_node_restyled_through_style_mut_resolves_its_new_base() {
+    let h = Signal::new(20.0_f32);
+    let wide = Signal::new(false);
+    // One node, its bindings shared by every clone of it.
+    let own = div().named("own").height(move || h.get()).into_element();
+    let mut s = Scenario::measuring(
+        move || {
+            let mut el = own.clone();
+            if wide.get()
+                && let Some(st) = el.style_mut()
+            {
+                st.width = gui::Length::Px(200.0);
+            }
+            div().child(el).into_element()
+        },
+        400,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.frame("first").expect("a frame");
+    s.act("widen", || wide.set(true));
+    s.frame("widened").expect("a frame");
+    assert_eq!(
+        own_width(&s),
+        Some(200.0),
+        "the new fixed style, not the memo of the old one"
+    );
 }

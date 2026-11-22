@@ -1,6 +1,7 @@
 //! Separator (`ui/separator`): a 1px rule.
 
-use gui::{Div, Styled, div};
+use gui::prelude::*;
+use gui::{Div, div};
 
 use crate::theme::theme;
 
@@ -14,9 +15,9 @@ pub enum Orientation {
 #[must_use]
 pub fn separator(orientation: Orientation) -> Div {
     let t = theme();
-    let d = div().named("separator").bg(t.border).shrink_0();
+    let d = div().named("separator").background(t.border).flex_shrink(0.0);
     match orientation {
-        Orientation::Horizontal => d.h_px(1.0).w_full(),
-        Orientation::Vertical => d.h_full().w_px(1.0),
+        Orientation::Horizontal => d.height(1.0).width(pct(100.0)),
+        Orientation::Vertical => d.height(pct(100.0)).width(1.0),
     }
 }

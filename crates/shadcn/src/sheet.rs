@@ -9,7 +9,7 @@
 
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{Animation, Div, Text, div, relative, text};
+use gui::{Animation, Div, Text, div, text};
 
 use crate::dialog::{DialogProps, ModalContentProps, ModalLook, dialog_description, modal_content, modal_root};
 use crate::part::Part;
@@ -48,35 +48,46 @@ pub fn sheet_content(side: SheetSide) -> Part<ModalContentProps> {
     let base = div()
         .named("sheet-content")
         .role(gui::Role::Dialog)
-        .animate(slide(Animation::enter(), off).duration(0.5))
-        .animate_out(slide(Animation::exit(), off).duration(0.3))
-        .transition()
-        .ease_in_out()
-        .bg(t.background)
-        .absolute()
-        .flex_col()
-        .gap(4.0)
-        .shadow_lg()
+        .animation(slide(Animation::enter(), off).duration(0.5))
+        .exit_animation(slide(Animation::exit(), off).duration(0.3))
+        .transition(Properties::DEFAULT)
+        .ease(Easing::STANDARD)
+        .background(t.background)
+        .position(Position::Absolute)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(16.0)
+        .shadow(crate::popover::LIFTED_SHADOW)
         .border_color(t.border);
     let placed = match side {
         SheetSide::Right => base
             .top(0.0)
             .bottom(0.0)
             .right(0.0)
-            .h_full()
-            .w_len(relative(0.75))
-            .border_l()
-            .max_w(96.0),
+            .height(pct(100.0))
+            .width(pct(75.0))
+            .border_left(1.0)
+            .max_width(384.0),
         SheetSide::Left => base
             .top(0.0)
             .bottom(0.0)
             .left(0.0)
-            .h_full()
-            .w_len(relative(0.75))
-            .border_r()
-            .max_w(96.0),
-        SheetSide::Top => base.left(0.0).right(0.0).top(0.0).h_auto().border_b(),
-        SheetSide::Bottom => base.left(0.0).right(0.0).bottom(0.0).h_auto().border_t(),
+            .height(pct(100.0))
+            .width(pct(75.0))
+            .border_right(1.0)
+            .max_width(384.0),
+        SheetSide::Top => base
+            .left(0.0)
+            .right(0.0)
+            .top(0.0)
+            .height(Length::Auto)
+            .border_bottom(1.0),
+        SheetSide::Bottom => base
+            .left(0.0)
+            .right(0.0)
+            .bottom(0.0)
+            .height(Length::Auto)
+            .border_top(1.0),
     };
     modal_content(
         placed,
@@ -91,17 +102,28 @@ pub fn sheet_content(side: SheetSide) -> Part<ModalContentProps> {
 
 /// `a` from or to `off`, a fraction of the sheet's own size.
 pub(crate) fn slide(a: Animation, (x, y): (Calc, Calc)) -> Animation {
-    a.slide_x(x).slide_y(y)
+    a.slide(Slide::X(x)).slide(Slide::Y(y))
 }
 
 #[must_use]
 pub fn sheet_header() -> Div {
-    div().named("sheet-header").flex_col().gap(1.5).p(4.0)
+    div()
+        .named("sheet-header")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(6.0)
+        .padding(16.0)
 }
 
 #[must_use]
 pub fn sheet_footer() -> Div {
-    div().named("sheet-footer").mt_auto().flex_col().gap(2.0).p(4.0)
+    div()
+        .named("sheet-footer")
+        .margin_top(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .padding(16.0)
 }
 
 #[must_use]
@@ -110,7 +132,7 @@ pub fn sheet_title(title: impl Into<String>) -> Text {
     text(title)
         .named("sheet-title")
         .text_color(t.foreground)
-        .font_semibold()
+        .font_weight(600)
 }
 
 #[must_use]

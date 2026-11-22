@@ -34,8 +34,9 @@ pub fn render() -> Render {
         page(
             "Number Field",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("NumberFieldDemo.vue", field("Age", age().min(0.0))))
                 .child(demo("NumberFieldDisabledDemo.vue", field("Age", age().disabled(true))))
                 .child(demo(
@@ -71,12 +72,12 @@ pub fn render() -> Render {
                 .child(section(
                     "Bounded decimals, grouped thousands",
                     div()
-                        .flex()
-                        .gap(6.0)
+                        .display(Display::Flex)
+                        .gap(24.0)
                         .child(
-                            field("Ratio", number_field().default_value(0.5).min(0.0).max(1.0).step(0.1)).w_px(160.0),
+                            field("Ratio", number_field().default_value(0.5).min(0.0).max(1.0).step(0.1)).width(160.0),
                         )
-                        .child(field("Amount", number_field().default_value(1234.0)).w_px(160.0)),
+                        .child(field("Amount", number_field().default_value(1234.0)).width(160.0)),
                 )),
         )
     })

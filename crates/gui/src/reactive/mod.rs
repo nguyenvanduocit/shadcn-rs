@@ -96,6 +96,12 @@ pub(crate) fn run_owned<R>(owner: Option<runtime::NodeId>, f: impl FnOnce() -> R
     f()
 }
 
+/// Make room in the active owner's list for `n` more signals or computeds
+/// about to be made together (an `Interaction`'s flags), so it grows once.
+pub(crate) fn reserve_owned(n: usize) {
+    runtime::with(|rt| rt.reserve_owned(n));
+}
+
 pub(crate) fn has_owner() -> bool {
     runtime::with(|rt| rt.active_owner.is_some_and(|o| rt.live(o).is_some()))
 }
@@ -111,11 +117,22 @@ pub(crate) fn waking() -> Option<SignalRef> {
     runtime::with(|rt| rt.waking)
 }
 
+/// What a [`RenderNode`] runs when something it read changed; one may be
+/// shared by several ([`RenderNode::marking`]).
+pub(crate) type Mark = runtime::Run;
+
 impl RenderNode {
     #[track_caller]
     pub(crate) fn new(mark: impl Fn() + 'static) -> Self {
+        let mark: Mark = std::rc::Rc::new(mark);
+        Self::marking(&mark)
+    }
+
+    /// A render node running `mark`, shared with whoever else holds it.
+    #[track_caller]
+    pub(crate) fn marking(mark: &Mark) -> Self {
         let at = std::panic::Location::caller();
-        let run: runtime::Run = std::rc::Rc::new(mark);
+        let run = std::rc::Rc::clone(mark);
         let id = runtime::with(|rt| {
             let id = rt.alloc(runtime::Kind::Render, runtime::flag::WATCHING, at);
             if let Some(n) = rt.live_mut(id) {
@@ -130,6 +147,12 @@ impl RenderNode {
     /// What its last run read.
     pub(crate) fn deps(self) -> Vec<SignalRef> {
         runtime::deps_of(self.0.index)
+    }
+
+    /// Whether something its last run read changed since (its mark ran):
+    /// it stays so until [`Self::track`] runs it again.
+    pub(crate) fn is_marked(self) -> bool {
+        runtime::with(|rt| rt.live(self.0).is_some_and(|n| n.flags & runtime::flag::DIRTY != 0))
     }
 
     /// Whether its last run read anything.

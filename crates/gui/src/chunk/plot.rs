@@ -4,7 +4,7 @@
 //! ```ignore
 //! let s = series();
 //! s.append(&xs, &ys);
-//! plot().x(0, 1_000).y_auto().mark(line(s).color(c)).build().w_full().h(64.0)
+//! plot().x(0, 1_000).y_auto().mark(line(s).color(c)).build().width(pct(100.0)).height(256.0)
 //! ```
 //!
 //! A [`Series`] is a `Copy` handle as a [`Signal`] is: appending to it
@@ -777,10 +777,10 @@ enum PlotMark {
 impl RuleParams {
     /// The rules as one path in `area` (its top left the origin), and how
     /// they are stroked; `None` when none is within the view.
-    fn path(&self, view: &MarkView, area: Bounds) -> Option<(crate::shape::Path, crate::shape::PathStyle)> {
+    fn path(&self, view: &MarkView, area: Bounds) -> Option<(crate::figure::Path, crate::figure::PathStyle)> {
         let (w, h) = (f64::from(area.width), f64::from(area.height));
         let f = crate::convert::f64_to_f32;
-        let mut b = crate::shape::Path::builder();
+        let mut b = crate::figure::Path::builder();
         let mut any = false;
         match &self.at {
             RuleAt::Y(ys) => {
@@ -809,13 +809,13 @@ impl RuleParams {
         if !any {
             return None;
         }
-        let mut stroke = crate::shape::Stroke::new(self.width);
+        let mut stroke = crate::figure::Stroke::new(self.width);
         if let Some((array, offset)) = &self.dash {
             stroke = stroke.dash(array.clone(), *offset);
         }
         Some((
             b.build(),
-            crate::shape::PathStyle::stroke(crate::scene::Gradient::Solid(self.color), stroke),
+            crate::figure::PathStyle::stroke(crate::scene::Gradient::Solid(self.color), stroke),
         ))
     }
 }

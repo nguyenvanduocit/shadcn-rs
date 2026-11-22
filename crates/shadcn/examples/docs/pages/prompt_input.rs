@@ -62,7 +62,7 @@ impl Composer {
             .flat_map(|(_, ms)| ms.iter())
             .find(|(id, _)| *id == model)
             .map_or("GPT-5", |(_, n)| *n);
-        let content = dropdown_menu_content().align(SideAlign::Start).w(48.0).child(
+        let content = dropdown_menu_content().align(SideAlign::Start).width(192.0).child(
             dropdown_menu_radio_group()
                 .model(self.model)
                 .children(PROVIDERS.iter().enumerate().map(|(i, (provider, models))| {
@@ -74,7 +74,7 @@ impl Composer {
                 })),
         );
         dropdown_menu()
-            .ml_auto()
+            .margin_left(Length::Auto)
             .child(dropdown_menu_trigger(
                 input_group_button(ButtonVariant::Outline, InputGroupButtonSize::Sm)
                     .child(name)
@@ -89,7 +89,7 @@ impl Composer {
             .iter()
             .find(|(id, _)| *id == effort)
             .map_or("Medium", |(_, n)| *n);
-        let content = dropdown_menu_content().align(SideAlign::Start).w(36.0).child(
+        let content = dropdown_menu_content().align(SideAlign::Start).width(144.0).child(
             dropdown_menu_group().child(dropdown_menu_label("Effort", false)).child(
                 dropdown_menu_radio_group()
                     .model(self.effort)
@@ -116,7 +116,7 @@ impl Composer {
             size: AttachmentSize::Sm,
             ..AttachmentProps::default()
         };
-        let row = input_group_addon(InputGroupAlign::BlockStart).flex_wrap();
+        let row = input_group_addon(InputGroupAlign::BlockStart).flex_wrap(true);
         Some(files.into_iter().enumerate().fold(row, |row, (i, name)| {
             let files = self.files;
             row.child(
@@ -143,7 +143,7 @@ impl Composer {
         let group = input_group(
             input_group_textarea(&self.draft)
                 .placeholder("Ask the agent to change your code...")
-                .p(3.0)
+                .padding(12.0)
                 .on_submit({
                     let send = send.clone();
                     move || send.submit()
@@ -158,20 +158,25 @@ impl Composer {
             input_group_addon(InputGroupAlign::BlockEnd)
                 .button(
                     input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm)
-                        .rounded_full()
+                        .radius(9999.0)
                         .child(icon(Icon::Plus)),
                 )
                 .button(self.model_menu())
                 .button(self.effort_menu())
                 .button(
                     input_group_button(ButtonVariant::Default, InputGroupButtonSize::IconSm)
-                        .rounded_full()
+                        .radius(9999.0)
                         .disabled(!can_send)
                         .child(icon(Icon::ArrowUp))
                         .on_click(move |_| send.submit()),
                 ),
         );
-        div().mx_auto().w_full().max_w(128.0).py(6.0).child(group)
+        div()
+            .margin_x(Length::Auto)
+            .width(pct(100.0))
+            .max_width(512.0)
+            .padding_y(24.0)
+            .child(group)
     }
 }
 
@@ -182,8 +187,9 @@ pub fn render() -> Render {
         page(
             "Prompt input",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("PromptInputDemo.vue", prompt.view(true)))
                 .child(demo("ModelSelectorDemo.vue", selector.view(false))),
         )

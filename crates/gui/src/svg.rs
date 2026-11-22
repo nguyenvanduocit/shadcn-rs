@@ -6,7 +6,7 @@
 //! svgtypes (its arcs come back as cubics); nothing is rasterized here.
 
 use crate::convert::f64_to_f32;
-use crate::shape::{Cap, Join, Path, PathBuilder};
+use crate::figure::{Cap, Join, Path, PathBuilder};
 
 /// One element of an icon: its path in the view box's units and whether it
 /// is filled and stroked.
@@ -201,6 +201,6 @@ mod tests {
         assert_eq!(d.parts.iter().filter(|p| p.fill).count(), 1);
         // The arc became cubics.
         let arc = d.parts.get(4).expect("the arc");
-        assert!(arc.path.verbs().contains(&crate::shape::Verb::Cubic));
+        assert!(arc.path.verbs().contains(&crate::figure::Verb::Cubic));
     }
 }

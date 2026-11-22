@@ -1093,12 +1093,23 @@ fn node_detail(frame: &Frame, i: usize) -> String {
             l.border.top, l.border.right, l.border.bottom, l.border.left
         ));
     }
-    let r = &l.radius;
-    if r.top_left > 0.0 || r.top_right > 0.0 || r.bottom_right > 0.0 || r.bottom_left > 0.0 {
-        look.push(format!(
-            "radius {}/{}/{}/{}",
-            r.top_left, r.top_right, r.bottom_right, r.bottom_left
-        ));
+    match l.shape {
+        crate::shape::Shape::Stadium => look.push("stadium".to_owned()),
+        shape => {
+            let r = shape.radii();
+            if !r.is_zero() {
+                let curve = shape.curve();
+                let k = if curve == crate::shape::ROUND {
+                    String::new()
+                } else {
+                    format!(" superellipse {curve}")
+                };
+                look.push(format!(
+                    "radius {}/{}/{}/{}{k}",
+                    r.top_left, r.top_right, r.bottom_right, r.bottom_left
+                ));
+            }
+        }
     }
     if !l.shadows.is_empty() {
         look.push(format!("shadows {}", l.shadows.len()));
@@ -1116,7 +1127,10 @@ fn node_detail(frame: &Frame, i: usize) -> String {
         out.push_str(&format!("  look       {}\n", look.join("  ")));
     }
     match &n.content {
-        Content::Text { content, text, runs } => {
+        Content::Text {
+            content, text, runs, ..
+        } => {
+            let content = crate::text::readable(content);
             out.push_str(&format!(
                 "  text       {content:?}\n             {}px/{}px w{} {}{}\n",
                 text.size,
@@ -1149,8 +1163,8 @@ fn node_detail(frame: &Frame, i: usize) -> String {
             let (w, h) = source.size();
             out.push_str(&format!("  image      {w}x{h} source pixels\n"));
         }
-        Content::Shapes(shapes) => {
-            out.push_str(&format!("  shapes     {}\n", shapes.len()));
+        Content::Figures(shapes) => {
+            out.push_str(&format!("  figures    {}\n", shapes.len()));
         }
         Content::Drawn(d) => {
             out.push_str(&format!("  drawing    {d:?}\n"));
@@ -2304,6 +2318,7 @@ fn instances() -> String {
 mod tests {
     use super::*;
     use crate::element::{IntoElement, div, text};
+    use crate::prelude::*;
     use crate::reactive::Signal;
     use crate::styled::Styled;
 
@@ -2314,12 +2329,12 @@ mod tests {
             move || {
                 let c = count;
                 div()
-                    .size_full()
-                    .p(8.0)
+                    .size(pct(100.0))
+                    .padding(32.0)
                     .child(
                         div()
                             .named("add")
-                            .p(4.0)
+                            .padding(16.0)
                             .on_click(move |_| c.update(|n| *n = n.saturating_add(1)))
                             .child(text("Add")),
                     )
@@ -2393,19 +2408,24 @@ mod tests {
             move || {
                 let color = if on.get() { 0x0022_c55e } else { 0x0094_a3b8 };
                 div()
-                    .size_full()
-                    .p(8.0)
-                    .gap(8.0)
-                    .flex()
+                    .size(pct(100.0))
+                    .padding(32.0)
+                    .gap(32.0)
+                    .display(Display::Flex)
                     .child(
                         div()
                             .named("swatch")
-                            .w_px(40.0)
-                            .h_px(30.0)
-                            .bg(crate::Color::hex(color))
+                            .width(40.0)
+                            .height(30.0)
+                            .background(crate::Color::hex(color))
                             .on_click(move |_| on.update(|v| *v = !*v)),
                     )
-                    .child(div().w_px(20.0).h_px(20.0).bg(crate::Color::hex(0x0011_1111)))
+                    .child(
+                        div()
+                            .width(20.0)
+                            .height(20.0)
+                            .background(crate::Color::hex(0x0011_1111)),
+                    )
                     .into_element()
             },
             200,
@@ -2501,18 +2521,26 @@ frame 2 at Ts took Tms (build Tms layout Tms paint Tms, most in layout): click (
             move || {
                 let rows = (0..50).map(|i| {
                     div()
-                        .h_px(24.0)
+                        .height(24.0)
                         .on_click(move |_| {
                             h.update(|v| v.push(i));
                         })
                         .child(text(format!("#{i}")))
                 });
                 div()
-                    .size_full()
-                    .flex_col()
+                    .size(pct(100.0))
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
                     .child(text("Your name"))
-                    .child(crate::element::text_input(&field).aria_label("Your name").h_px(24.0))
-                    .child(div().named("list").h_px(100.0).overflow_y_scroll().children(rows))
+                    .child(crate::element::text_input(&field).aria_label("Your name").height(24.0))
+                    .child(
+                        div()
+                            .named("list")
+                            .height(100.0)
+                            .overflow_y(Overflow::Scroll)
+                            .overflow_x(Overflow::Hidden)
+                            .children(rows),
+                    )
                     .into_element()
             },
             320,

@@ -9,8 +9,8 @@ use std::time::Duration;
 use gui::prelude::*;
 use gui::{Div, Element, Icon, Signal, div, icon, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, CodeBlockVariant, MessageProps, TraceStatus,
-    bubble, bubble_content, button, message, message_content, spinner, trace, trace_collapsible,
+    BubbleAlign, BubbleProps, BubbleVariant, Button, ButtonSize, ButtonVariant, CodeBlockVariant, MessageProps,
+    TraceStatus, bubble, bubble_content, button, message, message_content, spinner, trace, trace_collapsible,
     trace_collapsible_content, trace_collapsible_trigger, trace_icon, trace_line, trace_title,
 };
 
@@ -179,13 +179,15 @@ fn stream_words(words: &'static str, ms: u64) -> impl Iterator<Item = Step> {
 /// flex-col gap-4 py-6 text-sm`.
 fn thread() -> Div {
     div()
-        .flex_col()
-        .min_h(72.0)
-        .w_full()
-        .max_w(96.0)
-        .gap(4.0)
-        .py(6.0)
-        .text_sm()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .min_height(288.0)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(16.0)
+        .padding_y(24.0)
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 fn user_message(m: &Msg) -> Div {
@@ -203,14 +205,14 @@ fn user_message(m: &Msg) -> Div {
 /// The assistant's turn: `MessageContent class="gap-4"` around `body`.
 fn assistant_message(body: impl IntoIterator<Item = Element>) -> Div {
     let p = MessageProps::default();
-    message(p).child(message_content(p).gap(4.0).children(body))
+    message(p).child(message_content(p).gap(16.0).children(body))
 }
 
 /// The outline button under the thread (`mt-auto self-start`).
-fn thread_button(label: &str, f: impl Fn() + 'static) -> Div {
+fn thread_button(label: &str, f: impl Fn() + 'static) -> Button {
     button(ButtonVariant::Outline, ButtonSize::Sm)
-        .mt_auto()
-        .self_start()
+        .margin_top(Length::Auto)
+        .align_self(Align::Start)
         .child(label.to_owned())
         .on_click(move |_| f())
 }
@@ -475,7 +477,7 @@ impl TraceDemo {
 
 /// A conversation that starts empty: one question, sent by its button, and
 /// a Reset button once the answer is in.
-fn send_or_reset(chat: &Chat, question: &'static str, send: fn(&Chat, &'static str)) -> Option<Div> {
+fn send_or_reset(chat: &Chat, question: &'static str, send: fn(&Chat, &'static str)) -> Option<Button> {
     if chat.busy.get() {
         return None;
     }

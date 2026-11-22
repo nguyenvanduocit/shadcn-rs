@@ -3,11 +3,11 @@
 //! `NativeSelectFormDemo`, `NumberFieldFormDemo`).
 
 use gui::prelude::*;
-use gui::{ScenarioError, Signal, TextField, div, relative};
+use gui::{ScenarioError, Signal, TextField, div};
 use shadcn::{
-    ButtonSize, ButtonVariant, FieldOrientation, FormField, NumberFormat, Unset, button, field, field_description,
-    field_error, field_group, field_label, form_control, form_description, form_item, form_label, form_message,
-    form_submit, input, native_select, native_select_option, number_field, number_field_content,
+    Button, ButtonSize, ButtonVariant, FieldOrientation, FormField, NumberFormat, Unset, button, field,
+    field_description, field_error, field_group, field_label, form_control, form_description, form_item, form_label,
+    form_message, form_submit, input, native_select, native_select_option, number_field, number_field_content,
     number_field_decrement, number_field_increment, number_field_input, textarea, toaster,
 };
 
@@ -68,9 +68,9 @@ fn text_item(
 }
 
 /// The form's submit button; in a `space-y-*` form it keeps its own width.
-fn submit_button(on_submit: impl Fn() + 'static) -> gui::Div {
+fn submit_button(on_submit: impl Fn() + 'static) -> Button {
     button(ButtonVariant::Default, ButtonSize::Default)
-        .self_start()
+        .align_self(Align::Start)
         .child("Submit")
         .on_click(move |_| on_submit())
 }
@@ -112,10 +112,11 @@ pub fn render() -> Render {
         let form_demo = {
             let (u, e, b) = (demo_user, demo_email, demo_bio);
             div()
-                .w_full()
-                .max_w_px(384.0)
-                .flex_col()
-                .gap(6.0)
+                .width(pct(100.0))
+                .max_width(384.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(text_item(
                     "Username",
                     &demo_user,
@@ -141,15 +142,16 @@ pub fn render() -> Render {
                     submit_button(move || {
                         form_submit(&[&u, &e, &b]);
                     })
-                    .w_full(),
+                    .width(pct(100.0)),
                 )
         };
         let input_form = {
             let u = input_user;
             div()
-                .w_len(relative(2.0 / 3.0))
-                .flex_col()
-                .gap(6.0)
+                .width(Length::Fraction(2.0 / 3.0))
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(text_item(
                     "Username",
                     &input_user,
@@ -164,9 +166,10 @@ pub fn render() -> Render {
         let animate_form = {
             let (u, e) = (animate_user, animate_email);
             div()
-                .w_len(relative(2.0 / 3.0))
-                .flex_col()
-                .gap(6.0)
+                .width(Length::Fraction(2.0 / 3.0))
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(text_item(
                     "Username",
                     &animate_user,
@@ -188,7 +191,7 @@ pub fn render() -> Render {
         let native_select_form = {
             let invalid = country.invalid();
             let c = country;
-            div().w_full().max_w_px(384.0).child(
+            div().width(pct(100.0)).max_width(384.0).child(
                 field_group()
                     .child(
                         field(FieldOrientation::Vertical, invalid)
@@ -205,7 +208,7 @@ pub fn render() -> Render {
                                     submitted(&Json::Object(vec![("country", Json::Str(value))]), Pre::Neutral900);
                                 }
                             })
-                            .w_full(),
+                            .width(pct(100.0)),
                         ),
                     ),
             )
@@ -214,19 +217,20 @@ pub fn render() -> Render {
             let invalid = payment.invalid();
             let p = payment;
             div()
-                .w_len(relative(2.0 / 3.0))
-                .flex_col()
-                .gap(6.0)
+                .width(Length::Fraction(2.0 / 3.0))
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(
                     field(FieldOrientation::Vertical, invalid)
-                        .w_px(300.0)
+                        .width(300.0)
                         .child(field_label("Payment"))
                         .child(
                             number_field()
                                 .model(payment_value)
                                 .min(0.0)
                                 .format(NumberFormat::currency("EUR", true))
-                                .gap(2.0)
+                                .gap(8.0)
                                 .child(
                                     number_field_content()
                                         .child(number_field_decrement())
@@ -249,8 +253,9 @@ pub fn render() -> Render {
         page(
             "Form",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("FormDemo.vue", form_demo))
                 .child(demo("InputForm.vue", input_form))
                 .child(demo("InputFormAutoAnimate.vue", animate_form))

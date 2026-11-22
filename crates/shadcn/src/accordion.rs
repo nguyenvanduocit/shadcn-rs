@@ -9,7 +9,7 @@ use gui::{
     icon, provide, use_context, use_model,
 };
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
@@ -185,11 +185,11 @@ pub struct AccordionItemProps {
 
 /// One section, opening as `value`: its [`accordion_trigger`] and
 /// [`accordion_content`] go inside. `border-b last:border-b-0`: give the last
-/// item `.border_0()`.
+/// item `.border(0.0)`.
 #[must_use]
 pub fn accordion_item(value: impl Into<String>) -> Part<AccordionItemProps> {
     let t = theme();
-    let root = div().named("accordion-item").border_b().border_color(t.border);
+    let root = div().named("accordion-item").border_bottom(1.0).border_color(t.border);
     Part::new(AccordionItemProps { value: value.into() }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -206,20 +206,23 @@ pub fn accordion_trigger(label: impl IntoElement) -> Part<()> {
     let t = theme();
     let trigger = div()
         .named("accordion-trigger")
-        .flex()
-        .flex_1()
-        .items_start()
-        .justify_between()
-        .gap(4.0)
-        .rounded_md()
-        .py(4.0)
-        .text_left()
-        .text_sm()
-        .font_medium()
-        .transition_all()
-        .hover(|s| s.underline())
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5))
+        .display(Display::Flex)
+        .flex(Flex::grow(1.0))
+        .align_items(Align::Start)
+        .justify_content(Justify::Between)
+        .gap(16.0)
+        .radius(8.0)
+        .padding_y(16.0)
+        .text_align(TextAlign::Left)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .transition(Properties::ALL)
+        .with_interaction(|d, i| {
+            d.underline(move || i.hovered())
+                .focus_ring_on(i, &t)
+                .dim_disabled(i, 0.5)
+        })
         .child(label);
     Part::new((), trigger, |p| {
         component(p, |cx| {
@@ -247,12 +250,16 @@ pub fn accordion_trigger(label: impl IntoElement) -> Part<()> {
                             .named("accordion-chevron")
                             .text_color(t.muted_foreground)
                             // `translate-y-0.5`: a 2px nudge that does not grow the row.
-                            .mt(0.5)
-                            .transition_transform()
+                            .margin_top(2.0)
+                            .transition(Properties::TRANSFORM)
                             .duration_ms(200.0)
                             .when(open, |i| i.rotate(180.0)),
                     );
-                div().named("accordion-header").flex().child(trigger).into_element()
+                div()
+                    .named("accordion-header")
+                    .display(Display::Flex)
+                    .child(trigger)
+                    .into_element()
             }
         })
     })
@@ -264,7 +271,7 @@ pub fn accordion_trigger(label: impl IntoElement) -> Part<()> {
 /// mounts shows at once.
 #[must_use]
 pub fn accordion_content() -> Part<()> {
-    Part::new((), div().pt(0.0).pb(4.0), |p| {
+    Part::new((), div().padding_top(0.0).padding_bottom(16.0), |p| {
         component(p, |cx| {
             let props = cx.props();
             let root = use_context::<AccordionContext>();
@@ -279,10 +286,11 @@ pub fn accordion_content() -> Part<()> {
                 }
                 div()
                     .named("accordion-content")
-                    .overflow_hidden()
-                    .text_sm()
-                    .animate(Animation::accordion_down().after_mount())
-                    .animate_out(Animation::accordion_up())
+                    .overflow(Overflow::Hidden)
+                    .text_size(14.0)
+                    .line_height(20.0)
+                    .animation(Animation::accordion_down().after_mount())
+                    .exit_animation(Animation::accordion_up())
                     .child(props.with(|p| p.slot.0.clone()))
                     .into_element()
             }

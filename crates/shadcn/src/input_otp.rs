@@ -5,16 +5,16 @@
 //! goes to is active, and shows a blinking caret while empty. The root keeps
 //! the code, its own (`default_value`) or the caller's (`model`, `v-model`).
 
+use gui::Color;
 use gui::prelude::*;
 use gui::{
-    Bind, Div, FocusHandle, Icon, Key, KeyEvent, Model, NamedKey, Radius, Signal, UseModel, component, div, icon,
+    Bind, Div, FocusHandle, Icon, Key, KeyEvent, Model, NamedKey, Signal, Style, UseModel, component, div, icon,
     provide, use_context, use_model,
 };
 
-use crate::button_group::with_style;
-use crate::focus::{destructive_ring, focus_ring};
+use crate::focus::{StateLook, destructive_ring, focus_ring};
 use crate::part::{Part, PartProps};
-use crate::theme::{Theme, theme};
+use crate::theme::{Colors, theme};
 
 /// Which characters a code takes (`vue-input-otp`'s `REGEXP_ONLY_*`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -110,11 +110,11 @@ pub fn input_otp() -> Part<InputOtpProps> {
     };
     let root = div()
         .named("input-otp")
-        .flex()
-        .items_center()
-        .gap(2.0)
-        .cursor_text()
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed());
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .cursor(Cursor::Text)
+        .with_interaction(|d, i| d.dim_disabled(i, 0.5).cursor_disabled(i));
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -178,11 +178,11 @@ pub fn input_otp_group(slots: impl IntoIterator<Item = Part<OtpSlotProps>>) -> D
     let last = slots.len().saturating_sub(1);
     div()
         .named("input-otp-group")
-        .flex()
-        .items_center()
+        .display(Display::Flex)
+        .align_items(Align::Center)
         .children(slots.into_iter().enumerate().map(|(i, s)| {
-            let s = if i == 0 { s.rounded_l(Radius::MD).border_l() } else { s };
-            if i == last { s.rounded_r(Radius::MD) } else { s }
+            let s = if i == 0 { s.radius_left(8.0).border_left(1.0) } else { s };
+            if i == last { s.radius_right(8.0) } else { s }
         }))
 }
 
@@ -205,7 +205,7 @@ impl Part<OtpSlotProps> {
 #[must_use]
 pub fn input_otp_slot(index: usize) -> Part<OtpSlotProps> {
     let t = theme();
-    let root = otp_slot(&t).named("input-otp-slot").transition_all();
+    let root = otp_slot(&t).named("input-otp-slot").transition(Properties::ALL);
     Part::new(OtpSlotProps { index, invalid: false }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -218,10 +218,14 @@ pub fn input_otp_slot(index: usize) -> Part<OtpSlotProps> {
                 let t = theme();
                 let max_length = ctx.props.with(|p| p.props.max_length);
                 let (len, char) = ctx.value.with(|v| (v.chars().count(), v.chars().nth(slot.index)));
-                let active = ctx.focus.is_focused() && slot.index == len.min(max_length.saturating_sub(1));
+                // The slot the next character goes to is active while the
+                // root has focus: bound, so focus renders nothing.
+                let next = slot.index == len.min(max_length.saturating_sub(1));
+                let focus = ctx.focus;
+                let active = move || next && focus.is_focused();
                 otp_slot_state(root, &t, active, slot.invalid)
                     .when_some(char, |d, c| d.child(c.to_string()))
-                    .when(active && char.is_none(), |d| d.child(fake_caret(&t)))
+                    .when(next && char.is_none(), |d| d.child(fake_caret(&t, active)))
                     .into_element()
             }
         })
@@ -229,49 +233,57 @@ pub fn input_otp_slot(index: usize) -> Part<OtpSlotProps> {
 }
 
 /// The look of one slot; shared with the pin input, whose slots look the same.
-pub(crate) fn otp_slot(t: &Theme) -> Div {
+pub(crate) fn otp_slot(t: &Colors) -> Div {
     div()
-        .relative()
-        .flex()
-        .h(9.0)
-        .w(9.0)
-        .items_center()
-        .justify_center()
-        .border_t()
-        .border_b()
-        .border_r()
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .height(36.0)
+        .width(36.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .border_top(1.0)
+        .border_bottom(1.0)
+        .border_right(1.0)
         .border_color(t.input)
-        .text_sm()
-        .shadow_xs()
-        .when(t.dark, |d| d.bg(t.input.opacity(0.3)))
+        .text_size(14.0)
+        .line_height(20.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .when(t.dark, |d| d.background(t.input.opacity(0.3)))
 }
 
-/// A slot `active` as `data-active` or `:focus` sets it, and `invalid`.
-pub(crate) fn otp_slot_state(d: Div, t: &Theme, active: bool, invalid: bool) -> Div {
-    let t = *t;
-    match (active, invalid) {
-        (false, false) => d,
-        (false, true) => d.border_color(t.destructive),
-        (true, false) => with_style(d, |s| focus_ring(s, &t)),
-        (true, true) => with_style(d, |s| destructive_ring(s, &t).border_color(t.destructive)),
+/// A slot, its ring shown while `active` holds (as `data-active` or
+/// `:focus` sets it), and `invalid`.
+pub(crate) fn otp_slot_state(d: Div, t: &Colors, active: impl Fn() -> bool + Clone + 'static, invalid: bool) -> Div {
+    if invalid {
+        let ring = destructive_ring(Style::default(), t).border_color(t.destructive);
+        d.border_color(t.destructive).ring_while(active, &ring)
+    } else {
+        d.ring_while(active, &focus_ring(Style::default(), t))
     }
 }
 
-/// The blinking caret an empty active slot shows (`animate-caret-blink`).
-pub(crate) fn fake_caret(t: &Theme) -> Div {
+/// The blinking caret an empty slot shows while `active` holds
+/// (`animate-caret-blink`).
+pub(crate) fn fake_caret(t: &Colors, active: impl Fn() -> bool + 'static) -> Div {
     div()
-        .absolute()
+        .position(Position::Absolute)
         .inset(0.0)
-        .flex()
-        .items_center()
-        .justify_center()
+        .display(move || if active() { Display::Flex } else { Display::None })
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
         .pass_through()
         .child(
             div()
-                .h(4.0)
-                .w_px(1.0)
-                .bg(t.foreground)
-                .animate(gui::Animation::caret_blink()),
+                .height(16.0)
+                .width(1.0)
+                .background(t.foreground)
+                .animation(gui::Animation::caret_blink()),
         )
 }
 
@@ -281,6 +293,6 @@ pub fn input_otp_separator() -> Div {
     // No `size-*` on it in shadcn: lucide's own 24px.
     div()
         .named("input-otp-separator")
-        .flex()
-        .child(icon(Icon::Minus).size(6.0))
+        .display(Display::Flex)
+        .child(icon(Icon::Minus).size(24.0))
 }

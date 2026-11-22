@@ -102,9 +102,9 @@ fn header(entry: &Entry) -> Div {
     let t = theme();
     let doc = parse_doc(&entry.doc);
     let tags = div()
-        .flex()
-        .flex_wrap()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_wrap(true)
+        .gap(8.0)
         .when_some(doc.registry, |d, item| {
             d.child(
                 badge(BadgeVariant::Secondary)
@@ -118,16 +118,19 @@ fn header(entry: &Entry) -> Div {
                 .child(entry.path.clone()),
         );
     div()
-        .flex_col()
-        .gap(3.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
         .child(h1(&entry.title))
         .when(!doc.lead.is_empty(), |d| d.child(lead(&doc.lead)))
         .child(tags)
-        .children(
-            doc.notes
-                .iter()
-                .map(|n| inline(n).text_sm().leading_relaxed().text_color(t.muted_foreground)),
-        )
+        .children(doc.notes.iter().map(|n| {
+            inline(n)
+                .text_size(14.0)
+                .line_height(20.0)
+                .line_height(LineHeight::Relative(1.625))
+                .text_color(t.muted_foreground)
+        }))
 }
 
 /// The demo's preview: `flex min-h-[350px] items-center justify-center p-10`
@@ -136,15 +139,15 @@ fn preview(demo: Element) -> Div {
     let t = theme();
     div()
         .named("docs-preview")
-        .w_full()
-        .min_h_px(240.0)
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_lg()
-        .border()
+        .width(pct(100.0))
+        .min_height(240.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(10.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(6.0)
+        .padding(24.0)
         .child(demo)
 }
 
@@ -156,7 +159,8 @@ fn code_view(entry: &Entry, file: &str, state: &DemoState) -> Div {
                 "`{file}` reaches `demo()` from outside `{}`, so there is no call here to show.",
                 entry.path
             ))
-            .text_sm()
+            .text_size(14.0)
+            .line_height(20.0)
             .text_color(t.muted_foreground),
         );
     };
@@ -176,17 +180,19 @@ fn code_view(entry: &Entry, file: &str, state: &DemoState) -> Div {
                 CodeBlockContentProps::default(),
                 highlighted_lines(&found.code, "rust"),
             )
-            .max_h_px(520.0),
+            .max_height(520.0),
         );
     div()
-        .flex_col()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
         .when(!found.exact, |d| {
             d.child(
                 inline(&format!(
                     "`{file}` is named in a list; this is the call that maps it through `demo()`."
                 ))
-                .text_sm()
+                .text_size(14.0)
+                .line_height(20.0)
                 .text_color(t.muted_foreground),
             )
         })
@@ -198,16 +204,22 @@ fn demo_block(entry: &Entry, file: &'static str, demo: Element, state: &DemoStat
     let t = theme();
     let (light, dark) = verdicts.of(entry.page.name, file);
     let heading = div()
-        .flex()
-        .items_center()
-        .gap(3.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(12.0)
         .child(h3(&demo_title(&entry.title, file)))
-        .child(text(file).font_mono().text_xs().text_color(t.muted_foreground))
+        .child(
+            text(file)
+                .font_family(FontFamily::GEIST_MONO)
+                .text_size(12.0)
+                .line_height(16.0)
+                .text_color(t.muted_foreground),
+        )
         .child(
             div()
-                .ml_auto()
-                .flex()
-                .gap(1.5)
+                .margin_left(Length::Auto)
+                .display(Display::Flex)
+                .gap(6.0)
                 .when_some(light, |d, j| d.child(grade_badge(Some("Light"), j)))
                 .when_some(dark, |d, j| d.child(grade_badge(Some("Dark"), j))),
         );
@@ -216,11 +228,16 @@ fn demo_block(entry: &Entry, file: &'static str, demo: Element, state: &DemoStat
         .child(tabs_trigger("code").child(icon(Icon::Code2)).child("Code"));
     let shown = tabs()
         .default_value("preview")
-        .gap(3.0)
+        .gap(12.0)
         .child(switch)
         .child(tabs_content("preview").child(preview(demo)))
         .child(tabs_content("code").child(code_view(entry, file, state)));
-    div().flex_col().gap(4.0).child(heading).child(shown)
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(16.0)
+        .child(heading)
+        .child(shown)
 }
 
 /// The page of `entry`, from its lifted gallery page.
@@ -242,17 +259,26 @@ pub fn parts(entry: &Entry, lifted: Lifted, states: &mut DemoStates, verdicts: &
             "playground",
             Some("Playground"),
             div()
-                .flex_col()
-                .gap(4.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(16.0)
                 .child(h2("Playground"))
                 .child(
                     text("The gallery page's own examples, beyond shadcn-vue's demos.")
-                        .text_sm()
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .text_color(t.muted_foreground),
                 )
                 // The gallery lays its page out at its own widths: wider than
                 // the column, it scrolls sideways rather than run under "On this page".
-                .child(div().named(PLAYGROUND).w_full().overflow_x_scroll().child(rest)),
+                .child(
+                    div()
+                        .named(PLAYGROUND)
+                        .width(pct(100.0))
+                        .overflow_x(Overflow::Scroll)
+                        .overflow_y(Overflow::Hidden)
+                        .child(rest),
+                ),
         ));
     }
     parts

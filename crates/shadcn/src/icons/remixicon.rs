@@ -1,0 +1,52 @@
+//! Remix Icon, line (remixicon 4.8.0, Apache-2.0). Releases from 4.9.0 on are under the Remix Icon License v1.0,
+//! which restricts use and is not a permissive licence; these glyphs are byte for byte the same in 4.9.1.
+
+library! {
+    "remixicon";
+    glyphs {
+        CHECK_LINE => "check-line",
+        CLOSE_LINE => "close-line",
+        ARROW_DOWN_S_LINE => "arrow-down-s-line",
+        ARROW_UP_S_LINE => "arrow-up-s-line",
+        ARROW_LEFT_S_LINE => "arrow-left-s-line",
+        ARROW_RIGHT_S_LINE => "arrow-right-s-line",
+        ARROW_LEFT_DOUBLE_LINE => "arrow-left-double-line",
+        ARROW_RIGHT_DOUBLE_LINE => "arrow-right-double-line",
+        CHECKBOX_CIRCLE_LINE => "checkbox-circle-line",
+        INFORMATION_LINE => "information-line",
+        ALERT_LINE => "alert-line",
+        CLOSE_CIRCLE_LINE => "close-circle-line",
+        LOADER_4_LINE => "loader-4-line",
+        CIRCLE_LINE => "circle-line",
+        FILE_COPY_LINE => "file-copy-line",
+        SUBTRACT_LINE => "subtract-line",
+        ADD_LINE => "add-line",
+        SEARCH_LINE => "search-line",
+        MORE_LINE => "more-line",
+        SIDE_BAR_LINE => "side-bar-line",
+    }
+    roles {
+        Check => CHECK_LINE,
+        Close => CLOSE_LINE,
+        ChevronDown => ARROW_DOWN_S_LINE,
+        ChevronUp => ARROW_UP_S_LINE,
+        ChevronLeft => ARROW_LEFT_S_LINE,
+        ChevronRight => ARROW_RIGHT_S_LINE,
+        ChevronsLeft => ARROW_LEFT_DOUBLE_LINE,
+        ChevronsRight => ARROW_RIGHT_DOUBLE_LINE,
+        Selector => ARROW_DOWN_S_LINE,
+        Success => CHECKBOX_CIRCLE_LINE,
+        Info => INFORMATION_LINE,
+        Warning => ALERT_LINE,
+        Error => CLOSE_CIRCLE_LINE,
+        Loading => LOADER_4_LINE,
+        Circle => CIRCLE_LINE,
+        Copy => FILE_COPY_LINE,
+        Minus => SUBTRACT_LINE,
+        Plus => ADD_LINE,
+        Search => SEARCH_LINE,
+        More => MORE_LINE,
+        Sidebar => SIDE_BAR_LINE,
+        ArrowDown => super::ARROW_DOWN,
+    }
+}

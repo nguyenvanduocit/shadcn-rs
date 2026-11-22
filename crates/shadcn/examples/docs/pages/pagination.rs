@@ -14,19 +14,24 @@ pub fn render() -> Render {
         page(
             "Pagination",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "PaginationDemo.vue",
-                    div().flex_col().gap(6.0).child(
-                        pagination().total(30, 10).model(Model::bind(shown)).child(
-                            pagination_content()
-                                .child(pagination_previous())
-                                .child(pagination_list())
-                                .child(pagination_ellipsis())
-                                .child(pagination_next()),
+                    div()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(24.0)
+                        .child(
+                            pagination().total(30, 10).model(Model::bind(shown)).child(
+                                pagination_content()
+                                    .child(pagination_previous())
+                                    .child(pagination_list())
+                                    .child(pagination_ellipsis())
+                                    .child(pagination_next()),
+                            ),
                         ),
-                    ),
                 ))
                 .child(section(
                     "20 pages, edges shown",
@@ -39,7 +44,11 @@ pub fn render() -> Render {
                             .child(pagination_last()),
                     ),
                 ))
-                .child(text(format!("Page {} of 3", shown.get())).text_sm()),
+                .child(
+                    text(format!("Page {} of 3", shown.get()))
+                        .text_size(14.0)
+                        .line_height(20.0),
+                ),
         )
     })
 }

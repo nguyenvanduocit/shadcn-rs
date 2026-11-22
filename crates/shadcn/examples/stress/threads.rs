@@ -51,17 +51,18 @@ fn app(on: Arc<AtomicBool>) -> impl FnMut() -> gui::Element {
     let pressed = Signal::new(false);
     move || {
         div()
-            .size_full()
+            .size(pct(100.0))
             .child(
                 div()
-                    .flex_row()
-                    .gap(8.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Row)
+                    .gap(32.0)
                     .child(
                         div()
                             .named("button")
-                            .w_px(120.0)
-                            .h_px(40.0)
-                            .bg(if pressed.get() {
+                            .width(120.0)
+                            .height(40.0)
+                            .background(if pressed.get() {
                                 Color::hex(0x18181b)
                             } else {
                                 Color::hex(0xe4e4e7)
@@ -71,21 +72,22 @@ fn app(on: Arc<AtomicBool>) -> impl FnMut() -> gui::Element {
                     )
                     .child(
                         div()
-                            .w_px(40.0)
-                            .h_px(40.0)
-                            .bg(Color::hex(0x2563eb))
-                            .animate(Animation::spin()),
+                            .width(40.0)
+                            .height(40.0)
+                            .background(Color::hex(0x2563eb))
+                            .animation(Animation::spin()),
                     ),
             )
             .child(
                 div()
                     .named("list")
-                    .h_px(500.0)
-                    .overflow_y_scroll()
+                    .height(500.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
                     .children((0..300).map(|i| {
                         div()
-                            .h_px(24.0)
-                            .bg(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
+                            .height(24.0)
+                            .background(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
                             .child(text(format!("row {i}")))
                     })),
             )
@@ -112,7 +114,7 @@ pub fn run() -> (Vec<String>, bool) {
     let flag = Arc::clone(&on);
     let started = gui::offscreen(
         move || {
-            shadcn::provide_theme(Signal::labeled("theme", shadcn::Theme::light()));
+            shadcn::install(shadcn::Theme::default(), shadcn::VEGA);
             app(flag)
         },
         gui::RunOptions::default(),

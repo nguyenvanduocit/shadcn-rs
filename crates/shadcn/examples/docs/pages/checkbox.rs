@@ -3,6 +3,7 @@ use gui::{Color, Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{checkbox, label, theme};
 
 use crate::{Render, Shot, demo, page};
+use shadcn::focus::StateLook;
 
 /// The centre of the `nth` node named `name` in the last frame.
 fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32), ScenarioError> {
@@ -41,80 +42,95 @@ pub fn render() -> Render {
         page(
             "Checkbox",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "CheckboxDemo.vue",
                     div()
-                        .flex_col()
-                        .gap(6.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(24.0)
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(3.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(12.0)
                                 .child(checkbox().model(terms))
                                 .child(label("Accept terms and conditions").on_click(move |_| a.update(|v| *v = !*v))),
                         )
                         .child(
                             div()
-                                .flex()
-                                .items_start()
-                                .gap(3.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Start)
+                                .gap(12.0)
                                 .child(checkbox().model(terms2))
                                 .child(
                                     div()
-                                        .grid()
-                                        .gap(2.0)
+                                        .display(Display::Grid)
+                                        .gap(8.0)
                                         .child(
                                             label("Accept terms and conditions")
                                                 .on_click(move |_| b.update(|v| *v = !*v)),
                                         )
                                         .child(
                                             text("By clicking this checkbox, you agree to the terms and conditions.")
-                                                .text_sm()
+                                                .text_size(14.0)
+                                                .line_height(20.0)
                                                 .text_color(t.muted_foreground),
                                         ),
                                 ),
                         )
                         .child(
                             div()
-                                .flex()
-                                .items_start()
-                                .gap(3.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Start)
+                                .gap(12.0)
                                 .child(checkbox().disabled(true))
                                 .child(label("Enable notifications").disabled(true)),
                         )
                         .child(
                             div()
                                 .named("checkbox-card")
-                                .flex()
-                                .items_start()
-                                .gap(3.0)
-                                .rounded_lg()
-                                .border()
+                                .display(Display::Flex)
+                                .align_items(Align::Start)
+                                .gap(12.0)
+                                .radius(10.0)
+                                .border(1.0)
                                 .border_color(t.border)
-                                .p(3.0)
-                                .text_sm()
-                                .leading_none()
-                                .font_medium()
-                                .when(notify2.get(), |d| d.border_color(card_border).bg(card_bg))
-                                .when(!notify2.get(), |d| d.hover(move |s| s.bg(t.accent.opacity(0.5))))
+                                .padding(12.0)
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .line_height(LineHeight::Relative(1.0))
+                                .font_weight(500)
+                                .when(notify2.get(), |d| d.border_color(card_border).background(card_bg))
+                                .when(!notify2.get(), |d| {
+                                    d.with_interaction(|d, i| {
+                                        d.background_while(move || i.hovered(), t.accent.opacity(0.5))
+                                    })
+                                })
                                 .on_click(move |_| c.update(|v| *v = !*v))
                                 .child(checkbox().model(notify2).class(move |d| {
                                     d.when(notify2.get(), |d| {
-                                        d.border_color(blue).bg(blue).text_color(Color::WHITE)
+                                        d.border_color(blue).background(blue).text_color(Color::WHITE)
                                     })
                                 }))
                                 .child(
                                     div()
-                                        .grid()
-                                        .gap(1.5)
-                                        .font_normal()
-                                        .child(text("Enable notifications").text_sm().leading_none().font_medium())
+                                        .display(Display::Grid)
+                                        .gap(6.0)
+                                        .font_weight(400)
+                                        .child(
+                                            text("Enable notifications")
+                                                .text_size(14.0)
+                                                .line_height(20.0)
+                                                .line_height(LineHeight::Relative(1.0))
+                                                .font_weight(500),
+                                        )
                                         .child(
                                             text("You can enable or disable notifications at any time.")
-                                                .text_sm()
+                                                .text_size(14.0)
+                                                .line_height(20.0)
                                                 .text_color(t.muted_foreground),
                                         ),
                                 ),
@@ -124,9 +140,9 @@ pub fn render() -> Render {
                     "CheckboxDisabled.vue",
                     // `space-x-2`: the label 0.5rem after the box.
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(8.0)
                         .child(checkbox().disabled(true))
                         .child(label("Accept terms and conditions").disabled(true)),
                 )),

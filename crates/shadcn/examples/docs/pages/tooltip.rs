@@ -20,8 +20,9 @@ pub fn render() -> Render {
         page(
             "Tooltip",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo(
                     "TooltipDemo.vue",
                     tooltip()
@@ -31,9 +32,9 @@ pub fn render() -> Render {
                 .child(section(
                     "Sides",
                     div()
-                        .flex()
-                        .gap(2.0)
-                        .pl(28.0)
+                        .display(Display::Flex)
+                        .gap(8.0)
+                        .padding_left(112.0)
                         .children(SIDES.iter().map(|(name, side)| {
                             tooltip().child(hover_button(name)).child(
                                 tooltip_content()
@@ -45,7 +46,7 @@ pub fn render() -> Render {
                 ))
                 .child(section(
                     "700ms delay",
-                    div().flex().child(
+                    div().display(Display::Flex).child(
                         tooltip()
                             .delay_duration(Duration::from_millis(700))
                             .child(hover_button("Wait for it"))

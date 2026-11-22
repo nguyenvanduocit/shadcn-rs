@@ -1,7 +1,8 @@
 //! Button group (`ui/button-group`): buttons (or an input) joined into one
 //! control, with a separator and a text cell to put between them.
 
-use gui::{Div, Element, IntoElement, Style, Styled, div};
+use gui::prelude::*;
+use gui::{Color, Div, Element, IntoElement, Style, div};
 
 use crate::separator::{Orientation, separator};
 use crate::theme::theme;
@@ -26,7 +27,7 @@ pub fn button_group<E: IntoElement>(orientation: Orientation, items: impl IntoIt
 /// (`has-[>[data-slot=button-group]]:gap-2`), as a toolbar nests them.
 #[must_use]
 pub fn button_group_of_groups(orientation: Orientation, groups: impl IntoIterator<Item = Div>) -> Div {
-    root(orientation).gap(2.0).children(groups)
+    root(orientation).gap(8.0).children(groups)
 }
 
 /// A rule between two items (`ButtonGroupSeparator`), vertical by default
@@ -36,11 +37,11 @@ pub fn button_group_separator(orientation: Orientation) -> Div {
     let t = theme();
     let d = separator(orientation)
         .named("button-group-separator")
-        .bg(t.input)
-        .m(0.0)
-        .self_stretch();
+        .background(t.input)
+        .margin(0.0)
+        .align_self(Align::Stretch);
     match orientation {
-        Orientation::Vertical => d.h_auto(),
+        Orientation::Vertical => d.height(Length::Auto),
         Orientation::Horizontal => d,
     }
 }
@@ -52,25 +53,36 @@ pub fn button_group_text() -> Div {
     let t = theme();
     div()
         .named("button-group-text")
-        .bg(t.muted)
-        .flex()
-        .items_center()
-        .gap(2.0)
-        .rounded_md()
-        .border()
+        .background(t.muted)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .px(4.0)
-        .text_sm()
-        .font_medium()
-        .shadow_xs()
+        .padding_x(16.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
 }
 
 /// `flex w-fit items-stretch`.
 fn root(orientation: Orientation) -> Div {
-    let d = div().named("button-group").flex().w_fit().items_stretch();
+    let d = div()
+        .named("button-group")
+        .display(Display::Flex)
+        .width(Length::FitContent)
+        .align_items(Align::Stretch);
     match orientation {
         Orientation::Horizontal => d,
-        Orientation::Vertical => d.flex_col(),
+        Orientation::Vertical => d.display(Display::Flex).flex_direction(FlexDirection::Column),
     }
 }
 
@@ -78,12 +90,12 @@ fn join(item: Element, orientation: Orientation, first: bool, last: bool) -> Ele
     restyle(item, move |s| {
         let s = match orientation {
             Orientation::Horizontal if !first => {
-                let mut s = s.rounded_l(0.0);
+                let mut s = s.radius_left(0.0);
                 s.border_widths.left = 0.0;
                 s
             }
             Orientation::Vertical if !first => {
-                let mut s = s.rounded_t(0.0);
+                let mut s = s.radius_top(0.0);
                 s.border_widths.top = 0.0;
                 s
             }
@@ -91,8 +103,8 @@ fn join(item: Element, orientation: Orientation, first: bool, last: bool) -> Ele
         };
         match orientation {
             _ if last => s,
-            Orientation::Horizontal => s.rounded_r(0.0),
-            Orientation::Vertical => s.rounded_b(0.0),
+            Orientation::Horizontal => s.radius_right(0.0),
+            Orientation::Vertical => s.radius_bottom(0.0),
         }
     })
 }
@@ -100,16 +112,8 @@ fn join(item: Element, orientation: Orientation, first: bool, last: bool) -> Ele
 /// `item` with `f` applied to its style; an input also takes `flex-1`.
 fn restyle(item: Element, f: impl Fn(Style) -> Style + 'static) -> Element {
     if matches!(item, Element::Input(_)) || item.name() == Some("input") {
-        item.restyle(move |s| f(s).flex_1())
+        item.restyle(move |s| f(s).flex(Flex::grow(1.0)))
     } else {
         item.restyle(f)
     }
-}
-
-/// `node` with `f` (a style refinement, as `focus_ring` is) applied to its
-/// style now rather than in a state; `gui::Styled` has no setter for that.
-pub(crate) fn with_style<S: Styled>(mut node: S, f: impl FnOnce(Style) -> Style) -> S {
-    let s = std::mem::take(node.style_mut());
-    *node.style_mut() = f(s);
-    node
 }

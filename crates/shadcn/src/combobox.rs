@@ -11,9 +11,10 @@
 
 use std::rc::Rc;
 
+use gui::Color;
 use gui::prelude::*;
 use gui::{
-    Bind, Div, Element, FocusHandle, Icon, Model, NamedKey, Placement, Side, SideAlign, TextField, component, div,
+    Bind, Div, Element, FocusHandle, Icon, Model, NamedKey, Positioning, Side, SideAlign, TextField, component, div,
     icon, provide, use_context, use_model,
 };
 
@@ -100,49 +101,54 @@ fn close(open: &dyn OpenModel, list: &CommandContext, trigger: FocusHandle, by_k
 /// (`combobox::<Option<String>>()`) or several (`combobox::<Vec<String>>()`).
 #[must_use]
 pub fn combobox<M: SelectModel>() -> Part<ComboboxProps<M>> {
-    Part::new(ComboboxProps::default(), div().named("combobox").inline_flex(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let value = use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.value);
-            let open: Rc<dyn OpenModel> = Rc::new(use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.open));
-            let trigger = FocusHandle::new();
-            // Picking clears the search itself (`CommandContext::pick`).
-            let picked = {
-                let open = Rc::clone(&open);
-                CommandContext::new(TextField::new(""), move |item: &CommandItem| {
-                    let shut = || {
-                        open.set(false);
-                        gui::focus::set_focus(Some(trigger.id()), false);
-                    };
-                    if item.null {
-                        value.set(M::default());
-                        shut();
-                        return;
-                    }
-                    value.update(|m| m.pick(&item.value));
-                    if M::CLOSES_ON_PICK {
-                        shut();
-                    }
-                })
-            };
-            provide(picked.clone());
-            provide(ComboboxContext {
-                open,
-                holds: Rc::new(move |v: &str| value.with(|m| m.holds(v))),
-                first: Rc::new(move || value.get_untracked().chosen().into_iter().next()),
-                list: picked,
-                trigger,
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        ComboboxProps::default(),
+        div().named("combobox").display(Display::Flex).inline(true),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let value = use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.value);
+                let open: Rc<dyn OpenModel> =
+                    Rc::new(use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.open));
+                let trigger = FocusHandle::new();
+                // Picking clears the search itself (`CommandContext::pick`).
+                let picked = {
+                    let open = Rc::clone(&open);
+                    CommandContext::new(TextField::new(""), move |item: &CommandItem| {
+                        let shut = || {
+                            open.set(false);
+                            gui::focus::set_focus(Some(trigger.id()), false);
+                        };
+                        if item.null {
+                            value.set(M::default());
+                            shut();
+                            return;
+                        }
+                        value.update(|m| m.pick(&item.value));
+                        if M::CLOSES_ON_PICK {
+                            shut();
+                        }
+                    })
+                };
+                provide(picked.clone());
+                provide(ComboboxContext {
+                    open,
+                    holds: Rc::new(move |v: &str| value.with(|m| m.holds(v))),
+                    first: Rc::new(move || value.get_untracked().chosen().into_iter().next()),
+                    list: picked,
+                    trigger,
+                });
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 /// The trigger (usually an outline button): a click, Enter, Space or
 /// ArrowDown opens the list below it.
 #[must_use]
-pub fn combobox_trigger(trigger: Div) -> Part<()> {
-    Part::new((), trigger.named("combobox-trigger"), |p| {
+pub fn combobox_trigger(trigger: impl Into<Div>) -> Part<()> {
+    Part::new((), trigger.into().named("combobox-trigger"), |p| {
         component(p, |cx| {
             let props = cx.props();
             let combobox = use_context::<ComboboxContext>();
@@ -177,7 +183,7 @@ pub fn combobox_trigger(trigger: Div) -> Part<()> {
 /// `w-[200px]`: what the list lines up with.
 #[must_use]
 pub fn combobox_anchor() -> Div {
-    div().named("combobox-anchor").w_px(200.0)
+    div().named("combobox-anchor").width(200.0)
 }
 
 /// What [`combobox_list`] is given: how it lines up with the trigger.
@@ -204,14 +210,29 @@ pub fn combobox_list() -> Part<ComboboxListProps> {
     let t = theme();
     let root = popper(div(), Origin::Anchor)
         .named("combobox-list")
-        .w_px(200.0)
-        .rounded_md()
-        .border()
+        .width(200.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .overflow_hidden()
-        .shadow_md();
+        .overflow(Overflow::Hidden)
+        .shadow([
+            Shadow {
+                x: 0.0,
+                y: 4.0,
+                blur: 6.0,
+                spread: -1.0,
+                color: Color::BLACK.opacity(0.1),
+            },
+            Shadow {
+                x: 0.0,
+                y: 2.0,
+                blur: 4.0,
+                spread: -2.0,
+                color: Color::BLACK.opacity(0.1),
+            },
+        ]);
     Part::new(
         ComboboxListProps {
             align: SideAlign::Center,
@@ -239,7 +260,7 @@ pub fn combobox_list() -> Part<ComboboxListProps> {
                             }
                             keys.list.key(ev)
                         });
-                    let placement = Placement::Anchored {
+                    let placement = Positioning::Anchored {
                         side: Side::Bottom,
                         align,
                         offset: 4.0,
@@ -286,7 +307,10 @@ pub fn combobox_items(
 /// `value` is chosen.
 #[must_use]
 pub fn combobox_item_indicator(value: &str) -> Part<String> {
-    let root = div().named("combobox-item-indicator").ml_auto().flex();
+    let root = div()
+        .named("combobox-item-indicator")
+        .margin_left(Length::Auto)
+        .display(Display::Flex);
     Part::new(value.to_owned(), root, |p| {
         component(p, |cx| {
             let props = cx.props();

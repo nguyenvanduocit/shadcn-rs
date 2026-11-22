@@ -3,8 +3,9 @@
 //! buffers kept across frames, and replayed while the chunk is the same (its
 //! recording, the text settings, whether it may draw subpixel text). What a
 //! chunk draws each frame anew is only what cannot be kept as a quad: a
-//! vector path (its tiles are kept by [`super::path`]) and a glyph drawn
-//! from its curves. A chunk also keeps what the renderer decides with
+//! vector path (its tiles are kept by [`super::path`]), a glyph drawn
+//! from its curves, and what reads what lies below it (a backdrop, a
+//! blended border). A chunk also keeps what the renderer decides with
 //! (where its primitives lie, whether all of it can be drawn transformed)
 //! and the atlas pages and images it reads, which are kept while it lives.
 
@@ -15,7 +16,6 @@ use super::record::{self, KIND_COLOR, KIND_LCD, KIND_MASK, KIND_MONO};
 use super::words::Span;
 use super::{Extra, GpuRenderer, Page, Texture, image_key, phys, radii, rgba, wants_curves};
 use crate::image::ImageSource;
-use crate::paint::grow;
 use crate::scene::{Chunk, ChunkId, Display, Gradient, Item, PixelRect, Scene};
 use crate::text::gamma::MaskGamma;
 use crate::text::{Coverage, Glyphs};
@@ -39,6 +39,10 @@ pub(super) struct Kept {
     pub rects: Vec<[f32; 4]>,
     /// What it may paint in its space, reach included.
     pub bounds: Option<[f32; 4]>,
+    /// The boxes (physical x0, y0, x1, y1, in its space) whose backdrop it
+    /// blurs: a blur reads all of its box, so damage that meets one grows
+    /// to hold it whole (`frame.rs`'s `with_reads`).
+    pub blurs: Vec<[f32; 4]>,
     /// The atlas pages it reads: coverage, colour.
     pub pages: [u64; 2],
     pub images: Vec<ImageSource>,
@@ -76,6 +80,7 @@ pub(super) struct Encoding {
     pub segs: Vec<Seg>,
     pub rects: Vec<[f32; 4]>,
     pub bounds: Option<[f32; 4]>,
+    pub blurs: Vec<[f32; 4]>,
     pub pages: [u64; 2],
     pub images: Vec<ImageSource>,
     pub canvases: Vec<u64>,
@@ -235,6 +240,9 @@ impl GpuRenderer {
         let mut old = self.kept.remove(&chunk.id);
         if let Some(k) = old.as_mut() {
             self.unpin(k);
+            if !k.blurs.is_empty() {
+                self.blurring = self.blurring.saturating_sub(1);
+            }
         }
         let slot = old.as_ref().map_or_else(|| self.slots.take(), |k| k.slot);
         let mut enc = Encoding {
@@ -271,6 +279,7 @@ impl GpuRenderer {
             segs: enc.segs,
             rects: enc.rects,
             bounds: enc.bounds,
+            blurs: enc.blurs,
             pages: enc.pages,
             images: enc.images,
             canvases: enc.canvases,
@@ -282,6 +291,9 @@ impl GpuRenderer {
             pinned: false,
         };
         self.pin(&mut kept);
+        if !kept.blurs.is_empty() {
+            self.blurring = self.blurring.saturating_add(1);
+        }
         self.kept.insert(chunk.id, kept);
     }
 
@@ -383,6 +395,7 @@ impl GpuRenderer {
                             rect,
                             radii: None,
                             inner: None,
+                            curve: None,
                         }
                         .push(out);
                     });
@@ -395,8 +408,9 @@ impl GpuRenderer {
                             slot,
                             color: rgba(*color),
                             rect,
-                            radii: Some(radii(*radius, s)),
+                            radii: Some(radii(*radius, *bounds, s)),
                             inner: None,
+                            curve: None,
                         }
                         .push(out);
                     });
@@ -410,19 +424,48 @@ impl GpuRenderer {
                 } => {
                     let rect = phys(*outer, s);
                     enc.rect(corners(rect));
-                    let cut = (!inner.is_empty()).then(|| (phys(*inner, s), radii(*inner_radius, s)));
+                    let cut = (!inner.is_empty()).then(|| (phys(*inner, s), radii(*inner_radius, *inner, s)));
                     enc.record(Extra::None, |out| {
                         record::Solid {
                             slot,
                             color: rgba(*color),
                             rect,
-                            radii: Some(radii(*outer_radius, s)),
+                            radii: Some(radii(*outer_radius, *outer, s)),
                             inner: cut,
+                            curve: None,
                         }
                         .push(out);
                     });
                 }
-                Item::Shadow { bounds, radius, shadow } => {
+                Item::Superellipse {
+                    outer,
+                    outer_radius,
+                    inner,
+                    inner_radius,
+                    k,
+                    color,
+                } => {
+                    let rect = phys(*outer, s);
+                    enc.rect(corners(rect));
+                    let cut = (!inner.is_empty()).then(|| (phys(*inner, s), radii(*inner_radius, *inner, s)));
+                    enc.record(Extra::None, |out| {
+                        record::Solid {
+                            slot,
+                            color: rgba(*color),
+                            rect,
+                            radii: Some(radii(*outer_radius, *outer, s)),
+                            inner: cut,
+                            curve: Some(*k),
+                        }
+                        .push(out);
+                    });
+                }
+                Item::Shadow {
+                    bounds,
+                    radius,
+                    curve,
+                    shadow,
+                } => {
                     let shape = bounds.translated(shadow.x, shadow.y).outset(shadow.spread);
                     if shape.is_empty() {
                         continue;
@@ -437,10 +480,11 @@ impl GpuRenderer {
                             slot,
                             color: rgba(shadow.color),
                             shape: phys(shape, s),
-                            shape_radii: radii(grow(*radius, shadow.spread), s),
+                            shape_radii: radii(radius.spread(shadow.spread), shape, s),
                             caster: phys(*bounds, s),
-                            caster_radii: radii(*radius, s),
+                            caster_radii: radii(*radius, *bounds, s),
                             sigma,
+                            curve: Some(*curve),
                         }
                         .push(out);
                     });
@@ -457,7 +501,7 @@ impl GpuRenderer {
                         record::Gradient {
                             slot,
                             rect,
-                            radii: radii(*radius, s),
+                            radii: radii(*radius, *bounds, s),
                             line,
                             stops,
                         }
@@ -551,7 +595,12 @@ impl GpuRenderer {
                     .words();
                     enc.record(Extra::None, |out| out.extend(words));
                 }
-                Item::Image { source, bounds, radius } => {
+                Item::Image {
+                    source,
+                    bounds,
+                    radius,
+                    curve,
+                } => {
                     enc.drawable = false;
                     if !self.image(source) {
                         continue;
@@ -575,8 +624,9 @@ impl GpuRenderer {
                         record::Image {
                             slot,
                             rect,
-                            radii: radii(*radius, s),
+                            radii: radii(*radius, *bounds, s),
                             placed,
+                            curve: Some(*curve),
                         }
                         .push(out);
                     });
@@ -585,6 +635,22 @@ impl GpuRenderer {
                     if let Some(r) = item.reach(s) {
                         enc.rect(r);
                     }
+                    enc.segs.push(Seg::Item(n));
+                }
+                Item::Backdrop { bounds, backdrop, .. } => {
+                    // Read back each frame it is drawn, in its target: never
+                    // through a matrix (an effect over it takes a layer).
+                    enc.drawable = false;
+                    let r = corners(phys(*bounds, s));
+                    enc.rect(r);
+                    if backdrop.blur > 0.0 {
+                        enc.blurs.push(r);
+                    }
+                    enc.segs.push(Seg::Item(n));
+                }
+                Item::Blended { outer, .. } => {
+                    enc.drawable = false;
+                    enc.rect(corners(phys(*outer, s)));
                     enc.segs.push(Seg::Item(n));
                 }
                 Item::Data(_) | Item::World(_) => {
@@ -651,6 +717,9 @@ impl GpuRenderer {
         for id in gone {
             let Some(mut k) = self.kept.remove(&id) else { continue };
             self.unpin(&mut k);
+            if !k.blurs.is_empty() {
+                self.blurring = self.blurring.saturating_sub(1);
+            }
             self.slots.give(k.slot);
             if let Some(r) = k.records {
                 self.records.release(r);

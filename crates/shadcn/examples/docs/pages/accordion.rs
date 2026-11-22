@@ -41,12 +41,16 @@ pub fn render() -> Render {
                 accordion()
                     .single(true)
                     .default_value(&["item-1"])
-                    .w_full()
+                    .width(pct(100.0))
                     .children(ITEMS.iter().enumerate().map(|(i, (value, title, [first, second]))| {
                         accordion_item(*value)
-                            .when(i == last, |d| d.border_0())
+                            .when(i == last, |d| d.border(0.0))
                             .child(accordion_trigger(*title))
-                            .child(accordion_content().child(text(*first)).child(text(*second).mt(2.0)))
+                            .child(
+                                accordion_content()
+                                    .child(text(*first))
+                                    .child(text(*second).margin_top(8.0)),
+                            )
                     })),
             ),
         )

@@ -1,7 +1,7 @@
 use gui::prelude::*;
 use gui::{Div, Icon, ScenarioError, Signal, div, icon, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, ButtonSize, ButtonVariant, MarkerVariant,
+    BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, Button, ButtonSize, ButtonVariant, MarkerVariant,
     MessageProps, avatar, avatar_fallback, bubble, bubble_content, bubble_group, bubble_reactions, button, marker,
     message, message_avatar, message_content, message_footer, message_group, message_header, theme, tooltip,
     tooltip_content, tooltip_trigger,
@@ -14,7 +14,13 @@ use BubbleAlign::{End, Start};
 
 /// The demos' column: `flex w-full max-w-sm flex-col py-12`.
 fn column(gap: f32) -> Div {
-    div().flex_col().w_full().max_w(96.0).gap(gap).py(12.0)
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(gap)
+        .padding_y(48.0)
 }
 
 fn said(p: MessageProps, variant: BubbleVariant, words: &str) -> Div {
@@ -54,14 +60,14 @@ fn theirs() -> MessageProps {
     MessageProps::default()
 }
 
-fn ghost_icon(size: ButtonSize, glyph: Icon) -> Div {
+fn ghost_icon(size: ButtonSize, glyph: Icon) -> Button {
     button(ButtonVariant::Ghost, size).child(icon(glyph))
 }
 
 fn actions() -> Div {
     let theirs = theirs();
     let failed = mine(true);
-    column(8.0)
+    column(32.0)
         .child(
             message(theirs).child(
                 message_content(theirs)
@@ -88,8 +94,8 @@ fn actions() -> Div {
                     ))
                     .child(
                         message_footer(failed)
-                            .gap(2.0)
-                            .child(text("Failed to send").font_normal().text_color(theme().destructive))
+                            .gap(8.0)
+                            .child(text("Failed to send").font_weight(400).text_color(theme().destructive))
                             .child(ghost_icon(ButtonSize::IconSm, Icon::RefreshCcw)),
                     ),
             ),
@@ -98,7 +104,7 @@ fn actions() -> Div {
 
 fn grouped() -> Div {
     let p = theirs();
-    column(6.0).child(
+    column(24.0).child(
         message_group()
             .child(message(p).child(message_avatar(p)).child(message_content(p).child(said(
                 p,
@@ -175,17 +181,19 @@ impl Pattern {
         let (up, down) = (feedback, feedback);
         let vote = |s: &Signal<Option<bool>>, v: bool| s.update(|f| *f = if *f == Some(v) { None } else { Some(v) });
         div()
-            .mx_auto()
-            .flex_col()
-            .w_full()
-            .max_w(112.0)
-            .gap(8.0)
-            .py(6.0)
-            .text_sm()
+            .margin_x(Length::Auto)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .gap(32.0)
+            .padding_y(24.0)
+            .text_size(14.0)
+            .line_height(20.0)
             .child(
                 message(ask).child(
                     message_content(ask)
-                        .gap(2.0)
+                        .gap(8.0)
                         .child(bubble(b).child(
                             bubble_content(b).child(
                                 "How do I add a settings dialog? It should open from the gear icon in the header.",
@@ -200,7 +208,7 @@ impl Pattern {
             )
             .child(
                 message(reply).child(
-                    message_content(reply).gap(2.0).child(markdown(REPLY, 14.0)).child(
+                    message_content(reply).gap(8.0).child(markdown(REPLY, 14.0)).child(
                         message_footer(reply)
                             .child(Self::action(
                                 if copied { "Copied" } else { "Copy" },
@@ -224,7 +232,7 @@ pub fn render() -> Render {
         let delivered = mine(true);
         let main = demo(
             "MessageDemo.vue",
-            column(6.0)
+            column(24.0)
                 .child(turn(
                     End,
                     false,
@@ -263,14 +271,14 @@ pub fn render() -> Render {
                     MarkerVariant::Default,
                     gui::Element::Empty,
                     div()
-                        .flex()
-                        .child(text("Oliver").font_medium())
+                        .display(Display::Flex)
+                        .child(text("Oliver").font_weight(500))
                         .child(text("\u{a0}is typing...")),
                 )),
         );
         let avatars = demo(
             "MessageAvatarDemo.vue",
-            column(6.0)
+            column(24.0)
                 .child(turn(
                     Start,
                     false,
@@ -294,7 +302,7 @@ pub fn render() -> Render {
         let read = mine(true);
         let captions = demo(
             "MessageHeaderAndFooterDemo.vue",
-            column(8.0)
+            column(32.0)
                 .child(
                     message(theirs()).child(
                         message_content(theirs())
@@ -313,7 +321,7 @@ pub fn render() -> Render {
                             .child(
                                 message_footer(read)
                                     .child(text("Read\u{a0}"))
-                                    .child(text("Yesterday").font_normal()),
+                                    .child(text("Yesterday").font_weight(400)),
                             ),
                     ),
                 ),
@@ -321,7 +329,8 @@ pub fn render() -> Render {
         page(
             "Message",
             div()
-                .flex_col()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .child(main)
                 .child(avatars)
                 .child(captions)

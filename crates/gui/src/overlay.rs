@@ -68,7 +68,7 @@ fn label_text() -> ResolvedText {
     ResolvedText {
         size: 12.0,
         line_height: 16.0,
-        family: FontFamily::Mono,
+        family: FontFamily::GEIST_MONO,
         nowrap: true,
         ..ResolvedText::root(Color::hex(LABEL_TEXT))
     }

@@ -29,7 +29,7 @@ pub(crate) fn gradient(g: &LinearGradient, tile: Bounds, current: Color, ch: f32
         .iter()
         .map(|s| {
             at = at.max(s.at.resolve(length, ch));
-            (at, s.ink.resolve(current))
+            (at, s.color.resolve(current))
         })
         .collect();
     let (&(first, _), &(last, last_color)) = (stops.first()?, stops.last()?);
@@ -87,15 +87,16 @@ pub(crate) fn record_background(
     let Some(gradient) = gradient(&img.gradient, tile, node.look.text.color, ch) else {
         return;
     };
+    let b = target.snapped(node.bounds);
     target.items.push(Item::Gradient {
-        bounds: target.snapped(node.bounds).intersect(&tile),
-        radius: node.look.radius,
+        bounds: b.intersect(&tile),
+        radius: node.look.shape.used(b.width, b.height),
         gradient,
     });
 }
 
 /// `rect` in physical pixels, grown to whole pixels and kept inside `size`.
-fn physical_rect(rect: Bounds, scale: f32, size: (u32, u32)) -> Option<PixelRect> {
+pub(crate) fn physical_rect(rect: Bounds, scale: f32, size: (u32, u32)) -> Option<PixelRect> {
     let (w, h) = (
         i32::try_from(size.0).unwrap_or(i32::MAX),
         i32::try_from(size.1).unwrap_or(i32::MAX),
@@ -233,14 +234,17 @@ pub(crate) fn group_region(node: &FrameNode, scale: f32, size: (u32, u32)) -> Op
     physical_rect(node.bounds.outset(reach), scale, size)
 }
 
-/// How far past its border box `node` paints: its ring and shadows.
+/// How far past its border box `node` paints: its ring (at its offset)
+/// and shadows, its inset layer's shadows included.
 fn reach(node: &FrameNode) -> f32 {
     let look = &node.look;
-    let ring = look.ring.map_or(0.0, |r| r.width);
-    look.shadows
-        .iter()
-        .map(|s| s.blur.mul_add(1.5, s.spread) + s.x.abs().max(s.y.abs()))
-        .fold(ring, f32::max)
+    let ring = look.ring.map_or(0.0, |r| (r.offset + r.width).max(0.0));
+    let shadow = |s: &crate::style::Shadow| s.blur.mul_add(1.5, s.spread) + s.x.abs().max(s.y.abs());
+    let inset = look.decoration.inset.as_ref().map_or(0.0, |l| {
+        let least = l.inset.top.min(l.inset.right).min(l.inset.bottom).min(l.inset.left);
+        l.shadows.iter().map(shadow).fold(0.0, f32::max) - least
+    });
+    look.shadows.iter().map(shadow).fold(ring.max(inset), f32::max)
 }
 
 /// The physical region the nodes of a subtree paint, `nodes[0]` its root:

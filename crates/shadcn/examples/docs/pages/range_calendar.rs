@@ -32,9 +32,10 @@ pub fn render() -> Render {
             section(
                 "Two months, days outside them disabled",
                 div()
-                    .flex_col()
-                    .items_start()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .align_items(Align::Start)
+                    .gap(8.0)
                     .child(demo(
                         "CalendarRangeDemo.vue",
                         range_calendar()
@@ -42,14 +43,30 @@ pub fn render() -> Render {
                             .today(today())
                             .number_of_months(2)
                             .disable_days_outside_current_view()
-                            .rounded_md()
-                            .border()
+                            .radius(8.0)
+                            .border(1.0)
                             .border_color(t.border)
-                            .shadow_sm(),
+                            .shadow([
+                                Shadow {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    blur: 3.0,
+                                    spread: 0.0,
+                                    color: gui::Color::BLACK.opacity(0.1),
+                                },
+                                Shadow {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    blur: 2.0,
+                                    spread: -1.0,
+                                    color: gui::Color::BLACK.opacity(0.1),
+                                },
+                            ]),
                     ))
                     .child(
                         text_bound(move || describe(value.get()))
-                            .text_sm()
+                            .text_size(14.0)
+                            .line_height(20.0)
                             .text_color(t.muted_foreground),
                     ),
             ),

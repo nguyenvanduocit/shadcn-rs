@@ -1,7 +1,7 @@
 use gui::prelude::*;
 use gui::{Icon, ScenarioError, Signal, TextField, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize, Orientation, button, button_group,
+    Button, ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize, Orientation, button, button_group,
     button_group_of_groups, button_group_separator, input, input_group, input_group_addon, input_group_button,
     input_group_input, select, select_content, select_item, theme,
 };
@@ -13,11 +13,14 @@ const H: Orientation = Orientation::Horizontal;
 /// ButtonGroupWithSelectDemo's currencies: the symbol (its value) and name.
 const CURRENCIES: [(&str, &str); 3] = [("$", "US Dollar"), ("€", "Euro"), ("£", "British Pound")];
 
-fn outline(label: &str, size: ButtonSize) -> gui::Div {
+fn outline(label: &str, size: ButtonSize) -> Button {
     button(ButtonVariant::Outline, size).child(label.to_owned())
 }
 
-fn outline_icon(i: Icon, size: ButtonSize) -> gui::Div {
+/// `9999rem`, the radius of the input group demo.
+const PILL: f32 = 9999.0 * 16.0;
+
+fn outline_icon(i: Icon, size: ButtonSize) -> Button {
     button(ButtonVariant::Outline, size).child(icon(i))
 }
 
@@ -30,15 +33,16 @@ pub fn render() -> Render {
         let t = theme();
         let currencies =
             select_content()
-                .min_w(24.0)
+                .min_width(96.0)
                 .children(CURRENCIES.map(|(symbol, name)| {
                     select_item(symbol, symbol).child(text(name).text_color(t.muted_foreground))
                 }));
         page(
             "Button Group",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "ButtonGroupDemo.vue",
                     button_group_of_groups(
@@ -65,9 +69,10 @@ pub fn render() -> Render {
                 .child(demo(
                     "ButtonGroupSizeDemo.vue",
                     div()
-                        .flex_col()
-                        .items_start()
-                        .gap(8.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Start)
+                        .gap(32.0)
                         .child(button_group(
                             H,
                             [
@@ -186,25 +191,30 @@ pub fn render() -> Render {
                 ))
                 .child(demo(
                     "ButtonGroupInputGroupDemo.vue",
+                    // `--radius: 9999rem` on the group: the button and the
+                    // input group (`rounded-md`) and the input group's button
+                    // (`rounded-[calc(var(--radius)-5px)]`) follow it.
                     button_group_of_groups(
                         H,
                         [
-                            button_group(H, [outline_icon(Icon::Plus, ButtonSize::Icon)]),
+                            button_group(H, [outline_icon(Icon::Plus, ButtonSize::Icon).radius(PILL * 0.8)]),
                             button_group(
                                 H,
                                 [
-                                    input_group(input_group_input(&message).placeholder("Send a message...")).addon(
-                                        input_group_addon(InputGroupAlign::InlineEnd).button(
-                                            input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs)
-                                                .child(icon(Icon::AudioLines)),
+                                    input_group(input_group_input(&message).placeholder("Send a message..."))
+                                        .radius(PILL * 0.8)
+                                        .addon(
+                                            input_group_addon(InputGroupAlign::InlineEnd).button(
+                                                input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs)
+                                                    .radius(PILL - 5.0)
+                                                    .child(icon(Icon::AudioLines)),
+                                            ),
                                         ),
-                                    ),
                                 ],
                             )
-                            .flex_1(),
+                            .flex(Flex::grow(1.0)),
                         ],
-                    )
-                    .radius_var(9999.0 * 16.0),
+                    ),
                 ))
                 .child(demo(
                     "ButtonGroupWithSelectDemo.vue",
@@ -219,8 +229,8 @@ pub fn render() -> Render {
                                         .model(currency)
                                         .child(text(currency.get().unwrap_or_default()))
                                         .child(currencies)
-                                        .font_mono()
-                                        .w(14.0)
+                                        .font_family(FontFamily::GEIST_MONO)
+                                        .width(56.0)
                                         .into_element(),
                                     input().field(amount).placeholder("10.00").into_element(),
                                 ],

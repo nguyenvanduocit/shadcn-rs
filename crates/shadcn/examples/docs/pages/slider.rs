@@ -1,5 +1,5 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, relative, text};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{Orientation, label, slider, theme};
 
 use crate::{Render, Shot, demo, page, section};
@@ -34,26 +34,28 @@ pub fn render() -> Render {
         page(
             "Slider",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "SliderDemo.vue",
-                    div().w_full().child(
+                    div().width(pct(100.0)).child(
                         slider(Orientation::Horizontal)
                             .default_value(vec![50.0])
-                            .w_len(relative(0.6)),
+                            .width(Length::Fraction(0.6)),
                     ),
                 ))
                 .child(section(
                     "Range, steps of ten, vertical, labelled, disabled",
                     div()
-                        .flex()
-                        .gap(12.0)
+                        .display(Display::Flex)
+                        .gap(48.0)
                         .child(
                             div()
-                                .flex_col()
-                                .w_px(384.0)
-                                .gap(6.0)
+                                .display(Display::Flex)
+                                .flex_direction(FlexDirection::Column)
+                                .width(384.0)
+                                .gap(24.0)
                                 .child(slider(Orientation::Horizontal).default_value(vec![25.0, 50.0]))
                                 .child(
                                     slider(Orientation::Horizontal)
@@ -62,17 +64,22 @@ pub fn render() -> Render {
                                 )
                                 .child(
                                     div()
-                                        .grid()
-                                        .w_full()
-                                        .gap(3.0)
+                                        .display(Display::Grid)
+                                        .width(pct(100.0))
+                                        .gap(12.0)
                                         .child(
                                             div()
-                                                .flex()
-                                                .items_center()
-                                                .justify_between()
-                                                .gap(2.0)
+                                                .display(Display::Flex)
+                                                .align_items(Align::Center)
+                                                .justify_content(Justify::Between)
+                                                .gap(8.0)
                                                 .child(label("Temperature"))
-                                                .child(text(shown).text_sm().text_color(t.muted_foreground)),
+                                                .child(
+                                                    text(shown)
+                                                        .text_size(14.0)
+                                                        .line_height(20.0)
+                                                        .text_color(t.muted_foreground),
+                                                ),
                                         )
                                         .child(slider(Orientation::Horizontal).model(temperature).max(1.0).step(0.1)),
                                 )
@@ -80,9 +87,9 @@ pub fn render() -> Render {
                         )
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(6.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(24.0)
                                 .child(slider(Orientation::Vertical).default_value(vec![50.0]))
                                 .child(slider(Orientation::Vertical).default_value(vec![25.0])),
                         ),

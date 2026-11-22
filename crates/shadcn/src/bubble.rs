@@ -5,10 +5,10 @@
 //! `data-align`; here [`bubble_content`] takes the same [`BubbleProps`].
 
 use gui::prelude::*;
-use gui::{Color, Div, div, px, relative};
+use gui::{Color, Div, div, px};
 
-use crate::focus::focus_ring;
-use crate::theme::{Theme, theme};
+use crate::focus::StateLook;
+use crate::theme::{Colors, theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum BubbleVariant {
@@ -46,11 +46,17 @@ pub struct BubbleProps {
 /// takes it all).
 #[must_use]
 pub fn bubble(p: BubbleProps) -> Div {
-    let mut d = div().named("bubble").relative().flex_col().gap(1.0).min_w(0.0);
-    d.style_mut().max_width = relative(if p.variant == BubbleVariant::Ghost { 1.0 } else { 0.8 });
+    let mut d = div()
+        .named("bubble")
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(4.0)
+        .min_width(0.0);
+    d.style_mut().max_width = Length::Fraction(if p.variant == BubbleVariant::Ghost { 1.0 } else { 0.8 });
     match p.align {
-        BubbleAlign::Start => d.self_start(),
-        BubbleAlign::End => d.self_end(),
+        BubbleAlign::Start => d.align_self(Align::Start),
+        BubbleAlign::End => d.align_self(Align::End),
     }
 }
 
@@ -60,20 +66,21 @@ pub fn bubble_content(p: BubbleProps) -> Div {
     let t = theme();
     let d = div()
         .named("bubble-content")
-        .transition_colors()
-        .rounded_xl()
-        .border()
+        .transition(Properties::COLORS)
+        .radius(14.0)
+        .border(1.0)
         .border_color(Color::TRANSPARENT)
-        .px(3.0)
-        .py(2.0)
-        .text_sm()
-        .leading_relaxed()
-        .max_w_full()
-        .min_w(0.0)
-        .overflow_hidden();
+        .padding_x(12.0)
+        .padding_y(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .line_height(LineHeight::Relative(1.625))
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .overflow(Overflow::Hidden);
     let d = match p.align {
-        BubbleAlign::Start => d.self_start(),
-        BubbleAlign::End => d.self_end(),
+        BubbleAlign::Start => d.align_self(Align::Start),
+        BubbleAlign::End => d.align_self(Align::End),
     };
     variant(d, p.variant, &t)
 }
@@ -87,16 +94,13 @@ pub fn bubble_content_button(p: BubbleProps) -> Div {
     let hover_text = matches!(p.variant, BubbleVariant::Outline | BubbleVariant::Ghost).then_some(t.foreground);
     bubble_content(p)
         .focusable()
-        .cursor_pointer()
-        .text_left()
-        .hover(move |s| {
-            let s = s.bg(hover);
-            match hover_text {
-                Some(c) => s.text_color(c),
-                None => s,
-            }
+        .cursor(Cursor::Pointer)
+        .text_align(TextAlign::Left)
+        .with_interaction(|d, i| {
+            d.background_while(move || i.hovered(), hover)
+                .when_some(hover_text, |d, c| d.text_color_while(move || i.hovered(), c))
+                .focus_ring_on(i, &t)
         })
-        .focus_visible(move |s| focus_ring(s, &t))
 }
 
 /// Vue's `oklch(from var(--primary) l calc(c*k) h)`. `gui::Color` does not
@@ -106,24 +110,24 @@ fn primary_tint(lightness: f32) -> Color {
     Color::oklch(lightness, 0.0, 0.0)
 }
 
-fn variant(d: Div, v: BubbleVariant, t: &Theme) -> Div {
+fn variant(d: Div, v: BubbleVariant, t: &Colors) -> Div {
     match v {
-        BubbleVariant::Default => d.bg(t.primary).text_color(t.primary_foreground),
-        BubbleVariant::Secondary => d.bg(t.secondary).text_color(t.secondary_foreground),
-        BubbleVariant::Muted => d.bg(t.muted),
+        BubbleVariant::Default => d.background(t.primary).text_color(t.primary_foreground),
+        BubbleVariant::Secondary => d.background(t.secondary).text_color(t.secondary_foreground),
+        BubbleVariant::Muted => d.background(t.muted),
         BubbleVariant::Tinted => d
-            .bg(primary_tint(if t.dark { 0.3 } else { 0.93 }))
+            .background(primary_tint(if t.dark { 0.3 } else { 0.93 }))
             .text_color(t.foreground),
-        BubbleVariant::Outline => d.bg(t.background).border_color(t.border),
-        BubbleVariant::Ghost => d.rounded_none().bg(Color::TRANSPARENT).p(0.0),
+        BubbleVariant::Outline => d.background(t.background).border_color(t.border),
+        BubbleVariant::Ghost => d.radius(0.0).background(Color::TRANSPARENT).padding(0.0),
         BubbleVariant::Destructive => d
-            .bg(t.destructive.opacity(if t.dark { 0.2 } else { 0.1 }))
+            .background(t.destructive.opacity(if t.dark { 0.2 } else { 0.1 }))
             .text_color(t.destructive),
     }
 }
 
 /// The hover background of a pressable bubble's content.
-fn hover_bg(v: BubbleVariant, t: &Theme) -> Color {
+fn hover_bg(v: BubbleVariant, t: &Colors) -> Color {
     match v {
         BubbleVariant::Default => t.primary.opacity(0.8),
         BubbleVariant::Secondary => t.foreground.opacity(0.05).over(t.secondary),
@@ -150,7 +154,12 @@ fn hover_bg(v: BubbleVariant, t: &Theme) -> Color {
 /// Bubbles from one sender, stacked.
 #[must_use]
 pub fn bubble_group() -> Div {
-    div().named("bubble-group").flex_col().gap(2.0).min_w(0.0)
+    div()
+        .named("bubble-group")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .min_width(0.0)
 }
 
 /// Which edge of the bubble the reactions sit on.
@@ -179,7 +188,7 @@ const REACTIONS_BUTTON_HEIGHT: f32 = 32.0;
 /// fills it edge to edge (Vue's `has-[button]:p-0`).
 #[must_use]
 pub fn bubble_reactions_button(side: BubbleReactionsSide, align: BubbleAlign) -> Div {
-    reactions(side, align, REACTIONS_BUTTON_HEIGHT).p(0.0)
+    reactions(side, align, REACTIONS_BUTTON_HEIGHT).padding(0.0)
 }
 
 fn reactions(side: BubbleReactionsSide, align: BubbleAlign, height: f32) -> Div {
@@ -187,24 +196,25 @@ fn reactions(side: BubbleReactionsSide, align: BubbleAlign, height: f32) -> Div 
     let overhang = px(-0.75 * height);
     let d = div()
         .named("bubble-reactions")
-        .absolute()
-        .flex()
-        .items_center()
-        .justify_center()
-        .shrink_0()
-        .gap(1.0)
-        .px(1.5)
-        .py(0.5)
-        .rounded_full()
-        .ring(3.0, t.card)
-        .bg(t.muted)
-        .text_sm();
+        .position(Position::Absolute)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .flex_shrink(0.0)
+        .gap(4.0)
+        .padding_x(6.0)
+        .padding_y(2.0)
+        .radius(9999.0)
+        .ring(Ring::new(3.0, t.card))
+        .background(t.muted)
+        .text_size(14.0)
+        .line_height(20.0);
     let d = match side {
-        BubbleReactionsSide::Top => d.top_len(overhang),
-        BubbleReactionsSide::Bottom => d.bottom_len(overhang),
+        BubbleReactionsSide::Top => d.top(overhang),
+        BubbleReactionsSide::Bottom => d.bottom(overhang),
     };
     match align {
-        BubbleAlign::Start => d.left(3.0),
-        BubbleAlign::End => d.right(3.0),
+        BubbleAlign::Start => d.left(12.0),
+        BubbleAlign::End => d.right(12.0),
     }
 }

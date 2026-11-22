@@ -3,7 +3,7 @@
 use gui::prelude::*;
 use gui::{Color, Div, div, text};
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::separator::{Orientation, separator};
 use crate::theme::theme;
 
@@ -38,24 +38,25 @@ pub fn item(variant: ItemVariant, size: ItemSize) -> Div {
     let t = theme();
     let d = div()
         .named("item")
-        .transition_colors()
+        .transition(Properties::COLORS)
         .duration_ms(100.0)
-        .flex()
-        .items_center()
-        .border()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .border(1.0)
         .border_color(Color::TRANSPARENT)
-        .text_sm()
-        .rounded_md()
-        .flex_wrap()
-        .focus_visible(move |s| focus_ring(s, &t));
+        .text_size(14.0)
+        .line_height(20.0)
+        .radius(8.0)
+        .flex_wrap(true);
     let d = match variant {
         ItemVariant::Default => d,
         ItemVariant::Outline => d.border_color(t.border),
-        ItemVariant::Muted => d.bg(t.muted.opacity(0.5)),
+        ItemVariant::Muted => d.background(t.muted.opacity(0.5)),
     };
+    let d = d.with_interaction(|d, i| d.focus_ring_on(i, &t));
     match size {
-        ItemSize::Default => d.p(4.0).gap(4.0),
-        ItemSize::Sm => d.py(3.0).px(4.0).gap(2.5),
+        ItemSize::Default => d.padding(16.0).gap(16.0),
+        ItemSize::Sm => d.padding_y(12.0).padding_x(16.0).gap(10.0),
     }
 }
 
@@ -65,9 +66,9 @@ pub fn item(variant: ItemVariant, size: ItemSize) -> Div {
 pub fn item_link(variant: ItemVariant, size: ItemSize) -> Div {
     let t = theme();
     item(variant, size)
-        .cursor_pointer()
+        .cursor(Cursor::Pointer)
         .focusable()
-        .hover(move |s| s.bg(t.accent.opacity(0.5)))
+        .with_interaction(|d, i| d.background_while(move || i.hovered(), t.accent.opacity(0.5)))
 }
 
 /// The icon, avatar or image at the start of an item.
@@ -76,15 +77,20 @@ pub fn item_media(variant: ItemMediaVariant) -> Div {
     let t = theme();
     let d = div()
         .named("item-media")
-        .flex()
-        .shrink_0()
-        .items_center()
-        .justify_center()
-        .gap(2.0);
+        .display(Display::Flex)
+        .flex_shrink(0.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(8.0);
     match variant {
         ItemMediaVariant::Default => d,
-        ItemMediaVariant::Icon => d.size(8.0).border().border_color(t.border).rounded_sm().bg(t.muted),
-        ItemMediaVariant::Image => d.size(10.0).rounded_sm().overflow_hidden(),
+        ItemMediaVariant::Icon => d
+            .size(32.0)
+            .border(1.0)
+            .border_color(t.border)
+            .radius(6.0)
+            .background(t.muted),
+        ItemMediaVariant::Image => d.size(40.0).radius(6.0).overflow(Overflow::Hidden),
     }
 }
 
@@ -95,13 +101,22 @@ pub fn item_media(variant: ItemMediaVariant) -> Div {
 /// children hold, so its caller picks this over [`item_media`].
 #[must_use]
 pub fn item_media_described(variant: ItemMediaVariant) -> Div {
-    item_media(variant).self_start().relative().top(0.5)
+    item_media(variant)
+        .align_self(Align::Start)
+        .position(Position::Relative)
+        .top(2.0)
 }
 
 /// Title and description, taking the free width.
 #[must_use]
 pub fn item_content() -> Div {
-    div().named("item-content").flex().flex_1().flex_col().gap(1.0)
+    div()
+        .named("item-content")
+        .display(Display::Flex)
+        .flex(Flex::grow(1.0))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(4.0)
 }
 
 /// The title: words, or a [`gui::Text`] with styled spans; add a badge
@@ -111,13 +126,14 @@ pub fn item_title(title: impl IntoElement) -> Div {
     // `w-fit` in the content column: as wide as its text, not stretched.
     div()
         .named("item-title")
-        .flex()
-        .self_start()
-        .items_center()
-        .gap(2.0)
-        .text_sm()
-        .leading_snug()
-        .font_medium()
+        .display(Display::Flex)
+        .align_self(Align::Start)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .line_height(LineHeight::Relative(1.375))
+        .font_weight(500)
         .child(title)
 }
 
@@ -129,15 +145,20 @@ pub fn item_description(description: impl Into<String>) -> impl IntoElement {
         .named("item-description")
         .text_color(t.muted_foreground)
         .line_clamp(2)
-        .text_sm()
-        .leading_normal()
-        .font_normal()
+        .text_size(14.0)
+        .line_height(20.0)
+        .line_height(LineHeight::Relative(1.5))
+        .font_weight(400)
 }
 
 /// Buttons at the end of an item.
 #[must_use]
 pub fn item_actions() -> Div {
-    div().named("item-actions").flex().items_center().gap(2.0)
+    div()
+        .named("item-actions")
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
 }
 
 /// A full-width row above the rest of the item.
@@ -145,11 +166,11 @@ pub fn item_actions() -> Div {
 pub fn item_header() -> Div {
     div()
         .named("item-header")
-        .flex()
-        .basis_len(gui::relative(1.0))
-        .items_center()
-        .justify_between()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_basis(gui::Length::Fraction(1.0))
+        .align_items(Align::Center)
+        .justify_content(Justify::Between)
+        .gap(8.0)
 }
 
 /// A full-width row below the rest of the item.
@@ -157,21 +178,24 @@ pub fn item_header() -> Div {
 pub fn item_footer() -> Div {
     div()
         .named("item-footer")
-        .flex()
-        .basis_len(gui::relative(1.0))
-        .items_center()
-        .justify_between()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_basis(gui::Length::Fraction(1.0))
+        .align_items(Align::Center)
+        .justify_content(Justify::Between)
+        .gap(8.0)
 }
 
 /// A list of items.
 #[must_use]
 pub fn item_group() -> Div {
-    div().named("item-group").flex_col()
+    div()
+        .named("item-group")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
 }
 
 /// The rule between items in a group.
 #[must_use]
 pub fn item_separator() -> Div {
-    separator(Orientation::Horizontal).named("item-separator").my(0.0)
+    separator(Orientation::Horizontal).named("item-separator").margin_y(0.0)
 }

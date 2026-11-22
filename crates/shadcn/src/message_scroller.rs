@@ -36,12 +36,13 @@ use gui::{
 };
 
 use crate::button::{ButtonSize, ButtonVariant, button};
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 const SCROLL_EPSILON: f64 = 0.5;
 const AUTOSCROLLING_TIMEOUT: Duration = Duration::from_millis(180);
-/// The thread's gap between messages (`gap-8`), in spacing units.
-const DEFAULT_GAP: f32 = 8.0;
+/// The thread's gap between messages, in pixels.
+const DEFAULT_GAP: f32 = 32.0;
 /// How tall a message is taken to be until one is measured.
 const ROW_ESTIMATE: f32 = 96.0;
 
@@ -758,7 +759,7 @@ impl MessageScroller {
                 scrollable,
                 visibility,
                 autoscrolling,
-                gap: DEFAULT_GAP * gui::styled::UNIT,
+                gap: DEFAULT_GAP,
                 len: 0,
                 first: None,
                 last: None,
@@ -891,11 +892,12 @@ struct ProviderProps {
 pub fn message_scroller() -> Div {
     div()
         .named("message-scroller")
-        .relative()
-        .flex_col()
-        .size_full()
-        .min_h(0.0)
-        .overflow_hidden()
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .size(pct(100.0))
+        .min_height(0.0)
+        .overflow(Overflow::Hidden)
 }
 
 type Meta<T> = Rc<dyn for<'a> Fn(&'a T) -> (&'a str, bool)>;
@@ -934,7 +936,7 @@ impl<T: 'static> PartialEq for MessageScrollerViewportProps<T> {
 /// margin are built. `meta` gives each message its id (unique in the
 /// thread) and whether it is an anchor, a turn the thread settles near the
 /// top when it comes in; `row(index, item)` builds a message, set in a
-/// `message-scroller-item` row. The thread's gap is `gap-8`; change it with
+/// `message-scroller-item` row. The thread's gap is 32 px; change it with
 /// [`MessageScrollerViewport::gap`].
 #[must_use]
 pub fn message_scroller_viewport<T: 'static>(
@@ -955,7 +957,7 @@ pub fn message_scroller_viewport<T: 'static>(
 pub struct MessageScrollerViewport<T: 'static>(MessageScrollerViewportProps<T>);
 
 impl<T: 'static> MessageScrollerViewport<T> {
-    /// The gap between messages, in spacing units (as [`Styled::gap`]).
+    /// The gap between messages, in pixels.
     #[must_use]
     pub fn gap(mut self, gap: f32) -> Self {
         self.0.gap = gap;
@@ -995,7 +997,7 @@ fn viewport<T>(state: &MessageScroller, p: &MessageScrollerViewportProps<T>) -> 
     let key = |i: u64| at(i).map_or(ElementKey::default(), |t| key_of(meta(t).0));
     let anchor = |i: u64| at(i).is_some_and(|t| meta(t).1);
     if let Ok(mut e) = state.engine.try_borrow_mut() {
-        e.data(len, gap * gui::styled::UNIT, &key, &anchor);
+        e.data(len, gap, &key, &anchor);
     }
     state.list.hide_scrollbar(state.autoscrolling.get());
     let built = RefCell::new(Vec::new());
@@ -1008,26 +1010,39 @@ fn viewport<T>(state: &MessageScroller, p: &MessageScrollerViewportProps<T>) -> 
             built.borrow_mut().push(meta(t).1);
             div()
                 .named("message-scroller-item")
-                .w_full()
-                .min_w(0.0)
-                .shrink_0()
-                .when(i.saturating_add(1) < len, |d| d.pb(gap))
+                .width(pct(100.0))
+                .min_width(0.0)
+                .flex_shrink(0.0)
+                .when(i.saturating_add(1) < len, |d| d.padding_bottom(gap))
                 .child(row(usize::try_from(i).unwrap_or(usize::MAX), t))
                 .into_element()
         },
         // In flow, not over the list: the messages built give the thread its
         // width, as Vue's do (a card sized by its content is as wide as them).
-        |v| (p.viewport)(v.relative().flex_1().min_h(0.0).scroll_fade_b()),
+        |v| {
+            (p.viewport)(
+                v.position(Position::Relative)
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .mask(ScrollFade {
+                        axis: Axis::Vertical,
+                        start: false,
+                        end: true,
+                        size: None,
+                    }),
+            )
+        },
     );
     let window = state.list.window();
     if let Ok(mut e) = state.engine.try_borrow_mut() {
         e.built(window.start, built.into_inner(), &anchor);
     }
     list.named("message-scroller-viewport")
-        .flex_col()
-        .size_full()
-        .min_h(0.0)
-        .min_w(0.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .size(pct(100.0))
+        .min_height(0.0)
+        .min_width(0.0)
 }
 
 /// Which end of the thread the button jumps to.
@@ -1063,14 +1078,17 @@ fn scroll_button(state: MessageScroller, direction: MessageScrollerDirection) ->
         MessageScrollerDirection::End => scrollable.end,
     };
     let arrow = icon(Icon::ArrowDown).when(direction == MessageScrollerDirection::Start, |i| i.rotate(180.0));
-    let control = button(ButtonVariant::Secondary, ButtonSize::IconSm)
+    let control = button(ButtonVariant::Secondary, ButtonSize::IconSm);
+    let i = control.interaction();
+    let control = control
         .named("message-scroller-button")
-        .border()
+        .border(1.0)
         .border_color(t.border)
-        .bg(t.background)
+        .background(t.background)
         .text_color(t.foreground)
-        .hover(move |s| s.bg(t.muted).text_color(t.foreground))
-        .transition_props(Properties::TRANSFORM | Properties::OPACITY)
+        .background_while(move || i.hovered(), t.muted)
+        .focus_ring_on(i, &t)
+        .transition(Properties::TRANSFORM | Properties::OPACITY)
         .when(active, |b| {
             b.duration_ms(200.0).ease(Easing::CubicBezier(0.23, 1.0, 0.32, 1.0))
         })
@@ -1087,7 +1105,7 @@ fn scroll_button(state: MessageScroller, direction: MessageScrollerDirection) ->
                 .translate_y(Calc::fraction(off))
                 .pass_through()
                 // `inert`, not `disabled`: hidden, not dimmed.
-                .disabled_style(|s| s.opacity(0.0))
+                .dim_disabled(i, 0.0)
         })
         .disabled(!active)
         .child(arrow)
@@ -1098,16 +1116,16 @@ fn scroll_button(state: MessageScroller, direction: MessageScrollerDirection) ->
             };
         });
     let row = div()
-        .absolute()
+        .position(Position::Absolute)
         .left(0.0)
         .right(0.0)
-        .flex()
-        .justify_center()
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
         .pass_through()
         .child(control);
     match direction {
-        MessageScrollerDirection::End => row.bottom(4.0),
-        MessageScrollerDirection::Start => row.top(4.0),
+        MessageScrollerDirection::End => row.bottom(16.0),
+        MessageScrollerDirection::Start => row.top(16.0),
     }
 }
 
@@ -1156,15 +1174,15 @@ mod tests {
                     || Element::Empty
                 });
                 div()
-                    .w_px(400.0)
-                    .h_px(HEIGHT)
+                    .width(400.0)
+                    .height(HEIGHT)
                     .child(message_scroller_provider(
                         props,
                         message_scroller()
                             .child(message_scroller_viewport(
                                 msgs.get(),
                                 |m: &Msg| (m.id.as_str(), m.user),
-                                |_, m: &Msg| div().h_px(m.height).child(text(m.id.clone())),
+                                |_, m: &Msg| div().height(m.height).child(text(m.id.clone())),
                             ))
                             .child(capture),
                     ))

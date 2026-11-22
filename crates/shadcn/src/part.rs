@@ -128,8 +128,12 @@ impl<P: 'static> Part<P> {
 impl<P: 'static> Fluent for Part<P> {}
 
 impl<P: 'static> Styled for Part<P> {
-    fn style_mut(&mut self) -> &mut Style {
-        self.root.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.root.style_and_bindings()
+    }
+
+    fn node_interaction(&self) -> Option<gui::Interaction> {
+        self.root.node_interaction()
     }
 }
 

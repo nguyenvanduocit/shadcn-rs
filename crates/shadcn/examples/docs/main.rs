@@ -35,8 +35,8 @@ mod verdict;
 use std::path::PathBuf;
 
 use gui::prelude::*;
-use gui::{Element, ImageSource, Scenario, ScenarioError, Signal, div, text, use_context};
-use shadcn::{Theme, provide_theme, theme};
+use gui::{Element, ImageSource, Scenario, ScenarioError, div, text, use_context};
+use shadcn::{Scheme, Theme, VEGA, install, theme};
 
 /// The heap counted, for `--bench` and the frame HUD.
 #[cfg(not(feature = "dhat-heap"))]
@@ -88,13 +88,20 @@ pub fn page(title: &str, content: impl IntoElement) -> Element {
     }
     let t = theme();
     div()
-        .size_full()
-        .bg(t.background)
+        .size(pct(100.0))
+        .background(t.background)
         .text_color(t.foreground)
-        .p(8.0)
-        .flex_col()
-        .gap(6.0)
-        .child(text(title).text_2xl().font_semibold().tracking_tight())
+        .padding(32.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(24.0)
+        .child(
+            text(title)
+                .text_size(24.0)
+                .line_height(32.0)
+                .font_weight(600)
+                .tracking(-0.025),
+        )
         .child(content)
         .into_element()
 }
@@ -104,9 +111,16 @@ pub fn section(title: &str, content: impl IntoElement) -> Element {
     let t = theme();
     div()
         .named(SECTION)
-        .flex_col()
-        .gap(3.0)
-        .child(text(title).text_sm().font_medium().text_color(t.muted_foreground))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
+        .child(
+            text(title)
+                .text_size(14.0)
+                .line_height(20.0)
+                .font_weight(500)
+                .text_color(t.muted_foreground),
+        )
         .child(content)
         .into_element()
 }
@@ -118,8 +132,16 @@ pub fn section(title: &str, content: impl IntoElement) -> Element {
 pub fn demo(file: &'static str, content: impl IntoElement) -> Element {
     let d = div().named(file);
     match host() {
-        Host::Gallery => d.w_px(verdict::SPECIMEN_WIDTH).flex_col().items_start(),
-        Host::Docs => d.w_full().flex().justify_center().items_center(),
+        Host::Gallery => d
+            .width(verdict::SPECIMEN_WIDTH)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .align_items(Align::Start),
+        Host::Docs => d
+            .width(pct(100.0))
+            .display(Display::Flex)
+            .justify_content(Justify::Center)
+            .align_items(Align::Center),
     }
     .child(content)
     .into_element()
@@ -357,10 +379,10 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dark = args.iter().any(|a| a == "--dark");
     let theme_signal = move || {
-        provide_theme(Signal::labeled(
-            "theme",
-            if dark { Theme::dark() } else { Theme::light() },
-        ));
+        install(
+            Theme::default().scheme(if dark { Scheme::Dark } else { Scheme::Light }),
+            VEGA,
+        );
     };
     let rest: Vec<String> = args.iter().filter(|a| *a != "--dark").cloned().collect();
     let windowed = rest.first().is_none_or(|f| f == "--serve" || f == "--hud");

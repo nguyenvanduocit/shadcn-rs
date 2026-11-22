@@ -7,6 +7,7 @@
 //! [`FieldStack`] knows its children's kinds, so it applies those rules when
 //! it becomes an element.
 
+use gui::prelude::*;
 use gui::{Div, Element, Fluent, IntoElement, Span, Style, Styled, Text, div, text};
 
 use crate::label::label;
@@ -96,9 +97,9 @@ impl FieldStack {
         let holds_choices = self.children.iter().any(|c| matches!(c.0, Kind::Choices(_)));
         let holds_content = self.children.iter().any(|c| matches!(c.0, Kind::Content(_)));
         let mut root = match self.kind {
-            StackKind::Set if holds_choices => self.root.gap(3.0),
+            StackKind::Set if holds_choices => self.root.gap(12.0),
             StackKind::Field(FieldOrientation::Horizontal | FieldOrientation::Responsive) if holds_content => {
-                self.root.items_start()
+                self.root.align_items(Align::Start)
             }
             _ => self.root,
         };
@@ -106,9 +107,9 @@ impl FieldStack {
         // A fieldset draws its legend above its content box, outside the
         // flex column's gap: take the gap back from the legend's `mb-3`.
         let legend_mb = if self.kind == StackKind::Set {
-            3.0 - root.style_mut().row_gap / gui::styled::UNIT
+            12.0 - root.style_mut().row_gap
         } else {
-            3.0
+            12.0
         };
         let count = self.children.len();
         let mut after_legend = false;
@@ -116,16 +117,16 @@ impl FieldStack {
         for (i, FieldChild(kind)) in self.children.into_iter().enumerate() {
             let pulls_up = matches!(kind, Kind::Legend { pulls_up: true, .. });
             out.push(match kind {
-                Kind::Description(d) if after_legend => d.mt(-1.5).into_element(),
-                Kind::Description(d) if i.saturating_add(2) == count => d.mt(-1.0).into_element(),
-                Kind::Legend { el, .. } => el.mb(legend_mb).into_element(),
+                Kind::Description(d) if after_legend => d.margin_top(-6.0).into_element(),
+                Kind::Description(d) if i.saturating_add(2) == count => d.margin_top(-4.0).into_element(),
+                Kind::Legend { el, .. } => el.margin_bottom(legend_mb).into_element(),
                 Kind::Description(el) | Kind::Content(el) => el.into_element(),
                 Kind::Choices(el) => el,
                 Kind::Other(el) => el,
             });
             // `@md/field-group:[&>*]:w-auto`: a control drops its `w-full`.
             if auto_width && let Some(el) = out.pop() {
-                out.push(el.restyle(|s| s.w_auto()));
+                out.push(el.restyle(|s| s.width(Length::Auto)));
             }
             after_legend = pulls_up;
         }
@@ -136,8 +137,8 @@ impl FieldStack {
 impl Fluent for FieldStack {}
 
 impl Styled for FieldStack {
-    fn style_mut(&mut self) -> &mut Style {
-        self.root.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.root.style_and_bindings()
     }
 }
 
@@ -153,13 +154,16 @@ pub fn field(orientation: FieldOrientation, invalid: bool) -> FieldStack {
     let t = theme();
     let d = div()
         .named("field")
-        .flex()
-        .w_full()
-        .gap(3.0)
+        .display(Display::Flex)
+        .width(pct(100.0))
+        .gap(12.0)
         .when(invalid, |d| d.text_color(t.destructive));
     let d = match orientation {
-        FieldOrientation::Vertical => d.flex_col(),
-        FieldOrientation::Horizontal | FieldOrientation::Responsive => d.flex_row().items_center(),
+        FieldOrientation::Vertical => d.display(Display::Flex).flex_direction(FlexDirection::Column),
+        FieldOrientation::Horizontal | FieldOrientation::Responsive => d
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Row)
+            .align_items(Align::Center),
     };
     FieldStack::new(StackKind::Field(orientation), d)
 }
@@ -171,11 +175,12 @@ pub fn field_content() -> FieldContent {
         StackKind::Content,
         div()
             .named("field-content")
-            .flex()
-            .flex_1()
-            .flex_col()
-            .gap(1.5)
-            .leading_snug(),
+            .display(Display::Flex)
+            .flex(Flex::grow(1.0))
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(6.0)
+            .line_height(LineHeight::Relative(1.375)),
     ))
 }
 
@@ -192,8 +197,8 @@ impl FieldContent {
 impl Fluent for FieldContent {}
 
 impl Styled for FieldContent {
-    fn style_mut(&mut self) -> &mut Style {
-        self.0.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.0.style_and_bindings()
     }
 }
 
@@ -206,20 +211,32 @@ impl IntoFieldChild for FieldContent {
 /// A `<fieldset>`: a legend, a description and the fields they head.
 #[must_use]
 pub fn field_set() -> FieldStack {
-    FieldStack::new(StackKind::Set, div().named("field-set").flex_col().gap(6.0))
+    FieldStack::new(
+        StackKind::Set,
+        div()
+            .named("field-set")
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0),
+    )
 }
 
 /// Fields stacked with room between them.
 #[must_use]
 pub fn field_group() -> Div {
-    div().named("field-group").flex().w_full().flex_col().gap(7.0)
+    div()
+        .named("field-group")
+        .width(pct(100.0))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(28.0)
 }
 
 /// A group of checkbox fields, set close together
 /// (`FieldGroup data-slot="checkbox-group"`).
 #[must_use]
 pub fn field_checkbox_group() -> FieldChoices {
-    field_choices(field_group().gap(3.0))
+    field_choices(field_group().gap(12.0))
 }
 
 /// Mark `group` (a radio group, a checkbox group) as the choices of a field
@@ -249,8 +266,8 @@ impl<P: 'static> FieldChoices<crate::part::Part<P>> {
 impl<G: Styled> Fluent for FieldChoices<G> {}
 
 impl<G: Styled> Styled for FieldChoices<G> {
-    fn style_mut(&mut self) -> &mut Style {
-        self.0.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.0.style_and_bindings()
     }
 }
 
@@ -263,10 +280,14 @@ impl<G: Styled + IntoElement> IntoFieldChild for FieldChoices<G> {
 /// A field set's title.
 #[must_use]
 pub fn field_legend(title: impl Into<String>, variant: Option<FieldLegendVariant>) -> FieldLegend {
-    let d = div().named("field-legend").mb(3.0).font_medium().child(text(title));
+    let d = div()
+        .named("field-legend")
+        .margin_bottom(12.0)
+        .font_weight(500)
+        .child(text(title));
     let d = match variant {
-        Some(FieldLegendVariant::Legend) => d.text_base(),
-        Some(FieldLegendVariant::Label) => d.text_sm(),
+        Some(FieldLegendVariant::Legend) => d.text_size(16.0).line_height(24.0),
+        Some(FieldLegendVariant::Label) => d.text_size(14.0).line_height(20.0),
         None => d,
     };
     FieldLegend {
@@ -284,8 +305,8 @@ pub struct FieldLegend {
 impl Fluent for FieldLegend {}
 
 impl Styled for FieldLegend {
-    fn style_mut(&mut self) -> &mut Style {
-        self.el.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.el.style_and_bindings()
     }
 }
 
@@ -307,9 +328,10 @@ pub fn field_description(description: impl Into<String>) -> FieldDescription {
         el: div()
             .named("field-description")
             .text_color(t.muted_foreground)
-            .text_sm()
-            .leading_normal()
-            .font_normal(),
+            .text_size(14.0)
+            .line_height(20.0)
+            .line_height(LineHeight::Relative(1.5))
+            .font_weight(400),
         text: text(description),
     }
 }
@@ -331,7 +353,7 @@ impl FieldDescription {
     /// Append a link (Vue's `[&>a]:underline [&>a]:underline-offset-4`).
     #[must_use]
     pub fn link(self, label: impl Into<String>) -> Self {
-        self.span(gui::span(label).underline().underline_offset(4.0))
+        self.span(gui::span(label).underline(true).underline_offset(4.0))
     }
 
     fn into_div(self) -> Div {
@@ -342,8 +364,8 @@ impl FieldDescription {
 impl Fluent for FieldDescription {}
 
 impl Styled for FieldDescription {
-    fn style_mut(&mut self) -> &mut Style {
-        self.el.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.el.style_and_bindings()
     }
 }
 
@@ -356,7 +378,11 @@ impl IntoFieldChild for FieldDescription {
 /// A field's label.
 #[must_use]
 pub fn field_label(name: impl Into<String>) -> Div {
-    label(name).named("field-label").flex().gap(2.0).leading_snug()
+    label(name)
+        .named("field-label")
+        .display(Display::Flex)
+        .gap(8.0)
+        .line_height(LineHeight::Relative(1.375))
 }
 
 /// A label that is a card around a whole `field` (a choice card):
@@ -367,18 +393,22 @@ pub fn field_label_card(field: FieldStack, checked: bool) -> Div {
     let tint = if t.dark { 0.1 } else { 0.05 };
     div()
         .named("field-label")
-        .flex()
-        .w_full()
-        .flex_col()
-        .gap(2.0)
-        .text_sm()
-        .leading_snug()
-        .font_medium()
-        .rounded_md()
-        .border()
+        .display(Display::Flex)
+        .width(pct(100.0))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .line_height(LineHeight::Relative(1.375))
+        .font_weight(500)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .when(checked, |d| d.bg(t.primary.opacity(tint)).border_color(t.primary))
-        .child(field.p(4.0))
+        .when(checked, |d| {
+            d.background(t.primary.opacity(tint)).border_color(t.primary)
+        })
+        .child(field.padding(16.0))
 }
 
 /// A title inside a [`field_content`], for a label that is not a `<label>`.
@@ -386,12 +416,13 @@ pub fn field_label_card(field: FieldStack, checked: bool) -> Div {
 pub fn field_title(title: impl Into<String>) -> Div {
     div()
         .named("field-title")
-        .flex()
-        .items_center()
-        .gap(2.0)
-        .text_sm()
-        .leading_snug()
-        .font_medium()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .line_height(LineHeight::Relative(1.375))
+        .font_weight(500)
         .child(text(title))
 }
 
@@ -402,27 +433,28 @@ pub fn field_separator(content: Option<&str>) -> Div {
     // A flex row centres the words as shadcn's `mx-auto block w-fit` does.
     div()
         .named("field-separator")
-        .relative()
-        .flex()
-        .justify_center()
-        .my(-2.0)
-        .h(5.0)
-        .text_sm()
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .margin_y(-8.0)
+        .height(20.0)
+        .text_size(14.0)
+        .line_height(20.0)
         .child(
             separator(Orientation::Horizontal)
-                .absolute()
+                .position(Position::Absolute)
                 .left(0.0)
                 .right(0.0)
-                .top_len(gui::relative(0.5)),
+                .top(gui::Length::Fraction(0.5)),
         )
         .when_some(content, |d, c| {
             d.child(
                 div()
                     .named("field-separator-content")
-                    .bg(t.background)
+                    .background(t.background)
                     .text_color(t.muted_foreground)
-                    .relative()
-                    .px(2.0)
+                    .position(Position::Relative)
+                    .padding_x(8.0)
                     .child(text(c)),
             )
         })
@@ -443,18 +475,24 @@ pub fn field_error<S: Into<String>>(errors: impl IntoIterator<Item = S>) -> Opti
     let root = div()
         .named("field-error")
         .text_color(t.destructive)
-        .text_sm()
-        .font_normal();
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(400);
     match unique.as_slice() {
         [] => None,
         [one] => Some(root.child(text(one.clone()))),
         _ => Some(
             root.child(
-                div().ml(4.0).flex_col().gap(1.0).children(
-                    unique
-                        .into_iter()
-                        .map(|e| div().flex().gap(2.0).child(text("•")).child(text(e))),
-                ),
+                div()
+                    .margin_left(16.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(4.0)
+                    .children(
+                        unique
+                            .into_iter()
+                            .map(|e| div().display(Display::Flex).gap(8.0).child(text("•")).child(text(e))),
+                    ),
             ),
         ),
     }

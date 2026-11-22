@@ -278,15 +278,8 @@ fn slug_clip(id: u32, p: vec2<f32>) -> f32 {
     if (id == 0u) {
         return 1.0;
     }
-    let rect = clips[id * 4u];
-    let radii = clips[id * 4u + 1u];
-    let m = clips[id * 4u + 2u];
-    let t = clips[id * 4u + 3u];
-    let q = vec2<f32>(m.x * p.x + m.z * p.y + t.x, m.y * p.x + m.w * p.y + t.y);
-    if (t.z == 1.0 && m.y == 0.0 && m.z == 0.0) {
-        return rrect_cov(q, rect, radii);
-    }
-    return saturate(0.5 - rrect_sdf(q, rect, radii) * t.z);
+    let at = id * 4u;
+    return clip_entry_cov(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], p);
 }
 
 struct SlugShaded {

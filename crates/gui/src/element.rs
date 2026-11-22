@@ -1,7 +1,8 @@
 //! The element tree a component returns each frame.
 //!
-//! Every node kind shares [`Common`]: its style, the style refinements for
-//! hover, press and focus, its event handlers and its focus handle. What
+//! Every node kind shares [`Common`]: its style and bound properties, the
+//! [`Interaction`] its bindings read, its event handlers and its focus
+//! handle. What
 //! differs is what it holds: children ([`Div`]), a paragraph ([`Text`],
 //! whose [`Span`]s style parts of it inline), an
 //! [`Icon`], or an editable [`TextField`] ([`TextInput`]). [`Deferred`]
@@ -13,12 +14,13 @@ use std::rc::Rc;
 use crate::color::Color;
 use crate::edit::{TextEdit, TextField};
 use crate::events::{ClickEvent, DragEvent, KeyEvent};
+use crate::figure::Figure;
 use crate::focus::FocusHandle;
 use crate::geometry::Bounds;
 use crate::icon::Icon;
 use crate::image::ImageSource;
+use crate::interact::Interaction;
 use crate::scroll::ScrollHandle;
-use crate::shape::Shape;
 use crate::style::Style;
 use crate::styled::Styled;
 
@@ -33,9 +35,6 @@ pub fn key_of(s: &str) -> ElementKey {
     s.hash(&mut h);
     h.finish()
 }
-
-/// A style change applied while a node is in some state.
-pub type Refine = Rc<dyn Fn(Style) -> Style>;
 
 /// A handler for an event of type `E`.
 pub type Handler<E> = Rc<dyn Fn(&E)>;
@@ -61,21 +60,6 @@ pub struct Handlers {
     pub(crate) measured: Option<Handler<Bounds>>,
 }
 
-/// The style refinements for each interactive state.
-#[derive(Clone, Default)]
-pub struct States {
-    /// Bound to signals (ADR-0013's bindings by phase): run where the node's
-    /// style is resolved, under layout's tracker, so a write it read lays the
-    /// frame out again without rendering the instance that built it.
-    pub(crate) bound: Option<Refine>,
-    pub(crate) has_icon: Option<Refine>,
-    pub(crate) hover: Option<Refine>,
-    pub(crate) active: Option<Refine>,
-    pub(crate) focus: Option<Refine>,
-    pub(crate) focus_visible: Option<Refine>,
-    pub(crate) disabled: Option<Refine>,
-}
-
 /// What every node kind has.
 #[derive(Clone, Default)]
 pub struct Common {
@@ -83,7 +67,14 @@ pub struct Common {
     /// A name the debug tools show for this node.
     pub(crate) name: Option<&'static str>,
     pub(crate) style: Style,
-    pub(crate) states: States,
+    /// Its bound properties (ADR-0013's bindings by phase): replayed over
+    /// `style` where the node resolves, under a tracker of the node's own,
+    /// so a signal they read resolves the node again without rendering the
+    /// instance that built it.
+    pub(crate) bindings: crate::value::Bindings,
+    /// Where hit testing and focus write what they do to the node, for
+    /// its bindings (and its children's) to read.
+    pub(crate) interaction: Option<Interaction>,
     pub(crate) handlers: Handlers,
     pub(crate) focus: Option<FocusHandle>,
     /// Focusable by its place in the tree, as a `<button>` is.
@@ -135,12 +126,12 @@ pub struct Node<K> {
 pub type Div = Node<Vec<Element>>;
 /// A paragraph: text wrapped as one, parts of it styled by [`Span`]s.
 pub type Text = Node<TextSpec>;
-/// A lucide icon, drawn in the inherited text colour.
+/// A lucide icon, drawn in the content colour provided to it.
 pub type IconElement = Node<IconSpec>;
 /// An editable text box.
 pub type TextInput = Node<InputSpec>;
-/// Vector shapes drawn in the node's box.
-pub type Shapes = Node<Vec<Shape>>;
+/// Vector figures drawn in the node's box.
+pub type Figures = Node<Vec<Figure>>;
 /// A raster image covering the node's box.
 pub type Image = Node<ImageSource>;
 /// A [`crate::chunk::Picture`] laid into the node's box (see [`drawing`]).
@@ -160,6 +151,10 @@ pub struct TextSpec {
     /// Content bound to signals, read when laid out (see [`text_bound`]).
     pub(crate) bound: Option<Rc<dyn Fn() -> String>>,
     pub(crate) spans: Vec<SpanSpec>,
+    /// Elements laid in its lines as atomic inlines ([`Text::child`]), in
+    /// order, child `i` on the [`crate::text::OBJECT`] at byte `objects[i]`.
+    pub(crate) children: Vec<Element>,
+    pub(crate) objects: Vec<usize>,
 }
 
 /// A [`Span`] placed in its paragraph.
@@ -167,26 +162,34 @@ pub struct TextSpec {
 pub(crate) struct SpanSpec {
     pub(crate) range: Range<usize>,
     pub(crate) style: Style,
+    /// Its bound properties, replayed where its paragraph resolves.
+    pub(crate) bindings: crate::value::Bindings,
     pub(crate) click: Option<Handler<ClickEvent>>,
 }
 
 /// Text inside a paragraph in an inline style of its own, wrapping with the
 /// rest of it (`<a>`, `<code>`, `<strong>`, a highlighted token). Of its style
-/// it honours the inherited text properties (colour, size, weight, family,
-/// italic, underline, line-through, tracking), a background with its corner
-/// radius and padding, and the cursor; layout properties have no effect.
+/// it honours its content ([`crate::style::ContentStyle`]: colour, size,
+/// weight, family, italic, underline, line-through, tracking), each field
+/// it does not set taken from its paragraph (ADR-0001, ADR-0022), a
+/// background with its corner radius and padding, and the cursor; layout
+/// properties have no effect.
+/// A closure given to a setter is bound to its paragraph's node, as an
+/// element's is: a signal it reads resolves the paragraph again (a colour
+/// repaints it, a size lays it out), not the instance that built it.
 #[derive(Clone)]
 pub struct Span {
     content: String,
     style: Style,
+    bindings: crate::value::Bindings,
     click: Option<Handler<ClickEvent>>,
 }
 
 impl crate::styled::Fluent for Span {}
 
 impl Styled for Span {
-    fn style_mut(&mut self) -> &mut Style {
-        &mut self.style
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut crate::value::Bindings>) {
+        (&mut self.style, Some(&mut self.bindings))
     }
 }
 
@@ -217,6 +220,7 @@ pub fn span(content: impl Into<String>) -> Span {
     Span {
         content: content.into(),
         style: Style::default(),
+        bindings: crate::value::Bindings::default(),
         click: None,
     }
 }
@@ -224,15 +228,12 @@ pub fn span(content: impl Into<String>) -> Span {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct IconSpec {
     pub icon: Icon,
-    pub stroke_width: f32,
 }
 
 #[derive(Clone)]
 pub struct InputSpec {
     pub(crate) field: TextField,
     pub(crate) placeholder: String,
-    pub(crate) placeholder_color: Option<Color>,
-    pub(crate) selection_color: Option<Color>,
     pub(crate) multiline: bool,
     pub(crate) mode: InputMode,
 }
@@ -298,9 +299,10 @@ pub enum SideAlign {
     End,
 }
 
-/// Where a deferred layer goes.
+/// Where a deferred layer is asked to go; [`crate::Placement`] is where
+/// layout put it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Placement {
+pub enum Positioning {
     /// Next to the parent of the [`Deferred`] element, flipped and kept on screen.
     Anchored {
         side: Side,
@@ -331,8 +333,24 @@ pub enum Placement {
 /// A subtree drawn on its own layer above everything laid out before it.
 #[derive(Clone)]
 pub struct Deferred {
-    pub(crate) placement: Placement,
+    pub(crate) positioning: Positioning,
     pub(crate) child: Element,
+    /// Where layout reports how the layer was placed.
+    pub(crate) placed: Option<crate::reactive::Signal<Option<crate::placement::Placement>>>,
+}
+
+impl Deferred {
+    /// Report how the layer is placed into `placed` each time layout
+    /// places it (`None` while it is not anchored): the side it opened on,
+    /// its alignment, the room it has, its anchor and the origin facing
+    /// it, which a look reads as reka's content reads `data-side`.
+    #[must_use]
+    pub fn placement(self, placed: crate::reactive::Signal<Option<crate::placement::Placement>>) -> Self {
+        Self {
+            placed: Some(placed),
+            ..self
+        }
+    }
 }
 
 /// A node in the UI tree.
@@ -342,7 +360,7 @@ pub enum Element {
     Text(Rc<Text>),
     Icon(Rc<IconElement>),
     Input(Rc<TextInput>),
-    Shapes(Rc<Shapes>),
+    Figures(Rc<Figures>),
     Image(Rc<Image>),
     Drawn(Rc<Drawn>),
     Deferred(Rc<Deferred>),
@@ -360,7 +378,7 @@ impl Element {
             Self::Text(n) => Some(&n.common),
             Self::Icon(n) => Some(&n.common),
             Self::Input(n) => Some(&n.common),
-            Self::Shapes(n) => Some(&n.common),
+            Self::Figures(n) => Some(&n.common),
             Self::Image(n) => Some(&n.common),
             Self::Drawn(n) => Some(&n.common),
             Self::Deferred(_) | Self::Component(_) | Self::Empty => None,
@@ -373,7 +391,7 @@ impl Element {
             Self::Text(n) => Some(&mut Rc::make_mut(n).common),
             Self::Icon(n) => Some(&mut Rc::make_mut(n).common),
             Self::Input(n) => Some(&mut Rc::make_mut(n).common),
-            Self::Shapes(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Figures(n) => Some(&mut Rc::make_mut(n).common),
             Self::Image(n) => Some(&mut Rc::make_mut(n).common),
             Self::Drawn(n) => Some(&mut Rc::make_mut(n).common),
             Self::Deferred(_) | Self::Component(_) | Self::Empty => None,
@@ -394,7 +412,7 @@ impl Element {
             (Self::Text(a), Self::Text(b)) => Rc::ptr_eq(a, b),
             (Self::Icon(a), Self::Icon(b)) => Rc::ptr_eq(a, b),
             (Self::Input(a), Self::Input(b)) => Rc::ptr_eq(a, b),
-            (Self::Shapes(a), Self::Shapes(b)) => Rc::ptr_eq(a, b),
+            (Self::Figures(a), Self::Figures(b)) => Rc::ptr_eq(a, b),
             (Self::Image(a), Self::Image(b)) => Rc::ptr_eq(a, b),
             (Self::Drawn(a), Self::Drawn(b)) => Rc::ptr_eq(a, b),
             (Self::Deferred(a), Self::Deferred(b)) => Rc::ptr_eq(a, b),
@@ -412,7 +430,7 @@ impl Element {
             Self::Text(n) => Some(&mut Rc::make_mut(n).common.style),
             Self::Icon(n) => Some(&mut Rc::make_mut(n).common.style),
             Self::Input(n) => Some(&mut Rc::make_mut(n).common.style),
-            Self::Shapes(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Figures(n) => Some(&mut Rc::make_mut(n).common.style),
             Self::Image(n) => Some(&mut Rc::make_mut(n).common.style),
             Self::Drawn(n) => Some(&mut Rc::make_mut(n).common.style),
             Self::Deferred(_) | Self::Component(_) | Self::Empty => None,
@@ -441,8 +459,13 @@ impl Element {
             c.fallthrough = Some(f);
             return self;
         }
-        if let Some(style) = self.style_mut() {
-            *style = f(std::mem::take(style));
+        if let Some(common) = self.common_mut() {
+            // Over the node's bindings when it has any, so a property the
+            // node bound is the parent's when the parent writes it too.
+            let f: Rc<dyn Fn(Style) -> Style> = Rc::new(f);
+            if !common.bindings.restyle(Rc::clone(&f)) {
+                common.style = f(std::mem::take(&mut common.style));
+            }
         }
         self
     }
@@ -454,6 +477,49 @@ impl Element {
         match self {
             Self::Component(c) => Some(c.name),
             _ => self.common().and_then(|c| c.name),
+        }
+    }
+
+    /// The elements below this one in the tree: a box's children, or the
+    /// atomic inlines of a paragraph ([`Text::child`]); `None` for every
+    /// other kind. Whatever walks the element tree walks them alike.
+    pub(crate) fn kids(&self) -> Option<&[Self]> {
+        match self {
+            Self::Div(n) => Some(&n.kind),
+            Self::Text(n) => Some(&n.kind.children),
+            _ => None,
+        }
+    }
+
+    /// [`Self::kids`], to change them in place (not to add or take any: a
+    /// paragraph's stand on its content's [`crate::text::OBJECT`]s).
+    pub(crate) fn kids_mut(&mut self) -> Option<&mut [Self]> {
+        match self {
+            Self::Div(n) => Some(&mut Rc::make_mut(n).kind),
+            Self::Text(n) => Some(&mut Rc::make_mut(n).kind.children),
+            _ => None,
+        }
+    }
+
+    /// This element with `kids` in place of [`Self::kids`] (as many, in
+    /// the same order), sharing everything else.
+    pub(crate) fn with_kids(&self, kids: Vec<Self>) -> Self {
+        match self {
+            Self::Div(n) => Self::Div(Rc::new(Node {
+                common: n.common.clone(),
+                kind: kids,
+            })),
+            Self::Text(n) => Self::Text(Rc::new(Node {
+                common: n.common.clone(),
+                kind: TextSpec {
+                    content: n.kind.content.clone(),
+                    bound: n.kind.bound.clone(),
+                    spans: n.kind.spans.clone(),
+                    children: kids,
+                    objects: n.kind.objects.clone(),
+                },
+            })),
+            other => other.clone(),
         }
     }
 
@@ -503,9 +569,9 @@ impl IntoElement for TextInput {
     }
 }
 
-impl IntoElement for Shapes {
+impl IntoElement for Figures {
     fn into_element(self) -> Element {
-        Element::Shapes(Rc::new(self))
+        Element::Figures(Rc::new(self))
     }
 }
 
@@ -548,8 +614,12 @@ impl<T: IntoElement> IntoElement for Option<T> {
 impl<K> crate::styled::Fluent for Node<K> {}
 
 impl<K> Styled for Node<K> {
-    fn style_mut(&mut self) -> &mut Style {
-        &mut self.common.style
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut crate::value::Bindings>) {
+        (&mut self.common.style, Some(&mut self.common.bindings))
+    }
+
+    fn node_interaction(&self) -> Option<Interaction> {
+        self.common.interaction
     }
 }
 
@@ -586,58 +656,25 @@ impl<K> Node<K> {
         self
     }
 
-    /// Style bound to signals: `f` refines the style with any setter
-    /// (`.bind(move |s| s.bg(color.get()).w(width.get()))`), and runs when
-    /// the node is laid out. A signal it reads lays the frame out again
-    /// without rendering the instance that built it.
+    /// Write what the pointer and the keyboard do to this node into `i`
+    /// (hovered, pressed, focused, focus-visible, focus-within, disabled),
+    /// for bindings to read: `.background(move || if i.hovered() { a } else { b })`.
     #[must_use]
-    pub fn bind(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.bound = Some(Rc::new(f));
+    pub fn interaction(mut self, i: Interaction) -> Self {
+        self.common.interaction = Some(i);
         self
     }
 
-    /// Style while the pointer is over this node or a child.
+    /// Build on with this node's [`Interaction`], made and given to it when
+    /// it has none: `.with_interaction(|d, i| d.border_color(move || …))`.
     #[must_use]
-    pub fn hover(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.hover = Some(Rc::new(f));
-        self
-    }
-
-    /// Style while the primary button is held down on this node.
-    #[must_use]
-    pub fn active(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.active = Some(Rc::new(f));
-        self
-    }
-
-    /// Style while this node's focus handle holds focus.
-    #[must_use]
-    pub fn focus(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.focus = Some(Rc::new(f));
-        self
-    }
-
-    /// Style while focused by keyboard (and, for text inputs, by any means), as
-    /// CSS `:focus-visible`.
-    #[must_use]
-    pub fn focus_visible(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.focus_visible = Some(Rc::new(f));
-        self
-    }
-
-    /// Style while a direct child is an icon (CSS `:has(> svg)`, shadcn's
-    /// `has-[>svg]:`): known only once the caller has added the children.
-    #[must_use]
-    pub fn has_icon(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.has_icon = Some(Rc::new(f));
-        self
-    }
-
-    /// Style while disabled (CSS `:disabled`).
-    #[must_use]
-    pub fn disabled_style(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.common.states.disabled = Some(Rc::new(f));
-        self
+    #[track_caller]
+    pub fn with_interaction(mut self, f: impl FnOnce(Self, Interaction) -> Self) -> Self {
+        let i = match self.common.interaction {
+            Some(i) => i,
+            None => *self.common.interaction.insert(Interaction::new()),
+        };
+        f(self, i)
     }
 
     /// Make this node focusable by its place in the tree, in Tab order; for
@@ -840,10 +877,11 @@ impl Text {
         let span = span.into();
         let start = self.kind.content.len();
         self.kind.content.push_str(&span.content);
-        if span.style != Style::default() || span.click.is_some() {
+        if span.style != Style::default() || !span.bindings.is_empty() || span.click.is_some() {
             self.kind.spans.push(SpanSpec {
                 range: start..self.kind.content.len(),
                 style: span.style,
+                bindings: span.bindings,
                 click: span.click,
             });
         }
@@ -855,13 +893,44 @@ impl Text {
     pub fn spans<S: Into<Span>>(self, spans: impl IntoIterator<Item = S>) -> Self {
         spans.into_iter().fold(self, Self::span)
     }
+
+    /// Append `child` to the paragraph as an atomic inline (CSS
+    /// `inline-flex`, `inline-block`: a button in a `<p>`): laid out at its
+    /// shrink-to-fit width, it takes its size in the line, wraps with the
+    /// words around it, and sits on the baseline by its own first baseline
+    /// (its bottom margin edge when it has none); the line grows to hold
+    /// it. It is a node of its own below the paragraph, hit, focused,
+    /// painted and read as any child is. It stands on a
+    /// [`crate::text::OBJECT`] in the content, which no reader or copy
+    /// sees; a paragraph whose content is bound ([`text_bound`]) holds none.
+    #[must_use]
+    pub fn child(mut self, child: impl IntoElement) -> Self {
+        self.kind.objects.push(self.kind.content.len());
+        self.kind.content.push(crate::text::OBJECT);
+        self.kind.children.push(child.into_element());
+        self
+    }
+
+    /// Append each of `children` as [`Self::child`] does, in order.
+    #[must_use]
+    pub fn children<E: IntoElement>(self, children: impl IntoIterator<Item = E>) -> Self {
+        children.into_iter().fold(self, Self::child)
+    }
 }
 
 impl IconElement {
-    /// Line width in the icon's 24-unit grid (lucide's default is 2).
+    /// Line width in the icon's 24-unit grid (lucide's default is 2): a
+    /// value, or a closure bound to the node's paint.
     #[must_use]
-    pub fn stroke_width(mut self, width: f32) -> Self {
-        self.kind.stroke_width = width;
+    pub fn stroke_width<M>(mut self, width: impl crate::value::IntoValue<f32, M>) -> Self {
+        let (style, bindings) = self.style_and_bindings();
+        crate::value::set(
+            style,
+            bindings,
+            crate::value::Fields::of(&[crate::value::Field::StrokeWidth]),
+            width,
+            |s, v| s.stroke_width = v,
+        );
         self
     }
 }
@@ -873,15 +942,33 @@ impl TextInput {
         self
     }
 
+    /// The placeholder's colour (`::placeholder { color }`): a value, or
+    /// a closure bound to the node's paint.
     #[must_use]
-    pub fn placeholder_color(mut self, color: Color) -> Self {
-        self.kind.placeholder_color = Some(color);
+    pub fn placeholder_color<M>(mut self, color: impl crate::value::IntoValue<Option<Color>, M>) -> Self {
+        let (style, bindings) = self.style_and_bindings();
+        crate::value::set(
+            style,
+            bindings,
+            crate::value::Fields::of(&[crate::value::Field::PlaceholderColor]),
+            color,
+            |s, v| s.placeholder_color = v,
+        );
         self
     }
 
+    /// What is painted behind selected text (`::selection { background }`):
+    /// a value, or a closure bound to the node's paint.
     #[must_use]
-    pub fn selection_color(mut self, color: Color) -> Self {
-        self.kind.selection_color = Some(color);
+    pub fn selection_color<M>(mut self, color: impl crate::value::IntoValue<Option<Color>, M>) -> Self {
+        let (style, bindings) = self.style_and_bindings();
+        crate::value::set(
+            style,
+            bindings,
+            crate::value::Fields::of(&[crate::value::Field::SelectionColor]),
+            color,
+            |s, v| s.selection_color = v,
+        );
         self
     }
 
@@ -907,13 +994,14 @@ impl TextInput {
     }
 }
 
-/// A box (`<div>`): block layout until `.flex()` or `.grid()`.
+/// A box (`<div>`): block layout until `.display(Display::Flex)` or `.display(Display::Grid)`.
 #[must_use]
 pub fn div() -> Div {
     Node::new(Vec::new(), Style::default())
 }
 
-/// A paragraph in the inherited text style; [`Text::span`] adds more to it.
+/// A paragraph in the content style provided to it ([`crate::style::ContentStyle`]);
+/// [`Text::span`] adds more to it.
 #[must_use]
 pub fn text(content: impl Into<String>) -> Text {
     Node::new(
@@ -921,6 +1009,8 @@ pub fn text(content: impl Into<String>) -> Text {
             content: content.into(),
             bound: None,
             spans: Vec::new(),
+            children: Vec::new(),
+            objects: Vec::new(),
         },
         Style::default(),
     )
@@ -936,22 +1026,18 @@ pub fn text_bound(f: impl Fn() -> String + 'static) -> Text {
             content: String::new(),
             bound: Some(Rc::new(f)),
             spans: Vec::new(),
+            children: Vec::new(),
+            objects: Vec::new(),
         },
         Style::default(),
     )
 }
 
-/// A lucide icon, 16px (`size-4`) and not shrinking, as shadcn sizes them.
+/// A lucide icon, as large as the `icon_size` provided to it (16px at the
+/// root), and not shrinking.
 #[must_use]
 pub fn icon(icon: Icon) -> IconElement {
-    Node::new(
-        IconSpec {
-            icon,
-            stroke_width: 2.0,
-        },
-        Style::default(),
-    )
-    .shrink_0()
+    Node::new(IconSpec { icon }, Style::default()).flex_shrink(0.0)
 }
 
 /// A text box editing `field`, focusable through the field's handle.
@@ -962,24 +1048,22 @@ pub fn text_input(field: &TextField) -> TextInput {
         InputSpec {
             field: *field,
             placeholder: String::new(),
-            placeholder_color: None,
-            selection_color: None,
             multiline: false,
             mode: InputMode::default(),
         },
         Style::default(),
     )
     .track_focus(focus)
-    .cursor_text()
+    .cursor(crate::style::Cursor::Text)
     // A browser's own `input, textarea { text-align: start }`: a field
     // starts its text at its start edge in a centred parent too.
-    .text_left()
+    .text_align(crate::style::TextAlign::Left)
 }
 
-/// Vector `shapes` drawn in the node's box (give it a size).
+/// Vector `figures` drawn in the node's box (give it a size).
 #[must_use]
-pub fn shapes(shapes: Vec<Shape>) -> Shapes {
-    Node::new(shapes, Style::default())
+pub fn figures(figures: Vec<Figure>) -> Figures {
+    Node::new(figures, Style::default())
 }
 
 /// What `make` returns, drawn in the node's box (give it a size). `make`
@@ -997,11 +1081,12 @@ pub fn image(source: ImageSource) -> Image {
     Node::new(source, Style::default())
 }
 
-/// Lift `child` onto a layer placed by `placement`.
+/// Lift `child` onto a layer placed as `positioning` asks.
 #[must_use]
-pub fn deferred(placement: Placement, child: impl IntoElement) -> Deferred {
+pub fn deferred(positioning: Positioning, child: impl IntoElement) -> Deferred {
     Deferred {
-        placement,
+        positioning,
+        placed: None,
         child: child.into_element(),
     }
 }

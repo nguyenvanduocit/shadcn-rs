@@ -19,7 +19,7 @@ use gui::clock;
 use gui::prelude::*;
 use gui::style::Calc;
 use gui::{
-    Animation, Color, Div, Easing, Element, Icon, Placement, Properties, Scope, Shadow, Signal, component, deferred,
+    Animation, Color, Div, Easing, Element, Icon, Positioning, Properties, Scope, Shadow, Signal, component, deferred,
     div, icon, on_unmounted, text,
 };
 
@@ -35,8 +35,8 @@ const WIDTH: f32 = 356.0;
 const GAP: f32 = 14.0;
 /// vue-sonner's `VISIBLE_TOASTS_AMOUNT`.
 const VISIBLE: usize = 3;
-/// vue-sonner's `VIEWPORT_OFFSET` (24px), on Tailwind's scale.
-const OFFSET: f32 = 6.0;
+/// vue-sonner's `VIEWPORT_OFFSET`, in pixels.
+const OFFSET: f32 = 24.0;
 /// How much narrower each toast behind the front is (`scale(1 - n * 0.05)`).
 const SHRINK: f32 = 0.05;
 
@@ -384,14 +384,15 @@ fn stack(store: Store) -> Element {
     let visible: Vec<&Shown> = shown.iter().take(VISIBLE).collect();
     let stack = div()
         .named("toaster")
-        .relative()
-        .w_px(WIDTH)
+        .position(Position::Relative)
+        .width(WIDTH)
         .on_hover(move |inside| store.set_expanded(inside));
     let stack = if expanded {
         // Oldest on top, the newest at the bottom edge.
         stack
-            .flex_col()
-            .gap(GAP / gui::styled::UNIT)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(GAP)
             .children(visible.iter().rev().map(|s| toast_box(store, s, None)))
     } else {
         // All in one cell, the ones behind first so the front one paints
@@ -405,29 +406,33 @@ fn stack(store: Store) -> Element {
                 toast_box(store, s, (n > 0.0).then_some(n))
             })
             .collect();
-        stack.grid().items_end().children(toasts.into_iter().rev())
+        stack
+            .display(Display::Grid)
+            .align_items(Align::End)
+            .children(toasts.into_iter().rev())
     };
     let corner = div()
         .named("toaster-viewport")
-        .size_full()
+        .size(pct(100.0))
         .pass_through()
-        .flex_col()
-        .justify_end()
-        .items_end()
-        .p(OFFSET)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .justify_content(Justify::End)
+        .align_items(Align::End)
+        .padding(OFFSET)
         .child(stack);
-    deferred(Placement::Fill, corner).into_element()
+    deferred(Positioning::Fill, corner).into_element()
 }
 
 /// The surface every toast has.
 fn surface() -> Div {
     let t = theme();
     div()
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .border()
+        .border(1.0)
         .border_color(t.border)
-        .rounded_lg()
+        .radius(10.0)
         .shadow(Shadow {
             x: 0.0,
             y: 4.0,
@@ -461,13 +466,14 @@ fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
     };
     let content = div()
         .named("toast-content")
-        .flex_col()
-        .gap_y(0.5)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .row_gap(2.0)
         .child(
             text(s.toast.title.clone())
                 .named("toast-title")
-                .font_medium()
-                .leading_normal(),
+                .font_weight(500)
+                .line_height(LineHeight::Relative(1.5)),
         )
         .child(s.toast.description.clone().map(|d| {
             let d = match d {
@@ -476,8 +482,8 @@ fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
             };
             div()
                 .named("toast-description")
-                .font_normal()
-                .leading_px(13.0 * 1.4)
+                .font_weight(400)
+                .line_height(13.0 * 1.4)
                 .text_color(description_color(t.dark))
                 .child(d)
         }));
@@ -485,20 +491,23 @@ fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
         let id = s.id;
         div()
             .named("toast-action")
-            .flex()
-            .items_center()
-            .shrink_0()
-            .ml_auto()
-            .h(6.0)
-            .px(2.0)
-            .rounded(4.0)
-            .text_xs()
-            .font_medium()
-            .bg(t.popover_foreground)
+            .display(Display::Flex)
+            .align_items(Align::Center)
+            .flex_shrink(0.0)
+            .margin_left(Length::Auto)
+            .height(24.0)
+            .padding_x(8.0)
+            .radius(4.0)
+            .text_size(12.0)
+            .line_height(16.0)
+            .font_weight(500)
+            .background(t.popover_foreground)
             .text_color(t.popover)
-            .cursor_pointer()
+            .cursor(Cursor::Pointer)
             .focusable()
-            .focus_visible(|st| st.ring(2.0, Color::BLACK.opacity(0.4)))
+            .with_interaction(|d, i| {
+                d.ring(move || i.focus_visible().then(|| Ring::new(2.0, Color::BLACK.opacity(0.4))))
+            })
             .on_click(move |_| {
                 (a.on_click)();
                 store.dismiss(id);
@@ -507,7 +516,7 @@ fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
     });
     // vue-sonner's `[data-sonner-toast] > * { transition: opacity 400ms }`.
     let part = |d: Div| {
-        d.transition_opacity()
+        d.transition(Properties::OPACITY)
             .duration_ms(400.0)
             .ease(Easing::EASE)
             .when(behind.is_some(), |d| d.opacity(0.0))
@@ -517,12 +526,12 @@ fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
             part(
                 div()
                     .named("toast-icon")
-                    .flex()
-                    .items_center()
-                    .size(4.0)
-                    .shrink_0()
-                    .ml(-0.75)
-                    .mr(1.0)
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .size(16.0)
+                    .flex_shrink(0.0)
+                    .margin_left(-3.0)
+                    .margin_right(4.0)
                     .child(i),
             )
         }),
@@ -535,29 +544,35 @@ fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
         // Mounting rises from below and fades in; leaving sinks and fades
         // for the 200ms before vue-sonner unmounts it (`TIME_BEFORE_UNMOUNT`),
         // half its 400ms transition.
-        .transition_props(Properties::TRANSFORM | Properties::OPACITY)
+        .transition(Properties::TRANSFORM | Properties::OPACITY)
         .duration_ms(400.0)
         .ease(Easing::EASE)
-        .animate(Animation::enter().slide_y(Calc::fraction(1.0)).fade(0.0))
-        .animate_out(Animation::exit().slide_y(Calc::fraction(1.0)).fade(0.0).iterations(0.5))
-        .row_start(1)
-        .col_start(1)
+        .animation(Animation::enter().slide(Slide::Y(Calc::fraction(1.0))).fade(0.0))
+        .exit_animation(
+            Animation::exit()
+                .slide(Slide::Y(Calc::fraction(1.0)))
+                .fade(0.0)
+                .iterations(0.5),
+        )
+        .grid_row_start(1)
+        .grid_column_start(1)
         .when_some(behind, |d, n| {
-            d.absolute()
+            d.position(Position::Absolute)
                 .top(0.0)
                 .bottom(0.0)
                 .left(0.0)
                 .right(0.0)
-                .overflow_hidden()
+                .overflow(Overflow::Hidden)
                 .translate_y(Calc::px(-GAP * n))
                 .scale(1.0 - SHRINK * n)
         })
-        .w_px(WIDTH)
-        .flex()
-        .items_center()
-        .gap(1.5)
-        .p(4.0)
-        .text_size(13.0, 13.0 * 1.5)
+        .width(WIDTH)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(6.0)
+        .padding(16.0)
+        .text_size(13.0)
+        .line_height(13.0 * 1.5)
         .child(kind_icon)
         .child(content)
         .child(action)

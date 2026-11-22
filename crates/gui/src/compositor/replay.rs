@@ -24,13 +24,14 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use super::input_log::{Event, Header, InputLog, Phase, Platform, Routed, Router, Stamped, WheelDelta};
+use super::scroll::{THUMB_FADE, THUMB_SHOWN};
 use crate::app::Scenario;
 use crate::clock;
 use crate::color::Color;
 use crate::element::{IntoElement, div};
 use crate::events::DragPhase;
+use crate::prelude::*;
 use crate::scroll::ScrollHandle;
-use crate::styled::Styled;
 use crate::window::{Input, PointerResampler};
 
 /// A row's height in the probe.
@@ -133,27 +134,29 @@ fn replay(log: &InputLog, hz: f64, ui_every: u32) -> Run {
             let c = Rc::clone(&c);
             let d = Rc::clone(&d);
             div()
-                .size_full()
-                .flex_row()
+                .size(pct(100.0))
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Row)
                 .child(
                     div()
-                        .h_full()
-                        .flex_1()
-                        .overflow_y_scroll()
+                        .height(pct(100.0))
+                        .flex(Flex::grow(1.0))
+                        .overflow_y(Overflow::Scroll)
+                        .overflow_x(Overflow::Hidden)
                         .track_scroll(&h)
                         .children((0..ROWS).map(move |i| {
                             let c = Rc::clone(&c);
                             div()
-                                .h_px(ROW)
-                                .bg(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
+                                .height(ROW)
+                                .background(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
                                 .on_click(move |_| c.borrow_mut().push(i))
                         })),
                 )
                 .child(
                     div()
-                        .w_px(PAD)
-                        .h_full()
-                        .bg(Color::hex(0xe4e4e7))
+                        .width(PAD)
+                        .height(pct(100.0))
+                        .background(Color::hex(0xe4e4e7))
                         .on_drag(move |e| d.borrow_mut().push((e.phase, e.x, e.y))),
                 )
                 .into_element()
@@ -461,17 +464,26 @@ fn check(name: &str, log: &InputLog, run: &Run) -> String {
                 f.offset
             );
         }
+        // Past 35 ms the compositor draws only to fade the scrollbar out:
+        // nothing moves, and once it has faded nothing is drawn.
         let late: Vec<&Frame> = run
             .frames
             .iter()
             .filter(|f| !f.ui && f.vblank >= w.at + PREDICT_FOR + interval && f.vblank < next)
             .collect();
         assert!(
-            late.is_empty(),
-            "{what}: the compositor drew {} frames more than 35 ms after the last event at {:.3} s (first at {:.3} s)",
-            late.len(),
+            late.iter().all(|f| (f64::from(f.offset) - expected).abs() < 0.05),
+            "{what}: the list moved more than 35 ms after the last event at {:.3} s",
             w.at - T0,
-            late.first().map_or(0.0, |f| f.vblank - T0)
+        );
+        // It was last scrolled as the prediction ran out, then shows and fades.
+        let faded = w.at + PREDICT_FOR + f64::from(THUMB_SHOWN + THUMB_FADE) + interval;
+        let drawn = late.iter().filter(|f| f.vblank >= faded).count();
+        assert_eq!(
+            drawn,
+            0,
+            "{what}: the compositor drew {drawn} frames after the scrollbar faded, past the event at {:.3} s",
+            w.at - T0,
         );
     }
 
@@ -675,7 +687,12 @@ fn flings(run: &Run) -> Vec<f64> {
         // the compositor draws nothing.
         let v0 = steps.get(2).map_or(0.0, |s| s.abs() / interval);
         let lasts = FLING_TAU * (v0 / FLING_MIN).max(1.0).ln() + 0.1;
-        let moving: Vec<&&Frame> = after.iter().filter(|f| !f.ui).collect();
+        // Frames past it only fade the scrollbar: the list stays.
+        let moving: Vec<&&Frame> = after
+            .windows(2)
+            .filter(|p| p.get(1).is_some_and(|f| !f.ui) && p.first().map(|f| f.offset) != p.get(1).map(|f| f.offset))
+            .filter_map(|p| p.get(1))
+            .collect();
         if let Some(last) = moving.last() {
             assert!(
                 last.vblank - w.at <= lasts + 2.0 * interval,
@@ -757,12 +774,16 @@ fn macos_momentum_is_scrolled_as_it_comes_and_ends_with_its_last_event() {
         let total: f32 = run.wheels.iter().filter(|w| w.hit).map(|w| w.dy).sum();
         assert!((run.shown_final - START - total).abs() < 0.05);
         let last = run.wheels.iter().filter(|w| w.hit).map(|w| w.at).fold(0.0, f64::max);
-        let drawn_after = run
+        let moved_after = run
             .frames
             .iter()
             .filter(|f| f.vblank > last + PREDICT_FOR + 1.0 / hz)
+            .filter(|f| (f.offset - run.shown_final).abs() >= 0.05)
             .count();
-        assert_eq!(drawn_after, 0, "nothing drawn 35 ms after the momentum's last event");
+        assert_eq!(moved_after, 0, "nothing moves 35 ms after the momentum's last event");
+        let faded = last + PREDICT_FOR + f64::from(THUMB_SHOWN + THUMB_FADE) + 1.0 / hz;
+        let drawn_after = run.frames.iter().filter(|f| f.vblank > faded).count();
+        assert_eq!(drawn_after, 0, "nothing drawn once the scrollbar has faded");
         // A click during the momentum hits what was on screen.
         assert!(!run.presses.is_empty());
     }

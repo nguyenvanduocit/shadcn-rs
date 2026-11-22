@@ -7,13 +7,14 @@ use crate::{Render, Shot, demo, page};
 fn repository(name: &str) -> gui::Div {
     let t = theme();
     div()
-        .rounded_md()
-        .border()
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .px(4.0)
-        .py(2.0)
-        .font_mono()
-        .text_sm()
+        .padding_x(16.0)
+        .padding_y(8.0)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(14.0)
+        .line_height(20.0)
         .child(name.to_owned())
 }
 
@@ -24,28 +25,35 @@ pub fn render() -> Render {
             demo(
                 "CollapsibleDemo.vue",
                 collapsible()
-                    .flex_col()
-                    .w_px(350.0)
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .width(350.0)
+                    .gap(8.0)
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(4.0)
-                            .px(4.0)
-                            .child(text("@peduarte starred 3 repositories").text_sm().font_semibold())
+                            .display(Display::Flex)
+                            .align_items(Align::Center)
+                            .justify_content(Justify::Between)
+                            .gap(16.0)
+                            .padding_x(16.0)
+                            .child(
+                                text("@peduarte starred 3 repositories")
+                                    .text_size(14.0)
+                                    .line_height(20.0)
+                                    .font_weight(600),
+                            )
                             .child(collapsible_trigger_as(
                                 button(ButtonVariant::Ghost, ButtonSize::Icon)
-                                    .size(8.0)
+                                    .size(32.0)
                                     .child(icon(Icon::ChevronsUpDown)),
                             )),
                     )
                     .child(repository("@radix-ui/primitives"))
                     .child(
                         collapsible_content()
-                            .flex_col()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .gap(8.0)
                             .child(repository("@radix-ui/colors"))
                             .child(repository("@stitches/react")),
                     ),

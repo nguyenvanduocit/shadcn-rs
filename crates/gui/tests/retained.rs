@@ -10,12 +10,16 @@ use gui::style::Calc;
 use gui::{Color, Scenario, Signal, div, text};
 
 fn rows() -> impl IntoElement {
-    div().size_full().overflow_y_scroll().children((0..80).map(|i| {
-        div()
-            .h_px(24.0)
-            .bg(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
-            .child(text(format!("row {i}")))
-    }))
+    div()
+        .size(pct(100.0))
+        .overflow_y(Overflow::Scroll)
+        .overflow_x(Overflow::Hidden)
+        .children((0..80).map(|i| {
+            div()
+                .height(24.0)
+                .background(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
+                .child(text(format!("row {i}")))
+        }))
 }
 
 #[test]
@@ -50,19 +54,19 @@ fn a_scroll_records_nothing_again_and_lays_out_nothing() {
 fn moving(shown: Signal<bool>, opacity: bool) -> impl IntoElement {
     let on = shown.get();
     let b = div()
-        .w_px(120.0)
-        .h_px(40.0)
-        .bg(Color::hex(0x18181b))
+        .width(120.0)
+        .height(40.0)
+        .background(Color::hex(0x18181b))
         .duration_ms(200.0)
-        .ease_linear()
+        .ease(Easing::Linear)
         .child(text("moving"));
     let b = if opacity {
-        b.transition_opacity().opacity(if on { 1.0 } else { 0.2 })
+        b.transition(Properties::OPACITY).opacity(if on { 1.0 } else { 0.2 })
     } else {
-        b.transition_transform()
+        b.transition(Properties::TRANSFORM)
             .translate_y(Calc::px(if on { 0.0 } else { 40.0 }))
     };
-    div().size_full().p(2.0).child(b)
+    div().size(pct(100.0)).padding(8.0).child(b)
 }
 
 #[expect(clippy::expect_used, reason = "a scenario that cannot run is a failed test")]
@@ -123,21 +127,38 @@ fn a_hover_redraws_its_chunk_and_its_shadow_alone() {
     let mut s = Scenario::measuring(
         || {
             div()
-                .size_full()
-                .p(10.0)
-                .gap(4.0)
-                .flex_col()
+                .size(pct(100.0))
+                .padding(40.0)
+                .gap(16.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .child(text("A page with a button"))
-                .child(
+                .child({
+                    let i = Interaction::new();
                     div()
-                        .w_px(120.0)
-                        .h_px(36.0)
-                        .rounded_md()
-                        .shadow_md()
-                        .bg(Color::hex(0x18181b))
-                        .hover(|s| s.bg(Color::hex(0x3f3f46)))
-                        .child(text("Button")),
-                )
+                        .interaction(i)
+                        .width(120.0)
+                        .height(36.0)
+                        .radius(8.0)
+                        .shadow([
+                            Shadow {
+                                x: 0.0,
+                                y: 4.0,
+                                blur: 6.0,
+                                spread: -1.0,
+                                color: Color::BLACK.opacity(0.1),
+                            },
+                            Shadow {
+                                x: 0.0,
+                                y: 2.0,
+                                blur: 4.0,
+                                spread: -2.0,
+                                color: Color::BLACK.opacity(0.1),
+                            },
+                        ])
+                        .background(move || Color::hex(if i.hovered() { 0x3f3f46 } else { 0x18181b }))
+                        .child(text("Button"))
+                })
                 .child(text("Something below it"))
                 .into_element()
         },

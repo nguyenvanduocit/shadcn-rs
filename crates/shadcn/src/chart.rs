@@ -12,8 +12,8 @@ use std::f32::consts::{FRAC_PI_2, TAU};
 use gui::chunk::plot::{Series, area, bars, line, plot, series};
 use gui::prelude::*;
 use gui::{
-    Color, ComponentElement, Div, Element, Path, PathBuilder, Placement, Shape, Side, SideAlign, Signal, component,
-    deferred, div, px, shapes, text, watch,
+    Color, ComponentElement, Div, Element, Figure, Path, PathBuilder, Positioning, Side, SideAlign, Signal, component,
+    deferred, div, figures, px, text, watch,
 };
 
 use crate::theme::theme;
@@ -126,7 +126,13 @@ const DOT: f32 = 4.0;
 /// The chart's frame (`ChartContainer`): a column, centred, in `text-xs`.
 #[must_use]
 pub fn chart_container() -> Div {
-    div().named("chart").flex_col().justify_center().text_xs()
+    div()
+        .named("chart")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .justify_content(Justify::Center)
+        .text_size(12.0)
+        .line_height(16.0)
 }
 
 /// Units of data x a day of [`ChartRow::x`]: the plot's x is whole units,
@@ -205,7 +211,7 @@ fn units(px: f32, per: f64) -> i64 {
 fn xy(chart: &ChartXy, props: Signal<ChartXy>, data: &[Series], active: Signal<Option<usize>>) -> Element {
     let t = theme();
     let g = Geometry::new(chart);
-    let grid: Vec<Shape> = g
+    let grid: Vec<Figure> = g
         .grid()
         .into_iter()
         .map(|y| {
@@ -220,16 +226,16 @@ fn xy(chart: &ChartXy, props: Signal<ChartXy>, data: &[Series], active: Signal<O
     let hovers = chart.crosshair.is_some();
     div()
         .named("chart-xy")
-        .relative()
-        .w_px(chart.width)
-        .h_px(chart.height)
+        .position(Position::Relative)
+        .width(chart.width)
+        .height(chart.height)
         .child(
-            shapes(grid)
-                .absolute()
+            figures(grid)
+                .position(Position::Absolute)
                 .top(0.0)
                 .left(0.0)
-                .w_px(chart.width)
-                .h_px(chart.height),
+                .width(chart.width)
+                .height(chart.height),
         )
         .when(hovers && !matches!(chart.mark, ChartMark::Bar { .. }), |d| {
             d.child(chart_dots(props, active))
@@ -238,22 +244,22 @@ fn xy(chart: &ChartXy, props: Signal<ChartXy>, data: &[Series], active: Signal<O
             g.marks(data, active)
                 .build()
                 .named("chart-plot")
-                .absolute()
-                .left_len(px(g.left))
-                .top_len(px(top))
-                .w_px(width)
-                .h_px(g.height),
+                .position(Position::Absolute)
+                .left(px(g.left))
+                .top(px(top))
+                .width(width)
+                .height(g.height),
         )
         .children(chart.rows.iter().zip(g.xs()).filter(|_| chart.axes).map(|(row, x)| {
             div()
                 .named("chart-tick")
-                .absolute()
-                .left_len(px(x - g.band / 2.0))
-                .top_len(px(g.base + TICK_TOP))
-                .w_px(g.band)
-                .flex()
-                .justify_center()
-                .whitespace_nowrap()
+                .position(Position::Absolute)
+                .left(px(x - g.band / 2.0))
+                .top(px(g.base + TICK_TOP))
+                .width(g.band)
+                .display(Display::Flex)
+                .justify_content(Justify::Center)
+                .nowrap(true)
                 .text_color(t.muted_foreground)
                 .child(row.tick.clone())
         }))
@@ -272,12 +278,12 @@ fn chart_dots(chart: Signal<ChartXy>, active: Signal<Option<usize>>) -> Componen
             };
             chart.with(|chart| {
                 let g = Geometry::new(chart);
-                shapes(g.dots(i))
-                    .absolute()
+                figures(g.dots(i))
+                    .position(Position::Absolute)
                     .top(0.0)
                     .left(0.0)
-                    .w_px(chart.width)
-                    .h_px(chart.height)
+                    .width(chart.width)
+                    .height(chart.height)
                     .into_element()
             })
         }
@@ -319,13 +325,13 @@ fn category(chart: &ChartXy, i: usize) -> Option<Element> {
         div()
             .named("chart-category")
             .pass_through()
-            .absolute()
-            .left_len(px(left))
+            .position(Position::Absolute)
+            .left(px(left))
             .top(0.0)
-            .w_px((right - left).max(0.0))
-            .h_px(g.base)
+            .width((right - left).max(0.0))
+            .height(g.base)
             .child(deferred(
-                Placement::Anchored {
+                Positioning::Anchored {
                     side: Side::Right,
                     align: SideAlign::Center,
                     offset: 8.0,
@@ -345,7 +351,7 @@ pub fn chart_pie(pie: &ChartPie<'_>) -> Div {
     let r = pie.size / 2.0;
     let inner = pie.arc_width.map_or(0.0, |w| (r - w).max(0.0));
     let mut start = 0.0_f32;
-    let slices: Vec<Shape> = pie
+    let slices: Vec<Figure> = pie
         .config
         .iter()
         .zip(&pie.row.values)
@@ -376,9 +382,9 @@ pub fn chart_pie(pie: &ChartPie<'_>) -> Div {
         .collect();
     div()
         .named("chart-pie")
-        .w_px(pie.size)
-        .h_px(pie.size)
-        .child(shapes(slices).w_px(pie.size).h_px(pie.size))
+        .width(pie.size)
+        .height(pie.size)
+        .child(figures(slices).width(pie.size).height(pie.size))
 }
 
 /// The tooltip's card (`ChartTooltipContent`): an optional title, then one
@@ -389,53 +395,71 @@ pub fn chart_tooltip_content(label: Option<&str>, items: &[ChartTooltipItem], in
     let nest_label = items.len() == 1 && indicator != ChartIndicator::Dot;
     div()
         .named("chart-tooltip")
-        .grid()
-        .min_w_px(128.0)
-        .items_start()
-        .gap(1.5)
-        .rounded_lg()
-        .border()
+        .display(Display::Grid)
+        .min_width(128.0)
+        .align_items(Align::Start)
+        .gap(6.0)
+        .radius(10.0)
+        .border(1.0)
         .border_color(t.border.opacity(0.5))
-        .bg(t.background)
+        .background(t.background)
         .text_color(t.foreground)
-        .px(2.5)
-        .py(1.5)
-        .text_xs()
-        .shadow_xl()
-        .when_some(label.filter(|_| !nest_label), |d, l| d.child(text(l).font_medium()))
-        .child(div().grid().gap(1.5).children(items.iter().map(|item| {
+        .padding_x(10.0)
+        .padding_y(6.0)
+        .text_size(12.0)
+        .line_height(16.0)
+        .shadow([
+            Shadow {
+                x: 0.0,
+                y: 20.0,
+                blur: 25.0,
+                spread: -5.0,
+                color: Color::BLACK.opacity(0.1),
+            },
+            Shadow {
+                x: 0.0,
+                y: 8.0,
+                blur: 10.0,
+                spread: -6.0,
+                color: Color::BLACK.opacity(0.1),
+            },
+        ])
+        .when_some(label.filter(|_| !nest_label), |d, l| d.child(text(l).font_weight(500)))
+        .child(div().display(Display::Grid).gap(6.0).children(items.iter().map(|item| {
             let swatch = match indicator {
-                ChartIndicator::Dot => Some(div().size(2.5)),
-                ChartIndicator::Line => Some(div().w(1.0)),
+                ChartIndicator::Dot => Some(div().size(10.0)),
+                ChartIndicator::Line => Some(div().width(4.0)),
                 ChartIndicator::Hidden => None,
             };
             div()
-                .flex()
-                .w_full()
-                .flex_wrap()
-                .gap(2.0)
-                .items_stretch()
-                .when(indicator == ChartIndicator::Dot, |d| d.items_center())
-                .when_some(swatch, |d, s| d.child(s.shrink_0().rounded_xs().bg(item.color)))
+                .display(Display::Flex)
+                .width(pct(100.0))
+                .flex_wrap(true)
+                .gap(8.0)
+                .align_items(Align::Stretch)
+                .when(indicator == ChartIndicator::Dot, |d| d.align_items(Align::Center))
+                .when_some(swatch, |d, s| {
+                    d.child(s.flex_shrink(0.0).radius(2.0).background(item.color))
+                })
                 .child(
                     div()
-                        .flex()
-                        .flex_1()
-                        .justify_between()
-                        .leading_none()
-                        .when(nest_label, |d| d.items_end())
-                        .when(!nest_label, |d| d.items_center())
+                        .display(Display::Flex)
+                        .flex(Flex::grow(1.0))
+                        .justify_content(Justify::Between)
+                        .line_height(LineHeight::Relative(1.0))
+                        .when(nest_label, |d| d.align_items(Align::End))
+                        .when(!nest_label, |d| d.align_items(Align::Center))
                         .child(
                             div()
-                                .grid()
-                                .gap(1.5)
-                                .when_some(label.filter(|_| nest_label), |d, l| d.child(text(l).font_medium()))
+                                .display(Display::Grid)
+                                .gap(6.0)
+                                .when_some(label.filter(|_| nest_label), |d, l| d.child(text(l).font_weight(500)))
                                 .child(text(item.label.clone()).text_color(t.muted_foreground)),
                         )
                         .child(
                             text(item.value.clone())
-                                .font_mono()
-                                .font_medium()
+                                .font_family(FontFamily::GEIST_MONO)
+                                .font_weight(500)
                                 .text_color(t.foreground),
                         ),
                 )
@@ -447,17 +471,17 @@ pub fn chart_tooltip_content(label: Option<&str>, items: &[ChartTooltipItem], in
 pub fn chart_legend_content(config: &[ChartSeries]) -> Div {
     div()
         .named("chart-legend")
-        .flex()
-        .items_center()
-        .justify_center()
-        .gap(4.0)
-        .pt(3.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(16.0)
+        .padding_top(12.0)
         .children(config.iter().map(|s| {
             div()
-                .flex()
-                .items_center()
-                .gap(1.5)
-                .child(div().size(2.0).shrink_0().rounded_xs().bg(s.color))
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .gap(6.0)
+                .child(div().size(8.0).flex_shrink(0.0).radius(2.0).background(s.color))
                 .child(s.label.clone())
         }))
 }
@@ -689,7 +713,7 @@ impl<'a> Geometry<'a> {
     }
 
     /// The crosshair's dots at row `i`.
-    fn dots(&self, i: usize) -> Vec<Shape> {
+    fn dots(&self, i: usize) -> Vec<Figure> {
         let x = self.xs().nth(i).unwrap_or(0.0);
         let values = stacked(self.chart.mark, &self.chart.rows, self.chart.config.len());
         self.chart

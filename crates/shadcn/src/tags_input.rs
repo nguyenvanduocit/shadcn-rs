@@ -10,12 +10,11 @@ use std::rc::Rc;
 use gui::Properties;
 use gui::prelude::*;
 use gui::{
-    Bind, Color, Div, Element, Icon, KeyEvent, Model, NamedKey, Slot, TextField, UseModel, component, div, icon,
+    Bind, Color, Div, Element, Icon, KeyEvent, Model, NamedKey, Slot, Style, TextField, UseModel, component, div, icon,
     provide, text, text_input, use_context, use_model,
 };
 
-use crate::button_group::with_style;
-use crate::focus::{destructive_ring, focus_ring};
+use crate::focus::{StateLook, destructive_ring, focus_ring};
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
@@ -77,20 +76,27 @@ pub fn tags_input() -> Part<TagsInputProps> {
     let t = theme();
     let root = div()
         .named("tags-input")
-        .transition_props(Properties::COLOR | Properties::SHADOW)
-        .flex()
-        .flex_wrap()
-        .gap(2.0)
-        .items_center()
-        .rounded_md()
-        .border()
+        .transition(Properties::COLOR | Properties::SHADOW)
+        .display(Display::Flex)
+        .flex_wrap(true)
+        .gap(8.0)
+        .align_items(Align::Center)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.input)
-        .bg(t.background)
-        .px(2.0)
-        .py(1.0)
-        .text_sm()
-        .shadow_xs()
-        .cursor_text();
+        .background(t.background)
+        .padding_x(8.0)
+        .padding_y(4.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .cursor(Cursor::Text);
     Part::new(TagsInputProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -106,17 +112,20 @@ pub fn tags_input() -> Part<TagsInputProps> {
             move || {
                 let t = theme();
                 let (invalid, adds, root) = props.with(|p| (p.props.invalid, p.props.add_on_enter, p.slot.0.clone()));
-                let focused = field.focus.is_focused();
                 let d = root
                     .on_click(move |_| field.focus.focus())
                     .when(adds, |d| d.on_key_down(move |ev| ev.is(NamedKey::Enter) && ctx.add()));
                 // `focus-within:` and `aria-invalid:` are states of the box,
-                // not of the field that holds focus, so they are read here.
-                with_style(d, |s| match (focused, invalid) {
-                    (false, false) => s,
-                    (false, true) => s.border_color(t.destructive),
-                    (true, false) => focus_ring(s, &t),
-                    (true, true) => destructive_ring(s, &t).border_color(t.destructive),
+                // not of the field that holds focus: the box's own
+                // `focus_within`, bound to its border and ring.
+                d.with_interaction(|d, i| {
+                    if invalid {
+                        let ring = destructive_ring(Style::default(), &t).border_color(t.destructive);
+                        d.border_color(t.destructive)
+                            .ring_while(move || i.focus_within(), &ring)
+                    } else {
+                        d.ring_while(move || i.focus_within(), &focus_ring(Style::default(), &t))
+                    }
                 })
                 .into_element()
             }
@@ -173,11 +182,11 @@ pub fn tags_input_item() -> Div {
     let t = theme();
     div()
         .named("tags-input-item")
-        .flex()
-        .h(5.0)
-        .items_center()
-        .rounded_md()
-        .bg(t.secondary)
+        .display(Display::Flex)
+        .height(20.0)
+        .align_items(Align::Center)
+        .radius(8.0)
+        .background(t.secondary)
         .text_color(t.secondary_foreground)
 }
 
@@ -186,10 +195,11 @@ pub fn tags_input_item() -> Div {
 pub fn tags_input_item_text(tag: impl Into<String>) -> Div {
     div()
         .named("tags-input-item-text")
-        .py(0.5)
-        .px(2.0)
-        .text_sm()
-        .rounded_sm()
+        .padding_y(2.0)
+        .padding_x(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .radius(6.0)
         .child(text(tag))
 }
 
@@ -198,11 +208,11 @@ pub fn tags_input_item_text(tag: impl Into<String>) -> Div {
 pub fn tags_input_item_delete(tag: impl Into<String>) -> Part<String> {
     let root = div()
         .named("tags-input-item-delete")
-        .flex()
-        .rounded_sm()
-        .bg(Color::TRANSPARENT)
-        .mr(1.0)
-        .cursor_pointer()
+        .display(Display::Flex)
+        .radius(6.0)
+        .background(Color::TRANSPARENT)
+        .margin_right(4.0)
+        .cursor(Cursor::Pointer)
         .focusable()
         .aria_label("Remove")
         .child(icon(Icon::X));
@@ -273,11 +283,12 @@ impl IntoElement for TagsInputInput {
                         .placeholder_color(t.muted_foreground)
                         .selection_color(t.primary.opacity(0.35))
                         .text_color(t.foreground)
-                        .text_sm()
-                        .min_h(5.0)
-                        .flex_1()
-                        .bg(Color::TRANSPARENT)
-                        .px(1.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .min_height(20.0)
+                        .flex(Flex::grow(1.0))
+                        .background(Color::TRANSPARENT)
+                        .padding_x(4.0)
                         .when_some(p.keys.clone(), |i, keys| i.on_key_down(move |ev| keys(ev)))
                         .into_element()
                 })

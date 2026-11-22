@@ -97,13 +97,14 @@ impl PasswordCard {
         let rows = REQUIREMENTS.iter().map(|(label, _, test)| {
             let ok = test(&value);
             div()
-                .flex()
-                .items_center()
-                .gap(2.0)
-                .text_sm()
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .gap(8.0)
+                .text_size(14.0)
+                .line_height(20.0)
                 .child(
                     icon(Icon::Check)
-                        .size(4.0)
+                        .size(16.0)
                         .text_color(if ok { green_500() } else { t.muted_foreground }),
                 )
                 .child(text((*label).to_owned()).text_color(if ok { t.foreground } else { t.muted_foreground }))
@@ -123,13 +124,13 @@ impl PasswordCard {
         );
         let (submit, reset) = (*f, *f);
         card()
-            .w_full()
-            .max_w_px(448.0)
+            .width(pct(100.0))
+            .max_width(448.0)
             .child(
                 card_header()
-                    .border_b()
+                    .border_bottom(1.0)
                     .border_color(t.border)
-                    .pb(6.0)
+                    .padding_bottom(24.0)
                     .child(card_title("Create Password"))
                     .child(card_description("Choose a strong password to secure your account.")),
             )
@@ -141,36 +142,47 @@ impl PasswordCard {
                             .child(group)
                             .child(
                                 div()
-                                    .flex_col()
-                                    .gap(2.0)
-                                    .child(progress(percent).bg(strength_color(met)))
-                                    .child(div().flex_col().gap(1.5).children(rows)),
+                                    .display(Display::Flex)
+                                    .flex_direction(FlexDirection::Column)
+                                    .gap(8.0)
+                                    .child(progress(percent).background(strength_color(met)))
+                                    .child(
+                                        div()
+                                            .display(Display::Flex)
+                                            .flex_direction(FlexDirection::Column)
+                                            .gap(6.0)
+                                            .children(rows),
+                                    ),
                             )
                             .child(field_error(f.errors())),
                     ),
                 ),
             )
             .child(
-                card_footer().border_t().border_color(t.border).pt(6.0).child(
-                    field(FieldOrientation::Vertical, false)
-                        .child(
-                            button(ButtonVariant::Default, ButtonSize::Default)
-                                .child("Create Password")
-                                .on_click(move |_| {
-                                    if form_submit(&[&submit]) {
-                                        submitted(
-                                            &Json::Object(vec![("password", Json::Str(submit.control().text()))]),
-                                            Pre::Code,
-                                        );
-                                    }
-                                }),
-                        )
-                        .child(
-                            button(ButtonVariant::Outline, ButtonSize::Default)
-                                .child("Reset")
-                                .on_click(move |_| form_reset(&[&reset])),
-                        ),
-                ),
+                card_footer()
+                    .border_top(1.0)
+                    .border_color(t.border)
+                    .padding_top(24.0)
+                    .child(
+                        field(FieldOrientation::Vertical, false)
+                            .child(
+                                button(ButtonVariant::Default, ButtonSize::Default)
+                                    .child("Create Password")
+                                    .on_click(move |_| {
+                                        if form_submit(&[&submit]) {
+                                            submitted(
+                                                &Json::Object(vec![("password", Json::Str(submit.control().text()))]),
+                                                Pre::Code,
+                                            );
+                                        }
+                                    }),
+                            )
+                            .child(
+                                button(ButtonVariant::Outline, ButtonSize::Default)
+                                    .child("Reset")
+                                    .on_click(move |_| form_reset(&[&reset])),
+                            ),
+                    ),
             )
     }
 }

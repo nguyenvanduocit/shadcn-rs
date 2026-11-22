@@ -21,8 +21,11 @@ in `apps/v4/components/demo/<Name>Demo.vue` and `apps/v4/components/_internal/si
 - **Classes translate one for one** through `gui::Styled`: `px-4` → `.px(4.0)`,
   `h-9` → `.h(9.0)`, `w-[200px]` → `.w_px(200.0)`, `rounded-md` →
   `.rounded_md()`, `bg-primary/90` → `.bg(t.primary.opacity(0.9))`,
-  `hover:` → `.hover(|s| …)`, `focus-visible:` → `.focus_visible(|s| …)`,
-  `disabled:` → `.disabled_style(|s| …)`, `dark:` → `.when(t.dark, …)`.
+  `dark:` → `.when(t.dark, …)`. A state is a closure reading the node's
+  `gui::Interaction` (ADR-0022): `hover:bg-accent` →
+  `.background(move || i.hovered().then_some(t.accent))`, or the
+  `shadcn::focus::StateLook` helpers (`background_while`, `focus_ring_on`,
+  `dim_disabled`).
   Read the token colours from `let t = theme();`.
 - **A stateful component is an instance holding its own state** (ADR-0013):
   `gui::component(props, setup)`, `setup` run once, its render tracked.

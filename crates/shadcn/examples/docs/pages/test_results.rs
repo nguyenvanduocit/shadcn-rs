@@ -318,15 +318,16 @@ pub fn render() -> Render {
         page(
             "Test results",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "TestResultsDemo.vue",
                     test_results_demo(&turn, &checkout, &script),
                 ))
                 .child(demo(
                     "TestResultsSuitesDemo.vue",
-                    trace().max_w(96.0).child(results(SUITES, &suites)),
+                    trace().max_width(384.0).child(results(SUITES, &suites)),
                 )),
         )
     })

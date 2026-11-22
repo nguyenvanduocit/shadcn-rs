@@ -4,6 +4,7 @@
 //! (`default_value`) or the caller's (`model`, `v-model`), and Enter types a
 //! newline.
 
+use gui::prelude::*;
 use gui::{Color, Properties, Style, Styled};
 
 use crate::input::Input;
@@ -15,23 +16,30 @@ use crate::theme::theme;
 pub fn textarea() -> Input {
     let t = theme();
     let style = Style::default()
-        .transition_props(Properties::COLOR | Properties::SHADOW)
+        .transition(Properties::COLOR | Properties::SHADOW)
         .text_color(t.foreground)
         .border_color(t.input)
-        .flex()
-        .min_h(16.0)
-        .w_full()
-        .rounded_md()
-        .border()
-        .bg(if t.dark {
+        .display(Display::Flex)
+        .min_height(64.0)
+        .width(pct(100.0))
+        .radius(8.0)
+        .border(1.0)
+        .background(if t.dark {
             t.input.opacity(0.3)
         } else {
             Color::TRANSPARENT
         })
-        .px(3.0)
-        .py(2.0)
+        .padding_x(12.0)
+        .padding_y(8.0)
         // `text-base md:text-sm`: a desktop window is taken to be past `md`.
-        .text_sm()
-        .shadow_xs();
+        .text_size(14.0)
+        .line_height(20.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        });
     Input::new("textarea", style).multiline()
 }

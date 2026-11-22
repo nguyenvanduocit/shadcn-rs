@@ -1,0 +1,21 @@
+# Chrome's sheet of samples.txt (sheet.png), written by crates/shadcn/verdict/corners.mjs
+# (Chrome 145.0.0.0), at device pixel ratio 1. First line: the sheet's width and height;
+# then per sample, tab separated: the sample's line, its box's x and y in the sheet.
+816 348
+100 36 26 26 26 26	8	8
+120 36 full full full full	144	8
+36 100 full full full full	280	8
+100 25 30 10 10 10	416	8
+100 30 20 0 0 0	552	8
+40 40 30 10 30 10	688	8
+80 30 0 full full 0	8	124
+60 60 12 12 12 12	144	124
+70 40 40 40 0 0	280	124
+16 100 10 10 10 10	416	124
+50 20 12.5 12.5 12.5 12.5	552	124
+90 36 18 0 0 18	688	124
+80 80 30 30 30 30 2	8	240
+100 30 26 26 26 26 2	144	240
+80 50 20 20 20 20 0	280	240
+80 50 20 20 20 20 -1	416	240
+80 60 24 8 24 8 3	552	240

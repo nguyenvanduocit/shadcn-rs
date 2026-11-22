@@ -10,7 +10,7 @@
 //! ```ignore
 //! hover_card()
 //!     .child(hover_card_trigger(button(ButtonVariant::Link, ButtonSize::Default).child("@nuxt")))
-//!     .child(hover_card_content().w(80.0).child("…"))
+//!     .child(hover_card_content().width(320.0).child("…"))
 //! ```
 
 use std::time::Duration;
@@ -18,8 +18,8 @@ use std::time::Duration;
 use gui::clock;
 use gui::prelude::*;
 use gui::{
-    Bind, Div, Element, Model, NamedKey, Placement, Scope, Side, SideAlign, Signal, UseModel, component, deferred, div,
-    provide, use_context, use_model,
+    Bind, Div, Element, Model, NamedKey, Positioning, Scope, Side, SideAlign, Signal, UseModel, component, deferred,
+    div, provide, use_context, use_model,
 };
 
 use gui::style::Origin;
@@ -137,16 +137,20 @@ pub fn hover_card() -> Part<HoverCardProps> {
         open_delay: OPEN_DELAY,
         close_delay: CLOSE_DELAY,
     };
-    Part::new(props, div().named("hover-card").inline_flex(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            provide(HoverCardContext {
-                intent: HoverIntent::new(use_model(props, |p| &p.props.open)),
-                props,
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        props,
+        div().named("hover-card").display(Display::Flex).inline(true),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                provide(HoverCardContext {
+                    intent: HoverIntent::new(use_model(props, |p| &p.props.open)),
+                    props,
+                });
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 impl Part<HoverCardProps> {
@@ -182,9 +186,11 @@ impl Part<HoverCardProps> {
 }
 
 /// Make `trigger` open the card while the pointer rests on it (`HoverCardTrigger as-child`).
+/// Give `trigger` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn hover_card_trigger(trigger: Div) -> Part<()> {
-    Part::new((), trigger, |p| {
+pub fn hover_card_trigger(trigger: impl Into<Div>) -> Part<()> {
+    Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let card = use_context::<HoverCardContext>();
@@ -236,14 +242,14 @@ pub fn hover_card_content() -> Part<HoverCardContentProps> {
     let t = theme();
     let root = popper(div(), Origin::CENTER)
         .named("hover-card-content")
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .w(64.0)
-        .rounded_md()
-        .border()
+        .width(256.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(4.0)
-        .shadow_md();
+        .padding(16.0)
+        .shadow(crate::popover::POPUP_SHADOW);
     let props = HoverCardContentProps {
         side: Side::Bottom,
         align: SideAlign::Center,
@@ -279,7 +285,7 @@ pub fn hover_card_content() -> Part<HoverCardContentProps> {
                     })
                     .on_click_outside(move || c.intent.set_now(false));
                 deferred(
-                    Placement::Anchored {
+                    Positioning::Anchored {
                         side: p.side,
                         align: p.align,
                         offset: p.offset,

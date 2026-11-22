@@ -211,7 +211,7 @@ fn baselines_round_as_blink_places_them() {
     // each line's top (ADR-0005).
     let mut ts = TextSystem::new();
     let t = ResolvedText {
-        family: FontFamily::Mono,
+        family: FontFamily::GEIST_MONO,
         ..style(14.0, 22.75, 400)
     };
     let mut items = Vec::new();
@@ -266,6 +266,7 @@ fn inline_boxes_sit_in_the_line_and_wrap_with_it() {
         at: 6,
         width: 20.0,
         height: 16.0,
+        baseline: None,
         id: 7,
     }];
     let p = Paragraph {
@@ -282,6 +283,51 @@ fn inline_boxes_sit_in_the_line_and_wrap_with_it() {
         (b.x - hello).abs() < 1.0 && (b.width - 20.0).abs() < 0.01,
         "{b:?} after {hello}"
     );
+}
+
+#[test]
+fn a_line_an_inline_box_grows_keeps_blinks_strut() {
+    // A 14px/22.75 paragraph (`text-sm leading-relaxed`) holding a 24px
+    // `size="xs"` button whose label's baseline is 16px down: Chrome's line
+    // is 24 tall, 16 above the baseline (the button's, equal to the strut's
+    // rounded ascent and floored half-leading) and 6.75 below (the strut's),
+    // not Parley's unrounded 24.43.
+    let mut ts = TextSystem::new();
+    let t = style(14.0, 22.75, 400);
+    let content = "browser. \u{FFFC} Server";
+    let button = |height: f32, baseline: Option<f32>| {
+        [InlineSlot {
+            at: 9,
+            width: 60.0,
+            height,
+            baseline,
+            id: 1,
+        }]
+    };
+    let plain = ts.metrics("browser. Server", &t, None);
+    assert_eq!(plain.height, 22.75);
+    assert_eq!(plain.first_baseline, Some(16.0), "Blink's strut: 16 above, 6.75 below");
+    let boxes = button(24.0, Some(16.0));
+    let p = Paragraph {
+        content,
+        runs: &[],
+        boxes: &boxes,
+    };
+    let m = ts.metrics(p, &t, None);
+    assert_eq!(m.height, 24.0, "16 above the baseline and 8 below, the button's");
+    assert_eq!(m.first_baseline, Some(16.0));
+    let placed = ts.inline_boxes(p, &t, None);
+    assert_eq!(placed[0].1.y, 0.0, "the button's top on the line's");
+    // A short box with no baseline stands on it, inside the strut.
+    let boxes = button(10.0, None);
+    let p = Paragraph {
+        content,
+        runs: &[],
+        boxes: &boxes,
+    };
+    let m = ts.metrics(p, &t, None);
+    assert_eq!((m.height, m.first_baseline), (22.75, Some(16.0)));
+    assert_eq!(ts.inline_boxes(p, &t, None)[0].1.y, 6.0, "its bottom on the baseline");
 }
 
 fn glyph_key(ts: &mut TextSystem, ch: &str, size: f32, scale: f32) -> GlyphKey {

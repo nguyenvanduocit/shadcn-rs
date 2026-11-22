@@ -18,8 +18,9 @@ use gui::prelude::*;
 use gui::{Div, Icon, Signal, Track, component, div, icon, span, text};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
+use crate::focus::StateLook;
 use crate::part::Part;
-use crate::theme::{Theme, theme};
+use crate::theme::{Colors, theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CodeBlockVariant {
@@ -64,19 +65,24 @@ pub fn code_block(p: CodeBlockProps) -> Div {
     let t = theme();
     let d = div()
         .named("code-block")
-        .relative()
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
-        .overflow_hidden()
-        .rounded_lg()
-        .border();
-    let d = if p.sm() { d.text_xs() } else { d.text_sm() };
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .overflow(Overflow::Hidden)
+        .radius(10.0)
+        .border(1.0);
+    let d = if p.sm() {
+        d.text_size(12.0).line_height(16.0)
+    } else {
+        d.text_size(14.0).line_height(20.0)
+    };
     match p.variant {
         CodeBlockVariant::Default => d
             .border_color(t.input)
             .text_color(t.foreground)
-            .when(t.dark, |d| d.bg(t.input.opacity(0.3))),
+            .when(t.dark, |d| d.background(t.input.opacity(0.3))),
         CodeBlockVariant::Destructive => d
             .border_color(t.destructive.opacity(if t.dark { 0.4 } else { 0.3 }))
             .text_color(t.destructive),
@@ -89,13 +95,13 @@ pub fn code_block_header(p: CodeBlockProps) -> Div {
     let t = theme();
     div()
         .named("code-block-header")
-        .flex()
-        .items_center()
-        .shrink_0()
-        .min_w(0.0)
-        .gap(2.0)
-        .px(if p.sm() { 2.5 } else { 3.0 })
-        .pt(if p.sm() { 2.5 } else { 3.0 })
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .flex_shrink(0.0)
+        .min_width(0.0)
+        .gap(8.0)
+        .padding_x(if p.sm() { 10.0 } else { 12.0 })
+        .padding_top(if p.sm() { 10.0 } else { 12.0 })
         .text_color(if p.destructive() {
             t.destructive
         } else {
@@ -114,23 +120,35 @@ pub fn code_block_title(p: CodeBlockProps, leading: Option<Icon>, title: impl In
     let t = theme();
     let d = div()
         .named("code-block-title")
-        .flex()
-        .items_start()
-        .min_w(0.0)
-        .font_sans()
-        .font_medium()
+        .display(Display::Flex)
+        .align_items(Align::Start)
+        .min_width(0.0)
+        .font_family(FontFamily::INTER)
+        .font_weight(500)
         .text_color(if p.destructive() { t.destructive } else { t.foreground });
     let (d, middle) = if p.sm() {
-        (d.text_xs(), 2.08)
+        (d.text_size(12.0).line_height(16.0), 2.08)
     } else {
-        (d.text_sm(), 4.18)
+        (d.text_size(14.0).line_height(20.0), 4.18)
     };
     let title = title.into();
     match leading {
         Some(i) => d
-            .child(icon(i).size(3.5).shrink_0().me(1.5).mt(middle / gui::styled::UNIT))
-            .child(text(format!(" {title}")).truncate()),
-        None => d.child(text(title).truncate()),
+            .child(icon(i).size(14.0).flex_shrink(0.0).margin_end(6.0).margin_top(middle))
+            .child(
+                text(format!(" {title}"))
+                    .truncate(true)
+                    .nowrap(true)
+                    .overflow_x(Overflow::Hidden)
+                    .min_width(0.0),
+            ),
+        None => d.child(
+            text(title)
+                .truncate(true)
+                .nowrap(true)
+                .overflow_x(Overflow::Hidden)
+                .min_width(0.0),
+        ),
     }
 }
 
@@ -139,13 +157,13 @@ pub fn code_block_title(p: CodeBlockProps, leading: Option<Icon>, title: impl In
 pub fn code_block_actions() -> Div {
     div()
         .named("code-block-actions")
-        .flex()
-        .items_center()
-        .shrink_0()
-        .gap(1.0)
-        .ms_auto()
-        .my(-1.0)
-        .me(-1.5)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .flex_shrink(0.0)
+        .gap(4.0)
+        .margin_start(Length::Auto)
+        .margin_y(-4.0)
+        .margin_end(-6.0)
 }
 
 /// Buttons floating over the code's top-right corner, each on the page's
@@ -153,27 +171,39 @@ pub fn code_block_actions() -> Div {
 /// after the content so it paints above. Vue shows them only while the block
 /// is hovered or focused; `gui` has no hover state an ancestor passes to its
 /// children, so they always show, as Vue does on touch screens.
+///
+/// The buttons are ghost buttons, as shadcn's are here (the copy button
+/// is): their rest fill becomes the page's background, and over it they
+/// keep a ghost button's hover fill and focus ring.
 #[must_use]
 pub fn code_block_floating_actions<B: Styled + IntoElement>(
     p: CodeBlockProps,
     buttons: impl IntoIterator<Item = B>,
 ) -> Div {
     let t = theme();
-    let inset = if p.sm() { 1.5 } else { 2.0 };
+    let inset = if p.sm() { 6.0 } else { 8.0 };
     div()
         .named("code-block-actions")
-        .absolute()
+        .position(Position::Absolute)
         .top(inset)
         .right(inset)
-        .flex()
-        .items_center()
-        .shrink_0()
-        .gap(1.0)
-        .children(
-            buttons
-                .into_iter()
-                .map(|b| b.bg(t.background).ring(1.0, t.foreground.opacity(0.1))),
-        )
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .flex_shrink(0.0)
+        .gap(4.0)
+        .children(buttons.into_iter().map(|b| {
+            // `bg-background ring-1 ring-foreground/10` over the button's
+            // rest; its hover fill and focus ring stay over them.
+            let i = b.node_interaction();
+            let lit = if t.dark { t.accent.opacity(0.5) } else { t.accent };
+            let b = b
+                .background(t.background)
+                .ring(Ring::new(1.0, t.foreground.opacity(0.1)));
+            match i {
+                Some(i) => b.background_while(move || i.hovered(), lit).focus_ring_on(i, &t),
+                None => b,
+            }
+        }))
 }
 
 /// How a line is marked.
@@ -253,7 +283,7 @@ impl Default for CodeBlockContentProps {
 }
 
 /// The code: `lines` in a monospaced grid that scrolls when it overflows
-/// (give it `.max_h(…)` to cap its height).
+/// (give it `.max_height(…)` to cap its height).
 #[must_use]
 pub fn code_block_content(
     p: CodeBlockProps,
@@ -261,13 +291,13 @@ pub fn code_block_content(
     lines: impl IntoIterator<Item = CodeBlockLine>,
 ) -> Div {
     let t = theme();
-    let pad = if p.sm() { 2.5 } else { 3.0 };
+    let pad = if p.sm() { 10.0 } else { 12.0 };
     let top = match (p.header, p.sm()) {
-        (true, true) => 1.5,
-        (true, false) => 2.0,
+        (true, true) => 6.0,
+        (true, false) => 8.0,
         (false, _) => pad,
     };
-    let bottom = if p.footer { 2.0 } else { pad };
+    let bottom = if p.footer { 8.0 } else { pad };
     let columns = if c.line_numbers {
         vec![Track::Auto, Track::Fr(1.0)]
     } else {
@@ -279,30 +309,46 @@ pub fn code_block_content(
     });
     div()
         .named("code-block-content")
-        .min_h(0.0)
-        .min_w(0.0)
-        .px(pad)
-        .pt(top)
-        .pb(bottom)
-        .font_mono()
-        .leading_relaxed()
+        .min_height(0.0)
+        .min_width(0.0)
+        .padding_x(pad)
+        .padding_top(top)
+        .padding_bottom(bottom)
+        .font_family(FontFamily::GEIST_MONO)
+        .line_height(LineHeight::Relative(1.625))
         // Code reads left to right in a right to left page (Vue's `dir="ltr"`).
-        .dir_ltr()
-        .text_start()
+        .direction(Direction::Ltr)
+        .text_align(TextAlign::Start)
         .focusable()
         // Vue's `scrollbar-thin` under macOS's overlay scrollbars shows no
         // thumb at rest; the fade marks the overflow (`scroll-fade-x`,
         // `data-wrap:scroll-fade-y`).
-        .scrollbar_none()
-        .when(c.wrap, |d| d.overflow_y_scroll().scroll_fade())
-        .when(!c.wrap, |d| d.overflow_scroll().scroll_fade_x())
+        .scrollbar_hidden(true)
+        .when(c.wrap, |d| {
+            d.overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .mask(ScrollFade {
+                    axis: Axis::Vertical,
+                    start: true,
+                    end: true,
+                    size: None,
+                })
+        })
+        .when(!c.wrap, |d| {
+            d.overflow(Overflow::Scroll).mask(ScrollFade {
+                axis: Axis::Horizontal,
+                start: true,
+                end: true,
+                size: None,
+            })
+        })
         .child(
             div()
                 .named("code-block-code")
-                .grid()
-                .grid_cols_tracks(columns)
-                .content_start()
-                .min_w(0.0)
+                .display(Display::Grid)
+                .grid_columns(columns)
+                .align_content(Justify::Start)
+                .min_width(0.0)
                 .children(cells),
         )
 }
@@ -310,7 +356,7 @@ pub fn code_block_content(
 /// A line's grid cells: its number (when numbered) and its text, each
 /// carrying the line's band so the band runs edge to edge (Vue's
 /// `-mx-3 px-3` line on a subgrid).
-fn line_cells(t: &Theme, pad: f32, wrap: bool, number: Option<usize>, line: CodeBlockLine) -> Vec<Div> {
+fn line_cells(t: &Colors, pad: f32, wrap: bool, number: Option<usize>, line: CodeBlockLine) -> Vec<Div> {
     let band = match line.variant {
         CodeBlockLineVariant::Default => None,
         CodeBlockLineVariant::Added | CodeBlockLineVariant::Highlighted => Some(t.muted),
@@ -321,10 +367,21 @@ fn line_cells(t: &Theme, pad: f32, wrap: bool, number: Option<usize>, line: Code
         CodeBlockLineVariant::Removed => Some(("\u{2212}", t.destructive)),
         CodeBlockLineVariant::Default | CodeBlockLineVariant::Highlighted => None,
     };
-    let cell = || div().relative().min_w(0.0).when_some(band, Styled::bg);
+    let cell = || {
+        div()
+            .position(Position::Relative)
+            .min_width(0.0)
+            .when_some(band, |d, c| d.background(c))
+    };
     let gutter = |d: Div| {
         d.when_some(sign, |d, (s, color)| {
-            d.child(text(s).absolute().top(0.0).left(1.0).text_color(color))
+            d.child(
+                text(s)
+                    .position(Position::Absolute)
+                    .top(0.0)
+                    .left(4.0)
+                    .text_color(color),
+            )
         })
     };
     // An empty line still holds a line's height.
@@ -335,22 +392,28 @@ fn line_cells(t: &Theme, pad: f32, wrap: bool, number: Option<usize>, line: Code
             .spans(line.tokens.into_iter().map(|tk| {
                 span(tk.content).when_some(tk.colors, |s, c| s.text_color(if dark { c.dark } else { c.light }))
             }))
-            .when(!wrap, Styled::whitespace_nowrap);
+            .when(!wrap, |e| e.nowrap(true));
     match number {
         // The number is Vue's `before:min-w-6 before:text-end`, the column gap
         // its `gap-x-3`: the minimum holds the number, not the band's padding.
         Some(n) => vec![
             gutter(
                 cell()
-                    .ml(-pad)
-                    .pl(pad)
-                    .pr(3.0)
+                    .margin_left(-pad)
+                    .padding_left(pad)
+                    .padding_right(12.0)
                     .text_color(t.muted_foreground)
-                    .child(div().flex().justify_end().min_w(6.0).child(text(n.to_string()))),
+                    .child(
+                        div()
+                            .display(Display::Flex)
+                            .justify_content(Justify::End)
+                            .min_width(24.0)
+                            .child(text(n.to_string())),
+                    ),
             ),
-            cell().mr(-pad).pr(pad).child(code),
+            cell().margin_right(-pad).padding_right(pad).child(code),
         ],
-        None => vec![gutter(cell().mx(-pad).px(pad).child(code))],
+        None => vec![gutter(cell().margin_x(-pad).padding_x(pad).child(code))],
     }
 }
 
@@ -359,13 +422,13 @@ fn line_cells(t: &Theme, pad: f32, wrap: bool, number: Option<usize>, line: Code
 pub fn code_block_footer(p: CodeBlockProps) -> Div {
     div()
         .named("code-block-footer")
-        .flex()
-        .items_center()
-        .shrink_0()
-        .min_w(0.0)
-        .gap(2.0)
-        .px(if p.sm() { 2.5 } else { 3.0 })
-        .pb(if p.sm() { 2.5 } else { 3.0 })
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .flex_shrink(0.0)
+        .min_width(0.0)
+        .gap(8.0)
+        .padding_x(if p.sm() { 10.0 } else { 12.0 })
+        .padding_bottom(if p.sm() { 10.0 } else { 12.0 })
         .text_color(theme().muted_foreground)
 }
 
@@ -382,7 +445,9 @@ pub struct CodeBlockCopyProps {
 /// once it has (its own state, as `CodeBlockCopyButton.vue`'s `useClipboard`).
 #[must_use]
 pub fn code_block_copy_button(value: impl Into<String>) -> Part<CodeBlockCopyProps> {
-    let root = button(ButtonVariant::Ghost, ButtonSize::IconXs).named("code-block-copy-button");
+    let root = button(ButtonVariant::Ghost, ButtonSize::IconXs)
+        .named("code-block-copy-button")
+        .into_div();
     Part::new(CodeBlockCopyProps { value: value.into() }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -405,7 +470,7 @@ pub fn code_block_copy_button(value: impl Into<String>) -> Part<CodeBlockCopyPro
                 let shown = if copied.get() { Icon::Check } else { Icon::Copy };
                 props
                     .with(|p| p.slot.0.clone())
-                    .child(icon(shown).size(3.0))
+                    .child(icon(shown).size(12.0))
                     .on_click(move |_| copy())
                     .into_element()
             }

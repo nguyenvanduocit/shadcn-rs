@@ -472,7 +472,7 @@ use gui::{RunOptions, Signal, div};
 use shadcn::*;
 
 fn main() {
-    provide_theme(Signal::new(Theme::light()));
+    install(Theme::default(), VEGA);
     let airplane = Signal::new(false);
     gui::run(
         "Settings",
@@ -549,15 +549,14 @@ ${section("README.md", "Checking it")}`;
     `<div class="swatch" data-mode="${mode}"><span class="swatch-chip" style="background:${value}"></span><code>${escape(value)}</code></div>`;
   const rows = docs.tokens.map((t) => `<tr><td><code>--${escape(t.name)}</code></td><td>${swatch(t.light, "light")}</td><td>${swatch(t.dark, "dark")}</td></tr>`).join("");
   const md = `Components read the theme's tokens, never a colour of their own: \`let t = theme();\` then \`.bg(t.primary)\`,
-\`.text_color(t.muted_foreground)\`, \`.border_color(t.border)\`. \`Theme::light()\` and \`Theme::dark()\` are shadcn's
-neutral base colour; \`provide_theme\` sets the one a window starts with, and setting its \`Signal\` switches every
-component at once.
+\`.text_color(t.muted_foreground)\`, \`.border_color(t.border)\`. \`Theme::default()\` is shadcn's neutral base
+colour, light; \`install(theme, VEGA)\` sets the theme and style a window starts with, and writing the scheme through
+\`use_theme()\` switches every component at once.
 
 \`\`\`rust
-let theme = Signal::new(Theme::light());
-provide_theme(theme.clone());
+install(Theme::default(), VEGA);
 // later, from a button:
-theme.set(Theme::dark());
+use_theme().update(|t| t.scheme = Scheme::Dark);
 \`\`\`
 
 ## Tokens`;

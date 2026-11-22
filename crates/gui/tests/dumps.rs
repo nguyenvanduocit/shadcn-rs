@@ -30,45 +30,59 @@ fn settings() -> impl FnMut() -> Element + 'static {
         let r = remember;
         let checked = remember.get();
         div()
-            .size_full()
-            .p(4.0)
+            .size(pct(100.0))
+            .padding(16.0)
             .child(
                 div()
-                    .flex()
-                    .flex_col()
-                    .gap(3.0)
-                    .w_px(320.0)
-                    .p(6.0)
-                    .border()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(12.0)
+                    .width(320.0)
+                    .padding(24.0)
+                    .border(1.0)
                     .border_color(Color::BLACK)
-                    .child(text("Account settings").text_xl().font_semibold())
-                    .child(text("Choose how the app greets you and what it keeps between visits.").text_sm())
+                    .child(
+                        text("Account settings")
+                            .text_size(20.0)
+                            .line_height(28.0)
+                            .font_weight(600),
+                    )
+                    .child(
+                        text("Choose how the app greets you and what it keeps between visits.")
+                            .text_size(14.0)
+                            .line_height(20.0),
+                    )
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .gap(1.5)
-                            .child(text("Display name").text_sm().font_medium())
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .gap(6.0)
+                            .child(text("Display name").text_size(14.0).line_height(20.0).font_weight(500))
                             .child(
                                 text_input(&name)
                                     .placeholder("Ada Lovelace")
                                     .aria_label("Display name")
-                                    .h(9.0)
-                                    .px(3.0)
-                                    .border(),
+                                    .height(36.0)
+                                    .padding_x(12.0)
+                                    .border(1.0),
                             ),
                     )
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .align_items(Align::Center)
+                            .gap(8.0)
                             .role(Role::CheckBox)
                             .aria_label("Remember me")
                             .aria_checked(checked)
                             .on_click(move |_| r.update(|v| *v = !*v))
-                            .child(div().size(4.0).border().when(checked, |d| d.bg(Color::BLACK)))
-                            .child(text("Remember me").text_sm()),
+                            .child(
+                                div()
+                                    .size(16.0)
+                                    .border(1.0)
+                                    .when(checked, |d| d.background(Color::BLACK)),
+                            )
+                            .child(text("Remember me").text_size(14.0).line_height(20.0)),
                     )
                     .child(
                         div()
@@ -77,31 +91,31 @@ fn settings() -> impl FnMut() -> Element + 'static {
                                 div()
                                     .role(Role::ListItem)
                                     .aria_pos_in_set(i, 3)
-                                    .py(1.0)
-                                    .child(text(label).text_sm())
+                                    .padding_y(4.0)
+                                    .child(text(label).text_size(14.0).line_height(20.0))
                             })),
                     )
                     .child(
                         div()
-                            .flex()
-                            .justify_end()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .justify_content(Justify::End)
+                            .gap(8.0)
                             .child(
                                 div()
                                     .role(Role::Button)
                                     .disabled(true)
-                                    .px(4.0)
-                                    .py(2.0)
-                                    .child(text("Reset").text_sm()),
+                                    .padding_x(16.0)
+                                    .padding_y(8.0)
+                                    .child(text("Reset").text_size(14.0).line_height(20.0)),
                             )
                             .child(
                                 div()
                                     .role(Role::Button)
                                     .on_click(|_| {})
-                                    .px(4.0)
-                                    .py(2.0)
-                                    .bg(Color::BLACK)
-                                    .child(text("Save").text_sm().text_color(Color::WHITE)),
+                                    .padding_x(16.0)
+                                    .padding_y(8.0)
+                                    .background(Color::BLACK)
+                                    .child(text("Save").text_size(14.0).line_height(20.0).text_color(Color::WHITE)),
                             ),
                     ),
             )

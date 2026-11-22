@@ -18,18 +18,93 @@ fn pick_corner(center_to_point: vec2<f32>, radii: vec4<f32>) -> f32 {
     return radii.z;
 }
 
-// Signed distance from `p` to a rounded rectangle, negative inside.
+// Signed distance from `p` to a rounded rectangle, negative inside. The
+// radii are CSS's used values (`shape::Shape::used`): the two on a side
+// never sum past it, but one may pass half of it when its neighbour is
+// small, so beyond the common case each corner is tested in its own square.
 fn rrect_sdf(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
     let half_size = rect.zw / 2.0;
     let center = rect.xy + half_size;
     let center_to_point = p - center;
-    let r = min(pick_corner(center_to_point, radii), min(half_size.x, half_size.y));
     let corner_to_point = abs(center_to_point) - half_size;
-    let q = corner_to_point + r;
-    if (r <= 0.0) {
-        return max(q.x, q.y);
+    let most = max(max(radii.x, radii.y), max(radii.z, radii.w));
+    if (most <= min(half_size.x, half_size.y)) {
+        // Every corner lies in its own quadrant: the quadrant's decides.
+        let r = pick_corner(center_to_point, radii);
+        let q = corner_to_point + r;
+        if (r <= 0.0) {
+            return max(q.x, q.y);
+        }
+        return length(max(vec2<f32>(0.0), q)) + min(0.0, max(q.x, q.y)) - r;
     }
-    return length(max(vec2<f32>(0.0), q)) + min(0.0, max(q.x, q.y)) - r;
+    return shape_sdf(p, rect, radii, 1.0);
+}
+
+// The curve exponent of CSS's `superellipse(k)`, `|k|` bounded by
+// `shape::CURVE_LIMIT` (6) as hit testing and paths bound it.
+fn curve_n(k: f32) -> f32 {
+    return exp2(min(abs(k), 6.0));
+}
+
+// Signed distance (approximate off the curve, exact on it) from a corner's
+// curve, `q` the point's distance into the box from the corner along each
+// axis, `r` its radius, `k` CSS's superellipse parameter (1 round, 2
+// squircle, 0 bevel, below 0 concave).
+fn corner_sdf(q: vec2<f32>, r: f32, k: f32) -> f32 {
+    if (k == 1.0) {
+        return length(vec2<f32>(r) - q) - r;
+    }
+    let n = curve_n(k);
+    if (k > 0.0) {
+        // Centred on the corner's inner point: outside where the norm passes 1.
+        let a = max((vec2<f32>(r) - q) / r, vec2<f32>(1e-6));
+        let g = max(pow(pow(a.x, n) + pow(a.y, n), 1.0 / n), 1e-6);
+        let grad = length(vec2<f32>(pow(a.x, n - 1.0), pow(a.y, n - 1.0))) / pow(g, n - 1.0);
+        return r * (g - 1.0) / max(grad, 1e-6);
+    }
+    // Concave: centred on the corner itself, inside where the norm passes 1.
+    let a = max(q / r, vec2<f32>(1e-6));
+    let g = max(pow(pow(a.x, n) + pow(a.y, n), 1.0 / n), 1e-6);
+    let grad = length(vec2<f32>(pow(a.x, n - 1.0), pow(a.y, n - 1.0))) / pow(g, n - 1.0);
+    return r * (1.0 - g) / max(grad, 1e-6);
+}
+
+// Signed distance from `p` to a box whose corners of used radii `radii`
+// curve as `superellipse(k)`: the box's own, cut by each corner's curve
+// within that corner's square.
+fn shape_sdf(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, k: f32) -> f32 {
+    let half_size = rect.zw / 2.0;
+    let d = abs(p - (rect.xy + half_size)) - half_size;
+    var sdf = length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0);
+    let lo = rect.xy;
+    let hi = rect.xy + rect.zw;
+    // Each corner: the point's distance into the box from it.
+    let qs = array<vec2<f32>, 4>(
+        p - lo,
+        vec2<f32>(hi.x - p.x, p.y - lo.y),
+        hi - p,
+        vec2<f32>(p.x - lo.x, hi.y - p.y),
+    );
+    let rs = array<f32, 4>(radii.x, radii.y, radii.z, radii.w);
+    for (var i = 0u; i < 4u; i = i + 1u) {
+        let r = rs[i];
+        let q = qs[i];
+        if (r > 0.0 && q.x < r && q.y < r) {
+            sdf = max(sdf, corner_sdf(q, r, k));
+        }
+    }
+    return sdf;
+}
+
+// How much of the pixel centred on `p` a box with corners `superellipse(k)` covers.
+fn shape_cov(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, k: f32) -> f32 {
+    if (k == 1.0) {
+        return rrect_cov(p, rect, radii);
+    }
+    if (rect.z <= 0.0 || rect.w <= 0.0) {
+        return 0.0;
+    }
+    return saturate(0.5 - shape_sdf(p, rect, radii, k));
 }
 
 // How much of the pixel centred on `p` a rounded rectangle covers.
@@ -46,6 +121,26 @@ fn rrect_cov(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>) -> f32 {
         return size.x * size.y;
     }
     return saturate(0.5 - rrect_sdf(p, rect, radii));
+}
+
+// Signed distance from `p` to a box of corners `superellipse(k)` (any `k`).
+fn curved_sdf(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, k: f32) -> f32 {
+    if (k == 1.0) {
+        return rrect_sdf(p, rect, radii);
+    }
+    return shape_sdf(p, rect, radii, k);
+}
+
+// How much of the pixel at window point `p` a path-and-curve clip entry
+// keeps: four vec4s, its rectangle, radii, the map from the window into
+// its space (a, b, c, d) and (e, f, its scale, its corners' curve).
+fn clip_entry_cov(rect: vec4<f32>, radii: vec4<f32>, m: vec4<f32>, t: vec4<f32>, p: vec2<f32>) -> f32 {
+    let q = vec2<f32>(m.x * p.x + m.z * p.y + t.x, m.y * p.x + m.w * p.y + t.y);
+    if (t.z == 1.0 && m.y == 0.0 && m.z == 0.0) {
+        return shape_cov(q, rect, radii, t.w);
+    }
+    // In a scaled or turned space: by distance, one device pixel wide.
+    return saturate(0.5 - curved_sdf(q, rect, radii, t.w) * t.z);
 }
 
 fn premul(c: vec4<f32>) -> vec4<f32> {

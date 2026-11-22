@@ -4,6 +4,7 @@
 use gui::prelude::*;
 use gui::{Div, Icon, div, icon, text};
 
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 /// The `<nav>`.
@@ -19,17 +20,23 @@ pub fn breadcrumb_list() -> Div {
     div()
         .named("breadcrumb-list")
         .text_color(t.muted_foreground)
-        .flex()
-        .flex_wrap()
-        .items_center()
-        .gap(2.5)
-        .text_sm()
+        .display(Display::Flex)
+        .flex_wrap(true)
+        .align_items(Align::Center)
+        .gap(10.0)
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 /// An `<li>`: holds a link, the page, or a menu.
 #[must_use]
 pub fn breadcrumb_item() -> Div {
-    div().named("breadcrumb-item").inline_flex().items_center().gap(1.5)
+    div()
+        .named("breadcrumb-item")
+        .display(Display::Flex)
+        .inline(true)
+        .align_items(Align::Center)
+        .gap(6.0)
 }
 
 /// A link to an ancestor page; add where it goes with `.on_click`.
@@ -38,10 +45,10 @@ pub fn breadcrumb_link(label: impl Into<String>) -> Div {
     let t = theme();
     div()
         .named("breadcrumb-link")
-        .transition_colors()
-        .cursor_pointer()
+        .transition(Properties::COLORS)
+        .cursor(Cursor::Pointer)
         .focusable()
-        .hover(move |s| s.text_color(t.foreground))
+        .with_interaction(|d, i| d.text_color_while(move || i.hovered(), t.foreground))
         .child(text(label))
 }
 
@@ -52,7 +59,7 @@ pub fn breadcrumb_page(label: impl Into<String>) -> Div {
     div()
         .named("breadcrumb-page")
         .text_color(t.foreground)
-        .font_normal()
+        .font_weight(400)
         .child(text(label))
 }
 
@@ -65,7 +72,10 @@ pub fn breadcrumb_separator() -> Div {
 /// A separator drawn as `glyph` (the slot `<BreadcrumbSeparator><SlashIcon /></…>` fills).
 #[must_use]
 pub fn breadcrumb_separator_of(glyph: Icon) -> Div {
-    div().named("breadcrumb-separator").flex().child(icon(glyph).size(3.5))
+    div()
+        .named("breadcrumb-separator")
+        .display(Display::Flex)
+        .child(icon(glyph).size(14.0))
 }
 
 /// Collapsed items, shown as `…`.
@@ -73,9 +83,9 @@ pub fn breadcrumb_separator_of(glyph: Icon) -> Div {
 pub fn breadcrumb_ellipsis() -> Div {
     div()
         .named("breadcrumb-ellipsis")
-        .flex()
-        .size(9.0)
-        .items_center()
-        .justify_center()
+        .display(Display::Flex)
+        .size(36.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
         .child(icon(Icon::Ellipsis))
 }

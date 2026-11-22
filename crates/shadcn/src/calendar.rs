@@ -21,6 +21,7 @@ use gui::{
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::calendar_locale::{CalendarLocale, MonthWidth, WeekdayFormat};
 use crate::calendar_system::CalendarSystem;
+use crate::focus::StateLook;
 use crate::native_select::{NativeSelectEntry, native_select, native_select_option};
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
@@ -226,7 +227,7 @@ pub struct CalendarOptions {
     pub min: Option<CalendarDate>,
     pub max: Option<CalendarDate>,
     pub weekday_format: WeekdayFormat,
-    /// A day trigger's side, in spacing units (`size-8`).
+    /// A day trigger's side, in pixels (`size-8`).
     pub cell_size: f32,
     pub disable_outside_view: bool,
     /// `dir="rtl"`: rows run right to left, the arrows and arrow keys mirrored.
@@ -245,7 +246,7 @@ impl Default for CalendarOptions {
             min: None,
             max: None,
             weekday_format: WeekdayFormat::Narrow,
-            cell_size: 8.0,
+            cell_size: 32.0,
             disable_outside_view: false,
             rtl: false,
             system: CalendarSystem::Gregorian,
@@ -454,9 +455,9 @@ impl CalendarView {
     /// A row laid out in the locale's direction.
     pub(crate) fn row(&self) -> Div {
         if self.rtl() {
-            div().flex_row_reverse()
+            div().display(Display::Flex).flex_direction(FlexDirection::RowReverse)
         } else {
-            div().flex_row()
+            div().display(Display::Flex).flex_direction(FlexDirection::Row)
         }
     }
 
@@ -464,8 +465,8 @@ impl CalendarView {
     pub(crate) fn months_row(&self, grid: impl Fn(CalendarDate) -> Div) -> Div {
         let view = *self;
         self.row()
-            .mt(4.0)
-            .gap_x(4.0)
+            .margin_top(16.0)
+            .column_gap(16.0)
             .on_key_down(move |e| view.on_key(e))
             .children(self.shown().into_iter().map(grid))
     }
@@ -493,20 +494,26 @@ pub(crate) fn day_trigger(
     let outside = !view.in_month(day, month);
     let disabled = view.is_disabled(day, month);
     let today = view.opt().today;
-    button(ButtonVariant::Ghost, ButtonSize::IconSm)
-        .named("calendar-cell-trigger")
+    let cell = button(ButtonVariant::Ghost, ButtonSize::IconSm);
+    let i = cell.interaction();
+    let lit = if t.dark { t.accent.opacity(0.5) } else { t.accent };
+    cell.named("calendar-cell-trigger")
         .size(view.opt().cell_size)
-        .p(0.0)
-        .font_normal()
-        .cursor_default()
+        .padding(0.0)
+        .font_weight(400)
+        .cursor(Cursor::Default)
         .when(day == today && selection == DaySelection::Unselected, |b| {
-            b.bg(t.accent).text_color(t.accent_foreground)
+            b.background(t.accent).text_color(t.accent_foreground)
         })
         .when(outside, |b| b.text_color(t.muted_foreground))
+        // A picked day keeps its fill under the pointer; any other takes
+        // the ghost button's hover over what it shows.
         .when(selection == DaySelection::Picked, |b| {
-            b.bg(t.primary)
-                .text_color(t.primary_foreground)
-                .hover(move |s| s.bg(t.primary).text_color(t.primary_foreground))
+            b.background(t.primary).text_color(t.primary_foreground)
+        })
+        .when(selection != DaySelection::Picked, |b| {
+            b.background_while(move || i.hovered(), lit)
+                .text_color_while(move || i.hovered(), t.accent_foreground)
         })
         .when(disabled, |b| b.text_color(t.muted_foreground).disabled(true))
         .when(!outside && day == view.focused.get(), |b| b.track_focus(view.focus))
@@ -515,6 +522,7 @@ pub(crate) fn day_trigger(
             view.focus_day(day, false);
         })
         .child(view.day_label(day))
+        .into_div()
 }
 
 /// The prev and next arrows both calendars use: an outline icon button,
@@ -522,23 +530,26 @@ pub(crate) fn day_trigger(
 pub(crate) fn page_button(view: CalendarView, step: i64) -> Div {
     let t = theme();
     let back = (step < 0) != view.rtl();
-    button(ButtonVariant::Outline, ButtonSize::Default)
+    let arrow = button(ButtonVariant::Outline, ButtonSize::Default);
+    let i = arrow.interaction();
+    arrow
         .named(if step < 0 {
             "calendar-prev-button"
         } else {
             "calendar-next-button"
         })
-        .size(7.0)
-        .p(0.0)
-        .when(!t.dark, |b| b.bg(gui::Color::TRANSPARENT))
-        .opacity(0.5)
-        .hover(move |s| {
-            let bg = if t.dark { t.input.opacity(0.5) } else { t.accent };
-            s.bg(bg).text_color(t.accent_foreground).opacity(1.0)
+        .size(28.0)
+        .padding(0.0)
+        // Over the outline button's own hover (its fill in dark, its text).
+        .when(!t.dark, |b| {
+            b.background(gui::Color::TRANSPARENT)
+                .background_while(move || i.hovered(), t.accent)
         })
+        .opacity(move || if i.hovered() { 1.0 } else { 0.5 })
         .disabled(!view.can_page(step))
         .on_click(move |_| view.page(step))
         .child(icon(if back { Icon::ChevronLeft } else { Icon::ChevronRight }))
+        .into_div()
 }
 
 /// One month's grid: weekday names over its weeks; `cell` gives each day's
@@ -557,14 +568,15 @@ pub(crate) fn month_grid(
     });
     div()
         .named("calendar-grid")
-        .flex_col()
-        .w_full()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
         .child(view.row().named("calendar-grid-row").children(names.map(&head_cell)))
         .children(calendar_weeks(o.system, first, month).into_iter().map(|week| {
             view.row()
                 .named("calendar-grid-row")
-                .mt(2.0)
-                .w_full()
+                .margin_top(8.0)
+                .width(pct(100.0))
                 .children(week.into_iter().enumerate().map(|(col, day)| cell(day, col)))
         }))
 }
@@ -619,7 +631,7 @@ pub fn calendar() -> Part<CalendarProps> {
         heading: None,
         initial_focus: false,
     };
-    Part::new(props, div().named("calendar").p(3.0), |p| {
+    Part::new(props, div().named("calendar").padding(12.0), |p| {
         component(p, |cx| {
             let props = cx.props();
             let value = use_model(props, |p| &p.props.value);
@@ -659,9 +671,9 @@ fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) 
         CalendarLayout::Heading => calendar_heading(view.heading()).into_element(),
         CalendarLayout::MonthAndYear => view
             .row()
-            .items_center()
-            .justify_center()
-            .gap(1.0)
+            .align_items(Align::Center)
+            .justify_content(Justify::Center)
+            .gap(4.0)
             .child(calendar_month_select())
             .child(calendar_year_select())
             .into_element(),
@@ -669,9 +681,9 @@ fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) 
             let o = view.opt();
             let year = o.locale.year(o.system, view.month.get());
             view.row()
-                .items_center()
-                .justify_center()
-                .gap(1.0)
+                .align_items(Align::Center)
+                .justify_content(Justify::Center)
+                .gap(4.0)
                 .child(calendar_month_select())
                 .child(text(year))
                 .into_element()
@@ -680,24 +692,24 @@ fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) 
             let o = view.opt();
             let month = o.locale.month(o.system, view.month.get(), MonthWidth::Short);
             view.row()
-                .items_center()
-                .justify_center()
-                .gap(1.0)
+                .align_items(Align::Center)
+                .justify_content(Justify::Center)
+                .gap(4.0)
                 .child(text(month))
                 .child(calendar_year_select())
                 .into_element()
         }
     });
     root.child(
-        calendar_header().pt(0.0).child(heading).child(
+        calendar_header().padding_top(0.0).child(heading).child(
             view.row()
-                .items_center()
-                .gap(1.0)
-                .absolute()
+                .align_items(Align::Center)
+                .gap(4.0)
+                .position(Position::Absolute)
                 .top(0.0)
                 .left(0.0)
                 .right(0.0)
-                .justify_between()
+                .justify_content(Justify::Between)
                 .pass_through()
                 .child(page_button(view, -1))
                 .child(page_button(view, 1)),
@@ -740,7 +752,7 @@ impl<P: HasOptions> Part<P> {
         self.with_props(|p| p.options_mut().weekday_format = format)
     }
 
-    /// A day trigger's side in spacing units (`**:data-[slot=calendar-cell-trigger]:size-12!`).
+    /// A day trigger's side in pixels (`**:data-[slot=calendar-cell-trigger]:size-12!`).
     #[must_use]
     pub fn cell_size(self, size: f32) -> Self {
         self.with_props(|p| p.options_mut().cell_size = size)
@@ -852,18 +864,22 @@ fn calendar_day(day: CalendarDate, month: CalendarDate) -> Element {
 pub fn calendar_header() -> Div {
     div()
         .named("calendar-header")
-        .flex()
-        .justify_center()
-        .pt(1.0)
-        .relative()
-        .items_center()
-        .w_full()
-        .px(8.0)
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .padding_top(4.0)
+        .position(Position::Relative)
+        .align_items(Align::Center)
+        .width(pct(100.0))
+        .padding_x(32.0)
 }
 
 #[must_use]
 pub fn calendar_heading(heading: impl Into<String>) -> impl IntoElement {
-    text(heading).named("calendar-heading").text_sm().font_medium()
+    text(heading)
+        .named("calendar-heading")
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
 }
 
 /// The shown month's select, its months by short name: a part of the
@@ -959,16 +975,17 @@ fn heading_select(
 ) -> Div {
     let rtl = view.rtl();
     div()
-        .relative()
+        .position(Position::Relative)
         .child(
             div()
-                .absolute()
+                .position(Position::Absolute)
                 .inset(0.0)
-                .flex()
-                .items_center()
-                .when(rtl, |d| d.justify_end())
-                .text_sm()
-                .pl(2.0)
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .when(rtl, |d| d.justify_content(Justify::End))
+                .text_size(14.0)
+                .line_height(20.0)
+                .padding_left(8.0)
                 .pass_through()
                 .child(shown.to_owned()),
         )
@@ -979,15 +996,16 @@ fn heading_select(
                 .focus(focus)
                 .class(move |field, chevron| {
                     let field = field
-                        .text_xs()
-                        .h(8.0)
-                        .pr(6.0)
-                        .pl(2.0)
+                        .text_size(12.0)
+                        .line_height(16.0)
+                        .height(32.0)
+                        .padding_right(24.0)
+                        .padding_left(8.0)
                         .text_color(gui::Color::TRANSPARENT);
                     let chevron = if rtl {
-                        chevron.right_len(Length::Auto).left(3.5)
+                        chevron.right(Length::Auto).left(14.0)
                     } else {
-                        chevron.right(1.0)
+                        chevron.right(4.0)
                     };
                     (field, chevron)
                 }),
@@ -1000,12 +1018,13 @@ pub fn calendar_head_cell(name: &'static str) -> Div {
     let t = theme();
     div()
         .named("calendar-head-cell")
-        .flex_1()
-        .flex()
-        .justify_center()
-        .rounded_md()
-        .font_normal()
-        .text_size(12.8, 19.2)
+        .flex(Flex::grow(1.0))
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .radius(8.0)
+        .font_weight(400)
+        .text_size(12.8)
+        .line_height(19.2)
         .text_color(t.muted_foreground)
         .child(name)
 }
@@ -1016,13 +1035,14 @@ pub fn calendar_cell(selected: bool) -> Div {
     let t = theme();
     div()
         .named("calendar-cell")
-        .relative()
-        .p(0.0)
-        .flex()
-        .justify_center()
-        .text_sm()
-        .flex_1()
-        .when(selected, |d| d.rounded_md().bg(t.accent))
+        .position(Position::Relative)
+        .padding(0.0)
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .text_size(14.0)
+        .line_height(20.0)
+        .flex(Flex::grow(1.0))
+        .when(selected, |d| d.radius(8.0).background(t.accent))
 }
 
 #[cfg(test)]

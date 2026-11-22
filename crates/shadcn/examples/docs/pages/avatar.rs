@@ -17,21 +17,23 @@ pub fn render() -> Render {
         page(
             "Avatar",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "AvatarDemo.vue",
                     div()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .items_center()
-                        .gap(12.0)
+                        .display(Display::Flex)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Row)
+                        .flex_wrap(true)
+                        .align_items(Align::Center)
+                        .gap(48.0)
                         .child(person(shadcn.as_ref(), "CN"))
                         .child(person(evilrabbit.as_ref(), "ER"))
                         // `-space-x-2`, and each avatar's `ring-2 ring-background grayscale`.
                         .child(
-                            div().flex().children(
+                            div().display(Display::Flex).children(
                                 [
                                     (shadcn.as_ref(), "CN"),
                                     (leerob.as_ref(), "LR"),
@@ -41,9 +43,9 @@ pub fn render() -> Render {
                                 .enumerate()
                                 .map(|(i, (image, initials))| {
                                     person(image, initials)
-                                        .ring(2.0, t.background)
-                                        .grayscale()
-                                        .when(i > 0, |d| d.ml(-2.0))
+                                        .ring(Ring::new(2.0, t.background))
+                                        .filters(Filter::Grayscale(1.0))
+                                        .when(i > 0, |d| d.margin_left(-8.0))
                                 }),
                             ),
                         ),
@@ -51,11 +53,11 @@ pub fn render() -> Render {
                 .child(section(
                     "Fallback, when there is no picture",
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(16.0)
                         .child(person(None, "CN"))
-                        .child(person(None, "ER").size(12.0).text_lg()),
+                        .child(person(None, "ER").size(48.0).text_size(18.0).line_height(28.0)),
                 )),
         )
     })

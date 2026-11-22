@@ -6,7 +6,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, Model, ScenarioError, Side, SideAlign, Signal, TextField, div, icon, span, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Side, SideAlign, Signal, TextField, div, icon, text};
 use shadcn::{
     BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize,
     MarkerVariant, MenuItem, MessageProps, MessageScrollerDirection, MessageScrollerProps, TraceStatus, bubble,
@@ -108,9 +108,9 @@ impl Checkpoints {
                         MarkerVariant::Separator,
                         Element::Empty,
                         marker_content(MarkerVariant::Separator)
-                            .flex()
-                            .items_center()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .align_items(Align::Center)
+                            .gap(8.0)
                             .child(label)
                             .when(i < last, |c| {
                                 c.child(
@@ -128,8 +128,8 @@ impl Checkpoints {
         thread().children(rows).when(!self.script.busy() && next, |t| {
             t.child(
                 button(ButtonVariant::Outline, ButtonSize::Sm)
-                    .mt_auto()
-                    .self_start()
+                    .margin_top(Length::Auto)
+                    .align_self(Align::Start)
                     .child("Continue")
                     .on_click(move |_| me.send()),
             )
@@ -291,7 +291,7 @@ impl Suggestions {
         let chips = SUGGESTIONS.iter().map(|(prompt, _)| {
             let me = self.clone();
             button(ButtonVariant::Outline, ButtonSize::Sm)
-                .shrink_0()
+                .flex_shrink(0.0)
                 .child(*prompt)
                 .on_click(move |_| me.send(prompt))
         });
@@ -300,7 +300,7 @@ impl Suggestions {
         let composer = input_group(
             input_group_textarea(&self.draft)
                 .placeholder("Ask the agent to change your code...")
-                .p(3.0)
+                .padding(12.0)
                 .on_submit(move || {
                     if !enter.1.is_empty() {
                         enter.0.send(&enter.1);
@@ -311,13 +311,13 @@ impl Suggestions {
             input_group_addon(InputGroupAlign::BlockEnd)
                 .button(
                     input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm)
-                        .rounded_full()
+                        .radius(9999.0)
                         .child(icon(Icon::Plus)),
                 )
                 .button(
                     input_group_button(ButtonVariant::Default, InputGroupButtonSize::IconSm)
-                        .ml_auto()
-                        .rounded_full()
+                        .margin_left(Length::Auto)
+                        .radius(9999.0)
                         .disabled(!can_send)
                         .child(icon(Icon::ArrowUp))
                         .on_click(move |_| me.send(typed.trim())),
@@ -325,32 +325,42 @@ impl Suggestions {
         );
         let p = MessageProps::default();
         div()
-            .mx_auto()
-            .flex_col()
-            .w_full()
-            .max_w(128.0)
-            .gap(6.0)
-            .py(6.0)
-            .text_sm()
+            .margin_x(Length::Auto)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(pct(100.0))
+            .max_width(512.0)
+            .gap(24.0)
+            .padding_y(24.0)
+            .text_size(14.0)
+            .line_height(20.0)
             .when_some(self.turn.get(), |d, (prompt, reply)| {
                 d.child(
                     div()
-                        .flex_col()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
                         .child(user_turn(&prompt))
                         .child(message(p).child(message_content(p).child(text(reply)))),
                 )
             })
             .child(
                 div()
-                    .flex_col()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(8.0)
                     .child(
                         div()
-                            .flex()
-                            .scroll_fade_x()
-                            .gap(2.0)
-                            .overflow_x_scroll()
+                            .display(Display::Flex)
+                            .mask(ScrollFade {
+                                axis: Axis::Horizontal,
+                                start: true,
+                                end: true,
+                                size: None,
+                            })
+                            .gap(8.0)
+                            .overflow_x(Overflow::Scroll)
+                            .overflow_y(Overflow::Hidden)
                             .children(chips),
                     )
                     .child(composer),
@@ -358,34 +368,82 @@ impl Suggestions {
     }
 }
 
-/// A citation inside a paragraph: Vue's `<Button variant="secondary"
-/// size="xs">` set inline, as a span with the button's look. A span takes
-/// clicks but not hover, so it does not open the source's hover card (its
-/// title and summary): only the source's host shows.
-fn citation(host: &'static str) -> gui::Span {
+/// A source a citation points to.
+struct Source {
+    host: &'static str,
+    title: &'static str,
+    description: &'static str,
+}
+
+const STREAMING: Source = Source {
+    host: "nextjs.org",
+    title: "Linking and Navigating",
+    description: "How the App Router streams a route to the browser.",
+};
+const SUSPENSE: Source = Source {
+    host: "react.dev",
+    title: "<Suspense>",
+    description: "Display a fallback until its children have finished loading.",
+};
+const SERVER_COMPONENTS: Source = Source {
+    host: "react.dev",
+    title: "Server Components",
+    description: "Components that render ahead of time, on the server.",
+};
+const LOADING: Source = Source {
+    host: "nextjs.org",
+    title: "loading.js",
+    description: "Show an instant loading state for a route segment.",
+};
+const CHUNKED: Source = Source {
+    host: "developer.mozilla.org",
+    title: "Transfer-Encoding",
+    description: "Send a response as a series of chunks.",
+};
+
+/// A citation inside a paragraph: a secondary `xs` button set in the line
+/// as an atomic inline (`gui::Text::child`), on its baseline, opening a
+/// hover card with the source's title and summary.
+fn citation(source: &Source) -> Element {
     let t = theme();
-    span(host)
-        .text_xs()
-        .font_medium()
-        .bg(t.secondary)
-        .text_color(t.secondary_foreground)
-        .rounded_md()
-        .px(2.0)
-        .py(1.0)
+    hover_card()
+        .open_delay(Duration::from_millis(10))
+        .close_delay(Duration::from_millis(100))
+        .child(hover_card_trigger(
+            button(ButtonVariant::Secondary, ButtonSize::Xs).child(source.host),
+        ))
+        .child(
+            hover_card_content()
+                .width(256.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(4.0)
+                .child(text(source.title).font_weight(500))
+                .child(text(source.description).text_color(t.muted_foreground))
+                .child(
+                    text(source.host)
+                        .text_size(12.0)
+                        .line_height(16.0)
+                        .text_color(t.muted_foreground),
+                ),
+        )
+        .into_element()
 }
 
 fn citations() -> Div {
     div()
-        .mx_auto()
-        .flex_col()
-        .max_w(96.0)
-        .gap(3.0)
-        .py(6.0)
-        .text_sm()
-        .leading_relaxed()
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .max_width(384.0)
+        .gap(12.0)
+        .padding_y(24.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .line_height(LineHeight::Relative(1.625))
         .child(
             text("Next.js streams a route in chunks, so the page shows up before every request finishes. ")
-                .span(citation("nextjs.org")),
+                .child(citation(&STREAMING)),
         )
         .child(
             text(
@@ -393,15 +451,15 @@ fn citations() -> Div {
                  data resolves, the finished HTML streams into the same response and replaces the fallback, with no \
                  extra request from the browser. ",
             )
-            .span(citation("react.dev"))
+            .child(citation(&SUSPENSE))
             .span(" Server Components help here, because their code never ships to the browser. ")
-            .span(citation("react.dev")),
+            .child(citation(&SERVER_COMPONENTS)),
         )
         .child(
             text("A loading.tsx file does the same for a whole route segment. ")
-                .span(citation("nextjs.org"))
+                .child(citation(&LOADING))
                 .span(" It all runs over chunked transfer encoding, so there is nothing extra to set up. ")
-                .span(citation("developer.mozilla.org")),
+                .child(citation(&CHUNKED)),
         )
 }
 
@@ -425,48 +483,57 @@ fn context() -> Div {
     let used: u32 = ROWS.iter().map(|(_, v)| v).sum();
     let percent = (used.saturating_mul(100).saturating_add(LIMIT / 2)) / LIMIT;
     let t = theme();
-    div().flex().justify_center().py(12.0).child(
-        hover_card()
-            // The demo's delays: open almost at once, close soon after.
-            .open_delay(Duration::from_millis(10))
-            .close_delay(Duration::from_millis(100))
-            .child(hover_card_trigger(
-                button(ButtonVariant::Outline, ButtonSize::Sm).child(format!("{percent}% context")),
-            ))
-            .child(
-                hover_card_content()
-                    .w(64.0)
-                    .flex_col()
-                    .gap(3.0)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(3.0)
-                            .text_sm()
-                            .child(text("Context").font_medium())
-                            .child(
-                                text(format!("{} / {}", tokens(used), tokens(LIMIT))).text_color(t.muted_foreground),
-                            ),
-                    )
-                    .child(progress(f32::from(u16::try_from(percent).unwrap_or(100))))
-                    .child(
-                        div()
-                            .flex_col()
-                            .gap(1.0)
-                            .text_sm()
-                            .children(ROWS.iter().map(|(label, value)| {
-                                div()
-                                    .flex()
-                                    .justify_between()
-                                    .gap(3.0)
-                                    .child(text(*label).text_color(t.muted_foreground))
-                                    .child(text(tokens(*value)))
-                            })),
-                    ),
-            ),
-    )
+    div()
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .padding_y(48.0)
+        .child(
+            hover_card()
+                // The demo's delays: open almost at once, close soon after.
+                .open_delay(Duration::from_millis(10))
+                .close_delay(Duration::from_millis(100))
+                .child(hover_card_trigger(
+                    button(ButtonVariant::Outline, ButtonSize::Sm).child(format!("{percent}% context")),
+                ))
+                .child(
+                    hover_card_content()
+                        .width(256.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(12.0)
+                        .child(
+                            div()
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .justify_content(Justify::Between)
+                                .gap(12.0)
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .child(text("Context").font_weight(500))
+                                .child(
+                                    text(format!("{} / {}", tokens(used), tokens(LIMIT)))
+                                        .text_color(t.muted_foreground),
+                                ),
+                        )
+                        .child(progress(f32::from(u16::try_from(percent).unwrap_or(100))))
+                        .child(
+                            div()
+                                .display(Display::Flex)
+                                .flex_direction(FlexDirection::Column)
+                                .gap(4.0)
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .children(ROWS.iter().map(|(label, value)| {
+                                    div()
+                                        .display(Display::Flex)
+                                        .justify_content(Justify::Between)
+                                        .gap(12.0)
+                                        .child(text(*label).text_color(t.muted_foreground))
+                                        .child(text(tokens(*value)))
+                                })),
+                        ),
+                ),
+        )
 }
 
 pub fn render() -> Render {
@@ -478,8 +545,9 @@ pub fn render() -> Render {
         page(
             "Chat",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("ChatDemo.vue", agent.view()))
                 .child(demo("CheckpointDemo.vue", checkpoints.view()))
                 .child(demo("SourcesDemo.vue", sources.view()))
@@ -883,7 +951,7 @@ impl Agent {
         let p = MessageProps::default();
         message(p).child(
             message_content(p)
-                .gap(3.0)
+                .gap(12.0)
                 .when(!steps.is_empty(), |c| c.child(trace().children(steps)))
                 .when(!words.is_empty(), |c| c.child(markdown(&words, 14.0))),
         )
@@ -897,7 +965,7 @@ impl Agent {
         let (reset, send) = (self.clone(), self.clone());
         let last = turns.len().saturating_sub(1);
         let body = if turns.is_empty() {
-            empty().h_full().child(
+            empty().height(pct(100.0)).child(
                 empty_header()
                     .child(empty_media_icon(Icon::MessageCircleDashed))
                     .child(empty_title("What should we build?"))
@@ -914,8 +982,8 @@ impl Agent {
                         |turn: &Turn| (turn.id.as_str(), turn.user),
                         move |i, turn| me.turn(turn, busy && i == last),
                     )
-                    .gap(6.0)
-                    .viewport(|v| v.px(8.0)),
+                    .gap(24.0)
+                    .viewport(|v| v.padding_x(32.0)),
                 )
                 .child(message_scroller_button(MessageScrollerDirection::End))
         };
@@ -929,7 +997,7 @@ impl Agent {
         let context = dropdown_menu_content()
             .side(Side::Top)
             .align(SideAlign::Start)
-            .w(44.0)
+            .width(176.0)
             .child(attach(Icon::Paperclip, "Add Photos & Files"))
             .child(dropdown_menu_separator())
             .child(attach(Icon::Telescope, "Deep Research"))
@@ -937,7 +1005,7 @@ impl Agent {
         let composer = input_group(
             input_group_textarea(&self.draft)
                 .placeholder("Ask the agent...")
-                .min_h(14.0)
+                .min_height(56.0)
                 .on_submit({
                     let send = send.clone();
                     move || send.submit()
@@ -945,7 +1013,7 @@ impl Agent {
         )
         .addon(
             input_group_addon(InputGroupAlign::BlockEnd)
-                .pt(1.0)
+                .padding_top(4.0)
                 .button(
                     dropdown_menu()
                         .child(dropdown_menu_trigger(
@@ -956,46 +1024,64 @@ impl Agent {
                 )
                 .button(
                     input_group_button(ButtonVariant::Default, InputGroupButtonSize::IconSm)
-                        .ml_auto()
+                        .margin_left(Length::Auto)
                         .disabled(!can_send)
                         .child(icon(Icon::ArrowUp))
                         .on_click(move |_| send.submit()),
                 ),
         );
-        div().relative().flex_col().w_full().gap(4.0).child(
-            div()
-                .flex_col()
-                .h(200.0)
-                .w_full()
-                .gap(4.0)
-                .child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .justify_between()
-                        .gap(4.0)
-                        .p(8.0)
-                        .pb(4.0)
-                        .child(
-                            div().flex_col().gap(1.0).child(text("New Thread").font_medium()).child(
-                                text("Ask the agent to change your code.")
-                                    .text_sm()
-                                    .text_color(t.muted_foreground),
+        div()
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(pct(100.0))
+            .gap(16.0)
+            .child(
+                div()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .height(800.0)
+                    .width(pct(100.0))
+                    .gap(16.0)
+                    .child(
+                        div()
+                            .display(Display::Flex)
+                            .align_items(Align::Start)
+                            .justify_content(Justify::Between)
+                            .gap(16.0)
+                            .padding(32.0)
+                            .padding_bottom(16.0)
+                            .child(
+                                div()
+                                    .display(Display::Flex)
+                                    .flex_direction(FlexDirection::Column)
+                                    .gap(4.0)
+                                    .child(text("New Thread").font_weight(500))
+                                    .child(
+                                        text("Ask the agent to change your code.")
+                                            .text_size(14.0)
+                                            .line_height(20.0)
+                                            .text_color(t.muted_foreground),
+                                    ),
+                            )
+                            .child(
+                                tooltip()
+                                    .child(tooltip_trigger(
+                                        button(ButtonVariant::Outline, ButtonSize::Icon)
+                                            .disabled(busy)
+                                            .child(icon(Icon::RotateCw))
+                                            .on_click(move |_| reset.reset()),
+                                    ))
+                                    .child(tooltip_content().child(text("Reset"))),
                             ),
-                        )
-                        .child(
-                            tooltip()
-                                .child(tooltip_trigger(
-                                    button(ButtonVariant::Outline, ButtonSize::Icon)
-                                        .disabled(busy)
-                                        .child(icon(Icon::RotateCw))
-                                        .on_click(move |_| reset.reset()),
-                                ))
-                                .child(tooltip_content().child(text("Reset"))),
-                        ),
-                )
-                .child(div().min_h(0.0).flex_1().child(body))
-                .child(div().p(8.0).pt(0.0).child(div().w_full().child(composer))),
-        )
+                    )
+                    .child(div().min_height(0.0).flex(Flex::grow(1.0)).child(body))
+                    .child(
+                        div()
+                            .padding(32.0)
+                            .padding_top(0.0)
+                            .child(div().width(pct(100.0)).child(composer)),
+                    ),
+            )
     }
 }

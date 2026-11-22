@@ -1,7 +1,7 @@
 use gui::prelude::*;
 use gui::{Icon, ImageSource, ScenarioError, SideAlign, div, icon, image, span, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, ItemMediaVariant, ItemSize, ItemVariant, MenuItem, avatar, avatar_fallback,
+    Button, ButtonSize, ButtonVariant, ItemMediaVariant, ItemSize, ItemVariant, MenuItem, avatar, avatar_fallback,
     avatar_image, button, dropdown_menu, dropdown_menu_content, dropdown_menu_item, dropdown_menu_trigger, item,
     item_actions, item_content, item_description, item_group, item_header, item_link, item_media, item_media_described,
     item_separator, item_title, theme,
@@ -42,7 +42,7 @@ const MUSIC: [(&str, &str, &str, &str); 3] = [
     ("Digital Rain", "Cyber Symphony", "Binary Beats", "3:30"),
 ];
 
-fn open(label: &str) -> gui::Div {
+fn open(label: &str) -> Button {
     button(ButtonVariant::Outline, ButtonSize::Sm).child(label.to_owned())
 }
 
@@ -61,11 +61,12 @@ fn initial(login: &str) -> String {
 /// `ItemDemo` and `ItemSizeDemo`: a basic item and a small link item.
 fn sizes() -> gui::Div {
     div()
-        .flex()
-        .w_full()
-        .max_w_px(448.0)
-        .flex_col()
-        .gap(6.0)
+        .display(Display::Flex)
+        .width(pct(100.0))
+        .max_width(448.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(24.0)
         .child(
             item(ItemVariant::Outline, ItemSize::Default)
                 .child(
@@ -77,7 +78,7 @@ fn sizes() -> gui::Div {
         )
         .child(
             item_link(ItemVariant::Outline, ItemSize::Sm)
-                .child(item_media(ItemMediaVariant::Default).child(icon(Icon::BadgeCheck).size(5.0)))
+                .child(item_media(ItemMediaVariant::Default).child(icon(Icon::BadgeCheck).size(20.0)))
                 .child(item_content().child(item_title("Your profile has been verified.")))
                 .child(item_actions().child(icon(Icon::ChevronRight))),
         )
@@ -94,55 +95,67 @@ pub fn render() -> Render {
         let t = theme();
         let image_of = |login: &str| photos.iter().find(|(l, _)| *l == login).and_then(|(_, p)| p.as_ref());
 
-        let icon_demo = div().flex().w_full().max_w_px(512.0).flex_col().gap(6.0).child(
-            item(ItemVariant::Outline, ItemSize::Default)
-                .child(item_media_described(ItemMediaVariant::Icon).child(icon(Icon::ShieldAlert)))
-                .child(
-                    item_content()
-                        .child(item_title("Security Alert"))
-                        .child(item_description("New login detected from unknown device.")),
-                )
-                .child(item_actions().child(open("Review"))),
-        );
-        let variants = div().flex_col().gap(6.0).children(
-            [
-                (
-                    ItemVariant::Default,
-                    "Default Variant",
-                    "Standard styling with subtle background and borders.",
-                ),
-                (
-                    ItemVariant::Outline,
-                    "Outline Variant",
-                    "Outlined style with clear borders and transparent background.",
-                ),
-                (
-                    ItemVariant::Muted,
-                    "Muted Variant",
-                    "Subdued appearance with muted colors for secondary content.",
-                ),
-            ]
-            .map(|(v, title, description)| {
-                item(v, ItemSize::Default)
+        let icon_demo = div()
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .max_width(512.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0)
+            .child(
+                item(ItemVariant::Outline, ItemSize::Default)
+                    .child(item_media_described(ItemMediaVariant::Icon).child(icon(Icon::ShieldAlert)))
                     .child(
                         item_content()
-                            .child(item_title(title))
-                            .child(item_description(description)),
+                            .child(item_title("Security Alert"))
+                            .child(item_description("New login detected from unknown device.")),
                     )
-                    .child(item_actions().child(open("Open")))
-            }),
-        );
+                    .child(item_actions().child(open("Review"))),
+            );
+        let variants = div()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0)
+            .children(
+                [
+                    (
+                        ItemVariant::Default,
+                        "Default Variant",
+                        "Standard styling with subtle background and borders.",
+                    ),
+                    (
+                        ItemVariant::Outline,
+                        "Outline Variant",
+                        "Outlined style with clear borders and transparent background.",
+                    ),
+                    (
+                        ItemVariant::Muted,
+                        "Muted Variant",
+                        "Subdued appearance with muted colors for secondary content.",
+                    ),
+                ]
+                .map(|(v, title, description)| {
+                    item(v, ItemSize::Default)
+                        .child(
+                            item_content()
+                                .child(item_title(title))
+                                .child(item_description(description)),
+                        )
+                        .child(item_actions().child(open("Open")))
+                }),
+            );
 
         let rabbit = image_of("evilrabbit");
         let avatar_demo = div()
-            .flex()
-            .w_full()
-            .max_w_px(512.0)
-            .flex_col()
-            .gap(6.0)
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .max_width(512.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0)
             .child(
                 item(ItemVariant::Outline, ItemSize::Default)
-                    .child(item_media_described(ItemMediaVariant::Default).child(person(rabbit, "ER").size(10.0)))
+                    .child(item_media_described(ItemMediaVariant::Default).child(person(rabbit, "ER").size(40.0)))
                     .child(
                         item_content()
                             .child(item_title("Evil Rabbit"))
@@ -151,7 +164,7 @@ pub fn render() -> Render {
                     .child(
                         item_actions().child(
                             button(ButtonVariant::Outline, ButtonSize::IconSm)
-                                .rounded_full()
+                                .radius(9999.0)
                                 .child(icon(Icon::Plus)),
                         ),
                     ),
@@ -161,15 +174,15 @@ pub fn render() -> Render {
                     .child(
                         item_media_described(ItemMediaVariant::Default).child(
                             // `-space-x-2`, and each avatar's `ring-2 ring-background grayscale`.
-                            div().flex().children(
+                            div().display(Display::Flex).children(
                                 [("shadcn", "CN"), ("maxleiter", "LR"), ("evilrabbit", "ER")]
                                     .into_iter()
                                     .enumerate()
                                     .map(|(i, (login, initials))| {
                                         person(image_of(login), initials)
-                                            .ring(2.0, t.background)
-                                            .grayscale()
-                                            .when(i > 0, |d| d.ml(-2.0))
+                                            .ring(Ring::new(2.0, t.background))
+                                            .filters(Filter::Grayscale(1.0))
+                                            .when(i > 0, |d| d.margin_left(-8.0))
                                     }),
                             ),
                         ),
@@ -184,28 +197,29 @@ pub fn render() -> Render {
 
         let last = PEOPLE.len().saturating_sub(1);
         let group = div()
-            .flex()
-            .w_full()
-            .max_w_px(448.0)
-            .flex_col()
-            .gap(6.0)
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0)
             .child(
                 item_group().children(PEOPLE.iter().enumerate().flat_map(|(i, (login, email))| {
                     let row = item(ItemVariant::Default, ItemSize::Default)
                         .child(
                             item_media_described(ItemMediaVariant::Default)
-                                .child(person(image_of(login), &initial(login)).grayscale()),
+                                .child(person(image_of(login), &initial(login)).filters(Filter::Grayscale(1.0))),
                         )
                         .child(
                             item_content()
-                                .gap(1.0)
+                                .gap(4.0)
                                 .child(item_title(*login))
                                 .child(item_description(*email)),
                         )
                         .child(
                             item_actions().child(
                                 button(ButtonVariant::Ghost, ButtonSize::Icon)
-                                    .rounded_full()
+                                    .radius(9999.0)
                                     .child(icon(Icon::Plus)),
                             ),
                         );
@@ -218,106 +232,133 @@ pub fn render() -> Render {
                 })),
             );
 
+        // `--radius: 0.65rem` on the content: its own corners (`rounded-md`),
+        // its rows' (`rounded-sm`) and the items' (`rounded-md`) follow it.
+        let r: f32 = 0.65 * 16.0;
         let menu = dropdown_menu_content()
             .align(SideAlign::End)
-            .w(72.0)
-            .radius_var(0.65 * 16.0)
-            .children(PEOPLE.iter().map(|(login, email)| {
-                dropdown_menu_item(login, MenuItem::default()).p(0.0).child(
-                    item(ItemVariant::Default, ItemSize::Sm)
-                        .w_full()
-                        .p(2.0)
-                        .child(
-                            item_media_described(ItemMediaVariant::Default).child(
-                                avatar()
-                                    .size(8.0)
-                                    .child(avatar_image(image_of(login)).map(Styled::grayscale))
-                                    .child(avatar_fallback(image_of(login), initial(login))),
+            .width(288.0)
+            .radius(r * 0.8)
+            .children(PEOPLE.iter().map(move |(login, email)| {
+                dropdown_menu_item(login, MenuItem::default())
+                    .padding(0.0)
+                    .radius(r * 0.6)
+                    .child(
+                        item(ItemVariant::Default, ItemSize::Sm)
+                            .width(pct(100.0))
+                            .padding(8.0)
+                            .radius(r * 0.8)
+                            .child(
+                                item_media_described(ItemMediaVariant::Default).child(
+                                    avatar()
+                                        .size(32.0)
+                                        .child(avatar_image(image_of(login)).map(|e| e.filters(Filter::Grayscale(1.0))))
+                                        .child(avatar_fallback(image_of(login), initial(login))),
+                                ),
+                            )
+                            .child(
+                                item_content()
+                                    .gap(2.0)
+                                    .child(item_title(*login))
+                                    .child(item_description(*email)),
                             ),
-                        )
-                        .child(
-                            item_content()
-                                .gap(0.5)
-                                .child(item_title(*login))
-                                .child(item_description(*email)),
-                        ),
-                )
+                    )
             }));
         let dropdown = div()
-            .flex()
-            .min_h(64.0)
-            .w_full()
-            .max_w_px(448.0)
-            .flex_col()
-            .items_center()
-            .gap(6.0)
+            .display(Display::Flex)
+            .min_height(256.0)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .align_items(Align::Center)
+            .gap(24.0)
             .child(
                 dropdown_menu()
                     .child(dropdown_menu_trigger(
                         button(ButtonVariant::Outline, ButtonSize::Sm)
-                            .w_fit()
+                            .width(Length::FitContent)
                             .child("Select")
                             .child(icon(Icon::ChevronDown)),
                     ))
                     .child(menu),
             );
 
-        let header = div().flex().w_full().max_w_px(576.0).flex_col().gap(6.0).child(
-            item_group()
-                .grid()
-                .grid_cols(3)
-                .gap(4.0)
-                .children(MODELS.iter().zip(&models).map(|((name, description, _), cover)| {
-                    item_link(ItemVariant::Outline, ItemSize::Default)
-                        .child(
-                            item_header().child(
-                                cover
-                                    .clone()
-                                    .map(|c| image(c).aspect_square().w_full().rounded_sm().grayscale()),
-                            ),
-                        )
-                        .child(
-                            item_content()
-                                .child(item_title(*name))
-                                .child(item_description(*description)),
-                        )
-                })),
-        );
+        let header = div()
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .max_width(576.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0)
+            .child(
+                item_group()
+                    .display(Display::Grid)
+                    .grid_columns(Tracks::repeat(3, Track::Fr(1.0)))
+                    .gap(16.0)
+                    .children(MODELS.iter().zip(&models).map(|((name, description, _), cover)| {
+                        item_link(ItemVariant::Outline, ItemSize::Default)
+                            .child(item_header().child(cover.clone().map(|c| {
+                                image(c)
+                                    .aspect_ratio(1.0)
+                                    .width(pct(100.0))
+                                    .radius(6.0)
+                                    .filters(Filter::Grayscale(1.0))
+                            })))
+                            .child(
+                                item_content()
+                                    .child(item_title(*name))
+                                    .child(item_description(*description)),
+                            )
+                    })),
+            );
 
-        let images = div().flex().w_full().max_w_px(448.0).flex_col().gap(6.0).child(
-            item_group().gap(4.0).children(MUSIC.iter().zip(&covers).map(
-                |((title, artist, album, duration), cover)| {
-                    item_link(ItemVariant::Outline, ItemSize::Default)
-                        .child(
-                            item_media_described(ItemMediaVariant::Image)
-                                .child(cover.clone().map(|c| image(c).size_full().grayscale())),
-                        )
-                        .child(
-                            item_content()
-                                .child(
-                                    item_title(
-                                        text(format!("{title} - ")).span(span(*album).text_color(t.muted_foreground)),
+        let images = div()
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(24.0)
+            .child(
+                item_group().gap(16.0).children(MUSIC.iter().zip(&covers).map(
+                    |((title, artist, album, duration), cover)| {
+                        item_link(ItemVariant::Outline, ItemSize::Default)
+                            .child(
+                                item_media_described(ItemMediaVariant::Image).child(
+                                    cover
+                                        .clone()
+                                        .map(|c| image(c).size(pct(100.0)).filters(Filter::Grayscale(1.0))),
+                                ),
+                            )
+                            .child(
+                                item_content()
+                                    .child(
+                                        item_title(
+                                            text(format!("{title} - "))
+                                                .span(span(*album).text_color(t.muted_foreground)),
+                                        )
+                                        .line_clamp(1),
                                     )
-                                    .line_clamp(1),
-                                )
-                                .child(item_description(*artist)),
-                        )
-                        .child(
-                            item_content()
-                                .flex_none()
-                                .text_center()
-                                .child(item_description(*duration)),
-                        )
-                },
-            )),
-        );
+                                    .child(item_description(*artist)),
+                            )
+                            .child(
+                                item_content()
+                                    .flex(Flex::NONE)
+                                    .text_align(TextAlign::Center)
+                                    .child(item_description(*duration)),
+                            )
+                    },
+                )),
+            );
 
         let links = div()
-            .flex()
-            .w_full()
-            .max_w_px(448.0)
-            .flex_col()
-            .gap(4.0)
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(
                 item_link(ItemVariant::Default, ItemSize::Default)
                     .child(
@@ -340,8 +381,9 @@ pub fn render() -> Render {
         page(
             "Item",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("ItemDropdownDemo.vue", dropdown))
                 .child(demo("ItemDemo.vue", sizes()))
                 .child(demo("ItemIconDemo.vue", icon_demo))

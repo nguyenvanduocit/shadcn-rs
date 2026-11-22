@@ -10,16 +10,17 @@ pub fn render() -> Render {
         page(
             "Alert",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "AlertDemo.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(576.0)
-                        .items_start()
-                        .gap(4.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(576.0)
+                        .align_items(Align::Start)
+                        .gap(16.0)
                         .child(
                             alert(AlertVariant::Default, Some(Icon::CircleCheck))
                                 .child(alert_title("Success! Your changes have been saved"))
@@ -39,25 +40,30 @@ pub fn render() -> Render {
                                     alert_description(destructive)
                                         .child(
                                             text("Please verify your billing information and try again.")
-                                                .leading_relaxed(),
+                                                .line_height(LineHeight::Relative(1.625)),
                                         )
                                         .child(
-                                            div().mt(2.0).flex_col().gap(1.0).children(
-                                                [
-                                                    "Check your card details",
-                                                    "Ensure sufficient funds",
-                                                    "Verify billing address",
-                                                ]
-                                                .map(|item| {
-                                                    // `list-inside list-disc`: Chrome sets the text 19.5px
-                                                    // after the marker's left edge (measured on its render).
-                                                    div()
-                                                        .grid()
-                                                        .grid_cols_tracks(vec![Track::Px(19.5), Track::Fr(1.0)])
-                                                        .child("•")
-                                                        .child(item)
-                                                }),
-                                            ),
+                                            div()
+                                                .margin_top(8.0)
+                                                .display(Display::Flex)
+                                                .flex_direction(FlexDirection::Column)
+                                                .gap(4.0)
+                                                .children(
+                                                    [
+                                                        "Check your card details",
+                                                        "Ensure sufficient funds",
+                                                        "Verify billing address",
+                                                    ]
+                                                    .map(|item| {
+                                                        // `list-inside list-disc`: Chrome sets the text 19.5px
+                                                        // after the marker's left edge (measured on its render).
+                                                        div()
+                                                            .display(Display::Grid)
+                                                            .grid_columns(vec![Track::Px(19.5), Track::Fr(1.0)])
+                                                            .child("•")
+                                                            .child(item)
+                                                    }),
+                                                ),
                                         ),
                                 ),
                         ),
@@ -70,7 +76,7 @@ pub fn render() -> Render {
                 ))
                 .child(section(
                     "Without an icon",
-                    div().w_px(576.0).child(
+                    div().width(576.0).child(
                         alert(AlertVariant::Default, None)
                             .child(alert_title("Heads up!"))
                             .child(

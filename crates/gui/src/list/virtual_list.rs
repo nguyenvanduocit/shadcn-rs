@@ -54,19 +54,25 @@ use std::rc::{Rc, Weak};
 use super::extent_tree::{ExtentTree, UNITS, pixels, units};
 use crate::element::{Div, Element, ElementKey, IntoElement, Role, div};
 use crate::events::{DragEvent, DragPhase};
+use crate::prelude::*;
 use crate::reactive::{Signal, detached};
 use crate::scroll::{ScrollHandle, ScrollLayout};
-use crate::style::Length;
-use crate::style::{BackgroundImage, Calc, Ink, LinearGradient, Stop};
-use crate::styled::{Styled, px};
+use crate::style::{BackgroundImage, Calc, LinearGradient, Stop, StopColor};
 
 /// The viewport height a list assumes before its first layout.
 const FIRST_VIEWPORT: f32 = 600.0;
 /// Fewest pixels the thumb is tall (a scroll container's).
 const MIN_THUMB: f32 = 20.0;
-/// The thumb's inset from the track's ends and the viewport's right edge.
+/// The thumb's inset from the track's ends.
 const THUMB_INSET: f32 = 2.0;
+/// The thumb's inset from the viewport's right edge.
+const THUMB_RIGHT: f32 = 8.0;
 const THUMB_WIDTH: f32 = 6.0;
+/// How long the thumb stays shown after the reader last scrolled or
+/// dragged, then how long it fades (an overlay scrollbar, as the
+/// compositor shows a scroll container's), milliseconds.
+const THUMB_SHOWN_MS: u64 = 500;
+const THUMB_FADE_MS: f32 = 200.0;
 /// How far keys are looked for around the anchor's old row after the data changed.
 const KEY_SEARCH: u64 = 512;
 /// How close a placement must come to the one asked for.
@@ -162,6 +168,15 @@ struct Inner {
     grab: Cell<f32>,
     /// The thumb's top and height in the viewport; `None` when all rows fit.
     thumb: Signal<Option<(f32, f32)>>,
+    /// The thumb shows: the reader scrolled or dragged it lately. At rest
+    /// it is hidden, an overlay scrollbar.
+    thumb_shown: Signal<bool>,
+    /// The scroll handle's [`ScrollHandle::wheels`] as last seen, and the
+    /// timer hiding the thumb again (only the latest one hides it).
+    wheels_seen: Cell<u64>,
+    hide_run: Cell<u64>,
+    /// The thumb is held: it stays shown until let go.
+    dragging: Cell<bool>,
     /// The owner's hook, run once the window is settled.
     hook: RefCell<Option<Hook>>,
     /// The row holding focus, as last laid out, and its key.
@@ -178,6 +193,7 @@ impl Drop for Inner {
     fn drop(&mut self) {
         self.version.dispose_quietly();
         self.thumb.dispose_quietly();
+        self.thumb_shown.dispose_quietly();
         self.height.dispose_quietly();
     }
 }
@@ -239,6 +255,10 @@ impl ListState {
             measured: Cell::new((0, 0.0)),
             grab: Cell::new(0.0),
             thumb: detached(|| Signal::labeled("virtual list thumb", None)),
+            thumb_shown: detached(|| Signal::labeled("virtual list thumb shown", false)),
+            wheels_seen: Cell::new(0),
+            hide_run: Cell::new(0),
+            dragging: Cell::new(false),
             hook: RefCell::new(None),
             focus_row: Cell::new(None),
             active: Cell::new(None),
@@ -753,6 +773,10 @@ impl ListState {
                 });
             }
         }
+        let wheels = inner.scroll.wheels();
+        if wheels != inner.wheels_seen.replace(wheels) {
+            self.show_thumb();
+        }
         let thumb_moved = self.place_thumb(l.offset.1, height);
         let fitted = self.fit_height();
         let wants_end = self.wants_end();
@@ -874,8 +898,29 @@ impl ListState {
         }
     }
 
+    /// Show the thumb, and hide it [`THUMB_SHOWN_MS`] after the last call.
+    fn show_thumb(&self) {
+        let inner = &self.0;
+        if !inner.thumb_shown.get_untracked() {
+            inner.thumb_shown.set(true);
+        }
+        let run = inner.hide_run.get().wrapping_add(1);
+        inner.hide_run.set(run);
+        let weak = Rc::downgrade(&self.0);
+        crate::clock::after(std::time::Duration::from_millis(THUMB_SHOWN_MS), move || {
+            if let Some(inner) = weak.upgrade()
+                && inner.hide_run.get() == run
+                && !inner.dragging.get()
+            {
+                inner.thumb_shown.set(false);
+            }
+        });
+    }
+
     /// Move the thumb to put its top at `y` (window pixels).
     fn drag_thumb(&self, e: &DragEvent) {
+        self.0.dragging.set(e.phase != DragPhase::End);
+        self.show_thumb();
         match e.phase {
             DragPhase::Start => self.0.grab.set(e.y - e.bounds.y),
             DragPhase::Move | DragPhase::End => {
@@ -900,29 +945,27 @@ fn thumb_height(viewport: f32, extent: f64) -> f32 {
 
 /// The thumb's paint: the text colour at a quarter, as a scroll container's.
 fn thumb_ink() -> BackgroundImage {
-    let ink = Ink::Current {
+    let ink = StopColor::Current {
         lightness_floor: 0.0,
         lightness_lift: 0.0,
         alpha_scale: 0.25,
         alpha_add: 0.0,
     };
-    BackgroundImage {
-        gradient: LinearGradient {
-            angle: 180.0,
-            stops: vec![
-                Stop {
-                    ink,
-                    at: Calc::fraction(0.0),
-                },
-                Stop {
-                    ink,
-                    at: Calc::fraction(1.0),
-                },
-            ],
-        },
-        size: [Calc::fraction(1.0), Calc::fraction(1.0)],
-        ..BackgroundImage::default()
+    LinearGradient {
+        angle: 180.0,
+        stops: [
+            Stop {
+                color: ink,
+                at: Calc::fraction(0.0),
+            },
+            Stop {
+                color: ink,
+                at: Calc::fraction(1.0),
+            },
+        ]
+        .into(),
     }
+    .into()
 }
 
 /// Row `i` (keyed `k`) of a list, built as `el`: when it names a row's
@@ -976,17 +1019,22 @@ pub fn virtual_list_in(
     // clamps it).
     let local = if state.wants_end() { f32::MAX } else { w.local };
     state.0.scroll.scroll_to((0.0, local));
-    let row_at = |i: u64, k: ElementKey| row_wrapper(i, k, row(i)).flex_none().w_full().into_element();
+    let row_at = |i: u64, k: ElementKey| {
+        row_wrapper(i, k, row(i))
+            .flex(Flex::NONE)
+            .width(pct(100.0))
+            .into_element()
+    };
     let pins = state.pins_for(w, rows, &key);
     let before = pins.iter().take_while(|(r, _)| *r < w.first).count();
     // Kept built where nothing shows them: their bottom on the viewport's
     // top, out of the scroll range.
     let pinned = |&(i, k): &(u64, ElementKey)| {
         row_wrapper(i, k, row(i))
-            .absolute()
+            .position(Position::Absolute)
             .left(0.0)
-            .w_full()
-            .bottom_len(Length::Fraction(1.0))
+            .width(pct(100.0))
+            .bottom(Length::Fraction(1.0))
             .into_element()
     };
     let pins_before: Vec<Element> = pins.iter().take(before).map(pinned).collect();
@@ -998,15 +1046,18 @@ pub fn virtual_list_in(
         .chain((w.first..w.last).zip(&keys).map(|(i, &k)| row_at(i, k)))
         .chain(pins_after);
     let end_space = state.0.end_space.get();
-    let room = (w.last >= rows && end_space > 0.0).then(|| div().named("virtual-list-end").flex_none().h_px(end_space));
+    let room =
+        (w.last >= rows && end_space > 0.0).then(|| div().named("virtual-list-end").flex(Flex::NONE).height(end_space));
     let scroller = viewport(
         div()
             .named("virtual-list-viewport")
-            .absolute()
+            .position(Position::Absolute)
             .inset(0.0)
-            .flex_col()
-            .overflow_y_scroll()
-            .scrollbar_none()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .overflow_y(Overflow::Scroll)
+            .overflow_x(Overflow::Hidden)
+            .scrollbar_hidden(true)
             .track_scroll(&state.0.scroll),
     )
     .children(built.collect::<Vec<_>>())
@@ -1016,25 +1067,36 @@ pub fn virtual_list_in(
     // after each layout from the anchor over the whole extent, they move the
     // thumb without building the list again.
     let geometry = state.0.thumb;
+    let shown = state.0.thumb_shown;
     let s = state.clone();
     let thumb = (!state.0.no_scrollbar.get()).then(|| {
         div()
             .named("virtual-list-thumb")
-            .absolute()
-            .right(THUMB_INSET)
-            .w_px(THUMB_WIDTH)
-            .rounded(THUMB_WIDTH / 2.0)
+            .position(Position::Absolute)
+            .right(THUMB_RIGHT)
+            .width(THUMB_WIDTH)
+            .radius(THUMB_WIDTH / 2.0)
             .background_image(thumb_ink())
-            .bind(move |st| match geometry.get() {
-                Some((y, h)) => st.top_len(px(y)).h_px(h),
-                None => st.hidden(),
+            .top(move || geometry.get().map_or(0.0, |(y, _)| y))
+            .height(move || geometry.get().map_or(0.0, |(_, h)| h))
+            // Shown at once, faded out.
+            .opacity(move || if shown.get() { 1.0 } else { 0.0 })
+            .duration_ms(move || if shown.get() { 0.0 } else { THUMB_FADE_MS })
+            .ease(Easing::Linear)
+            .transition(crate::motion::Properties::OPACITY)
+            .display(move || {
+                if geometry.get().is_some() {
+                    Display::Block
+                } else {
+                    Display::None
+                }
             })
             .on_drag(move |e| s.drag_thumb(e))
     });
     let list = div()
         .named("virtual-list")
-        .relative()
-        .overflow_hidden()
+        .position(Position::Relative)
+        .overflow(Overflow::Hidden)
         .role(Role::List)
         .aria_row_count(usize::try_from(rows).unwrap_or(usize::MAX))
         .child(scroller)
@@ -1047,7 +1109,7 @@ pub fn virtual_list_in(
                 state.0.height.set(rows_h);
             }
             let height = state.0.height;
-            list.flex_none().bind(move |st| st.h_px(height.get()))
+            list.flex(Flex::NONE).height(move || height.get())
         }
         None => list,
     }
@@ -1063,7 +1125,7 @@ mod tests {
 
     fn list(state: &ListState) -> Element {
         div()
-            .w_px(300.0)
+            .width(300.0)
             .child(
                 virtual_list(
                     state,
@@ -1071,12 +1133,12 @@ mod tests {
                     |i| i,
                     |i| {
                         div()
-                            .h_px(if i % 3 == 0 { 40.0 } else { 24.0 })
+                            .height(if i % 3 == 0 { 40.0 } else { 24.0 })
                             .child(text(format!("row {i}")))
                             .into_element()
                     },
                 )
-                .h_px(400.0),
+                .height(400.0),
             )
             .into_element()
     }
@@ -1137,6 +1199,34 @@ mod tests {
         assert!(rows(&s).len() < 80);
     }
 
+    /// Whether its thumb is shown.
+    fn thumb_shown(state: &ListState) -> bool {
+        state.0.thumb_shown.get_untracked()
+    }
+
+    #[test]
+    fn the_thumb_shows_while_the_reader_scrolls_and_hides_at_rest() {
+        let state = ListState::new(30.0);
+        let mut s = scenario(&state);
+        assert!(!thumb_shown(&state), "hidden at rest, as an overlay scrollbar");
+        s.act("to the middle", || state.scroll_to_fraction(0.5));
+        s.settle().unwrap();
+        assert!(!thumb_shown(&state), "a program's scroll shows none");
+        s.hover(100.0, 200.0);
+        s.wheel(100.0);
+        s.settle().unwrap();
+        assert!(thumb_shown(&state), "the reader scrolled it");
+        s.wait(std::time::Duration::from_millis(THUMB_SHOWN_MS.saturating_sub(100)));
+        s.wheel(100.0);
+        s.settle().unwrap();
+        s.wait(std::time::Duration::from_millis(THUMB_SHOWN_MS.saturating_sub(100)));
+        s.settle().unwrap();
+        assert!(thumb_shown(&state), "shown from the last scroll on");
+        s.wait(std::time::Duration::from_millis(200));
+        s.settle().unwrap();
+        assert!(!thumb_shown(&state), "hidden once the reader stopped");
+    }
+
     #[test]
     fn the_far_end_and_the_middle_land_where_asked_and_stay() {
         let state = ListState::new(30.0);
@@ -1169,8 +1259,8 @@ mod tests {
         let mut s = Scenario::measuring(
             move || {
                 div()
-                    .w_px(300.0)
-                    .child(virtual_list(&st, n.get(), |i| i, |i| text(format!("row {i}")).into_element()).h_px(400.0))
+                    .width(300.0)
+                    .child(virtual_list(&st, n.get(), |i| i, |i| text(format!("row {i}")).into_element()).height(400.0))
                     .into_element()
             },
             300,
@@ -1238,13 +1328,14 @@ mod tests {
         let mut s = Scenario::measuring(
             move || {
                 div()
-                    .w_px(300.0)
-                    .flex_col()
+                    .width(300.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
                     .child(virtual_list(
                         &state,
                         n.get(),
                         |i| i,
-                        |i| div().h_px(25.0).child(text(format!("row {i}"))).into_element(),
+                        |i| div().height(25.0).child(text(format!("row {i}"))).into_element(),
                     ))
                     .child(text("below"))
                     .into_element()
@@ -1276,15 +1367,15 @@ mod tests {
         let mut s = Scenario::measuring(
             move || {
                 div()
-                    .w_px(300.0)
+                    .width(300.0)
                     .child(
                         virtual_list(
                             &st,
                             30,
                             |i| i,
-                            |i| div().h_px(25.0).child(text(format!("row {i}"))).into_element(),
+                            |i| div().height(25.0).child(text(format!("row {i}"))).into_element(),
                         )
-                        .h_px(400.0),
+                        .height(400.0),
                     )
                     .into_element()
             },

@@ -9,7 +9,7 @@ use gui::{
     use_model,
 };
 
-use crate::button::{ButtonSize, ButtonVariant, button};
+use crate::button::{Button, ButtonSize, ButtonVariant, button};
 use crate::part::{Part, PartProps};
 
 /// What [`pagination`] is given (reka's `PaginationRoot`); `page` is
@@ -114,7 +114,12 @@ pub fn pagination_range(page: usize, count: usize, siblings: usize, show_edges: 
 /// the caller shows (`.page(…)` with `.on_change(…)`).
 #[must_use]
 pub fn pagination() -> Part<PaginationProps> {
-    let root = div().named("pagination").mx_auto().flex().w_full().justify_center();
+    let root = div()
+        .named("pagination")
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .width(pct(100.0))
+        .justify_content(Justify::Center);
     Part::new(PaginationProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -178,7 +183,12 @@ impl Part<PaginationProps> {
 /// The list of links.
 #[must_use]
 pub fn pagination_content() -> Div {
-    div().named("pagination-content").flex_row().items_center().gap(1.0)
+    div()
+        .named("pagination-content")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Row)
+        .align_items(Align::Center)
+        .gap(4.0)
 }
 
 /// The pages and ellipses around the current page, in a
@@ -244,10 +254,10 @@ pub fn pagination_item(page: usize) -> ComponentElement {
 pub fn pagination_ellipsis() -> Div {
     div()
         .named("pagination-ellipsis")
-        .flex()
-        .size(9.0)
-        .items_center()
-        .justify_center()
+        .display(Display::Flex)
+        .size(36.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
         .child(icon(Icon::Ellipsis))
 }
 
@@ -265,8 +275,8 @@ enum Step {
     Last,
 }
 
-fn step(to: Step, root: Div) -> Part<PaginationStepProps> {
-    Part::new(PaginationStepProps { to }, root, |p| {
+fn step(to: Step, root: Button) -> Part<PaginationStepProps> {
+    Part::new(PaginationStepProps { to }, root.into_div(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let ctx = PaginationContext::find();
@@ -288,8 +298,10 @@ fn step(to: Step, root: Div) -> Part<PaginationStepProps> {
     })
 }
 
-fn step_button() -> Div {
-    button(ButtonVariant::Ghost, ButtonSize::Default).gap(1.0).px(2.5)
+fn step_button() -> Button {
+    button(ButtonVariant::Ghost, ButtonSize::Default)
+        .gap(4.0)
+        .padding_x(10.0)
 }
 
 /// Back one page; disabled on the first.

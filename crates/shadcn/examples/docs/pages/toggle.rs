@@ -20,8 +20,9 @@ pub fn render() -> Render {
         page(
             "Toggle",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo(
                     "ToggleDemo.vue",
                     toggle(ToggleVariant::Default, ToggleSize::Default).child(icon(Icon::Bold)),

@@ -22,6 +22,7 @@ use crate::dropdown_menu::{
 use gui::style::Origin;
 use gui::{Side, SideAlign};
 
+use crate::focus::StateLook;
 use crate::motion::{popper, popper_in};
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
@@ -83,16 +84,22 @@ pub fn menubar() -> Part<MenubarProps> {
     let root = div()
         .named("menubar")
         .role(gui::Role::MenuBar)
-        .bg(t.background)
-        .flex()
-        .h(9.0)
-        .items_center()
-        .gap(1.0)
-        .rounded_md()
-        .border()
+        .background(t.background)
+        .display(Display::Flex)
+        .height(36.0)
+        .align_items(Align::Center)
+        .gap(4.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(1.0)
-        .shadow_xs();
+        .padding(4.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: gui::Color::BLACK.opacity(0.05),
+        });
     Part::new(MenubarProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -129,41 +136,45 @@ thread_local! {
 /// against. Give it a [`menubar_trigger`] and a [`menubar_content`].
 #[must_use]
 pub fn menubar_menu() -> Part<MenubarMenuProps> {
-    Part::new(MenubarMenuProps::default(), div().named("menubar-menu").flex(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let bar = use_context::<MenubarContext>();
-            let me = props.with_untracked(|p| p.props.value.clone()).unwrap_or_else(|| {
-                let n = NEXT_MENU.get();
-                NEXT_MENU.set(n.wrapping_add(1));
-                format!("menubar-menu-{n}")
-            });
-            let level = match &bar {
-                Some(b) => {
-                    let open = Rc::new(BarOpen {
-                        bar: b.value,
-                        me: me.clone(),
-                    });
-                    let (menus, from) = (b.menus.clone(), me.clone());
-                    MenuState::with_open(
-                        open,
-                        Some(Rc::new(move |forward| move_sideways(&menus, &from, forward))),
-                    )
+    Part::new(
+        MenubarMenuProps::default(),
+        div().named("menubar-menu").display(Display::Flex),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let bar = use_context::<MenubarContext>();
+                let me = props.with_untracked(|p| p.props.value.clone()).unwrap_or_else(|| {
+                    let n = NEXT_MENU.get();
+                    NEXT_MENU.set(n.wrapping_add(1));
+                    format!("menubar-menu-{n}")
+                });
+                let level = match &bar {
+                    Some(b) => {
+                        let open = Rc::new(BarOpen {
+                            bar: b.value,
+                            me: me.clone(),
+                        });
+                        let (menus, from) = (b.menus.clone(), me.clone());
+                        MenuState::with_open(
+                            open,
+                            Some(Rc::new(move |forward| move_sideways(&menus, &from, forward))),
+                        )
+                    }
+                    None => MenuState::new(),
+                };
+                level.return_focus_on_close();
+                provide(level.clone());
+                move || {
+                    let root = props.with(|p| p.slot.0.clone());
+                    match &bar {
+                        Some(b) => root.member(&b.menus, (me.clone(), level.clone())),
+                        None => root,
+                    }
+                    .into_element()
                 }
-                None => MenuState::new(),
-            };
-            level.return_focus_on_close();
-            provide(level.clone());
-            move || {
-                let root = props.with(|p| p.slot.0.clone());
-                match &bar {
-                    Some(b) => root.member(&b.menus, (me.clone(), level.clone())),
-                    None => root,
-                }
-                .into_element()
-            }
-        })
-    })
+            })
+        },
+    )
 }
 
 /// ArrowLeft or ArrowRight past a menu's items: the neighbouring menu opens
@@ -187,14 +198,18 @@ pub fn menubar_trigger(label: &str) -> Part<()> {
     let root = div()
         .named("menubar-trigger")
         .role(gui::Role::MenuItem)
-        .flex()
-        .items_center()
-        .rounded_sm()
-        .px(2.0)
-        .py(1.0)
-        .text_sm()
-        .font_medium()
-        .focus(move |s| s.bg(t.accent).text_color(t.accent_foreground))
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .radius(6.0)
+        .padding_x(8.0)
+        .padding_y(4.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .with_interaction(|d, i| {
+            d.background_while(move || i.focused(), t.accent)
+                .text_color_while(move || i.focused(), t.accent_foreground)
+        })
         .child(label.to_owned());
     Part::new((), root, |p| {
         component(p, |cx| {
@@ -210,7 +225,9 @@ pub fn menubar_trigger(label: &str) -> Part<()> {
                 let (hover, bar) = (level.clone(), bar.clone());
                 level
                     .trigger(root)
-                    .when(level.is_open(), |d| d.bg(t.accent).text_color(t.accent_foreground))
+                    .when(level.is_open(), |d| {
+                        d.background(t.accent).text_color(t.accent_foreground)
+                    })
                     .on_hover(move |inside| {
                         let any_open = bar.as_ref().is_some_and(|b| !b.value.get_untracked().is_empty());
                         if inside && !gui::untracked(|| hover.is_open()) && any_open {
@@ -235,9 +252,9 @@ pub fn menubar_content() -> Part<MenuContentProps> {
             menu_box(&t)
                 .named("menubar-content")
                 .role(gui::Role::Menu)
-                .min_w_px(192.0)
-                .overflow_hidden()
-                .shadow_md(),
+                .min_width(192.0)
+                .overflow(Overflow::Hidden)
+                .shadow(crate::popover::POPUP_SHADOW),
             Origin::Anchor,
         ),
         MenuPlace::Anchored {
@@ -284,9 +301,9 @@ pub fn menubar_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheckboxIt
     menu_checkbox_item(
         menu_row_base(&t, item)
             .named("menubar-checkbox-item")
-            .rounded_xs()
-            .pl(8.0)
-            .pr(2.0)
+            .radius(2.0)
+            .padding_left(32.0)
+            .padding_right(8.0)
             .child(label.to_owned()),
         label,
         disabled,
@@ -304,9 +321,9 @@ pub fn menubar_radio_item(label: &str, value: &str, disabled: bool) -> Part<Menu
     menu_radio_item(
         menu_row_base(&t, item)
             .named("menubar-radio-item")
-            .rounded_xs()
-            .pl(8.0)
-            .pr(2.0)
+            .radius(2.0)
+            .padding_left(32.0)
+            .padding_right(8.0)
             .child(label.to_owned()),
         label,
         value,
@@ -319,11 +336,12 @@ pub fn menubar_radio_item(label: &str, value: &str, disabled: bool) -> Part<Menu
 pub fn menubar_label(label: &str, inset: bool) -> Div {
     div()
         .named("menubar-label")
-        .px(2.0)
-        .py(1.5)
-        .text_sm()
-        .font_medium()
-        .when(inset, |d| d.pl(8.0))
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .when(inset, |d| d.padding_left(32.0))
         .child(label.to_owned())
 }
 
@@ -354,7 +372,7 @@ pub fn menubar_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerPr
             .named("menubar-sub-trigger")
             .gap(0.0)
             .child(label.to_owned())
-            .child(icon(Icon::ChevronRight).ml_auto()),
+            .child(icon(Icon::ChevronRight).margin_left(Length::Auto)),
         label,
         item,
         true,
@@ -367,7 +385,10 @@ pub fn menubar_sub_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
         popper(
-            menu_box(&t).named("menubar-sub-content").overflow_hidden().shadow_lg(),
+            menu_box(&t)
+                .named("menubar-sub-content")
+                .overflow(Overflow::Hidden)
+                .shadow(crate::popover::LIFTED_SHADOW),
             Origin::Anchor,
         ),
         MenuPlace::Beside,

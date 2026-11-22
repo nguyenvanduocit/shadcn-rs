@@ -33,9 +33,9 @@ use crate::canvas::plan::{Step, View, cut_about, plan_live};
 use crate::canvas::planner::{Planner, Request, TileKey, plan_tile};
 use crate::canvas::{Camera, WorldSnapshot, WorldView, cos_sin, turn};
 use crate::chunk::{DataItem, TextureId};
+use crate::figure::Path;
 use crate::geometry::Bounds;
 use crate::scene::Clip;
-use crate::shape::Path;
 use crate::text::Glyphs;
 
 /// Device pixels of a tile's side.
@@ -595,7 +595,7 @@ impl GpuRenderer {
                 break;
             }
             spent = spent.saturating_add(cost);
-            let place = Place {
+            let place = Stage {
                 bounds: tile_bounds,
                 s: 1.0,
                 off: (0.0, 0.0),
@@ -636,7 +636,7 @@ impl GpuRenderer {
     }
 
     /// The draws of step `step` (the `nth` of its plan) placed by `place`.
-    fn step_ops(&mut self, ops: &mut Vec<Op>, step: &Step, place: &Place, nth: usize, text: &mut Glyphs) {
+    fn step_ops(&mut self, ops: &mut Vec<Op>, step: &Step, place: &Stage, nth: usize, text: &mut Glyphs) {
         let (ox, oy) = place.origin;
         match step {
             Step::Boxes(data) => {
@@ -715,7 +715,7 @@ impl GpuRenderer {
         if shown[2] <= shown[0] || shown[3] <= shown[1] {
             return;
         }
-        let at = Place {
+        let at = Stage {
             bounds: b,
             s,
             off,
@@ -743,7 +743,7 @@ impl GpuRenderer {
         &mut self,
         ops: &mut Vec<Op>,
         v: &WorldView,
-        place: &Place,
+        place: &Stage,
         dev: [f32; 4],
         areas: &[[f64; 4]],
         text: &mut Glyphs,
@@ -791,7 +791,7 @@ impl GpuRenderer {
                 r[2].min(place.visible[2]),
                 r[3].min(place.visible[3]),
             ];
-            let at = Place {
+            let at = Stage {
                 origin: (dev[0], dev[1]),
                 visible,
                 local,
@@ -821,7 +821,7 @@ impl GpuRenderer {
     /// draw live what tiles cannot show yet (lifted objects, changes being
     /// rastered).
     #[expect(clippy::too_many_lines, reason = "a tiled frame's decisions, in order")]
-    fn tiled_ops(&mut self, ops: &mut Vec<Op>, v: &Arc<WorldView>, place: &Place, dev: [f32; 4], text: &mut Glyphs) {
+    fn tiled_ops(&mut self, ops: &mut Vec<Op>, v: &Arc<WorldView>, place: &Stage, dev: [f32; 4], text: &mut Glyphs) {
         let cam = v.camera;
         let world = Arc::clone(&v.world);
         let ver = world.version;
@@ -1057,7 +1057,7 @@ impl GpuRenderer {
     /// disjoint, whole pixels): its lifted objects, and the changes tiles
     /// `drawn` do not show yet when they are little to draw; and whether
     /// those changes are (else they are left to the tiles).
-    fn live_holes(&self, v: &WorldView, place: &Place, dev: [f32; 4], drawn: &[TileKey]) -> (Vec<[f64; 4]>, bool) {
+    fn live_holes(&self, v: &WorldView, place: &Stage, dev: [f32; 4], drawn: &[TileKey]) -> (Vec<[f64; 4]>, bool) {
         let world = &v.world;
         let cam = v.camera;
         let s = f64::from(place.s);
@@ -1139,7 +1139,7 @@ impl GpuRenderer {
         v: &WorldView,
         key: TileKey,
         tiling: &Tiling,
-        place: &Place,
+        place: &Stage,
         dev: [f32; 4],
         holes: &[[f64; 4]],
     ) {
@@ -1279,7 +1279,7 @@ fn subtract(r: [f64; 4], holes: &[[f64; 4]]) -> Vec<[f64; 4]> {
 /// (for boxes), the device origin the steps' coordinates start from, what
 /// is visible, the clips and fade, a seed for the boxes' keys.
 #[derive(Clone, Copy)]
-struct Place {
+struct Stage {
     bounds: Bounds,
     s: f32,
     off: (f32, f32),
@@ -1360,6 +1360,7 @@ fn clip_entry_logical(clips: &mut Vec<f32>, r: [f32; 4]) -> u32 {
                 height: r[3] - r[1],
             },
             radius: crate::style::Corners::default(),
+            curve: crate::shape::ROUND,
         },
         1.0,
         None,

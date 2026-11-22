@@ -31,15 +31,16 @@ use parley::{
 
 pub use self::access::TextRun;
 pub(crate) use self::fonts::CURVE_EM;
+use self::fonts::Fonts;
 pub use self::fonts::{Coverage, GlyphContent, GlyphImage, GlyphKey, Glyphs};
-use self::fonts::{Fonts, MONO, SANS};
+pub(crate) use self::fonts::{MONO, SANS};
 use self::gamma::{GammaParams, MaskGamma};
 use self::settings::TextSettings;
 use crate::color::Color;
 use crate::convert::{f32_to_i32, f32_to_u32, i32_to_f32};
 use crate::geometry::Bounds;
 use crate::scene::Item;
-use crate::style::{Direction, Edges, FontFamily, ResolvedText, TextAlign, WrapStyle};
+use crate::style::{Direction, Edges, FontFamily, GenericFamily, ResolvedText, TextAlign, WrapStyle};
 
 /// Subdivisions of a pixel lengths are kept in (Blink's `LayoutUnit`).
 const LAYOUT_UNITS: f32 = 64.0;
@@ -68,9 +69,10 @@ pub struct Run {
     pub padding: Edges<f32>,
 }
 
-/// A box laid out in a line as a glyph is (an icon, a chip): it takes its
-/// width in the line, wraps with the words around it, and sits with its
-/// bottom on the baseline (CSS `display: inline-block` with no baseline).
+/// A box laid out in a line as a glyph is (an icon, a chip, a button): it
+/// takes its width in the line, wraps with the words around it, and sits
+/// on the baseline by its own (CSS `vertical-align: baseline` of an atomic
+/// inline), the line growing to hold it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct InlineSlot {
     /// The byte offset in the content of the [`OBJECT`] character it
@@ -78,8 +80,22 @@ pub struct InlineSlot {
     pub at: usize,
     pub width: f32,
     pub height: f32,
+    /// Its baseline below its top; none puts its bottom edge on the line's
+    /// baseline (an `inline-block` with no line box in it).
+    pub baseline: Option<f32>,
     /// Names it in [`TextSystem::inline_boxes`].
     pub id: u64,
+}
+
+/// `content` as a reader or a copy has it: without the [`OBJECT`]s its
+/// atomic inlines stand on (each is a node of its own).
+#[must_use]
+pub fn readable(content: &str) -> std::borrow::Cow<'_, str> {
+    if content.contains(OBJECT) {
+        std::borrow::Cow::Owned(content.replace(OBJECT, ""))
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    }
 }
 
 /// What text shapes and draws: `content`, with `runs` (sorted, not
@@ -197,7 +213,9 @@ struct PieceRun {
 struct ShapeKey {
     base: StyleKey,
     runs: Vec<PieceRun>,
-    boxes: Vec<(usize, u32, u32, u64)>,
+    /// Each inline box: its offset, width, height, baseline (`u32::MAX`
+    /// for none, which no finite baseline's bits are) and id.
+    boxes: Vec<(usize, u32, u32, u32, u64)>,
     /// Bytes put before the text: a U+FFFC for a leading run's padding.
     lead: usize,
     rtl: bool,
@@ -239,6 +257,8 @@ struct Shaped {
     layout: Layout<u32>,
     /// How its lines are broken now, and how far right they then sit.
     broken: Option<Breaking>,
+    /// Its lines' boxes as so broken, by Blink's rules ([`rows`]).
+    rows: Vec<Row>,
     shift: f32,
     /// The widths `pretty` and `balance` settled on, by how they were asked.
     settled: Vec<(Breaking, f32)>,
@@ -359,28 +379,28 @@ fn hash_of(content: &str, key: &ShapeKey) -> u64 {
     h.finish()
 }
 
-/// The font stack of style `family`: ours, then the generic family as
-/// Chrome resolves it, as the CSS `"Inter", sans-serif` and `"Geist Mono",
-/// monospace` the reference page sets; what none has falls back per script.
-/// Chrome's `monospace` on macOS is Menlo (its default fixed font), where
+/// The font stack of `family`: its named fonts, then its generic family as
+/// Chrome resolves it, as CSS's `"Inter", sans-serif` and `"Geist Mono",
+/// monospace` do; what none has falls back per script. Chrome's
+/// `monospace` on macOS is Menlo (its default fixed font), where
 /// fontique's is Courier, which lacks the symbols code shows (✓, ✗).
 fn family(family: FontFamily) -> ParleyFamily<'static> {
-    use parley::style::{FontFamilyName, GenericFamily};
+    use parley::style::{FontFamilyName, GenericFamily as Generic};
     use std::borrow::Cow;
-    let mut stack = Vec::with_capacity(3);
-    match family {
-        FontFamily::Sans => {
-            stack.push(FontFamilyName::Named(Cow::Borrowed(SANS)));
-            stack.push(FontFamilyName::Generic(GenericFamily::SansSerif));
-        }
-        FontFamily::Mono => {
-            stack.push(FontFamilyName::Named(Cow::Borrowed(MONO)));
+    let mut stack = Vec::with_capacity(family.names.len().saturating_add(2));
+    stack.extend(family.names.iter().map(|n| FontFamilyName::Named(Cow::Borrowed(*n))));
+    let generic = match family.generic {
+        GenericFamily::SansSerif => Generic::SansSerif,
+        GenericFamily::Serif => Generic::Serif,
+        GenericFamily::Monospace => {
             if cfg!(target_os = "macos") {
                 stack.push(FontFamilyName::Named(Cow::Borrowed("Menlo")));
             }
-            stack.push(FontFamilyName::Generic(GenericFamily::Monospace));
+            Generic::Monospace
         }
-    }
+        GenericFamily::SystemUi => Generic::SystemUi,
+    };
+    stack.push(FontFamilyName::Generic(generic));
     ParleyFamily::List(Cow::Owned(stack))
 }
 
@@ -513,7 +533,15 @@ impl TextSystem {
             .boxes
             .iter()
             .filter(|b| b.at >= start && b.at < end && p.content.get(b.at..).is_some_and(|r| r.starts_with(OBJECT)))
-            .map(|b| (b.at.saturating_sub(start), b.width.to_bits(), b.height.to_bits(), b.id))
+            .map(|b| {
+                (
+                    b.at.saturating_sub(start),
+                    b.width.to_bits(),
+                    b.height.to_bits(),
+                    b.baseline.map_or(u32::MAX, f32::to_bits),
+                    b.id,
+                )
+            })
             .collect();
         // A run padded at its start that starts the piece has no character
         // before it to carry its padding: an inline box on a U+FFFC put
@@ -556,6 +584,7 @@ impl TextSystem {
                 key,
                 layout,
                 broken: None,
+                rows: Vec::new(),
                 shift: 0.0,
                 settled: Vec::new(),
                 lines: Vec::new(),
@@ -630,13 +659,13 @@ impl TextSystem {
         let mut boxes: Vec<InlineBox> = key
             .boxes
             .iter()
-            .map(|&(at, w, h, id)| InlineBox {
+            .map(|&(at, w, h, baseline, id)| InlineBox {
                 id,
                 kind: InlineBoxKind::InFlow,
                 index: at.saturating_add(lead),
                 width: f32::from_bits(w),
                 height: f32::from_bits(h),
-                baseline: None,
+                baseline: (baseline != u32::MAX).then(|| f32::from_bits(baseline)),
                 vertical_align: VerticalAlign::BASELINE,
             })
             .collect();
@@ -714,6 +743,7 @@ impl TextSystem {
             s.layout.break_all_lines(Some(at));
             s.shift = (w - at) * factor;
         }
+        s.rows = rows(&s.layout, &s.key);
         s.broken = Some(how);
     }
 
@@ -726,10 +756,7 @@ impl TextSystem {
         for piece in pieces {
             self.break_piece(piece.hash, how);
             out.push((piece, y));
-            y += self
-                .shaped
-                .get(&piece.hash)
-                .map_or(t.line_height, |s| height(&s.layout, t));
+            y += self.shaped.get(&piece.hash).map_or(t.line_height, |s| height(s, t));
         }
         out
     }
@@ -839,16 +866,16 @@ impl TextSystem {
             if !cached {
                 self.break_piece(piece.hash, how);
                 if let Some(s) = self.shaped.get_mut(&piece.hash) {
-                    let primary = s.layout.root_span_metrics();
                     let lines = s
                         .layout
                         .lines()
-                        .map(|l| {
+                        .zip(&s.rows)
+                        .map(|(l, r)| {
                             let m = l.metrics();
                             LineSize {
                                 width: m.advance - m.hanging_advance,
-                                height: m.line_height,
-                                baseline: line_baseline(m.line_height, m.baseline - m.block_min_coord, primary, t),
+                                height: r.height,
+                                baseline: r.baseline,
                             }
                         })
                         .collect();
@@ -911,16 +938,15 @@ impl TextSystem {
                 }
                 continue;
             }
-            let primary = s.layout.root_span_metrics();
-            for (j, line) in s.layout.lines().enumerate() {
+            for (j, (line, r)) in s.layout.lines().zip(&s.rows).enumerate() {
                 let m = line.metrics();
                 let w = match cut {
                     Some(c) if c.piece == i && c.line == j => c.end - m.offset + c.ellipsis,
                     _ => m.advance - m.hanging_advance,
                 };
                 widest = widest.max(w);
-                baselines.add(height + line_baseline(m.line_height, m.baseline - m.block_min_coord, primary, t));
-                height += m.line_height;
+                baselines.add(height + r.baseline);
+                height += r.height;
                 lines = lines.saturating_add(1);
                 if clamp.is_some_and(|c| lines >= c) {
                     break 'pieces;
@@ -964,7 +990,15 @@ impl TextSystem {
         let Some(s) = self.shaped.get(&piece.hash) else {
             return piece.start;
         };
-        let cursor = ParleyCursor::from_point(&s.layout, x - s.shift, y - top);
+        let local = y - top;
+        let local = s
+            .rows
+            .iter()
+            .rev()
+            .find(|r| r.top <= local)
+            .or(s.rows.first())
+            .map_or(local, |r| r.parley(local));
+        let cursor = ParleyCursor::from_point(&s.layout, x - s.shift, local);
         piece.start.saturating_add(cursor.index()).min(piece.end)
     }
 
@@ -991,10 +1025,14 @@ impl TextSystem {
         let (y, height) = if s.layout.is_empty() {
             (0.0, t.line_height)
         } else {
-            (
-                crate::convert::f64_to_f32(g.y0),
-                crate::convert::f64_to_f32(g.y1 - g.y0),
-            )
+            let (y0, y1) = (crate::convert::f64_to_f32(g.y0), crate::convert::f64_to_f32(g.y1));
+            match row_at(&s.rows, y0) {
+                Some(r) if (y0 - r.parley_top).abs() < 0.01 && (y1 - y0 - r.parley_height).abs() < 0.01 => {
+                    (r.top, r.height)
+                }
+                Some(r) => (r.place(y0), y1 - y0),
+                None => (y0, y1 - y0),
+            }
         };
         Caret {
             x: crate::convert::f64_to_f32(g.x0) + s.shift,
@@ -1043,11 +1081,20 @@ impl TextSystem {
                 ParleyCursor::from_byte_index(&s.layout, b, Affinity::Upstream),
             );
             for (bb, _) in sel.geometry(&s.layout) {
+                let (y0, y1) = (crate::convert::f64_to_f32(bb.y0), crate::convert::f64_to_f32(bb.y1));
+                // Our line's box where Parley covers its whole line.
+                let (y0, y1) = match row_at(&s.rows, y0) {
+                    Some(r) if (y0 - r.parley_top).abs() < 0.01 && (y1 - y0 - r.parley_height).abs() < 0.01 => {
+                        (r.top, r.top + r.height)
+                    }
+                    Some(r) => (r.place(y0), r.place(y1)),
+                    None => (y0, y1),
+                };
                 boxes.push(Bounds {
                     x: crate::convert::f64_to_f32(bb.x0) + s.shift,
-                    y: top + crate::convert::f64_to_f32(bb.y0),
+                    y: top + y0,
                     width: crate::convert::f64_to_f32(bb.x1 - bb.x0).max(1.0),
-                    height: crate::convert::f64_to_f32(bb.y1 - bb.y0),
+                    height: y1 - y0,
                 });
             }
         }
@@ -1067,7 +1114,7 @@ impl TextSystem {
             let Some(s) = self.shaped.get(&piece.hash) else {
                 continue;
             };
-            for line in s.layout.lines() {
+            for (line, row) in s.layout.lines().zip(&s.rows) {
                 for item in line.items() {
                     if let PositionedLayoutItem::InlineBox(b) = item
                         && padding_of(b.id).is_none()
@@ -1076,7 +1123,7 @@ impl TextSystem {
                             b.id,
                             Bounds {
                                 x: b.x + s.shift,
-                                y: top + b.y,
+                                y: top + row.place(b.y),
                                 width: b.width,
                                 height: b.height,
                             },
@@ -1138,7 +1185,7 @@ impl TextSystem {
                 }
                 // Into the piece above or below, at the same x.
                 let x = crate::convert::f64_to_f32(line.x0) + s.shift;
-                let y = if up { top - 0.5 } else { top + height(layout, t) + 0.5 };
+                let y = if up { top - 0.5 } else { top + height(s, t) + 0.5 };
                 if (up && pi == 0) || (!up && pi.saturating_add(1) >= laid.len()) {
                     return if up { 0 } else { content.len() };
                 }
@@ -1241,14 +1288,13 @@ impl TextSystem {
                 shown = shown.saturating_add(1);
                 continue;
             }
-            let primary = layout.root_span_metrics();
-            for (li, line) in layout.lines().enumerate() {
+            for (li, (line, row)) in layout.lines().zip(&s.rows).enumerate() {
                 if clamp.is_some_and(|c| shown >= c) {
                     break 'pieces;
                 }
                 shown = shown.saturating_add(1);
                 let m = line.metrics();
-                let line_top = top + m.block_min_coord;
+                let line_top = top + row.top;
                 // A long text in a scroll container: only the lines in view
                 // cost anything; a line's ink may reach past its box, so it
                 // counts as shown a line's height either side.
@@ -1259,14 +1305,7 @@ impl TextSystem {
                         continue;
                     }
                 }
-                let device = baseline(
-                    origin.1 + line_top,
-                    m.line_height,
-                    m.baseline - m.block_min_coord,
-                    primary,
-                    t,
-                    scale,
-                );
+                let device = baseline(origin.1 + line_top + row.baseline, scale);
                 let base = device / scale;
                 let cut_end = cut.filter(|c| c.piece == pi && c.line == li).map(|c| c.end);
                 let x0 = origin.0 + s.shift;
@@ -1665,50 +1704,123 @@ fn quarter(x: f32) -> (f32, u8) {
 }
 
 /// The height of a piece's lines; an empty piece is one line high.
-fn height(layout: &Layout<u32>, t: &ResolvedText) -> f32 {
-    if layout.is_empty() {
-        t.line_height
-    } else {
-        layout.height()
+fn height(s: &Shaped, t: &ResolvedText) -> f32 {
+    s.rows.last().map_or(t.line_height, |r| r.top + r.height)
+}
+
+/// One line of a piece as Blink boxes it: where it starts below the
+/// piece's top, its height and its baseline below its top; and where
+/// Parley put its top and baseline, and its height there, which what is in
+/// the line (glyphs, inline boxes, carets) is placed against.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Row {
+    top: f32,
+    height: f32,
+    baseline: f32,
+    parley_top: f32,
+    parley_baseline: f32,
+    parley_height: f32,
+}
+
+impl Row {
+    /// Where Parley's `y` in this line lies in ours: the line's content
+    /// keeps its place against the baseline.
+    fn place(&self, y: f32) -> f32 {
+        self.top + self.baseline + (y - self.parley_baseline)
+    }
+
+    /// Where our `y` in this line lies in Parley's lines.
+    fn parley(&self, y: f32) -> f32 {
+        (self.parley_baseline + (y - self.top - self.baseline))
+            .clamp(self.parley_top, self.parley_top + self.parley_height)
     }
 }
 
-/// Where a line whose top is at window `y` has its baseline, in device
-/// pixels, as Blink places it: the primary font's ascent and descent each
-/// rounded to whole pixels (`SimpleFontData`) and the half of the leading
-/// above them floored (`CalculateLeadingSpace`), so the baseline lies a whole
-/// number of pixels below the line's top (measured in Chrome: Geist Mono at
-/// 14px on a 22.75px line has its 18px content box 2px below each line's
-/// top, not 2.375px); then on the nearest device pixel, a half rounding up
-/// as Skia draws horizontal text. A line taller than the paragraph's line
-/// height (a larger run, an inline box) keeps Parley's baseline.
-fn baseline(
-    y: f32,
-    line_height: f32,
-    parley_offset: f32,
-    primary: Option<parley::SpanMetrics>,
-    t: &ResolvedText,
-    scale: f32,
-) -> f32 {
-    ((y + line_baseline(line_height, parley_offset, primary, t)) * scale + 0.5).floor()
+/// The span box of a font whose primary font has `m`, on a line `line_height`
+/// tall, as Blink sizes it: its ascent and descent each rounded to whole
+/// pixels (`SimpleFontData`) and the half of the leading above them floored
+/// (`CalculateLeadingSpace`); how far it reaches above and below its
+/// baseline. Its baseline so lies a whole number of pixels below its top
+/// (measured in Chrome: Geist Mono at 14px on a 22.75px line has its 18px
+/// content box 2px below each line's top, not 2.375px).
+fn blink_box(m: parley::SpanMetrics, line_height: f32) -> (f32, f32) {
+    let (ascent, descent) = (m.ascent.round(), m.descent.round());
+    let over = ((line_height - (ascent + descent)) / 2.0).floor() + ascent;
+    (over, line_height - over)
+}
+
+/// The boxes of `layout`'s lines as broken, by Blink's rules (ADR-0005):
+/// the line box holds the paragraph's strut and every span box and inline
+/// box on the line, each aligned on its baseline where Parley aligned it,
+/// the strut and span boxes sized by [`blink_box`]. Parley sizes them from
+/// unrounded metrics, so a line an inline box grows (a 24px button on a
+/// 14px/22.75 line) would be 24.43 tall where Chrome's is 24 (16 above
+/// the baseline, the box's, and 6.75 below, the strut's); a line nothing
+/// grows is the paragraph's line height with Blink's baseline.
+fn rows(layout: &Layout<u32>, key: &ShapeKey) -> Vec<Row> {
+    let line_height_of = |brush: u32| {
+        let style = match brush.checked_sub(1) {
+            Some(i) => key.runs.iter().find(|r| r.index == i).map_or(&key.base, |r| &r.style),
+            None => &key.base,
+        };
+        f32::from_bits(style.line_height)
+    };
+    let primary = layout.root_span_metrics();
+    let mut top = 0.0;
+    let mut out = Vec::with_capacity(layout.len());
+    for line in layout.lines() {
+        let m = line.metrics();
+        let (mut over, mut under) = match primary {
+            Some(p) => blink_box(p, line_height_of(0)),
+            None => (m.baseline - m.block_min_coord, m.block_max_coord - m.baseline),
+        };
+        for item in line.items() {
+            match item {
+                PositionedLayoutItem::GlyphRun(run) => {
+                    let (o, u) = blink_box(run.span_metrics(), line_height_of(run.style().brush));
+                    // How far its baseline is above the line's.
+                    let shift = m.baseline - run.baseline();
+                    over = over.max(o + shift);
+                    under = under.max(u - shift);
+                }
+                PositionedLayoutItem::InlineBox(b) => {
+                    over = over.max(m.baseline - b.y);
+                    under = under.max(b.y + b.height - m.baseline);
+                }
+            }
+        }
+        let height = over + under;
+        out.push(Row {
+            top,
+            height,
+            baseline: over,
+            parley_top: m.block_min_coord,
+            parley_baseline: m.baseline,
+            parley_height: m.block_max_coord - m.block_min_coord,
+        });
+        top += height;
+    }
+    out
+}
+
+/// The row of `rows` holding Parley's `y`.
+fn row_at(rows: &[Row], y: f32) -> Option<&Row> {
+    rows.iter().rev().find(|r| r.parley_top <= y + 0.01).or(rows.first())
+}
+
+/// A line's baseline at window `y` ([`Row::baseline`] below its top,
+/// Blink's), in device pixels: on the nearest one, a half rounding up as
+/// Skia draws horizontal text.
+fn baseline(y: f32, scale: f32) -> f32 {
+    (y * scale + 0.5).floor()
 }
 
 /// The baseline of an empty piece's one line: its primary font's, by
-/// Blink's rounding, else at the line's bottom.
+/// Blink's rounding ([`blink_box`]), else at the line's bottom.
 fn empty_baseline(layout: &Layout<u32>, t: &ResolvedText) -> f32 {
-    line_baseline(t.line_height, t.line_height, layout.root_span_metrics(), t)
-}
-
-/// How far below its top a line has its baseline, in layout pixels, by
-/// Blink's rounding ([`baseline`]); layout aligns text on it.
-fn line_baseline(line_height: f32, parley_offset: f32, primary: Option<parley::SpanMetrics>, t: &ResolvedText) -> f32 {
-    match primary {
-        Some(m) if (line_height - t.line_height).abs() < 0.01 => {
-            let (ascent, descent) = (m.ascent.round(), m.descent.round());
-            ((line_height - (ascent + descent)) / 2.0).floor() + ascent
-        }
-        _ => parley_offset,
-    }
+    layout
+        .root_span_metrics()
+        .map_or(t.line_height, |m| blink_box(m, t.line_height).0)
 }
 
 /// The narrowest width at which `layout` keeps the line count it has at

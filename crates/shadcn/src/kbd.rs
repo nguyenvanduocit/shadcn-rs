@@ -1,36 +1,44 @@
 //! Kbd (`ui/kbd`): a keyboard key, and a group of keys.
 
-use gui::{Div, Styled, div};
+use gui::prelude::*;
+use gui::{Div, div};
 
 use crate::theme::theme;
 
-/// One key; put its label (text, or an icon at `.size(3.0)` as shadcn's
+/// One key; put its label (text, or an icon at `.size(12.0)` as shadcn's
 /// `[&_svg]:size-3`) in with `.child`.
 #[must_use]
 pub fn kbd() -> Div {
     let t = theme();
     div()
         .named("kbd")
-        .bg(t.muted)
+        .background(t.muted)
         .text_color(t.muted_foreground)
         .pass_through()
-        .inline_flex()
-        .h(5.0)
-        .min_w(5.0)
-        .items_center()
-        .justify_center()
-        .gap(1.0)
-        .rounded_sm()
-        .px(1.0)
-        .font_sans()
-        .text_xs()
-        .font_medium()
+        .display(Display::Flex)
+        .inline(true)
+        .height(20.0)
+        .min_width(20.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(4.0)
+        .radius(6.0)
+        .padding_x(4.0)
+        .font_family(FontFamily::INTER)
+        .text_size(12.0)
+        .line_height(16.0)
+        .font_weight(500)
 }
 
 /// Keys pressed together.
 #[must_use]
 pub fn kbd_group() -> Div {
-    div().named("kbd-group").inline_flex().items_center().gap(1.0)
+    div()
+        .named("kbd-group")
+        .display(Display::Flex)
+        .inline(true)
+        .align_items(Align::Center)
+        .gap(4.0)
 }
 
 /// A key inside a tooltip, inverted with it
@@ -40,6 +48,6 @@ pub fn kbd_group() -> Div {
 pub fn kbd_on_tooltip() -> Div {
     let t = theme();
     kbd()
-        .bg(t.background.opacity(if t.dark { 0.1 } else { 0.2 }))
+        .background(t.background.opacity(if t.dark { 0.1 } else { 0.2 }))
         .text_color(t.background)
 }

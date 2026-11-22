@@ -12,6 +12,7 @@ use gui::{
     text_input, use_context, use_model, watch,
 };
 
+use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
@@ -259,28 +260,32 @@ pub fn number_field() -> Part<NumberFieldProps> {
         format: NumberFormat::default(),
         disabled: false,
     };
-    Part::new(props, div().named("number-field").grid().gap(1.5), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let value = use_model(props, |p| &p.props.value);
-            let (bounds, format) = props.with_untracked(|p| (p.props.bounds, p.props.format));
-            let field = TextField::new(format.format(bounds.fit(value.get_untracked())));
-            let ctx = NumberFieldContext { value, field, props };
-            // What was typed applies when the input loses focus.
-            watch(
-                move || field.focus.is_focused(),
-                move |focused, _| {
-                    if !*focused {
-                        ctx.apply_text();
-                    }
-                },
-            );
-            // A value written from outside shows formatted.
-            watch(move || value.get(), move |v, _| ctx.show(*v));
-            provide(ctx);
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        props,
+        div().named("number-field").display(Display::Grid).gap(6.0),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let value = use_model(props, |p| &p.props.value);
+                let (bounds, format) = props.with_untracked(|p| (p.props.bounds, p.props.format));
+                let field = TextField::new(format.format(bounds.fit(value.get_untracked())));
+                let ctx = NumberFieldContext { value, field, props };
+                // What was typed applies when the input loses focus.
+                watch(
+                    move || field.focus.is_focused(),
+                    move |focused, _| {
+                        if !*focused {
+                            ctx.apply_text();
+                        }
+                    },
+                );
+                // A value written from outside shows formatted.
+                watch(move || value.get(), move |v, _| ctx.show(*v));
+                provide(ctx);
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 impl Part<NumberFieldProps> {
@@ -333,7 +338,7 @@ impl Part<NumberFieldProps> {
 /// The box the input and its two buttons share.
 #[must_use]
 pub fn number_field_content() -> Div {
-    div().named("number-field-content").relative()
+    div().named("number-field-content").position(Position::Relative)
 }
 
 /// The input; the buttons sit over its sides. shadcn-vue's `pl-5 pr-5` for
@@ -353,24 +358,45 @@ pub fn number_field_input() -> Part<()> {
                 let t = theme();
                 text_input(&ctx.field)
                     .named("number-field-input")
-                    .transition_colors()
+                    .transition(Properties::COLORS)
                     .placeholder_color(t.muted_foreground)
                     .selection_color(t.primary.opacity(0.35))
                     .text_color(t.foreground)
-                    .flex()
-                    .h(9.0)
-                    .w_full()
-                    .rounded_md()
-                    .border()
+                    .display(Display::Flex)
+                    .height(36.0)
+                    .width(pct(100.0))
+                    .radius(8.0)
+                    .border(1.0)
                     .border_color(t.input)
-                    .bg(Color::TRANSPARENT)
-                    .py(1.0)
-                    .text_sm()
-                    .text_center()
-                    .shadow_sm()
+                    .background(Color::TRANSPARENT)
+                    .padding_y(4.0)
+                    .text_size(14.0)
+                    .line_height(20.0)
+                    .text_align(TextAlign::Center)
+                    .shadow([
+                        Shadow {
+                            x: 0.0,
+                            y: 1.0,
+                            blur: 3.0,
+                            spread: 0.0,
+                            color: Color::BLACK.opacity(0.1),
+                        },
+                        Shadow {
+                            x: 0.0,
+                            y: 1.0,
+                            blur: 2.0,
+                            spread: -1.0,
+                            color: Color::BLACK.opacity(0.1),
+                        },
+                    ])
                     .disabled(ctx.disabled())
-                    .focus_visible(move |s| s.ring(1.0, t.ring))
-                    .disabled_style(|s| s.opacity(0.5).cursor_not_allowed())
+                    .with_interaction(|mut d, i| {
+                        let base = d.style_mut().ring;
+                        let focused = Ring::new(1.0, t.ring);
+                        d.ring(move || if i.focus_visible() { Some(focused) } else { base })
+                            .dim_disabled(i, 0.5)
+                            .cursor_disabled(i)
+                    })
                     .on_key_down(move |ev| {
                         match &ev.key {
                             Key::Named(NamedKey::ArrowUp) => ctx.step_by(1.0),
@@ -407,13 +433,13 @@ pub fn number_field_increment() -> Part<()> {
 fn stepper(name: &'static str, glyph: Icon, steps: f64) -> Part<()> {
     let root = div()
         .named(name)
-        .absolute()
-        .top_len(gui::relative(0.5))
-        .mt(-5.0)
-        .p(3.0)
+        .position(Position::Absolute)
+        .top(gui::Length::Fraction(0.5))
+        .margin_top(-20.0)
+        .padding(12.0)
         .when(steps < 0.0, |d| d.left(0.0))
         .when(steps > 0.0, |d| d.right(0.0))
-        .disabled_style(|s| s.opacity(0.2).cursor_not_allowed())
+        .with_interaction(|d, i| d.dim_disabled(i, 0.2).cursor_disabled(i))
         .child(icon(glyph));
     // `Part::new` takes a plain `fn`, so each sign has its own.
     if steps < 0.0 {

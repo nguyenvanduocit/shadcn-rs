@@ -14,9 +14,9 @@ pub fn render() -> Render {
         page(
             "Alert Dialog",
             div()
-                .flex_col()
-                .items_start()
-                .gap(4.0)
+                .display(Display::Flex).flex_direction(FlexDirection::Column)
+                .align_items(Align::Start)
+                .gap(16.0)
                 .child(demo(
                     "AlertDialogDemo.vue",
                     alert_dialog()
@@ -33,7 +33,7 @@ pub fn render() -> Render {
                                     .child(alert_dialog_action(move || count.update(|n| *n = n.saturating_add(1))).child("Continue")),
                             )),
                 ))
-                .child(text_bound(move || format!("Continued {} times", confirmed.get())).text_sm()),
+                .child(text_bound(move || format!("Continued {} times", confirmed.get())).text_size(14.0).line_height(20.0)),
         )
     })
 }

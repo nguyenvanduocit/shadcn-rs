@@ -13,7 +13,7 @@
 //!
 //! ```ignore
 //! select()
-//!     .w_px(180.0)
+//!     .width(180.0)
 //!     .child(select_value("Select a fruit"))
 //!     .child(select_content().child(select_item("apple", "Apple")))
 //! ```
@@ -22,11 +22,12 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
+use gui::Color;
 use gui::Properties;
 use gui::clock::{self, TimerId};
 use gui::prelude::*;
 use gui::{
-    Bind, Div, Element, ElementKey, Icon, Model, NamedKey, Placement, ScrollHandle, Side, SideAlign, Signal, Slot,
+    Bind, Div, Element, ElementKey, Icon, Model, NamedKey, Positioning, ScrollHandle, Side, SideAlign, Signal, Slot,
     UseModel, component, div, icon, key_of, provide, text, use_context, use_model,
 };
 
@@ -35,7 +36,7 @@ use crate::dropdown_menu::{MenuItem, MenuNav, MenuState, menu_picks, menu_row, m
 use crate::part::Part;
 use gui::style::Origin;
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::motion::popper;
 use crate::theme::theme;
 
@@ -305,27 +306,38 @@ pub fn select_multiple() -> Part<SelectProps<Vec<String>>> {
 
 fn root<M: SelectModel>() -> Part<SelectProps<M>> {
     let t = theme();
+    let i = Interaction::new();
     let trigger = div()
         .named("select-trigger")
-        .transition_props(Properties::COLOR | Properties::SHADOW)
+        .interaction(i)
+        .transition(Properties::COLOR | Properties::SHADOW)
         .border_color(t.input)
         .when(t.dark, |d| {
-            d.bg(t.input.opacity(0.3)).hover(move |s| s.bg(t.input.opacity(0.5)))
+            d.background(t.input.opacity(0.3))
+                .background_while(move || i.hovered(), t.input.opacity(0.5))
         })
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap(2.0)
-        .rounded_md()
-        .border()
-        .px(3.0)
-        .py(2.0)
-        .text_sm()
-        .whitespace_nowrap()
-        .shadow_xs()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.cursor_not_allowed().opacity(0.5))
-        .h(9.0);
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Between)
+        .gap(8.0)
+        .radius(8.0)
+        .border(1.0)
+        .padding_x(12.0)
+        .padding_y(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .nowrap(true)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .focus_ring_on(i, &t)
+        .cursor_disabled(i)
+        .dim_disabled(i, 0.5)
+        .height(36.0);
     let props = SelectProps {
         value: Bind::default(),
         open: Bind::default(),
@@ -426,8 +438,8 @@ impl<M: SelectModel> Part<SelectProps<M>> {
     #[must_use]
     pub fn size(self, size: SelectSize) -> Self {
         match size {
-            SelectSize::Default => self.h(9.0),
-            SelectSize::Sm => self.h(8.0),
+            SelectSize::Default => self.height(36.0),
+            SelectSize::Sm => self.height(32.0),
         }
     }
 
@@ -474,7 +486,10 @@ impl IntoElement for SelectValue {
                 text(shown)
                     .named("select-value")
                     .key(value_key())
-                    .truncate()
+                    .truncate(true)
+                    .nowrap(true)
+                    .overflow_x(Overflow::Hidden)
+                    .min_width(0.0)
                     .into_element()
             }
         })
@@ -502,16 +517,32 @@ pub fn select_content() -> Part<SelectContentProps> {
     let t = theme();
     let root = popper(div(), Origin::CENTER)
         .named("select-content")
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .relative()
-        .flex_col()
-        .min_w_px(128.0)
-        .overflow_hidden()
-        .rounded_md()
-        .border()
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .min_width(128.0)
+        .overflow(Overflow::Hidden)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .shadow_md();
+        .shadow([
+            Shadow {
+                x: 0.0,
+                y: 4.0,
+                blur: 6.0,
+                spread: -1.0,
+                color: Color::BLACK.opacity(0.1),
+            },
+            Shadow {
+                x: 0.0,
+                y: 2.0,
+                blur: 4.0,
+                spread: -2.0,
+                color: Color::BLACK.opacity(0.1),
+            },
+        ]);
     Part::new(SelectContentProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -561,15 +592,16 @@ fn list(select: &SelectContext, position: SelectPosition, root: Div) -> Element 
     // percentage would resolve before the root's min width applies.
     let viewport = div()
         .named("select-viewport")
-        .min_h(0.0)
-        .overflow_y_scroll()
-        .scrollbar_none()
+        .min_height(0.0)
+        .overflow_y(Overflow::Scroll)
+        .overflow_x(Overflow::Hidden)
+        .scrollbar_hidden(true)
         .track_scroll(&handle)
-        .p(1.0);
+        .padding(4.0);
     let mut root = if open {
         select.menu.content(root).into_element()
     } else {
-        root.hidden().into_element()
+        root.display(Display::None).into_element()
     };
     if let Some(kids) = root.children_mut() {
         let items = std::mem::take(kids);
@@ -587,14 +619,14 @@ fn list(select: &SelectContext, position: SelectPosition, root: Div) -> Element 
         return root;
     }
     let placement = match position {
-        SelectPosition::Popper => Placement::Anchored {
+        SelectPosition::Popper => Positioning::Anchored {
             side: Side::Bottom,
             align: SideAlign::Start,
             offset: 4.0,
             match_width: true,
             fit_height: true,
         },
-        SelectPosition::ItemAligned => Placement::Over {
+        SelectPosition::ItemAligned => Positioning::Over {
             part: aligned_key(),
             anchor_part: value_key(),
         },
@@ -609,12 +641,12 @@ fn scroll_button(scroll: &Scroll, chevron: Icon, dy: f32) -> Div {
     let hover = scroll.clone();
     div()
         .named("select-scroll-button")
-        .flex()
-        .shrink_0()
-        .cursor_default()
-        .items_center()
-        .justify_center()
-        .py(1.0)
+        .display(Display::Flex)
+        .flex_shrink(0.0)
+        .cursor(Cursor::Default)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .padding_y(4.0)
         .on_hover(move |inside| {
             if inside {
                 hover.step(dy);
@@ -637,9 +669,10 @@ pub fn select_label(label: &str) -> Div {
     div()
         .named("select-label")
         .text_color(t.muted_foreground)
-        .px(2.0)
-        .py(1.5)
-        .text_xs()
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .text_size(12.0)
+        .line_height(16.0)
         .child(label.to_owned())
 }
 
@@ -761,17 +794,17 @@ fn item(select: &SelectContext, position: SelectPosition, p: &SelectItem) -> Div
     let item_text = text(p.label.clone()).named("select-item-text");
     let d = menu_row(&t, menu_item, select.menu.is_highlighted(&p.label))
         .named("select-item")
-        .w_full()
-        .pl(2.0)
-        .pr(8.0)
+        .width(pct(100.0))
+        .padding_left(8.0)
+        .padding_right(32.0)
         .child(
             div()
-                .absolute()
-                .right(2.0)
-                .flex()
-                .size(3.5)
-                .items_center()
-                .justify_center()
+                .position(Position::Absolute)
+                .right(8.0)
+                .display(Display::Flex)
+                .size(14.0)
+                .align_items(Align::Center)
+                .justify_content(Justify::Center)
                 .child(chosen.then(|| icon(Icon::Check).text_color(t.muted_foreground))),
         )
         .child(if aligned {
@@ -835,7 +868,7 @@ mod tests {
             move || {
                 div()
                     .child(
-                        select().open(open).w_px(180.0).child(select_value("Pick")).child(
+                        select().open(open).width(180.0).child(select_value("Pick")).child(
                             select_content()
                                 .children(["a", "b", "c"].map(|v| select_item(v, v.to_uppercase()).child(probe()))),
                         ),

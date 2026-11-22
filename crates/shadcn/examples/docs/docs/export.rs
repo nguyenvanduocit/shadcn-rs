@@ -98,9 +98,9 @@ pub fn export(path: &Path) -> std::io::Result<()> {
         .chain(&catalog.components)
         .filter_map(|&r| page(&catalog, &verdicts, r))
         .collect();
-    let tokens: Vec<String> = tokens(Theme::light())
+    let tokens: Vec<String> = tokens(Theme::default().colors.light.painted())
         .into_iter()
-        .zip(tokens(Theme::dark()))
+        .zip(tokens(Theme::default().colors.dark.painted()))
         .map(|((name, light), (_, dark))| {
             format!(
                 "{{\"name\":{},\"light\":{},\"dark\":{}}}",

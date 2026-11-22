@@ -39,12 +39,15 @@ impl Easing {
     pub const EASE_OUT: Self = Self::CubicBezier(0.0, 0.0, 0.58, 1.0);
     /// CSS `ease-in-out`.
     pub const EASE_IN_OUT: Self = Self::CubicBezier(0.42, 0.0, 0.58, 1.0);
-    /// Tailwind's `ease-in` (`--ease-in`).
-    pub const TW_IN: Self = Self::CubicBezier(0.4, 0.0, 1.0, 1.0);
-    /// Tailwind's `ease-out` (`--ease-out`).
-    pub const TW_OUT: Self = Self::CubicBezier(0.0, 0.0, 0.2, 1.0);
-    /// Tailwind's `ease-in-out` (`--ease-in-out`), and its transitions' default timing.
-    pub const TW_IN_OUT: Self = Self::CubicBezier(0.4, 0.0, 0.2, 1.0);
+    /// `cubic-bezier(0.4, 0, 1, 1)`, leaving fast (Material's accelerate
+    /// curve; Tailwind's `--ease-in`).
+    pub const ACCELERATE: Self = Self::CubicBezier(0.4, 0.0, 1.0, 1.0);
+    /// `cubic-bezier(0, 0, 0.2, 1)`, arriving slow (Material's decelerate
+    /// curve; Tailwind's `--ease-out`).
+    pub const DECELERATE: Self = Self::CubicBezier(0.0, 0.0, 0.2, 1.0);
+    /// `cubic-bezier(0.4, 0, 0.2, 1)` (Material's standard curve;
+    /// Tailwind's `--ease-in-out`), a transition's default timing.
+    pub const STANDARD: Self = Self::CubicBezier(0.4, 0.0, 0.2, 1.0);
 
     /// The output progress at input progress `x` (`0.0..=1.0`): the curve's
     /// `y` where its `x` is `x`.
@@ -165,6 +168,21 @@ pub struct Pose {
     pub height: Option<Extent>,
     /// `background-position-x`, a fraction of the room the background tile moves in.
     pub background_x: Option<f32>,
+}
+
+/// Where an [`Animation::enter`] slides in from, or an
+/// [`Animation::exit`] slides out to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Slide {
+    /// Along the row: `Calc::px(-8.0)` comes in from 8 px to the left,
+    /// `Calc::fraction(1.0)` leaves by its own width to the right.
+    X(Calc),
+    /// Down the column: `Calc::px(-8.0)` comes in from 8 px above.
+    Y(Calc),
+    /// This many pixels toward the anchor of its layer, on whichever side
+    /// the layer opened ([`crate::Placement::side`]; reka's `data-side`
+    /// with tw-animate's four `slide-in-from-*` at once).
+    FromAnchor(f32),
 }
 
 /// A keyframe: a [`Pose`] at a share `at` (`0.0..=1.0`) of the animation.
@@ -310,25 +328,15 @@ impl Animation {
         self.edge(|p| p.scale = Some(scale))
     }
 
-    /// `slide-in-from-left-n` is `slide_x(Calc::px(-n * 4.0))`, `slide-out-to-right` is
-    /// `slide_x(Calc::fraction(1.0))`.
+    /// Where it slides from (`slide-in-from-*`) or to (`slide-out-to-*`)
+    /// at the edge.
     #[must_use]
-    pub fn slide_x(self, x: Calc) -> Self {
-        self.edge(|p| p.translate_x = Some(x))
-    }
-
-    /// `slide-in-from-top-n` is `slide_y(Calc::px(-n * 4.0))`.
-    #[must_use]
-    pub fn slide_y(self, y: Calc) -> Self {
-        self.edge(|p| p.translate_y = Some(y))
-    }
-
-    /// shadcn's `data-[side=bottom]:slide-in-from-top-n` and its three
-    /// siblings at once: `n` Tailwind units toward the anchor of the layer,
-    /// on whichever side it opened.
-    #[must_use]
-    pub fn slide_from_anchor(self, n: f32) -> Self {
-        self.edge(|p| p.toward_anchor = Some(n * crate::styled::UNIT))
+    pub fn slide(self, slide: Slide) -> Self {
+        self.edge(|p| match slide {
+            Slide::X(x) => p.translate_x = Some(x),
+            Slide::Y(y) => p.translate_y = Some(y),
+            Slide::FromAnchor(px) => p.toward_anchor = Some(px),
+        })
     }
 
     /// `animate-accordion-down` (and `animate-collapsible-down`): height
@@ -496,17 +504,28 @@ impl Mix for Option<Color> {
 /// Tailwind draws the ring as a box shadow, which eases from `0 0 #0000`.
 impl Mix for Option<Ring> {
     fn mix(&self, to: &Self, t: f32) -> Self {
-        let none = Ring {
+        let none = |r: &Ring| Ring {
             width: 0.0,
+            offset: r.offset,
             color: Color::TRANSPARENT,
+            corners: r.corners,
         };
         match (self, to) {
             (None, None) => None,
             (a, b) => {
-                let (a, b) = (a.unwrap_or(none), b.unwrap_or(none));
+                // A ring easing in or out keeps the offset and corners of
+                // the one shown; between two, the corners switch halfway.
+                let (a, b) = match (a, b) {
+                    (Some(a), Some(b)) => (*a, *b),
+                    (Some(a), None) => (*a, none(a)),
+                    (None, Some(b)) => (none(b), *b),
+                    (None, None) => return None,
+                };
                 Some(Ring {
                     width: a.width.mix(&b.width, t),
+                    offset: a.offset.mix(&b.offset, t),
                     color: a.color.mix(&b.color, t),
+                    corners: if t < 0.5 { a.corners } else { b.corners },
                 })
             }
         }
@@ -514,7 +533,7 @@ impl Mix for Option<Ring> {
 }
 
 /// CSS pads the shorter shadow list with transparent zero shadows.
-impl Mix for Vec<Shadow> {
+impl Mix for crate::style::Shadows {
     fn mix(&self, to: &Self, t: f32) -> Self {
         let none = Shadow {
             x: 0.0,
@@ -728,7 +747,7 @@ struct NodeState {
     color: Option<Track<Color>>,
     opacity: Option<Track<f32>>,
     ring: Option<Track<Option<Ring>>>,
-    shadows: Option<Track<Vec<Shadow>>>,
+    shadows: Option<Track<crate::style::Shadows>>,
     translate_x: Option<Track<Calc>>,
     translate_y: Option<Track<Calc>>,
     scale: Option<Track<f32>>,
@@ -1215,7 +1234,7 @@ impl Motion {
 fn transitions(state: &mut NodeState, style: &mut Style, m: &MotionStyle, still: bool, now: f32, busy: &mut Busy) {
     let timing = Timing {
         duration: m.duration.unwrap_or(0.15),
-        easing: m.easing.unwrap_or(Easing::TW_IN_OUT),
+        easing: m.easing.unwrap_or(Easing::STANDARD),
         delay: m.delay.unwrap_or(0.0),
     };
     let listed = m.transition;
@@ -1234,9 +1253,9 @@ fn transitions(state: &mut NodeState, style: &mut Style, m: &MotionStyle, still:
         now,
         busy,
     );
-    // An inherited colour is the parent's to ease.
-    match style.text.color {
-        Some(c) => style.text.color = Some(transition(&mut state.color, c, on(Properties::COLOR), now, busy)),
+    // A colour provided above is its provider's to ease.
+    match style.content.color {
+        Some(c) => style.content.color = Some(transition(&mut state.color, c, on(Properties::COLOR), now, busy)),
         None => state.color = None,
     }
     style.opacity = transition(&mut state.opacity, style.opacity, on(Properties::OPACITY), now, busy);
@@ -1555,14 +1574,23 @@ fn siblings_at<'a>(root: &'a mut Element, path: &[PathSeg]) -> Option<&'a mut Ve
     for seg in rest {
         at = child_mut(kids_mut(at)?, *seg)?;
     }
-    kids_mut(at)
+    boxed_mut(at)
 }
 
-fn kids_mut(el: &mut Element) -> Option<&mut Vec<Element>> {
+/// The children of a box, to put one back among: a paragraph's atomic
+/// inlines stand on its content, and one leaving goes with its place.
+fn boxed_mut(el: &mut Element) -> Option<&mut Vec<Element>> {
     match el {
         Element::Div(d) => Some(&mut Rc::make_mut(d).kind),
-        Element::Deferred(d) => kids_mut(&mut Rc::make_mut(d).child),
+        Element::Deferred(d) => boxed_mut(&mut Rc::make_mut(d).child),
         _ => None,
+    }
+}
+
+fn kids_mut(el: &mut Element) -> Option<&mut [Element]> {
+    match el {
+        Element::Deferred(d) => kids_mut(&mut Rc::make_mut(d).child),
+        _ => el.kids_mut(),
     }
 }
 
@@ -1602,11 +1630,10 @@ fn holds(root: &Element, path: &[PathSeg]) -> bool {
     !matches!(at, Element::Empty)
 }
 
-fn kids(el: &Element) -> Option<&Vec<Element>> {
+fn kids(el: &Element) -> Option<&[Element]> {
     match el {
-        Element::Div(d) => Some(&d.kind),
         Element::Deferred(d) => kids(&d.child),
-        _ => None,
+        _ => el.kids(),
     }
 }
 
@@ -1656,8 +1683,8 @@ fn inert(el: &mut Element) {
         c.focusable = false;
         c.pass_through = true;
     }
-    if let Element::Div(d) = el {
-        Rc::make_mut(d).kind.iter_mut().for_each(inert);
+    if let Some(kids) = el.kids_mut() {
+        kids.iter_mut().for_each(inert);
     }
 }
 

@@ -1,10 +1,35 @@
-//! Where a layer goes ([`Placement`]): beside its anchor, on the side with
-//! room and kept on screen (floating-ui's `flip`, `shift` and `size`, which
-//! reka's popper content uses), over its anchor with one of its parts on the
-//! anchor's (reka's item-aligned select), at a point, or over the window.
+//! Where a layer goes ([`Positioning`]): beside its anchor, on the side
+//! with room and kept on screen (floating-ui's `flip`, `shift` and `size`,
+//! which reka's popper content uses), over its anchor with one of its parts
+//! on the anchor's (reka's item-aligned select), at a point, or over the
+//! window; and how it went ([`Placement`]), which a look reads.
 
-use crate::element::{Placement, Side, SideAlign};
+use crate::element::{Positioning, Side, SideAlign};
 use crate::geometry::Bounds;
+
+/// How layout placed an anchored layer (floating-ui's result, as reka's
+/// popper content exposes it: `data-side`, `data-align`,
+/// `--reka-popper-available-width/height`, the anchor's rectangle and
+/// `--reka-popper-transform-origin`). A look reads it through
+/// [`crate::Deferred::placement`]; `gui` moves and scales a layer by it
+/// itself ([`crate::style::Origin::Anchor`], `Slide::FromAnchor`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    /// The side of the anchor it opened on, after flipping.
+    pub side: Side,
+    /// How it lines up with the anchor along that side.
+    pub align: SideAlign,
+    /// The room it may take, width and height: on its side, to the
+    /// window's edge less the margin kept there; across, the window less
+    /// both margins.
+    pub available: (f32, f32),
+    /// The anchor's border box in the window (a point, for a layer at one).
+    pub anchor: Bounds,
+    /// The point of the layer facing the anchor, from its top-left corner:
+    /// the middle of the edge nearest the anchor for a centred layer, the
+    /// edge's start or end for one aligned there.
+    pub origin: (f32, f32),
+}
 
 /// Space kept between a placed layer and the window edge.
 pub(crate) const EDGE_MARGIN: f32 = 8.0;
@@ -56,12 +81,12 @@ fn flip(side: Side, offset: f32, anchor: Bounds, size: (f32, f32), viewport: Bou
 /// than it would take: the room on the side it opens on, for one that fits
 /// its height to it (floating-ui's `size`).
 pub(crate) fn fitted_height(
-    placement: Placement,
+    placement: Positioning,
     anchor: Option<Bounds>,
     size: (f32, f32),
     viewport: Bounds,
 ) -> Option<f32> {
-    let Placement::Anchored {
+    let Positioning::Anchored {
         side,
         offset,
         fit_height: true,
@@ -79,15 +104,20 @@ pub(crate) fn fitted_height(
     (size.1 > room).then_some(room)
 }
 
-/// Where a layer of `size` placed by `placement` goes (not [`Placement::Over`],
+/// Where a layer of `size` placed by `placement` goes (not [`Positioning::Over`],
 /// which [`over`] places).
-pub(crate) fn position(placement: Placement, anchor: Option<Bounds>, size: (f32, f32), viewport: Bounds) -> (f32, f32) {
+pub(crate) fn position(
+    placement: Positioning,
+    anchor: Option<Bounds>,
+    size: (f32, f32),
+    viewport: Bounds,
+) -> (f32, f32) {
     let (w, h) = size;
     let clamp = |v: f32, len: f32, max: f32| v.min(max - len - EDGE_MARGIN).max(EDGE_MARGIN);
     match placement {
-        Placement::Fill | Placement::Over { .. } => (0.0, 0.0),
-        Placement::At { x, y } => (clamp(x, w, viewport.width), clamp(y, h, viewport.height)),
-        Placement::Anchored {
+        Positioning::Fill | Positioning::Over { .. } => (0.0, 0.0),
+        Positioning::At { x, y } => (clamp(x, w, viewport.width), clamp(y, h, viewport.height)),
+        Positioning::Anchored {
             side, align, offset, ..
         } => {
             let a = anchor.unwrap_or_default();
@@ -107,26 +137,75 @@ pub(crate) fn position(placement: Placement, anchor: Option<Bounds>, size: (f32,
     }
 }
 
-/// The side a layer of `size` placed by `placement` opened on and how it
-/// lines up there (reka's `data-side` and `data-align`): an anchored layer's
-/// after flipping, and a layer at a point opens to its right, as reka's
-/// context menu does; `None` for the rest.
+/// How a layer of `size` placed by `placement` went: an anchored layer's
+/// side after flipping and its alignment, and a layer at a point opens to
+/// its right, as reka's context menu does; `None` for the rest.
 pub(crate) fn placed(
-    placement: Placement,
+    placement: Positioning,
     anchor: Option<Bounds>,
     size: (f32, f32),
     viewport: Bounds,
-) -> Option<(Side, SideAlign)> {
-    match placement {
-        Placement::Anchored {
+) -> Option<Placement> {
+    let (side, align, offset, anchor) = match placement {
+        Positioning::Anchored {
             side, align, offset, ..
-        } => Some((flip(side, offset, anchor?, size, viewport), align)),
-        Placement::At { .. } => Some((Side::Right, SideAlign::Start)),
-        Placement::Fill | Placement::Over { .. } => None,
+        } => {
+            let a = anchor?;
+            (flip(side, offset, a, size, viewport), align, offset, a)
+        }
+        Positioning::At { x, y } => (
+            Side::Right,
+            SideAlign::Start,
+            0.0,
+            Bounds {
+                x,
+                y,
+                width: 0.0,
+                height: 0.0,
+            },
+        ),
+        Positioning::Fill | Positioning::Over { .. } => return None,
+    };
+    let across_x = (viewport.width - 2.0 * EDGE_MARGIN).max(0.0);
+    let across_y = (viewport.height - 2.0 * EDGE_MARGIN).max(0.0);
+    let here = room(side, offset, anchor, viewport);
+    let available = match side {
+        Side::Top | Side::Bottom => (across_x, here),
+        Side::Left | Side::Right => (here, across_y),
+    };
+    let mut placed = Placement {
+        side,
+        align,
+        available,
+        anchor,
+        origin: (0.0, 0.0),
+    };
+    placed.origin = placed.facing(size.0, size.1);
+    Some(placed)
+}
+
+impl Placement {
+    /// The point of a box of `width` × `height` in this layer that faces
+    /// the anchor, from its top-left corner: [`Placement::origin`] for the
+    /// layer itself, and the anchor origin ([`crate::style::Origin::Anchor`])
+    /// of any node in it.
+    #[must_use]
+    pub fn facing(&self, width: f32, height: f32) -> (f32, f32) {
+        let along = match self.align {
+            SideAlign::Start => 0.0,
+            SideAlign::Center => 0.5,
+            SideAlign::End => 1.0,
+        };
+        match self.side {
+            Side::Bottom => (width * along, 0.0),
+            Side::Top => (width * along, height),
+            Side::Right => (0.0, height * along),
+            Side::Left => (width, height * along),
+        }
     }
 }
 
-/// Where a [`Placement::Over`] layer goes.
+/// Where a [`Positioning::Over`] layer goes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Over {
     pub origin: (f32, f32),

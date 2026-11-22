@@ -4,6 +4,7 @@
 
 use gui::prelude::*;
 use gui::{Div, Element, Icon, Model, ScenarioError, Signal, TextField, div, icon, text};
+use shadcn::focus::StateLook;
 use shadcn::{
     ButtonSize, ButtonVariant, Orientation, SidebarCollapsible, SidebarMenuButtonProps, SidebarMenuButtonSize,
     SidebarMenuButtonVariant, SidebarMenuSubButtonSize, SidebarSide, SidebarVariant, avatar, avatar_fallback,
@@ -75,28 +76,29 @@ pub fn render() -> Render {
     Box::new(move || {
         let t = theme();
         let frame = |w: Div| {
-            w.h_full()
-                .border()
+            w.height(pct(100.0))
+                .border(1.0)
                 .border_color(t.border)
-                .rounded_lg()
-                .overflow_hidden()
+                .radius(10.0)
+                .overflow(Overflow::Hidden)
         };
         page(
             "Sidebar",
             div()
-                .flex_col()
-                .gap(4.0)
-                .flex_1()
-                .min_h(0.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(16.0)
+                .flex(Flex::grow(1.0))
+                .min_height(0.0)
                 .child(controls(&demo))
                 .child(
                     div()
-                        .flex()
-                        .gap(4.0)
-                        .h_px(472.0)
-                        .shrink_0()
-                        .child(frame(div().flex_1().min_w(0.0)).child(sidebar_07(&demo)))
-                        .child(frame(div().w_px(258.0).shrink_0()).child(parts(&demo))),
+                        .display(Display::Flex)
+                        .gap(16.0)
+                        .height(472.0)
+                        .flex_shrink(0.0)
+                        .child(frame(div().flex(Flex::grow(1.0)).min_width(0.0)).child(sidebar_07(&demo)))
+                        .child(frame(div().width(258.0).flex_shrink(0.0)).child(parts(&demo))),
                 )
                 .child(crate::demo("SidebarDemo.vue", sidebar_demo())),
         )
@@ -117,11 +119,17 @@ fn sidebar_demo() -> Element {
         sidebar_menu_item().child(
             sidebar_menu_button(SidebarMenuButtonProps::default())
                 .child(icon(glyph))
-                .child(text(title).truncate()),
+                .child(
+                    text(title)
+                        .truncate(true)
+                        .nowrap(true)
+                        .overflow_x(Overflow::Hidden)
+                        .min_width(0.0),
+                ),
         )
     }));
     sidebar_provider()
-        .h_px(900.0)
+        .height(900.0)
         .child(
             sidebar().child(
                 sidebar_content().child(
@@ -134,11 +142,11 @@ fn sidebar_demo() -> Element {
         .child(
             sidebar_inset().child(
                 div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px(4.0)
-                    .h(12.0)
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .justify_content(Justify::Between)
+                    .padding_x(16.0)
+                    .height(48.0)
                     .child(sidebar_trigger()),
             ),
         )
@@ -149,24 +157,27 @@ fn sidebar_demo() -> Element {
 fn controls(demo: &Demo) -> Div {
     fn choice<T: Copy + PartialEq + 'static>(signal: &Signal<T>, options: &[(&'static str, T)]) -> Div {
         let current = signal.get();
-        div().flex().gap(1.0).children(options.iter().map(|&(label, value)| {
-            let signal = *signal;
-            let variant = if value == current {
-                ButtonVariant::Secondary
-            } else {
-                ButtonVariant::Ghost
-            };
-            button(variant, ButtonSize::Sm)
-                .child(label)
-                .on_click(move |_| signal.set(value))
-        }))
+        div()
+            .display(Display::Flex)
+            .gap(4.0)
+            .children(options.iter().map(|&(label, value)| {
+                let signal = *signal;
+                let variant = if value == current {
+                    ButtonVariant::Secondary
+                } else {
+                    ButtonVariant::Ghost
+                };
+                button(variant, ButtonSize::Sm)
+                    .child(label)
+                    .on_click(move |_| signal.set(value))
+            }))
     }
     let t = theme();
-    let caption = |s: &'static str| text(s).text_sm().text_color(t.muted_foreground);
+    let caption = |s: &'static str| text(s).text_size(14.0).line_height(20.0).text_color(t.muted_foreground);
     div()
-        .flex()
-        .items_center()
-        .gap(3.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(12.0)
         .child(caption("Variant"))
         .child(choice(
             &demo.variant,
@@ -213,13 +224,13 @@ fn sidebar_07(demo: &Demo) -> Element {
 /// The square logo or avatar at the start of a large menu button.
 fn tile(label: impl IntoElement) -> Div {
     div()
-        .size(8.0)
-        .shrink_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_lg()
-        .overflow_hidden()
+        .size(32.0)
+        .flex_shrink(0.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(10.0)
+        .overflow(Overflow::Hidden)
         .child(label)
 }
 
@@ -234,16 +245,33 @@ fn identity(tile: Div, name: &str, detail: &str) -> Div {
             .child(tile)
             .child(
                 div()
-                    .flex_col()
-                    .flex_1()
-                    .min_w(0.0)
-                    .text_left()
-                    .text_sm()
-                    .leading_tight()
-                    .child(text(name).truncate().font_medium())
-                    .child(text(detail).truncate().text_xs()),
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .flex(Flex::grow(1.0))
+                    .min_width(0.0)
+                    .text_align(TextAlign::Left)
+                    .text_size(14.0)
+                    .line_height(20.0)
+                    .line_height(LineHeight::Relative(1.25))
+                    .child(
+                        text(name)
+                            .truncate(true)
+                            .nowrap(true)
+                            .overflow_x(Overflow::Hidden)
+                            .min_width(0.0)
+                            .font_weight(500),
+                    )
+                    .child(
+                        text(detail)
+                            .truncate(true)
+                            .nowrap(true)
+                            .overflow_x(Overflow::Hidden)
+                            .min_width(0.0)
+                            .text_size(12.0)
+                            .line_height(16.0),
+                    ),
             )
-            .child(icon(Icon::ChevronsUpDown).ml_auto()),
+            .child(icon(Icon::ChevronsUpDown).margin_left(Length::Auto)),
         ),
     )
 }
@@ -251,14 +279,14 @@ fn identity(tile: Div, name: &str, detail: &str) -> Div {
 fn team_switcher() -> Div {
     let t = theme();
     let logo = tile(icon(Icon::GalleryVerticalEnd))
-        .bg(t.sidebar_primary)
+        .background(t.sidebar_primary)
         .text_color(t.sidebar_primary_foreground);
     identity(logo, "Acme Inc", "Enterprise")
 }
 
 fn nav_user() -> Div {
-    let initials = avatar_fallback(None, "CN").map(|f| f.rounded_lg());
-    identity(avatar().rounded_lg().child(initials), "shadcn", "m@example.com")
+    let initials = avatar_fallback(None, "CN").map(|f| f.radius(10.0));
+    identity(avatar().radius(10.0).child(initials), "shadcn", "m@example.com")
 }
 
 fn nav_main(demo: &Demo) -> Div {
@@ -283,15 +311,31 @@ fn nav_main(demo: &Demo) -> Div {
                 });
             })
             .child(icon(glyph))
-            .child(text(title).truncate())
-            .child(icon(Icon::ChevronRight).ml_auto().when(is_open, |i| i.rotate(90.0)));
+            .child(
+                text(title)
+                    .truncate(true)
+                    .nowrap(true)
+                    .overflow_x(Overflow::Hidden)
+                    .min_width(0.0),
+            )
+            .child(
+                icon(Icon::ChevronRight)
+                    .margin_left(Length::Auto)
+                    .when(is_open, |i| i.rotate(90.0)),
+            );
             sidebar_menu_item().child(button).when(is_open, |d| {
                 d.child(sidebar_menu_sub().children(subs.iter().map(|&sub| {
                     let active = demo.active;
                     sidebar_menu_sub_item().child(
                         sidebar_menu_sub_button(SidebarMenuSubButtonSize::Md, sub == current)
                             .on_click(move |_| active.set(sub))
-                            .child(text(sub).truncate()),
+                            .child(
+                                text(sub)
+                                    .truncate(true)
+                                    .nowrap(true)
+                                    .overflow_x(Overflow::Hidden)
+                                    .min_width(0.0),
+                            ),
                     )
                 })))
             })
@@ -309,28 +353,48 @@ fn nav_projects(demo: &Demo) -> Div {
                     is_active: name == current,
                     ..SidebarMenuButtonProps::default()
                 })
-                .pr(8.0)
+                .padding_right(32.0)
                 .on_click(move |_| active.set(name))
                 .child(icon(glyph))
-                .child(text(name).truncate()),
+                .child(
+                    text(name)
+                        .truncate(true)
+                        .nowrap(true)
+                        .overflow_x(Overflow::Hidden)
+                        .min_width(0.0),
+                ),
             )
             .child(sidebar_menu_action(SidebarMenuButtonSize::Default, true).child(icon(Icon::Ellipsis)))
     });
     let more = sidebar_menu_item().child(
         sidebar_menu_button(SidebarMenuButtonProps::default())
-            .text_color(t.sidebar_foreground.opacity(0.7))
+            .when(true, |b| {
+                // Over the button's rest: its hover and press text stay over it.
+                let i = b.node_interaction();
+                let b = b.text_color(t.sidebar_foreground.opacity(0.7));
+                match i {
+                    Some(i) => b.text_color_while(move || i.hovered() || i.pressed(), t.sidebar_accent_foreground),
+                    None => b,
+                }
+            })
             .child(icon(Icon::Ellipsis))
-            .child(text("More").truncate()),
+            .child(
+                text("More")
+                    .truncate(true)
+                    .nowrap(true)
+                    .overflow_x(Overflow::Hidden)
+                    .min_width(0.0),
+            ),
     );
     sidebar_group()
-        .when(demo.icon_collapsed(), Styled::hidden)
+        .when(demo.icon_collapsed(), |e| e.display(Display::None))
         .child(sidebar_group_label().child("Projects"))
         .child(sidebar_menu().children(items).child(more))
 }
 
 fn inset(demo: &Demo) -> impl IntoElement {
     let t = theme();
-    let placeholder = || div().bg(t.muted.opacity(0.5)).rounded_xl();
+    let placeholder = || div().background(t.muted.opacity(0.5)).radius(14.0);
     let crumbs = breadcrumb().child(
         breadcrumb_list()
             .child(breadcrumb_item().child(breadcrumb_link("Building Your Application")))
@@ -340,37 +404,38 @@ fn inset(demo: &Demo) -> impl IntoElement {
     sidebar_inset()
         .child(
             div()
-                .flex()
-                .h(if demo.icon_collapsed() { 12.0 } else { 16.0 })
-                .shrink_0()
-                .items_center()
-                .gap(2.0)
+                .display(Display::Flex)
+                .height((if demo.icon_collapsed() { 12.0 } else { 16.0 }) * 4.0)
+                .flex_shrink(0.0)
+                .align_items(Align::Center)
+                .gap(8.0)
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(2.0)
-                        .px(4.0)
-                        .child(sidebar_trigger().ml(-1.0))
-                        .child(separator(Orientation::Vertical).mr(2.0).h(4.0))
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(8.0)
+                        .padding_x(16.0)
+                        .child(sidebar_trigger().margin_left(-4.0))
+                        .child(separator(Orientation::Vertical).margin_right(8.0).height(16.0))
                         .child(crumbs),
                 ),
         )
         .child(
             div()
-                .flex_col()
-                .flex_1()
-                .gap(4.0)
-                .p(4.0)
-                .pt(0.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .flex(Flex::grow(1.0))
+                .gap(16.0)
+                .padding(16.0)
+                .padding_top(0.0)
                 .child(
                     div()
-                        .grid()
-                        .grid_cols(3)
-                        .gap(4.0)
-                        .children((0..3).map(|_| placeholder().aspect(16.0 / 9.0))),
+                        .display(Display::Grid)
+                        .grid_columns(Tracks::repeat(3, Track::Fr(1.0)))
+                        .gap(16.0)
+                        .children((0..3).map(|_| placeholder().aspect_ratio(16.0 / 9.0))),
                 )
-                .child(placeholder().flex_1()),
+                .child(placeholder().flex(Flex::grow(1.0))),
         )
 }
 
@@ -391,7 +456,13 @@ fn parts(demo: &Demo) -> Element {
                         ..props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Default)
                     })
                     .child(icon(Icon::Inbox))
-                    .child(text("Inbox").truncate()),
+                    .child(
+                        text("Inbox")
+                            .truncate(true)
+                            .nowrap(true)
+                            .overflow_x(Overflow::Hidden)
+                            .min_width(0.0),
+                    ),
                 )
                 .child(sidebar_menu_badge(SidebarMenuButtonSize::Default).child("24")),
         )
@@ -400,21 +471,37 @@ fn parts(demo: &Demo) -> Element {
                 .child(
                     sidebar_menu_button(props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Sm))
                         .child(icon(Icon::Pencil))
-                        .child(text("Drafts").truncate()),
+                        .child(
+                            text("Drafts")
+                                .truncate(true)
+                                .nowrap(true)
+                                .overflow_x(Overflow::Hidden)
+                                .min_width(0.0),
+                        ),
                 )
                 .child(sidebar_menu_badge(SidebarMenuButtonSize::Sm).child("3"))
                 .child(
                     sidebar_menu_sub()
                         .child(
                             sidebar_menu_sub_item().child(
-                                sidebar_menu_sub_button(SidebarMenuSubButtonSize::Sm, true)
-                                    .child(text("Replies").truncate()),
+                                sidebar_menu_sub_button(SidebarMenuSubButtonSize::Sm, true).child(
+                                    text("Replies")
+                                        .truncate(true)
+                                        .nowrap(true)
+                                        .overflow_x(Overflow::Hidden)
+                                        .min_width(0.0),
+                                ),
                             ),
                         )
                         .child(
                             sidebar_menu_sub_item().child(
-                                sidebar_menu_sub_button(SidebarMenuSubButtonSize::Sm, false)
-                                    .child(text("Notes").truncate()),
+                                sidebar_menu_sub_button(SidebarMenuSubButtonSize::Sm, false).child(
+                                    text("Notes")
+                                        .truncate(true)
+                                        .nowrap(true)
+                                        .overflow_x(Overflow::Hidden)
+                                        .min_width(0.0),
+                                ),
                             ),
                         ),
                 ),
@@ -423,14 +510,26 @@ fn parts(demo: &Demo) -> Element {
             sidebar_menu_item().child(
                 sidebar_menu_button(props(SidebarMenuButtonVariant::Outline, SidebarMenuButtonSize::Default))
                     .child(icon(Icon::Star))
-                    .child(text("Starred").truncate()),
+                    .child(
+                        text("Starred")
+                            .truncate(true)
+                            .nowrap(true)
+                            .overflow_x(Overflow::Hidden)
+                            .min_width(0.0),
+                    ),
             ),
         )
         .child(
             sidebar_menu_item().child(
                 sidebar_menu_button(props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Lg))
                     .child(icon(Icon::Download))
-                    .child(text("Archive (large)").truncate()),
+                    .child(
+                        text("Archive (large)")
+                            .truncate(true)
+                            .nowrap(true)
+                            .overflow_x(Overflow::Hidden)
+                            .min_width(0.0),
+                    ),
             ),
         );
     sidebar_provider()

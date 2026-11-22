@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 
 use super::arena::{Arena, Range, Scratch};
+use crate::figure::{Cap, Draw, FillRule, Join, Path, PathStyle, Stroke};
 use crate::scene::Gradient;
-use crate::shape::{Cap, Draw, FillRule, Join, Path, PathStyle, Stroke};
 
 /// Words per job record (`JOB` in the shaders).
 pub(crate) const JOB: usize = 32;
@@ -89,7 +89,7 @@ pub(crate) fn records(path: &Path, stroke: bool) -> Vec<(Record, CurveInfo)> {
             if let (Some(first), Some(last)) = (curves.first(), curves.last())
                 && first.start() != last.end()
             {
-                let close = crate::shape::PathBuilder::default()
+                let close = crate::figure::PathBuilder::default()
                     .move_to(last.end()[0], last.end()[1])
                     .line_to(first.start()[0], first.start()[1])
                     .build();

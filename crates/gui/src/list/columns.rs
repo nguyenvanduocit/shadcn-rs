@@ -9,9 +9,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::element::{Div, Element, IntoElement, div};
+use crate::prelude::*;
 use crate::reactive::{Signal, detached};
 use crate::style::Track;
-use crate::styled::Styled;
 
 /// How a column's width is found.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,12 +136,12 @@ impl Columns {
                 if matches!(self.0.widths.get(i), Some(Width::Auto { .. })) {
                     let c = self.clone();
                     div()
-                        .flex()
-                        .min_w_px(0.0)
-                        .overflow_hidden()
+                        .display(Display::Flex)
+                        .min_width(0.0)
+                        .overflow(Overflow::Hidden)
                         .child(
                             div()
-                                .flex_none()
+                                .flex(Flex::NONE)
                                 .on_measured(move |b| {
                                     c.observe(i, b.width);
                                 })
@@ -157,7 +157,10 @@ impl Columns {
 
     /// A bare row of `cells` on the columns' tracks.
     pub fn row<E: IntoElement>(&self, cells: impl IntoIterator<Item = E>) -> Div {
-        div().grid().grid_cols_tracks(self.tracks()).children(self.cells(cells))
+        div()
+            .display(Display::Grid)
+            .grid_columns(self.tracks())
+            .children(self.cells(cells))
     }
 }
 

@@ -1,0 +1,51 @@
+//! Lucide (lucide-static 1.77.0, ISC; some glyphs derived from Feather, MIT).
+
+library! {
+    "lucide";
+    glyphs {
+        CHECK => "check",
+        X => "x",
+        CHEVRON_DOWN => "chevron-down",
+        CHEVRON_UP => "chevron-up",
+        CHEVRON_LEFT => "chevron-left",
+        CHEVRON_RIGHT => "chevron-right",
+        CHEVRONS_LEFT => "chevrons-left",
+        CHEVRONS_RIGHT => "chevrons-right",
+        CIRCLE_CHECK => "circle-check",
+        INFO => "info",
+        TRIANGLE_ALERT => "triangle-alert",
+        OCTAGON_X => "octagon-x",
+        LOADER_CIRCLE => "loader-circle",
+        CIRCLE => "circle",
+        COPY => "copy",
+        MINUS => "minus",
+        PLUS => "plus",
+        SEARCH => "search",
+        ELLIPSIS => "ellipsis",
+        PANEL_LEFT => "panel-left",
+    }
+    roles {
+        Check => CHECK,
+        Close => X,
+        ChevronDown => CHEVRON_DOWN,
+        ChevronUp => CHEVRON_UP,
+        ChevronLeft => CHEVRON_LEFT,
+        ChevronRight => CHEVRON_RIGHT,
+        ChevronsLeft => CHEVRONS_LEFT,
+        ChevronsRight => CHEVRONS_RIGHT,
+        Selector => CHEVRON_DOWN,
+        Success => CIRCLE_CHECK,
+        Info => INFO,
+        Warning => TRIANGLE_ALERT,
+        Error => OCTAGON_X,
+        Loading => LOADER_CIRCLE,
+        Circle => CIRCLE,
+        Copy => COPY,
+        Minus => MINUS,
+        Plus => PLUS,
+        Search => SEARCH,
+        More => ELLIPSIS,
+        Sidebar => PANEL_LEFT,
+        ArrowDown => super::ARROW_DOWN,
+    }
+}

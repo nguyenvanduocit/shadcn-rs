@@ -53,6 +53,9 @@ struct Inner {
     laid: RefCell<Option<ScrollLayout>>,
     /// The wheel moved it since the last [`ScrollHandle::take_wheeled`].
     wheeled: Cell<bool>,
+    /// How many times the reader scrolled it (its wheel, the UI's or the
+    /// compositor's), never reset: what shows an overlay scrollbar.
+    wheels: Cell<u64>,
     /// Bumped when the program or the UI's own wheel sets the offset: the
     /// compositor drops what it scrolled before (ADR-0015).
     generation: Cell<u64>,
@@ -73,6 +76,7 @@ impl Default for Inner {
             offset: Cell::default(),
             laid: RefCell::default(),
             wheeled: Cell::default(),
+            wheels: Cell::default(),
             generation: Cell::default(),
             hook: RefCell::default(),
             reveal: RefCell::default(),
@@ -149,6 +153,13 @@ impl ScrollHandle {
         self.0.wheeled.replace(false)
     }
 
+    /// How many times the reader has scrolled it: a change since last read
+    /// means they scrolled it (an overlay scrollbar shows).
+    #[must_use]
+    pub fn wheels(&self) -> u64 {
+        self.0.wheels.get()
+    }
+
     /// Run `f` after each layout of the container. It returns whether it
     /// changed what the frame is built from (a signal the view reads, the
     /// offset), and then the frame is laid out again before it is painted.
@@ -184,6 +195,7 @@ impl ScrollHandle {
     pub(crate) fn wheel(&self, offset: (f32, f32)) {
         self.0.offset.set(offset);
         self.0.wheeled.set(true);
+        self.0.wheels.set(self.0.wheels.get().wrapping_add(1));
         self.0.generation.set(self.0.generation.get().wrapping_add(1));
         self.moved();
     }
@@ -204,6 +216,7 @@ impl ScrollHandle {
     pub(crate) fn synced(&self, offset: (f32, f32)) {
         self.0.offset.set(offset);
         self.0.wheeled.set(true);
+        self.0.wheels.set(self.0.wheels.get().wrapping_add(1));
         self.moved();
     }
 

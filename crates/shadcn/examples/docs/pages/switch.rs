@@ -34,75 +34,80 @@ pub fn render() -> Render {
         page(
             "Switch",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "SwitchDemo.vue",
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(8.0)
                         .child(switch().model(airplane))
                         .child(label("Airplane Mode").on_click(move |_| a.update(|v| *v = !*v))),
                 ))
                 .child(section(
                     "Coloured, disabled and in a card",
                     div()
-                        .flex_col()
-                        .gap(6.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(24.0)
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(2.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(8.0)
                                 .child(
                                     switch()
                                         .model(bluetooth)
-                                        .class(move |d| d.when(bluetooth.get(), |d| d.bg(blue))),
+                                        .class(move |d| d.when(bluetooth.get(), |d| d.background(blue))),
                                 )
                                 .child(label("Bluetooth")),
                         )
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(2.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(8.0)
                                 .child(switch().default_checked(true).disabled(true))
                                 .child(label("Disabled")),
                         )
                         .child(
                             div()
                                 .named("switch-card")
-                                .flex()
-                                .items_center()
-                                .gap(6.0)
-                                .max_w_px(384.0)
-                                .rounded_lg()
-                                .border()
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(24.0)
+                                .max_width(384.0)
+                                .radius(10.0)
+                                .border(1.0)
                                 .border_color(if fm { blue_600 } else { t.border })
-                                .p(4.0)
-                                .text_sm()
-                                .leading_none()
-                                .font_medium()
+                                .padding(16.0)
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .line_height(LineHeight::Relative(1.0))
+                                .font_weight(500)
                                 .on_click(move |_| f.update(|v| *v = !*v))
                                 .child(
                                     div()
-                                        .flex_col()
-                                        .gap(1.0)
-                                        .child(text("Share across devices").font_medium())
+                                        .display(Display::Flex)
+                                        .flex_direction(FlexDirection::Column)
+                                        .gap(4.0)
+                                        .child(text("Share across devices").font_weight(500))
                                         .child(
                                             text(
                                                 "Focus is shared across devices, and turns off when you leave the app.",
                                             )
-                                            .text_sm()
-                                            .font_normal()
+                                            .text_size(14.0)
+                                            .line_height(20.0)
+                                            .font_weight(400)
                                             .text_color(t.muted_foreground),
                                         ),
                                 )
                                 .child(
                                     switch()
                                         .model(focus_mode)
-                                        .class(move |d| d.when(focus_mode.get(), |d| d.bg(blue))),
+                                        .class(move |d| d.when(focus_mode.get(), |d| d.background(blue))),
                                 ),
                         ),
                 )),

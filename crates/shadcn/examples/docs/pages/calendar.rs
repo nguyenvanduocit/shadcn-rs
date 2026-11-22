@@ -3,6 +3,7 @@ use gui::{
     Effect, Icon, Modifiers, NamedKey, ScenarioError, Side, SideAlign, Signal, TextField, div, icon, span, text,
     text_bound,
 };
+use shadcn::focus::StateLook;
 use shadcn::{
     ButtonSize, ButtonVariant, CalendarDate, CalendarLayout, CalendarLocale, CalendarProps, CalendarSystem, MonthWidth,
     Part, PopoverProps, SelectSize, WeekdayFormat, button, calendar, calendar_month_select, input, input_time, label,
@@ -169,24 +170,49 @@ fn preferred(tag: &str) -> Vec<CalendarSystem> {
 
 /// The demos' calendar look: `rounded-md border shadow-sm`.
 fn framed<S: Styled>(d: S) -> S {
-    d.rounded_md().border().border_color(theme().border).shadow_sm()
+    d.radius(8.0).border(1.0).border_color(theme().border).shadow([
+        Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 3.0,
+            spread: 0.0,
+            color: gui::Color::BLACK.opacity(0.1),
+        },
+        Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: -1.0,
+            color: gui::Color::BLACK.opacity(0.1),
+        },
+    ])
 }
 
 /// A labelled column (`flex flex-col gap-3`, the label `px-1`).
 fn labelled(name: &str, control: impl IntoElement) -> gui::Div {
-    div().flex_col().gap(3.0).child(label(name).px(1.0)).child(control)
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
+        .child(label(name).padding_x(4.0))
+        .child(control)
 }
 
 /// A date picker's trigger and its popover calendar (`PopoverContent
 /// class="w-auto overflow-hidden p-0" align="start|end"`).
-fn picker(open: Signal<bool>, trigger: gui::Div, align: SideAlign, cal: impl IntoElement) -> Part<PopoverProps> {
+fn picker(
+    open: Signal<bool>,
+    trigger: impl Into<gui::Div>,
+    align: SideAlign,
+    cal: impl IntoElement,
+) -> Part<PopoverProps> {
     popover().open(open).child(popover_trigger(trigger)).child(
         popover_content()
             .side(Side::Bottom)
             .align(align)
-            .w_auto()
-            .overflow_hidden()
-            .p(0.0)
+            .width(Length::Auto)
+            .overflow(Overflow::Hidden)
+            .padding(0.0)
             .child(cal),
     )
 }
@@ -240,23 +266,23 @@ pub fn render() -> Render {
         });
 
         let custom_heading = div()
-            .flex()
-            .gap(2.0)
-            .items_center()
+            .display(Display::Flex)
+            .gap(8.0)
+            .align_items(Align::Center)
             .child(div().child("Custom heading"))
             .child(calendar_month_select());
 
         let date_time_demo = div()
-            .flex()
-            .gap(4.0)
+            .display(Display::Flex)
+            .gap(16.0)
             .child(labelled(
                 "Date",
                 picker(
                     date_time_open,
                     button(ButtonVariant::Outline, ButtonSize::Default)
-                        .w(32.0)
-                        .justify_between()
-                        .font_normal()
+                        .width(128.0)
+                        .justify_content(Justify::Between)
+                        .font_weight(400)
                         .child(date_time.get().map_or_else(|| "Select date".to_owned(), numeric))
                         .child(icon(Icon::ChevronDown)),
                     SideAlign::Start,
@@ -265,7 +291,7 @@ pub fn render() -> Render {
             ))
             .child(labelled(
                 "Time",
-                input_time().default_value("10:30:00").bg(t.background),
+                input_time().default_value("10:30:00").background(t.background),
             ));
 
         let birth_demo = labelled(
@@ -273,9 +299,9 @@ pub fn render() -> Render {
             picker(
                 birth_open,
                 button(ButtonVariant::Outline, ButtonSize::Default)
-                    .w(48.0)
-                    .justify_between()
-                    .font_normal()
+                    .width(192.0)
+                    .justify_content(Justify::Between)
+                    .font_weight(400)
                     .child(birth.get().map_or_else(|| "Select date".to_owned(), numeric))
                     .child(icon(Icon::ChevronDown)),
                 SideAlign::Start,
@@ -290,11 +316,16 @@ pub fn render() -> Render {
         let picker_demo = picker(
             picker_open,
             button(ButtonVariant::Outline, ButtonSize::Default)
-                .w_px(240.0)
-                .justify_start()
-                .text_left()
-                .font_normal()
-                .when(picked_day.is_none(), |b| b.text_color(t.muted_foreground))
+                .width(240.0)
+                .justify_content(Justify::Start)
+                .text_align(TextAlign::Left)
+                .font_weight(400)
+                .when(picked_day.is_none(), |b| {
+                    // Over the outline button's rest: its hover text stays over it.
+                    let i = b.interaction();
+                    b.text_color(t.muted_foreground)
+                        .text_color_while(move || i.hovered(), t.accent_foreground)
+                })
                 .child(icon(Icon::Calendar))
                 .child(picked_day.map_or_else(|| "Pick a date".to_owned(), long)),
             SideAlign::Start,
@@ -307,29 +338,30 @@ pub fn render() -> Render {
         let parsed = parse_date(&phrase.text(), today());
         let sync = phrase;
         let phrase_demo = div()
-            .flex_col()
-            .gap(3.0)
-            .child(label("Schedule Date").px(1.0))
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
+            .child(label("Schedule Date").padding_x(4.0))
             .child(
                 div()
-                    .relative()
-                    .flex()
-                    .gap(2.0)
+                    .position(Position::Relative)
+                    .display(Display::Flex)
+                    .gap(8.0)
                     .child(
                         input()
                             .field(phrase)
-                            .bg(t.background)
-                            .pr(10.0)
+                            .background(t.background)
+                            .padding_right(40.0)
                             .placeholder("Tomorrow or next week"),
                     )
                     .child(
                         picker(
                             phrase_open,
                             button(ButtonVariant::Ghost, ButtonSize::Default)
-                                .size(6.0)
-                                .p(0.0)
+                                .size(24.0)
+                                .padding(0.0)
                                 .named("date-picker")
-                                .child(icon(Icon::Calendar).size(3.5))
+                                .child(icon(Icon::Calendar).size(14.0))
                                 // The calendar opens on the day the phrase names.
                                 .on_click(move |_| phrase_date.set(parse_date(&sync.text(), today()))),
                             SideAlign::End,
@@ -346,17 +378,18 @@ pub fn render() -> Render {
                                     .initial_focus()
                             },
                         )
-                        .absolute()
-                        .top(1.5)
-                        .right(2.0),
+                        .position(Position::Absolute)
+                        .top(6.0)
+                        .right(8.0),
                     ),
             )
             .child(
                 text("Your post will be published on ")
-                    .span(span(parsed.map(two_digit_day).unwrap_or_default()).font_medium())
+                    .span(span(parsed.map(two_digit_day).unwrap_or_default()).font_weight(500))
                     .span(".")
-                    .px(1.0)
-                    .text_sm()
+                    .padding_x(4.0)
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground),
             );
 
@@ -364,7 +397,8 @@ pub fn render() -> Render {
         let (system, locale) = (CalendarSystem::Persian, CalendarLocale::FaIr);
         let fields = system.fields(persian_day);
         let persian_demo = div()
-            .flex_col()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
             .child(framed(
                 cal()
                     .model(persian)
@@ -374,10 +408,11 @@ pub fn render() -> Render {
             ))
             .child(
                 div()
-                    .flex_col()
-                    .justify_center()
-                    .items_center()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .justify_content(Justify::Center)
+                    .align_items(Align::Center)
+                    .gap(8.0)
                     .child(text(format!("{}/{}/{}", fields.year, fields.month, fields.day)))
                     .child(text(format!(
                         "{} {}",
@@ -398,8 +433,9 @@ pub fn render() -> Render {
             _ => CalendarLayout::MonthAndYear,
         };
         let year_and_month_demo = div()
-            .flex_col()
-            .gap(4.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(framed(
                 cal()
                     .default_value(Some(today()))
@@ -411,8 +447,16 @@ pub fn render() -> Render {
                 select()
                     .model(layout_select)
                     .size(SelectSize::Sm)
-                    .bg(t.background)
-                    .w_full()
+                    .when(true, |s| {
+                        // Over the trigger's rest: its dark hover fill stays over it.
+                        let i = s.node_interaction();
+                        let s = s.background(t.background);
+                        match i {
+                            Some(i) if t.dark => s.background_while(move || i.hovered(), t.input.opacity(0.5)),
+                            _ => s,
+                        }
+                    })
+                    .width(pct(100.0))
                     .child(select_value("Dropdown"))
                     .child(layouts),
             ));
@@ -425,7 +469,15 @@ pub fn render() -> Render {
             .unwrap_or_default();
         let others: Vec<CalendarSystem> = CalendarSystem::ALL.into_iter().filter(|c| !first.contains(c)).collect();
         let item = |value: &str, name: &str| {
-            select_item(value, name).class(|d| d.text_xs().leading_none().rounded(3.0).h_px(25.0).pr(8.75).pl(6.25))
+            select_item(value, name).class(|d| {
+                d.text_size(12.0)
+                    .line_height(16.0)
+                    .line_height(LineHeight::Relative(1.0))
+                    .radius(3.0)
+                    .height(25.0)
+                    .padding_right(35.0)
+                    .padding_left(25.0)
+            })
         };
         let locales = select_content().children(LOCALES.map(|(name, tag, _)| item(tag, name)));
         let calendars = select_content()
@@ -435,13 +487,14 @@ pub fn render() -> Render {
             .child(select_label("Other"))
             .child(select_group().children(others.iter().map(|c| item(c.identifier(), calendar_name(*c)))));
         let systems_demo = div()
-            .flex_col()
-            .gap(4.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(label("Locale"))
             .child(
                 select()
                     .model(locale_select)
-                    .w_full()
+                    .width(pct(100.0))
                     .child(select_value("Select a fruit"))
                     .child(locales),
             )
@@ -449,7 +502,7 @@ pub fn render() -> Render {
             .child(
                 select()
                     .model(system_select)
-                    .w_full()
+                    .width(pct(100.0))
                     .child(select_value("Select a calendar"))
                     .child(calendars),
             )
@@ -461,17 +514,20 @@ pub fn render() -> Render {
         page(
             "Calendar",
             div()
-                .flex_1()
-                .min_h(0.0)
-                .overflow_y_scroll()
-                .flex_col()
-                .gap(8.0)
+                .flex(Flex::grow(1.0))
+                .min_height(0.0)
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(section(
                     "Default",
                     div()
-                        .flex_col()
-                        .items_start()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Start)
+                        .gap(8.0)
                         .child(demo(
                             "CalendarDemo.vue",
                             framed(
@@ -482,7 +538,7 @@ pub fn render() -> Render {
                                     .layout(CalendarLayout::MonthAndYear),
                             ),
                         ))
-                        .child(chosen.text_sm().text_color(t.muted_foreground)),
+                        .child(chosen.text_size(14.0).line_height(20.0).text_color(t.muted_foreground)),
                 ))
                 .child(demo("CalendarYearAndMonthSelector.vue", year_and_month_demo))
                 .child(demo("CalendarPersianDemo.vue", persian_demo))
@@ -493,7 +549,7 @@ pub fn render() -> Render {
                         cal()
                             .default_value(Some(today()))
                             .weekday_format(WeekdayFormat::Short)
-                            .cell_size(12.0)
+                            .cell_size(48.0)
                             .heading(custom_heading),
                     ),
                 ))
@@ -504,7 +560,7 @@ pub fn render() -> Render {
                 .child(section(
                     "Ten days either side of today",
                     div()
-                        .flex()
+                        .display(Display::Flex)
                         .child(framed(cal().min(today().add_days(-10)).max(today().add_days(10)))),
                 )),
         )

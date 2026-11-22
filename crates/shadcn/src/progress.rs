@@ -1,7 +1,8 @@
 //! Progress (`ui/progress`): a bar filled to a percentage.
 
+use gui::prelude::*;
 use gui::style::Calc;
-use gui::{Div, Styled, div};
+use gui::{Div, div};
 
 use crate::theme::theme;
 
@@ -18,19 +19,19 @@ pub fn progress(value: f32) -> Div {
     };
     div()
         .named("progress")
-        .bg(t.primary.opacity(0.2))
-        .relative()
-        .h(2.0)
-        .w_full()
-        .overflow_hidden()
-        .rounded_full()
+        .background(t.primary.opacity(0.2))
+        .position(Position::Relative)
+        .height(8.0)
+        .width(pct(100.0))
+        .overflow(Overflow::Hidden)
+        .radius(9999.0)
         .child(
             div()
                 .named("progress-indicator")
-                .bg(t.primary)
-                .h_full()
-                .w_full()
-                .transition_all()
+                .background(t.primary)
+                .height(pct(100.0))
+                .width(pct(100.0))
+                .transition(Properties::ALL)
                 .translate_x(Calc::fraction(filled - 1.0)),
         )
 }

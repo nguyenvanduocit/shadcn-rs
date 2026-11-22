@@ -3,6 +3,7 @@ use gui::{Color, Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{label, radio_group, radio_group_item, theme};
 
 use crate::{Render, Shot, demo, page, section};
+use shadcn::focus::StateLook;
 
 /// The centre of the `nth` node named `name` in the last frame.
 fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32), ScenarioError> {
@@ -47,9 +48,9 @@ pub fn render() -> Render {
         let row = |pick: Option<Signal<Option<String>>>, value: &str, name: &str| {
             let owned = value.to_owned();
             div()
-                .flex()
-                .items_center()
-                .gap(2.0)
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .gap(8.0)
                 .child(radio_group_item(value))
                 .child(label(name).when_some(pick, |l, pick| l.on_click(move |_| pick.set(Some(owned.clone())))))
         };
@@ -57,8 +58,9 @@ pub fn render() -> Render {
         page(
             "Radio Group",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "RadioGroupDemo.vue",
                     radio_group()
@@ -71,31 +73,40 @@ pub fn render() -> Render {
                     "Plans",
                     radio_group()
                         .model(plan)
-                        .max_w_px(384.0)
+                        .max_width(384.0)
                         .children(PLANS.map(|(id, name, description)| {
                             let on = chosen.as_deref() == Some(id);
                             let pick = plan;
                             div()
                                 .named("plan")
-                                .flex()
-                                .items_start()
-                                .gap(3.0)
-                                .rounded_lg()
-                                .border()
+                                .display(Display::Flex)
+                                .align_items(Align::Start)
+                                .gap(12.0)
+                                .radius(10.0)
+                                .border(1.0)
                                 .border_color(if on { green } else { t.border })
-                                .when(on, |d| d.bg(green_bg))
-                                .when(!on, |d| d.hover(move |s| s.bg(t.accent.opacity(0.5))))
-                                .p(4.0)
-                                .text_sm()
+                                .when(on, |d| d.background(green_bg))
+                                .when(!on, |d| {
+                                    d.with_interaction(|d, i| {
+                                        d.background_while(move || i.hovered(), t.accent.opacity(0.5))
+                                    })
+                                })
+                                .padding(16.0)
+                                .text_size(14.0)
+                                .line_height(20.0)
                                 .on_click(move |_| pick.set(Some(id.to_owned())))
-                                .child(radio_group_item(id).shadow_none())
+                                .child(radio_group_item(id).shadow(Shadows::new()))
                                 .child(
                                     div()
-                                        .grid()
-                                        .gap(1.0)
-                                        .font_normal()
-                                        .child(text(name).font_medium())
-                                        .child(text(description).leading_snug().text_color(t.muted_foreground)),
+                                        .display(Display::Grid)
+                                        .gap(4.0)
+                                        .font_weight(400)
+                                        .child(text(name).font_weight(500))
+                                        .child(
+                                            text(description)
+                                                .line_height(LineHeight::Relative(1.375))
+                                                .text_color(t.muted_foreground),
+                                        ),
                                 )
                         })),
                 ))

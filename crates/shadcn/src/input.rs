@@ -11,14 +11,15 @@
 use std::rc::Rc;
 
 use gui::prelude::*;
+use gui::value::Bindings;
 use gui::{
     Bind, Color, Div, Element, InputType, Model, Properties, Signal, Slot, Style, TextField, TextInput, TimeInput,
     component, div, text, text_input, time_input, use_model,
 };
 
-use crate::button_group::with_style;
+use crate::focus::StateLook;
 use crate::focus::focus_ring;
-use crate::theme::{Theme, theme};
+use crate::theme::{Colors, theme};
 
 /// A one-line text input (`<Input>`): empty, and keeping its own text, until
 /// told otherwise. Style it as any node; its own classes come first.
@@ -29,12 +30,14 @@ pub fn input() -> Input {
 }
 
 /// A text input being built: [`input`] or [`crate::textarea`].
-#[derive(Clone, PartialEq)]
+#[derive(Clone)]
 pub struct Input {
     value: Bind<String>,
     field: Option<TextField>,
     name: &'static str,
     style: Style,
+    /// The closures given to its setters, bound to the text input's node.
+    bindings: Bindings,
     placeholder: String,
     input_type: InputType,
     read_only: bool,
@@ -53,7 +56,8 @@ impl Input {
             field: None,
             name,
             // A browser's own `input, textarea { text-align: start }`, and its text cursor.
-            style: style.text_left().cursor_text(),
+            style: style.text_align(TextAlign::Left).cursor(Cursor::Text),
+            bindings: Bindings::default(),
             placeholder: String::new(),
             input_type: InputType::Text,
             read_only: false,
@@ -146,7 +150,11 @@ impl Input {
     fn render(&self, field: &TextField) -> TextInput {
         let t = theme();
         let mut el = text_input(field);
-        *el.style_mut() = self.style.clone();
+        let (style, bindings) = el.style_and_bindings();
+        *style = self.style.clone();
+        if let Some(bindings) = bindings {
+            *bindings = self.bindings.clone();
+        }
         let el = el
             .named(self.name)
             .placeholder(self.placeholder.clone())
@@ -154,8 +162,7 @@ impl Input {
             .selection_color(t.primary.opacity(0.35))
             .input_type(self.input_type)
             .disabled(self.disabled)
-            .focus_visible(move |s| focus_ring(s, &t))
-            .disabled_style(|s| s.opacity(0.5).cursor_not_allowed())
+            .with_interaction(|d, i| d.focus_ring_on(i, &t).dim_disabled(i, 0.5).cursor_disabled(i))
             .when(self.multiline, TextInput::multiline)
             .when(self.read_only, TextInput::read_only);
         match &self.refine {
@@ -168,8 +175,27 @@ impl Input {
 impl Fluent for Input {}
 
 impl Styled for Input {
-    fn style_mut(&mut self) -> &mut Style {
-        &mut self.style
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut Bindings>) {
+        (&mut self.style, Some(&mut self.bindings))
+    }
+}
+
+/// Props compare by value; bound properties cannot be compared, so an
+/// input with any re-renders with its parent.
+impl PartialEq for Input {
+    fn eq(&self, other: &Self) -> bool {
+        self.bindings.is_empty()
+            && other.bindings.is_empty()
+            && self.value == other.value
+            && self.field == other.field
+            && self.name == other.name
+            && self.style == other.style
+            && self.placeholder == other.placeholder
+            && self.input_type == other.input_type
+            && self.read_only == other.read_only
+            && self.disabled == other.disabled
+            && self.multiline == other.multiline
+            && self.refine == other.refine
     }
 }
 
@@ -206,9 +232,14 @@ pub fn input_time() -> TimeInput {
         Color::hex(0x00b3_d7fe)
     };
     frame(time_input(), &t)
-        .focused_field(move |s| s.bg(highlight).text_color(Color::BLACK))
+        .map_field(move |d, i| {
+            d.background_while(move || i.focused(), highlight)
+                .text_color_while(move || i.focused(), Color::BLACK)
+        })
         // `focus-visible:` matches the input while one of its fields holds focus.
-        .focus_within(move |d| with_style(d, |s| focus_ring(s, &t)))
+        .map_root(|d| {
+            d.with_interaction(|d, i| d.ring_while(move || i.focus_within(), &focus_ring(Style::default(), &t)))
+        })
 }
 
 /// A file input showing the file in `chosen`: the browser's "Choose File"
@@ -221,35 +252,41 @@ pub fn input_file(chosen: Signal<Option<String>>) -> Div {
     let t = theme();
     // One line from the content box's top: the 28px button overhangs the
     // 26px box below, and the name sits on the button's baseline.
-    let line = || div().h(7.0).flex().items_center();
+    let line = || div().height(28.0).display(Display::Flex).align_items(Align::Center);
     frame(div().named("input-file"), &t)
-        .flex()
-        .items_start()
+        .display(Display::Flex)
+        .align_items(Align::Start)
         .focusable()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed())
-        .child(line().mr(1.0).font_medium().child("Choose File"))
+        .with_interaction(|d, i| d.focus_ring_on(i, &t).dim_disabled(i, 0.5).cursor_disabled(i))
+        .child(line().margin_right(4.0).font_weight(500).child("Choose File"))
         .child(line().child(text(chosen.get().unwrap_or_else(|| "No file chosen".to_owned()))))
 }
 
 /// The box all three draw: `border-input h-9 w-full min-w-0 rounded-md
 /// border bg-transparent px-3 py-1 md:text-sm shadow-xs dark:bg-input/30`.
-fn frame<S: Styled>(el: S, t: &Theme) -> S {
-    el.transition_props(Properties::COLOR | Properties::SHADOW)
+fn frame<S: Styled>(el: S, t: &Colors) -> S {
+    el.transition(Properties::COLOR | Properties::SHADOW)
         .text_color(t.foreground)
         .border_color(t.input)
-        .h(9.0)
-        .w_full()
-        .min_w(0.0)
-        .rounded_md()
-        .border()
-        .bg(if t.dark {
+        .height(36.0)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .radius(8.0)
+        .border(1.0)
+        .background(if t.dark {
             t.input.opacity(0.3)
         } else {
             Color::TRANSPARENT
         })
-        .px(3.0)
-        .py(1.0)
-        .text_sm()
-        .shadow_xs()
+        .padding_x(12.0)
+        .padding_y(4.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
 }

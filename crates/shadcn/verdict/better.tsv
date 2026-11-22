@@ -5,3 +5,15 @@
 # <Demo>.vue<TAB>what ours does better (concrete: what a user sees or gets)
 ChartDemo.vue	Shows the bar chart its title names: six months of Desktop and Mobile bars with their month ticks. shadcn-vue's draws an empty grid, because its VisGroupedBar and x VisAxis read month names (d.month) on unovis' continuous x scale, so no bar or tick lands, and margin-left -20 cuts its y labels to a sliver.
 MessageScrollerOpeningPositionDemo.vue	Opens on the last anchored turn with 64px of the reply before it in view, as the selected "last-anchor" tab says; theirs measures its items while content-visibility:auto still holds them at the 160px placeholder size, so scrollToMessage aims past the real end and the browser clamps it to the bottom (scrollTo 320, max 208, traced in Chrome)
+#
+# Icon libraries (shadcn::icons). Not entries yet: the verdict runs under lucide, where upstream draws every icon, and
+# an entry is per demo, so it would excuse a lucide diff. When the verdict runs per library, these become entries
+# keyed by library. Upstream's createIconLoader draws nothing for a name its library's __<library>__.ts module does
+# not re-export; ours draws the glyph the IconPlaceholder names, so the icon the component means is on screen:
+#   tabler     IconOctagonOff (sonner error), IconLoader2 (spinner, sonner loading)
+#   hugeicons  CancelCircleIcon (sonner error), Minus01Icon (number field, pin input; ours draws MinusSign, as
+#              upstream's OTP separator does, since @hugeicons/core-free-icons has no Minus01Icon)
+#   phosphor   SpinnerGapIcon (spinner, sonner loading), CircleIcon (radio group indicator)
+#   remixicon  RiArrowLeftDoubleLine, RiArrowRightDoubleLine (pagination first, last), RiAlertLine (sonner warning),
+#              RiCircleLine (radio group indicator)
+MessageScrollerPreviousContextDemo.vue	Opens at the end of the thread, as defaultScrollPosition "end" asks; theirs runs scrollToEnd while content-visibility:auto still holds both turns at the 160px placeholder size (scrollHeight 352, so scrollTop 33), and with no autoScroll nothing follows once they measure 109 and 214.75: it rests 4px short of the end (scrollTop 33, max 37, traced in Chrome)

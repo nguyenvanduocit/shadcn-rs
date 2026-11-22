@@ -10,7 +10,7 @@
 //! ```ignore
 //! dropdown_menu()
 //!     .child(dropdown_menu_trigger(button(ButtonVariant::Outline, ButtonSize::Default).child("Open")))
-//!     .child(dropdown_menu_content().align(SideAlign::Start).w(56.0)
+//!     .child(dropdown_menu_content().align(SideAlign::Start).width(224.0)
 //!         .child(dropdown_menu_item("Profile", MenuItem::default()).on_select(|| …).child("Profile")))
 //! ```
 //!
@@ -27,7 +27,7 @@ use std::rc::{Rc, Weak};
 
 use gui::prelude::*;
 use gui::{
-    Bind, Callback, Div, Element, FocusHandle, Icon, KeyEvent, Model, NamedKey, Placement, Side, SideAlign, Signal,
+    Bind, Callback, Div, Element, FocusHandle, Icon, KeyEvent, Model, NamedKey, Positioning, Side, SideAlign, Signal,
     Text, UseModel, component, deferred, div, icon, provide, text, use_context, use_model, watch,
 };
 
@@ -35,7 +35,7 @@ use gui::style::Origin;
 
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
-use crate::theme::{Theme, theme};
+use crate::theme::{Colors, theme};
 
 /// A step of the highlight through a list.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -560,36 +560,37 @@ impl MenuItem {
 /// gap-2 rounded-sm px-2 py-1.5 text-sm select-none data-[disabled]:opacity-50
 /// data-[inset]:pl-8`, highlighted as `focus:bg-accent focus:text-accent-foreground`
 /// (the destructive variant: `text-destructive focus:bg-destructive/10`, `/20` in dark).
-pub(crate) fn menu_row(t: &Theme, item: MenuItem, highlighted: bool) -> Div {
+pub(crate) fn menu_row(t: &Colors, item: MenuItem, highlighted: bool) -> Div {
     menu_highlight(menu_row_base(t, item), t, item, highlighted)
 }
 
 /// [`menu_row`] not highlighted, for a part to highlight in its render.
-pub(crate) fn menu_row_base(t: &Theme, item: MenuItem) -> Div {
+pub(crate) fn menu_row_base(t: &Colors, item: MenuItem) -> Div {
     let destructive = item.variant == MenuItemVariant::Destructive;
     div()
-        .relative()
-        .flex()
-        .cursor_default()
-        .items_center()
-        .gap(2.0)
-        .rounded_sm()
-        .px(2.0)
-        .py(1.5)
-        .text_sm()
-        .when(item.inset, |d| d.pl(8.0))
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .cursor(Cursor::Default)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .radius(6.0)
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .when(item.inset, |d| d.padding_left(32.0))
         .when(item.disabled, |d| d.opacity(0.5))
         .when(destructive, |d| d.text_color(t.destructive))
 }
 
 /// A row's highlight, on top of [`menu_row_base`].
-pub(crate) fn menu_highlight(d: Div, t: &Theme, item: MenuItem, highlighted: bool) -> Div {
+pub(crate) fn menu_highlight(d: Div, t: &Colors, item: MenuItem, highlighted: bool) -> Div {
     let destructive = item.variant == MenuItemVariant::Destructive;
     d.when(highlighted && !destructive, |d| {
-        d.bg(t.accent).text_color(t.accent_foreground)
+        d.background(t.accent).text_color(t.accent_foreground)
     })
     .when(highlighted && destructive, |d| {
-        d.bg(t.destructive.opacity(if t.dark { 0.2 } else { 0.1 }))
+        d.background(t.destructive.opacity(if t.dark { 0.2 } else { 0.1 }))
     })
 }
 
@@ -597,12 +598,12 @@ pub(crate) fn menu_highlight(d: Div, t: &Theme, item: MenuItem, highlighted: boo
 /// `pointer-events-none absolute left-2 flex size-3.5 items-center justify-center`.
 pub(crate) fn menu_indicator(mark: Option<gui::Element>) -> Div {
     div()
-        .absolute()
-        .left(2.0)
-        .flex()
-        .size(3.5)
-        .items_center()
-        .justify_center()
+        .position(Position::Absolute)
+        .left(8.0)
+        .display(Display::Flex)
+        .size(14.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
         .pass_through()
         .child(mark)
 }
@@ -615,34 +616,35 @@ pub(crate) fn menu_check() -> gui::Element {
 /// The dot of a chosen radio item (`Circle class="size-2 fill-current"`): a
 /// filled circle in the text colour.
 pub(crate) fn menu_dot(color: gui::Color) -> gui::Element {
-    div().size(2.0).rounded_full().bg(color).into_element()
+    div().size(8.0).radius(9999.0).background(color).into_element()
 }
 
 /// The content's box: `bg-popover text-popover-foreground min-w-[8rem]
 /// rounded-md border p-1`, without its shadow and overflow, which differ.
-pub(crate) fn menu_box(t: &Theme) -> Div {
+pub(crate) fn menu_box(t: &Colors) -> Div {
     div()
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .min_w_px(128.0)
-        .rounded_md()
-        .border()
+        .min_width(128.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(1.0)
+        .padding(4.0)
 }
 
 /// `bg-border -mx-1 my-1 h-px`.
-pub(crate) fn menu_separator(t: &Theme) -> Div {
-    div().bg(t.border).mx(-1.0).my(1.0).h_px(1.0)
+pub(crate) fn menu_separator(t: &Colors) -> Div {
+    div().background(t.border).margin_x(-4.0).margin_y(4.0).height(1.0)
 }
 
 /// `text-muted-foreground ml-auto text-xs tracking-widest`.
-pub(crate) fn menu_shortcut(t: &Theme, keys: &str) -> Text {
+pub(crate) fn menu_shortcut(t: &Colors, keys: &str) -> Text {
     text(keys)
         .text_color(t.muted_foreground)
-        .ml_auto()
-        .text_xs()
-        .tracking_widest()
+        .margin_left(Length::Auto)
+        .text_size(12.0)
+        .line_height(16.0)
+        .tracking(0.1)
 }
 
 // ── The parts every menu builds on (dropdown, context menu, menubar) ──
@@ -803,7 +805,7 @@ pub(crate) fn menu_content(root: Div, place: MenuPlace) -> Part<MenuContentProps
                         align,
                         offset,
                         fit_height,
-                    } => Placement::Anchored {
+                    } => Positioning::Anchored {
                         side,
                         align,
                         offset,
@@ -812,9 +814,9 @@ pub(crate) fn menu_content(root: Div, place: MenuPlace) -> Part<MenuContentProps
                     },
                     MenuPlace::Pointer => {
                         let (x, y) = pointer.map_or((0.0, 0.0), |p| p.0.get());
-                        Placement::At { x, y }
+                        Positioning::At { x, y }
                     }
-                    MenuPlace::Beside => Placement::Anchored {
+                    MenuPlace::Beside => Positioning::Anchored {
                         side: Side::Right,
                         align: SideAlign::Start,
                         offset: 0.0,
@@ -1117,13 +1119,15 @@ pub(crate) fn menu_sub_trigger(
 /// against. Give it a [`dropdown_menu_trigger`] and a [`dropdown_menu_content`].
 #[must_use]
 pub fn dropdown_menu() -> Part<MenuRootProps> {
-    menu_root(div().named("dropdown-menu").inline_flex())
+    menu_root(div().named("dropdown-menu").display(Display::Flex).inline(true))
 }
 
 /// Make `trigger` (usually a button) toggle the menu (`DropdownMenuTrigger as-child`).
+/// Give `trigger` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn dropdown_menu_trigger(trigger: Div) -> Part<()> {
-    menu_trigger(trigger.named("dropdown-menu-trigger"))
+pub fn dropdown_menu_trigger(trigger: impl Into<Div>) -> Part<()> {
+    menu_trigger(trigger.into().named("dropdown-menu-trigger"))
 }
 
 /// The floating panel (`DropdownMenuContent`, `side-offset 4`): below the
@@ -1138,8 +1142,9 @@ pub fn dropdown_menu_content() -> Part<MenuContentProps> {
             menu_box(&t)
                 .named("dropdown-menu-content")
                 .role(gui::Role::Menu)
-                .overflow_y_scroll()
-                .shadow_md(),
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .shadow(crate::popover::POPUP_SHADOW),
             Origin::Anchor,
         ),
         MenuPlace::Anchored {
@@ -1191,8 +1196,8 @@ pub fn dropdown_menu_checkbox_item(label: &str, disabled: bool) -> Part<MenuChec
     menu_checkbox_item(
         menu_row_base(&t, item)
             .named("dropdown-menu-checkbox-item")
-            .pl(8.0)
-            .pr(2.0)
+            .padding_left(32.0)
+            .padding_right(8.0)
             .child(label.to_owned()),
         label,
         disabled,
@@ -1210,8 +1215,8 @@ pub fn dropdown_menu_radio_item(label: &str, value: &str, disabled: bool) -> Par
     menu_radio_item(
         menu_row_base(&t, item)
             .named("dropdown-menu-radio-item")
-            .pl(8.0)
-            .pr(2.0)
+            .padding_left(32.0)
+            .padding_right(8.0)
             .child(label.to_owned()),
         label,
         value,
@@ -1224,11 +1229,12 @@ pub fn dropdown_menu_radio_item(label: &str, value: &str, disabled: bool) -> Par
 pub fn dropdown_menu_label(label: &str, inset: bool) -> Div {
     div()
         .named("dropdown-menu-label")
-        .px(2.0)
-        .py(1.5)
-        .text_sm()
-        .font_medium()
-        .when(inset, |d| d.pl(8.0))
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .when(inset, |d| d.padding_left(32.0))
         .child(label.to_owned())
 }
 
@@ -1258,7 +1264,11 @@ pub fn dropdown_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTri
         menu_row_base(&t, item)
             .named("dropdown-menu-sub-trigger")
             .child(label.to_owned())
-            .child(icon(Icon::ChevronRight).ml_auto().text_color(t.muted_foreground)),
+            .child(
+                icon(Icon::ChevronRight)
+                    .margin_left(Length::Auto)
+                    .text_color(t.muted_foreground),
+            ),
         label,
         item,
         false,
@@ -1273,8 +1283,8 @@ pub fn dropdown_menu_sub_content() -> Part<MenuContentProps> {
         popper(
             menu_box(&t)
                 .named("dropdown-menu-sub-content")
-                .overflow_hidden()
-                .shadow_lg(),
+                .overflow(Overflow::Hidden)
+                .shadow(crate::popover::LIFTED_SHADOW),
             Origin::Anchor,
         ),
         MenuPlace::Beside,

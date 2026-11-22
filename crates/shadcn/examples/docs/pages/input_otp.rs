@@ -23,8 +23,9 @@ pub fn render() -> Render {
         page(
             "Input OTP",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "InputOTPDemo.vue",
                     input_otp()
@@ -44,8 +45,9 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputOTPControlledDemo.vue",
                     div()
-                        .flex_col()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(8.0)
                         .child(input_otp().model(controlled).child(slots(0..6)))
                         .child(
                             text(if entered.is_empty() {
@@ -53,8 +55,9 @@ pub fn render() -> Render {
                             } else {
                                 format!("You entered: {entered}")
                             })
-                            .text_sm()
-                            .text_center(),
+                            .text_size(14.0)
+                            .line_height(20.0)
+                            .text_align(TextAlign::Center),
                         ),
                 ))
                 .child(demo(
@@ -64,9 +67,10 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputOTPFormDemo.vue",
                     div()
-                        .w(96.0)
-                        .flex_col()
-                        .gap(6.0)
+                        .width(384.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(24.0)
                         .child(
                             field_group().child(
                                 field(FieldOrientation::Vertical, form_error.is_some())

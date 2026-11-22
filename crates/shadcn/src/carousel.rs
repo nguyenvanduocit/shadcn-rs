@@ -10,7 +10,7 @@
 //! track is translated by a fraction of its own size per snap, the move eased
 //! over [`SLIDE_SECONDS`] as a transform transition. Embla measures each slide; `gui`
 //! hands a render no sizes, so a slide's step is its declared basis
-//! (`.basis(…)`), which holds while no slide outgrows it.
+//! (`.flex_basis(…)`), which holds while no slide outgrows it.
 
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use gui::prelude::*;
 use gui::style::Calc;
 use gui::{
     Bind, ComponentElement, Div, Easing, Icon, Length, Members, Model, NamedKey, Scope, Signal, UseModel, component,
-    div, icon, on_mounted, on_updated, provide, relative, use_context, use_model,
+    div, icon, on_mounted, on_updated, provide, use_context, use_model,
 };
 
 use crate::button::{ButtonSize, ButtonVariant, button};
@@ -164,7 +164,7 @@ impl CarouselContext {
 /// The carousel's region: focusable, arrow keys move it.
 #[must_use]
 pub fn carousel() -> Part<CarouselProps> {
-    let root = div().named("carousel").relative().focusable();
+    let root = div().named("carousel").position(Position::Relative).focusable();
     Part::new(CarouselProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -263,7 +263,7 @@ impl Part<CarouselProps> {
 /// `CarouselContent` puts its class) and put its [`carousel_item`]s in.
 #[must_use]
 pub fn carousel_content() -> Part<()> {
-    Part::new((), div().named("carousel-track").flex(), |p| {
+    Part::new((), div().named("carousel-track").display(Display::Flex), |p| {
         component(p, |cx| {
             let props = cx.props();
             let ctx = CarouselContext::find();
@@ -279,16 +279,20 @@ pub fn carousel_content() -> Part<()> {
                 // (`easeOutCubic`) from wherever it is.
                 let slider = div()
                     .named("carousel-slider")
-                    .flex()
-                    .relative()
-                    .shrink_0()
-                    .transition_transform()
+                    .display(Display::Flex)
+                    .position(Position::Relative)
+                    .flex_shrink(0.0)
+                    .transition(Properties::TRANSFORM)
                     .duration_ms(SLIDE_SECONDS * 1000.0)
                     .ease(Easing::CubicBezier(0.33, 1.0, 0.68, 1.0))
                     .children(items);
                 let slider = match ctx.orientation() {
-                    Orientation::Horizontal => slider.w_full().translate_x(shift),
-                    Orientation::Vertical => slider.flex_col().h_full().translate_y(shift),
+                    Orientation::Horizontal => slider.width(pct(100.0)).translate_x(shift),
+                    Orientation::Vertical => slider
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .height(pct(100.0))
+                        .translate_y(shift),
                 };
                 if let Some(style) = track.style_mut() {
                     // `-ml-4` across, `-mt-4 flex-col` down: the caller's margin wins.
@@ -313,7 +317,7 @@ pub fn carousel_content() -> Part<()> {
                 }
                 div()
                     .named("carousel-content")
-                    .overflow_hidden()
+                    .overflow(Overflow::Hidden)
                     .child(track)
                     .into_element()
             }
@@ -324,7 +328,7 @@ pub fn carousel_content() -> Part<()> {
 /// One slide, the carousel's basis of the track.
 #[must_use]
 pub fn carousel_item() -> Part<()> {
-    let root = div().named("carousel-item").min_w(0.0).shrink_0();
+    let root = div().named("carousel-item").min_width(0.0).flex_shrink(0.0);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -334,13 +338,13 @@ pub fn carousel_item() -> Part<()> {
                 let Some(ctx) = &ctx else {
                     return item.into_element();
                 };
-                item = item.basis_len(relative(ctx.basis())).member(&ctx.slides, ());
+                item = item.flex_basis(Length::Fraction(ctx.basis())).member(&ctx.slides, ());
                 // `pl-4` across, `pt-4` down, unless the caller padded it
                 // (its class wins in `cn`).
                 let padding = item.style_mut().padding;
                 match ctx.orientation() {
-                    Orientation::Horizontal if padding.left == 0.0 => item = item.pl(4.0),
-                    Orientation::Vertical if padding.top == 0.0 => item = item.pt(4.0),
+                    Orientation::Horizontal if padding.left == 0.0 => item = item.padding_left(16.0),
+                    Orientation::Vertical if padding.top == 0.0 => item = item.padding_top(16.0),
                     _ => {}
                 }
                 item.into_element()
@@ -351,16 +355,20 @@ pub fn carousel_item() -> Part<()> {
 
 fn arrow(orientation: Orientation, enabled: bool, glyph: Icon) -> Div {
     let d = button(ButtonVariant::Outline, ButtonSize::Icon)
-        .absolute()
-        .size(8.0)
-        .rounded_full()
+        .position(Position::Absolute)
+        .size(32.0)
+        .radius(9999.0)
         .disabled(!enabled);
     // `-translate-1/2` of its own 32px. Vertical turns the button a quarter
     // (`rotate-90`); it is a circle, so only its arrow shows the turn.
     match orientation {
-        Orientation::Horizontal => d.top_len(relative(0.5)).mt(-4.0).child(icon(glyph)),
-        Orientation::Vertical => d.left_len(relative(0.5)).ml(-4.0).child(icon(glyph).rotate(90.0)),
+        Orientation::Horizontal => d.top(Length::Fraction(0.5)).margin_top(-16.0).child(icon(glyph)),
+        Orientation::Vertical => d
+            .left(Length::Fraction(0.5))
+            .margin_left(-16.0)
+            .child(icon(glyph).rotate(90.0)),
     }
+    .into_div()
 }
 
 /// Which arrow.
@@ -396,16 +404,16 @@ fn carousel_arrow(next: bool) -> ComponentElement {
                     .named("carousel-next")
                     .on_click(move |_| ctx.scroll_next());
                 match orientation {
-                    Orientation::Horizontal => d.right(-12.0),
-                    Orientation::Vertical => d.bottom(-12.0),
+                    Orientation::Horizontal => d.right(-48.0),
+                    Orientation::Vertical => d.bottom(-48.0),
                 }
             } else {
                 let d = arrow(orientation, ctx.can_scroll_prev(), Icon::ArrowLeft)
                     .named("carousel-previous")
                     .on_click(move |_| ctx.scroll_prev());
                 match orientation {
-                    Orientation::Horizontal => d.left(-12.0),
-                    Orientation::Vertical => d.top(-12.0),
+                    Orientation::Horizontal => d.left(-48.0),
+                    Orientation::Vertical => d.top(-48.0),
                 }
             }
             .into_element()

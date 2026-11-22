@@ -126,6 +126,11 @@ impl Compositor {
             {
                 let along = t.travel * (offset.1 / s.max.1);
                 src.thumbs.push((t.transform, (t.top.0, t.top.1 + along)));
+                // Shown only while it is: at rest it stays as committed (hidden).
+                let shown = self.scrolls.thumb_opacity(s.key, at);
+                if shown > 0.0 && usize::try_from(t.effect).is_ok_and(|e| e < props.effects.len()) {
+                    src.opacity.insert(t.effect, shown);
+                }
             }
         }
         src

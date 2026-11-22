@@ -18,7 +18,13 @@ pub fn render() -> Render {
     let name = TextField::new("Pedro Duarte");
     let username = TextField::new("@peduarte");
     Box::new(move || {
-        let field = |name: &str, f: &TextField| div().grid().gap(3.0).child(label(name)).child(input().field(*f));
+        let field = |name: &str, f: &TextField| {
+            div()
+                .display(Display::Grid)
+                .gap(12.0)
+                .child(label(name))
+                .child(input().field(*f))
+        };
         let profile = |side: SheetSide| {
             sheet_content(side)
                 .child(
@@ -30,11 +36,11 @@ pub fn render() -> Render {
                 )
                 .child(
                     div()
-                        .grid()
-                        .flex_1()
-                        .auto_rows_min()
-                        .gap(6.0)
-                        .px(4.0)
+                        .display(Display::Grid)
+                        .flex(Flex::grow(1.0))
+                        .grid_auto_rows(Track::MinContent)
+                        .gap(24.0)
+                        .padding_x(16.0)
                         .child(field("Name", &name))
                         .child(field("Username", &username)),
                 )
@@ -49,12 +55,13 @@ pub fn render() -> Render {
         page(
             "Sheet",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "SheetDemo.vue",
                     sheet()
-                        .flex()
+                        .display(Display::Flex)
                         .child(dialog_trigger(
                             button(ButtonVariant::Outline, ButtonSize::Default).child("Open"),
                         ))
@@ -62,13 +69,16 @@ pub fn render() -> Render {
                 ))
                 .child(section(
                     "Sides",
-                    div().flex().gap(2.0).children(SIDES.iter().map(|(name, side)| {
-                        sheet()
-                            .child(dialog_trigger(
-                                button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
-                            ))
-                            .child(profile(*side))
-                    })),
+                    div()
+                        .display(Display::Flex)
+                        .gap(8.0)
+                        .children(SIDES.iter().map(|(name, side)| {
+                            sheet()
+                                .child(dialog_trigger(
+                                    button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
+                                ))
+                                .child(profile(*side))
+                        })),
                 )),
         )
     })

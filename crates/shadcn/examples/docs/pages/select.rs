@@ -101,27 +101,28 @@ pub fn render() -> Render {
         page(
             "Select",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo(
                     "SelectDemo.vue",
                     select()
                         .model(fruit)
-                        .w_px(180.0)
+                        .width(180.0)
                         .child(select_value("Select a fruit"))
                         .child(fruits()),
                 ))
                 .child(demo(
                     "SelectMultipleDemo.vue",
                     select_multiple()
-                        .w_px(180.0)
+                        .width(180.0)
                         .child(select_value("Select a fruit"))
                         .child(fruits()),
                 ))
                 .child(demo(
                     "SelectScrollable.vue",
                     select()
-                        .w_px(280.0)
+                        .width(280.0)
                         .child(select_value("Select a timezone"))
                         .child(select_content().children(ZONES.map(|(region, zones)| {
                             select_group()
@@ -131,11 +132,11 @@ pub fn render() -> Render {
                 ))
                 .child(section(
                     "Small, groups, separator, disabled item",
-                    div().flex().child(
+                    div().display(Display::Flex).child(
                         select()
                             .model(small)
                             .size(SelectSize::Sm)
-                            .w_px(280.0)
+                            .width(280.0)
                             .child(select_value("Select a timezone"))
                             .child(zones),
                     ),
@@ -146,7 +147,8 @@ pub fn render() -> Render {
                         fruit.get().unwrap_or_default(),
                         small.get().unwrap_or_default()
                     ))
-                    .text_sm()
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground),
                 ),
         )

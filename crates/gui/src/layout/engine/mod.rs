@@ -34,6 +34,7 @@ pub mod cache;
 pub mod calc;
 mod flex;
 mod grid;
+mod inline;
 mod leaf;
 mod row;
 mod sizing;
@@ -198,6 +199,40 @@ pub trait Measure: Send {
     fn replaced(&self) -> bool {
         false
     }
+
+    /// [`Measure::measure`] for a leaf with children, laid in its content
+    /// as atomic inlines ([`inline`]): `boxes` are their margin boxes, one
+    /// to a child, in order, at the size they take in this space. A leaf
+    /// that lays none out ignores them.
+    fn measure_inline(
+        &self,
+        cx: &mut Self::Cx,
+        known: Size<Option<f32>>,
+        available: Size<AvailableSpace>,
+        boxes: &[InlineBox],
+    ) -> Measured {
+        let _ = boxes;
+        self.measure(cx, known, available)
+    }
+
+    /// Where each of `boxes` (as [`Measure::measure_inline`] has them) has
+    /// its margin box's top-left corner in a content box `width` wide, one
+    /// to a box; the content box's corner for each by default.
+    fn place_inline(&self, cx: &mut Self::Cx, width: f32, boxes: &[InlineBox]) -> Vec<taffy::Point<f32>> {
+        let _ = (cx, width);
+        vec![taffy::Point::ZERO; boxes.len()]
+    }
+}
+
+/// A child laid in its leaf parent's lines as a glyph is (CSS's atomic
+/// inline, an `inline-flex` button in a `<p>`): its margin box, and its
+/// baseline below that box's top; none puts its bottom margin edge on the
+/// line's baseline.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct InlineBox {
+    pub width: f32,
+    pub height: f32,
+    pub baseline: Option<f32>,
 }
 
 /// A measuring context, one per thread.
@@ -355,6 +390,9 @@ pub struct Node<S: NodeStyle, L> {
     /// A grid's tracks and its items' contributions from its last run
     /// (its own style and children unchanged since).
     grid: grid::Memo,
+    /// A leaf with children: its children's boxes in its lines, as its
+    /// last final layout laid them ([`inline`]).
+    inline: Vec<InlineBox>,
     /// What its answers read of the height it is given (as last settled,
     /// [`Node::heights_read`]).
     reads_available_height: bool,
@@ -419,6 +457,7 @@ impl<S: NodeStyle, L: Measure> Node<S, L> {
             root_space: None,
             stack: None,
             grid: grid::Memo::default(),
+            inline: Vec::new(),
             reads_available_height: true,
             width_reads_height: true,
             free_answer: false,
@@ -443,6 +482,7 @@ impl<S: NodeStyle, L: Measure> Node<S, L> {
     ///   passes the available height to the measure and nowhere else, and
     ///   its width is the measured width unless the style's aspect ratio
     ///   derives it from the height.
+    /// - A leaf with children ([`inline`]) gives it to them: it reads it.
     /// - A flex row (`compute_flexbox_layout`, single-line): the available
     ///   height becomes each item's available height, and the known height
     ///   of a stretched item whose height is not a length, but only in its
@@ -457,7 +497,9 @@ impl<S: NodeStyle, L: Measure> Node<S, L> {
             let width = m.width_reads_height || style.aspect_ratio().is_some();
             return (m.available_height, width);
         }
-        if self.style.display() != Display::Flex
+        // A leaf with children ([`inline`]) reads it: it gives it to them.
+        if self.leaf.is_some()
+            || self.style.display() != Display::Flex
             || style.aspect_ratio().is_some()
             || !matches!(
                 style.flex_direction(),
@@ -481,6 +523,13 @@ impl<S: NodeStyle, L: Measure> Node<S, L> {
             c.reads_available_height || (stretched && c.width_reads_height)
         });
         (reads, true)
+    }
+
+    /// A leaf with children: their boxes in its lines as its last final
+    /// layout laid them, one to a child ([`Measure::measure_inline`]).
+    #[must_use]
+    pub fn inline_boxes(&self) -> &[InlineBox] {
+        &self.inline
     }
 
     /// Its layout: size and place in its parent (the containing block for
@@ -945,6 +994,9 @@ fn run<S: NodeStyle, L: Measure>(
     let me = NodeId::new(SELF);
     let mut output = match (view.node.style.display(), view.node.children.is_empty()) {
         (Display::None, _) => taffy::compute_hidden_layout(view, me),
+        // A leaf with children lays them in its content (a paragraph
+        // holding elements): an inline formatting context.
+        (_, false) if view.node.leaf.is_some() => inline::compute(view, input),
         (Display::Block, false) => block::compute(view, input, block),
         (Display::FlowRoot, false) => block::compute(view, input, None),
         // A container with its own ratio is the general algorithms' (its

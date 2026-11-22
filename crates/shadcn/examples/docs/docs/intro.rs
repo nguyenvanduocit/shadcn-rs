@@ -9,6 +9,7 @@ use super::catalog::{Catalog, Route};
 use super::fidelity::Verdicts;
 use super::prose::{h1, markdown};
 use super::{Nav, Part};
+use shadcn::focus::StateLook;
 
 const README: &str = include_str!("../../../README.md");
 
@@ -17,17 +18,21 @@ fn link_card(nav: &Nav, route: Route, glyph: Icon, title: &str, about: String) -
     let t = theme();
     let go = nav.clone();
     card()
-        .flex_1()
-        .gap(3.0)
-        .py(5.0)
-        .cursor_pointer()
+        .flex(Flex::grow(1.0))
+        .gap(12.0)
+        .padding_y(20.0)
+        .cursor(Cursor::Pointer)
         .focusable()
-        .hover(move |s| s.bg(t.accent))
-        .focus_visible(move |s| s.ring(2.0, t.ring))
+        .with_interaction(|mut d, i| {
+            let ring = d.style_mut().ring;
+            let shown = Ring::new(2.0, t.ring);
+            d.background_while(move || i.hovered(), t.accent)
+                .ring(move || if i.focus_visible() { Some(shown) } else { ring })
+        })
         .on_click(move |_| go.go(route))
         .child(
             card_header()
-                .child(icon(glyph).size(5.0).mb(2.0))
+                .child(icon(glyph).size(20.0).margin_bottom(8.0))
                 .child(card_title(title))
                 .child(card_description(about)),
         )
@@ -45,8 +50,8 @@ pub fn parts(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav) -> Vec<Part> {
     };
     let first = catalog.components.first().copied().unwrap_or(Route::Introduction);
     let cards = div()
-        .flex()
-        .gap(4.0)
+        .display(Display::Flex)
+        .gap(16.0)
         .child(link_card(
             nav,
             first,
@@ -72,8 +77,9 @@ pub fn parts(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav) -> Vec<Part> {
             fidelity,
         ));
     let header = div()
-        .flex_col()
-        .gap(4.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(16.0)
         .child(h1("Introduction"))
         .when_some(opening, |d, o| d.child(o))
         .child(cards);
@@ -88,7 +94,8 @@ pub fn parts(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav) -> Vec<Part> {
         "source",
         None,
         text("From crates/shadcn/README.md.")
-            .text_xs()
+            .text_size(12.0)
+            .line_height(16.0)
             .text_color(t.muted_foreground),
     ));
     parts

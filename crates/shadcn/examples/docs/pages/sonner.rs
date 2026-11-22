@@ -20,9 +20,9 @@ pub fn render() -> Render {
     Box::new(move || {
         let outline = |label: &str| button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned());
         let types = div()
-            .flex()
-            .flex_wrap()
-            .gap(2.0)
+            .display(Display::Flex)
+            .flex_wrap(true)
+            .gap(8.0)
             .child(outline("Default").on_click(|_| {
                 toast("Event has been created");
             }))
@@ -48,8 +48,9 @@ pub fn render() -> Render {
         page(
             "Sonner",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "SonnerDemo.vue",
                     outline("Show Toast").on_click(|_| {
@@ -61,19 +62,19 @@ pub fn render() -> Render {
                     "SonnerWithDialogDemo.vue",
                     // A press on a toast is no press outside the dialog: the
                     // toaster's layer is above it, so the dialog stays open.
-                    div().flex().child(
+                    div().display(Display::Flex).child(
                         dialog().child(dialog_trigger(outline("Dialog with toast"))).child(
                             dialog_content()
-                                .max_w(112.0)
+                                .max_width(448.0)
                                 .child(
                                     dialog_header()
                                         .child(dialog_title("Vue Sonner Toast"))
                                         .child(dialog_description("Dialog with toast")),
                                 )
                                 .child(
-                                    div().grid().gap(4.0).child(
+                                    div().display(Display::Grid).gap(16.0).child(
                                         button(ButtonVariant::Default, ButtonSize::Sm)
-                                            .px(3.0)
+                                            .padding_x(12.0)
                                             .on_click(|_| {
                                                 toast(event_created());
                                             })

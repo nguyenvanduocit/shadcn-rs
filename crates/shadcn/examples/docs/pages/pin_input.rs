@@ -14,15 +14,20 @@ pub fn render() -> Render {
     let simple = Signal::labeled("pin", Vec::<Option<char>>::new());
     Box::new(move || {
         let t = theme();
-        let labelled =
-            |name: &str, body: Part<PinInputProps>| div().grid().gap(2.0).child(label(name.to_owned())).child(body);
+        let labelled = |name: &str, body: Part<PinInputProps>| {
+            div()
+                .display(Display::Grid)
+                .gap(8.0)
+                .child(label(name.to_owned()))
+                .child(body)
+        };
         let code: String = simple.with(|v| v.iter().flatten().collect());
         page(
             "Pin Input",
             div()
-                .flex()
-                .flex_wrap()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_wrap(true)
+                .gap(24.0)
                 .child(demo(
                     "PinInputDemo.vue",
                     pin_input()
@@ -47,13 +52,15 @@ pub fn render() -> Render {
                 .child(labelled(
                     "With Spacing",
                     pin_input().child(
-                        input_otp_group((0..4).map(|i| pin_input_slot(i).invalid(true).rounded_md().border())).gap(2.0),
+                        input_otp_group((0..4).map(|i| pin_input_slot(i).invalid(true).radius(8.0).border(1.0)))
+                            .gap(8.0),
                     ),
                 ))
                 .child(
                     text(format!("Simple: \"{code}\""))
-                        .w_full()
-                        .text_sm()
+                        .width(pct(100.0))
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .text_color(t.muted_foreground),
                 ),
         )

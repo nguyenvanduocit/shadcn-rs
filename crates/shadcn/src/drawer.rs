@@ -11,9 +11,7 @@ use std::cell::Cell;
 
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{
-    Animation, Div, DragEvent, DragPhase, Easing, Element, Radius, Signal, Text, component, div, relative, text,
-};
+use gui::{Animation, Div, DragEvent, DragPhase, Easing, Element, Signal, Text, component, div, text};
 
 use crate::dialog::{
     DialogContext, DialogProps, ModalLook, dialog_close, dialog_description, dialog_trigger, modal_layer, modal_root,
@@ -45,14 +43,18 @@ pub fn drawer() -> Part<DialogProps> {
 }
 
 /// Make `trigger` open the drawer when pressed (`DrawerTrigger as-child`).
+/// Give `trigger` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn drawer_trigger(trigger: Div) -> Part<()> {
+pub fn drawer_trigger(trigger: impl Into<Div>) -> Part<()> {
     dialog_trigger(trigger)
 }
 
 /// Make `close` close the drawer when pressed (`DrawerClose as-child`).
+/// Give `close` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn drawer_close(close: Div) -> Part<()> {
+pub fn drawer_close(close: impl Into<Div>) -> Part<()> {
     dialog_close(close)
 }
 
@@ -73,12 +75,13 @@ pub fn drawer_content(direction: DrawerDirection) -> Part<DrawerContentProps> {
     let root = div()
         .named("drawer-content")
         .role(gui::Role::Dialog)
-        .bg(t.background)
-        .absolute()
-        .flex_col()
-        .h_auto()
+        .background(t.background)
+        .position(Position::Absolute)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .height(Length::Auto)
         // `duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]`.
-        .transition_transform()
+        .transition(Properties::TRANSFORM)
         .ease(Easing::CubicBezier(0.32, 0.72, 0.0, 1.0))
         .when(direction == DrawerDirection::Down, |d| d.child(drawer_handle()));
     Part::new(DrawerContentProps { direction }, root, |p| {
@@ -160,20 +163,25 @@ fn placed(root: Div, direction: DrawerDirection, swipe: f32) -> Div {
     };
     // `slide-in-from-bottom` and its siblings; `data-swiping:duration-0`.
     let base = root
-        .animate(slide(Animation::enter(), off))
-        .animate_out(slide(Animation::exit(), off))
+        .animation(slide(Animation::enter(), off))
+        .exit_animation(slide(Animation::exit(), off))
         .duration_ms(if swipe > 0.0 { 0.0 } else { 500.0 })
         .translate_x(Calc::px(along.0))
         .translate_y(Calc::px(along.1));
     let mut placed = match direction {
-        DrawerDirection::Up => base.left(0.0).right(0.0).top(0.0).mb(24.0).rounded_b(Radius::LG),
-        DrawerDirection::Down => base.left(0.0).right(0.0).bottom(0.0).mt(24.0).rounded_t(Radius::LG),
-        DrawerDirection::Right => base.top(0.0).bottom(0.0).right(0.0).w_len(relative(0.75)).max_w(96.0),
-        DrawerDirection::Left => base.top(0.0).bottom(0.0).left(0.0).w_len(relative(0.75)).max_w(96.0),
+        DrawerDirection::Up => base
+            .left(0.0)
+            .right(0.0)
+            .top(0.0)
+            .margin_bottom(96.0)
+            .radius_bottom(10.0),
+        DrawerDirection::Down => base.left(0.0).right(0.0).bottom(0.0).margin_top(96.0).radius_top(10.0),
+        DrawerDirection::Right => base.top(0.0).bottom(0.0).right(0.0).width(pct(75.0)).max_width(384.0),
+        DrawerDirection::Left => base.top(0.0).bottom(0.0).left(0.0).width(pct(75.0)).max_width(384.0),
     };
     if matches!(direction, DrawerDirection::Up | DrawerDirection::Down) {
         // `max-h-[80vh]`: the layer is the window's height.
-        placed.style_mut().max_height = relative(0.8);
+        placed.style_mut().max_height = Length::Fraction(0.8);
     }
     placed
 }
@@ -183,23 +191,34 @@ fn drawer_handle() -> Div {
     let t = theme();
     div()
         .named("drawer-handle")
-        .bg(t.muted)
-        .mx_auto()
-        .mt(4.0)
-        .h(2.0)
-        .w_px(100.0)
-        .shrink_0()
-        .rounded_full()
+        .background(t.muted)
+        .margin_x(Length::Auto)
+        .margin_top(16.0)
+        .height(8.0)
+        .width(100.0)
+        .flex_shrink(0.0)
+        .radius(9999.0)
 }
 
 #[must_use]
 pub fn drawer_header() -> Div {
-    div().named("drawer-header").flex_col().gap(1.5).p(4.0)
+    div()
+        .named("drawer-header")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(6.0)
+        .padding(16.0)
 }
 
 #[must_use]
 pub fn drawer_footer() -> Div {
-    div().named("drawer-footer").mt_auto().flex_col().gap(2.0).p(4.0)
+    div()
+        .named("drawer-footer")
+        .margin_top(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .padding(16.0)
 }
 
 #[must_use]
@@ -208,7 +227,7 @@ pub fn drawer_title(title: impl Into<String>) -> Text {
     text(title)
         .named("drawer-title")
         .text_color(t.foreground)
-        .font_semibold()
+        .font_weight(600)
 }
 
 #[must_use]

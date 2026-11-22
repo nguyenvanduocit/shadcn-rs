@@ -15,7 +15,7 @@ use gui::{
     use_model,
 };
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
@@ -77,16 +77,24 @@ fn roving_target(len: usize, current: Option<usize>, key: &KeyEvent) -> Option<u
 /// The tabs: their triggers and panels go inside.
 #[must_use]
 pub fn tabs() -> Part<TabsProps> {
-    Part::new(TabsProps::default(), div().named("tabs").flex_col().gap(2.0), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            provide(TabsContext {
-                value: use_model(props, |p| &p.props.value),
-                triggers: Members::new(),
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        TabsProps::default(),
+        div()
+            .named("tabs")
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(8.0),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                provide(TabsContext {
+                    value: use_model(props, |p| &p.props.value),
+                    triggers: Members::new(),
+                });
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 impl Part<TabsProps> {
@@ -118,15 +126,16 @@ pub fn tabs_list() -> Div {
     div()
         .named("tabs-list")
         .role(gui::Role::TabList)
-        .bg(t.muted)
+        .background(t.muted)
         .text_color(t.muted_foreground)
-        .inline_flex()
-        .self_start()
-        .h(9.0)
-        .items_center()
-        .justify_center()
-        .rounded_lg()
-        .p(0.75)
+        .display(Display::Flex)
+        .inline(true)
+        .align_self(Align::Start)
+        .height(36.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(10.0)
+        .padding(3.0)
 }
 
 /// What a trigger or a panel is given: the value it stands for.
@@ -142,25 +151,26 @@ pub fn tabs_trigger(value: impl Into<String>) -> Part<TabProps> {
     let root = div()
         .named("tabs-trigger")
         .role(gui::Role::Tab)
-        .transition_props(Properties::COLOR | Properties::SHADOW)
+        .transition(Properties::COLOR | Properties::SHADOW)
         .text_color(if t.dark { t.muted_foreground } else { t.foreground })
-        .inline_flex()
+        .display(Display::Flex)
+        .inline(true)
         // `h-[calc(100%-1px)]` of the list's 30px inside its 3px padding.
-        .h_px(29.0)
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .gap(1.5)
-        .rounded_md()
-        .border()
+        .height(29.0)
+        .flex(Flex::grow(1.0))
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(6.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(Color::TRANSPARENT)
-        .px(2.0)
-        .py(1.0)
-        .text_sm()
-        .font_medium()
-        .whitespace_nowrap()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5));
+        .padding_x(8.0)
+        .padding_y(4.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .nowrap(true)
+        .with_interaction(|d, i| d.dim_disabled(i, 0.5));
     Part::new(TabProps { value: value.into() }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -179,12 +189,31 @@ pub fn tabs_trigger(value: impl Into<String>) -> Part<TabProps> {
                     .track_focus(handle)
                     .member(&tabs.triggers, (value, handle))
                     .when(active, |d| {
-                        d.bg(t.background).shadow_sm().when(t.dark, |d| {
-                            d.text_color(t.foreground)
-                                .border_color(t.input)
-                                .bg(t.input.opacity(0.3))
-                        })
+                        d.background(t.background)
+                            .shadow([
+                                Shadow {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    blur: 3.0,
+                                    spread: 0.0,
+                                    color: Color::BLACK.opacity(0.1),
+                                },
+                                Shadow {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    blur: 2.0,
+                                    spread: -1.0,
+                                    color: Color::BLACK.opacity(0.1),
+                                },
+                            ])
+                            .when(t.dark, |d| {
+                                d.text_color(t.foreground)
+                                    .border_color(t.input)
+                                    .background(t.input.opacity(0.3))
+                            })
                     })
+                    // Over the border the active tab has (`dark:data-[state=active]:border-input`).
+                    .with_interaction(|d, i| d.focus_ring_on(i, &t))
                     .on_click(move |_| on_click.value.set(click_value.clone()))
                     .on_key_down(move |key| on_key.navigate(&key_value, key))
                     .into_element()
@@ -197,7 +226,10 @@ pub fn tabs_trigger(value: impl Into<String>) -> Part<TabProps> {
 /// otherwise); fill it with `.child`.
 #[must_use]
 pub fn tabs_content(value: impl Into<String>) -> Part<TabProps> {
-    let root = div().named("tabs-content").role(gui::Role::TabPanel).flex_1();
+    let root = div()
+        .named("tabs-content")
+        .role(gui::Role::TabPanel)
+        .flex(Flex::grow(1.0));
     Part::new(TabProps { value: value.into() }, root, |p| {
         component(p, |cx| {
             let props = cx.props();

@@ -8,6 +8,7 @@ use gui::prelude::*;
 use gui::{Div, Icon, IconElement, Image, ImageSource, Text, div, icon, image, text};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -79,42 +80,46 @@ pub fn attachment(p: AttachmentProps, slots: AttachmentSlots) -> Div {
     let t = theme();
     let d = div()
         .named("attachment")
-        .transition_colors()
-        .relative()
-        .inline_flex()
-        .flex_wrap()
-        .max_w_full()
-        .min_w(0.0)
-        .shrink_0()
-        .rounded_xl()
-        .border()
+        .transition(Properties::COLORS)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .inline(true)
+        .flex_wrap(true)
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .flex_shrink(0.0)
+        .radius(14.0)
+        .border(1.0)
         .border_color(match p.state {
             AttachmentState::Error => t.destructive.opacity(0.3),
             _ => t.border,
         })
-        .bg(t.card)
+        .background(t.card)
         .text_color(t.card_foreground);
     // (gap, padding with media, side and top padding with content only)
     let (gap, even, (x, y)) = match p.size {
-        AttachmentSize::Default => (2.0, 2.0, (2.5, 2.0)),
-        AttachmentSize::Sm => (2.5, 1.5, (2.0, 1.5)),
-        AttachmentSize::Xs => (1.5, 1.0, (1.5, 1.0)),
+        AttachmentSize::Default => (8.0, 8.0, (10.0, 8.0)),
+        AttachmentSize::Sm => (10.0, 6.0, (8.0, 6.0)),
+        AttachmentSize::Xs => (6.0, 4.0, (6.0, 4.0)),
     };
     let d = match p.size {
-        AttachmentSize::Default => d.text_sm(),
-        AttachmentSize::Sm => d.text_xs(),
-        AttachmentSize::Xs => d.text_xs().rounded_lg(),
+        AttachmentSize::Default => d.text_size(14.0).line_height(20.0),
+        AttachmentSize::Sm => d.text_size(12.0).line_height(16.0),
+        AttachmentSize::Xs => d.text_size(12.0).line_height(16.0).radius(10.0),
     }
     .gap(gap);
     // Vue's media rule sorts after its content rule, so media wins.
     let d = match (slots.media, slots.content) {
-        (true, _) => d.p(even),
-        (false, true) => d.px(x).py(y),
+        (true, _) => d.padding(even),
+        (false, true) => d.padding_x(x).padding_y(y),
         (false, false) => d,
     };
     match p.orientation {
-        AttachmentOrientation::Horizontal => d.min_w(40.0).items_center(),
-        AttachmentOrientation::Vertical => d.w(if slots.content { 30.0 } else { 24.0 }).flex_col(),
+        AttachmentOrientation::Horizontal => d.min_width(160.0).align_items(Align::Center),
+        AttachmentOrientation::Vertical => d
+            .width(if slots.content { 120.0 } else { 96.0 })
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column),
     }
 }
 
@@ -125,22 +130,24 @@ pub fn attachment_media(p: AttachmentProps, variant: AttachmentMediaVariant) -> 
     let error = p.state == AttachmentState::Error;
     let d = div()
         .named("attachment-media")
-        .relative()
-        .flex()
-        .aspect_square()
-        .shrink_0()
-        .items_center()
-        .justify_center()
-        .overflow_hidden()
-        .rounded_lg()
-        .bg(if error { t.destructive.opacity(0.1) } else { t.muted })
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .aspect_ratio(1.0)
+        .flex_shrink(0.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .overflow(Overflow::Hidden)
+        .radius(10.0)
+        .background(if error { t.destructive.opacity(0.1) } else { t.muted })
         .text_color(if error { t.destructive } else { t.foreground });
     let d = match p.size {
-        AttachmentSize::Default => d.w(10.0),
-        AttachmentSize::Sm => d.w(8.0),
-        AttachmentSize::Xs => d.w(7.0).rounded_md(),
+        AttachmentSize::Default => d.width(40.0),
+        AttachmentSize::Sm => d.width(32.0),
+        AttachmentSize::Xs => d.width(28.0).radius(8.0),
     };
-    let d = d.when(p.orientation == AttachmentOrientation::Vertical, Styled::w_full);
+    let d = d.when(p.orientation == AttachmentOrientation::Vertical, |e| {
+        e.width(pct(100.0))
+    });
     let settled = matches!(p.state, AttachmentState::Idle | AttachmentState::Done);
     d.when(variant == AttachmentMediaVariant::Image && !settled, |d| d.opacity(0.6))
 }
@@ -150,9 +157,9 @@ pub fn attachment_media(p: AttachmentProps, variant: AttachmentMediaVariant) -> 
 #[must_use]
 pub fn attachment_icon(p: AttachmentProps, which: Icon) -> IconElement {
     let size = match (p.orientation, p.size) {
-        (AttachmentOrientation::Vertical, _) => 6.0,
-        (AttachmentOrientation::Horizontal, AttachmentSize::Xs) => 3.5,
-        (AttachmentOrientation::Horizontal, _) => 4.0,
+        (AttachmentOrientation::Vertical, _) => 24.0,
+        (AttachmentOrientation::Horizontal, AttachmentSize::Xs) => 14.0,
+        (AttachmentOrientation::Horizontal, _) => 16.0,
     };
     icon(which).size(size)
 }
@@ -160,7 +167,7 @@ pub fn attachment_icon(p: AttachmentProps, which: Icon) -> IconElement {
 /// A preview filling the media square.
 #[must_use]
 pub fn attachment_image(source: ImageSource) -> Image {
-    image(source).w_full().aspect_square()
+    image(source).width(pct(100.0)).aspect_ratio(1.0)
 }
 
 /// The name and details column.
@@ -168,11 +175,11 @@ pub fn attachment_image(source: ImageSource) -> Image {
 pub fn attachment_content(p: AttachmentProps) -> Div {
     div()
         .named("attachment-content")
-        .leading_tight()
-        .max_w_full()
-        .min_w(0.0)
-        .flex_1()
-        .when(p.orientation == AttachmentOrientation::Vertical, |d| d.px(1.0))
+        .line_height(LineHeight::Relative(1.25))
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .flex(Flex::grow(1.0))
+        .when(p.orientation == AttachmentOrientation::Vertical, |d| d.padding_x(4.0))
 }
 
 /// The file name, cut to one line.
@@ -180,9 +187,12 @@ pub fn attachment_content(p: AttachmentProps) -> Div {
 pub fn attachment_title(title: impl Into<String>) -> Text {
     text(title)
         .named("attachment-title")
-        .font_medium()
-        .max_w_full()
-        .truncate()
+        .font_weight(500)
+        .max_width(pct(100.0))
+        .truncate(true)
+        .nowrap(true)
+        .overflow_x(Overflow::Hidden)
+        .min_width(0.0)
 }
 
 /// Size, type or progress under the name; red when the upload failed.
@@ -191,10 +201,14 @@ pub fn attachment_description(p: AttachmentProps, description: impl Into<String>
     let t = theme();
     text(description)
         .named("attachment-description")
-        .mt(0.5)
-        .text_xs()
-        .max_w_full()
-        .truncate()
+        .margin_top(2.0)
+        .text_size(12.0)
+        .line_height(16.0)
+        .max_width(pct(100.0))
+        .truncate(true)
+        .nowrap(true)
+        .overflow_x(Overflow::Hidden)
+        .min_width(0.0)
         .text_color(if p.state == AttachmentState::Error {
             t.destructive.opacity(0.8)
         } else {
@@ -208,13 +222,13 @@ pub fn attachment_description(p: AttachmentProps, description: impl Into<String>
 pub fn attachment_actions(p: AttachmentProps) -> Div {
     let d = div()
         .named("attachment-actions")
-        .relative()
-        .flex()
-        .shrink_0()
-        .items_center();
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_shrink(0.0)
+        .align_items(Align::Center);
     match p.orientation {
         AttachmentOrientation::Horizontal => d,
-        AttachmentOrientation::Vertical => d.absolute().top(3.0).right(3.0).gap(1.0),
+        AttachmentOrientation::Vertical => d.position(Position::Absolute).top(12.0).right(12.0).gap(4.0),
     }
 }
 
@@ -224,7 +238,8 @@ pub fn attachment_actions(p: AttachmentProps) -> Div {
 pub fn attachment_action(which: Icon) -> Div {
     button(ButtonVariant::Ghost, ButtonSize::IconXs)
         .named("attachment-action")
-        .child(icon(which).size(3.0))
+        .child(icon(which).size(12.0))
+        .into_div()
 }
 
 /// Makes the whole attachment pressable (open, preview). Vue lays a
@@ -236,9 +251,13 @@ pub fn attachment_trigger(attachment: Div) -> Div {
     let t = theme();
     attachment
         .focusable()
-        .cursor_pointer()
-        .hover(move |s| s.bg(t.muted.opacity(0.5)))
-        .focus_visible(move |s| s.ring(1.0, t.ring.opacity(0.5)))
+        .cursor(Cursor::Pointer)
+        .with_interaction(|mut d, i| {
+            let ring = d.style_mut().ring;
+            let shown = Ring::new(1.0, t.ring.opacity(0.5));
+            d.background_while(move || i.hovered(), t.muted.opacity(0.5))
+                .ring(move || if i.focus_visible() { Some(shown) } else { ring })
+        })
 }
 
 /// A row of attachments that scrolls sideways when it overflows, its
@@ -247,11 +266,17 @@ pub fn attachment_trigger(attachment: Div) -> Div {
 pub fn attachment_group() -> Div {
     div()
         .named("attachment-group")
-        .flex()
-        .gap(3.0)
-        .py(1.0)
-        .min_w(0.0)
-        .overflow_x_scroll()
-        .scroll_fade_x()
-        .scrollbar_none()
+        .display(Display::Flex)
+        .gap(12.0)
+        .padding_y(4.0)
+        .min_width(0.0)
+        .overflow_x(Overflow::Scroll)
+        .overflow_y(Overflow::Hidden)
+        .mask(ScrollFade {
+            axis: Axis::Horizontal,
+            start: true,
+            end: true,
+            size: None,
+        })
+        .scrollbar_hidden(true)
 }

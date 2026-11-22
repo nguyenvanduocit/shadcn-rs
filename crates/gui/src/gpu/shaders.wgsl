@@ -44,7 +44,8 @@ struct Globals {
 // One word per instance: where its record starts.
 @group(0) @binding(2) var<storage, read> index: array<u32>;
 // The property tables: a slot is (transform, clip, effect) ids; a
-// transform its offset; a clip its rectangle and radii; an effect its alpha.
+// transform its offset; a clip its rectangle, radii and corners' curve (three
+// vec4s); an effect its alpha.
 @group(0) @binding(3) var<storage, read> props: array<vec4<f32>>;
 // Atlas pages (ADR-0016): coverage (glyphs, icons), and colour or subpixel.
 @group(0) @binding(4) var mono_atlas: texture_2d_array<f32>;
@@ -66,9 +67,17 @@ const KIND_MASK: u32 = 6u;
 const KIND_LAYER: u32 = 7u;
 const KIND_TEXT_THROUGH: u32 = 8u;
 const KIND_LCD: u32 = 9u;
+// What lies below, read back into `extra` (`gpu/read.rs`).
+const KIND_READ: u32 = 10u;
+const READ_BACKDROP: u32 = 0u;
+const READ_DARKEN: u32 = 1u;
+const READ_LIGHTEN: u32 = 2u;
 
 const F_RADII: u32 = 256u;
 const F_INNER: u32 = 512u;
+// A solid record's corners curve as `superellipse(k)`, its last word `k`
+// (a shadow's and an image's too).
+const F_CURVE: u32 = 1024u;
 
 fn word(at: u32) -> u32 {
     return records[at];
@@ -136,8 +145,8 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     quad = vec4<f32>(quad.xy + offset, quad.zw);
     var clip = 0u;
     if (slot.y != 0u) {
-        let rect = props[globals.bases.z + slot.y * 2u];
-        let radii = props[globals.bases.z + slot.y * 2u + 1u];
+        let rect = props[globals.bases.z + slot.y * 3u];
+        let radii = props[globals.bases.z + slot.y * 3u + 1u];
         // Wholly inside the clip's inner rectangle (its corners and half a
         // pixel of its edges left out): the clip changes nothing.
         let r = max(max(radii.x, radii.y), max(radii.z, radii.w)) + 0.5;
@@ -173,9 +182,10 @@ fn clip_cov(clip: u32, p: vec2<f32>) -> f32 {
     if (clip == 0u) {
         return 1.0;
     }
-    let rect = props[globals.bases.z + clip * 2u];
-    let radii = props[globals.bases.z + clip * 2u + 1u];
-    return rrect_cov(p, rect, radii);
+    let rect = props[globals.bases.z + clip * 3u];
+    let radii = props[globals.bases.z + clip * 3u + 1u];
+    let curve = props[globals.bases.z + clip * 3u + 2u].x;
+    return shape_cov(p, rect, radii, curve);
 }
 
 // ---- shadows: Raph Levien's blurred rounded rectangle, as GPUI draws them ----
@@ -264,6 +274,33 @@ fn record_gradient(first: u32, count: u32, p: vec2<f32>, line: vec4<f32>) -> vec
     return color;
 }
 
+// A box of corners `superellipse(k)` (not round) blurred by `sigma`: the
+// rectangle's blur, exact and separable, cut where the curve is by the
+// blur of the edge nearest (an approximation the draft leaves open; a
+// round box takes `blurred_rrect`).
+fn blurred_shape(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, k: f32, sigma: f32) -> f32 {
+    let s = 1.0 / (sigma * sqrt(2.0));
+    let lo = rect.xy;
+    let hi = rect.xy + rect.zw;
+    let x = 0.5 * (erf7((p.x - lo.x) * s) - erf7((p.x - hi.x) * s));
+    let y = 0.5 * (erf7((p.y - lo.y) * s) - erf7((p.y - hi.y) * s));
+    let edge = 0.5 * (1.0 - erf7(shape_sdf(p, rect, radii, k) * s));
+    return min(x * y, edge);
+}
+
+// `saturate(k)` of Filter Effects 1 on a premultiplied colour (the matrix
+// is linear, so alpha need not be divided out), clamped to its alpha.
+fn saturated(px: vec4<f32>, k: f32) -> vec4<f32> {
+    if (k == 1.0) {
+        return px;
+    }
+    let r = vec3<f32>(0.213 + 0.787 * k, 0.715 - 0.715 * k, 0.072 - 0.072 * k);
+    let g = vec3<f32>(0.213 - 0.213 * k, 0.715 + 0.285 * k, 0.072 - 0.072 * k);
+    let b = vec3<f32>(0.213 - 0.213 * k, 0.715 - 0.715 * k, 0.072 + 0.928 * k);
+    let rgb = vec3<f32>(dot(r, px.rgb), dot(g, px.rgb), dot(b, px.rgb));
+    return vec4<f32>(clamp(rgb, vec3<f32>(0.0), vec3<f32>(px.a)), px.a);
+}
+
 fn filtered(px: vec4<f32>, kind: f32, amount: f32) -> vec4<f32> {
     // On premultiplied channels, clamped to alpha, as the CPU renderer filters.
     var rgb = px.rgb;
@@ -302,11 +339,15 @@ fn shade(input: Varying) -> Shaded {
             if ((head & F_RADII) != 0u) {
                 a_radii = w4(at + 8u);
             }
-            var cov = rrect_cov(p, a, a_radii);
+            var k = 1.0;
+            if ((head & F_CURVE) != 0u) {
+                k = wf(at + select(12u, 20u, (head & F_INNER) != 0u));
+            }
+            var cov = shape_cov(p, a, a_radii, k);
             if ((head & F_INNER) != 0u) {
                 let b = w4(at + 12u);
                 if (b.z > 0.0 && b.w > 0.0) {
-                    cov = max(cov - rrect_cov(p, b, w4(at + 16u)), 0.0);
+                    cov = max(cov - shape_cov(p, b, w4(at + 16u), k), 0.0);
                 }
             }
             out = premul(color) * cov;
@@ -315,14 +356,20 @@ fn shade(input: Varying) -> Shaded {
             let a = w4(at + 4u);
             let a_radii = w4(at + 8u);
             let sigma = wf(at + 20u);
+            var k = 1.0;
+            if ((head & F_CURVE) != 0u) {
+                k = wf(at + 21u);
+            }
             var alpha: f32;
             if (sigma <= 0.0) {
-                alpha = rrect_cov(p, a, a_radii);
-            } else {
+                alpha = shape_cov(p, a, a_radii, k);
+            } else if (k == 1.0) {
                 alpha = blurred_rrect(p, a, a_radii, sigma);
+            } else {
+                alpha = blurred_shape(p, a, a_radii, k, sigma);
             }
             // CSS draws a shadow only outside the box casting it.
-            alpha = alpha * (1.0 - rrect_cov(p, w4(at + 12u), w4(at + 16u)));
+            alpha = alpha * (1.0 - shape_cov(p, w4(at + 12u), w4(at + 16u), k));
             out = premul(color) * alpha;
         }
         case KIND_GRADIENT: {
@@ -356,7 +403,11 @@ fn shade(input: Varying) -> Shaded {
             // Where the whole image lands, covering the box.
             let placed = w4(at + 12u);
             let uv = (p - placed.xy) / placed.zw;
-            out = textureSampleLevel(extra, linear_sampler, uv, 0.0) * rrect_cov(p, w4(at + 4u), w4(at + 8u));
+            var k = 1.0;
+            if ((head & F_CURVE) != 0u) {
+                k = wf(at + 16u);
+            }
+            out = textureSampleLevel(extra, linear_sampler, uv, 0.0) * shape_cov(p, w4(at + 4u), w4(at + 8u), k);
         }
         case KIND_LAYER: {
             // The group's region, the inverse of its transform, two
@@ -393,6 +444,46 @@ fn shade(input: Varying) -> Shaded {
             }
             let texel = vec2<i32>(floor(p - a.xy));
             out = fill * textureLoad(extra, texel, 0).a;
+        }
+        case KIND_READ: {
+            // Its shape (an outer box, an inner one cut out), where the
+            // texture's first texel lies in the window, how many window
+            // pixels a texel covers, `saturate(k)`, the curve, and the
+            // texels that hold what was read.
+            let k = wf(at + 24u);
+            var cov = shape_cov(p, w4(at + 4u), w4(at + 8u), k);
+            if ((head & F_INNER) != 0u) {
+                let b = w4(at + 12u);
+                if (b.z > 0.0 && b.w > 0.0) {
+                    cov = max(cov - shape_cov(p, b, w4(at + 16u), k), 0.0);
+                }
+            }
+            let origin = vec2<f32>(wf(at + 20u), wf(at + 21u));
+            let level = wf(at + 22u);
+            let valid = vec2<f32>(wf(at + 25u), wf(at + 26u));
+            let mode = (head >> 16u) & 0xffu;
+            if (mode == READ_BACKDROP) {
+                // Between texel centres, never past what was read.
+                let q = clamp((window - origin) / level, vec2<f32>(0.5), valid - 0.5);
+                let px = textureSampleLevel(extra, linear_sampler, q / vec2<f32>(textureDimensions(extra)), 0.0);
+                out = saturated(px, wf(at + 23u)) * cov;
+            } else {
+                // Compositing 1's separable blend: what shows is
+                // `(1 - ab)·Cs + ab·B(Cb, Cs)`, source-over the backdrop.
+                let texel = clamp(vec2<i32>(floor(window - origin)), vec2<i32>(0), vec2<i32>(valid) - 1);
+                let below = textureLoad(extra, texel, 0);
+                let ab = below.a;
+                var cb = vec3<f32>(0.0);
+                if (ab > 0.0) {
+                    cb = below.rgb / ab;
+                }
+                var mixed = min(cb, color.rgb);
+                if (mode == READ_LIGHTEN) {
+                    mixed = max(cb, color.rgb);
+                }
+                let a = color.a * cov;
+                out = vec4<f32>(((1.0 - ab) * color.rgb + ab * mixed) * a, a);
+            }
         }
         default: {}
     }

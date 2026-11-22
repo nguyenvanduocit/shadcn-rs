@@ -1,17 +1,17 @@
-//! The Theming page: every token of [`Theme`], light and dark, as a swatch.
+//! The Theming page: every token of a [`Palette`], light and dark, as a swatch.
 
 use gui::prelude::*;
 use gui::{Color, Div, Track, div, text};
+use shadcn::theme::Palette;
 use shadcn::{Theme, table, table_body, table_head, table_header, table_row, theme};
 
 use super::Part;
 use super::prose::{h1, h2, inline, lead, paragraph};
 
 /// Every token of `t`, named as shadcn names it. The pattern names every
-/// field, so a token added to [`Theme`] fails to build until it shows here.
-pub(super) fn tokens(t: Theme) -> Vec<(String, Color)> {
-    let Theme {
-        dark: _,
+/// field, so a token added to [`Palette`] fails to build until it shows here.
+pub(super) fn tokens(t: Palette<Color>) -> Vec<(String, Color)> {
+    let Palette {
         background,
         foreground,
         card,
@@ -113,71 +113,92 @@ pub(super) fn oklch(c: Color) -> String {
 }
 
 /// A token's swatch on the background of the theme it belongs to, and its value.
-fn swatch(on: Theme, c: Color) -> Div {
+fn swatch(on: Palette<Color>, c: Color) -> Div {
     div()
-        .flex()
-        .items_center()
-        .gap(3.0)
-        .p(2.0)
-        .rounded_md()
-        .bg(on.background)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(12.0)
+        .padding(8.0)
+        .radius(8.0)
+        .background(on.background)
         .text_color(on.muted_foreground)
         .child(
             div()
-                .size(8.0)
-                .shrink_0()
-                .rounded_md()
-                .border()
+                .size(32.0)
+                .flex_shrink(0.0)
+                .radius(8.0)
+                .border(1.0)
                 .border_color(on.foreground.opacity(0.15))
-                .bg(c),
+                .background(c),
         )
-        .child(text(oklch(c)).font_mono().text_xs().truncate())
+        .child(
+            text(oklch(c))
+                .font_family(FontFamily::GEIST_MONO)
+                .text_size(12.0)
+                .line_height(16.0)
+                .truncate(true)
+                .nowrap(true)
+                .overflow_x(Overflow::Hidden)
+                .min_width(0.0),
+        )
 }
 
 /// The Theming page.
 pub fn parts(doc: &str) -> Vec<Part> {
     let t = theme();
-    let (light, dark) = (Theme::light(), Theme::dark());
+    let colors = Theme::default().colors;
+    let (light, dark) = (colors.light.painted(), colors.dark.painted());
     let header = div()
-        .flex_col()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
         .child(h1("Theming"))
         .child(lead(&doc.replace('\n', " ")));
     let usage = div()
-        .flex_col()
-        .gap(3.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
         .child(h2("Using the tokens"))
         .child(paragraph(
             "A component reads its colours from `let t = theme();` and nothing else: `bg-primary/90` is \
-             `.bg(t.primary.opacity(0.9))`, `dark:` is `.when(t.dark, …)`.",
+             `.background(t.primary.opacity(0.9))`, `dark:` is `.when(t.dark, …)`.",
         ))
         .child(paragraph(
-            "The theme is a `Signal<Theme>` handed to `provide_theme`; setting it to `Theme::dark()` re-renders every \
-             component, which is what the sun and moon in the header do.",
+            "The theme is installed with `install(theme, VEGA)`; writing its scheme (`use_theme().update(|t| t.scheme = \
+             Scheme::Dark)`) re-renders every component that read it, which is what the sun and moon in the header do.",
         ));
     let columns = [Track::Px(210.0), Track::Fr(1.0), Track::Fr(1.0)];
     let rows = tokens(light).into_iter().zip(tokens(dark)).map(|((name, l), (_, d))| {
         table_row(&columns, false)
-            .items_center()
-            .child(div().px(2.0).child(inline(&format!("`{name}`")).text_sm()))
-            .child(div().p(1.0).child(swatch(light, l)))
-            .child(div().p(1.0).child(swatch(dark, d)))
-    });
-    let table = div().flex_col().gap(3.0).child(h2("Tokens")).child(
-        div()
-            .rounded_lg()
-            .border()
-            .border_color(t.border)
-            .overflow_hidden()
+            .align_items(Align::Center)
             .child(
-                table()
-                    .child(table_header([table_row(&columns, false)
-                        .child(table_head("Token"))
-                        .child(table_head("Light"))
-                        .child(table_head("Dark"))]))
-                    .child(table_body(rows)),
-            ),
-    );
+                div()
+                    .padding_x(8.0)
+                    .child(inline(&format!("`{name}`")).text_size(14.0).line_height(20.0)),
+            )
+            .child(div().padding(4.0).child(swatch(light, l)))
+            .child(div().padding(4.0).child(swatch(dark, d)))
+    });
+    let table = div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
+        .child(h2("Tokens"))
+        .child(
+            div()
+                .radius(10.0)
+                .border(1.0)
+                .border_color(t.border)
+                .overflow(Overflow::Hidden)
+                .child(
+                    table()
+                        .child(table_header([table_row(&columns, false)
+                            .child(table_head("Token"))
+                            .child(table_head("Light"))
+                            .child(table_head("Dark"))]))
+                        .child(table_body(rows)),
+                ),
+        );
     vec![
         Part::new("top", None, header),
         Part::new("usage", Some("Using the tokens"), usage),

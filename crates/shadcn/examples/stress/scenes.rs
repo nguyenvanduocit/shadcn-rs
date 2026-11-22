@@ -20,6 +20,7 @@ use shadcn::{
 };
 
 use crate::Render;
+use shadcn::focus::StateLook;
 
 /// One stress scene: an app, what to do with it, and what to repeat.
 pub struct Scene {
@@ -518,16 +519,18 @@ fn list_of(count: u64) -> Render {
             |i| {
                 let tall = i.is_multiple_of(7);
                 div()
-                    .px(4.0)
-                    .py(2.0)
-                    .border_b()
+                    .padding_x(16.0)
+                    .padding_y(8.0)
+                    .border_bottom(1.0)
                     .border_color(t.border)
-                    .flex_col()
-                    .child(text(format!("Row {i}")).font_medium())
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .child(text(format!("Row {i}")).font_weight(500))
                     .when(tall, |d| {
                         d.child(
                             text(format!("{i} is a multiple of seven, so this row has a second line"))
-                                .text_sm()
+                                .text_size(14.0)
+                                .line_height(20.0)
                                 .text_color(t.muted_foreground),
                         )
                     })
@@ -535,21 +538,28 @@ fn list_of(count: u64) -> Render {
             },
         );
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(4.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(
                 div()
-                    .flex()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .gap(8.0)
                     .child(jump("Go to start", 0.0))
                     .child(jump("Go to middle", 0.5))
                     .child(jump("Go to end", 1.0)),
             )
-            .child(rows.flex_1().min_h_px(0.0).border().border_color(t.border).rounded_md())
+            .child(
+                rows.flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .border(1.0)
+                    .border_color(t.border)
+                    .radius(8.0),
+            )
             .into_element()
     })
 }
@@ -656,7 +666,7 @@ fn big_table() -> Render {
                         table_cell(checkbox().checked(on).on_change(move |_| {
                             selection.update(|s| s.toggle(u64::from(row)));
                         })),
-                        table_cell(id).font_mono(),
+                        table_cell(id).font_family(FontFamily::GEIST_MONO),
                         table_cell(email),
                         table_cell(format!("${amount}.00")),
                         table_cell(status_badge(status)),
@@ -665,17 +675,18 @@ fn big_table() -> Render {
             },
         );
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(4.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .gap(8.0)
                     .child(
                         button(ButtonVariant::Outline, ButtonSize::Sm)
                             .on_click(move |_| {
@@ -710,16 +721,17 @@ fn big_table() -> Render {
                             "{shown} shown, {picked} selected{}",
                             if sorting.get() { ", sorting…" } else { "" }
                         ))
-                        .text_sm()
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .text_color(t.muted_foreground),
                     ),
             )
             .child(
                 table()
-                    .flex_1()
-                    .min_h_px(0.0)
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
                     .child(table_header([head]))
-                    .child(body.flex_1().min_h_px(0.0)),
+                    .child(body.flex(Flex::grow(1.0)).min_height(0.0)),
             )
             .into_element()
     })
@@ -817,7 +829,7 @@ fn data_table() -> Render {
                     .child(table_cell(checkbox().checked(everything).on_change(move |on| {
                         picked.update(|n| *n = if on { n.saturating_add(1) } else { n.saturating_sub(1) });
                     })))
-                    .child(table_cell(id.clone()).font_mono())
+                    .child(table_cell(id.clone()).font_family(FontFamily::GEIST_MONO))
                     .child(table_cell(email.clone()))
                     .child(table_cell(format!("${amount}.00")))
                     .child(table_cell(status_badge(status))),
@@ -825,23 +837,24 @@ fn data_table() -> Render {
         });
         let toggle = all;
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(4.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(4.0)
-                    .child(input().field(filter).max_w_px(320.0).placeholder("Filter emails…"))
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .gap(16.0)
+                    .child(input().field(filter).max_width(320.0).placeholder("Filter emails…"))
                     .child(
                         div()
-                            .flex()
-                            .items_center()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .align_items(Align::Center)
+                            .gap(8.0)
                             .child(checkbox().checked(everything).on_change(move |on| toggle.set(on)))
                             .child(label("Select all")),
                     )
@@ -852,16 +865,18 @@ fn data_table() -> Render {
                             data.len(),
                             selected.get()
                         ))
-                        .text_sm()
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .text_color(t.muted_foreground),
                     ),
             )
             .child(
                 div()
                     .named("rows")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
                     .child(table().child(table_header([head])).child(table_body(body))),
             )
             .into_element()
@@ -905,21 +920,28 @@ fn folder_view(f: &Folder, depth: usize) -> Element {
     let t = theme();
     let open = f.open.get();
     let toggle = f.open;
-    // One Tailwind unit (4px) per level.
-    let indent = f32::from(u16::try_from(depth).unwrap_or(u16::MAX));
+    // 4 px per level.
+    let indent = 4.0 * f32::from(u16::try_from(depth).unwrap_or(u16::MAX));
     let row = div()
-        .flex()
-        .items_center()
-        .gap(2.0)
-        .pl(indent)
-        .py(0.5)
-        .rounded_md()
-        .cursor_pointer()
-        .hover(move |s| s.bg(t.accent))
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .padding_left(indent)
+        .padding_y(2.0)
+        .radius(8.0)
+        .cursor(Cursor::Pointer)
+        .with_interaction(|d, i| d.background_while(move || i.hovered(), t.accent))
         .on_click(move |_| toggle.update(|o| *o = !*o))
-        .child(text(if open { "▾" } else { "▸" }).text_xs())
-        .child(text(f.name.rsplit('/').next().unwrap_or(&f.name).to_owned()).text_sm());
-    let mut node = div().flex_col().child(row);
+        .child(text(if open { "▾" } else { "▸" }).text_size(12.0).line_height(16.0))
+        .child(
+            text(f.name.rsplit('/').next().unwrap_or(&f.name).to_owned())
+                .text_size(14.0)
+                .line_height(20.0),
+        );
+    let mut node = div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .child(row);
     if open {
         for sub in &f.folders {
             node = node.child(folder_view(sub, depth.saturating_add(1)));
@@ -927,9 +949,10 @@ fn folder_view(f: &Folder, depth: usize) -> Element {
         for file in &f.files {
             node = node.child(
                 text(file.rsplit('/').next().unwrap_or(file).to_owned())
-                    .text_sm()
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground)
-                    .pl(indent + 5.0),
+                    .padding_left(indent + 20.0),
             );
         }
     }
@@ -939,11 +962,11 @@ fn folder_view(f: &Folder, depth: usize) -> Element {
 /// Boxes nested `depth` deep, each a pixel inside the last.
 fn chain(depth: usize) -> Element {
     let t = theme();
-    let mut inner = div().w_px(8.0).h_px(8.0).bg(t.primary).into_element();
+    let mut inner = div().width(8.0).height(8.0).background(t.primary).into_element();
     for _ in 0..depth {
         inner = div()
-            .p(0.25)
-            .border_w(1.0)
+            .padding(1.0)
+            .border(1.0)
             .border_color(t.border)
             .child(inner)
             .into_element();
@@ -960,21 +983,22 @@ fn file_tree() -> Render {
         let (open_all, close_all) = (Rc::clone(&every), Rc::clone(&every));
         let shown = every.iter().filter(|o| o.get()).count();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex()
-            .gap(6.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .gap(24.0)
             .child(
                 div()
-                    .flex_col()
-                    .gap(2.0)
-                    .w_px(420.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(8.0)
+                    .width(420.0)
                     .child(
                         div()
-                            .flex()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .gap(8.0)
                             .child(
                                 button(ButtonVariant::Outline, ButtonSize::Sm)
                                     .on_click(move |_| batch(|| open_all.iter().for_each(|o| o.set(true))))
@@ -988,15 +1012,17 @@ fn file_tree() -> Render {
                     )
                     .child(
                         text(format!("{shown} of {} folders open", every.len()))
-                            .text_xs()
+                            .text_size(12.0)
+                            .line_height(16.0)
                             .text_color(t.muted_foreground),
                     )
                     .child(
                         div()
                             .named("tree")
-                            .flex_1()
-                            .min_h(0.0)
-                            .overflow_y_scroll()
+                            .flex(Flex::grow(1.0))
+                            .min_height(0.0)
+                            .overflow_y(Overflow::Scroll)
+                            .overflow_x(Overflow::Hidden)
                             .child(folder_view(&root, 0)),
                     ),
             )
@@ -1018,17 +1044,18 @@ fn button_grid() -> Render {
         // Each button is an instance: a click renders that one alone.
         let cells = counts.iter().enumerate().map(|(i, c)| grid_button(i, *c, total));
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(4.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(16.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(3.0)
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .gap(12.0)
                     .child(
                         button(ButtonVariant::Secondary, ButtonSize::Sm)
                             .on_click(move |_| {
@@ -1040,16 +1067,22 @@ fn button_grid() -> Render {
                             .child("Reset"),
                     )
                     .child(component((), move |_| {
-                        move || text(format!("{} clicks", total.get())).text_sm().into_element()
+                        move || {
+                            text(format!("{} clicks", total.get()))
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .into_element()
+                        }
                     })),
             )
             .child(
                 div()
                     .named("grid")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
-                    .child(div().flex().flex_wrap().gap(1.0).children(cells)),
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
+                    .child(div().display(Display::Flex).flex_wrap(true).gap(4.0).children(cells)),
             )
             .into_element()
     })
@@ -1068,7 +1101,7 @@ fn grid_button(i: usize, count: Signal<u32>, all: Signal<u32>) -> Element {
                 },
                 ButtonSize::Xs,
             )
-            .w_px(44.0)
+            .width(44.0)
             .on_click(move |_| {
                 count.update(|n| *n = n.saturating_add(1));
                 all.update(|n| *n = n.saturating_add(1));
@@ -1133,16 +1166,17 @@ fn reactive_graph() -> Render {
         let (all, first) = (Rc::clone(&g), Rc::clone(&g));
         let end = g.chain.last().map_or(0, Computed::get);
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(8.0)
-            .flex_col()
-            .gap(4.0)
+            .padding(32.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(
                 div()
-                    .flex()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .gap(8.0)
                     .child(
                         button(ButtonVariant::Default, ButtonSize::Default)
                             .on_click(move |_| {
@@ -1192,17 +1226,18 @@ fn feed() -> Render {
         let (clear_lines, clear_count) = (lines, received);
         let shown = lines.get();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(
                 div()
-                    .flex()
-                    .gap(2.0)
-                    .items_center()
+                    .display(Display::Flex)
+                    .gap(8.0)
+                    .align_items(Align::Center)
                     .child(
                         button(ButtonVariant::Default, ButtonSize::Sm)
                             .on_click(move |_| {
@@ -1229,16 +1264,22 @@ fn feed() -> Render {
                             })
                             .child("Clear"),
                     )
-                    .child(text(format!("{} received", received.get())).text_sm()),
+                    .child(
+                        text(format!("{} received", received.get()))
+                            .text_size(14.0)
+                            .line_height(20.0),
+                    ),
             )
             .child(
                 div()
                     .named("feed")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
-                    .font_mono()
-                    .text_xs()
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
+                    .font_family(FontFamily::GEIST_MONO)
+                    .text_size(12.0)
+                    .line_height(16.0)
                     .children(shown.into_iter().map(text)),
             )
             .into_element()
@@ -1256,10 +1297,10 @@ fn toast_storm() -> Render {
         let t = theme();
         let n = Rc::clone(&next);
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(8.0)
+            .padding(32.0)
             .child(
                 button(ButtonVariant::Outline, ButtonSize::Default)
                     .on_click(move |_| {
@@ -1301,24 +1342,27 @@ fn big_text() -> Render {
     Box::new(move || {
         let t = theme();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(input().field(field).placeholder("Big input"))
-            .child(textarea().field(notes).h_px(120.0))
+            .child(textarea().field(notes).height(120.0))
             .child(
                 div()
                     .named("prose")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
-                    .flex_col()
-                    .gap(3.0)
-                    .child(text(word.clone()).text_sm())
-                    .children(prose.iter().map(|p| text(p.clone()).text_sm())),
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(12.0)
+                    .child(text(word.clone()).text_size(14.0).line_height(20.0))
+                    .children(prose.iter().map(|p| text(p.clone()).text_size(14.0).line_height(20.0))),
             )
             .into_element()
     })
@@ -1339,12 +1383,13 @@ fn random_tree() -> Render {
         let t = theme();
         let r = Rc::clone(&rng);
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(
                 button(ButtonVariant::Outline, ButtonSize::Sm)
                     .on_click(move |_| {
@@ -1360,9 +1405,10 @@ fn random_tree() -> Render {
             .child(
                 div()
                     .named("random")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
                     .child(tree.with(RandomTree::element)),
             )
             .into_element()
@@ -1384,13 +1430,13 @@ fn shuffle() -> Render {
         let rows = items.get().into_iter().map(|i| {
             div()
                 .key(key_of(&format!("item-{i}")))
-                .flex()
-                .justify_between()
-                .px(3.0)
-                .py(1.0)
-                .border_b()
+                .display(Display::Flex)
+                .justify_content(Justify::Between)
+                .padding_x(12.0)
+                .padding_y(4.0)
+                .border_bottom(1.0)
                 .border_color(t.border)
-                .child(text(format!("Item {i}")).text_sm())
+                .child(text(format!("Item {i}")).text_size(14.0).line_height(20.0))
                 .child(badge(BadgeVariant::Secondary).child(format!("{}", i.checked_rem(7).unwrap_or(0))))
         });
         let action = |name: &'static str, f: Box<dyn Fn()>| {
@@ -1399,16 +1445,17 @@ fn shuffle() -> Render {
                 .child(name)
         };
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(
                 div()
-                    .flex()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .gap(8.0)
                     .child(action(
                         "Shuffle",
                         Box::new(move || {
@@ -1463,9 +1510,10 @@ fn shuffle() -> Render {
             .child(
                 div()
                     .named("items")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
                     .children(rows),
             )
             .into_element()
@@ -1481,20 +1529,25 @@ fn churn() -> Render {
     Box::new(move || {
         let t = theme();
         let (on, off) = (mounted, mounted);
-        let cards = mounted
-            .get()
-            .then(|| div().flex().flex_wrap().gap(2.0).children((0..CARDS).map(churn_card)));
+        let cards = mounted.get().then(|| {
+            div()
+                .display(Display::Flex)
+                .flex_wrap(true)
+                .gap(8.0)
+                .children((0..CARDS).map(churn_card))
+        });
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(
                 div()
-                    .flex()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .gap(8.0)
                     .child(
                         button(ButtonVariant::Default, ButtonSize::Sm)
                             .on_click(move |_| on.set(true))
@@ -1509,9 +1562,10 @@ fn churn() -> Render {
             .child(
                 div()
                     .named("cards")
-                    .flex_1()
-                    .min_h(0.0)
-                    .overflow_y_scroll()
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0)
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
                     .child(cards),
             )
             .into_element()
@@ -1526,7 +1580,7 @@ fn churn_card(i: usize) -> Element {
         move || {
             let i = cx.props().get();
             card()
-                .w_px(220.0)
+                .width(220.0)
                 .child(
                     card_header()
                         .child(card_title(format!("Card {i}")))
@@ -1534,9 +1588,9 @@ fn churn_card(i: usize) -> Element {
                 )
                 .child(
                     card_content()
-                        .flex()
-                        .items_center()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(8.0)
                         .child(checkbox().model(done))
                         .child(label("Done"))
                         .child(progress(f32::from(
@@ -1577,7 +1631,7 @@ fn customer(i: usize) -> (String, String, u32) {
 fn kpi(title: &str, value: String, change: &str, progress_value: f32) -> Div {
     let t = theme();
     card()
-        .flex_1()
+        .flex(Flex::grow(1.0))
         .child(
             card_header()
                 .child(card_description(title.to_owned()))
@@ -1585,9 +1639,15 @@ fn kpi(title: &str, value: String, change: &str, progress_value: f32) -> Div {
         )
         .child(
             card_content()
-                .flex_col()
-                .gap(2.0)
-                .child(text(change.to_owned()).text_xs().text_color(t.muted_foreground))
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(8.0)
+                .child(
+                    text(change.to_owned())
+                        .text_size(12.0)
+                        .line_height(16.0)
+                        .text_color(t.muted_foreground),
+                )
                 .child(progress(progress_value)),
         )
 }
@@ -1597,56 +1657,69 @@ fn overview(d: &Dashboard) -> Div {
     let bars = (0_u16..24).map(|h| {
         let v = f32::from(h.wrapping_mul(37).checked_rem(90).unwrap_or(0)) + 10.0;
         div()
-            .flex_1()
-            .h_px(v * 2.0)
-            .rounded_sm()
-            .bg(t.primary)
+            .flex(Flex::grow(1.0))
+            .height(v * 2.0)
+            .radius(6.0)
+            .background(t.primary)
             .opacity(0.4 + v / 200.0)
     });
-    div().flex_col().gap(4.0).child(
-        tabs()
-            .default_value("overview")
-            .child(
-                tabs_list()
-                    .child(tabs_trigger("overview").child("Overview"))
-                    .child(tabs_trigger("analytics").child("Analytics"))
-                    .child(tabs_trigger("reports").child("Reports")),
-            )
-            .child(
-                tabs_content("overview").child(
-                    div()
-                        .flex()
-                        .gap(4.0)
-                        .child(kpi(
-                            "Total Revenue",
-                            "$45,231.89".to_owned(),
-                            "+20.1% from last month",
-                            72.0,
-                        ))
-                        .child(kpi(
-                            "Subscriptions",
-                            "+2,350".to_owned(),
-                            "+180.1% from last month",
-                            55.0,
-                        ))
-                        .child(kpi("Sales", "+12,234".to_owned(), "+19% from last month", 64.0))
-                        .child(kpi(
-                            "Active Now",
-                            format!("+{}", 573_u32.saturating_add(d.saved.get())),
-                            "+201 since last hour",
-                            31.0,
-                        )),
-                ),
-            )
-            .child(
-                tabs_content("analytics").child(
-                    card()
-                        .child(card_header().child(card_title("Visitors per hour")))
-                        .child(card_content().child(div().flex().items_end().gap(1.0).h_px(200.0).children(bars))),
-                ),
-            )
-            .child(tabs_content("reports").child(text("No reports yet.").text_sm())),
-    )
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(16.0)
+        .child(
+            tabs()
+                .default_value("overview")
+                .child(
+                    tabs_list()
+                        .child(tabs_trigger("overview").child("Overview"))
+                        .child(tabs_trigger("analytics").child("Analytics"))
+                        .child(tabs_trigger("reports").child("Reports")),
+                )
+                .child(
+                    tabs_content("overview").child(
+                        div()
+                            .display(Display::Flex)
+                            .gap(16.0)
+                            .child(kpi(
+                                "Total Revenue",
+                                "$45,231.89".to_owned(),
+                                "+20.1% from last month",
+                                72.0,
+                            ))
+                            .child(kpi(
+                                "Subscriptions",
+                                "+2,350".to_owned(),
+                                "+180.1% from last month",
+                                55.0,
+                            ))
+                            .child(kpi("Sales", "+12,234".to_owned(), "+19% from last month", 64.0))
+                            .child(kpi(
+                                "Active Now",
+                                format!("+{}", 573_u32.saturating_add(d.saved.get())),
+                                "+201 since last hour",
+                                31.0,
+                            )),
+                    ),
+                )
+                .child(
+                    tabs_content("analytics").child(
+                        card()
+                            .child(card_header().child(card_title("Visitors per hour")))
+                            .child(
+                                card_content().child(
+                                    div()
+                                        .display(Display::Flex)
+                                        .align_items(Align::End)
+                                        .gap(4.0)
+                                        .height(200.0)
+                                        .children(bars),
+                                ),
+                            ),
+                    ),
+                )
+                .child(tabs_content("reports").child(text("No reports yet.").text_size(14.0).line_height(20.0))),
+        )
 }
 
 fn customers(d: &Dashboard) -> Div {
@@ -1678,9 +1751,15 @@ fn customers(d: &Dashboard) -> Div {
         )
     });
     div()
-        .flex_col()
-        .gap(3.0)
-        .child(input().field(d.search).max_w_px(320.0).placeholder("Search customers…"))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(12.0)
+        .child(
+            input()
+                .field(d.search)
+                .max_width(320.0)
+                .placeholder("Search customers…"),
+        )
         .child(
             table()
                 .child(table_header([table_row(&tracks, false)
@@ -1695,16 +1774,16 @@ fn customers(d: &Dashboard) -> Div {
 fn settings(d: &Dashboard) -> Div {
     let row = |name: &'static str, on: &Signal<bool>| {
         div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .w_px(420.0)
-            .py(2.0)
+            .display(Display::Flex)
+            .align_items(Align::Center)
+            .justify_content(Justify::Between)
+            .width(420.0)
+            .padding_y(8.0)
             .child(label(name))
             .child(switch().model(*on))
     };
     card()
-        .w_px(480.0)
+        .width(480.0)
         .child(
             card_header()
                 .child(card_title("Settings"))
@@ -1712,7 +1791,8 @@ fn settings(d: &Dashboard) -> Div {
         )
         .child(
             card_content()
-                .flex_col()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .child(row("Email reports", &d.email_reports))
                 .child(row("Dark charts", &d.dark_charts)),
         )
@@ -1725,7 +1805,7 @@ fn edit_dialog(d: &Dashboard) -> Element {
         .open(d.edit)
         .child(
             dialog_content()
-                .max_w_px(460.0)
+                .max_width(460.0)
                 .child(
                     dialog_header()
                         .child(dialog_title("Edit customer"))
@@ -1733,17 +1813,18 @@ fn edit_dialog(d: &Dashboard) -> Element {
                 )
                 .child(
                     div()
-                        .flex_col()
-                        .gap(3.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(12.0)
                         .child(label("Customer name"))
                         .child(input().field(name).map(|i| i.aria_label("Customer name")))
                         .child(label("Email"))
                         .child(input().field(edit_email()).map(|i| i.aria_label("Email")))
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(2.0)
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(8.0)
                                 .child(checkbox().model(vip))
                                 .child(label("VIP")),
                         ),
@@ -1802,8 +1883,8 @@ fn dashboard() -> Render {
                 },
                 ButtonSize::Default,
             )
-            .w_full()
-            .justify_start()
+            .width(pct(100.0))
+            .justify_content(Justify::Start)
             .on_click(move |_| section.set(s))
             .child(s)
         });
@@ -1814,34 +1895,43 @@ fn dashboard() -> Render {
         };
         let _ = d.newsletter.get();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .flex()
+            .display(Display::Flex)
             .child(
                 div()
                     .named("nav")
-                    .w_px(220.0)
-                    .h_full()
-                    .border_r()
+                    .width(220.0)
+                    .height(pct(100.0))
+                    .border_right(1.0)
                     .border_color(t.border)
-                    .p(3.0)
-                    .flex_col()
-                    .gap(1.0)
-                    .child(text("Acme Inc.").font_semibold().px(3.0).py(2.0))
+                    .padding(12.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(4.0)
+                    .child(text("Acme Inc.").font_weight(600).padding_x(12.0).padding_y(8.0))
                     .children(nav),
             )
             .child(
                 div()
                     .named("main")
-                    .flex_1()
-                    .min_w(0.0)
-                    .h_full()
-                    .overflow_y_scroll()
-                    .p(8.0)
-                    .flex_col()
-                    .gap(4.0)
-                    .child(text(current).text_2xl().font_bold().tracking_tight())
+                    .flex(Flex::grow(1.0))
+                    .min_width(0.0)
+                    .height(pct(100.0))
+                    .overflow_y(Overflow::Scroll)
+                    .overflow_x(Overflow::Hidden)
+                    .padding(32.0)
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(16.0)
+                    .child(
+                        text(current)
+                            .text_size(24.0)
+                            .line_height(32.0)
+                            .font_weight(700)
+                            .tracking(-0.025),
+                    )
                     .child(body),
             )
             .child(edit_dialog(&d))
@@ -1952,16 +2042,17 @@ fn chart_100m() -> Render {
     Box::new(move || {
         let t = theme();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
-            .flex_col()
-            .gap(3.0)
+            .padding(24.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(
                 div()
-                    .flex()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .gap(8.0)
                     .child(
                         button(ButtonVariant::Outline, ButtonSize::Sm)
                             .on_click(move |_| pan())
@@ -1977,7 +2068,7 @@ fn chart_100m() -> Render {
                             .on_click(move |_| zoom(true))
                             .child("Zoom out"),
                     )
-                    .child(text(format!("{} points", s.len())).text_sm()),
+                    .child(text(format!("{} points", s.len())).text_size(14.0).line_height(20.0)),
             )
             .child(
                 plot()
@@ -1991,8 +2082,8 @@ fn chart_100m() -> Render {
                     })
                     .on_wheel(move |e| wheel(e.dy, e.x - e.bounds.x, e.bounds.width))
                     .named("chart-plot")
-                    .flex_1()
-                    .min_h(0.0),
+                    .flex(Flex::grow(1.0))
+                    .min_height(0.0),
             )
             .into_element()
     })
@@ -2058,10 +2149,10 @@ fn stream() -> Render {
         }
         let t = theme();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
-            .p(6.0)
+            .padding(24.0)
             .child(
                 plot()
                     .x_with(move || {
@@ -2072,7 +2163,7 @@ fn stream() -> Render {
                     .mark(line(s).color(t.primary).width(1.5))
                     .build()
                     .named("stream-plot")
-                    .size_full(),
+                    .size(pct(100.0)),
             )
             .into_element()
     })
@@ -2149,12 +2240,12 @@ fn canvas_100k() -> Render {
     Box::new(move || {
         let t = theme();
         div()
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .child(
                 canvas_editor(w, camera, move |id| id == card)
                     .named("canvas")
-                    .size_full(),
+                    .size(pct(100.0)),
             )
             .into_element()
     })

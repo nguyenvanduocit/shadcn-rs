@@ -35,3 +35,18 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+# shadcn ships the glyphs of its icon libraries (`crates/shadcn/assets/icons/`, THIRD_PARTY.md). Its own code is MIT;
+# Lucide is ISC (its Feather-derived glyphs MIT); Tabler, Hugeicons and Phosphor are MIT; Remix Icon 4.8.0 is
+# Apache-2.0 (from 4.9.0 it has its own licence, which is not permissive). The hashes (xxHash32) tie the expression to
+# the licence files; `shadcn`'s test `icons::tests::deny_clarifies_the_vendored_licences` keeps them in step.
+[[licenses.clarify]]
+crate = "shadcn"
+expression = "MIT AND ISC AND Apache-2.0"
+license-files = [
+    { path = "assets/icons/lucide/LICENSE", hash = 0xb739b6e3 },
+    { path = "assets/icons/tabler/LICENSE", hash = 0xcd85e776 },
+    { path = "assets/icons/hugeicons/LICENSE", hash = 0x7c61ccd4 },
+    { path = "assets/icons/phosphor/LICENSE", hash = 0xd4d44d3f },
+    { path = "assets/icons/remixicon/LICENSE", hash = 0x0a6d4ed6 },
+]

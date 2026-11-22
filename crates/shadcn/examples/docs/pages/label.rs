@@ -13,9 +13,9 @@ pub fn render() -> Render {
             demo(
                 "LabelDemo.vue",
                 div()
-                    .flex()
-                    .items_center()
-                    .gap(2.0)
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .gap(8.0)
                     .child(checkbox().model(terms))
                     // `for="terms"`: a click on the label flips the checkbox.
                     .child(label("Accept terms and conditions").on_click(move |_| flip.update(|v| *v = !*v))),

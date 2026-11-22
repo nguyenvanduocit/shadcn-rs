@@ -14,11 +14,11 @@ use crate::app::Scenario;
 use crate::edit::TextField;
 use crate::element::{Element, IntoElement, div, icon, text, text_input};
 use crate::icon::Icon;
-use crate::interact::Interaction;
+use crate::interact::InputState;
 use crate::layout::layout;
 use crate::list::{ListState, virtual_list};
+use crate::prelude::*;
 use crate::reactive::Signal;
-use crate::styled::Styled;
 use crate::window::Input;
 
 #[test]
@@ -35,12 +35,12 @@ fn a_screen_reader_reads_names_roles_and_focus_and_can_press_and_type() {
         )
         .child(div().aria_label("Close").role(Role::Button).child(icon(Icon::X)))
         .child(div().aria_hidden().child(text("decoration")))
-        .child(text_input(&field).placeholder("Ask the assistant").w_px(200.0))
+        .child(text_input(&field).placeholder("Ask the assistant").width(200.0))
         .into_element();
     let mut text_system = TextSystem::new();
-    let mut ui = Interaction::default();
+    let mut ui = InputState::default();
     field.focus.focus();
-    ui.sync_focus();
+    ui.sync_focus(&crate::layout::LayoutTree::default());
     let frame = layout(
         &root,
         400.0,
@@ -96,14 +96,20 @@ fn a_screen_reader_reads_names_roles_and_focus_and_can_press_and_type() {
 fn page(label: Signal<String>, items: Signal<usize>) -> impl FnMut() -> Element {
     move || {
         div()
-            .flex_col()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
             .child(text(label.get()))
-            .child(div().flex_col().children((0..items.get()).map(|i| {
+            .child(
                 div()
-                    .key(u64::try_from(i).unwrap())
-                    .on_click(|_| {})
-                    .child(text(format!("item {i}")))
-            })))
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .children((0..items.get()).map(|i| {
+                        div()
+                            .key(u64::try_from(i).unwrap())
+                            .on_click(|_| {})
+                            .child(text(format!("item {i}")))
+                    })),
+            )
             .into_element()
     }
 }
@@ -210,9 +216,10 @@ fn incremental_updates_keep_accesskits_contract_and_equal_the_whole_tree() {
     let mut s = Scenario::measuring(
         move || {
             div()
-                .flex_col()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .child(page())
-                .child(text_input(&f).w_px(200.0))
+                .child(text_input(&f).width(200.0))
                 .into_element()
         },
         300,
@@ -247,8 +254,12 @@ fn field_scenario(field: &TextField, multiline: bool) -> Scenario {
     let f = *field;
     let mut s = Scenario::measuring(
         move || {
-            let input = text_input(&f).w_px(240.0);
-            let input = if multiline { input.multiline().h_px(80.0) } else { input };
+            let input = text_input(&f).width(240.0);
+            let input = if multiline {
+                input.multiline().height(80.0)
+            } else {
+                input
+            };
             div().child(input).into_element()
         },
         300,
@@ -397,9 +408,9 @@ fn list_scenario(state: &ListState, rows: impl Fn(u64) -> Element + 'static, tab
     let mut s = Scenario::measuring(
         move || {
             let r = Rc::clone(&rows);
-            let list = virtual_list(&st, ROWS, |i| i, move |i| r(i)).h_px(200.0);
+            let list = virtual_list(&st, ROWS, |i| i, move |i| r(i)).height(200.0);
             let list = if table { list.role(Role::Table) } else { list };
-            div().w_px(300.0).child(list).into_element()
+            div().width(300.0).child(list).into_element()
         },
         300,
         300,
@@ -415,7 +426,7 @@ fn a_virtual_list_says_how_many_rows_it_has_and_where_each_is() {
     let state = ListState::new(24.0);
     let mut s = list_scenario(
         &state,
-        |i| div().h_px(24.0).child(text(format!("row {i}"))).into_element(),
+        |i| div().height(24.0).child(text(format!("row {i}"))).into_element(),
         false,
     );
     let u = full(&mut s);
@@ -444,7 +455,7 @@ fn a_row_that_names_its_role_carries_its_index_itself() {
         |i| {
             div()
                 .role(Role::Row)
-                .h_px(24.0)
+                .height(24.0)
                 .child(text(format!("row {i}")))
                 .into_element()
         },
@@ -474,7 +485,7 @@ fn the_focused_and_the_active_rows_stay_when_scrolled_out_of_view() {
         |i| {
             div()
                 .focusable()
-                .h_px(24.0)
+                .height(24.0)
                 .child(text(format!("row {i}")))
                 .into_element()
         },
@@ -536,22 +547,26 @@ fn the_focused_and_the_active_rows_stay_when_scrolled_out_of_view() {
 
 #[test]
 fn a_scroll_sends_the_container_alone() {
-    let mut s =
-        Scenario::measuring(
-            || {
-                div()
-                    .child(
-                        div().w_px(200.0).h_px(100.0).overflow_y_scroll().flex_col().children(
-                            (0..20).map(|i| div().h_px(30.0).on_click(|_| {}).child(text(format!("row {i}")))),
-                        ),
-                    )
-                    .into_element()
-            },
-            300,
-            300,
-            1.0,
-        )
-        .unwrap();
+    let mut s = Scenario::measuring(
+        || {
+            div()
+                .child(
+                    div()
+                        .width(200.0)
+                        .height(100.0)
+                        .overflow_y(Overflow::Scroll)
+                        .overflow_x(Overflow::Hidden)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .children((0..20).map(|i| div().height(30.0).on_click(|_| {}).child(text(format!("row {i}"))))),
+                )
+                .into_element()
+        },
+        300,
+        300,
+        1.0,
+    )
+    .unwrap();
     let mut tree = Tree::new(update(&mut s), true);
     s.hover(50.0, 50.0);
     s.wheel(45.0);

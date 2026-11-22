@@ -10,13 +10,20 @@ use crate::{Render, Shot, demo, page, photo};
 
 /// The demos' column: `mx-auto flex w-full max-w-sm flex-col py-12`.
 fn column(gap: f32) -> Div {
-    div().mx_auto().flex_col().w_full().max_w(96.0).gap(gap).py(12.0)
+    div()
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(gap)
+        .padding_y(48.0)
 }
 
 /// A horizontal file attachment, `class="w-full"`, with media, name, details and actions.
 fn file(p: AttachmentProps, media: impl IntoElement, name: &str, meta: Option<&str>, actions: &[Icon]) -> Div {
     attachment(p, AttachmentSlots::default())
-        .w_full()
+        .width(pct(100.0))
         .child(attachment_media(p, AttachmentMediaVariant::Icon).child(media))
         .child(
             attachment_content(p)
@@ -57,23 +64,28 @@ pub fn render() -> Render {
         let o = opened;
         let trigger = demo(
             "AttachmentTriggerDemo.vue",
-            div().mx_auto().w_full().max_w(96.0).py(12.0).child(
-                attachment_trigger(file(
-                    plain,
-                    attachment_icon(plain, Icon::FileSearch),
-                    "research-summary.pdf",
-                    Some("Open preview dialog"),
-                    &[Icon::Copy, Icon::X],
-                ))
-                .on_click(move |_| o.update(|n| *n = n.saturating_add(1))),
-            ),
+            div()
+                .margin_x(Length::Auto)
+                .width(pct(100.0))
+                .max_width(384.0)
+                .padding_y(48.0)
+                .child(
+                    attachment_trigger(file(
+                        plain,
+                        attachment_icon(plain, Icon::FileSearch),
+                        "research-summary.pdf",
+                        Some("Open preview dialog"),
+                        &[Icon::Copy, Icon::X],
+                    ))
+                    .on_click(move |_| o.update(|n| *n = n.saturating_add(1))),
+                ),
         );
         let gallery = demo(
             "AttachmentDemo.vue",
-            column(3.0)
+            column(12.0)
                 .child(attachment_group().children(photos.iter().map(|(name, meta, img)| {
                     attachment(vertical, AttachmentSlots::default())
-                        .flex_none()
+                        .flex(Flex::NONE)
                         .child(
                             attachment_media(vertical, AttachmentMediaVariant::Image)
                                 .child(img.clone().map(attachment_image)),
@@ -128,7 +140,7 @@ pub fn render() -> Render {
         ];
         let states = demo(
             "AttachmentStatesDemo.vue",
-            column(2.0).children(states.map(|(s, which, name, meta)| {
+            column(8.0).children(states.map(|(s, which, name, meta)| {
                 let p = with_state(s);
                 let actions: &[Icon] = if s == AttachmentState::Error {
                     &[Icon::RefreshCw, Icon::X]
@@ -146,7 +158,7 @@ pub fn render() -> Render {
         ];
         let sizes = demo(
             "AttachmentSizesDemo.vue",
-            column(3.0).children(sizes.map(|(size, name, meta)| {
+            column(12.0).children(sizes.map(|(size, name, meta)| {
                 let p = AttachmentProps { size, ..plain };
                 file(p, attachment_icon(p, Icon::FileText), name, meta, &[])
             })),
@@ -161,45 +173,48 @@ pub fn render() -> Render {
         let group = demo(
             "AttachmentGroupDemo.vue",
             div()
-                .mx_auto()
-                .w_full()
-                .max_w(96.0)
-                .py(12.0)
-                .child(attachment_group().w_full().children(files.map(|(name, meta, which)| {
-                    let media = match which {
-                        Some(i) => {
-                            attachment_media(plain, AttachmentMediaVariant::Icon).child(attachment_icon(plain, i))
-                        }
-                        None => attachment_media(plain, AttachmentMediaVariant::Image)
-                            .child(workspace.clone().map(attachment_image)),
-                    };
-                    attachment(plain, AttachmentSlots::default())
-                        .flex_none()
-                        .w(64.0)
-                        .child(media)
-                        .child(
-                            attachment_content(plain)
-                                .child(attachment_title(name))
-                                .child(attachment_description(plain, meta)),
-                        )
-                        .child(attachment_actions(plain).child(attachment_action(Icon::X)))
-                }))),
+                .margin_x(Length::Auto)
+                .width(pct(100.0))
+                .max_width(384.0)
+                .padding_y(48.0)
+                .child(
+                    attachment_group()
+                        .width(pct(100.0))
+                        .children(files.map(|(name, meta, which)| {
+                            let media = match which {
+                                Some(i) => attachment_media(plain, AttachmentMediaVariant::Icon)
+                                    .child(attachment_icon(plain, i)),
+                                None => attachment_media(plain, AttachmentMediaVariant::Image)
+                                    .child(workspace.clone().map(attachment_image)),
+                            };
+                            attachment(plain, AttachmentSlots::default())
+                                .flex(Flex::NONE)
+                                .width(256.0)
+                                .child(media)
+                                .child(
+                                    attachment_content(plain)
+                                        .child(attachment_title(name))
+                                        .child(attachment_description(plain, meta)),
+                                )
+                                .child(attachment_actions(plain).child(attachment_action(Icon::X)))
+                        })),
+                ),
         );
         let o = opened;
         let images = demo(
             "AttachmentImageDemo.vue",
             div()
-                .mx_auto()
-                .w_full()
-                .max_w(96.0)
-                .py(12.0)
+                .margin_x(Length::Auto)
+                .width(pct(100.0))
+                .max_width(384.0)
+                .padding_y(48.0)
                 .child(
                     attachment_group()
-                        .w_full()
+                        .width(pct(100.0))
                         .children(photos.iter().map(|(name, meta, img)| {
                             attachment_trigger(
                                 attachment(vertical, AttachmentSlots::default())
-                                    .flex_none()
+                                    .flex(Flex::NONE)
                                     .child(
                                         attachment_media(vertical, AttachmentMediaVariant::Image)
                                             .child(img.clone().map(attachment_image)),
@@ -218,8 +233,13 @@ pub fn render() -> Render {
         page(
             "Attachment",
             div()
-                .flex_col()
-                .child(text(format!("Opened {} times", opened.get())).text_sm())
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .child(
+                    text(format!("Opened {} times", opened.get()))
+                        .text_size(14.0)
+                        .line_height(20.0),
+                )
                 .child(trigger)
                 .child(gallery)
                 .child(states)

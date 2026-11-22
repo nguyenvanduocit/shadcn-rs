@@ -89,8 +89,9 @@ pub fn render() -> Render {
         page(
             "Menubar",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo(
                     "MenubarDemo.vue",
                     menubar()
@@ -108,7 +109,8 @@ pub fn render() -> Render {
                             profile.get()
                         )
                     })
-                    .text_sm()
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground),
                 ),
         )

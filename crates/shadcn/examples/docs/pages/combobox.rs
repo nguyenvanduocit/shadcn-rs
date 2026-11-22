@@ -101,7 +101,7 @@ pub fn render() -> Render {
             move |login: &str| {
                 let source = photos.iter().find(|(u, _)| *u == login).and_then(|(_, p)| p.as_ref());
                 avatar()
-                    .size(5.0)
+                    .size(20.0)
                     .child(avatar_image(source))
                     .child(avatar_fallback(source, login.chars().take(1).collect::<String>()))
             }
@@ -113,8 +113,8 @@ pub fn render() -> Render {
             .model(framework)
             .child(combobox_trigger(
                 outline()
-                    .w_px(200.0)
-                    .justify_between()
+                    .width(200.0)
+                    .justify_content(Justify::Between)
                     .child(chosen.unwrap_or_else(|| String::from("Select framework...")))
                     .child(icon(Icon::ChevronsUpDown).opacity(0.5)),
             ))
@@ -131,37 +131,40 @@ pub fn render() -> Render {
         // The demo's checkbox look: `size-4 rounded-[4px] border`, filled when selected.
         let tick = move |on: bool| {
             div()
-                .size(4.0)
-                .shrink_0()
-                .rounded(4.0)
-                .border()
+                .size(16.0)
+                .flex_shrink(0.0)
+                .radius(4.0)
+                .border(1.0)
                 .border_color(if on { t.primary } else { t.input })
                 .when(on, |d| {
-                    d.bg(t.primary)
+                    d.background(t.primary)
                         .text_color(t.primary_foreground)
-                        .child(icon(Icon::Check).size(3.5))
+                        .child(icon(Icon::Check).size(14.0))
                 })
         };
         let many_combobox = combobox()
             .model(frameworks)
             .child(combobox_trigger(
                 outline()
-                    .w_px(280.0)
-                    .justify_between()
+                    .width(280.0)
+                    .justify_content(Justify::Between)
                     .child(
                         text(if picked.is_empty() {
                             String::from("Select frameworks...")
                         } else {
                             picked.join(", ")
                         })
-                        .truncate(),
+                        .truncate(true)
+                        .nowrap(true)
+                        .overflow_x(Overflow::Hidden)
+                        .min_width(0.0),
                     )
                     .child(icon(Icon::ChevronsUpDown).opacity(0.5)),
             ))
             .child(
                 combobox_list()
                     .align(SideAlign::Start)
-                    .w_px(280.0)
+                    .width(280.0)
                     .child(combobox_input("Search framework..."))
                     .child(combobox_items(Rc::clone(&frameworks_list), move |item, row| {
                         row.child(tick(frameworks.with(|p| p.contains(&item.value))))
@@ -175,22 +178,24 @@ pub fn render() -> Render {
             .and_then(|z| TIMEZONES.iter().find(|(_, zones)| zones.contains(&z)))
             .map(|(region, _)| *region);
         let tz_trigger = outline()
-            .h(12.0)
-            .w_px(200.0)
-            .justify_between()
-            .px(2.5)
+            .height(48.0)
+            .width(200.0)
+            .justify_content(Justify::Between)
+            .padding_x(10.0)
             .child(zone.map_or_else(
                 || div().child("Select timezone"),
                 |z| {
                     div()
-                        .flex_col()
-                        .items_start()
-                        .gap(0.5)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Start)
+                        .gap(2.0)
                         .child(
                             text(region.unwrap_or_default())
                                 .text_color(t.muted_foreground)
-                                .text_xs()
-                                .font_normal(),
+                                .text_size(12.0)
+                                .line_height(16.0)
+                                .font_weight(400),
                         )
                         .child(text(z))
                 },
@@ -199,7 +204,7 @@ pub fn render() -> Render {
         let tz_combobox = combobox().model(timezone).child(combobox_trigger(tz_trigger)).child(
             combobox_list()
                 .align(SideAlign::Start)
-                .w(72.0)
+                .width(288.0)
                 .child(combobox_input("Search timezone..."))
                 .child(
                     combobox_items(Rc::clone(&timezones_list), move |item, row| {
@@ -218,11 +223,18 @@ pub fn render() -> Render {
 
         let who = user.get();
         let user_trigger = outline()
-            .w_px(200.0)
-            .justify_between()
+            .width(200.0)
+            .justify_content(Justify::Between)
             .child(who.map_or_else(
                 || div().child("Select user..."),
-                |login| div().flex().items_center().gap(2.0).child(face(&login)).child(login),
+                |login| {
+                    div()
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(8.0)
+                        .child(face(&login))
+                        .child(login)
+                },
             ))
             .child(icon(Icon::ChevronsUpDown).opacity(0.5));
         let user_combobox = combobox().model(user).child(combobox_trigger(user_trigger)).child(
@@ -251,8 +263,11 @@ pub fn render() -> Render {
                 .find(|(v, _)| *v == item.value)
                 .map_or("", |(_, l)| *l);
             let on = listbox_value.with(|v| v.as_deref() == Some(item.value.as_str()));
-            row.child(label)
-                .child(icon(Icon::Check).ml_auto().opacity(if on { 1.0 } else { 0.0 }))
+            row.child(label).child(
+                icon(Icon::Check)
+                    .margin_left(Length::Auto)
+                    .opacity(if on { 1.0 } else { 0.0 }),
+            )
         })
         .on_select(move |item| {
             let value = item.value.clone();
@@ -263,13 +278,13 @@ pub fn render() -> Render {
             .open(listbox)
             .child(popover_trigger(
                 outline()
-                    .w_px(200.0)
-                    .justify_between()
+                    .width(200.0)
+                    .justify_content(Justify::Between)
                     .child(listbox_label)
                     .child(icon(Icon::ChevronsUpDown).opacity(0.5)),
             ))
             .child(
-                popover_content().w_px(200.0).p(0.0).child(
+                popover_content().width(200.0).padding(0.0).child(
                     command()
                         .child(command_input("Search framework..."))
                         .child(listbox_items),
@@ -279,8 +294,9 @@ pub fn render() -> Render {
         page(
             "Combobox",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo("ComboboxDemo.vue", demo_combobox))
                 .child(demo("ComboboxMultipleDemo.vue", many_combobox))
                 .child(demo("ComboboxTimezoneDemo.vue", tz_combobox))

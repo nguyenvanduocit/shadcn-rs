@@ -34,8 +34,9 @@ pub fn render() -> Render {
         page(
             "Toggle Group",
             div()
-                .flex_col()
-                .gap(5.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(20.0)
                 .child(demo(
                     "ToggleGroupDemo.vue",
                     icons(toggle_group_multiple().variant(ToggleVariant::Outline)),
@@ -57,15 +58,15 @@ pub fn render() -> Render {
                 .child(section(
                     "Text items, joined and spaced",
                     div()
-                        .flex()
-                        .items_start()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Start)
+                        .gap(16.0)
                         .child(
                             toggle_group()
                                 .variant(ToggleVariant::Outline)
                                 .default_value(Some("all".to_owned()))
-                                .child(toggle_group_item("all").class(|d| d.w(20.0)).child("All"))
-                                .child(toggle_group_item("missed").class(|d| d.w(20.0)).child("Missed")),
+                                .child(toggle_group_item("all").class(|d| d.width(80.0)).child("All"))
+                                .child(toggle_group_item("missed").class(|d| d.width(80.0)).child("Missed")),
                         )
                         .child(
                             toggle_group()

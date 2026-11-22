@@ -26,7 +26,7 @@ struct Globals {
 @group(0) @binding(5) var<storage, read> instances: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> stops: array<vec4<f32>>;
 // Four vec4s per clip: rect, radii, the map from the window into the
-// clip's space (a, b, c, d), (e, f, its scale, 0). Clip 0 is none.
+// clip's space (a, b, c, d), (e, f, its scale, its corners' curve). Clip 0 is none.
 @group(0) @binding(7) var<storage, read> clips: array<vec4<f32>>;
 
 const TILE: f32 = 16.0;
@@ -168,16 +168,8 @@ fn clip_coverage(id: u32, p: vec2<f32>) -> f32 {
     if (id == 0u) {
         return 1.0;
     }
-    let rect = clips[id * 4u];
-    let radii = clips[id * 4u + 1u];
-    let m = clips[id * 4u + 2u];
-    let t = clips[id * 4u + 3u];
-    let q = vec2<f32>(m.x * p.x + m.z * p.y + t.x, m.y * p.x + m.w * p.y + t.y);
-    if (t.z == 1.0 && m.y == 0.0 && m.z == 0.0) {
-        return rrect_cov(q, rect, radii);
-    }
-    // In a scaled or turned space: by distance, one device pixel wide.
-    return saturate(0.5 - rrect_sdf(q, rect, radii) * t.z);
+    let at = id * 4u;
+    return clip_entry_cov(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], p);
 }
 
 struct PathShaded {

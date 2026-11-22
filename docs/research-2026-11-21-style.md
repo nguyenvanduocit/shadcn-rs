@@ -1895,8 +1895,9 @@ const INVALID_BORDER: Tone = Tone { light: Ink::Role(Destructive), dark: Ink::Al
 - **`Ink::Content` là màu mà container bao ngoài cung cấp.**
   - Outline và ghost không đặt màu chữ lúc nghỉ, nên chữ theo container. Ví dụ, trong một alert destructive, chữ của
     chúng đỏ.
-  - Ở upstream đây là màu chữ kế thừa. Ở đây đó là một phép đọc tường minh `content().color`, như `IconButton` của
-    Compose lấy `LocalContentColor.current`.
+  - Ở upstream đây là màu chữ kế thừa. Ở đây container để trống `ContentStyle.color`, nên chữ và icon của nó lấy màu
+    của provider bao ngoài lúc vẽ, như `IconButton` của Compose lấy `LocalContentColor.current` (§7.10, "Gộp theo
+    field").
 - **Theme giải giá trị trong binding.** Mỗi phép đọc có track, nên binding chỉ chạy lại khi đúng nhóm đó đổi:
   - `t.ink(tone)` đọc scheme và palettes;
   - `t.shape(corner)` đọc radius;
@@ -1993,8 +1994,20 @@ pub fn content() -> ContentStyle;                              // the nearest on
   Màu của nó còn được `StopColor::Current` (ADR-0003) và `Ink::Content` (§7.7) đọc.
 - **Đọc có track, ở đúng pha.** Màu được đọc ở paint, kiểu chữ ở text layout. Màu content đổi khi hover thì text chỉ vẽ
   lại.
-- **Không gộp ngầm.** Container muốn sửa một phần thì viết tường minh: `ContentStyle { color, ..content() }`. Không có
-  luật gộp từng thuộc tính như `inherit` của CSS.
+- **Gộp theo field (khác bản vẽ trên, quyết định ở S5 của M10).** Bản vẽ trên cho mọi field luôn có giá trị, và
+  container sửa một phần bằng `ContentStyle { color, ..content() }`, với `content()` đọc lúc render. Cài đặt làm khác:
+  mỗi field là `Option`, container chỉ đặt cái nó đổi, cây giữ lại gộp từng field vào của provider bao ngoài lúc node
+  được resolve, và không có `content()`. Lý do:
+  - element là giá trị dựng tách khỏi cây nó sẽ vào (con thường dựng trước container), nên lúc render chưa có provider
+    bao ngoài nào để đọc;
+  - đọc lúc render thì render đăng ký theo provider bao ngoài, nên màu hover hay đổi theme ở trên sẽ render lại
+    instance, thay vì chỉ vẽ lại chữ (§7.12);
+  - gộp theo field chính là cách của tham chiếu: `ProvideTextStyle` và `ProvideContentColorTextStyle` của Compose cung
+    cấp `LocalTextStyle.current.merge(..)`, `DefaultTextStyle.merge` và `IconTheme.merge` của Flutter lấy giá trị bao
+    ngoài cho field để null.
+
+  Thứ làm nó khác `inherit` của CSS vẫn giữ: một struct có kiểu, do container cung cấp tường minh, chỉ text, icon và
+  `currentColor` đọc. `Ink::Content` (§7.7) là provider để trống `color`.
 - **Khác kế thừa của CSS ở ba chỗ:**
   - container cung cấp tường minh một struct có kiểu;
   - chỉ text và icon đọc;

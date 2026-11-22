@@ -176,13 +176,15 @@ impl Follow {
 /// flex-col gap-4 py-6 text-sm`.
 pub fn thread() -> Div {
     div()
-        .flex_col()
-        .min_h(72.0)
-        .w_full()
-        .max_w(96.0)
-        .gap(4.0)
-        .py(6.0)
-        .text_sm()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .min_height(288.0)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(16.0)
+        .padding_y(24.0)
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 /// The reader's turn: a muted bubble on the right.
@@ -201,7 +203,7 @@ pub fn user_turn(words: &str) -> Div {
 /// The agent's turn: `<MessageContent class="gap-4">` around `body`.
 pub fn assistant_turn(body: impl IntoIterator<Item = Element>) -> Div {
     let p = MessageProps::default();
-    message(p).child(message_content(p).gap(4.0).children(body))
+    message(p).child(message_content(p).gap(16.0).children(body))
 }
 
 /// The agent's prose: a paragraph, nothing while it is empty.
@@ -223,16 +225,16 @@ pub fn output(code: &str) -> Div {
         wrap: true,
         ..CodeBlockContentProps::default()
     };
-    code_block(p).child(code_block_content(p, c, code_block_lines(code)).max_h(64.0))
+    code_block(p).child(code_block_content(p, c, code_block_lines(code)).max_height(256.0))
 }
 
 /// The outline button under the thread (`mt-auto self-start`), hidden while
 /// the script writes.
-pub fn replay(script: &Script, f: impl Fn() + 'static) -> Option<Div> {
+pub fn replay(script: &Script, f: impl Fn() + 'static) -> Option<shadcn::Button> {
     (!script.busy()).then(|| {
         button(ButtonVariant::Outline, ButtonSize::Sm)
-            .mt_auto()
-            .self_start()
+            .margin_top(Length::Auto)
+            .align_self(Align::Start)
             .child("Replay")
             .on_click(move |_| f())
     })

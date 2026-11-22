@@ -68,23 +68,24 @@ fn whole(v: f32) -> u32 {
 
 fn view(rows: &[Row], height: u32) -> Element {
     div()
-        .relative()
-        .w_px(f32::from(u16::try_from(WIDTH).unwrap_or(u16::MAX)))
-        .h_px(f32::from(u16::try_from(height).unwrap_or(u16::MAX)))
-        .bg(Color::WHITE)
+        .position(Position::Relative)
+        .width(f32::from(u16::try_from(WIDTH).unwrap_or(u16::MAX)))
+        .height(f32::from(u16::try_from(height).unwrap_or(u16::MAX)))
+        .background(Color::WHITE)
         .children(rows.iter().map(|r| {
             let line = div()
-                .absolute()
-                .left(MARGIN / 4.0)
-                .top(r.top / 4.0)
-                .text_size(r.size, r.height)
+                .position(Position::Absolute)
+                .left(MARGIN)
+                .top(r.top)
+                .text_size(r.size)
+                .line_height(r.height)
                 .text_color(Color::BLACK)
-                .whitespace_nowrap();
+                .nowrap(true);
             let line = match r.weight {
-                500 => line.font_medium(),
-                600 => line.font_semibold(),
-                700 => line.font_bold(),
-                _ => line.font_normal(),
+                500 => line.font_weight(500),
+                600 => line.font_weight(600),
+                700 => line.font_weight(700),
+                _ => line.font_weight(400),
             };
             line.child(text(r.text)).into_element()
         }))

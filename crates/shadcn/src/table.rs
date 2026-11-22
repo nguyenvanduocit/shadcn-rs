@@ -15,6 +15,7 @@ use gui::list::{Columns, ListState, virtual_list};
 use gui::prelude::*;
 use gui::{Div, ElementKey, Track, div, text};
 
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 /// The table (`<table>` in its `overflow-auto` container): `w-full text-sm`,
@@ -24,11 +25,14 @@ pub fn table() -> Div {
     div()
         .named("table")
         .role(gui::Role::Table)
-        .relative()
-        .w_full()
-        .overflow_x_scroll()
-        .flex_col()
-        .text_sm()
+        .position(Position::Relative)
+        .width(pct(100.0))
+        .overflow_x(Overflow::Scroll)
+        .overflow_y(Overflow::Hidden)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 /// `<thead>`: every row keeps its bottom border.
@@ -37,7 +41,8 @@ pub fn table_header(rows: impl IntoIterator<Item = Div>) -> Div {
     div()
         .named("table-header")
         .role(gui::Role::RowGroup)
-        .flex_col()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
         .children(rows)
 }
 
@@ -47,7 +52,8 @@ pub fn table_body(rows: impl IntoIterator<Item = Div>) -> Div {
     div()
         .named("table-body")
         .role(gui::Role::RowGroup)
-        .flex_col()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
         .children(without_last_border(rows))
 }
 
@@ -65,7 +71,7 @@ pub fn table_body_virtual(
 ) -> Div {
     virtual_list(state, rows, key, move |i| {
         row(i)
-            .when(i.saturating_add(1) == rows, Styled::border_0)
+            .when(i.saturating_add(1) == rows, |e| e.border(0.0))
             .into_element()
     })
     .named("table-body")
@@ -85,11 +91,12 @@ pub fn table_footer(rows: impl IntoIterator<Item = Div>) -> Div {
     div()
         .named("table-footer")
         .role(gui::Role::RowGroup)
-        .flex_col()
-        .bg(t.muted.opacity(0.5))
-        .border_t()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .background(t.muted.opacity(0.5))
+        .border_top(1.0)
         .border_color(t.border)
-        .font_medium()
+        .font_weight(500)
         .children(without_last_border(rows))
 }
 
@@ -98,7 +105,7 @@ fn without_last_border(rows: impl IntoIterator<Item = Div>) -> Vec<Div> {
     let last = rows.len().checked_sub(1);
     rows.into_iter()
         .enumerate()
-        .map(|(i, row)| row.when(Some(i) == last, Styled::border_0))
+        .map(|(i, row)| row.when(Some(i) == last, |e| e.border(0.0)))
         .collect()
 }
 
@@ -110,13 +117,18 @@ pub fn table_row(columns: &[Track], selected: bool) -> Div {
         .named("table-row")
         .role(gui::Role::Row)
         .when(selected, |d| d.aria_selected(true))
-        .transition_colors()
-        .grid()
-        .grid_cols_tracks(columns.to_vec())
-        .border_b()
+        .transition(Properties::COLORS)
+        .display(Display::Grid)
+        .grid_columns(columns.to_vec())
+        .border_bottom(1.0)
         .border_color(t.border)
-        .hover(move |s| s.bg(t.muted.opacity(0.5)))
-        .when(selected, |d| d.bg(t.muted).hover(move |s| s.bg(t.muted)))
+        .with_interaction(|d, i| {
+            if selected {
+                d.background(t.muted)
+            } else {
+                d.background_while(move || i.hovered(), t.muted.opacity(0.5))
+            }
+        })
 }
 
 /// `<th>`: a column heading, left-aligned until a class says otherwise.
@@ -126,14 +138,15 @@ pub fn table_head(content: impl IntoElement) -> Div {
     div()
         .named("table-head")
         .role(gui::Role::ColumnHeader)
-        .flex_col()
-        .justify_center()
-        .h(10.0)
-        .px(2.0)
-        .text_left()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .justify_content(Justify::Center)
+        .height(40.0)
+        .padding_x(8.0)
+        .text_align(TextAlign::Left)
         .text_color(t.foreground)
-        .font_medium()
-        .whitespace_nowrap()
+        .font_weight(500)
+        .nowrap(true)
         .child(content)
 }
 
@@ -143,10 +156,11 @@ pub fn table_cell(content: impl IntoElement) -> Div {
     div()
         .named("table-cell")
         .role(gui::Role::Cell)
-        .flex_col()
-        .justify_center()
-        .p(2.0)
-        .whitespace_nowrap()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .justify_content(Justify::Center)
+        .padding(8.0)
+        .nowrap(true)
         .child(content)
 }
 
@@ -156,11 +170,19 @@ pub fn table_empty(columns: &[Track], content: impl IntoElement) -> Div {
     let t = theme();
     let span = u16::try_from(columns.len()).unwrap_or(u16::MAX);
     table_row(columns, false).child(
-        table_cell(div().flex().items_center().justify_center().py(10.0).child(content))
-            .col_span(span)
-            .p(4.0)
-            .text_sm()
-            .text_color(t.foreground),
+        table_cell(
+            div()
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .justify_content(Justify::Center)
+                .padding_y(40.0)
+                .child(content),
+        )
+        .grid_column_span(span)
+        .padding(16.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .text_color(t.foreground),
     )
 }
 
@@ -170,8 +192,9 @@ pub fn table_caption(caption: impl Into<String>) -> impl IntoElement {
     let t = theme();
     text(caption)
         .named("table-caption")
-        .mt(4.0)
-        .text_sm()
-        .text_center()
+        .margin_top(16.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .text_align(TextAlign::Center)
         .text_color(t.muted_foreground)
 }

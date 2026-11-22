@@ -6,10 +6,12 @@
 
 use std::rc::Rc;
 
+use gui::Color;
 use gui::Properties;
 use gui::prelude::*;
 use gui::{Bind, Div, Element, FocusHandle, Icon, Model, NamedKey, Slot, component, div, icon, text, use_model};
 
+use crate::focus::StateLook;
 use crate::focus::{destructive_ring, focus_ring};
 use crate::theme::theme;
 
@@ -196,42 +198,54 @@ fn render(p: &NativeSelect, value: &str, on_change: impl Fn(String) + 'static) -
     let current = value.to_owned();
     let labels = all.iter().map(|c| {
         text(c.text.clone())
-            .col_start(1)
-            .row_start(1)
-            .whitespace_nowrap()
-            .when(c.value != value, |l| l.invisible())
+            .grid_column_start(1)
+            .grid_row_start(1)
+            .nowrap(true)
+            .when(c.value != value, |l| l.invisible(true))
     });
+    let i = Interaction::new();
     let field = div()
         .named("native-select")
-        .transition_props(Properties::COLOR | Properties::SHADOW)
-        .grid()
+        .interaction(i)
+        .transition(Properties::COLOR | Properties::SHADOW)
+        .display(Display::Grid)
         .border_color(if invalid { t.destructive } else { t.input })
-        .h(9.0)
-        .w_full()
-        .min_w(0.0)
-        .rounded_md()
-        .border()
-        .bg(if t.dark {
+        .height(36.0)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .radius(8.0)
+        .border(1.0)
+        .background(if t.dark {
             t.input.opacity(0.3)
         } else {
             gui::Color::TRANSPARENT
         })
-        .when(t.dark && !disabled, |d| d.hover(move |s| s.bg(t.input.opacity(0.5))))
-        .px(3.0)
-        .py(2.0)
-        .pr(9.0)
-        .text_sm()
-        .shadow_xs()
-        .items_center()
-        .focus_visible(move |s| {
-            if invalid {
-                destructive_ring(s, &t).border_color(t.destructive)
-            } else {
-                focus_ring(s, &t)
-            }
+        .when(t.dark && !disabled, |d| {
+            d.background_while(move || i.hovered(), t.input.opacity(0.5))
         })
+        .padding_x(12.0)
+        .padding_y(8.0)
+        .padding_right(36.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .align_items(Align::Center)
+        .ring_while(
+            move || i.focus_visible(),
+            &if invalid {
+                destructive_ring(gui::Style::default(), &t).border_color(t.destructive)
+            } else {
+                focus_ring(gui::Style::default(), &t)
+            },
+        )
         .disabled(disabled)
-        .disabled_style(|s| s.cursor_not_allowed())
+        .cursor_disabled(i)
         .focusable()
         .when_some(p.focus, Div::track_focus)
         .on_key_down(move |ev| {
@@ -253,12 +267,12 @@ fn render(p: &NativeSelect, value: &str, on_change: impl Fn(String) + 'static) -
         .children(labels);
     // Vue's `top-1/2 -translate-y-1/2`: centred on the box whatever its height.
     let chevron = div()
-        .absolute()
+        .position(Position::Absolute)
         .top(0.0)
         .bottom(0.0)
-        .right(3.5)
-        .flex()
-        .items_center()
+        .right(14.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
         .pass_through()
         .child(
             icon(Icon::ChevronDown)
@@ -273,7 +287,7 @@ fn render(p: &NativeSelect, value: &str, on_change: impl Fn(String) + 'static) -
     };
     div()
         .named("native-select-wrapper")
-        .relative()
+        .position(Position::Relative)
         .when(disabled, |d| d.opacity(0.5))
         .child(field)
         .child(chevron)

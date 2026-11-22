@@ -26,16 +26,20 @@ use crate::theme::theme;
 /// [`context_menu_trigger`] area and a [`context_menu_content`].
 #[must_use]
 pub fn context_menu() -> Part<MenuRootProps> {
-    Part::new(MenuRootProps::default(), div().named("context-menu").flex(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let level = MenuState::with_open(Rc::new(use_model(props, |p| p.props.open_bind())), None);
-            level.return_focus_on_close();
-            provide(level);
-            provide(MenuPointer(Signal::labeled("context menu at", (0.0, 0.0))));
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        MenuRootProps::default(),
+        div().named("context-menu").display(Display::Flex),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let level = MenuState::with_open(Rc::new(use_model(props, |p| p.props.open_bind())), None);
+                level.return_focus_on_close();
+                provide(level);
+                provide(MenuPointer(Signal::labeled("context menu at", (0.0, 0.0))));
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 /// The area a right click opens the menu in, at the pointer
@@ -76,8 +80,9 @@ pub fn context_menu_content() -> Part<MenuContentProps> {
             menu_box(&t)
                 .named("context-menu-content")
                 .role(gui::Role::Menu)
-                .overflow_y_scroll()
-                .shadow_md(),
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .shadow(crate::popover::POPUP_SHADOW),
             Origin::CENTER,
         ),
         MenuPlace::Pointer,
@@ -121,8 +126,8 @@ pub fn context_menu_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheck
     menu_checkbox_item(
         menu_row_base(&t, item)
             .named("context-menu-checkbox-item")
-            .pl(8.0)
-            .pr(2.0)
+            .padding_left(32.0)
+            .padding_right(8.0)
             .child(label.to_owned()),
         label,
         disabled,
@@ -140,8 +145,8 @@ pub fn context_menu_radio_item(label: &str, value: &str, disabled: bool) -> Part
     menu_radio_item(
         menu_row_base(&t, item)
             .named("context-menu-radio-item")
-            .pl(8.0)
-            .pr(2.0)
+            .padding_left(32.0)
+            .padding_right(8.0)
             .child(label.to_owned()),
         label,
         value,
@@ -156,11 +161,12 @@ pub fn context_menu_label(label: &str, inset: bool) -> Div {
     div()
         .named("context-menu-label")
         .text_color(t.foreground)
-        .px(2.0)
-        .py(1.5)
-        .text_sm()
-        .font_medium()
-        .when(inset, |d| d.pl(8.0))
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .when(inset, |d| d.padding_left(32.0))
         .child(label.to_owned())
 }
 
@@ -191,7 +197,7 @@ pub fn context_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTrig
             .named("context-menu-sub-trigger")
             .gap(0.0)
             .child(label.to_owned())
-            .child(icon(Icon::ChevronRight).ml_auto()),
+            .child(icon(Icon::ChevronRight).margin_left(Length::Auto)),
         label,
         item,
         true,
@@ -206,8 +212,8 @@ pub fn context_menu_sub_content() -> Part<MenuContentProps> {
         popper(
             menu_box(&t)
                 .named("context-menu-sub-content")
-                .overflow_hidden()
-                .shadow_lg(),
+                .overflow(Overflow::Hidden)
+                .shadow(crate::popover::LIFTED_SHADOW),
             Origin::CENTER,
         ),
         MenuPlace::Beside,

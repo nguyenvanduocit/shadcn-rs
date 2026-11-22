@@ -13,7 +13,7 @@ use super::{
     C_DOT, C_END_CAP, C_JOIN_IN, C_START_CAP, CurveInfo, StrokeParams, TOLERANCE, TileRect, line_bounds, records,
     scales, segment_bound,
 };
-use crate::shape::{Cap, Draw, FillRule, Join, Path, PathStyle};
+use crate::figure::{Cap, Draw, FillRule, Join, Path, PathStyle};
 
 const TILE: f32 = 16.0;
 const FIX: f32 = 256.0;
@@ -179,7 +179,7 @@ fn connect(out: &mut Out<'_>, p: V, n0: V, n1: V, side: f32, from: V, to: V, rou
     let s = out
         .job
         .stroke
-        .unwrap_or_else(|| StrokeParams::new(&crate::shape::Stroke::new(1.0), 1.0));
+        .unwrap_or_else(|| StrokeParams::new(&crate::figure::Stroke::new(1.0), 1.0));
     let h = s.half;
     let cross = n0[0] * n1[1] - n0[1] * n1[0];
     let back = cross.abs() < 1e-6 && dot(n0, n1) < 0.0;
@@ -220,7 +220,7 @@ fn arc(out: &mut Out<'_>, p: V, a: V, b: V, from: V, to: V) {
     let s = out
         .job
         .stroke
-        .unwrap_or_else(|| StrokeParams::new(&crate::shape::Stroke::new(1.0), 1.0));
+        .unwrap_or_else(|| StrokeParams::new(&crate::figure::Stroke::new(1.0), 1.0));
     let angle = (a[0] * b[1] - a[1] * b[0]).atan2(dot(a, b));
     let steps = ((angle.abs() / s.theta).ceil() as u32).clamp(1, s.arc_bound);
     let mut prev = from;
@@ -238,7 +238,7 @@ fn half_turn(out: &mut Out<'_>, p: V, a: V, toward: V, from: V, to: V) {
     let s = out
         .job
         .stroke
-        .unwrap_or_else(|| StrokeParams::new(&crate::shape::Stroke::new(1.0), 1.0));
+        .unwrap_or_else(|| StrokeParams::new(&crate::figure::Stroke::new(1.0), 1.0));
     let pi = std::f32::consts::PI;
     let sense = (a[0] * toward[1] - a[1] * toward[0]).signum();
     let steps = ((pi / s.theta).ceil() as u32).clamp(2, s.arc_bound);

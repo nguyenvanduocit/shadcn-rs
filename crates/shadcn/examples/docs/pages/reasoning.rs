@@ -103,7 +103,7 @@ fn duration() -> Div {
         .child(trace_icon(icon(Icon::CircleCheck)))
         .child(trace_title("Thought"))
         .child(trace_description("12s"));
-    trace().max_w(96.0).child(
+    trace().max_width(384.0).child(
         trace_collapsible().child(trace_collapsible_trigger(false, line)).child(
             trace_collapsible_content().map_root(|c| {
                 c.child(text(
@@ -190,7 +190,7 @@ impl Research {
                     wrap: true,
                     ..CodeBlockContentProps::default()
                 };
-                code_block(p).child(code_block_content(p, c, code_block_lines(log)).max_h(64.0))
+                code_block(p).child(code_block_content(p, c, code_block_lines(log)).max_height(256.0))
             }
             Self::SearchWeb { results, .. } => trace().children(results.iter().map(|title| {
                 trace_action(
@@ -201,11 +201,17 @@ impl Research {
                         .child(trace_end_icon(icon(Icon::ArrowUpRight))),
                 )
             })),
-            Self::SearchCode { files, .. } => div().flex().flex_wrap().gap(1.5).children(
-                files
-                    .iter()
-                    .map(|f| badge(BadgeVariant::Secondary).font_mono().child(*f)),
-            ),
+            Self::SearchCode { files, .. } => {
+                div()
+                    .display(Display::Flex)
+                    .flex_wrap(true)
+                    .gap(6.0)
+                    .children(files.iter().map(|f| {
+                        badge(BadgeVariant::Secondary)
+                            .font_family(FontFamily::GEIST_MONO)
+                            .child(*f)
+                    }))
+            }
         }
     }
 }
@@ -341,8 +347,9 @@ pub fn render() -> Render {
         page(
             "Reasoning",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("ReasoningDemo.vue", reasoning.view()))
                 .child(demo("ReasoningDurationDemo.vue", duration()))
                 .child(demo("ChainOfThoughtDemo.vue", chain.view())),

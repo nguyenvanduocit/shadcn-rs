@@ -29,6 +29,7 @@ use gui::{
 };
 
 use crate::dropdown_menu::{menu_nav_key, menu_step};
+use crate::focus::StateLook;
 use crate::part::Part;
 use crate::theme::theme;
 
@@ -399,14 +400,14 @@ pub fn command() -> Part<CommandProps> {
     let t = theme();
     let root = div()
         .named("command")
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .flex()
-        .h_full()
-        .w_full()
-        .flex_col()
-        .overflow_hidden()
-        .rounded_md();
+        .height(pct(100.0))
+        .width(pct(100.0))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .overflow(Overflow::Hidden)
+        .radius(8.0);
     Part::new(CommandProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -439,14 +440,14 @@ pub fn command_input(placeholder: &str) -> Part<String> {
     let t = theme();
     let root = div()
         .named("command-input-wrapper")
-        .flex()
-        .h(9.0)
-        .items_center()
-        .gap(2.0)
-        .border_b()
+        .display(Display::Flex)
+        .height(36.0)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .border_bottom(1.0)
         .border_color(t.border)
-        .px(3.0)
-        .child(icon(Icon::Search).shrink_0().opacity(0.5));
+        .padding_x(12.0)
+        .child(icon(Icon::Search).flex_shrink(0.0).opacity(0.5));
     Part::new(placeholder.to_owned(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -467,13 +468,14 @@ pub fn command_input(placeholder: &str) -> Part<String> {
                         .placeholder(placeholder)
                         .placeholder_color(t.muted_foreground)
                         .selection_color(t.primary.opacity(0.35))
-                        .flex()
-                        .h(10.0)
-                        .w_full()
-                        .rounded_md()
-                        .py(3.0)
-                        .text_sm()
-                        .disabled_style(|s| s.cursor_not_allowed().opacity(0.5)),
+                        .display(Display::Flex)
+                        .height(40.0)
+                        .width(pct(100.0))
+                        .radius(8.0)
+                        .padding_y(12.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .with_interaction(|d, i| d.cursor_disabled(i).dim_disabled(i, 0.5)),
                 )
                 .into_element()
             }
@@ -652,11 +654,11 @@ impl IntoElement for CommandList {
                                 .into_element()
                         })
                     },
-                    |viewport| viewport.overflow_x_hidden(),
+                    |viewport| viewport.overflow_x(Overflow::Hidden),
                 )
                 .named(names.list)
                 .role(gui::Role::ListBox)
-                .w_full()
+                .width(pct(100.0))
                 .member(&cmd.lists, h.clone());
                 if tail.is_empty() {
                     return body.into_element();
@@ -666,7 +668,12 @@ impl IntoElement for CommandList {
                     .iter()
                     .enumerate()
                     .map(|(i, r)| ctx.build(&footer, r, tail_options.get(i).copied().flatten()));
-                div().flex_col().child(body).children(tail_rows).into_element()
+                div()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .child(body)
+                    .children(tail_rows)
+                    .into_element()
             })
         })
         .named("command-list")
@@ -696,11 +703,11 @@ impl Rows<'_> {
                 .named(names.group)
                 .role(gui::Role::GenericContainer)
                 .text_color(t.foreground)
-                .overflow_hidden()
-                .px(1.0)
-                .when(first, |d| d.pt(1.0))
-                .when(last, |d| d.pb(1.0))
-                .when(!grouped(section), |d| d.px(0.0))
+                .overflow(Overflow::Hidden)
+                .padding_x(4.0)
+                .when(first, |d| d.padding_top(4.0))
+                .when(last, |d| d.padding_bottom(4.0))
+                .when(!grouped(section), |d| d.padding_x(0.0))
         };
         match *r {
             Row::Heading { section } => {
@@ -711,10 +718,11 @@ impl Rows<'_> {
                 group_part(section, true, false).child(
                     div()
                         .named(names.heading)
-                        .px(2.0)
-                        .py(1.5)
-                        .text_xs()
-                        .font_medium()
+                        .padding_x(8.0)
+                        .padding_y(6.0)
+                        .text_size(12.0)
+                        .line_height(16.0)
+                        .font_weight(500)
                         .text_color(t.muted_foreground)
                         .child(heading),
                 )
@@ -761,7 +769,7 @@ impl Rows<'_> {
         let t = theme();
         let (hover, click, list) = (self.cmd.clone(), self.cmd.clone(), self.list.clone());
         let (hovered, picked) = (item.value.clone(), item.clone());
-        d.when(on, |d| d.bg(t.accent).text_color(t.accent_foreground))
+        d.when(on, |d| d.background(t.accent).text_color(t.accent_foreground))
             .on_hover(move |inside| {
                 if inside {
                     hover.highlight(Some(hovered.clone()));
@@ -857,29 +865,39 @@ fn row_key(sections: &[CommandSection], r: &Row) -> ElementKey {
 }
 
 pub(crate) fn command_empty_box(message: &str) -> Div {
-    div().py(6.0).text_center().text_sm().child(message.to_owned())
+    div()
+        .padding_y(24.0)
+        .text_align(TextAlign::Center)
+        .text_size(14.0)
+        .line_height(20.0)
+        .child(message.to_owned())
 }
 
 /// The look of an item: `relative flex cursor-default items-center gap-2
 /// rounded-sm px-2 py-1.5 text-sm select-none`.
 pub(crate) fn command_item_row() -> Div {
     div()
-        .relative()
-        .flex()
-        .cursor_default()
-        .items_center()
-        .gap(2.0)
-        .rounded_sm()
-        .px(2.0)
-        .py(1.5)
-        .text_sm()
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .cursor(Cursor::Default)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .radius(6.0)
+        .padding_x(8.0)
+        .padding_y(6.0)
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 /// `bg-border -mx-1 h-px`.
 #[must_use]
 pub fn command_separator() -> Div {
     let t = theme();
-    div().named("command-separator").bg(t.border).mx(-1.0).h_px(1.0)
+    div()
+        .named("command-separator")
+        .background(t.border)
+        .margin_x(-4.0)
+        .height(1.0)
 }
 
 /// `text-muted-foreground ml-auto text-xs tracking-widest`.
@@ -889,9 +907,10 @@ pub fn command_shortcut(keys: &str) -> Text {
     text(keys)
         .named("command-shortcut")
         .text_color(t.muted_foreground)
-        .ml_auto()
-        .text_xs()
-        .tracking_widest()
+        .margin_left(Length::Auto)
+        .text_size(12.0)
+        .line_height(16.0)
+        .tracking(0.1)
 }
 
 #[cfg(test)]
@@ -934,7 +953,7 @@ mod tests {
         ];
         command()
             .search(search)
-            .w_px(400.0)
+            .width(400.0)
             .child(probe())
             .child(
                 command_list(sections, |item, row| row.child(text(item.value.clone())))

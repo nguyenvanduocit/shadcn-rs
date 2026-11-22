@@ -7,7 +7,7 @@ use std::rc::Rc;
 
 use gui::{Div, Element, Icon, Model, ScenarioError, Side, SideAlign, Signal, Text, component, div, icon, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize,
+    BubbleAlign, BubbleProps, BubbleVariant, Button, ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize,
     MarkerVariant, MenuItem, MessageProps, MessageScroller, MessageScrollerDefaultScrollPosition,
     MessageScrollerDirection, MessageScrollerProps, MessageScrollerScrollAlign, MessageScrollerScrollOptions,
     MessageScrollerScrollable, Orientation, Toast, ToastKind, ToggleGroupItem, bubble, bubble_content, button, card,
@@ -24,6 +24,7 @@ use shadcn::{
 use super::demo_chat::{DemoChat, DemoMessage, Role, Turns, animated};
 use super::thread::{click_named, wait};
 use crate::{Render, Shot, demo, page};
+use shadcn::focus::StateLook;
 
 /// A saved conversation: id, role and text of each message.
 type Transcript = &'static [(&'static str, Role, &'static str)];
@@ -75,10 +76,10 @@ fn bump(key: Signal<u32>) {
 /// `CardHeader class="border-b"`, with `gap-1` when `tight`.
 fn header(title: &str, description: &str, tight: bool) -> Div {
     card_header()
-        .when(tight, |h| h.gap(1.0))
-        .border_b()
+        .when(tight, |h| h.gap(4.0))
+        .border_bottom(1.0)
         .border_color(theme().border)
-        .pb(6.0)
+        .padding_bottom(24.0)
         .child(card_title(title))
         .child(card_description(description))
 }
@@ -87,30 +88,41 @@ fn header(title: &str, description: &str, tight: bool) -> Div {
 /// (`CardContent class="min-h-0 flex-1 overflow-hidden p-0"`) and a footer.
 fn shell(header: Div, body: impl IntoElement, footer: Option<Div>) -> Div {
     card()
-        .h(140.0)
-        .w_full()
+        .height(560.0)
+        .width(pct(100.0))
         .gap(0.0)
         .child(header)
-        .child(card_content().min_h(0.0).flex_1().overflow_hidden().p(0.0).child(body))
+        .child(
+            card_content()
+                .min_height(0.0)
+                .flex(Flex::grow(1.0))
+                .overflow(Overflow::Hidden)
+                .padding(0.0)
+                .child(body),
+        )
         .when_some(footer, Div::child)
 }
 
 /// `Card class="mx-auto h-140 w-full max-w-sm gap-0"`.
 fn centred(card: Div) -> Div {
-    card.mx_auto().max_w(96.0)
+    card.margin_x(Length::Auto).max_width(384.0)
 }
 
 /// `CardFooter class="border-t"`.
 fn footer_ruled() -> Div {
-    card_footer().border_t().border_color(theme().border).pt(6.0)
+    card_footer()
+        .border_top(1.0)
+        .border_color(theme().border)
+        .padding_top(24.0)
 }
 
 /// The note under a demo: `px-0.5 text-center text-xs text-muted-foreground`.
 fn caption(words: &str) -> Text {
     text(words)
-        .px(0.5)
-        .text_center()
-        .text_xs()
+        .padding_x(2.0)
+        .text_align(TextAlign::Center)
+        .text_size(12.0)
+        .line_height(16.0)
         .text_color(theme().muted_foreground)
 }
 
@@ -130,7 +142,7 @@ fn reset_button(disabled: bool, on: impl Fn() + 'static) -> Div {
 
 /// What a thread shows before its first message.
 fn empty_thread(title: &str, description: &str) -> Div {
-    empty().h_full().child(
+    empty().height(pct(100.0)).child(
         empty_header()
             .child(empty_media_icon(Icon::MessageCircleDashed))
             .child(empty_title(title))
@@ -166,9 +178,9 @@ fn turns(messages: Vec<DemoMessage>) -> Div {
 }
 
 /// The send button of a footer: `size="icon" class="ml-auto"`.
-fn send_button(disabled: bool, on: impl Fn() + 'static) -> Div {
+fn send_button(disabled: bool, on: impl Fn() + 'static) -> Button {
     button(ButtonVariant::Default, ButtonSize::Icon)
-        .ml_auto()
+        .margin_left(Length::Auto)
         .disabled(disabled)
         .child(icon(Icon::ArrowUp))
         .on_click(move |_| on())
@@ -194,13 +206,13 @@ fn composer(chat: &DemoChat, idle: &str, extra: Option<Div>) -> Div {
     let files = dropdown_menu_content()
         .side(Side::Top)
         .align(SideAlign::Start)
-        .w(44.0)
+        .width(176.0)
         .child(attach(Icon::Paperclip, "Add Photos & Files"))
         .child(dropdown_menu_separator())
         .child(attach(Icon::Image, "Create Image"))
         .child(attach(Icon::Telescope, "Deep Research"))
         .child(attach(Icon::Globe, "Web Search"));
-    let addon = input_group_addon(InputGroupAlign::BlockEnd).pt(1.0).button(
+    let addon = input_group_addon(InputGroupAlign::BlockEnd).padding_top(4.0).button(
         dropdown_menu()
             .child(dropdown_menu_trigger(
                 input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm).child(icon(Icon::Plus)),
@@ -214,16 +226,28 @@ fn composer(chat: &DemoChat, idle: &str, extra: Option<Div>) -> Div {
     let send = chat.clone();
     let addon = addon.button(
         input_group_button(ButtonVariant::Default, InputGroupButtonSize::IconSm)
-            .ml_auto()
+            .margin_left(Length::Auto)
             .disabled(next.is_none() || busy)
             .child(icon(Icon::ArrowUp))
             .on_click(move |_| send.send()),
     );
-    card_footer().flex_col().gap(2.0).child(
-        div()
-            .w_full()
-            .child(input_group_content(div().h(14.0).w_full().px(3.0).py(2.5).child(line)).addon(addon)),
-    )
+    card_footer()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .child(
+            div().width(pct(100.0)).child(
+                input_group_content(
+                    div()
+                        .height(56.0)
+                        .width(pct(100.0))
+                        .padding_x(12.0)
+                        .padding_y(10.0)
+                        .child(line),
+                )
+                .addon(addon),
+            ),
+        )
 }
 
 // ── MessageScrollerDemo, MessageScrollerStreamingDemo ──────────────────────
@@ -259,9 +283,10 @@ impl Chat {
             turns(messages.clone())
         };
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(provider(
                 self.props,
                 0,
@@ -321,13 +346,14 @@ impl Context {
             peek: self.peek,
         };
         let amount = div()
-            .flex()
-            .w(28.0)
-            .items_center()
-            .gap(2.0)
+            .display(Display::Flex)
+            .width(112.0)
+            .align_items(Align::Center)
+            .gap(8.0)
             .child(
                 text(format!("{peek:.0}px"))
-                    .text_xs()
+                    .text_size(12.0)
+                    .line_height(16.0)
                     .text_color(theme().muted_foreground),
             )
             .child(
@@ -338,9 +364,10 @@ impl Context {
                     .disabled(busy),
             );
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(provider(
                 props,
                 self.key.get(),
@@ -435,9 +462,10 @@ impl Anchoring {
             )
         };
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(centred(shell(
                 header("Anchoring Turns", "Choose which role settles near the top edge.", false).child(
                     card_action().child(
@@ -461,8 +489,8 @@ impl Anchoring {
             )))
             .child(
                 caption("Toggle the anchor role, then send messages to compare where turns settle.")
-                    .mx_auto()
-                    .max_w(80.0),
+                    .margin_x(Length::Auto)
+                    .max_width(320.0),
             )
     }
 }
@@ -501,9 +529,10 @@ impl Animation {
         let presets =
             select_content().child(select_group().children(PRESETS.iter().map(|(id, name)| select_item(*id, *name))));
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(centred(shell(
                 header(
                     "Animation",
@@ -511,15 +540,19 @@ impl Animation {
                     false,
                 )
                 .child(
-                    card_action().flex().items_center().gap(2.0).child(
-                        button(ButtonVariant::Outline, ButtonSize::Icon)
-                            .disabled(messages.is_empty() || busy)
-                            .child(icon(Icon::RotateCw))
-                            .on_click(move |_| {
-                                chat.reset();
-                                bump(fresh);
-                            }),
-                    ),
+                    card_action()
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(8.0)
+                        .child(
+                            button(ButtonVariant::Outline, ButtonSize::Icon)
+                                .disabled(messages.is_empty() || busy)
+                                .child(icon(Icon::RotateCw))
+                                .on_click(move |_| {
+                                    chat.reset();
+                                    bump(fresh);
+                                }),
+                        ),
                 ),
                 body,
                 Some(
@@ -532,9 +565,9 @@ impl Animation {
             )))
             .child(
                 caption("Select an animation then click send to see it in action.")
-                    .mx_auto()
-                    .max_w(96.0)
-                    .text_balance(),
+                    .margin_x(Length::Auto)
+                    .max_width(384.0)
+                    .text_wrap(WrapStyle::Balance),
             )
     }
 }
@@ -566,7 +599,7 @@ impl Commands {
         let messages = transcript(COMMANDS);
         // `CommandMenu`, a child of the provider driving it.
         let menu = scrolled(move |scroller| {
-            let jumps = dropdown_menu_content().align(SideAlign::End).w(64.0).child(
+            let jumps = dropdown_menu_content().align(SideAlign::End).width(256.0).child(
                 dropdown_menu_group()
                     .child(dropdown_menu_label("Conversations", false))
                     .children(user_turns(COMMANDS).map(|(index, id, words)| {
@@ -575,7 +608,7 @@ impl Commands {
                             .on_select(move || {
                                 s.scroll_to_message(index, MessageScrollerScrollOptions::default());
                             })
-                            .child(text(trimmed(words)).line_clamp(1).min_w(0.0))
+                            .child(text(trimmed(words)).line_clamp(1).min_width(0.0))
                     })),
             );
             dropdown_menu()
@@ -590,9 +623,10 @@ impl Commands {
             ..MessageScrollerProps::default()
         };
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(provider(
                 props,
                 0,
@@ -604,9 +638,9 @@ impl Commands {
             ))
             .child(
                 caption("Use the controls to jump to any message in the conversation.")
-                    .mx_auto()
-                    .max_w(96.0)
-                    .text_balance(),
+                    .margin_x(Length::Auto)
+                    .max_width(384.0)
+                    .text_wrap(WrapStyle::Balance),
             )
     }
 }
@@ -655,9 +689,10 @@ impl History {
         let (reset, load) = (self.clone(), self.clone());
         let rows: Vec<Option<DemoMessage>> = messages.iter().cloned().map(Some).chain([None]).collect();
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(centred(shell(
                 header("Load History", "Prepended messages keep your place.", true).child(reset_button(
                     messages.len() <= INITIAL_VISIBLE_COUNT,
@@ -684,28 +719,30 @@ impl History {
                 ),
                 Some(
                     footer_ruled()
-                        .flex_col()
-                        .items_center()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Center)
+                        .gap(8.0)
                         .child(
                             button(ButtonVariant::Secondary, ButtonSize::Default)
-                                .w_full()
+                                .width(pct(100.0))
                                 .disabled(!can_load)
                                 .child(if can_load { "Load History" } else { "History Loaded" })
                                 .on_click(move |_| load.load()),
                         )
                         .child(
                             text("Restore earlier messages while keeping your place.")
-                                .text_xs()
+                                .text_size(12.0)
+                                .line_height(16.0)
                                 .text_color(t.muted_foreground),
                         ),
                 ),
             )))
             .child(
                 caption("Click Load History to load the entire conversation")
-                    .mx_auto()
-                    .max_w(96.0)
-                    .text_balance(),
+                    .margin_x(Length::Auto)
+                    .max_width(384.0)
+                    .text_wrap(WrapStyle::Balance),
             )
     }
 }
@@ -748,8 +785,8 @@ fn opening_tabs(position: Signal<String>) -> Element {
             let triggers = ["start", "end", "last-anchor"].map(|p| tabs_trigger(p).child(p));
             tabs()
                 .model(model)
-                .w_full()
-                .child(tabs_list().w_full().children(triggers))
+                .width(pct(100.0))
+                .child(tabs_list().width(pct(100.0)).children(triggers))
                 .into_element()
         }
     })
@@ -760,22 +797,27 @@ fn opening_tabs(position: Signal<String>) -> Element {
 fn opening(position: Signal<String>) -> Div {
     let messages = transcript(OPENING);
     div()
-        .relative()
-        .flex_col()
-        .gap(4.0)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(16.0)
         .child(provider(
             MessageScrollerProps::default(),
             0,
             centred(shell(
                 header("Opening Position", "Choose where a saved transcript opens.", true),
                 turns(messages),
-                Some(footer_ruled().justify_center().child(opening_tabs(position))),
+                Some(
+                    footer_ruled()
+                        .justify_content(Justify::Center)
+                        .child(opening_tabs(position)),
+                ),
             )),
         ))
         .child(
             caption("Toggle the defaultScrollPosition to see where the transcript starts when you open the thread")
-                .mx_auto()
-                .max_w(96.0),
+                .margin_x(Length::Auto)
+                .max_width(384.0),
         )
 }
 
@@ -823,24 +865,26 @@ fn scrollable() -> Div {
             true,
         ),
         message_scroller()
-            .child(message_scroller_viewport(messages, turn_meta, turn_row).gap(4.0))
+            .child(message_scroller_viewport(messages, turn_meta, turn_row).gap(16.0))
             .child(message_scroller_button(MessageScrollerDirection::End)),
         Some(
             footer_ruled()
-                .justify_center()
-                .text_center()
-                .text_sm()
+                .justify_content(Justify::Center)
+                .text_align(TextAlign::Center)
+                .text_size(14.0)
+                .line_height(20.0)
                 .text_color(t.muted_foreground)
                 .child(scrolled(|s| text(scroll_status(s.scrollable())).into_element())),
         ),
     )
-    .overflow_hidden();
+    .overflow(Overflow::Hidden);
     div()
-        .mx_auto()
-        .flex_col()
-        .w_full()
-        .max_w(96.0)
-        .gap(4.0)
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(16.0)
         .child(provider(props, 0, card))
         .child(caption("Scroll the transcript to see the footer update."))
 }
@@ -858,41 +902,53 @@ impl Visibility {
         let current = scroller.visibility().current_anchor;
         let is_current = |index: usize| current == Some(index);
         let bars = div()
-            .flex_col()
-            .size(9.0)
-            .items_center()
-            .justify_center()
-            .gap(1.0)
-            .rounded_md()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .size(36.0)
+            .align_items(Align::Center)
+            .justify_content(Justify::Center)
+            .gap(4.0)
+            .radius(8.0)
             .children(user_turns(VISIBILITY).map(|(index, _, _)| {
-                div().h(0.5).w(4.0).rounded_full().bg(if is_current(index) {
-                    t.foreground
-                } else {
-                    t.muted_foreground.opacity(0.4)
-                })
+                div()
+                    .height(2.0)
+                    .width(16.0)
+                    .radius(9999.0)
+                    .background(if is_current(index) {
+                        t.foreground
+                    } else {
+                        t.muted_foreground.opacity(0.4)
+                    })
             }));
         let card = hover_card_content()
             .side(Side::Left)
             .align(SideAlign::Center)
             .side_offset(-28.0)
-            .flex_col()
-            .w(64.0)
-            .gap(1.0)
-            .rounded_2xl()
-            .p(1.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(256.0)
+            .gap(4.0)
+            .radius(18.0)
+            .padding(4.0)
             .children(user_turns(VISIBILITY).map(|(index, _, words)| {
                 let s = scroller.clone();
                 div()
-                    .flex()
-                    .min_h(7.0)
-                    .items_center()
-                    .rounded_xl()
-                    .px(2.0)
-                    .py(1.5)
-                    .text_sm()
-                    .when(is_current(index), |d| d.bg(t.accent).text_color(t.accent_foreground))
-                    .hover(move |s| s.bg(t.accent).text_color(t.accent_foreground))
-                    .child(text(trimmed(words)).line_clamp(1).min_w(0.0))
+                    .display(Display::Flex)
+                    .min_height(28.0)
+                    .align_items(Align::Center)
+                    .radius(14.0)
+                    .padding_x(8.0)
+                    .padding_y(6.0)
+                    .text_size(14.0)
+                    .line_height(20.0)
+                    .when(is_current(index), |d| {
+                        d.background(t.accent).text_color(t.accent_foreground)
+                    })
+                    .with_interaction(|d, i| {
+                        d.background_while(move || i.hovered(), t.accent)
+                            .text_color_while(move || i.hovered(), t.accent_foreground)
+                    })
+                    .child(text(trimmed(words)).line_clamp(1).min_width(0.0))
                     .on_click(move |_| {
                         s.scroll_to_message(index, MessageScrollerScrollOptions::default());
                     })
@@ -908,17 +964,18 @@ impl Visibility {
         };
         let me = Self;
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(provider(
                 props,
                 0,
                 div()
-                    .relative()
-                    .mx_auto()
-                    .w_full()
-                    .max_w(96.0)
+                    .position(Position::Relative)
+                    .margin_x(Length::Auto)
+                    .width(pct(100.0))
+                    .max_width(384.0)
                     .child(shell(
                         header("Transcript Outline", "Track the current anchored turn.", true),
                         turns(messages),
@@ -927,17 +984,17 @@ impl Visibility {
                     // `absolute top-1/2 -right-12 -translate-y-1/2` around the 36px trigger.
                     .child(
                         div()
-                            .absolute()
-                            .top_len(gui::relative(0.5))
-                            .right(-12.0)
-                            .mt(-4.5)
+                            .position(Position::Absolute)
+                            .top(gui::Length::Fraction(0.5))
+                            .right(-48.0)
+                            .margin_top(-18.0)
                             .child(scrolled(move |s| me.outline(s).into_element())),
                     ),
             ))
             .child(
                 caption("Open the outline to jump between anchored turns as you read.")
-                    .mx_auto()
-                    .max_w(96.0),
+                    .margin_x(Length::Auto)
+                    .max_width(384.0),
             )
     }
 }
@@ -1059,9 +1116,10 @@ impl GroupChat {
             .collect();
         let (advance, reset) = (self.clone(), self.clone());
         div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(16.0)
             .child(centred(shell(
                 header(
                     "Group Chat",
@@ -1079,12 +1137,13 @@ impl GroupChat {
                 ),
                 Some(
                     footer_ruled()
-                        .flex_col()
-                        .items_center()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Center)
+                        .gap(8.0)
                         .child(
                             button(ButtonVariant::Secondary, ButtonSize::Default)
-                                .w_full()
+                                .width(pct(100.0))
                                 .disabled(step >= 2)
                                 .child(if step == 0 {
                                     "Add Rocky"
@@ -1099,16 +1158,17 @@ impl GroupChat {
                             } else {
                                 "Now send Rocky's reply into the conversation"
                             })
-                            .text_xs()
+                            .text_size(12.0)
+                            .line_height(16.0)
                             .text_color(t.muted_foreground),
                         ),
                 ),
             )))
             .child(
                 caption("When a user joins, a marker is created. scrollAnchor on the marker marks it as the next turn")
-                    .mx_auto()
-                    .max_w(96.0)
-                    .text_balance(),
+                    .margin_x(Length::Auto)
+                    .max_width(384.0)
+                    .text_wrap(WrapStyle::Balance),
             )
     }
 }
@@ -1167,8 +1227,9 @@ pub fn render() -> Render {
         page(
             "Message scroller",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("MessageScrollerDemo.vue", basic.view()))
                 .child(demo("MessageScrollerStreamingDemo.vue", streaming.view()))
                 .child(demo("MessageScrollerPreviousContextDemo.vue", context.view()))

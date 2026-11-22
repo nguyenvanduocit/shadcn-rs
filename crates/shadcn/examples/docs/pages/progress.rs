@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use gui::prelude::*;
-use gui::{ScenarioError, Signal, div, relative, text};
+use gui::{ScenarioError, Signal, div, text};
 use shadcn::progress;
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page, section};
@@ -15,21 +15,26 @@ pub fn render() -> Render {
         page(
             "Progress",
             div()
-                .flex_col()
-                .gap(8.0)
-                .child(demo("ProgressDemo.vue", progress(value.get()).w_len(relative(0.6))))
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
+                .child(demo(
+                    "ProgressDemo.vue",
+                    progress(value.get()).width(Length::Fraction(0.6)),
+                ))
                 .child(section(
                     "Values",
                     div()
-                        .flex_col()
-                        .gap(4.0)
-                        .w_px(480.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
+                        .width(480.0)
                         .children([0.0, 25.0, 66.0, 100.0].map(|v| {
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(4.0)
-                                .child(text(format!("{v}%")).text_sm().w(12.0))
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .gap(16.0)
+                                .child(text(format!("{v}%")).text_size(14.0).line_height(20.0).width(48.0))
                                 .child(progress(v))
                         })),
                 )),

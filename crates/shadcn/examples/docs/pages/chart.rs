@@ -64,12 +64,22 @@ fn chart_card(title: &str, description: &str, chart: impl IntoElement, footer: &
         .child(card_content().child(chart))
         .child(
             card_footer()
-                .flex_col()
-                .items_start()
-                .gap(2.0)
-                .text_sm()
-                .child(text("Trending up by 5.2% this month").font_medium().leading_none())
-                .child(text(footer).leading_none().text_color(t.muted_foreground)),
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .align_items(Align::Start)
+                .gap(8.0)
+                .text_size(14.0)
+                .line_height(20.0)
+                .child(
+                    text("Trending up by 5.2% this month")
+                        .font_weight(500)
+                        .line_height(LineHeight::Relative(1.0)),
+                )
+                .child(
+                    text(footer)
+                        .line_height(LineHeight::Relative(1.0))
+                        .text_color(t.muted_foreground),
+                ),
         )
 }
 
@@ -125,53 +135,59 @@ pub fn render() -> Render {
         };
         page(
             "Chart",
-            div().flex_1().min_h(0.0).overflow_y_scroll().child(
-                div()
-                    .flex_col()
-                    .gap(8.0)
-                    .pr(3.0)
-                    .child(
-                        div()
-                            .grid()
-                            .grid_cols(2)
-                            .gap(4.0)
-                            .child(chart_card(
-                                "Area Chart - Stacked",
-                                "Showing total visitors for the last 6 months",
-                                chart_container().child(chart_xy(area_chart)),
-                                "January - June 2024",
-                            ))
-                            .child(chart_card(
-                                "Bar Chart - Multiple",
-                                "January - June 2024",
-                                chart_container()
-                                    .child(chart_xy(bar_chart))
-                                    .child(chart_legend_content(&desktop_mobile)),
-                                "Showing total visitors for the last 6 months",
-                            ))
-                            .child(chart_card(
-                                "Line Chart",
-                                "January - June 2024",
-                                chart_container().child(chart_xy(line_chart)),
-                                "Showing total visitors for the last 6 months",
-                            ))
-                            .child(chart_card(
-                                "Pie Chart - Donut",
-                                "January - June 2024",
-                                chart_container()
-                                    .items_center()
-                                    .child(chart_pie(&pie))
-                                    .child(chart_legend_content(&browsers))
-                                    .child(
-                                        text(chart_summary(&browsers, std::slice::from_ref(&visitors)))
-                                            .pt(3.0)
-                                            .text_color(t.muted_foreground),
-                                    ),
-                                "Showing total visitors for the last 6 months",
-                            )),
-                    )
-                    .child(section("shadcn-vue demos", demos())),
-            ),
+            div()
+                .flex(Flex::grow(1.0))
+                .min_height(0.0)
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .child(
+                    div()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(32.0)
+                        .padding_right(12.0)
+                        .child(
+                            div()
+                                .display(Display::Grid)
+                                .grid_columns(Tracks::repeat(2, Track::Fr(1.0)))
+                                .gap(16.0)
+                                .child(chart_card(
+                                    "Area Chart - Stacked",
+                                    "Showing total visitors for the last 6 months",
+                                    chart_container().child(chart_xy(area_chart)),
+                                    "January - June 2024",
+                                ))
+                                .child(chart_card(
+                                    "Bar Chart - Multiple",
+                                    "January - June 2024",
+                                    chart_container()
+                                        .child(chart_xy(bar_chart))
+                                        .child(chart_legend_content(&desktop_mobile)),
+                                    "Showing total visitors for the last 6 months",
+                                ))
+                                .child(chart_card(
+                                    "Line Chart",
+                                    "January - June 2024",
+                                    chart_container().child(chart_xy(line_chart)),
+                                    "Showing total visitors for the last 6 months",
+                                ))
+                                .child(chart_card(
+                                    "Pie Chart - Donut",
+                                    "January - June 2024",
+                                    chart_container()
+                                        .align_items(Align::Center)
+                                        .child(chart_pie(&pie))
+                                        .child(chart_legend_content(&browsers))
+                                        .child(
+                                            text(chart_summary(&browsers, std::slice::from_ref(&visitors)))
+                                                .padding_top(12.0)
+                                                .text_color(t.muted_foreground),
+                                        ),
+                                    "Showing total visitors for the last 6 months",
+                                )),
+                        )
+                        .child(section("shadcn-vue demos", demos())),
+                ),
         )
     })
 }
@@ -217,13 +233,14 @@ fn demos() -> gui::Div {
     // The legend's `pt-3` and 16px line come out of the container's height.
     let legend = full(SPECIMEN_H - 28.0, true, true);
     div()
-        .flex_col()
-        .gap(8.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(32.0)
         .child(demo(
             "ChartDemo.vue",
             card()
-                .w_full()
-                .max_w_px(448.0)
+                .width(pct(100.0))
+                .max_width(448.0)
                 .child(
                     card_header()
                         .child(card_title("Bar Chart - Multiple"))
@@ -232,22 +249,24 @@ fn demos() -> gui::Div {
                 .child(card_content().child(chart_container().child(chart_xy(in_card))))
                 .child(
                     card_footer()
-                        .flex_col()
-                        .items_start()
-                        .gap(2.0)
-                        .text_sm()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Start)
+                        .gap(8.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .child(
                             div()
-                                .flex()
-                                .gap(2.0)
-                                .font_medium()
-                                .leading_none()
+                                .display(Display::Flex)
+                                .gap(8.0)
+                                .font_weight(500)
+                                .line_height(LineHeight::Relative(1.0))
                                 .child("Trending up by 5.2% this month")
-                                .child(icon(Icon::TrendingUp).size(4.0)),
+                                .child(icon(Icon::TrendingUp).size(16.0)),
                         )
                         .child(
                             text("Showing total visitors for the last 6 months")
-                                .leading_none()
+                                .line_height(LineHeight::Relative(1.0))
                                 .text_color(t.muted_foreground),
                         ),
                 ),

@@ -1262,6 +1262,7 @@ dependencies = [
  "rayon",
  "roxmltree",
  "skrifa",
+ "smallvec",
  "smelt-perf",
  "svgtypes",
  "taffy",

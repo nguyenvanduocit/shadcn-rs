@@ -76,15 +76,27 @@ fn mean(run: &[Judged]) -> f64 {
 fn stat(figure: String, label: &str) -> Div {
     let t = theme();
     div()
-        .flex_col()
-        .gap(1.0)
-        .flex_1()
-        .rounded_lg()
-        .border()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(4.0)
+        .flex(Flex::grow(1.0))
+        .radius(10.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(4.0)
-        .child(text(figure).text_2xl().font_semibold().tracking_tight())
-        .child(text(label.to_owned()).text_sm().text_color(t.muted_foreground))
+        .padding(16.0)
+        .child(
+            text(figure)
+                .text_size(24.0)
+                .line_height(32.0)
+                .font_weight(600)
+                .tracking(-0.025),
+        )
+        .child(
+            text(label.to_owned())
+                .text_size(14.0)
+                .line_height(20.0)
+                .text_color(t.muted_foreground),
+        )
 }
 
 fn count(run: &[Judged], grade: Grade) -> usize {
@@ -95,8 +107,8 @@ fn count(run: &[Judged], grade: Grade) -> usize {
 fn summary(mode: &str, run: &[Judged]) -> Div {
     let grades = [Grade::Pass, Grade::Better, Grade::Warn, Grade::Fail];
     div()
-        .flex()
-        .gap(3.0)
+        .display(Display::Flex)
+        .gap(12.0)
         .child(stat(
             format!("{:.1}", mean(run)),
             &format!("{mode}: mean of {} demos", run.len()),
@@ -107,18 +119,18 @@ fn summary(mode: &str, run: &[Judged]) -> Div {
 /// The message shown before any verdict has run.
 fn none_yet() -> Div {
     empty()
-        .border()
+        .border(1.0)
         .border_color(theme().border)
         .child(
             empty_header()
-                .child(empty_media(EmptyMediaVariant::Icon).child(icon(Icon::FlaskConical).size(6.0)))
+                .child(empty_media(EmptyMediaVariant::Icon).child(icon(Icon::FlaskConical).size(24.0)))
                 .child(empty_title("No verdict yet"))
                 .child(empty_description(
                     "Run crates/shadcn/verdict/run.sh to judge every demo against shadcn-vue's own; \
                      this page reads what it writes.",
                 )),
         )
-        .child(empty_content().w_full().child(code(
+        .child(empty_content().width(pct(100.0)).child(code(
             "crates/shadcn/verdict/run.sh         # light\ncrates/shadcn/verdict/run.sh --dark  # dark",
             "bash",
         )))
@@ -147,18 +159,24 @@ pub fn parts(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav, reload: impl Fn(
         verdict::FAIL,
     );
     let header = div()
-        .flex_col()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
         .child(h1("Fidelity"))
         .child(lead(&intro))
         .child(
-            div().flex().items_center().gap(2.0).pt(2.0).child(
-                button(ButtonVariant::Outline, ButtonSize::Sm)
-                    .named("reload-verdict")
-                    .on_click(move |_| reload())
-                    .child(icon(Icon::RefreshCw))
-                    .child("Read again"),
-            ),
+            div()
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .gap(8.0)
+                .padding_top(8.0)
+                .child(
+                    button(ButtonVariant::Outline, ButtonSize::Sm)
+                        .named("reload-verdict")
+                        .on_click(move |_| reload())
+                        .child(icon(Icon::RefreshCw))
+                        .child("Read again"),
+                ),
         );
     let mut parts = vec![Part::new("top", None, header)];
     let runs = [("Light", verdicts.light.as_deref()), ("Dark", verdicts.dark.as_deref())];
@@ -171,13 +189,15 @@ pub fn parts(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav, reload: impl Fn(
         "summary",
         Some("Summary"),
         div()
-            .flex_col()
-            .gap(3.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(h2("Summary"))
             .children(summaries)
             .child(
                 inline(&format!("{}.", read_from(&runs)))
-                    .text_sm()
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground),
             ),
     ));
@@ -185,8 +205,9 @@ pub fn parts(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav, reload: impl Fn(
         "demos",
         Some("By demo"),
         div()
-            .flex_col()
-            .gap(3.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(h2("By demo"))
             .child(by_demo(catalog, verdicts, nav)),
     ));
@@ -215,24 +236,29 @@ fn by_demo(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav) -> Element {
         for (i, demo) in demos.iter().enumerate() {
             let (light, dark) = verdicts.of(entry.page.name, demo);
             let cell = |j: Option<&Judged>| match j {
-                Some(j) => table_cell(grade_badge(None, j).self_start()),
+                Some(j) => table_cell(grade_badge(None, j).align_self(Align::Start)),
                 None => table_cell(text("–").text_color(t.muted_foreground)),
             };
             let go = nav.clone();
             let component = (i == 0).then(|| {
                 text(entry.title.clone())
-                    .font_medium()
-                    .cursor_pointer()
+                    .font_weight(500)
+                    .cursor(Cursor::Pointer)
                     .underline_offset(4.0)
-                    .hover(|s| s.underline())
+                    .with_interaction(|d, i| d.underline(move || i.hovered()))
             });
             rows.push(
                 table_row(&columns, false)
                     .key(key_of(&format!("{}/{demo}", entry.page.name)))
-                    .cursor_pointer()
+                    .cursor(Cursor::Pointer)
                     .on_click(move |_| go.go(route))
                     .child(table_cell(component))
-                    .child(table_cell(text((*demo).to_owned()).font_mono().text_xs()))
+                    .child(table_cell(
+                        text((*demo).to_owned())
+                            .font_family(FontFamily::GEIST_MONO)
+                            .text_size(12.0)
+                            .line_height(16.0),
+                    ))
                     .child(cell(light))
                     .child(cell(dark)),
             );
@@ -244,10 +270,10 @@ fn by_demo(catalog: &Catalog, verdicts: &Verdicts, nav: &Nav) -> Element {
         .child(table_head("Light"))
         .child(table_head("Dark"));
     div()
-        .rounded_lg()
-        .border()
+        .radius(10.0)
+        .border(1.0)
         .border_color(t.border)
-        .overflow_hidden()
+        .overflow(Overflow::Hidden)
         .child(table().child(table_header([head])).child(table_body(rows)))
         .into_element()
 }

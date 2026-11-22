@@ -17,7 +17,7 @@ const R: FieldOrientation = FieldOrientation::Responsive;
 fn label_for(name: &str, checked: &Signal<bool>) -> gui::Div {
     let flip = *checked;
     field_label(name.to_owned())
-        .font_normal()
+        .font_weight(400)
         .on_click(move |_| flip.update(|c| *c = !*c))
 }
 
@@ -44,7 +44,7 @@ pub fn render() -> Render {
     Box::new(move || {
         let months = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"];
         let years = ["2024", "2025", "2026", "2027", "2028", "2029"];
-        let field_demo = div().w_full().max_w_px(448.0).child(
+        let field_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_group()
                 .child(
                     field_set()
@@ -65,9 +65,9 @@ pub fn render() -> Render {
                                 )
                                 .child(
                                     div()
-                                        .grid()
-                                        .grid_cols(3)
-                                        .gap(4.0)
+                                        .display(Display::Grid)
+                                        .grid_columns(Tracks::repeat(3, Track::Fr(1.0)))
+                                        .gap(16.0)
                                         .child(field(V, false).child(field_label("Month")).child(pick("MM", &months)))
                                         .child(field(V, false).child(field_label("Year")).child(pick("YYYY", &years)))
                                         .child(
@@ -103,7 +103,7 @@ pub fn render() -> Render {
                 ),
         );
 
-        let input_demo = div().w_full().max_w_px(448.0).child(
+        let input_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_set().child(
                 field_group()
                     .child(
@@ -121,7 +121,7 @@ pub fn render() -> Render {
             ),
         );
 
-        let fieldset_demo = div().w_full().max_w_px(448.0).child(
+        let fieldset_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_set()
                 .child(field_legend("Address Information", None))
                 .child(field_description("We need your address to deliver your order."))
@@ -134,9 +134,9 @@ pub fn render() -> Render {
                         )
                         .child(
                             div()
-                                .grid()
-                                .grid_cols(2)
-                                .gap(4.0)
+                                .display(Display::Grid)
+                                .grid_columns(Tracks::repeat(2, Track::Fr(1.0)))
+                                .gap(16.0)
                                 .child(
                                     field(V, false)
                                         .child(field_label("City"))
@@ -151,7 +151,7 @@ pub fn render() -> Render {
                 ),
         );
 
-        let group_demo = div().w_full().max_w_px(448.0).child(
+        let group_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_group()
                 .child(
                     field_set()
@@ -163,7 +163,7 @@ pub fn render() -> Render {
                             field_checkbox_group().child(
                                 field(H, false)
                                     .child(checkbox().model(b[1]).disabled(true))
-                                    .child(field_label("Push notifications").font_normal()),
+                                    .child(field_label("Push notifications").font_weight(400)),
                             ),
                         ),
                 )
@@ -198,7 +198,7 @@ pub fn render() -> Render {
             )
             .on_click(move |_| choose.set(Some(value.to_owned())))
         };
-        let choice_demo = div().w_full().max_w_px(448.0).child(
+        let choice_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_group().child(
                 field_set()
                     .child(field_label("Compute Environment"))
@@ -220,7 +220,7 @@ pub fn render() -> Render {
             ),
         );
 
-        let checkbox_demo = div().w_full().max_w_px(448.0).child(
+        let checkbox_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_group()
                 .child(
                     field_set()
@@ -228,7 +228,7 @@ pub fn render() -> Render {
                         .child(field_description("Select the items you want to show on the desktop."))
                         .child(
                             field_group()
-                                .gap(3.0)
+                                .gap(12.0)
                                 .child(check("Hard disks", &b[4]))
                                 .child(check("External disks", &b[5]))
                                 .child(check("CDs, DVDs, and iPods", &b[8]))
@@ -250,9 +250,9 @@ pub fn render() -> Render {
         let radio = |value: &str, name: &str| {
             field(H, false)
                 .child(radio_group_item(value))
-                .child(field_label(name.to_owned()).font_normal())
+                .child(field_label(name.to_owned()).font_weight(400))
         };
-        let radio_demo = div().w_full().max_w_px(448.0).child(
+        let radio_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_set()
                 .child(field_label("Subscription Plan"))
                 .child(field_description(
@@ -266,7 +266,7 @@ pub fn render() -> Render {
                 )),
         );
 
-        let switch_demo = div().w_full().max_w_px(448.0).child(
+        let switch_demo = div().width(pct(100.0)).max_width(448.0).child(
             field(H, false)
                 .child(field_content().child(field_label("Multi-factor authentication")).child(field_description(
                     "Enable multi-factor authentication. If you do not have a two-factor device, you can use a one-time code sent to your email.",
@@ -274,7 +274,7 @@ pub fn render() -> Render {
                 .child(switch()),
         );
 
-        let textarea_demo = div().w_full().max_w_px(448.0).child(
+        let textarea_demo = div().width(pct(100.0)).max_width(448.0).child(
             field_set().child(
                 field_group().child(
                     field(V, false)
@@ -285,7 +285,7 @@ pub fn render() -> Render {
             ),
         );
 
-        let responsive_demo = div().w_full().max_w_px(896.0).child(
+        let responsive_demo = div().width(pct(100.0)).max_width(896.0).child(
             field_set()
                 .child(field_legend("Profile", None))
                 .child(field_description("Fill in your profile information."))
@@ -307,7 +307,12 @@ pub fn render() -> Render {
                                 .child(field_content().child(field_label("Message")).child(field_description(
                                     "You can write your message here. Keep it short, preferably under 100 characters.",
                                 )))
-                                .child(textarea().placeholder("Hello, world!").min_h_px(100.0).min_w_px(300.0)),
+                                .child(
+                                    textarea()
+                                        .placeholder("Hello, world!")
+                                        .min_height(100.0)
+                                        .min_width(300.0),
+                                ),
                         )
                         .child(field_separator(None))
                         .child(
@@ -320,14 +325,14 @@ pub fn render() -> Render {
 
         let range = price.get();
         let at = |i: usize| range.get(i).copied().unwrap_or_default().to_string();
-        let slider_demo = div().w_full().max_w_px(448.0).child(
+        let slider_demo = div().width(pct(100.0)).max_width(448.0).child(
             field(V, false)
                 .child(field_title("Price Range"))
                 .child(
                     field_description("Set your budget range ($ ")
-                        .span(span(at(0)).font_medium().tabular_nums())
+                        .span(span(at(0)).font_weight(500).tabular_nums(true))
                         .span(" - ")
-                        .span(span(at(1)).font_medium().tabular_nums())
+                        .span(span(at(1)).font_weight(500).tabular_nums(true))
                         .span(")."),
                 )
                 .child(
@@ -335,8 +340,8 @@ pub fn render() -> Render {
                         .model(price)
                         .max(1000.0)
                         .step(10.0)
-                        .mt(2.0)
-                        .w_full(),
+                        .margin_top(8.0)
+                        .width(pct(100.0)),
                 ),
         );
 
@@ -350,7 +355,7 @@ pub fn render() -> Render {
             "Finance",
             "Operations",
         ];
-        let select_demo = div().w_full().max_w_px(448.0).child(
+        let select_demo = div().width(pct(100.0)).max_width(448.0).child(
             field(V, false)
                 .child(field_label("Department"))
                 .child(pick("Choose department", &departments))
@@ -360,8 +365,9 @@ pub fn render() -> Render {
         page(
             "Field",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("FieldDemo.vue", field_demo))
                 .child(demo("FieldInputDemo.vue", input_demo))
                 .child(demo("FieldFieldsetDemo.vue", fieldset_demo))

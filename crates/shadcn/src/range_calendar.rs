@@ -4,9 +4,7 @@
 //! `RangeCalendarRoot` does. Dates, paging and keys come from `calendar`.
 
 use gui::prelude::*;
-use gui::{
-    Bind, Div, Element, IntoElement, Model, Radius, UseModel, component, div, provide, text, use_context, use_model,
-};
+use gui::{Bind, Div, Element, IntoElement, Model, UseModel, component, div, provide, text, use_context, use_model};
 
 use crate::calendar::{
     CalendarDate, CalendarOptions, CalendarView, DaySelection, HasOptions, day_trigger, month_grid, page_button,
@@ -102,7 +100,7 @@ pub fn range_calendar() -> Part<RangeCalendarProps> {
         value: Bind::default(),
         options: CalendarOptions::default(),
     };
-    Part::new(props, div().named("range-calendar").p(3.0), |p| {
+    Part::new(props, div().named("range-calendar").padding(12.0), |p| {
         component(p, |cx| {
             let props = cx.props();
             let value = use_model(props, |p| &p.props.value);
@@ -116,8 +114,8 @@ pub fn range_calendar() -> Part<RangeCalendarProps> {
                     .child(
                         range_calendar_header()
                             .child(range_calendar_heading(view.heading()))
-                            .child(page_button(view, -1).absolute().left(1.0))
-                            .child(page_button(view, 1).absolute().right(1.0)),
+                            .child(page_button(view, -1).position(Position::Absolute).left(4.0))
+                            .child(page_button(view, 1).position(Position::Absolute).right(4.0)),
                     )
                     .child(view.months_row(|month| {
                         month_grid(view, month, range_calendar_head_cell, |day, col| {
@@ -199,17 +197,21 @@ fn range_day(day: CalendarDate, month: CalendarDate, col: usize) -> Element {
 pub fn range_calendar_header() -> Div {
     div()
         .named("range-calendar-header")
-        .flex()
-        .justify_center()
-        .pt(1.0)
-        .relative()
-        .items_center()
-        .w_full()
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .padding_top(4.0)
+        .position(Position::Relative)
+        .align_items(Align::Center)
+        .width(pct(100.0))
 }
 
 #[must_use]
 pub fn range_calendar_heading(heading: impl Into<String>) -> impl IntoElement {
-    text(heading).named("range-calendar-heading").text_sm().font_medium()
+    text(heading)
+        .named("range-calendar-heading")
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
 }
 
 /// A weekday's name over its column (`w-8 text-[0.8rem]`).
@@ -218,12 +220,13 @@ pub fn range_calendar_head_cell(name: &'static str) -> Div {
     let t = theme();
     div()
         .named("range-calendar-head-cell")
-        .w(8.0)
-        .flex()
-        .justify_center()
-        .rounded_md()
-        .font_normal()
-        .text_size(12.8, 19.2)
+        .width(32.0)
+        .display(Display::Flex)
+        .justify_content(Justify::Center)
+        .radius(8.0)
+        .font_weight(400)
+        .text_size(12.8)
+        .line_height(19.2)
         .text_color(t.muted_foreground)
         .child(name)
 }
@@ -235,12 +238,13 @@ pub fn range_calendar_cell(selected: bool, round_left: bool, round_right: bool) 
     let t = theme();
     div()
         .named("range-calendar-cell")
-        .relative()
-        .p(0.0)
-        .text_sm()
+        .position(Position::Relative)
+        .padding(0.0)
+        .text_size(14.0)
+        .line_height(20.0)
         .when(selected, |d| {
-            d.bg(t.accent)
-                .when(round_left, |d| d.rounded_l(Radius::MD))
-                .when(round_right, |d| d.rounded_r(Radius::MD))
+            d.background(t.accent)
+                .when(round_left, |d| d.radius_left(8.0))
+                .when(round_right, |d| d.radius_right(8.0))
         })
 }

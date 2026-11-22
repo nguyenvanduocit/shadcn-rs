@@ -12,31 +12,44 @@ use shadcn::{
 
 /// A page's title: `scroll-m-20 text-3xl font-semibold tracking-tight`.
 pub fn h1(title: &str) -> Text {
-    text(title).text_3xl().font_semibold().tracking_tight()
+    text(title)
+        .text_size(30.0)
+        .line_height(36.0)
+        .font_weight(600)
+        .tracking(-0.025)
 }
 
 /// A section's heading: `text-xl font-semibold tracking-tight`.
 pub fn h2(title: &str) -> Text {
-    text(title).text_xl().font_semibold().tracking_tight()
+    text(title)
+        .text_size(20.0)
+        .line_height(28.0)
+        .font_weight(600)
+        .tracking(-0.025)
 }
 
 /// A demo's heading: `text-lg font-medium tracking-tight`.
 pub fn h3(title: &str) -> Text {
-    text(title).text_lg().font_medium().tracking_tight()
+    text(title)
+        .text_size(18.0)
+        .line_height(28.0)
+        .font_weight(500)
+        .tracking(-0.025)
 }
 
 /// The sentence under a title: `text-muted-foreground text-[1.05rem] text-balance`.
 pub fn lead(s: &str) -> Text {
     let t = theme();
     inline(s)
-        .text_size(16.8, 27.0)
+        .text_size(16.8)
+        .line_height(27.0)
         .text_color(t.muted_foreground)
-        .leading_relaxed()
+        .line_height(LineHeight::Relative(1.625))
 }
 
 /// A paragraph: `leading-7`.
 pub fn paragraph(s: &str) -> Text {
-    inline(s).leading_relaxed()
+    inline(s).line_height(LineHeight::Relative(1.625))
 }
 
 /// `s` with each `` `code` `` as inline code; a rustdoc link (`` [`Name`] ``)
@@ -56,11 +69,12 @@ pub fn inline(s: &str) -> Text {
 fn code_span(s: &str) -> gui::Span {
     let t = theme();
     span(s.to_owned())
-        .font_mono()
-        .text_size(12.8, 20.0)
-        .bg(t.muted)
-        .rounded_md()
-        .px(1.2)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(12.8)
+        .line_height(20.0)
+        .background(t.muted)
+        .radius(8.0)
+        .padding_x(4.8)
 }
 
 /// A block of code in `language`, as the docs show one.
@@ -99,8 +113,8 @@ fn runs_text(runs: &[Run]) -> Text {
             p.span(code_span(&r.text))
         } else {
             let s = span(r.text.clone());
-            let s = if r.strong { s.font_semibold() } else { s };
-            p.span(if r.em { s.italic() } else { s })
+            let s = if r.strong { s.font_weight(600) } else { s };
+            p.span(if r.em { s.italic(true) } else { s })
         }
     })
 }
@@ -202,21 +216,32 @@ pub fn markdown(md: &str) -> Vec<(Option<String>, Element)> {
                 parts.push((Some(title.clone()), vec![h2(&title).into_element()]));
                 continue;
             }
-            Block::Heading(_, runs) => runs_text(&runs).text_lg().font_semibold().mt(2.0).into_element(),
+            Block::Heading(_, runs) => runs_text(&runs)
+                .text_size(18.0)
+                .line_height(28.0)
+                .font_weight(600)
+                .margin_top(8.0)
+                .into_element(),
             Block::Paragraph(runs) if parts.len() == 1 && parts.first().is_some_and(|(_, e)| e.is_empty()) => {
                 runs_text(&runs)
-                    .text_size(16.8, 27.0)
+                    .text_size(16.8)
+                    .line_height(27.0)
                     .text_color(t.muted_foreground)
-                    .leading_relaxed()
+                    .line_height(LineHeight::Relative(1.625))
                     .into_element()
             }
-            Block::Paragraph(runs) => runs_text(&runs).leading_relaxed().into_element(),
+            Block::Paragraph(runs) => runs_text(&runs).line_height(LineHeight::Relative(1.625)).into_element(),
             Block::Item(depth, runs) => div()
-                .flex()
-                .gap(2.0)
-                .pl(f32::from(u16::try_from(depth).unwrap_or(1)) * 5.0 - 5.0)
+                .display(Display::Flex)
+                .gap(8.0)
+                .padding_left((f32::from(u16::try_from(depth).unwrap_or(1)) * 5.0 - 5.0) * 4.0)
                 .child(text("•").text_color(t.muted_foreground))
-                .child(runs_text(&runs).leading_relaxed().flex_1().min_w(0.0))
+                .child(
+                    runs_text(&runs)
+                        .line_height(LineHeight::Relative(1.625))
+                        .flex(Flex::grow(1.0))
+                        .min_width(0.0),
+                )
                 .into_element(),
             Block::Code(lang, body) => code(&body, if lang.is_empty() { "bash" } else { &lang }).into_element(),
             Block::Table(rows) => markdown_table(rows).into_element(),
@@ -228,7 +253,17 @@ pub fn markdown(md: &str) -> Vec<(Option<String>, Element)> {
     parts
         .into_iter()
         .filter(|(_, els)| !els.is_empty())
-        .map(|(title, els)| (title, div().flex_col().gap(4.0).children(els).into_element()))
+        .map(|(title, els)| {
+            (
+                title,
+                div()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(16.0)
+                    .children(els)
+                    .into_element(),
+            )
+        })
         .collect()
 }
 
@@ -239,20 +274,21 @@ fn markdown_table(rows: Vec<Vec<Vec<Run>>>) -> Div {
     let head = rows.next().unwrap_or_default();
     let t = theme();
     div()
-        .rounded_lg()
-        .border()
+        .radius(10.0)
+        .border(1.0)
         .border_color(t.border)
-        .overflow_hidden()
+        .overflow(Overflow::Hidden)
         .child(
             table()
                 .child(table_header([
                     table_row(&tracks, false).children(head.iter().map(|cell| table_head(runs_text(cell))))
                 ]))
                 .child(table_body(rows.map(|row| {
-                    table_row(&tracks, false).children(
-                        row.iter()
-                            .map(|cell| div().p(2.0).child(runs_text(cell).leading_relaxed())),
-                    )
+                    table_row(&tracks, false).children(row.iter().map(|cell| {
+                        div()
+                            .padding(8.0)
+                            .child(runs_text(cell).line_height(LineHeight::Relative(1.625)))
+                    }))
                 }))),
         )
 }

@@ -9,26 +9,35 @@ pub fn render() -> Render {
     Box::new(move || {
         let t = theme();
         // `grid w-full max-w-sm items-center gap-1.5`.
-        let stack = || div().grid().w_full().max_w_px(384.0).items_center().gap(1.5);
+        let stack = || {
+            div()
+                .display(Display::Grid)
+                .width(pct(100.0))
+                .max_width(384.0)
+                .align_items(Align::Center)
+                .gap(6.0)
+        };
         page(
             "Input",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo("InputDemo.vue", input().placeholder("Email")))
                 .child(
                     div()
-                        .grid()
-                        .max_w_px(384.0)
-                        .gap(3.0)
+                        .display(Display::Grid)
+                        .max_width(384.0)
+                        .gap(12.0)
                         .child(label("Name"))
                         .child(input().default_value("Nguyễn Văn A")),
                 )
                 .child(section(
                     "shadcn-vue demos",
                     div()
-                        .flex_col()
-                        .gap(6.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(24.0)
                         .child(demo("InputDisabled.vue", input().placeholder("Email").disabled(true)))
                         .child(demo(
                             "InputFile.vue",
@@ -38,11 +47,11 @@ pub fn render() -> Render {
                             "InputWithButton.vue",
                             // `space-x-2`: the button 0.5rem after the input.
                             div()
-                                .flex()
-                                .w_full()
-                                .max_w_px(384.0)
-                                .items_center()
-                                .gap(2.0)
+                                .display(Display::Flex)
+                                .width(pct(100.0))
+                                .max_width(384.0)
+                                .align_items(Align::Center)
+                                .gap(8.0)
                                 .child(input().placeholder("Email"))
                                 .child(button(ButtonVariant::Default, ButtonSize::Default).child("Subscribe")),
                         ))
@@ -54,7 +63,8 @@ pub fn render() -> Render {
                             "InputWithText.vue",
                             stack().child(label("Email")).child(input().placeholder("Email")).child(
                                 text("Enter your email address.")
-                                    .text_sm()
+                                    .text_size(14.0)
+                                    .line_height(20.0)
                                     .text_color(t.muted_foreground),
                             ),
                         )),

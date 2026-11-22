@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use gui::devtools::Session;
 use gui::heap;
 use gui::inspect::{Spread, bytes, ms};
-use gui::{Element, Scenario, Signal};
-use shadcn::{Theme, provide_theme};
+use gui::{Element, Scenario};
+use shadcn::{Theme, VEGA, install};
 
 /// The heap counted, for the leak checks and the reports.
 #[cfg(not(feature = "dhat-heap"))]
@@ -587,7 +587,7 @@ fn main() {
     #[cfg(feature = "dhat-heap")]
     let profiler = dhat::Profiler::new_heap();
     let args: Vec<String> = std::env::args().skip(1).collect();
-    provide_theme(Signal::labeled("theme", Theme::light()));
+    install(Theme::default(), VEGA);
     let result = match args.split_first() {
         Some((flag, tail)) if flag == "--run" => run(tail),
         Some((flag, tail)) if flag == "--a11y" => a11y(tail),
@@ -597,7 +597,7 @@ fn main() {
                 &format!("stress: {}", sc.name),
                 // On the UI thread, where the app's state lives (ADR-0015).
                 move || {
-                    provide_theme(Signal::labeled("theme", Theme::light()));
+                    install(Theme::default(), VEGA);
                     (sc.render)()
                 },
                 gui::RunOptions {

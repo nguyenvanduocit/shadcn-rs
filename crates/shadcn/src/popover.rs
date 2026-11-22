@@ -11,12 +11,12 @@
 //! ```ignore
 //! popover()
 //!     .child(popover_trigger(button(ButtonVariant::Outline, ButtonSize::Default).child("Open")))
-//!     .child(popover_content().w(80.0).child("…"))
+//!     .child(popover_content().width(320.0).child("…"))
 //! ```
 
 use gui::prelude::*;
 use gui::{
-    Bind, Div, Element, Model, NamedKey, Placement, Side, SideAlign, UseModel, component, deferred, div, provide,
+    Bind, Div, Element, Model, NamedKey, Positioning, Side, SideAlign, UseModel, component, deferred, div, provide,
     use_context, use_model,
 };
 
@@ -26,6 +26,50 @@ use crate::dialog::return_focus;
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
+
+/// A popup's shadow (shadcn's `shadow-md`): menu, popover and hover card
+/// content.
+pub(crate) const POPUP_SHADOW: [Shadow; 2] = [
+    Shadow {
+        x: 0.0,
+        y: 4.0,
+        blur: 6.0,
+        spread: -1.0,
+        color: SHADE,
+    },
+    Shadow {
+        x: 0.0,
+        y: 2.0,
+        blur: 4.0,
+        spread: -2.0,
+        color: SHADE,
+    },
+];
+
+/// The shadow of what is lifted over a page or a popup (shadcn's
+/// `shadow-lg`): a sub-menu, a dialog, a sheet.
+pub(crate) const LIFTED_SHADOW: [Shadow; 2] = [
+    Shadow {
+        x: 0.0,
+        y: 10.0,
+        blur: 15.0,
+        spread: -3.0,
+        color: SHADE,
+    },
+    Shadow {
+        x: 0.0,
+        y: 4.0,
+        blur: 6.0,
+        spread: -4.0,
+        color: SHADE,
+    },
+];
+
+/// Black at 10%, the colour of both shadows (`rgb(0 0 0 / 0.1)`).
+const SHADE: gui::Color = gui::Color {
+    a: 0.1,
+    ..gui::Color::BLACK
+};
 
 /// What [`popover`] is given.
 #[derive(Clone, PartialEq, Default)]
@@ -58,15 +102,19 @@ impl PopoverContext {
 /// content) in it. Closed, and kept by itself, until told otherwise.
 #[must_use]
 pub fn popover() -> Part<PopoverProps> {
-    Part::new(PopoverProps::default(), div().named("popover").inline_flex(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            provide(PopoverContext {
-                open: use_model(props, |p| &p.props.open),
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
+    Part::new(
+        PopoverProps::default(),
+        div().named("popover").display(Display::Flex).inline(true),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                provide(PopoverContext {
+                    open: use_model(props, |p| &p.props.open),
+                });
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 impl Part<PopoverProps> {
@@ -90,9 +138,11 @@ impl Part<PopoverProps> {
 }
 
 /// Make `trigger` open and close the popover when pressed (`PopoverTrigger as-child`).
+/// Give `trigger` its children first: a [`Button`](crate::Button) decides
+/// its padding from them as it becomes the box.
 #[must_use]
-pub fn popover_trigger(trigger: Div) -> Part<()> {
-    Part::new((), trigger, |p| {
+pub fn popover_trigger(trigger: impl Into<Div>) -> Part<()> {
+    Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let popover = PopoverContext::find();
@@ -157,14 +207,14 @@ pub fn popover_content() -> Part<PopoverContentProps> {
     let t = theme();
     let root = popper(div(), Origin::Anchor)
         .named("popover-content")
-        .bg(t.popover)
+        .background(t.popover)
         .text_color(t.popover_foreground)
-        .w(72.0)
-        .rounded_md()
-        .border()
+        .width(288.0)
+        .radius(8.0)
+        .border(1.0)
         .border_color(t.border)
-        .p(4.0)
-        .shadow_md();
+        .padding(16.0)
+        .shadow(POPUP_SHADOW);
     let props = PopoverContentProps {
         side: Side::Bottom,
         align: SideAlign::Center,
@@ -188,7 +238,7 @@ pub fn popover_content() -> Part<PopoverContentProps> {
                     // Kept, hidden where it would float from: a layer is no
                     // step of its instances' identity, so they stay.
                     return if p.force_mount {
-                        root.hidden().into_element()
+                        root.display(Display::None).into_element()
                     } else {
                         Element::Empty
                     };
@@ -203,7 +253,7 @@ pub fn popover_content() -> Part<PopoverContentProps> {
                     })
                     .on_click_outside(move || o.set_open(false));
                 deferred(
-                    Placement::Anchored {
+                    Positioning::Anchored {
                         side: p.side,
                         align: p.align,
                         offset: 4.0,

@@ -1,5 +1,6 @@
 use gui::prelude::*;
 use gui::{Div, Icon, Model, ScenarioError, Signal, div, icon, text};
+use shadcn::focus::StateLook;
 use shadcn::{
     BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, ButtonSize, ButtonVariant, bubble, bubble_content,
     bubble_content_button, bubble_group, bubble_reactions, bubble_reactions_button, button, collapsible,
@@ -14,7 +15,13 @@ use BubbleVariant as V;
 
 /// The demos' column: `flex w-full max-w-sm flex-col py-12`.
 fn column(gap: f32) -> Div {
-    div().flex_col().w_full().max_w(96.0).gap(gap).py(12.0)
+    div()
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(gap)
+        .padding_y(48.0)
 }
 
 fn said(variant: BubbleVariant, align: BubbleAlign, words: &str) -> Div {
@@ -39,7 +46,7 @@ I also recommend keeping the change in the style file instead of the primitive s
 const PREVIEW_LENGTH: usize = 180;
 
 fn alignment() -> Div {
-    column(8.0)
+    column(32.0)
         .child(said(
             V::Muted,
             Start,
@@ -66,17 +73,17 @@ fn collapsed(open: &Signal<bool>) -> Div {
     };
     let toggle = collapsible_trigger_as(
         button(ButtonVariant::Link, ButtonSize::Default)
-            .gap(1.0)
-            .p(0.0)
+            .gap(4.0)
+            .padding(0.0)
             .text_color(theme().muted_foreground)
             .child(if shown { "Show less" } else { "Show more" })
             .child(
                 icon(Icon::ChevronDown)
-                    .size(4.0)
+                    .size(16.0)
                     .rotate(if shown { 180.0 } else { 0.0 }),
             ),
     );
-    column(8.0)
+    column(32.0)
         .child(said(V::Muted, Start, "How can I help you today?"))
         .child(
             bubble(p).child(
@@ -91,7 +98,7 @@ fn collapsed(open: &Signal<bool>) -> Div {
 }
 
 fn grouped() -> Div {
-    column(8.0)
+    column(32.0)
         .child(said(V::Muted, Start, "Can you tell me what's the issue?"))
         .child(
             bubble_group()
@@ -120,7 +127,7 @@ fn choices() -> Div {
             toast(said);
         }))
     };
-    column(8.0)
+    column(32.0)
         .child(said(V::Muted, Start, "How can I help you today?"))
         .child(
             bubble_group()
@@ -138,33 +145,43 @@ fn choices() -> Div {
 
 fn failed(details: Signal<bool>) -> Div {
     let t = theme();
-    let info = button(ButtonVariant::Ghost, ButtonSize::IconSm)
-        .rounded_full()
-        .when(details.get(), |b| b.text_color(t.destructive))
+    let info = button(ButtonVariant::Ghost, ButtonSize::IconSm);
+    let i = info.interaction();
+    // The ghost button's hover text over the destructive colour.
+    let info = info
+        .radius(9999.0)
+        .when(details.get(), |b| {
+            b.text_color(t.destructive)
+                .text_color_while(move || i.hovered(), t.accent_foreground)
+        })
         .child(icon(Icon::Info));
-    column(4.0).child(said(V::Default, End, "Run the build script.")).child(
-        said(V::Destructive, Start, "Failed to run the command.").child(
-            bubble_reactions_button(BubbleReactionsSide::Bottom, End).child(
-                popover().open(details).child(popover_trigger(info)).child(
-                    popover_content().child(
-                        div()
-                            .flex_col()
-                            .gap(1.0)
-                            .text_sm()
-                            .child(text("Command failed with exit code 1").font_medium())
-                            .child(
-                                text("ENOENT: no such file or directory, open pnpm-lock.yaml")
-                                    .text_color(t.muted_foreground),
-                            ),
+    column(16.0)
+        .child(said(V::Default, End, "Run the build script."))
+        .child(
+            said(V::Destructive, Start, "Failed to run the command.").child(
+                bubble_reactions_button(BubbleReactionsSide::Bottom, End).child(
+                    popover().open(details).child(popover_trigger(info)).child(
+                        popover_content().child(
+                            div()
+                                .display(Display::Flex)
+                                .flex_direction(FlexDirection::Column)
+                                .gap(4.0)
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .child(text("Command failed with exit code 1").font_weight(500))
+                                .child(
+                                    text("ENOENT: no such file or directory, open pnpm-lock.yaml")
+                                        .text_color(t.muted_foreground),
+                                ),
+                        ),
                     ),
                 ),
             ),
-        ),
-    )
+        )
 }
 
 fn read_receipt() -> Div {
-    column(4.0)
+    column(16.0)
         .child(said(V::Secondary, Start, "Did you remove the stale route?"))
         .child(
             said(V::Default, End, "Yes, removed it from the registry.").child(
@@ -172,7 +189,7 @@ fn read_receipt() -> Div {
                     tooltip()
                         .child(tooltip_trigger(
                             button(ButtonVariant::Ghost, ButtonSize::IconSm)
-                                .rounded_full()
+                                .radius(9999.0)
                                 .child(icon(Icon::Check)),
                         ))
                         .child(tooltip_content().child(text("Read on Jan 5, 2026 at 4:32 PM"))),
@@ -189,7 +206,7 @@ pub fn render() -> Render {
         let bottom = BubbleReactionsSide::Bottom;
         let thread = demo(
             "BubbleDemo.vue",
-            column(8.0)
+            column(32.0)
                 .child(said(V::Default, End, "Hey there! what's up?"))
                 .child(
                     bubble_group()
@@ -215,7 +232,7 @@ pub fn render() -> Render {
         );
         let variants = demo(
             "BubbleVariantsDemo.vue",
-            column(12.0)
+            column(48.0)
                 .child(said(V::Default, Start, "This is the default primary bubble."))
                 .child(said(V::Secondary, End, "This is the secondary variant."))
                 .child(
@@ -252,7 +269,7 @@ pub fn render() -> Render {
         let r = ran;
         let reacted = demo(
             "BubbleReactionsDemo.vue",
-            column(12.0)
+            column(48.0)
                 .child(
                     said(V::Muted, End, "I don't need tests, I know my code works.").child(reactions(
                         bottom,
@@ -289,8 +306,13 @@ pub fn render() -> Render {
         page(
             "Bubble",
             div()
-                .flex_col()
-                .child(text(if ran.get() { "Running command…" } else { "Not run yet" }).text_sm())
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .child(
+                    text(if ran.get() { "Running command…" } else { "Not run yet" })
+                        .text_size(14.0)
+                        .line_height(20.0),
+                )
                 .child(reacted)
                 .child(thread)
                 .child(variants)

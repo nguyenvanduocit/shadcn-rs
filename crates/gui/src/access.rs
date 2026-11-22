@@ -719,7 +719,8 @@ fn inputs_of<'f>(
             .or_else(|| s.row_index.map(|r| (r.saturating_add(1), set.map(|(_, rows)| rows)))),
     };
     match &n.content {
-        Content::Text { content, .. } => inputs.value = Some(Cow::Borrowed(content.as_str())),
+        // Its atomic inlines are nodes of their own: their places are not read.
+        Content::Text { content, .. } => inputs.value = Some(crate::text::readable(content)),
         Content::Input {
             edit,
             placeholder,
@@ -940,10 +941,10 @@ fn row_role(list: Option<Role>) -> Role {
 /// follow it in the frame until the first that is not inside it.
 fn text_within(frame: &Frame, i: usize) -> String {
     let inside = |j: &usize| frame.ancestors(*j).any(|a| a == i);
-    let words: Vec<&str> = (i.saturating_add(1)..frame.nodes.len())
+    let words: Vec<Cow<'_, str>> = (i.saturating_add(1)..frame.nodes.len())
         .take_while(inside)
         .filter_map(|j| match &frame.nodes.get(j)?.content {
-            Content::Text { content, .. } => Some(content.as_str()),
+            Content::Text { content, .. } => Some(crate::text::readable(content)),
             _ => None,
         })
         .collect();
@@ -961,7 +962,7 @@ fn implied_role(n: &FrameNode, b: &Behaviour, s: &Semantics) -> Option<Role> {
             (InputType::Text, false) => Role::TextInput,
         }),
         Content::Image { .. } => Some(Role::Image),
-        Content::Icon { .. } | Content::Shapes(_) | Content::Drawn(_) => s.label.as_ref().map(|_| Role::Image),
+        Content::Icon { .. } | Content::Figures(_) | Content::Drawn(_) => s.label.as_ref().map(|_| Role::Image),
         Content::None if b.handlers.click.is_some() => Some(Role::Button),
         Content::None => Some(Role::GenericContainer),
     }

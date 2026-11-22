@@ -138,13 +138,13 @@ fn row(i: usize) -> Ours {
     with(
         boxed(|s| {
             s.display = Display::Grid;
-            s.grid_template_columns = vec![
+            s.grid_template_columns = gui::style::Tracks::from_iter([
                 Track::Px(40.0),
                 Track::Fr(1.0),
                 Track::Fr(2.0),
                 Track::Fr(1.0),
                 Track::Fr(1.0),
-            ];
+            ]);
             s.border.bottom = 1.0;
         }),
         vec![

@@ -6,10 +6,11 @@
 
 use std::rc::Rc;
 
+use gui::Color;
 use gui::prelude::*;
 use gui::{Bind, Div, Element, Icon, Model, Slot, component, div, icon, use_model};
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 /// What a checkbox shows: reka's `boolean | 'indeterminate'`.
@@ -147,37 +148,46 @@ impl IntoElement for Checkbox {
 /// The box for `state`.
 fn look(state: CheckedState) -> Div {
     let t = theme();
+    let i = Interaction::new();
     let base = div()
         .named("checkbox")
+        .interaction(i)
         .role(gui::Role::CheckBox)
         .aria_checked(match state {
             CheckedState::Checked => gui::Toggled::True,
             CheckedState::Indeterminate => gui::Toggled::Mixed,
             CheckedState::Unchecked => gui::Toggled::False,
         })
-        .transition_shadow()
-        .flex()
-        .items_center()
-        .justify_center()
-        .size(4.0)
-        .shrink_0()
-        .rounded(4.0)
-        .border()
+        .transition(Properties::SHADOW)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .size(16.0)
+        .flex_shrink(0.0)
+        .radius(4.0)
+        .border(1.0)
         .border_color(t.input)
-        .shadow_xs()
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
         .focusable()
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed());
-    let indicator = || icon(Icon::Check).named("checkbox-indicator").size(3.5);
+        .dim_disabled(i, 0.5)
+        .cursor_disabled(i);
+    let indicator = || icon(Icon::Check).named("checkbox-indicator").size(14.0);
     match state {
         // `data-[state=checked]:border-primary` outranks `focus-visible:border-ring`.
         CheckedState::Checked => base
-            .bg(t.primary)
+            .background(t.primary)
             .text_color(t.primary_foreground)
             .border_color(t.primary)
-            .focus_visible(move |s| s.ring(3.0, t.ring.opacity(0.5)))
+            .ring(move || i.focus_visible().then(|| Ring::new(3.0, t.ring.opacity(0.5))))
             .child(indicator()),
         // The indicator shows, but the `checked` fill and colour do not.
-        CheckedState::Indeterminate => base.focus_visible(move |s| focus_ring(s, &t)).child(indicator()),
-        CheckedState::Unchecked => base.focus_visible(move |s| focus_ring(s, &t)),
+        CheckedState::Indeterminate => base.focus_ring_on(i, &t).child(indicator()),
+        CheckedState::Unchecked => base.focus_ring_on(i, &t),
     }
 }

@@ -246,7 +246,15 @@ const FREE_LINK: Link = Link {
 #[derive(Default)]
 pub(crate) struct Settle {
     cleanups: Vec<Cleanup>,
-    garbage: Vec<Box<dyn Any>>,
+    garbage: Vec<Garbage>,
+}
+
+/// A value or closure let go by a disposed node, held as it was (no box of
+/// its own: a render that ends thousands of signals allocates nothing for it).
+enum Garbage {
+    Value(#[expect(dead_code, reason = "held only to be dropped after the borrow ends")] Rc<dyn Any>),
+    Update(#[expect(dead_code, reason = "held only to be dropped after the borrow ends")] Update),
+    Run(#[expect(dead_code, reason = "held only to be dropped after the borrow ends")] Run),
 }
 
 #[derive(Default)]
@@ -466,17 +474,9 @@ impl Runtime {
         let id = if let Some(index) = self.free_nodes.pop()
             && let Some(slot) = self.nodes.get_mut(index)
         {
+            // A freed slot holds no lists (`dispose_index` took them).
             let generation = slot.generation;
-            let mut cleanups = std::mem::take(&mut slot.cleanups);
-            let mut owned = std::mem::take(&mut slot.owned);
-            cleanups.clear();
-            owned.clear();
-            *slot = Node {
-                generation,
-                cleanups,
-                owned,
-                ..node
-            };
+            *slot = Node { generation, ..node };
             NodeId { index, generation }
         } else {
             self.nodes.push(node);
@@ -493,6 +493,26 @@ impl Runtime {
             Kind::Render => self.counts.renders = self.counts.renders.saturating_add(1),
         }
         id
+    }
+
+    /// The room the free slots' `owned` lists hold (none: a list goes with
+    /// its node).
+    #[cfg(test)]
+    pub(crate) fn free_owned_capacity(&self) -> usize {
+        self.free_nodes
+            .iter()
+            .filter_map(|&i| self.nodes.get(i))
+            .map(|n| n.owned.capacity())
+            .sum()
+    }
+
+    /// Room for `n` more entries in the active owner's `owned` list.
+    pub(crate) fn reserve_owned(&mut self, n: usize) {
+        if let Some(owner) = self.active_owner.filter(|o| self.live(*o).is_some())
+            && let Some(o) = self.node_mut(owner.index)
+        {
+            o.owned.reserve(n);
+        }
     }
 
     /// Record `id` as owned by the active owner: effects and scopes are linked
@@ -921,17 +941,20 @@ impl Runtime {
         n.deps_tail = NONE;
         n.subs = NONE;
         n.subs_tail = NONE;
-        n.owned = owned;
-        n.owned.clear();
+        // A free slot holds no list: the one it had goes with the node. Kept
+        // for whatever is made in the slot next (most often a signal, which
+        // owns nothing), lists would spread over the free slots, a render
+        // scope's table's worth of entries among them, and stay there.
+        drop(owned);
         self.settle.cleanups.extend(cleanups);
         if let Some(v) = value {
-            self.settle.garbage.push(Box::new(v));
+            self.settle.garbage.push(Garbage::Value(v));
         }
         if let Some(u) = update {
-            self.settle.garbage.push(Box::new(u));
+            self.settle.garbage.push(Garbage::Update(u));
         }
         if let Some(r) = run {
-            self.settle.garbage.push(Box::new(r));
+            self.settle.garbage.push(Garbage::Run(r));
         }
         self.free_nodes.push(i);
         match kind {

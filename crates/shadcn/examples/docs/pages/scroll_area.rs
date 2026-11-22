@@ -14,19 +14,26 @@ pub fn render() -> Render {
             demo(
                 "ScrollAreaDemo.vue",
                 scroll_area()
-                    .h(72.0)
-                    .w(48.0)
-                    .rounded_md()
-                    .border()
+                    .height(288.0)
+                    .width(192.0)
+                    .radius(8.0)
+                    .border(1.0)
                     .border_color(t.border)
                     .child(
                         div()
-                            .p(4.0)
-                            .child(text("Tags").mb(4.0).text_sm().leading_none().font_medium())
+                            .padding(16.0)
+                            .child(
+                                text("Tags")
+                                    .margin_bottom(16.0)
+                                    .text_size(14.0)
+                                    .line_height(20.0)
+                                    .line_height(LineHeight::Relative(1.0))
+                                    .font_weight(500),
+                            )
                             .children(tags.iter().flat_map(|tag| {
                                 [
-                                    text(tag.clone()).text_sm().into_element(),
-                                    separator(Orientation::Horizontal).my(2.0).into_element(),
+                                    text(tag.clone()).text_size(14.0).line_height(20.0).into_element(),
+                                    separator(Orientation::Horizontal).margin_y(8.0).into_element(),
                                 ]
                             })),
                     ),

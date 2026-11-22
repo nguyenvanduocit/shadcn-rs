@@ -25,8 +25,8 @@ pub fn render() -> Render {
         page(
             "Empty",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex).flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo(
                     "EmptyDemo.vue",
                     empty()
@@ -41,8 +41,8 @@ pub fn render() -> Render {
                         .child(
                             empty_content().child(
                                 div()
-                                    .flex()
-                                    .gap(2.0)
+                                    .display(Display::Flex)
+                                    .gap(8.0)
                                     .child(button(ButtonVariant::Default, ButtonSize::Default).child("Create Project"))
                                     .child(button(ButtonVariant::Outline, ButtonSize::Default).child("Import Project")),
                             ),
@@ -57,7 +57,7 @@ pub fn render() -> Render {
                 .child(demo(
                     "EmptyOutlineDemo.vue",
                     empty()
-                        .border()
+                        .border(1.0)
                         .child(
                             empty_header()
                                 .child(empty_media_icon(Icon::Cloud))
@@ -79,8 +79,8 @@ pub fn render() -> Render {
                                 .child(
                                     empty_media(EmptyMediaVariant::Default).child(
                                         avatar()
-                                            .size(12.0)
-                                            .child(avatar_image(zernonia.as_ref()).map(Styled::grayscale))
+                                            .size(48.0)
+                                            .child(avatar_image(zernonia.as_ref()).map(|e| e.filters(Filter::Grayscale(1.0))))
                                             .child(avatar_fallback(zernonia.as_ref(), "ZN")),
                                     ),
                                 )
@@ -97,11 +97,15 @@ pub fn render() -> Render {
                     "EmptyBackgroundDemo.vue",
                     // `from-muted/50 to-background h-full bg-gradient-to-b from-30%`.
                     empty()
-                        .h_full()
-                        .bg_linear_to_b()
-                        .from(t.muted.opacity(0.5))
-                        .gradient_from_at(0.3)
-                        .to(t.background)
+                        .height(pct(100.0))
+                        .background_image(LinearGradient {
+                            angle: 180.0,
+                            stops: [
+                                Stop { color: StopColor::Color(t.muted.opacity(0.5)), at: Calc::fraction(0.3) },
+                                Stop { color: StopColor::Color(t.background), at: Calc::fraction(1.0) },
+                            ]
+                            .into(),
+                        })
                         .child(
                             empty_header()
                                 .child(empty_media_icon(Icon::Bell))
@@ -130,7 +134,7 @@ pub fn render() -> Render {
                             empty_content()
                                 .child(
                                     input_group(input_group_input(&search).placeholder("Try searching for pages..."))
-                                        .w_len(gui::relative(0.75))
+                                        .width(gui::Length::Fraction(0.75))
                                         .addon(input_group_addon(InputGroupAlign::InlineStart).child(icon(Icon::Search)))
                                         .addon(input_group_addon(InputGroupAlign::InlineEnd).kbd(kbd().child("/"))),
                                 )
@@ -145,12 +149,12 @@ pub fn render() -> Render {
                                 .child(
                                     empty_media(EmptyMediaVariant::Default).child(
                                         // `-space-x-2`, and each avatar's `size-12 ring-2 ring-background grayscale`.
-                                        div().flex().children(team.iter().enumerate().map(|(i, (image, initials))| {
+                                        div().display(Display::Flex).children(team.iter().enumerate().map(|(i, (image, initials))| {
                                             person(image.as_ref(), initials)
-                                                .size(12.0)
-                                                .ring(2.0, t.background)
-                                                .grayscale()
-                                                .when(i > 0, |d| d.ml(-2.0))
+                                                .size(48.0)
+                                                .ring(Ring::new(2.0, t.background))
+                                                .filters(Filter::Grayscale(1.0))
+                                                .when(i > 0, |d| d.margin_left(-8.0))
                                         })),
                                     ),
                                 )

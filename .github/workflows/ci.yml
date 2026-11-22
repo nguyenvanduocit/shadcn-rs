@@ -22,11 +22,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # The icon libraries besides the default lucide (shadcn::icons): each is a
+      # feature, so their tables, vendored SVGs and tests build only with them.
+      - run: cargo clippy -p shadcn --all-targets --locked --features tabler,hugeicons,phosphor,remixicon -- -D warnings
       # What the GPU can do, printed: compute and dual-source blending (ADR-0016, ADR-0019).
       - run: cargo test -p gui --test adapter --locked -- --nocapture
-      - run: cargo test -p gui --lib --locked -- --test-threads=1 2>&1 | tee /tmp/gui-lib.txt; tail -5 /tmp/gui-lib.txt; exit ${PIPESTATUS[0]}
-        shell: bash
       - run: cargo test --workspace --locked
+      - run: cargo test -p shadcn --lib --locked --features tabler,hugeicons,phosphor,remixicon icons::
       # Allocation budgets per scene and frame on the UI thread (ADR-0023): a
       # scene over its budget fails the run. Release: the scenes are large.
       - run: cargo run --release --locked -p shadcn --example stress -- --run --cycles=0 --monkey=0

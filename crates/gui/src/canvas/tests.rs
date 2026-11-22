@@ -4,11 +4,11 @@
 
 use super::{Camera, WorldPath, WorldView, world};
 use crate::color::Color;
+use crate::figure::PathStyle;
 use crate::geometry::Bounds;
 use crate::gpu::GpuRenderer;
 use crate::image::Pixels;
 use crate::scene::{Gradient, Item, Renderer, Scene};
-use crate::shape::PathStyle;
 use crate::text::Glyphs;
 use std::sync::Arc;
 
@@ -371,7 +371,7 @@ fn mixed() -> super::World {
                     .line_to(x + size * 1.5, y);
                 w.add(
                     p,
-                    PathStyle::stroke(Gradient::Solid(color), crate::shape::Stroke::round(1.0)),
+                    PathStyle::stroke(Gradient::Solid(color), crate::figure::Stroke::round(1.0)),
                 );
             }
         }
@@ -565,7 +565,7 @@ fn long_lines_are_simplified_per_level_of_detail() {
     let w = world();
     w.add(
         p.clone(),
-        PathStyle::stroke(Gradient::Solid(Color::BLACK), crate::shape::Stroke::round(1.0)),
+        PathStyle::stroke(Gradient::Solid(Color::BLACK), crate::figure::Stroke::round(1.0)),
     );
     let s = w.snapshot();
     let o = s.object(0).unwrap();
@@ -605,7 +605,7 @@ fn long_lines_are_simplified_per_level_of_detail() {
     let full = world();
     full.add(
         p,
-        PathStyle::stroke(Gradient::Solid(Color::BLACK), crate::shape::Stroke::round(1.0)),
+        PathStyle::stroke(Gradient::Solid(Color::BLACK), crate::figure::Stroke::round(1.0)),
     );
     // Below the simplification bound, the same line drawn whole.
     let whole = shoot(

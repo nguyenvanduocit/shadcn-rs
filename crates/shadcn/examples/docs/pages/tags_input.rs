@@ -15,7 +15,7 @@ fn tags(model: Signal<Vec<String>>, placeholder: &str, invalid: bool) -> Part<Ta
     tags_input()
         .model(model)
         .invalid(invalid)
-        .w_px(300.0)
+        .width(300.0)
         .children(model.get().iter().map(|tag| tag_item(tag)))
         .child(tags_input_input().placeholder(placeholder))
 }
@@ -56,10 +56,11 @@ pub fn render() -> Render {
             let on = frameworks.with(|f| f.contains(&label));
             row.child(label).child(on.then(|| {
                 div()
-                    .ml_auto()
-                    .inline_flex()
-                    .items_center()
-                    .justify_center()
+                    .margin_left(Length::Auto)
+                    .display(Display::Flex)
+                    .inline(true)
+                    .align_items(Align::Center)
+                    .justify_content(Justify::Center)
                     .child(icon(Icon::Check).text_color(t.muted_foreground))
             }))
         })
@@ -82,7 +83,7 @@ pub fn render() -> Render {
             }
             opens
         });
-        let with_listbox = popover().open(open).w_px(300.0).child(
+        let with_listbox = popover().open(open).width(300.0).child(
             command()
                 .search(search)
                 .child(
@@ -91,24 +92,25 @@ pub fn render() -> Render {
                         .text(search)
                         // `@keydown.enter.prevent`: Enter picks from the listbox, never adds the typed text.
                         .add_on_enter(false)
-                        .w_full()
+                        .width(pct(100.0))
                         .children(frameworks.get().iter().map(|tag| tag_item(tag)))
                         .child(filter)
                         .child(popover_trigger(
                             // `order-last self-start ml-auto`.
                             button(ButtonVariant::Ghost, ButtonSize::IconSm)
-                                .self_start()
-                                .ml_auto()
-                                .child(icon(Icon::ChevronDown).size(3.5)),
+                                .align_self(Align::Start)
+                                .margin_left(Length::Auto)
+                                .child(icon(Icon::ChevronDown).size(14.0)),
                         )),
                 )
-                .child(popover_content().open_auto_focus(false).p(1.0).child(list)),
+                .child(popover_content().open_auto_focus(false).padding(4.0).child(list)),
         );
         page(
             "Tags Input",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("TagsInputDemo.vue", tags(fruits, "Fruits...", false)))
                 .child(demo("TagsInputWithListbox.vue", with_listbox))
                 .child(section("Invalid", tags(invalid, "Labels...", true))),

@@ -87,19 +87,21 @@ fn parse(stack: &str, internal: impl Fn(&str) -> bool) -> Stack {
 fn failure(content: Div, stack: &Stack, frames: &Signal<bool>) -> Div {
     let t = shadcn::theme();
     content
-        .flex_col()
-        .gap(2.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
         .child(
             text(stack.error.clone())
-                .font_mono()
-                .text_xs()
+                .font_family(FontFamily::GEIST_MONO)
+                .text_size(12.0)
+                .line_height(16.0)
                 .text_color(t.destructive),
         )
         .child(
             trace()
                 .children(stack.app.iter().map(|f| {
                     // An `<a href>` around the line: a link the browser follows.
-                    div().cursor_pointer().focusable().child(
+                    div().cursor(Cursor::Pointer).focusable().child(
                         trace_line(None)
                             .child(trace_icon(icon(Icon::FileCode)))
                             .child(trace_title(f.place.clone().unwrap_or_else(|| f.line.clone()))),
@@ -117,15 +119,18 @@ fn failure(content: Div, stack: &Stack, frames: &Signal<bool>) -> Div {
                         .child(trace_collapsible_content().map_root(|c| {
                             c.child(
                                 div()
-                                    .flex_col()
-                                    .gap(1.0)
-                                    .overflow_x_scroll()
-                                    .rounded_md()
-                                    .bg(t.muted)
-                                    .p(3.0)
-                                    .font_mono()
-                                    .text_xs()
-                                    .children(stack.internal.iter().map(|f| text(f.line.clone()).whitespace_nowrap())),
+                                    .display(Display::Flex)
+                                    .flex_direction(FlexDirection::Column)
+                                    .gap(4.0)
+                                    .overflow_x(Overflow::Scroll)
+                                    .overflow_y(Overflow::Hidden)
+                                    .radius(8.0)
+                                    .background(t.muted)
+                                    .padding(12.0)
+                                    .font_family(FontFamily::GEIST_MONO)
+                                    .text_size(12.0)
+                                    .line_height(16.0)
+                                    .children(stack.internal.iter().map(|f| text(f.line.clone()).nowrap(true))),
                             )
                         })),
                 ),
@@ -283,13 +288,14 @@ pub fn render() -> Render {
         page(
             "Stack trace",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("StackTraceDemo.vue", stack_trace_demo(&turn, &folds, &script)))
                 .child(demo(
                     "StackTraceFramesDemo.vue",
                     trace()
-                        .max_w(96.0)
+                        .max_width(384.0)
                         .child(failed(&invoice_open, &invoice_frames, &invoice, Icon::CircleX)),
                 )),
         )

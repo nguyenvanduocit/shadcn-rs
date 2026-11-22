@@ -97,12 +97,12 @@ fn questionnaire_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps
         let _ = name;
         questionnaire_choice(
             value,
-            text(label.to_owned()).when(description.is_some(), |t| t.font_medium()),
+            text(label.to_owned()).when(description.is_some(), |t| t.font_weight(500)),
             description,
         )
     };
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(questionnaire_progress())
         .child(
             questionnaire_item("direction")
@@ -195,8 +195,8 @@ fn animated() -> Part<QuestionnaireProps> {
 /// Vue fades and slides each item in as it opens; `gui` draws no entrance
 /// animations, so an item shows at once, as Vue does under `motion-reduce`.
 fn animated_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(questionnaire_progress())
         .child(simple_item(
             "task",
@@ -258,7 +258,7 @@ fn card_item(name: &str, title: &str, description: &str, entries: &[(&str, &str)
             card_header()
                 // `as-child` merges the title's `text-base` into `CardTitle`'s
                 // `leading-none`, and `text-base`'s 24px line wins (Chrome).
-                .child(questionnaire_title(title.to_owned()).col_start(1))
+                .child(questionnaire_title(title.to_owned()).grid_column_start(1))
                 .child(card_description(description.to_owned()))
                 .child(card_action().child(questionnaire_progress())),
         )
@@ -266,7 +266,7 @@ fn card_item(name: &str, title: &str, description: &str, entries: &[(&str, &str)
 }
 
 fn card_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.mx_auto().max_w(112.0).child(
+    root.margin_x(Length::Auto).max_width(448.0).child(
         card()
             .child(card_item(
                 "task",
@@ -288,7 +288,7 @@ fn card_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
                     ("review", "Full review handoff"),
                 ],
             ))
-            .child(card_footer().child(actions("Create task").w_full())),
+            .child(card_footer().child(actions("Create task").width(pct(100.0)))),
     )
 }
 
@@ -319,8 +319,8 @@ fn conditional() -> Part<QuestionnaireProps> {
 }
 
 fn conditional_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(questionnaire_progress())
         .child(simple_item(
             "runtime",
@@ -380,21 +380,23 @@ fn controlled_demo(root: Part<QuestionnaireProps>, current: Signal<String>) -> D
         _ => "",
     };
     div()
-        .relative()
-        .mx_auto()
-        .flex_col()
-        .w_full()
-        .max_w(112.0)
+        .position(Position::Relative)
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(448.0)
         .child(
             text(format!("Current checkpoint: {label}"))
-                .absolute()
+                .position(Position::Absolute)
                 .right(0.0)
                 .top(0.0)
-                .text_sm()
+                .text_size(14.0)
+                .line_height(20.0)
                 .text_color(t.muted_foreground),
         )
         .child(
-            root.mt_auto()
+            root.margin_top(Length::Auto)
                 .child(questionnaire_progress())
                 .child(simple_item(
                     "scope",
@@ -512,8 +514,8 @@ fn freeform() -> Part<QuestionnaireProps> {
 }
 
 fn freeform_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(
             questionnaire_item("approach")
                 .child(questionnaire_title("How should the agent approach this refactor?"))
@@ -544,8 +546,8 @@ fn multiple() -> Part<QuestionnaireProps> {
 }
 
 fn multiple_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(simple_item(
             "context",
             "What context should the agent inspect?",
@@ -580,8 +582,8 @@ fn navigation_state() -> Part<QuestionnaireProps> {
 
 fn navigation_state_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
     let unanswered = |s: Option<QuestionnaireStatus>| s == Some(QuestionnaireStatus::Unanswered);
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(questionnaire_progress())
         .child(simple_item(
             "permission",
@@ -640,21 +642,25 @@ fn progress() -> Part<QuestionnaireProps> {
 fn progress_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
     let progress = |p: QuestionnaireProgressState| {
         let t = theme();
-        let bar = div().mb(2.0).flex().gap(1.5).children((1..=p.total).map(|step| {
-            div()
-                .h(1.5)
-                .flex_1()
-                .rounded_full()
-                .bg(if step <= p.current { t.primary } else { t.muted })
-        }));
+        let bar = div()
+            .margin_bottom(8.0)
+            .display(Display::Flex)
+            .gap(6.0)
+            .children((1..=p.total).map(|step| {
+                div()
+                    .height(6.0)
+                    .flex(Flex::grow(1.0))
+                    .radius(9999.0)
+                    .background(if step <= p.current { t.primary } else { t.muted })
+            }));
         div()
             .child(bar)
             .child(text(format!("Checkpoint {} of {}", p.current, p.total)))
             .into_element()
     };
-    root.mx_auto()
-        .max_w(112.0)
-        .child(questionnaire_progress_with(progress).w_full())
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
+        .child(questionnaire_progress_with(progress).width(pct(100.0)))
         .child(simple_item(
             "scope",
             "How large is the change?",
@@ -724,8 +730,8 @@ fn resume_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
     root.on_reset(move |_| {
         shadcn::toast("Saved answers restored");
     })
-    .mx_auto()
-    .max_w(112.0)
+    .margin_x(Length::Auto)
+    .max_width(448.0)
     .child(questionnaire_progress())
     .child(simple_item(
         "change",
@@ -790,17 +796,18 @@ fn shortcuts_demo(root: Part<QuestionnaireProps>, mode: &Signal<String>, focus: 
     .focus(focus)
     // The demo's `class` lands on the `<select>`, not its wrapper: the
     // wrapper keeps no width and the box hangs off its left edge, as in Vue.
-    .class(|field, chevron| (field.absolute().right(0.0).top(0.0), chevron));
+    .class(|field, chevron| (field.position(Position::Absolute).right(0.0).top(0.0), chevron));
     div()
-        .relative()
-        .mx_auto()
-        .flex_col()
-        .w_full()
-        .max_w(112.0)
+        .position(Position::Relative)
+        .margin_x(Length::Auto)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .max_width(448.0)
         // The wrapper's `w-fit`: with the select out of flow it has no width.
-        .child(div().self_start().child(select))
+        .child(div().align_self(Align::Start).child(select))
         .child(
-            root.mt_auto()
+            root.margin_top(Length::Auto)
                 .child(simple_item(
                     "action",
                     "What should the agent do next?",
@@ -840,8 +847,8 @@ fn skip() -> Part<QuestionnaireProps> {
 }
 
 fn skip_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.mx_auto()
-        .max_w(112.0)
+    root.margin_x(Length::Auto)
+        .max_width(448.0)
         .child(questionnaire_progress())
         .child(simple_item(
             "task",
@@ -927,13 +934,17 @@ fn validation_item(
     questionnaire_item(name)
         .child(
             card_header()
-                .child(questionnaire_title(title.to_owned()).col_start(1))
+                .child(questionnaire_title(title.to_owned()).grid_column_start(1))
                 // Not the item's legend here, so it keeps its place under the title.
-                .child(questionnaire_description(description.to_owned()).mt(0.0).col_start(1))
+                .child(
+                    questionnaire_description(description.to_owned())
+                        .margin_top(0.0)
+                        .grid_column_start(1),
+                )
                 .child(
                     card_action().child(
                         questionnaire_progress_with(|p| text(format!("{} / {}", p.current, p.total)).into_element())
-                            .min_w(0.0),
+                            .min_width(0.0),
                     ),
                 ),
         )
@@ -945,9 +956,9 @@ fn validation_item(
 }
 
 fn validation_demo(root: Part<QuestionnaireProps>, error: &Signal<Option<String>>) -> Part<QuestionnaireProps> {
-    root.mx_auto().max_w(112.0).child(
+    root.margin_x(Length::Auto).max_width(448.0).child(
         card()
-            .w_full()
+            .width(pct(100.0))
             .child(validation_item(
                 "detail",
                 "How much detail should the answer include?",
@@ -977,10 +988,11 @@ pub fn render() -> Render {
         page(
             "Questionnaire",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("QuestionnaireDemo.vue", questionnaire_demo(the_demo(&saved))))
-                .child(text(saved.get()).text_sm())
+                .child(text(saved.get()).text_size(14.0).line_height(20.0))
                 .child(demo("QuestionnaireAnimatedDemo.vue", animated_demo(animated())))
                 .child(demo("QuestionnaireCardDemo.vue", card_demo(card_questionnaire())))
                 .child(demo(

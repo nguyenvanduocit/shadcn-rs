@@ -4,8 +4,8 @@
 use super::path::{TileRect, reference};
 use super::*;
 use crate::convert::i32_to_f32;
+use crate::figure::{Cap, FillRule, Join, PathBuilder};
 use crate::scene::{Clip, EffectNode, Gradient, GroupTransform, Item, PixelRect, State};
-use crate::shape::{Cap, FillRule, Join, PathBuilder};
 
 /// A device on the first adapter, when the machine has one.
 pub(super) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
@@ -20,6 +20,11 @@ pub(super) fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
 
 fn gpu() -> GpuRenderer {
     GpuRenderer::headless().expect("a GPU (CI paints on lavapipe)")
+}
+
+/// Half black over white, 127.5, as a GPU rounds it (127 or 128), opaque.
+fn half_grey(p: [u8; 4]) -> bool {
+    p[3] == 255 && p[..3].iter().all(|&c| c == 127 || c == 128) && p[0] == p[1] && p[1] == p[2]
 }
 
 fn at(p: &Pixels, x: u32, y: u32) -> [u8; 4] {
@@ -293,6 +298,7 @@ fn busy_scene(size: u32) -> Scene {
         Clip {
             bounds: rect(0.0, 0.0, 60.0, 60.0),
             radius: Corners::default(),
+            curve: crate::shape::ROUND,
         },
         0,
     );
@@ -805,7 +811,12 @@ fn a_fade_is_folded_unless_what_it_holds_overlaps() {
     gpu.end_frame();
     assert_eq!((d.folded, d.layers), (1, 0), "apart: folded, {d}");
     let shot = gpu.capture(&scene, None, &mut text).expect("read back");
-    assert_eq!(at(&shot, 20, 20), [128, 128, 128, 255], "half black over white");
+    // 127.5 either way: Metal rounds it up, lavapipe down.
+    assert!(
+        half_grey(at(&shot, 20, 20)),
+        "half black over white: {:?}",
+        at(&shot, 20, 20)
+    );
     let mut scene = chunks((128, 64), &[(1, State::default(), &a), (3, State::default(), &over)]);
     fade(&mut scene, 0.5, 0.0);
     gpu.render(&scene, &Changed::all(), &mut text);
@@ -814,7 +825,11 @@ fn a_fade_is_folded_unless_what_it_holds_overlaps() {
     assert_eq!((d.folded, d.layers), (0, 1), "overlapping: a layer, {d}");
     canvas_is_whole(&mut gpu, &scene, &mut text);
     let shot = gpu.capture(&scene, None, &mut text).expect("read back");
-    assert_eq!(at(&shot, 25, 25), [128, 128, 128, 255], "the overlap is faded once");
+    assert!(
+        half_grey(at(&shot, 25, 25)),
+        "the overlap is faded once: {:?}",
+        at(&shot, 25, 25)
+    );
     // Moved and faded further: the layer is composited as kept.
     let mut scene = chunks((128, 64), &[(1, State::default(), &a), (3, State::default(), &over)]);
     fade(&mut scene, 0.25, 2.0);
@@ -828,4 +843,157 @@ fn a_fade_is_folded_unless_what_it_holds_overlaps() {
     gpu.end_frame();
     assert_eq!((d.layers, d.layers_kept, d.encoded), (0, 1, 0), "{d}");
     canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// Black and white stripes `w` px wide over the whole of a `size` square.
+fn stripes(size: f32, w: f32) -> std::sync::Arc<crate::scene::Display> {
+    let mut items = Vec::new();
+    let mut x = 0.0;
+    while x < size {
+        items.push(Item::Rect {
+            bounds: rect(x, 0.0, w, size),
+            color: Color::BLACK,
+        });
+        x += 2.0 * w;
+    }
+    std::sync::Arc::new(crate::scene::Display::new(items))
+}
+
+fn read(items: Vec<Item>) -> std::sync::Arc<crate::scene::Display> {
+    std::sync::Arc::new(crate::scene::Display::new(items))
+}
+
+fn gray(v: f32, a: f32) -> Color {
+    Color { r: v, g: v, b: v, a }
+}
+
+/// `mix-blend-mode: darken` takes the darker of each channel, faded by
+/// the colour's alpha (Compositing 1): over white a half-alpha mid gray
+/// gives 0.75, over black it leaves black, where a normal blend would
+/// lighten black to a quarter.
+#[test]
+fn a_darkened_border_takes_the_darker_of_each_channel() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let black = solid(rect(32.0, 0.0, 32.0, 32.0), Color::BLACK);
+    let blended = |blend, a| {
+        read(vec![Item::Blended {
+            outer: rect(0.0, 0.0, 64.0, 32.0),
+            outer_radius: Corners::default(),
+            inner: Bounds::default(),
+            inner_radius: Corners::default(),
+            curve: 1.0,
+            color: gray(0.5, a),
+            blend,
+        }])
+    };
+    let cases = [
+        (crate::shape::Blend::Darken, 1.0, [128, 0]),
+        (crate::shape::Blend::Darken, 0.5, [191, 0]),
+        (crate::shape::Blend::Lighten, 1.0, [255, 128]),
+        (crate::shape::Blend::Lighten, 0.5, [255, 64]),
+    ];
+    for (blend, a, want) in cases {
+        let top = blended(blend, a);
+        let scene = chunks((64, 32), &[(1, State::default(), &black), (2, State::default(), &top)]);
+        let shot = gpu.capture(&scene, None, &mut text).expect("read back");
+        let got = [at(&shot, 8, 16)[0], at(&shot, 48, 16)[0]];
+        for (g, w) in got.iter().zip(want) {
+            assert!(g.abs_diff(w) <= 1, "{blend:?} at alpha {a}: {got:?}, not {want:?}");
+        }
+    }
+}
+
+/// A backdrop shows what lies below its box blurred (stripes become their
+/// mean), at a small sigma straight and at a large one through halvings;
+/// outside its box nothing changes.
+#[test]
+fn a_backdrop_blurs_what_lies_below_inside_its_box() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let below = stripes(96.0, 1.0);
+    for blur in [3.0, 24.0] {
+        let top = read(vec![Item::Backdrop {
+            bounds: rect(16.0, 16.0, 64.0, 64.0),
+            radius: Corners::default(),
+            curve: 1.0,
+            backdrop: crate::shape::Backdrop::blur(blur),
+        }]);
+        let scene = chunks((96, 96), &[(1, State::default(), &below), (2, State::default(), &top)]);
+        let shot = gpu.capture(&scene, None, &mut text).expect("read back");
+        for (x, y) in [(48, 48), (20, 40), (75, 75)] {
+            let v = at(&shot, x, y)[0];
+            assert!(v.abs_diff(128) <= 8, "blur {blur} at ({x}, {y}): {v}");
+        }
+        assert_eq!(at(&shot, 4, 4)[0], 0, "outside the box");
+        assert_eq!(at(&shot, 5, 4)[0], 255, "outside the box");
+    }
+}
+
+/// `saturate(2)` of Filter Effects 1, on what lies below.
+#[test]
+fn a_backdrop_saturates() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let c = Color::hex(0xc86432);
+    let below = solid(rect(0.0, 0.0, 32.0, 32.0), c);
+    let top = read(vec![Item::Backdrop {
+        bounds: rect(0.0, 0.0, 32.0, 32.0),
+        radius: Corners::default(),
+        curve: 1.0,
+        backdrop: crate::shape::Backdrop {
+            blur: 0.0,
+            saturate: 2.0,
+        },
+    }]);
+    let scene = chunks((32, 32), &[(1, State::default(), &below), (2, State::default(), &top)]);
+    let shot = gpu.capture(&scene, None, &mut text).expect("read back");
+    let k = 2.0_f32;
+    let rgb = [c.r, c.g, c.b];
+    let rows = [
+        [0.213 + 0.787 * k, 0.715 - 0.715 * k, 0.072 - 0.072 * k],
+        [0.213 - 0.213 * k, 0.715 + 0.285 * k, 0.072 - 0.072 * k],
+        [0.213 - 0.213 * k, 0.715 - 0.715 * k, 0.072 + 0.928 * k],
+    ];
+    let got = at(&shot, 16, 16);
+    for (i, row) in rows.iter().enumerate() {
+        let v = row.iter().zip(rgb).map(|(m, c)| m * c).sum::<f32>().clamp(0.0, 1.0) * 255.0;
+        let g = f32::from(got[i]);
+        assert!((g - v).abs() <= 2.0, "channel {i}: {g}, not {v}");
+    }
+}
+
+/// Damage that meets a blurred backdrop redraws its whole box (the blur
+/// reads all of it), so the canvas stays what a whole redraw gives.
+#[test]
+fn damage_under_a_blurred_backdrop_redraws_its_box() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let below = stripes(128.0, 2.0);
+    let top = read(vec![Item::Backdrop {
+        bounds: rect(32.0, 32.0, 64.0, 48.0),
+        radius: Corners::all(12.0),
+        curve: 2.0,
+        backdrop: crate::shape::Backdrop::blur(6.0),
+    }]);
+    let red = solid(rect(36.0, 36.0, 4.0, 4.0), Color::hex(0xdc2626));
+    let blue = solid(rect(36.0, 36.0, 4.0, 4.0), Color::hex(0x2563eb));
+    let scene = |spot| {
+        chunks(
+            (128, 128),
+            &[
+                (1, State::default(), &below),
+                (2, State::default(), spot),
+                (3, State::default(), &top),
+            ],
+        )
+    };
+    gpu.render(&scene(&red), &Changed::all(), &mut text);
+    gpu.end_frame();
+    let next = scene(&blue);
+    gpu.render(&next, &Changed::all(), &mut text);
+    let d = gpu.drawn();
+    gpu.end_frame();
+    assert!(d.damage >= 64 * 48, "the box is redrawn whole: {d}");
+    canvas_is_whole(&mut gpu, &next, &mut text);
 }

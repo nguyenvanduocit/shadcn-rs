@@ -42,11 +42,11 @@ use self::zkey::ZKey;
 use crate::chunk::{Drawing, Picture};
 use crate::color::Color;
 use crate::element::{Drawn, drawing};
+use crate::figure::{Path, PathBuilder, PathStyle};
 use crate::geometry::Bounds;
 use crate::reactive::Signal;
 use crate::scene::Gradient;
 use crate::scene::Item;
-use crate::shape::{Path, PathBuilder, PathStyle};
 
 /// Screen pixels past which an object is drawn anchored at the camera.
 pub const REANCHOR: f64 = 262_144.0;
@@ -199,7 +199,7 @@ impl Camera {
 /// A path in world coordinates (`f64`), as given.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorldPath {
-    verbs: Vec<crate::shape::Verb>,
+    verbs: Vec<crate::figure::Verb>,
     points: Vec<[f64; 2]>,
 }
 
@@ -211,35 +211,35 @@ impl WorldPath {
 
     #[must_use]
     pub fn move_to(mut self, x: f64, y: f64) -> Self {
-        self.verbs.push(crate::shape::Verb::Move);
+        self.verbs.push(crate::figure::Verb::Move);
         self.points.push([x, y]);
         self
     }
 
     #[must_use]
     pub fn line_to(mut self, x: f64, y: f64) -> Self {
-        self.verbs.push(crate::shape::Verb::Line);
+        self.verbs.push(crate::figure::Verb::Line);
         self.points.push([x, y]);
         self
     }
 
     #[must_use]
     pub fn quad_to(mut self, cx: f64, cy: f64, x: f64, y: f64) -> Self {
-        self.verbs.push(crate::shape::Verb::Quad);
+        self.verbs.push(crate::figure::Verb::Quad);
         self.points.extend([[cx, cy], [x, y]]);
         self
     }
 
     #[must_use]
     pub fn cubic_to(mut self, c1x: f64, c1y: f64, c2x: f64, c2y: f64, x: f64, y: f64) -> Self {
-        self.verbs.push(crate::shape::Verb::Cubic);
+        self.verbs.push(crate::figure::Verb::Cubic);
         self.points.extend([[c1x, c1y], [c2x, c2y], [x, y]]);
         self
     }
 
     #[must_use]
     pub fn close(mut self) -> Self {
-        self.verbs.push(crate::shape::Verb::Close);
+        self.verbs.push(crate::figure::Verb::Close);
         self
     }
 
@@ -330,7 +330,7 @@ impl WorldPath {
     /// `tolerance`; a piece of curve whose control points all lie outside
     /// `area` on one side is its chord (the curve lies in their hull).
     fn flattened(&self, area: Aabb, tolerance: f64) -> Vec<(Vec<[f64; 2]>, bool)> {
-        use crate::shape::Verb;
+        use crate::figure::Verb;
         let mut out: Vec<(Vec<[f64; 2]>, bool)> = Vec::new();
         let mut cur: Vec<[f64; 2]> = Vec::new();
         let mut pts = self.points.iter().copied();
@@ -387,7 +387,7 @@ impl WorldPath {
     /// every subpath's start stay as they are.
     #[must_use]
     pub fn simplified(&self, tolerance: f64) -> Self {
-        use crate::shape::Verb;
+        use crate::figure::Verb;
         let mut out = Self::new();
         let mut pts = self.points.iter().copied();
         // The run of lines going: its points, the first already in `out`.
@@ -443,7 +443,7 @@ impl WorldPath {
 
     /// Where the last subpath began.
     fn subpath_start(&self) -> Option<[f64; 2]> {
-        use crate::shape::Verb;
+        use crate::figure::Verb;
         let mut at = 0_usize;
         let mut start = None;
         for v in &self.verbs {
@@ -473,7 +473,7 @@ impl WorldPath {
         let mut b: PathBuilder = Path::builder();
         let mut pts = self.points.iter();
         for v in &self.verbs {
-            use crate::shape::Verb;
+            use crate::figure::Verb;
             b = match v {
                 Verb::Move => match pts.next() {
                     Some(p) => {
@@ -888,8 +888,8 @@ impl Placed {
     pub fn ink(&self) -> Aabb {
         let extra = match &self.body {
             Body::Path(p) => match &p.style.draw {
-                crate::shape::Draw::Stroke(s) => (plan::stroke_reach(&p.style) - f64::from(s.width) / 2.0).max(0.0),
-                crate::shape::Draw::Fill => 0.0,
+                crate::figure::Draw::Stroke(s) => (plan::stroke_reach(&p.style) - f64::from(s.width) / 2.0).max(0.0),
+                crate::figure::Draw::Fill => 0.0,
             },
             Body::Text(_) => 0.0,
         };
@@ -1207,8 +1207,8 @@ fn place(source: WorldPath, style: PathStyle, z: ZKey) -> Placed {
     };
     // Stroked paths reach half their width past their points.
     let reach = match &style.draw {
-        crate::shape::Draw::Stroke(s) => f64::from(s.width) / 2.0,
-        crate::shape::Draw::Fill => 0.0,
+        crate::figure::Draw::Stroke(s) => f64::from(s.width) / 2.0,
+        crate::figure::Draw::Fill => 0.0,
     };
     let bbox = [bbox[0] - reach, bbox[1] - reach, bbox[2] + reach, bbox[3] + reach];
     Placed {

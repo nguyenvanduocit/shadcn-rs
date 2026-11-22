@@ -16,8 +16,8 @@ pub fn render() -> Render {
             demo(
                 "CardDemo.vue",
                 card()
-                    .w_full()
-                    .max_w_px(384.0)
+                    .width(pct(100.0))
+                    .max_width(384.0)
                     .child(
                         card_header()
                             .child(card_title("Login to your account"))
@@ -29,27 +29,35 @@ pub fn render() -> Render {
                     .child(
                         card_content().child(
                             div()
-                                .grid()
-                                .w_full()
-                                .items_center()
-                                .gap(4.0)
+                                .display(Display::Grid)
+                                .width(pct(100.0))
+                                .align_items(Align::Center)
+                                .gap(16.0)
                                 .child(
                                     div()
-                                        .flex_col()
-                                        .gap(1.5)
+                                        .display(Display::Flex)
+                                        .flex_direction(FlexDirection::Column)
+                                        .gap(6.0)
                                         .child(label("Email"))
                                         .child(input().field(email).placeholder("m@example.com")),
                                 )
                                 .child(
                                     div()
-                                        .flex_col()
-                                        .gap(1.5)
+                                        .display(Display::Flex)
+                                        .flex_direction(FlexDirection::Column)
+                                        .gap(6.0)
                                         .child(
                                             div()
-                                                .flex()
-                                                .items_center()
+                                                .display(Display::Flex)
+                                                .align_items(Align::Center)
                                                 .child(label("Password"))
-                                                .child(text("Forgot your password?").ml_auto().text_sm().underline()),
+                                                .child(
+                                                    text("Forgot your password?")
+                                                        .margin_left(Length::Auto)
+                                                        .text_size(14.0)
+                                                        .line_height(20.0)
+                                                        .underline(true),
+                                                ),
                                         )
                                         .child(input().field(password)),
                                 ),
@@ -57,16 +65,17 @@ pub fn render() -> Render {
                     )
                     .child(
                         card_footer()
-                            .flex_col()
-                            .gap(2.0)
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .gap(8.0)
                             .child(
                                 button(ButtonVariant::Default, ButtonSize::Default)
-                                    .w_full()
+                                    .width(pct(100.0))
                                     .child("Login"),
                             )
                             .child(
                                 button(ButtonVariant::Outline, ButtonSize::Default)
-                                    .w_full()
+                                    .width(pct(100.0))
                                     .child("Login with Google"),
                             ),
                     ),

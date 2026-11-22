@@ -113,11 +113,16 @@ pub fn markdown(source: &str, size: f32) -> Div {
         place(&mut stack, &mut blocks, el);
     }
     flow(
-        div().named("markdown").w_full().min_w(0.0).overflow_hidden(),
+        div()
+            .named("markdown")
+            .width(pct(100.0))
+            .min_width(0.0)
+            .overflow(Overflow::Hidden),
         blocks,
         size,
     )
-    .text_size(size, size * LEADING)
+    .text_size(size)
+    .line_height(size * LEADING)
     .text_color(theme().foreground)
 }
 
@@ -138,30 +143,34 @@ fn place(stack: &mut [Open], blocks: &mut Vec<Element>, el: Element) {
 /// `margin-block-start`, trimmed on the first).
 fn flow(column: Div, blocks: Vec<Element>, size: f32) -> Div {
     let gap = FLOW * size;
-    column.flex_col().children(
-        blocks
-            .into_iter()
-            .enumerate()
-            .map(|(i, b)| div().min_w(0.0).when(i > 0, |d| d.mt(gap / gui::styled::UNIT)).child(b)),
-    )
+    column
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .children(
+            blocks
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| div().min_width(0.0).when(i > 0, |d| d.margin_top(gap)).child(b)),
+        )
 }
 
 fn styled(s: Span, inline: Inline) -> Span {
-    s.when(inline.strong > 0, |s| s.font_semibold())
-        .when(inline.emphasis > 0, |s| s.italic())
-        .when(inline.link > 0, |s| s.font_medium().underline())
+    s.when(inline.strong > 0, |s| s.font_weight(600))
+        .when(inline.emphasis > 0, |s| s.italic(true))
+        .when(inline.link > 0, |s| s.font_weight(500).underline(true))
 }
 
 /// Markdown.vue's inline code: `rounded-sm bg-muted px-1 py-0.5 font-mono text-[0.9em]`.
 fn code_span(code: &str, size: f32) -> Span {
     let em = 0.9 * size;
     span(code.to_owned())
-        .font_mono()
-        .text_size(em, em * LEADING)
-        .bg(theme().muted)
-        .rounded_sm()
-        .px(1.0)
-        .py(0.5)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(em)
+        .line_height(em * LEADING)
+        .background(theme().muted)
+        .radius(6.0)
+        .padding_x(4.0)
+        .padding_y(2.0)
 }
 
 fn paragraph(runs: Vec<Span>) -> Text {
@@ -172,14 +181,15 @@ fn paragraph(runs: Vec<Span>) -> Text {
 fn item(children: Vec<Element>, size: f32) -> Element {
     let half = 0.5 * size;
     div()
-        .flex_col()
-        .min_w(0.0)
-        .children(children.into_iter().enumerate().map(|(i, c)| {
-            div()
-                .min_w(0.0)
-                .when(i > 0, |d| d.mt(half / gui::styled::UNIT))
-                .child(c)
-        }))
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .min_width(0.0)
+        .children(
+            children
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| div().min_width(0.0).when(i > 0, |d| d.margin_top(half)).child(c)),
+        )
         .into_element()
 }
 
@@ -189,27 +199,28 @@ fn list(ordered: Option<u64>, items: Vec<Element>, size: f32) -> Div {
     let t = theme();
     let (indent, room, half) = (1.5 * size, 0.4 * size, 0.5 * size);
     div()
-        .flex_col()
-        .pl(indent / gui::styled::UNIT)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .padding_left(indent)
         .children(items.into_iter().enumerate().map(|(i, el)| {
             let marker = match ordered {
                 Some(first) => format!("{}.", first.saturating_add(u64::try_from(i).unwrap_or(u64::MAX))),
                 None => "•".to_owned(),
             };
             div()
-                .relative()
-                .min_w(0.0)
-                .mt(half / gui::styled::UNIT)
-                .pl(room / gui::styled::UNIT)
+                .position(Position::Relative)
+                .min_width(0.0)
+                .margin_top(half)
+                .padding_left(room)
                 .child(
                     div()
-                        .absolute()
+                        .position(Position::Absolute)
                         .top(0.0)
-                        .left_len(gui::px(-indent))
-                        .w_px(indent)
-                        .flex()
-                        .justify_end()
-                        .pr(room / gui::styled::UNIT)
+                        .left(gui::px(-indent))
+                        .width(indent)
+                        .display(Display::Flex)
+                        .justify_content(Justify::End)
+                        .padding_right(room)
                         .text_color(t.muted_foreground)
                         .child(text(marker)),
                 )

@@ -15,15 +15,15 @@ const SLIDES: usize = 5;
 /// The slide every carousel demo shows: its number on a card. `square` is
 /// `aspect-square`; `number` styles the `<span>` (its text size).
 fn slide(n: usize, square: bool, number: impl FnOnce(gui::Text) -> gui::Text) -> Div {
-    div().p(1.0).child(
+    div().padding(4.0).child(
         card().child(
             card_content()
-                .flex()
-                .when(square, Styled::aspect_square)
-                .items_center()
-                .justify_center()
-                .p(6.0)
-                .child(number(text(n.to_string()).font_semibold())),
+                .display(Display::Flex)
+                .when(square, |e| e.aspect_ratio(1.0))
+                .align_items(Align::Center)
+                .justify_content(Justify::Center)
+                .padding(24.0)
+                .child(number(text(n.to_string()).font_weight(600))),
         ),
     )
 }
@@ -36,15 +36,15 @@ fn numbered(
     content: impl Fn(usize) -> Div,
 ) -> Part<CarouselProps> {
     let slides = (1..=SLIDES).map(|n| item(carousel_item()).child(content(n)));
-    root.w_full()
-        .max_w_px(320.0)
+    root.width(pct(100.0))
+        .max_width(320.0)
         .child(track(carousel_content()).children(slides))
         .child(carousel_previous())
         .child(carousel_next())
 }
 
 fn big(n: usize) -> Div {
-    slide(n, true, gui::Text::text_4xl)
+    slide(n, true, |t: gui::Text| t.text_size(36.0).line_height(40.0))
 }
 
 pub fn render() -> Render {
@@ -60,9 +60,10 @@ pub fn render() -> Render {
                     .child(numbered(carousel().model(Model::bind(api)), |d| d, |d| d, big))
                     .child(
                         div()
-                            .py(2.0)
-                            .text_center()
-                            .text_sm()
+                            .padding_y(8.0)
+                            .text_align(TextAlign::Center)
+                            .text_size(14.0)
+                            .line_height(20.0)
                             .text_color(t.muted_foreground)
                             .child(format!(
                                 "Slide {} of {}",
@@ -84,7 +85,7 @@ pub fn render() -> Render {
                     carousel().basis(1.0 / 3.0),
                     |d| d,
                     |d| d,
-                    |n| slide(n, true, gui::Text::text_3xl),
+                    |n| slide(n, true, |t: gui::Text| t.text_size(30.0).line_height(36.0)),
                 ),
             )
             .into_element(),
@@ -92,20 +93,20 @@ pub fn render() -> Render {
                 "CarouselSpacing.vue",
                 numbered(
                     carousel().basis(1.0 / 3.0),
-                    |d| d.ml(-1.0),
-                    |d| d.pl(1.0),
-                    |n| slide(n, true, gui::Text::text_2xl),
+                    |d| d.margin_left(-4.0),
+                    |d| d.padding_left(4.0),
+                    |n| slide(n, true, |t: gui::Text| t.text_size(24.0).line_height(32.0)),
                 )
-                .max_w_px(384.0),
+                .max_width(384.0),
             )
             .into_element(),
             demo(
                 "CarouselOrientation.vue",
                 numbered(
                     carousel().orientation(Orientation::Vertical).basis(0.5),
-                    |d| d.mt(-1.0).h_px(200.0),
-                    |d| d.p(1.0),
-                    |n| slide(n, false, gui::Text::text_3xl),
+                    |d| d.margin_top(-4.0).height(200.0),
+                    |d| d.padding(4.0),
+                    |n| slide(n, false, |t: gui::Text| t.text_size(30.0).line_height(36.0)),
                 ),
             )
             .into_element(),
@@ -113,13 +114,15 @@ pub fn render() -> Render {
         page(
             "Carousel",
             div()
-                .flex_1()
-                .min_h(0.0)
-                .overflow_y_scroll()
-                .flex_col()
-                .gap(24.0)
-                .px(12.0)
-                .py(12.0)
+                .flex(Flex::grow(1.0))
+                .min_height(0.0)
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(96.0)
+                .padding_x(48.0)
+                .padding_y(48.0)
                 .children(demos),
         )
     })

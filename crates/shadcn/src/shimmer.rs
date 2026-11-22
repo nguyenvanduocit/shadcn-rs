@@ -3,8 +3,9 @@
 //! labels. `text("Generating response…").shimmer(Shimmer::default())`.
 
 use gui::motion::{Keyframe, Pose};
-use gui::style::{BackgroundClip, BackgroundImage, Calc, Ink, LinearGradient, Stop};
-use gui::{Animation, Color, Easing, Styled};
+use gui::prelude::*;
+use gui::style::{BackgroundClip, BackgroundImage, Calc, LinearGradient, Stop, StopColor};
+use gui::{Animation, Color, Easing};
 
 use crate::theme::theme;
 
@@ -55,11 +56,11 @@ impl Shimmer {
         }
     }
 
-    /// `shimmer-spread-n`, `n` on Tailwind's scale.
+    /// `shimmer-spread-*`: the highlight's width, in pixels.
     #[must_use]
-    pub fn spread(self, n: f32) -> Self {
+    pub fn spread(self, px: f32) -> Self {
         Self {
-            spread: Some(n * gui::styled::UNIT),
+            spread: Some(px),
             ..self
         }
     }
@@ -120,7 +121,7 @@ impl Shimmer {
             || {
                 if theme().dark {
                     // `oklch(from currentColor max(0.8, l + 0.4) c h / alpha + 0.4)`
-                    Ink::Current {
+                    StopColor::Current {
                         lightness_floor: 0.8,
                         lightness_lift: 0.4,
                         alpha_scale: 1.0,
@@ -128,7 +129,7 @@ impl Shimmer {
                     }
                 } else {
                     // `oklch(from currentColor l c h / alpha * 0.2)`
-                    Ink::Current {
+                    StopColor::Current {
                         lightness_floor: 0.0,
                         lightness_lift: 0.0,
                         alpha_scale: 0.2,
@@ -136,19 +137,20 @@ impl Shimmer {
                     }
                 }
             },
-            Ink::Color,
+            StopColor::Color,
         );
-        let stop = |ink, at| Stop { ink, at };
+        let stop = |ink, at| Stop { color: ink, at };
         BackgroundImage {
             // The utility's two half-way stops are the OKLCH mix of their
             // neighbours, which the OKLab interpolation between those yields.
             gradient: LinearGradient {
                 angle: 90.0 + self.angle,
-                stops: vec![
-                    stop(Ink::CURRENT, from_middle(-1.0)),
+                stops: [
+                    stop(StopColor::CURRENT, from_middle(-1.0)),
                     stop(highlight, Calc::fraction(0.5)),
-                    stop(Ink::CURRENT, from_middle(1.0)),
-                ],
+                    stop(StopColor::CURRENT, from_middle(1.0)),
+                ]
+                .into(),
             },
             size: [
                 Calc {
@@ -168,7 +170,7 @@ impl Shimmer {
 pub trait ShimmerExt: Styled {
     #[must_use]
     fn shimmer(self, shimmer: Shimmer) -> Self {
-        self.background_image(shimmer.image()).animate(shimmer.sweep())
+        self.background_image(shimmer.image()).animation(shimmer.sweep())
     }
 }
 

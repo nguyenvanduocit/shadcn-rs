@@ -12,16 +12,16 @@
 use std::fmt;
 use std::rc::Rc;
 
-use gui::Properties;
 use gui::prelude::*;
 use gui::style::Align;
 use gui::{
     Bind, Callback, ComponentElement, Div, Element, FocusHandle, Icon, KeyEvent, Model, NamedKey, Signal, Text,
     TextField, UseModel, component, div, icon, provide, text, use_context, use_model,
 };
+use gui::{Color, Properties};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
-use crate::focus::{destructive_ring, focus_ring};
+use crate::focus::{StateLook, destructive_ring};
 use crate::input::input;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
@@ -678,7 +678,13 @@ pub fn questionnaire(items: Vec<QuestionnaireItem>) -> Part<QuestionnaireProps> 
         on_change: None,
         on_reset: None,
     };
-    let root = div().named("questionnaire").flex_col().w_full().min_w(0.0).gap(6.0);
+    let root = div()
+        .named("questionnaire")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .gap(24.0);
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -788,12 +794,13 @@ pub fn questionnaire_progress_with(
     let t = theme();
     let root = div()
         .named("questionnaire-progress")
-        .self_start()
-        .min_w_px(PROGRESS_MIN_WIDTH)
-        .text_xs()
-        .font_medium()
+        .align_self(Align::Start)
+        .min_width(PROGRESS_MIN_WIDTH)
+        .text_size(12.0)
+        .line_height(16.0)
+        .font_weight(500)
         .text_color(t.muted_foreground)
-        .tabular_nums();
+        .tabular_nums(true);
     Part::new(QuestionnaireView(Rc::new(content)), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -825,7 +832,12 @@ pub struct QuestionnaireItemProps {
 /// it with title, description, choices and error: they belong to it.
 #[must_use]
 pub fn questionnaire_item(name: &str) -> Part<QuestionnaireItemProps> {
-    let root = div().named("questionnaire-item").flex_col().gap(5.0).min_w(0.0);
+    let root = div()
+        .named("questionnaire-item")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(20.0)
+        .min_width(0.0);
     Part::new(QuestionnaireItemProps { name: name.to_owned() }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -854,9 +866,10 @@ pub fn questionnaire_item(name: &str) -> Part<QuestionnaireItemProps> {
 pub fn questionnaire_title(title: impl Into<String>) -> Text {
     text(title)
         .named("questionnaire-title")
-        .text_base()
-        .font_semibold()
-        .text_pretty()
+        .text_size(16.0)
+        .line_height(24.0)
+        .font_weight(600)
+        .text_wrap(WrapStyle::Pretty)
 }
 
 /// Help under the question. The title is the item's legend, outside the
@@ -865,16 +878,21 @@ pub fn questionnaire_title(title: impl Into<String>) -> Text {
 pub fn questionnaire_description(description: impl Into<String>) -> Text {
     text(description)
         .named("questionnaire-description")
-        .mt(-5.0)
-        .text_sm()
-        .text_pretty()
+        .margin_top(-20.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .text_wrap(WrapStyle::Pretty)
         .text_color(theme().muted_foreground)
 }
 
 /// The column of [`questionnaire_choice`]s and the [`questionnaire_input`].
 #[must_use]
 pub fn questionnaire_choices() -> Div {
-    div().named("questionnaire-choices").grid().gap(3.0).min_w(0.0)
+    div()
+        .named("questionnaire-choices")
+        .display(Display::Grid)
+        .gap(12.0)
+        .min_width(0.0)
 }
 
 /// What a choice is given. Its label is the parent's slot, made anew by
@@ -933,76 +951,94 @@ fn choice(q: &Questionnaire, name: &str, p: &QuestionnaireChoiceProps) -> Div {
 
     // Vue's `translate-y-[--spacing(0.45)]` (`translate-y-0.5` beside a
     // description): moved down without taking room, as a relative offset is.
-    let nudge = if description.is_some() { 0.5 } else { 0.45 };
+    let nudge = if description.is_some() { 2.0 } else { 1.8 };
     let indicator = div()
         .named("questionnaire-choice-indicator")
-        .flex()
-        .size(4.0)
-        .shrink_0()
-        .relative()
+        .display(Display::Flex)
+        .size(16.0)
+        .flex_shrink(0.0)
+        .position(Position::Relative)
         .top(nudge)
-        .items_center()
-        .justify_center()
-        .border()
-        .rounded(if multiple { 4.0 } else { 9999.0 })
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .border(1.0)
+        .radius(if multiple { 4.0 } else { 9999.0 })
         .border_color(if checked { t.primary } else { t.input })
-        .when(checked, |d| d.bg(t.primary).text_color(t.primary_foreground))
-        .when(!checked && t.dark, |d| d.bg(t.input.opacity(0.3)))
-        .when(checked && multiple, |d| d.child(icon(Icon::Check).size(3.5)))
+        .when(checked, |d| d.background(t.primary).text_color(t.primary_foreground))
+        .when(!checked && t.dark, |d| d.background(t.input.opacity(0.3)))
+        .when(checked && multiple, |d| d.child(icon(Icon::Check).size(14.0)))
         .when(checked && !multiple, |d| {
-            d.child(div().size(2.0).rounded_full().bg(t.primary_foreground))
+            d.child(div().size(8.0).radius(9999.0).background(t.primary_foreground))
         });
     let key = shortcut.map(|c| {
         div()
             .named("questionnaire-choice-shortcut")
-            .flex()
-            .size(5.0)
-            .shrink_0()
-            .relative()
+            .display(Display::Flex)
+            .size(20.0)
+            .flex_shrink(0.0)
+            .position(Position::Relative)
             .top(nudge)
-            .ml_auto()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .border()
+            .margin_left(Length::Auto)
+            .align_items(Align::Center)
+            .justify_content(Justify::Center)
+            .radius(8.0)
+            .border(1.0)
             .border_color(t.input)
-            .bg(t.background)
-            .shadow_xs()
-            .font_mono()
-            .font_medium()
-            .text_size(10.0, 10.0)
+            .background(t.background)
+            .shadow(Shadow {
+                x: 0.0,
+                y: 1.0,
+                blur: 2.0,
+                spread: 0.0,
+                color: Color::BLACK.opacity(0.05),
+            })
+            .font_family(FontFamily::GEIST_MONO)
+            .font_weight(500)
+            .text_size(10.0)
+            .line_height(10.0)
             .text_color(t.muted_foreground)
             .child(c.to_string())
     });
 
     let (q2, name2, value2) = (q.clone(), name.to_owned(), value.to_owned());
     let (q3, value3) = (q.clone(), value.to_owned());
+    let it = Interaction::new();
     div()
         .named("questionnaire-choice")
-        .transition_colors()
-        .relative()
-        .flex()
-        .items_start()
-        .gap(3.0)
-        .min_h(11.0)
-        .px(4.0)
-        .py(3.5)
-        .rounded_md()
-        .border()
-        .shadow_xs()
-        .text_sm()
-        .text_left()
-        .cursor_pointer()
+        .interaction(it)
+        .transition(Properties::COLORS)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .align_items(Align::Start)
+        .gap(12.0)
+        .min_height(44.0)
+        .padding_x(16.0)
+        .padding_y(14.0)
+        .radius(8.0)
+        .border(1.0)
+        .shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        })
+        .text_size(14.0)
+        .line_height(20.0)
+        .text_align(TextAlign::Left)
+        .cursor(Cursor::Pointer)
         .border_color(match (invalid, checked) {
             (true, _) => t.destructive,
             (false, true) => t.primary.opacity(0.4),
             (false, false) => t.input,
         })
-        .when(checked, |d| d.bg(t.muted))
-        .when(!checked && t.dark, |d| d.bg(t.input.opacity(0.2)))
-        .when(!checked, |d| d.hover(move |s| s.bg(t.muted.opacity(0.5))))
+        .when(checked, |d| d.background(t.muted))
+        .when(!checked && t.dark, |d| d.background(t.input.opacity(0.2)))
+        .when(!checked, |d| {
+            d.background_while(move || it.hovered(), t.muted.opacity(0.5))
+        })
         .when_some(focus, Div::track_focus)
-        .focus_visible(move |s| focus_ring(s, &t))
+        .focus_ring_on(it, &t)
         .on_click(move |_| q2.choose(&name2, &value2))
         // Enter on a checked choice moves on, as Vue's answer Enter does.
         .on_key_down(move |ev| {
@@ -1023,11 +1059,12 @@ fn choice(q: &Questionnaire, name: &str, p: &QuestionnaireChoiceProps) -> Div {
         .child(
             div()
                 .named("questionnaire-choice-label")
-                .flex_col()
-                .flex_1()
-                .min_w(0.0)
-                .gap(1.0)
-                .leading_snug()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .flex(Flex::grow(1.0))
+                .min_width(0.0)
+                .gap(4.0)
+                .line_height(LineHeight::Relative(1.375))
                 .child(p.label.clone())
                 .child(description.map(choice_description)),
         )
@@ -1086,15 +1123,18 @@ impl IntoElement for QuestionnaireInput {
                 input()
                     .field(*field)
                     .named("questionnaire-input")
-                    .transition_props(Properties::COLOR | Properties::SHADOW | Properties::BACKGROUND)
+                    .transition(Properties::COLOR | Properties::SHADOW | Properties::BACKGROUND)
                     .when_some(props.with(|p| p.placeholder.clone()), crate::input::Input::placeholder)
                     .when(invalid, |d| {
                         d.border_color(t.destructive)
-                            .ring(3.0, t.destructive.opacity(if t.dark { 0.4 } else { 0.2 }))
+                            .ring(Ring::new(3.0, t.destructive.opacity(if t.dark { 0.4 } else { 0.2 })))
                     })
                     .map(move |el| {
-                        el.selection_color(t.primary)
-                            .when(invalid, |d| d.focus_visible(move |s| destructive_ring(s, &t)))
+                        el.selection_color(t.primary).when(invalid, |d| {
+                            d.with_interaction(|d, it| {
+                                d.ring_while(move || it.focus_visible(), &destructive_ring(gui::Style::default(), &t))
+                            })
+                        })
                     })
                     .into_element()
             }
@@ -1142,7 +1182,8 @@ fn error_part(message: Option<String>) -> ComponentElement {
             });
             text(message)
                 .named("questionnaire-error")
-                .text_sm()
+                .text_size(14.0)
+                .line_height(20.0)
                 .text_color(theme().destructive)
                 .into_element()
         }
@@ -1154,12 +1195,12 @@ fn error_part(message: Option<String>) -> ComponentElement {
 pub fn questionnaire_actions() -> Div {
     div()
         .named("questionnaire-actions")
-        .grid()
-        .grid_cols_tracks(vec![gui::Track::Fr(1.0), gui::Track::Auto, gui::Track::Auto])
-        .items_center()
-        .w_full()
-        .min_h(9.0)
-        .gap(2.0)
+        .display(Display::Grid)
+        .grid_columns(vec![gui::Track::Fr(1.0), gui::Track::Auto, gui::Track::Auto])
+        .align_items(Align::Center)
+        .width(pct(100.0))
+        .min_height(36.0)
+        .gap(8.0)
 }
 
 /// Which navigation button a part is.
@@ -1264,8 +1305,8 @@ fn nav_button(q: Questionnaire, p: &QuestionnaireNavProps) -> Option<Div> {
     let nav = p.nav;
     let b = button(variant, ButtonSize::Default)
         .named(name)
-        .col_start(column)
-        .row_start(1)
+        .grid_column_start(column)
+        .grid_row_start(1)
         .child(p.label.clone())
         .disabled(disabled)
         .on_click(move |_| match nav {
@@ -1277,9 +1318,9 @@ fn nav_button(q: Questionnaire, p: &QuestionnaireNavProps) -> Option<Div> {
     Some(if nav == Nav::Previous {
         let mut b = b;
         b.style_mut().justify_self = Some(Align::Start);
-        b
+        b.into_div()
     } else {
-        b.justify_self_end()
+        b.justify_self(Align::End).into_div()
     })
 }
 
@@ -1310,8 +1351,8 @@ pub fn questionnaire_submit(label: &str) -> QuestionnaireNav {
 /// `button` as the form's reset (`type="reset"`): back to the default
 /// answers and the opening question, then the questionnaire's `on_reset`.
 #[must_use]
-pub fn questionnaire_reset(button: Div) -> Part<()> {
-    Part::new((), button, |p| {
+pub fn questionnaire_reset(button: impl Into<Div>) -> Part<()> {
+    Part::new((), button.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let q = use_questionnaire();

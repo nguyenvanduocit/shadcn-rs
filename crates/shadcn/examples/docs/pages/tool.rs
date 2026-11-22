@@ -33,7 +33,7 @@ fn ran(open: &Signal<bool>, failed: bool, title: &str, out: &str) -> Element {
 fn states(open: &[Signal<bool>; 2]) -> Div {
     let [status, dev] = open;
     trace()
-        .max_w(96.0)
+        .max_width(384.0)
         .child(ran(
             status,
             false,
@@ -302,8 +302,8 @@ impl Cleanup {
         let me = self.clone();
         let action = (!self.script.busy()).then(|| {
             button(ButtonVariant::Outline, ButtonSize::Sm)
-                .mt_auto()
-                .self_start()
+                .margin_top(Length::Auto)
+                .align_self(Align::Start)
                 .child(if asked { "Reset" } else { "Send message" })
                 .on_click(move |_| if asked { me.reset() } else { me.send() })
         });
@@ -386,14 +386,16 @@ impl FileRead {
                     sheet_content(SheetSide::Right)
                         .child(
                             sheet_header()
-                                .child(sheet_title(PATH).font_mono())
+                                .child(sheet_title(PATH).font_family(FontFamily::GEIST_MONO))
                                 .child(sheet_description(format!("{lines} lines"))),
                         )
-                        .child(code_block(p).mx(6.0).mb(6.0).w_auto().child(code_block_content(
-                            p,
-                            content,
-                            code_block_lines(PACKAGE_JSON),
-                        ))),
+                        .child(
+                            code_block(p)
+                                .margin_x(24.0)
+                                .margin_bottom(24.0)
+                                .width(Length::Auto)
+                                .child(code_block_content(p, content, code_block_lines(PACKAGE_JSON))),
+                        ),
                 ),
         )
     }
@@ -415,8 +417,8 @@ impl FileRead {
         let me = self.clone();
         let action = (!streaming).then(|| {
             button(ButtonVariant::Outline, ButtonSize::Sm)
-                .mt_auto()
-                .self_start()
+                .margin_top(Length::Auto)
+                .align_self(Align::Start)
                 .child(if asked { "Reset" } else { "Send message" })
                 .on_click(move |_| if asked { me.reset() } else { me.send() })
         });
@@ -442,8 +444,9 @@ pub fn render() -> Render {
         page(
             "Tool",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("ToolDemo.vue", commands.view()))
                 .child(demo("ToolStatesDemo.vue", states(&open_states)))
                 .child(demo("ToolApprovalDemo.vue", approval.view()))

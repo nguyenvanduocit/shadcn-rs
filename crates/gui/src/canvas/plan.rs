@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use super::{Aabb, Body, LOD_BOX, LOD_DROP, Placed, REANCHOR, WorldSnapshot, turn};
 use crate::color::Color;
-use crate::shape::{Path, PathStyle};
+use crate::figure::{Path, PathStyle};
 use crate::text::GlyphKey;
 
 /// Device pixels an em under which text is drawn as a grey bar.
@@ -258,8 +258,8 @@ impl Run {
 #[must_use]
 pub fn stroke_reach(style: &PathStyle) -> f64 {
     match &style.draw {
-        crate::shape::Draw::Stroke(s) => f64::from(s.width) * 0.5 * f64::from(s.miter_limit.max(1.0)),
-        crate::shape::Draw::Fill => 0.0,
+        crate::figure::Draw::Stroke(s) => f64::from(s.width) * 0.5 * f64::from(s.miter_limit.max(1.0)),
+        crate::figure::Draw::Fill => 0.0,
     }
 }
 

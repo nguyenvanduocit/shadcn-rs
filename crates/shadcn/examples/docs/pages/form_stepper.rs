@@ -137,49 +137,51 @@ pub fn render() -> Render {
         let step = stepper.get();
         let valid = fields.valid(step);
         let last = STEPS.len();
-        let header =
-            stepper_root()
-                .model(Model::bind(stepper))
-                .w_full()
-                .children(STEPS.map(|(n, title, description)| {
-                    stepper_item(n)
-                        .relative()
-                        .flex()
-                        .w_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .fill(move |item, d| {
-                            let t = theme();
-                            let active = item.state == StepState::Active;
-                            d.when(n != last, |d| d.child(line(item)))
-                                .child(trigger(item, step, valid))
-                                .child(
-                                    div()
-                                        .mt(5.0)
-                                        .flex_col()
-                                        .items_center()
-                                        .text_center()
-                                        // `text-sm lg:text-base`: the reference renders at desktop width.
-                                        .child(
-                                            stepper_title(title)
-                                                .text_base()
-                                                .font_semibold()
-                                                .when(active, |d| d.text_color(t.primary)),
-                                        )
-                                        // `text-xs lg:text-sm`; its `text-primary` loses to
-                                        // `text-muted-foreground` in the stylesheet's order.
-                                        .child(stepper_description(description).text_sm()),
-                                )
-                        })
-                }));
+        let header = stepper_root()
+            .model(Model::bind(stepper))
+            .width(pct(100.0))
+            .children(STEPS.map(|(n, title, description)| {
+                stepper_item(n)
+                    .position(Position::Relative)
+                    .display(Display::Flex)
+                    .width(pct(100.0))
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .align_items(Align::Center)
+                    .justify_content(Justify::Center)
+                    .fill(move |item, d| {
+                        let t = theme();
+                        let active = item.state == StepState::Active;
+                        d.when(n != last, |d| d.child(line(item)))
+                            .child(trigger(item, step, valid))
+                            .child(
+                                div()
+                                    .margin_top(20.0)
+                                    .display(Display::Flex)
+                                    .flex_direction(FlexDirection::Column)
+                                    .align_items(Align::Center)
+                                    .text_align(TextAlign::Center)
+                                    // `text-sm lg:text-base`: the reference renders at desktop width.
+                                    .child(
+                                        stepper_title(title)
+                                            .text_size(16.0)
+                                            .line_height(24.0)
+                                            .font_weight(600)
+                                            .when(active, |d| d.text_color(t.primary)),
+                                    )
+                                    // `text-xs lg:text-sm`; its `text-primary` loses to
+                                    // `text-muted-foreground` in the stylesheet's order.
+                                    .child(stepper_description(description).text_size(14.0).line_height(20.0)),
+                            )
+                    })
+            }));
         let body = match step {
             1 => field_group()
-                .mt(4.0)
+                .margin_top(16.0)
                 .child(text_input("Full Name", &fields.full_name, InputType::Text))
                 .child(text_input("Email", &fields.email, InputType::Text)),
             2 => field_group()
-                .mt(4.0)
+                .margin_top(16.0)
                 .child(text_input("Password", &fields.password, InputType::Password))
                 .child(text_input("Confirm Password", &fields.confirm, InputType::Password)),
             _ => {
@@ -190,13 +192,13 @@ pub fn render() -> Render {
                         .child(select_item("tea", "Tea"))
                         .child(select_item("soda", "Soda")),
                 );
-                field_group().mt(4.0).child(
+                field_group().margin_top(16.0).child(
                     field(FieldOrientation::Vertical, invalid)
                         .child(field_label("Drink"))
                         .child(form_control(
                             select()
                                 .model(fields.drink_select)
-                                .w_full()
+                                .width(pct(100.0))
                                 .child(select_value("Select a drink"))
                                 .child(drinks),
                             invalid,
@@ -230,19 +232,32 @@ pub fn render() -> Render {
         page(
             "Form (stepper)",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "StepperForm.vue",
-                    div().w_full().flex_col().child(header).child(body).child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .mt(4.0)
-                            .child(back)
-                            .child(div().flex().items_center().gap(3.0).child(forward)),
-                    ),
+                    div()
+                        .width(pct(100.0))
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .child(header)
+                        .child(body)
+                        .child(
+                            div()
+                                .display(Display::Flex)
+                                .align_items(Align::Center)
+                                .justify_content(Justify::Between)
+                                .margin_top(16.0)
+                                .child(back)
+                                .child(
+                                    div()
+                                        .display(Display::Flex)
+                                        .align_items(Align::Center)
+                                        .gap(12.0)
+                                        .child(forward),
+                                ),
+                        ),
                 ))
                 .child(toaster()),
         )

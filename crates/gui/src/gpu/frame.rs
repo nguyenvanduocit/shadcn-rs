@@ -32,10 +32,10 @@ use super::record;
 use super::words::Table;
 use super::{Extra, GpuRenderer, Op, SLUG, SlugKey, Texture, glyph_matrix, icon_parts, phys, push_op, radii, rgba};
 use crate::color::Color;
+use crate::figure::{Path, PathStyle};
 use crate::geometry::Bounds;
 use crate::image::Pixels;
 use crate::scene::{Changed, ChunkId, Clip, Drawn, Gradient, Item, Marks, PixelRect, Properties, Scene};
-use crate::shape::{Path, PathStyle};
 use crate::style::{Corners, Filter};
 use crate::text::gamma::MaskGamma;
 use crate::text::{GlyphKey, Glyphs};
@@ -48,11 +48,14 @@ const LAYER_BUDGET: usize = 64 << 20;
 /// This frame's tables: the clips, stops and curve glyphs paths and curve
 /// text read (drawn this frame only).
 pub(super) struct FrameData {
-    /// Four vec4s a clip; clip 0 is none.
+    /// Four vec4s a clip (rect, radii, the map into its space, then
+    /// `e, f`, its scale and its corners' curve); clip 0 is none.
     pub pclips: Vec<f32>,
     pclip_ids: foldhash::HashMap<(u32, u32), u32>,
     pub stops: Vec<f32>,
     pub slugs: Vec<f32>,
+    /// What lies below, read back by this frame's passes (`read.rs`).
+    pub reads: Vec<super::read::Read>,
 }
 
 impl Default for FrameData {
@@ -62,6 +65,7 @@ impl Default for FrameData {
             pclip_ids: foldhash::HashMap::default(),
             stops: Vec::new(),
             slugs: Vec::new(),
+            reads: Vec::new(),
         }
     }
 }
@@ -74,6 +78,7 @@ impl FrameData {
         self.pclip_ids.clear();
         self.stops.clear();
         self.slugs.clear();
+        self.reads.clear();
     }
 }
 
@@ -86,7 +91,7 @@ impl FrameData {
 pub(super) struct Tables {
     slot_states: Vec<[u32; 4]>,
     transforms: Vec<[f32; 2]>,
-    clips: Vec<[f32; 8]>,
+    clips: Vec<[f32; 12]>,
     effects: Vec<f32>,
     /// Where each table started when last laid out whole (vec4s), and the
     /// slots it was laid out for: entries are patched in place while the
@@ -118,7 +123,7 @@ impl Tables {
                 0,
                 n,
                 n.saturating_add(t),
-                n.saturating_add(t).saturating_add(c.saturating_mul(2)),
+                n.saturating_add(t).saturating_add(c.saturating_mul(3)),
             ],
             n,
         )
@@ -212,12 +217,12 @@ impl Tables {
         self.patch(table, at, &[offset[0].to_bits(), offset[1].to_bits(), 0, 0]);
     }
 
-    fn set_clip(&mut self, table: &mut Table, id: u32, clip: [f32; 8]) {
+    fn set_clip(&mut self, table: &mut Table, id: u32, clip: [f32; 12]) {
         let Some(c) = usize::try_from(id).ok().and_then(|i| self.clips.get_mut(i)) else {
             return;
         };
         *c = clip;
-        let at = self.base(2).map(|b| b.saturating_add(id.saturating_mul(2)));
+        let at = self.base(2).map(|b| b.saturating_add(id.saturating_mul(3)));
         self.patch(table, at, &clip.map(f32::to_bits));
     }
 
@@ -257,10 +262,24 @@ fn transform_entry(t: &crate::scene::TransformNode, s: f32) -> [f32; 2] {
     [t.offset.0 * s, t.offset.1 * s]
 }
 
-fn clip_table_entry(c: &crate::scene::ClipNode, s: f32) -> [f32; 8] {
+/// A clip's entry: its rectangle, its radii, and its corners' curve (three vec4s).
+fn clip_table_entry(c: &crate::scene::ClipNode, s: f32) -> [f32; 12] {
     let r = phys(c.clip.bounds.snapped(s), s);
-    let k = radii(c.clip.radius, s);
-    [r[0], r[1], r[2], r[3], k[0], k[1], k[2], k[3]]
+    let k = radii(c.clip.radius, c.clip.bounds, s);
+    [
+        r[0],
+        r[1],
+        r[2],
+        r[3],
+        k[0],
+        k[1],
+        k[2],
+        k[3],
+        c.clip.curve,
+        0.0,
+        0.0,
+        0.0,
+    ]
 }
 
 /// A text-through mask to draw: into chunk `chunk`'s mask `k`.
@@ -330,7 +349,7 @@ enum Entry {
 
 /// Where an entry is: the canvas's at a position, or in a layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Place {
+enum EntryAt {
     None,
     Root(usize),
     Layer(u32),
@@ -344,7 +363,7 @@ struct LayerPlan {
     content: u64,
     /// The layer it composites into (0: the canvas), and where its entry is.
     outer: u32,
-    place: Place,
+    place: EntryAt,
 }
 
 /// A frame's decisions, kept across frames: a frame planned from what
@@ -362,7 +381,7 @@ pub(super) struct Plan {
     chains: Vec<Vec<u32>>,
     members: Vec<Vec<usize>>,
     /// Where each chunk's entry is.
-    place: Vec<Place>,
+    place: Vec<EntryAt>,
     /// The chunks planned: their ids and states.
     ids: Vec<ChunkId>,
     states: Vec<crate::scene::State>,
@@ -508,7 +527,7 @@ fn hash_f(h: &mut DefaultHasher, v: &[f32]) {
     }
 }
 
-fn offset_of(props: &Properties, transform: u32, s: f32) -> (f32, f32) {
+pub(super) fn offset_of(props: &Properties, transform: u32, s: f32) -> (f32, f32) {
     let o = props.transform(transform).offset;
     (o.0 * s, o.1 * s)
 }
@@ -680,7 +699,7 @@ impl GpuRenderer {
             let route = self.route(scene, c, chain, &fx);
             routes.push(route);
             if route == Route::Skip {
-                place.push(Place::None);
+                place.push(EntryAt::None);
                 continue;
             }
             let mut outer = 0_u32;
@@ -690,11 +709,11 @@ impl GpuRenderer {
                     let at = match layers.get_mut(&outer) {
                         Some(o) if outer != 0 => {
                             o.entries.push(Entry::Layer(l));
-                            Place::Layer(outer)
+                            EntryAt::Layer(outer)
                         }
                         _ => {
                             root.push(Entry::Layer(l));
-                            Place::Root(root.len().saturating_sub(1))
+                            EntryAt::Root(root.len().saturating_sub(1))
                         }
                     };
                     layers.insert(
@@ -714,11 +733,11 @@ impl GpuRenderer {
             place.push(match layers.get_mut(&outer) {
                 Some(o) if outer != 0 => {
                     o.entries.push(Entry::Chunk(i));
-                    Place::Layer(outer)
+                    EntryAt::Layer(outer)
                 }
                 _ => {
                     root.push(Entry::Chunk(i));
-                    Place::Root(root.len().saturating_sub(1))
+                    EntryAt::Root(root.len().saturating_sub(1))
                 }
             });
         }
@@ -996,8 +1015,8 @@ impl GpuRenderer {
         let mut roots: Vec<usize> = Vec::new();
         for &i in &dirty {
             match plan.place.get(i) {
-                Some(Place::Root(k)) => roots.push(*k),
-                Some(Place::Layer(l)) => stale.push(*l),
+                Some(EntryAt::Root(k)) => roots.push(*k),
+                Some(EntryAt::Layer(l)) => stale.push(*l),
                 _ => {}
             }
         }
@@ -1006,7 +1025,7 @@ impl GpuRenderer {
         let mut k = 0;
         while let Some(&l) = moved.get(k) {
             k = k.saturating_add(1);
-            if let Some(Place::Layer(outer)) = plan.layers.get(&l).map(|lp| lp.place)
+            if let Some(EntryAt::Layer(outer)) = plan.layers.get(&l).map(|lp| lp.place)
                 && !stale.contains(&outer)
             {
                 stale.push(outer);
@@ -1026,7 +1045,7 @@ impl GpuRenderer {
             self.layer_content(scene, plan, l, 0);
         }
         for &l in &moved {
-            if let Some(Place::Root(k)) = plan.layers.get(&l).map(|lp| lp.place) {
+            if let Some(EntryAt::Root(k)) = plan.layers.get(&l).map(|lp| lp.place) {
                 roots.push(k);
             }
         }
@@ -1189,7 +1208,8 @@ impl GpuRenderer {
                 &mut h,
                 &[r[0] - origin.0, r[1] - origin.1, r[2] - origin.0, r[3] - origin.1],
             );
-            hash_f(&mut h, &radii(cn.clip.radius, s));
+            hash_f(&mut h, &radii(cn.clip.radius, cn.clip.bounds, s));
+            hash_f(&mut h, &[cn.clip.curve]);
         }
         h.finish()
     }
@@ -1291,7 +1311,8 @@ impl GpuRenderer {
                     &mut h,
                     &[k[0] - origin.0, k[1] - origin.1, k[2] - origin.0, k[3] - origin.1],
                 );
-                hash_f(&mut h, &radii(cn.clip.radius, s));
+                hash_f(&mut h, &radii(cn.clip.radius, cn.clip.bounds, s));
+                hash_f(&mut h, &[cn.clip.curve]);
             }
         }
         h.finish()
@@ -1383,6 +1404,21 @@ impl GpuRenderer {
                 let rects = self.damage(&plan, screen, whole, fresh);
                 (plan, rects)
             }
+        };
+        // A blurred backdrop on the canvas reads all of its box: damage
+        // that meets it holds it whole (`read.rs`).
+        let rects = if whole || self.blurring == 0 {
+            rects
+        } else {
+            let root: Vec<usize> = plan
+                .root
+                .iter()
+                .filter_map(|e| match e {
+                    Entry::Chunk(c) => Some(*c),
+                    Entry::Layer(_) => None,
+                })
+                .collect();
+            self.with_reads(scene, &root, rects)
         };
         let mut passes = self.mask_passes();
         if !rects.is_empty() {
@@ -1574,7 +1610,11 @@ impl GpuRenderer {
                     ),
                     Seg::Item(n) => {
                         if let Some(item) = usize::try_from(n).ok().and_then(|n| display.items.get(n)) {
-                            self.item_ops(&mut ops, item, scene.scale, (0.0, 0.0), visible, 0, 1.0, text);
+                            if matches!(item, Item::Backdrop { .. } | Item::Blended { .. }) {
+                                self.read_ops(&mut ops, item, scene.scale, (0.0, 0.0), slot, visible);
+                            } else {
+                                self.item_ops(&mut ops, item, scene.scale, (0.0, 0.0), visible, 0, 1.0, text);
+                            }
                         }
                     }
                 }
@@ -1621,7 +1661,6 @@ impl GpuRenderer {
         let band = h.min(max);
         let mut out = Pixels::new(w, h)?;
         let target = self.offscreen((w, band));
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut built = Built::default();
         let mut top = 0;
         while top < h {
@@ -1655,7 +1694,7 @@ impl GpuRenderer {
                 clear: Some(clear_color(scene.background)),
                 parts: vec![(None, ops)],
             });
-            self.submit(&passes, Some(&view));
+            self.submit(&passes, Some(&target));
             let part = self.read_back(&target, (w, band))?;
             let row = usize::try_from(w.saturating_mul(4)).ok()?;
             let start = usize::try_from(top).ok()?.saturating_mul(row);
@@ -1791,7 +1830,7 @@ impl GpuRenderer {
     }
 
     /// A record of this frame only: its instance.
-    fn transient_record(&mut self, words: &[u32]) -> Option<u32> {
+    pub(super) fn transient_record(&mut self, words: &[u32]) -> Option<u32> {
         let len = u32::try_from(words.len()).ok()?;
         let r = self.records.alloc(len);
         self.records.write(r.start, words);
@@ -1824,6 +1863,7 @@ impl GpuRenderer {
             ],
             radii: None,
             inner: None,
+            curve: None,
         }
         .push(&mut words);
         let at = self.transient_record(&words).unwrap_or(0);
@@ -1876,7 +1916,12 @@ impl GpuRenderer {
         let mut ops = Vec::new();
         let Some(c) = scene.chunks.get(i) else { return ops };
         let Some(k) = self.kept.get(&c.id) else { return ops };
-        let (segs, base, display) = (k.segs.clone(), k.index.map_or(0, |i| i.start), Arc::clone(&k.display));
+        let (segs, base, display, slot) = (
+            k.segs.clone(),
+            k.index.map_or(0, |i| i.start),
+            Arc::clone(&k.display),
+            k.slot,
+        );
         let fold = usize::try_from(c.state.effect)
             .ok()
             .and_then(|e| plan.fx.get(e))
@@ -1900,6 +1945,12 @@ impl GpuRenderer {
                             let Some(item) = usize::try_from(n).ok().and_then(|n| display.items.get(n)) else {
                                 continue;
                             };
+                            if matches!(item, Item::Backdrop { .. } | Item::Blended { .. }) {
+                                // Read in its box, whatever clips it: the
+                                // draw is clipped by its slot.
+                                self.read_ops(&mut ops, item, s, off, slot, visible);
+                                continue;
+                            }
                             let clip = *device.get_or_insert_with(|| self.pclip(props, s, c.state.clip, until));
                             let shown = props
                                 .clip(c.state.clip)
@@ -2045,6 +2096,24 @@ impl GpuRenderer {
                 .build();
                 self.push_path(ops, &path, &fill(*color), g, visible, device, local, alpha);
             }
+            Item::Superellipse {
+                outer,
+                outer_radius,
+                inner,
+                inner_radius,
+                k,
+                color,
+            } => {
+                let path = Path::superellipse_band(
+                    phys_bounds(*outer),
+                    scaled(*outer_radius),
+                    phys_bounds(*inner),
+                    scaled(*inner_radius),
+                    *k,
+                )
+                .build();
+                self.push_path(ops, &path, &fill(*color), g, visible, device, local, alpha);
+            }
             Item::Gradient {
                 bounds,
                 radius,
@@ -2101,7 +2170,14 @@ impl GpuRenderer {
                 self.push_path(ops, path, style, m, visible, device, local, alpha);
             }
             // An effect is drawn through its matrix only when it holds none of these.
-            Item::Shadow { .. } | Item::Image { .. } | Item::TextThrough { .. } | Item::Data(_) | Item::World(_) => {}
+            // A read is never drawn through a matrix: an effect over it takes a layer.
+            Item::Shadow { .. }
+            | Item::Image { .. }
+            | Item::TextThrough { .. }
+            | Item::Data(_)
+            | Item::World(_)
+            | Item::Backdrop { .. }
+            | Item::Blended { .. } => {}
         }
     }
 
@@ -2191,7 +2267,7 @@ impl GpuRenderer {
 
     /// Upload what changed and draw `passes` (into `external` where they say).
     #[expect(clippy::too_many_lines, reason = "a frame's uploads and passes, in order")]
-    fn submit(&mut self, passes: &[PassPlan], external: Option<&wgpu::TextureView>) {
+    fn submit(&mut self, passes: &[PassPlan], external: Option<&wgpu::Texture>) {
         let (device, queue) = (&self.device, &self.queue);
         let (mut bytes, bases) = self.tables.upload(&mut self.props, device, queue, self.slots.len());
         bytes = bytes
@@ -2242,6 +2318,7 @@ impl GpuRenderer {
             self.globals_shown = globals;
         }
         bytes = bytes.saturating_add(self.paths.upload(&self.device, &self.queue));
+        bytes = bytes.saturating_add(self.prepare_reads());
         self.refresh_bind_groups();
         let surface = if passes
             .iter()
@@ -2302,6 +2379,7 @@ impl GpuRenderer {
         } else {
             &self.pipelines.slug_banded
         };
+        let external_view = external.map(|t| t.create_view(&wgpu::TextureViewDescriptor::default()));
         for (i, pass) in passes.iter().enumerate() {
             let stamp = self.data.stamp(crate::chunk::runtime::Stamped::Main);
             let target = match pass.target {
@@ -2313,35 +2391,58 @@ impl GpuRenderer {
                     .and_then(|kept| kept.masks.get(usize::try_from(k).ok()?))
                     .map(|t| &t.view),
                 PassTarget::Blit | PassTarget::Surface => surface.as_ref(),
-                PassTarget::External => external,
+                PassTarget::External => external_view.as_ref(),
                 PassTarget::Tile(id) => self.data.store.texture(id).map(|t| &t.view),
             };
             let Some(target) = target else { continue };
+            // What a read copies from: the targets that can be read back.
+            let source = match pass.target {
+                PassTarget::Canvas => self.canvas.as_ref().map(|c| &c.texture),
+                PassTarget::Layer(l) => self.layers.get(&l).map(|c| &c.texture.texture),
+                PassTarget::External => external,
+                _ => None,
+            };
             let load = match pass.clear {
                 Some(c) => wgpu::LoadOp::Clear(c),
                 None => wgpu::LoadOp::Load,
             };
             let stamps = stamp.and_then(|at| Some((self.data.query_set()?, at)));
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gui pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                timestamp_writes: stamps.map(|(set, at)| wgpu::RenderPassTimestampWrites {
-                    query_set: set,
-                    beginning_of_pass_write_index: Some(at),
-                    end_of_pass_write_index: Some(at.saturating_add(1)),
-                }),
-                ..Default::default()
-            });
+            // A read ends the pass and begins it again: the first part
+            // stamps its start, the last its end.
+            let reads = pass
+                .parts
+                .iter()
+                .flat_map(|(_, ops)| ops)
+                .filter(|o| matches!(o, Op::Read(_)))
+                .count();
+            let begin = |encoder: &mut wgpu::CommandEncoder, load: wgpu::LoadOp<wgpu::Color>, part: usize| {
+                encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("gui pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: target,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        timestamp_writes: stamps.filter(|_| part == 0 || part == reads).map(|(set, at)| {
+                            wgpu::RenderPassTimestampWrites {
+                                query_set: set,
+                                beginning_of_pass_write_index: (part == 0).then_some(at),
+                                end_of_pass_write_index: (part == reads).then(|| at.saturating_add(1)),
+                            }
+                        }),
+                        ..Default::default()
+                    })
+                    .forget_lifetime()
+            };
+            let mut part = 0_usize;
+            let mut rp = Some(begin(&mut encoder, load, part));
             if matches!(pass.target, PassTarget::Blit) {
-                if let Some(c) = &self.canvas {
+                if let (Some(c), Some(rp)) = (&self.canvas, rp.as_mut()) {
                     rp.set_pipeline(&self.pipelines.blit);
                     rp.set_bind_group(0, &c.blit, &[]);
                     rp.draw(0..3, 0..1);
@@ -2350,6 +2451,7 @@ impl GpuRenderer {
             }
             let offset = pass_offset(i);
             for (scissor, ops) in &pass.parts {
+                let mut clipped = None;
                 if let Some(r) = scissor {
                     let (w, h) = (
                         i32::try_from(pass.size.0).unwrap_or(i32::MAX),
@@ -2368,12 +2470,34 @@ impl GpuRenderer {
                     if sw == 0 || sh == 0 {
                         continue;
                     }
-                    rp.set_scissor_rect(x, y, sw, sh);
+                    clipped = Some((x, y, sw, sh));
+                    if let Some(rp) = rp.as_mut() {
+                        rp.set_scissor_rect(x, y, sw, sh);
+                    }
                 }
                 // Which pipeline is bound: switched only when the next draw needs another.
                 let mut bound: Option<u8> = None;
                 let mut extra_bound: Option<Extra> = None;
                 for d in ops {
+                    if let Op::Read(k) = d {
+                        // The pass ends (its draws are what is below), the
+                        // read is copied and blurred, and it goes on over
+                        // what it drew.
+                        drop(rp.take());
+                        if let Some(source) = source {
+                            self.encode_read(&mut encoder, source, *k, pass.origin, pass.size, *scissor);
+                        }
+                        part = part.saturating_add(1);
+                        let mut again = begin(&mut encoder, wgpu::LoadOp::Load, part);
+                        if let Some((x, y, w, h)) = clipped {
+                            again.set_scissor_rect(x, y, w, h);
+                        }
+                        rp = Some(again);
+                        bound = None;
+                        extra_bound = None;
+                        continue;
+                    }
+                    let Some(rp) = rp.as_mut() else { continue };
                     match d {
                         Op::Quads { extra, instances } => {
                             let Some(g) = &self.bind_groups.quad else { continue };
@@ -2397,6 +2521,7 @@ impl GpuRenderer {
                                         .get(id)
                                         .and_then(|kept| kept.masks.get(usize::try_from(*k).ok()?))
                                         .map_or(&self.blank.bind, |t| &t.bind),
+                                    Extra::Read(k) => self.reads.texture(*k).map_or(&self.blank.bind, |t| &t.bind),
                                 };
                                 rp.set_bind_group(1, group, &[]);
                                 extra_bound = Some(*extra);
@@ -2431,10 +2556,11 @@ impl GpuRenderer {
                             extra_bound = None;
                         }
                         Op::Data(d) => {
-                            self.data.replay(&mut rp, *d, offset);
+                            self.data.replay(rp, *d, offset);
                             bound = None;
                             extra_bound = None;
                         }
+                        Op::Read(_) => {}
                     }
                 }
             }
@@ -2626,7 +2752,6 @@ impl GpuRenderer {
             let m = glyph_matrix(&key, 8.0, 56.0, None);
             gpu.push_slug(&mut ops, text, &key, m, Color::BLACK, 1.0, 0, 0);
             let target = gpu.offscreen((64, 64));
-            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
             let banded = gpu.banded_ok;
             gpu.banded_ok = Some(!full);
             gpu.submit(
@@ -2637,7 +2762,7 @@ impl GpuRenderer {
                     clear: Some(wgpu::Color::WHITE),
                     parts: vec![(None, ops)],
                 }],
-                Some(&view),
+                Some(&target),
             );
             gpu.banded_ok = banded;
             gpu.read_back(&target, (64, 64)).map(|p| p.data().to_vec())
@@ -2669,7 +2794,7 @@ fn clear_color(background: Option<Color>) -> wgpu::Color {
 /// with `g`, in the space `g` maps to the target; its id.
 pub(super) fn clip_entry(clips: &mut Vec<f32>, c: Clip, s: f32, g: Option<[f32; 6]>) -> u32 {
     let rect = phys(c.bounds.snapped(s), s);
-    let r = radii(c.radius, s);
+    let r = radii(c.radius, c.bounds, s);
     let (map, scale) = match g {
         None => (IDENTITY, 1.0),
         Some(g) => (path::invert(g).unwrap_or([0.0; 6]), path::scales(g).0),
@@ -2678,7 +2803,7 @@ pub(super) fn clip_entry(clips: &mut Vec<f32>, c: Clip, s: f32, g: Option<[f32; 
     clips.extend_from_slice(&rect);
     clips.extend_from_slice(&r);
     clips.extend_from_slice(&[map[0], map[1], map[2], map[3]]);
-    clips.extend_from_slice(&[map[4], map[5], scale, 0.0]);
+    clips.extend_from_slice(&[map[4], map[5], scale, c.curve]);
     id
 }
 

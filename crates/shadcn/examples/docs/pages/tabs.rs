@@ -8,7 +8,11 @@ use shadcn::{
 use crate::{Render, Shot, demo, page};
 
 fn field(name: &str, field: &TextField) -> gui::Div {
-    div().grid().gap(3.0).child(label(name)).child(input().field(*field))
+    div()
+        .display(Display::Grid)
+        .gap(12.0)
+        .child(label(name))
+        .child(input().field(*field))
 }
 
 pub fn render() -> Render {
@@ -21,51 +25,57 @@ pub fn render() -> Render {
             "Tabs",
             demo(
                 "TabsDemo.vue",
-                div().flex_col().w_full().max_w_px(384.0).gap(6.0).child(
-                    tabs()
-                        .default_value("account")
-                        .child(
-                            tabs_list()
-                                .child(tabs_trigger("account").child("Account"))
-                                .child(tabs_trigger("password").child("Password")),
-                        )
-                        .child(
-                            tabs_content("account").child(
-                                card()
-                                    .child(card_header().child(card_title("Account")).child(card_description(
-                                        "Make changes to your account here. Click save when you're done.",
-                                    )))
-                                    .child(
-                                        card_content()
-                                            .grid()
-                                            .gap(6.0)
-                                            .child(field("Name", &name))
-                                            .child(field("Username", &username)),
-                                    )
-                                    .child(card_footer().child(
-                                        button(ButtonVariant::Default, ButtonSize::Default).child("Save changes"),
-                                    )),
+                div()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .width(pct(100.0))
+                    .max_width(384.0)
+                    .gap(24.0)
+                    .child(
+                        tabs()
+                            .default_value("account")
+                            .child(
+                                tabs_list()
+                                    .child(tabs_trigger("account").child("Account"))
+                                    .child(tabs_trigger("password").child("Password")),
+                            )
+                            .child(
+                                tabs_content("account").child(
+                                    card()
+                                        .child(card_header().child(card_title("Account")).child(card_description(
+                                            "Make changes to your account here. Click save when you're done.",
+                                        )))
+                                        .child(
+                                            card_content()
+                                                .display(Display::Grid)
+                                                .gap(24.0)
+                                                .child(field("Name", &name))
+                                                .child(field("Username", &username)),
+                                        )
+                                        .child(card_footer().child(
+                                            button(ButtonVariant::Default, ButtonSize::Default).child("Save changes"),
+                                        )),
+                                ),
+                            )
+                            .child(
+                                tabs_content("password").child(
+                                    card()
+                                        .child(card_header().child(card_title("Password")).child(card_description(
+                                            "Change your password here. After saving, you'll be logged out.",
+                                        )))
+                                        .child(
+                                            card_content()
+                                                .display(Display::Grid)
+                                                .gap(24.0)
+                                                .child(field("Current password", &current))
+                                                .child(field("New password", &new)),
+                                        )
+                                        .child(card_footer().child(
+                                            button(ButtonVariant::Default, ButtonSize::Default).child("Save password"),
+                                        )),
+                                ),
                             ),
-                        )
-                        .child(
-                            tabs_content("password").child(
-                                card()
-                                    .child(card_header().child(card_title("Password")).child(card_description(
-                                        "Change your password here. After saving, you'll be logged out.",
-                                    )))
-                                    .child(
-                                        card_content()
-                                            .grid()
-                                            .gap(6.0)
-                                            .child(field("Current password", &current))
-                                            .child(field("New password", &new)),
-                                    )
-                                    .child(card_footer().child(
-                                        button(ButtonVariant::Default, ButtonSize::Default).child("Save password"),
-                                    )),
-                            ),
-                        ),
-                ),
+                    ),
             ),
         )
     })

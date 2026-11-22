@@ -74,25 +74,31 @@ impl StepperContext {
 /// The row (or column) of steps.
 #[must_use]
 pub fn stepper() -> Part<StepperProps> {
-    Part::new(StepperProps::default(), div().named("stepper").flex().gap(2.0), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            provide(StepperContext {
-                props,
-                step: use_model(props, |p| &p.props.step),
-            });
-            move || {
-                props
-                    .with(|p| {
-                        p.slot
-                            .0
-                            .clone()
-                            .when(p.props.orientation == Orientation::Vertical, Styled::flex_col)
-                    })
-                    .into_element()
-            }
-        })
-    })
+    Part::new(
+        StepperProps::default(),
+        div().named("stepper").display(Display::Flex).gap(8.0),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                provide(StepperContext {
+                    props,
+                    step: use_model(props, |p| &p.props.step),
+                });
+                move || {
+                    props
+                        .with(|p| {
+                            p.slot
+                                .0
+                                .clone()
+                                .when(p.props.orientation == Orientation::Vertical, |e| {
+                                    e.display(Display::Flex).flex_direction(FlexDirection::Column)
+                                })
+                        })
+                        .into_element()
+                }
+            })
+        },
+    )
 }
 
 impl Part<StepperProps> {
@@ -162,7 +168,11 @@ struct ItemContext {
 /// depends on its state goes in through [`fill`](Part::fill).
 #[must_use]
 pub fn stepper_item(step: usize) -> Part<StepperItemProps> {
-    let root = div().named("stepper-item").flex().items_center().gap(2.0);
+    let root = div()
+        .named("stepper-item")
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0);
     Part::new(StepperItemProps { step, fill: None }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -207,20 +217,20 @@ pub fn stepper_trigger() -> Part<()> {
     stepper_trigger_as(
         div()
             .named("stepper-trigger")
-            .p(1.0)
-            .flex()
-            .flex_col()
-            .items_center()
-            .text_center()
-            .gap(1.0)
-            .rounded_md(),
+            .padding(4.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .align_items(Align::Center)
+            .text_align(TextAlign::Center)
+            .gap(4.0)
+            .radius(8.0),
     )
 }
 
 /// `child` made the trigger of its item's step (`as-child`), as a button is in the demos.
 #[must_use]
-pub fn stepper_trigger_as(child: Div) -> Part<()> {
-    Part::new((), child, |p| {
+pub fn stepper_trigger_as(child: impl Into<Div>) -> Part<()> {
+    Part::new((), child.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let stepper = use_context::<StepperContext>();
@@ -245,16 +255,17 @@ pub fn stepper_indicator(item: StepperItem) -> Div {
     let t = theme();
     let d = div()
         .named("stepper-indicator")
-        .inline_flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
+        .display(Display::Flex)
+        .inline(true)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(9999.0)
         .text_color(t.muted_foreground.opacity(0.5))
-        .w(8.0)
-        .h(8.0);
+        .width(32.0)
+        .height(32.0);
     let d = match item.state {
-        StepState::Active => d.bg(t.primary).text_color(t.primary_foreground),
-        StepState::Completed => d.bg(t.accent).text_color(t.accent_foreground),
+        StepState::Active => d.background(t.primary).text_color(t.primary_foreground),
+        StepState::Completed => d.background(t.accent).text_color(t.accent_foreground),
         StepState::Inactive => d,
     };
     d.when(!item.reachable, |d| d.text_color(t.muted_foreground).opacity(0.5))
@@ -266,7 +277,7 @@ pub fn stepper_separator(item: StepperItem) -> Div {
     let t = theme();
     div()
         .named("stepper-separator")
-        .bg(if item.state == StepState::Completed {
+        .background(if item.state == StepState::Completed {
             t.accent
         } else {
             t.muted
@@ -277,7 +288,7 @@ pub fn stepper_separator(item: StepperItem) -> Div {
 #[must_use]
 pub fn stepper_title(title: impl Into<String>) -> gui::Text {
     // `text-md` is no Tailwind size, so the inherited size stands.
-    text(title).named("stepper-title").font_semibold().whitespace_nowrap()
+    text(title).named("stepper-title").font_weight(600).nowrap(true)
 }
 
 #[must_use]
@@ -285,6 +296,7 @@ pub fn stepper_description(description: impl Into<String>) -> gui::Text {
     let t = theme();
     text(description)
         .named("stepper-description")
-        .text_xs()
+        .text_size(12.0)
+        .line_height(16.0)
         .text_color(t.muted_foreground)
 }

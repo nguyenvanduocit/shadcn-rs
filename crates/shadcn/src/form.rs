@@ -17,8 +17,10 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use gui::element::Node;
+use gui::prelude::*;
 use gui::{Div, Fluent, FocusHandle, Signal, Styled, TextField, div, text, watch};
 
+use crate::focus::StateLook;
 use crate::focus::destructive_ring;
 use crate::label::label;
 use crate::theme::theme;
@@ -304,7 +306,7 @@ pub fn form_reset(fields: &[&dyn FormEntry]) {
 /// One field of a form: its parts stacked.
 #[must_use]
 pub fn form_item() -> Div {
-    div().named("form-item").grid().gap(2.0)
+    div().named("form-item").display(Display::Grid).gap(8.0)
 }
 
 /// The field's name, destructive while it is `invalid`.
@@ -328,8 +330,12 @@ impl<K> FormControl for Node<K> {
     fn invalid(self, invalid: bool) -> Self {
         let t = theme();
         self.when(invalid, |c| {
-            c.border_color(t.destructive)
-                .focus_visible(move |s| destructive_ring(s, &t).border_color(t.destructive))
+            c.border_color(t.destructive).with_interaction(|c, i| {
+                c.ring_while(
+                    move || i.focus_visible(),
+                    &destructive_ring(gui::Style::default(), &t).border_color(t.destructive),
+                )
+            })
         })
     }
 }
@@ -364,7 +370,8 @@ pub fn form_description(description: impl Into<String>) -> Div {
     div()
         .named("form-description")
         .text_color(t.muted_foreground)
-        .text_sm()
+        .text_size(14.0)
+        .line_height(20.0)
         .child(text(description))
 }
 
@@ -376,7 +383,8 @@ pub fn form_message(error: Option<&str>) -> Option<Div> {
         div()
             .named("form-message")
             .text_color(t.destructive)
-            .text_sm()
+            .text_size(14.0)
+            .line_height(20.0)
             .child(text(e))
     })
 }

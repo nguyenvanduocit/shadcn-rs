@@ -22,7 +22,7 @@ use crate::events::{ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
 use crate::gpu::GpuRenderer;
 use crate::heap;
 use crate::inspect::{self, Footprint, FrameReport, LayoutDiff, Spread, Timings, ms};
-use crate::interact::{self, ImeTarget, Interaction, Outcome};
+use crate::interact::{self, ImeTarget, InputState, Outcome};
 use crate::layout::{Frame, LayoutTree, layout};
 use crate::mailbox;
 use crate::motion::Motion;
@@ -75,7 +75,7 @@ pub struct Pipeline {
     resend: bool,
     /// The frame HUD as last painted, drawn over every commit until the next.
     hud: Option<Scene>,
-    interaction: Interaction,
+    input_state: InputState,
     /// The changes of the last frame that changed something.
     diff: LayoutDiff,
     frames: u64,
@@ -163,7 +163,7 @@ impl Pipeline {
             commits: 0,
             resend: false,
             hud: None,
-            interaction: Interaction::default(),
+            input_state: InputState::default(),
             diff: LayoutDiff::default(),
             frames: 0,
             causes: Vec::new(),
@@ -206,7 +206,7 @@ impl Pipeline {
 
     #[must_use]
     pub fn cursor(&self) -> Cursor {
-        self.interaction.cursor(self.tree.frame())
+        self.input_state.cursor(self.tree.frame())
     }
 
     /// What a screen reader must be told of the last frame, laid out at
@@ -266,7 +266,7 @@ impl Pipeline {
 
     /// Where an input method may type in the last frame, if anywhere.
     pub fn ime_target(&mut self) -> Option<ImeTarget> {
-        self.interaction.ime_target(self.tree.frame(), &mut self.text)
+        self.input_state.ime_target(self.tree.frame(), &mut self.text)
     }
 
     /// Route `input`, which arrived while `presented` was on screen, to
@@ -274,10 +274,10 @@ impl Pipeline {
     /// since its commit is hit where the screen showed it.
     pub fn input_shown(&mut self, input: Input, presented: &Presented) -> Outcome {
         self.refresh();
-        self.interaction
+        self.input_state
             .set_shift(interact::shift_of(self.tree.frame(), presented));
         let out = self.input(input);
-        self.interaction.set_shift(Vec::new());
+        self.input_state.set_shift(Vec::new());
         out
     }
 
@@ -288,23 +288,23 @@ impl Pipeline {
         self.refresh();
         let (f, t) = (self.tree.frame(), &mut self.text);
         let mut out = match input {
-            Input::PointerMoved { x, y } => self.interaction.pointer_moved(f, t, x, y),
-            Input::PointerLeft => self.interaction.pointer_left(f),
-            Input::MouseDown { x, y } => self.interaction.mouse_down(f, t, x, y),
-            Input::MouseUp { x, y } => self.interaction.mouse_up(f, x, y),
-            Input::SecondaryDown { x, y } => self.interaction.secondary_down(f, x, y),
+            Input::PointerMoved { x, y } => self.input_state.pointer_moved(f, t, x, y),
+            Input::PointerLeft => self.input_state.pointer_left(f),
+            Input::MouseDown { x, y } => self.input_state.mouse_down(f, t, x, y),
+            Input::MouseUp { x, y } => self.input_state.mouse_up(f, x, y),
+            Input::SecondaryDown { x, y } => self.input_state.secondary_down(f, x, y),
             Input::Wheel { dx, dy } => {
                 // A scroll moves every box under it: the next input (the
                 // next wheel step included) reaches them where they are now.
-                let out = self.interaction.wheel(f, dx, dy);
+                let out = self.input_state.wheel(f, dx, dy);
                 self.stale |= out.redraw;
                 out
             }
-            Input::Key(ev) => self.interaction.key(f, t, &ev),
-            Input::Ime(ev) => self.interaction.ime(f, &ev),
-            Input::Act(request) => self.interaction.act(f, t, &request),
+            Input::Key(ev) => self.input_state.key(f, t, &ev),
+            Input::Ime(ev) => self.input_state.ime(f, &ev),
+            Input::Act(request) => self.input_state.act(f, t, &request),
             Input::Modifiers(m) => {
-                self.interaction.set_modifiers(m);
+                self.input_state.set_modifiers(m);
                 Outcome::default()
             }
         };
@@ -329,7 +329,7 @@ impl Pipeline {
             return;
         }
         self.dirty = true;
-        self.interaction.sync_focus();
+        self.input_state.sync_focus(&self.tree);
         reactive::begin_frame();
         self.lay_out();
     }
@@ -367,7 +367,7 @@ impl Pipeline {
         }
         let (size, state, motion, text, tree) = (
             self.size,
-            self.interaction.state(),
+            self.input_state.state(),
             &mut self.motion,
             &mut self.text,
             &mut self.tree,
@@ -416,13 +416,17 @@ impl Pipeline {
         let thread_before = heap::thread();
         clock::begin_frame(begin.present_at);
         reactive::begin_frame();
-        if self.interaction.apply_scroll(self.tree.frame(), &begin.scroll) {
+        if self.input_state.apply_scroll(self.tree.frame(), &begin.scroll) {
             self.causes.push("compositor scroll".to_owned());
         }
-        self.interaction.sync_focus();
-        self.interaction.set_scale(scale);
+        self.input_state.sync_focus(&self.tree);
+        self.input_state.set_scale(scale);
         self.stale = false;
         let timings = self.lay_out();
+        // What the frame allocated before paint records it: the input
+        // state taken in, the bindings run, the tree laid out.
+        let built = heap::thread();
+
         if self.cold_check {
             self.check_cold();
         }
@@ -436,8 +440,10 @@ impl Pipeline {
             self.tree.frame(),
             self.trackers.paint,
         );
-        let mut commit = reactive::in_phase(reactive::Phase::Paint, false, || {
-            paint.track(|| painter.record(frame, text, size, scale, Color::WHITE, full))
+        let (mut commit, recorded) = heap::measure(|| {
+            reactive::in_phase(reactive::Phase::Paint, false, || {
+                paint.track(|| painter.record(frame, text, size, scale, Color::WHITE, full))
+            })
         });
         let shaped = self.text.take_shaped();
         if self.cold_check {
@@ -467,13 +473,13 @@ impl Pipeline {
         commit.full = full;
         commit.glyphs = self.text.glyph_update(full);
         let overlay = self.overlays(size, scale);
-        target.commit(commit, overlay);
+        let ((), committed) = heap::measure(|| target.commit(commit, overlay));
         let t3 = Instant::now();
         let vsync = target.waited();
         self.text.end_frame();
         // The boxes under a resting pointer may have changed.
         if self.visits.placed > 0 {
-            self.dirty = self.interaction.rehover(self.tree.frame(), &mut self.text).redraw;
+            self.dirty = self.input_state.rehover(self.tree.frame(), &mut self.text).redraw;
         }
         let drawn = target.drawn();
         self.held = target.held();
@@ -482,6 +488,9 @@ impl Pipeline {
         footprint.thread = heap::thread()
             .zip(thread_before)
             .map(|(after, before)| after.since(before));
+        footprint.built = built.zip(thread_before).map(|(after, before)| after.since(before));
+        footprint.recorded = recorded;
+        footprint.committed = committed;
         FrameReport {
             number: self.frames,
             causes,
@@ -567,7 +576,7 @@ impl Pipeline {
             &root,
             self.size.0,
             self.size.1,
-            self.interaction.state(),
+            self.input_state.state(),
             &mut motion,
             &mut self.text,
         );
@@ -616,6 +625,9 @@ impl Pipeline {
             graph: reactive::graph(),
             heap: heap::now(),
             thread: None,
+            built: None,
+            recorded: None,
+            committed: None,
         }
     }
 
@@ -658,7 +670,7 @@ impl Pipeline {
     /// The overlay for the last frame, `size` physical pixels at `scale`.
     fn overlay_scene(&mut self, size: (u32, u32), scale: f32) -> Scene {
         let hovered = self
-            .interaction
+            .input_state
             .pointer()
             .and_then(|(x, y)| interact::hit(self.tree.frame(), x, y))
             .and_then(|i| self.tree.frame().nodes.get(i));
@@ -1500,7 +1512,7 @@ impl Scenario {
     /// without the UI, which takes the scroll in with its next frame.
     /// Whether anything scrolled.
     pub fn wheel(&mut self, dy: f32) -> bool {
-        let at = self.pipeline.interaction.pointer().unwrap_or_default();
+        let at = self.pipeline.input_state.pointer().unwrap_or_default();
         self.headless.wheel(at, (0.0, dy), clock::current_seconds())
     }
 
@@ -1615,6 +1627,7 @@ mod tests {
     use super::*;
     use crate::element::{div, text};
     use crate::geometry::Bounds;
+    use crate::prelude::*;
     use crate::scene::Item;
     use crate::styled::Styled;
 
@@ -1629,10 +1642,10 @@ mod tests {
                     // holds: two layers at once.
                     div()
                         .opacity(0.5)
-                        .bg(Color::BLACK)
-                        .child(div().opacity(0.5).bg(Color::WHITE).child(text("nested")))
+                        .background(Color::BLACK)
+                        .child(div().opacity(0.5).background(Color::WHITE).child(text("nested")))
                 });
-                div().size_full().child(groups).into_element()
+                div().size(pct(100.0)).child(groups).into_element()
             },
             200,
             100,
@@ -1652,11 +1665,18 @@ mod tests {
     /// a scaled group they keep their fractions, so a zoom moves them smoothly.
     #[test]
     fn only_untransformed_boxes_snap_to_device_pixels() {
-        let box_at = || div().ml(10.3).mt(4.6).w_px(20.2).h_px(8.0).bg(Color::BLACK);
+        let box_at = || {
+            div()
+                .margin_left(41.2)
+                .margin_top(18.4)
+                .width(20.2)
+                .height(8.0)
+                .background(Color::BLACK)
+        };
         let mut s = Scenario::measuring(
             move || {
                 div()
-                    .size_full()
+                    .size(pct(100.0))
                     .child(box_at())
                     .child(div().scale(1.37).child(box_at()))
                     .into_element()
@@ -1708,8 +1728,13 @@ mod tests {
 
     #[test]
     fn the_hud_is_four_lines_that_fit_a_small_window() {
-        let mut s = Scenario::measuring(|| div().size_full().child(text("hello")).into_element(), 480, 320, 1.0)
-            .expect("a scenario");
+        let mut s = Scenario::measuring(
+            || div().size(pct(100.0)).child(text("hello")).into_element(),
+            480,
+            320,
+            1.0,
+        )
+        .expect("a scenario");
         let report = s.frame("one").expect("a frame");
         let mut history = History::default();
         history.push(&report);

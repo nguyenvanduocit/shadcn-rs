@@ -35,8 +35,8 @@ use crate::color::Color;
 use crate::element::{Div, Element, IntoElement, Role, div, icon, text};
 use crate::events::DragPhase;
 use crate::icon::Icon;
+use crate::prelude::*;
 use crate::reactive::Signal;
-use crate::styled::{Fluent, Styled, UNIT};
 
 /// The title bar's height, logical pixels (sctk-adwaita's header).
 pub const HEADER: f32 = 35.0;
@@ -284,17 +284,17 @@ fn framed(c: &Chrome, caption: &Rc<RefCell<Caption>>, actions: &Actions, app: El
     let p = Palette::of(c.dark, c.active);
     let floating = !c.maximized && !c.fullscreen;
     let content = div()
-        .absolute()
-        .top_len(crate::styled::px(if c.fullscreen { 0.0 } else { HEADER }))
+        .position(Position::Absolute)
+        .top(if c.fullscreen { 0.0 } else { HEADER })
         .left(0.0)
         .right(0.0)
         .bottom(0.0)
-        .overflow_hidden()
+        .overflow(Overflow::Hidden)
         .child(app);
     div()
-        .relative()
-        .size_full()
-        .when(floating, |d| d.border_w(BORDER).border_color(p.border))
+        .position(Position::Relative)
+        .size(pct(100.0))
+        .when(floating, |d| d.border(BORDER).border_color(p.border))
         .child(content)
         .when(!c.fullscreen, |d| d.child(bar(c, &p, caption, actions)))
         .into_element()
@@ -308,21 +308,25 @@ fn push(actions: &Actions, action: WindowAction) {
 fn bar(c: &Chrome, p: &Palette, caption: &Rc<RefCell<Caption>>, actions: &Actions) -> Div {
     let buttons = if c.resizable { 3.0 } else { 2.0 };
     // The title keeps clear of the buttons on both sides, so it stays centred.
-    let reserve = (buttons * BUTTON + (buttons - 1.0) * BUTTON_SPACING + 2.0 * BUTTON_MARGIN) / UNIT;
+    let reserve = buttons * BUTTON + (buttons - 1.0) * BUTTON_SPACING + 2.0 * BUTTON_MARGIN;
     let title = div()
-        .absolute()
+        .position(Position::Absolute)
         .inset(0.0)
-        .flex()
-        .items_center()
-        .justify_center()
-        .pl(reserve)
-        .pr(reserve)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .padding_left(reserve)
+        .padding_right(reserve)
         .child(
             text(c.title.clone())
                 .text_color(p.title)
-                .text_size(14.0, 20.0)
-                .font_bold()
-                .truncate(),
+                .text_size(14.0)
+                .line_height(20.0)
+                .font_weight(700)
+                .truncate(true)
+                .nowrap(true)
+                .overflow_x(Overflow::Hidden)
+                .min_width(0.0),
         );
     let (maximize, maximize_label) = if c.maximized {
         (Icon::Copy, "Restore")
@@ -330,11 +334,11 @@ fn bar(c: &Chrome, p: &Palette, caption: &Rc<RefCell<Caption>>, actions: &Action
         (Icon::Square, "Maximize")
     };
     let controls = div()
-        .relative()
-        .flex()
-        .items_center()
-        .gap(BUTTON_SPACING / UNIT)
-        .pr(BUTTON_MARGIN / UNIT)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(BUTTON_SPACING)
+        .padding_right(BUTTON_MARGIN)
         // A press here is a button's, never the bar's move or double click.
         .on_mouse_down(|_| {})
         .on_drag(|_| {})
@@ -352,15 +356,15 @@ fn bar(c: &Chrome, p: &Palette, caption: &Rc<RefCell<Caption>>, actions: &Action
     let (down, drag, menu) = (Rc::clone(caption), Rc::clone(caption), Rc::clone(caption));
     let (a_down, a_drag, a_menu) = (Rc::clone(actions), Rc::clone(actions), Rc::clone(actions));
     div()
-        .absolute()
+        .position(Position::Absolute)
         .top(0.0)
         .left(0.0)
         .right(0.0)
-        .h_px(HEADER)
-        .bg(p.bar)
-        .flex()
-        .items_center()
-        .justify_end()
+        .height(HEADER)
+        .background(p.bar)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::End)
         .on_mouse_down(move |e| {
             if let Some(a) = down.borrow_mut().press(clock::current_seconds(), e.x, e.y) {
                 push(&a_down, a);
@@ -385,16 +389,17 @@ fn bar(c: &Chrome, p: &Palette, caption: &Rc<RefCell<Caption>>, actions: &Action
 
 /// A round window button showing `glyph`, asking `action` when clicked.
 fn button(glyph: Icon, label: &str, action: WindowAction, p: &Palette, actions: &Actions) -> Div {
-    let hover = p.button_hover;
+    let (rest, hover) = (p.button, p.button_hover);
     let actions = Rc::clone(actions);
+    let i = crate::interact::Interaction::new();
     div()
-        .size_px(BUTTON)
-        .rounded_full()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(p.button)
-        .hover(move |s| s.bg(hover))
+        .interaction(i)
+        .size(BUTTON)
+        .radius(9999.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .background(move || if i.hovered() { hover } else { rest })
         .role(Role::Button)
         .aria_label(label)
         .on_click(move |_| push(&actions, action))
@@ -503,7 +508,7 @@ mod tests {
     fn the_title_bar_moves_maximizes_and_closes_the_window() {
         let chrome = Signal::new(floating());
         let actions = Actions::default();
-        let app = || div().size_full().child(text("content")).into_element();
+        let app = || div().size(pct(100.0)).child(text("content")).into_element();
         let made = crate::app::Scenario::measuring(decorate(chrome, Rc::clone(&actions), app), 400, 300, 1.0);
         let Ok(mut s) = made else {
             eprintln!("no GPU: skipped");
@@ -570,7 +575,7 @@ mod tests {
             client: false,
             ..floating()
         });
-        let app = || div().size_full().child(text("content")).into_element();
+        let app = || div().size(pct(100.0)).child(text("content")).into_element();
         let made = crate::app::Scenario::measuring(decorate(chrome, Actions::default(), app), 400, 300, 1.0);
         let Ok(mut s) = made else {
             eprintln!("no GPU: skipped");

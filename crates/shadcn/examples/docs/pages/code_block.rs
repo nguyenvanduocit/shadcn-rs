@@ -2,8 +2,9 @@ mod stream;
 
 use gui::prelude::*;
 use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, span, text};
+use shadcn::focus::StateLook;
 use shadcn::{
-    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockLine, CodeBlockLineVariant, CodeBlockProps,
+    Button, ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockLine, CodeBlockLineVariant, CodeBlockProps,
     CodeBlockSize, CodeBlockVariant, MessageProps, TraceStatus, button, code_block, code_block_actions,
     code_block_content, code_block_copy_button, code_block_floating_actions, code_block_footer, code_block_header,
     code_block_lines, code_block_title, highlighted_lines, message, message_content, tabs, tabs_content, tabs_list,
@@ -214,7 +215,7 @@ Error: listen EADDRINUSE: address already in use :::3000
 
 /// `w-full max-w-md`.
 fn frame() -> Div {
-    div().w_full().max_w(112.0)
+    div().width(pct(100.0)).max_width(448.0)
 }
 
 fn with_header(p: CodeBlockProps) -> CodeBlockProps {
@@ -275,19 +276,24 @@ fn header(p: CodeBlockProps, glyph: Option<Icon>, title: &str, actions: Vec<Elem
 }
 
 /// The wrap toggle: `aria-pressed:text-foreground`.
-fn wrap_button(wrap: &Signal<bool>) -> Div {
+fn wrap_button(wrap: &Signal<bool>) -> Button {
     let toggle = *wrap;
     button(ButtonVariant::Ghost, ButtonSize::IconXs)
         .named("wrap-lines")
-        .when(wrap.get(), |b| b.text_color(theme().foreground))
-        .child(icon(Icon::WrapText).size(3.0))
+        .when(wrap.get(), |b| {
+            // Over the ghost button's rest: its hover text stays over it.
+            let i = b.interaction();
+            b.text_color(theme().foreground)
+                .text_color_while(move || i.hovered(), theme().accent_foreground)
+        })
+        .child(icon(Icon::WrapText).size(12.0))
         .on_click(move |_| toggle.update(|w| *w = !*w))
 }
 
 /// The download button. Vue saves the code as a file; `gui` has no way to
 /// save one yet, so it is drawn and takes focus but saves nothing.
-fn download_button() -> Div {
-    button(ButtonVariant::Ghost, ButtonSize::IconXs).child(icon(Icon::Download).size(3.0))
+fn download_button() -> Button {
+    button(ButtonVariant::Ghost, ButtonSize::IconXs).child(icon(Icon::Download).size(12.0))
 }
 
 /// `output` without its ANSI escapes (`/\x1B\[[\d;]*m/g`), as the copy button copies it.
@@ -336,11 +342,21 @@ fn show_more(expanded: &Signal<bool>, scroll: bool) -> Div {
     let content = code_block_content(p, numbered(), highlighted_lines(CHAT_COMPONENT, "vue"));
     let content = match (open, scroll) {
         (false, _) => {
-            let mut c = content.max_h(64.0).scroll_fade();
+            let mut c = content.max_height(256.0).mask(ScrollFade {
+                axis: Axis::Vertical,
+                start: true,
+                end: true,
+                size: None,
+            });
             c.style_mut().overflow_y = gui::style::Overflow::Hidden;
             c
         }
-        (true, true) => content.max_h(96.0).scroll_fade(),
+        (true, true) => content.max_height(384.0).mask(ScrollFade {
+            axis: Axis::Vertical,
+            start: true,
+            end: true,
+            size: None,
+        }),
         (true, false) => content,
     };
     let toggle = *expanded;
@@ -354,7 +370,7 @@ fn show_more(expanded: &Signal<bool>, scroll: bool) -> Div {
             ))
             .child(content)
             .child(
-                code_block_footer(p).justify_center().child(
+                code_block_footer(p).justify_content(Justify::Center).child(
                     button(ButtonVariant::Ghost, ButtonSize::Xs)
                         .child(icon(Icon::ChevronDown).rotate(if open { 180.0 } else { 0.0 }))
                         .child(if open { "Show less" } else { "Show more" })
@@ -382,7 +398,7 @@ fn ran(open: &Signal<bool>, failed: bool, title: &str, output: &str) -> gui::Ele
         .model(Model::bind(*open))
         .child(trace_collapsible_trigger(failed, line))
         .child(trace_collapsible_content().map_root(|c| {
-            c.child(code_block(p).child(code_block_content(p, wrapped(), code_block_lines(output)).max_h(64.0)))
+            c.child(code_block(p).child(code_block_content(p, wrapped(), code_block_lines(output)).max_height(256.0)))
         }))
         .into_element()
 }
@@ -392,39 +408,42 @@ fn ran(open: &Signal<bool>, failed: bool, title: &str, output: &str) -> gui::Ele
 fn typeset_code(code: &str, size: f32) -> gui::Span {
     let em = 0.85 * size;
     span(code)
-        .font_mono()
-        .text_size(em, em)
-        .bg(theme().muted)
-        .rounded((gui::styled::RADIUS * 0.6).min(0.35 * em))
-        .px(0.3 * em / gui::styled::UNIT)
-        .py(0.125 * em / gui::styled::UNIT)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(em)
+        .line_height(em)
+        .background(theme().muted)
+        .radius((10.0_f32 * 0.6).min(0.35 * em))
+        .padding_x(0.3 * em)
+        .padding_y(0.125 * em)
 }
 
 /// `CodeBlockTypesetDemo`: `.typeset` at 16px, its heading, prose with
 /// inline code, and a code block placed in the flow.
 fn typeset() -> Div {
     const SIZE: f32 = 16.0;
-    let flow = 1.25 * SIZE / gui::styled::UNIT;
+    let flow = 1.25 * SIZE;
     let p = with_header(CodeBlockProps::default());
-    let prose = |d: gui::Text| d.leading_px(1.75 * SIZE);
+    let prose = |d: gui::Text| d.line_height(1.75 * SIZE);
     frame()
-        .text_size(SIZE, 1.75 * SIZE)
+        .text_size(SIZE)
+        .line_height(1.75 * SIZE)
         .child(
             text("Stream a response")
-                .text_size(1.125 * SIZE, 1.125 * SIZE * 1.45)
-                .font_semibold(),
+                .text_size(1.125 * SIZE)
+                .line_height(1.125 * SIZE * 1.45)
+                .font_weight(600),
         )
         .child(
             prose(text("Create a server route that calls "))
                 .span(typeset_code("streamText", SIZE))
                 .span(" and returns the stream to the client.")
                 // `h3 + *`: the heading owns `1em` below it.
-                .mt(SIZE / gui::styled::UNIT),
+                .margin_top(SIZE),
         )
         .child(
             code_block(p)
                 // A component in the flow takes the flow above it, in its own `text-sm`.
-                .mt(1.25 * 14.0 / gui::styled::UNIT)
+                .margin_top(1.25 * 14.0)
                 .child(header(
                     p,
                     Some(Icon::FileCode),
@@ -443,7 +462,7 @@ fn typeset() -> Div {
                 .span(" class from ")
                 .span(typeset_code("@ai-sdk/vue", SIZE))
                 .span(" reads the stream on the client and renders the answer while it is written.")
-                .mt(flow),
+                .margin_top(flow),
         )
 }
 
@@ -508,11 +527,12 @@ pub fn render() -> Render {
         page(
             "Code block",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "CodeBlockHeaderDemo.vue",
-                    div().w_full().max_w(112.0).child(titled(
+                    div().width(pct(100.0)).max_width(448.0).child(titled(
                         d,
                         Some(Icon::Terminal),
                         "Terminal",
@@ -555,8 +575,9 @@ pub fn render() -> Render {
                 .child(demo(
                     "CodeBlockSizeDemo.vue",
                     frame()
-                        .flex_col()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
                         .child(titled(
                             d,
                             Some(Icon::Terminal),
@@ -577,8 +598,9 @@ pub fn render() -> Render {
                 .child(demo(
                     "CodeBlockWrapDemo.vue",
                     frame()
-                        .flex_col()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
                         .child(code_block(d).child(code_block_content(d, plain(), code_block_lines(TOO_LARGE))))
                         .child(code_block(d).child(code_block_content(d, wrapped(), code_block_lines(TOO_LARGE)))),
                 ))
@@ -603,7 +625,7 @@ pub fn render() -> Render {
                 .child(demo("CodeBlockDemo.vue", {
                     let p = with_header(d);
                     let wrap = s.wrap.get();
-                    div().w_full().max_w(128.0).child(
+                    div().width(pct(100.0)).max_width(512.0).child(
                         code_block(p)
                             .child(header(
                                 p,
@@ -676,8 +698,13 @@ pub fn render() -> Render {
                             ))
                             .child(
                                 code_block_content(p, plain(), code_block_lines(&logs))
-                                    .max_h(48.0)
-                                    .scroll_fade(),
+                                    .max_height(192.0)
+                                    .mask(ScrollFade {
+                                        axis: Axis::Vertical,
+                                        start: true,
+                                        end: true,
+                                        size: None,
+                                    }),
                             ),
                     )
                 }))
@@ -695,8 +722,9 @@ pub fn render() -> Render {
                 .child(demo(
                     "CodeBlockLanguagesDemo.vue",
                     frame()
-                        .flex_col()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
                         .children(SAMPLES.map(|(language, title, code)| {
                             titled(d, None, title, None, plain(), highlighted_lines(code, language))
                         })),
@@ -704,14 +732,16 @@ pub fn render() -> Render {
                 .child(demo("CodeBlockChatDemo.vue", {
                     let p = MessageProps::default();
                     frame()
-                        .flex_col()
-                        .gap(4.0)
-                        .text_sm()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .child(user_turn("How do I stream a response?"))
                         .child(
                             message(p).child(
                                 message_content(p)
-                                    .gap(3.0)
+                                    .gap(12.0)
                                     .child(text("Create a server route that returns the stream:"))
                                     .child(titled(
                                         d,
@@ -731,8 +761,8 @@ pub fn render() -> Render {
                     "CodeBlockTabsDemo.vue",
                     tabs()
                         .default_value("route")
-                        .w_full()
-                        .max_w(112.0)
+                        .width(pct(100.0))
+                        .max_width(448.0)
                         .child(tabs_list().children(FILES.map(|(value, title, _, _)| {
                             tabs_trigger(value).child(title.rsplit('/').next().unwrap_or(title))
                         })))
@@ -758,10 +788,12 @@ pub fn render() -> Render {
                 .child(demo(
                     "CodeBlockRTLDemo.vue",
                     frame()
-                        .flex_col()
-                        .gap(3.0)
-                        .text_sm()
-                        .dir_rtl()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(12.0)
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .direction(Direction::Rtl)
                         .child(text("ثبّت الحزم، ثم شغّل خادم التطوير."))
                         .child(titled(
                             d,

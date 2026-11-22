@@ -34,7 +34,7 @@ pub fn render() -> Render {
         let account_menu = dropdown_menu().child(dropdown_menu_trigger(open("Open"))).child(
             dropdown_menu_content()
                 .align(SideAlign::Start)
-                .w(56.0)
+                .width(224.0)
                 .child(dropdown_menu_label("My Account", false))
                 .child(
                     dropdown_menu_group()
@@ -71,7 +71,7 @@ pub fn render() -> Render {
         let checkbox_menu = dropdown_menu().child(dropdown_menu_trigger(open("Checkboxes"))).child(
             dropdown_menu_content()
                 .align(SideAlign::Start)
-                .w(56.0)
+                .width(224.0)
                 .child(
                     dropdown_menu_group()
                         .child(dropdown_menu_label("Account", false))
@@ -94,7 +94,7 @@ pub fn render() -> Render {
         let radio_menu = dropdown_menu().child(dropdown_menu_trigger(open("Radio Group"))).child(
             dropdown_menu_content()
                 .align(SideAlign::Start)
-                .w(56.0)
+                .width(224.0)
                 .child(dropdown_menu_label("Panel Position", true))
                 .child(
                     dropdown_menu_group().child(
@@ -110,16 +110,17 @@ pub fn render() -> Render {
         page(
             "Dropdown Menu",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo("DropdownMenuDemo.vue", account_menu))
                 .child(section(
                     "Checkboxes, radio group",
                     div()
-                        .flex()
-                        .flex_wrap()
-                        .items_start()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .flex_wrap(true)
+                        .align_items(Align::Start)
+                        .gap(16.0)
                         .child(checkbox_menu)
                         .child(radio_menu),
                 ))
@@ -132,7 +133,8 @@ pub fn render() -> Render {
                             panel.get()
                         )
                     })
-                    .text_sm()
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .text_color(t.muted_foreground),
                 ),
         )

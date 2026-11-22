@@ -207,7 +207,7 @@ fn terminal_demo(turn: &Signal<Turn>, folds: &[Follow], script: &Script) -> Div 
 
 fn error_demo(open: &Signal<bool>) -> Div {
     trace()
-        .max_w(96.0)
+        .max_width(384.0)
         .child(
             trace_line(None)
                 .child(trace_icon(icon(Icon::Terminal)))
@@ -236,8 +236,9 @@ pub fn render() -> Render {
         page(
             "Terminal",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("TerminalDemo.vue", terminal_demo(&turn, &folds, &script)))
                 .child(demo("TerminalErrorDemo.vue", error_demo(&lint))),
         )

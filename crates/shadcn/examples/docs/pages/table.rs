@@ -165,7 +165,7 @@ fn data_table(dt: &DataTable) -> Div {
                         .checked(all_state)
                         .on_change(move |on| select(&set, &ids, on)),
                 )
-                .pr(0.0)
+                .padding_right(0.0)
                 .into_element()
             }
             Column::Status => table_head("Status").into_element(),
@@ -175,12 +175,12 @@ fn data_table(dt: &DataTable) -> Div {
                     button(ButtonVariant::Ghost, ButtonSize::Default)
                         .on_click(move |_| sorted.update(|s| *s = Some(*s == Some(false))))
                         .child("Email")
-                        .child(icon(Icon::ArrowUpDown).ml(2.0).size(4.0)),
+                        .child(icon(Icon::ArrowUpDown).margin_left(8.0).size(16.0)),
                 )
-                .items_start()
+                .align_items(Align::Start)
                 .into_element()
             }
-            Column::Amount => table_head(div().text_right().child("Amount")).into_element(),
+            Column::Amount => table_head(div().text_align(TextAlign::Right).child("Amount")).into_element(),
             Column::Actions => table_head(Element::Empty).into_element(),
         }
     };
@@ -196,23 +196,29 @@ fn data_table(dt: &DataTable) -> Div {
                         .checked(dt.is_selected(id))
                         .on_change(move |on| select(&set, &[id], on)),
                 )
-                .pr(0.0)
-                .items_start()
+                .padding_right(0.0)
+                .align_items(Align::Start)
                 .into_element()
             }
             Column::Status => table_cell(capitalize(status)).into_element(),
             Column::Email => table_cell(email.to_lowercase()).into_element(),
-            Column::Amount => table_cell(div().text_right().font_medium().child(dollars(amount))).into_element(),
+            Column::Amount => table_cell(
+                div()
+                    .text_align(TextAlign::Right)
+                    .font_weight(500)
+                    .child(dollars(amount)),
+            )
+            .into_element(),
             Column::Actions => {
                 let menu_for = |name: &'static str| dropdown_menu_item(name, MenuItem::default()).child(name);
                 table_cell(
                     dropdown_menu()
                         .child(dropdown_menu_trigger(
                             button(ButtonVariant::Ghost, ButtonSize::Default)
-                                .h(8.0)
-                                .w(8.0)
-                                .p(0.0)
-                                .child(icon(Icon::Ellipsis).size(4.0)),
+                                .height(32.0)
+                                .width(32.0)
+                                .padding(0.0)
+                                .child(icon(Icon::Ellipsis).size(16.0)),
                         ))
                         .child(
                             dropdown_menu_content()
@@ -230,7 +236,7 @@ fn data_table(dt: &DataTable) -> Div {
                                 .child(menu_for("View payment details")),
                         ),
                 )
-                .items_start()
+                .align_items(Align::Start)
                 .into_element()
             }
         }
@@ -239,7 +245,14 @@ fn data_table(dt: &DataTable) -> Div {
     let body = if page.is_empty() {
         // A row and a cell across every column (`colspan`, `h-24 text-center`), not `TableEmpty`.
         let span = u16::try_from(tracks.len()).unwrap_or(u16::MAX);
-        vec![table_row(&tracks, false).child(table_cell("No results.").col_span(span).h(24.0).text_center())]
+        vec![
+            table_row(&tracks, false).child(
+                table_cell("No results.")
+                    .grid_column_span(span)
+                    .height(96.0)
+                    .text_align(TextAlign::Center),
+            ),
+        ]
     } else {
         page.iter()
             .map(|&i| {
@@ -253,20 +266,25 @@ fn data_table(dt: &DataTable) -> Div {
     let can_next = start.saturating_add(PAGE_SIZE) < rows.len();
     let (prev, next) = (dt.page, dt.page);
     div()
-        .w_full()
+        .width(pct(100.0))
         .child(
             div()
-                .flex()
-                .items_center()
-                .py(4.0)
-                .child(input().field(dt.filter).max_w_px(384.0).placeholder("Filter emails..."))
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .padding_y(16.0)
+                .child(
+                    input()
+                        .field(dt.filter)
+                        .max_width(384.0)
+                        .placeholder("Filter emails..."),
+                )
                 .child(
                     dropdown_menu()
-                        .ml_auto()
+                        .margin_left(Length::Auto)
                         .child(dropdown_menu_trigger(
                             button(ButtonVariant::Outline, ButtonSize::Default)
                                 .child("Columns")
-                                .child(icon(Icon::ChevronDown).ml(2.0).size(4.0)),
+                                .child(icon(Icon::ChevronDown).margin_left(8.0).size(16.0)),
                         ))
                         .child(dropdown_menu_content().align(SideAlign::End).children(
                             hideable.map(|(name, shown)| {
@@ -276,7 +294,7 @@ fn data_table(dt: &DataTable) -> Div {
                 ),
         )
         .child(
-            div().rounded_md().border().border_color(t.border).child(
+            div().radius(8.0).border(1.0).border_color(t.border).child(
                 table()
                     .child(table_header([
                         table_row(&tracks, false).children(columns.iter().map(|&c| head(c)))
@@ -286,22 +304,29 @@ fn data_table(dt: &DataTable) -> Div {
         )
         .child(
             div()
-                .flex()
-                .items_center()
-                .justify_end()
-                .gap(2.0)
-                .py(4.0)
-                .child(div().flex_1().text_sm().text_color(t.muted_foreground).child(format!(
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .justify_content(Justify::End)
+                .gap(8.0)
+                .padding_y(16.0)
+                .child(
+                    div()
+                        .flex(Flex::grow(1.0))
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .text_color(t.muted_foreground)
+                        .child(format!(
                             "{} of {} row(s) selected.",
                             rows.iter()
                                 .filter(|&&i| PAYMENTS.get(i).is_some_and(|p| dt.is_selected(p.0)))
                                 .count(),
                             rows.len()
-                        )))
+                        )),
+                )
                 .child(
                     div()
-                        .flex()
-                        .gap(2.0)
+                        .display(Display::Flex)
+                        .gap(8.0)
                         .child(
                             button(ButtonVariant::Outline, ButtonSize::Sm)
                                 .disabled(!can_prev)
@@ -330,21 +355,21 @@ pub fn render() -> Render {
                 .child(table_head("Invoice"))
                 .child(table_head("Status"))
                 .child(table_head("Method"))
-                .child(table_head("Amount").text_right())])
+                .child(table_head("Amount").text_align(TextAlign::Right))])
         };
         let invoices = |selected: Option<&str>| {
             table()
                 .child(header())
                 .child(table_body(INVOICES.map(|(invoice, status, method, amount)| {
                     table_row(&cols, selected == Some(invoice))
-                        .child(table_cell(invoice).font_medium())
+                        .child(table_cell(invoice).font_weight(500))
                         .child(table_cell(status))
                         .child(table_cell(method))
-                        .child(table_cell(amount).text_right())
+                        .child(table_cell(amount).text_align(TextAlign::Right))
                 })))
                 .child(table_footer([table_row(&cols, false)
-                    .child(table_cell("Total").col_span(3))
-                    .child(table_cell("$2,500.00").text_right())]))
+                    .child(table_cell("Total").grid_column_span(3))
+                    .child(table_cell("$2,500.00").text_align(TextAlign::Right))]))
                 .child(table_caption("A list of your recent invoices."))
         };
         let empty = table()
@@ -353,21 +378,22 @@ pub fn render() -> Render {
         page(
             "Table",
             gui::div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("DataTableDemo.vue", data_table(&payments)))
                 .child(demo("TableDemo.vue", invoices(None)))
                 .child(
                     gui::div()
-                        .flex()
-                        .items_start()
-                        .gap(8.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Start)
+                        .gap(32.0)
                         .child(
                             gui::div()
-                                .flex_1()
+                                .flex(Flex::grow(1.0))
                                 .child(section("INV003 selected", invoices(Some("INV003")))),
                         )
-                        .child(gui::div().flex_1().child(section("Empty", empty))),
+                        .child(gui::div().flex(Flex::grow(1.0)).child(section("Empty", empty))),
                 ),
         )
     })

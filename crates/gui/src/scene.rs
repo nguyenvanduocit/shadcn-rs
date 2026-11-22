@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::color::Color;
+use crate::figure::{Path, PathStyle};
 use crate::geometry::Bounds;
 use crate::icon::Icon;
 use crate::image::ImageSource;
 use crate::image::Pixels;
 use crate::inspect::Raster;
-use crate::shape::{Path, PathStyle};
-use crate::style::{Corners, Filter, Shadow};
+use crate::style::{Corners, Shadow};
 use crate::text::Glyphs;
 
 /// One frame: chunks painted in order over `background`, under the states
@@ -271,7 +271,7 @@ pub struct ClipNode {
 pub struct EffectNode {
     pub parent: u32,
     pub opacity: f32,
-    pub filters: Vec<Filter>,
+    pub filters: crate::style::Filters,
     /// A gradient whose alpha scales the group's, before filters (window,
     /// logical).
     pub mask: Option<Gradient>,
@@ -292,7 +292,7 @@ impl Default for EffectNode {
         Self {
             parent: 0,
             opacity: 1.0,
-            filters: Vec::new(),
+            filters: crate::style::Filters::new(),
             mask: None,
             transform: 0,
             transformed: false,
@@ -303,12 +303,24 @@ impl Default for EffectNode {
 }
 
 /// A rounded rectangle an item paints inside: an ancestor's clip, its
-/// bounds as laid out (snapped to device pixels when painted) and its
-/// inner corners.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// bounds as laid out (snapped to device pixels when painted), its inner
+/// corners and their curve (the ancestor's shape's, CSS's
+/// `superellipse(k)`; 1 is round).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Clip {
     pub bounds: Bounds,
     pub radius: Corners,
+    pub curve: f32,
+}
+
+impl Default for Clip {
+    fn default() -> Self {
+        Self {
+            bounds: Bounds::default(),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        }
+    }
 }
 
 /// One primitive, in its chunk's paint space.
@@ -331,10 +343,25 @@ pub enum Item {
         inner_radius: Corners,
         color: Color,
     },
-    /// A box shadow cast by `bounds` (snapped), drawn only outside it, as CSS does.
+    /// A box whose corners curve as CSS's `superellipse(k)` (a
+    /// [`crate::shape::Shape::Superellipse`]), filled, or with `inner`
+    /// (same curve) cut out: a border, a ring. Radii are used values.
+    Superellipse {
+        outer: Bounds,
+        outer_radius: Corners,
+        /// Empty fills the whole outer box.
+        inner: Bounds,
+        inner_radius: Corners,
+        k: f32,
+        color: Color,
+    },
+    /// A box shadow cast by `bounds` (snapped), drawn only outside it, as
+    /// CSS does; the box's corners curve as `curve` (CSS's
+    /// `superellipse(k)`, 1 round), and so do the shadow's.
     Shadow {
         bounds: Bounds,
         radius: Corners,
+        curve: f32,
         shadow: Shadow,
     },
     /// `gradient` filling a rounded rectangle.
@@ -360,11 +387,38 @@ pub enum Item {
         x: i32,
         y: i32,
     },
-    /// An image covering `bounds` (snapped), centred, inside rounded corners.
+    /// An image covering `bounds` (snapped), centred, inside corners of
+    /// radii `radius` curving as `curve`.
     Image {
         source: ImageSource,
         bounds: Bounds,
         radius: Corners,
+        curve: f32,
+    },
+    /// What lies below `bounds` in its target (the canvas, or the layer of
+    /// the nearest effect drawn aside: Filter Effects 2's backdrop root),
+    /// blurred and saturated, shown inside the box's corners (radii
+    /// `radius`, curve `curve`): CSS's `backdrop-filter`. The blur reads
+    /// only the box, its edges mirrored, as Chrome's does.
+    Backdrop {
+        bounds: Bounds,
+        radius: Corners,
+        curve: f32,
+        backdrop: crate::shape::Backdrop,
+    },
+    /// What lies between two boxes of one curve (a border), in `color`
+    /// blended with what lies below by `blend` (CSS's `mix-blend-mode`,
+    /// separable, in the target's encoded values as browsers blend). A
+    /// [`crate::shape::Blend::Normal`] one is a [`Item::Band`].
+    Blended {
+        outer: Bounds,
+        outer_radius: Corners,
+        /// Empty paints the whole outer box.
+        inner: Bounds,
+        inner_radius: Corners,
+        curve: f32,
+        color: Color,
+        blend: crate::shape::Blend,
     },
     /// A vector path painted with `style`, its coordinates (logical) from
     /// `origin`: rasterized on the GPU (ADR-0017).
@@ -410,8 +464,10 @@ impl Item {
             Self::Rect { bounds, .. } | Self::RoundedRect { bounds, .. } | Self::Gradient { bounds, .. } => {
                 phys(*bounds, 1.0)
             }
-            Self::Image { bounds, .. } => phys(*bounds, 1.0),
-            Self::Band { outer, .. } => phys(*outer, 1.0),
+            Self::Image { bounds, .. } | Self::Backdrop { bounds, .. } => phys(*bounds, 1.0),
+            Self::Band { outer, .. } | Self::Superellipse { outer, .. } | Self::Blended { outer, .. } => {
+                phys(*outer, 1.0)
+            }
             Self::Shadow { bounds, shadow, .. } => {
                 let shape = bounds.translated(shadow.x, shadow.y).outset(shadow.spread);
                 if shape.is_empty() {
@@ -436,8 +492,8 @@ impl Item {
                 // A stroke reaches half its width out, a mitred join as far
                 // as its limit lets it.
                 let w = match &style.draw {
-                    crate::shape::Draw::Stroke(s) => s.width * 0.5 * s.miter_limit.max(1.0),
-                    crate::shape::Draw::Fill => 0.0,
+                    crate::figure::Draw::Stroke(s) => s.width * 0.5 * s.miter_limit.max(1.0),
+                    crate::figure::Draw::Fill => 0.0,
                 };
                 let b = Bounds {
                     x: x0 + origin.0 - w,

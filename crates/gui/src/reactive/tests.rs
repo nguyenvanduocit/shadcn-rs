@@ -1405,3 +1405,23 @@ fn a_timer_set_again_by_an_owned_timer_is_owned_and_ends_with_its_scope() {
     crate::clock::advance_to(std::time::Duration::from_millis(100));
     assert_eq!(ticks.get(), 3, "no timer outlives its scope");
 }
+
+/// A scope that owned many signals leaves no room behind in its freed slot:
+/// kept, such lists spread over the free slots as they are reused, and the
+/// heap keeps them.
+#[test]
+fn a_disposed_owner_leaves_no_list_in_its_slot() {
+    for _ in 0..3 {
+        let scope = Scope::detached();
+        scope.run(|| {
+            for i in 0..1000_u32 {
+                let _ = Signal::new(i);
+            }
+        });
+        scope.dispose();
+        let small = Scope::detached();
+        small.run(|| Signal::new(0_u32));
+        small.dispose();
+    }
+    assert_eq!(runtime::with(|rt| rt.free_owned_capacity()), 0);
+}

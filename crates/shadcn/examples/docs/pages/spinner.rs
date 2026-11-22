@@ -26,15 +26,17 @@ pub fn render() -> Render {
         page(
             "Spinner",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo(
                     "SpinnerBasic.vue",
                     div()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap(8.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Center)
+                        .justify_content(Justify::Center)
+                        .gap(32.0)
                         .child(spinner()),
                 ))
                 .child(demo(
@@ -47,53 +49,57 @@ pub fn render() -> Render {
                 .child(demo(
                     "SpinnerSizeDemo.vue",
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(6.0)
-                        .child(spinner().size(3.0))
-                        .child(spinner().size(4.0))
-                        .child(spinner().size(6.0))
-                        .child(spinner().size(8.0)),
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(24.0)
+                        .child(spinner().size(12.0))
+                        .child(spinner().size(16.0))
+                        .child(spinner().size(24.0))
+                        .child(spinner().size(32.0)),
                 ))
                 .child(demo(
                     "SpinnerColorDemo.vue",
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(6.0)
-                        .children(COLORS.map(|(l, c, h)| spinner().size(6.0).text_color(Color::oklch(l, c, h)))),
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(24.0)
+                        .children(COLORS.map(|(l, c, h)| spinner().size(24.0).text_color(Color::oklch(l, c, h)))),
                 ))
                 .child(demo(
                     "SpinnerBadgeDemo.vue",
                     div()
-                        .flex()
-                        .items_center()
-                        .gap(4.0)
-                        .radius_var(19.2)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .gap(16.0)
                         .child(badge(BadgeVariant::Default).child(spinner()).child("Syncing"))
                         .child(badge(BadgeVariant::Secondary).child(spinner()).child("Updating"))
                         .child(badge(BadgeVariant::Outline).child(spinner()).child("Processing")),
                 ))
                 .child(demo(
                     "SpinnerButtonDemo.vue",
-                    div().flex_col().items_center().gap(4.0).children(
-                        [
-                            (ButtonVariant::Default, "Loading..."),
-                            (ButtonVariant::Outline, "Please wait"),
-                            (ButtonVariant::Secondary, "Processing"),
-                        ]
-                        .map(|(variant, label)| {
-                            button(variant, ButtonSize::Sm)
-                                .disabled(true)
-                                .child(spinner())
-                                .child(label)
-                        }),
-                    ),
+                    div()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Center)
+                        .gap(16.0)
+                        .children(
+                            [
+                                (ButtonVariant::Default, "Loading..."),
+                                (ButtonVariant::Outline, "Please wait"),
+                                (ButtonVariant::Secondary, "Processing"),
+                            ]
+                            .map(|(variant, label)| {
+                                button(variant, ButtonSize::Sm)
+                                    .disabled(true)
+                                    .child(spinner())
+                                    .child(label)
+                            }),
+                        ),
                 ))
                 .child(demo(
                     "SpinnerEmptyDemo.vue",
                     empty()
-                        .w_full()
+                        .width(pct(100.0))
                         .child(
                             empty_header()
                                 // The spinner keeps its own `size-4` on the tile.
@@ -109,11 +115,12 @@ pub fn render() -> Render {
                 .child(demo(
                     "SpinnerInputGroupDemo.vue",
                     div()
-                        .flex()
-                        .w_full()
-                        .max_w_px(448.0)
-                        .flex_col()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .width(pct(100.0))
+                        .max_width(448.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
                         .child(
                             input_group(
                                 input_group_input(&message)
@@ -134,7 +141,7 @@ pub fn render() -> Render {
                                     .child("Validating...")
                                     .button(
                                         input_group_button(ButtonVariant::Default, InputGroupButtonSize::Xs)
-                                            .ml_auto()
+                                            .margin_left(Length::Auto)
                                             .child(icon(Icon::ArrowUp)),
                                     ),
                             ),
@@ -143,23 +150,29 @@ pub fn render() -> Render {
                 .child(demo(
                     "SpinnerItemDemo.vue",
                     div()
-                        .flex()
-                        .w_full()
-                        .max_w_px(448.0)
-                        .flex_col()
-                        .gap(4.0)
-                        .radius_var(16.0)
+                        .display(Display::Flex)
+                        .width(pct(100.0))
+                        .max_width(448.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(16.0)
+                        // `--radius: 1rem`: the item (`rounded-md`), its media
+                        // (`rounded-sm`) and its button (`rounded-md`) follow it.
                         .child(
                             item(ItemVariant::Outline, ItemSize::Default)
-                                .child(item_media(ItemMediaVariant::Icon).child(spinner()))
+                                .radius(16.0 * 0.8)
+                                .child(item_media(ItemMediaVariant::Icon).radius(16.0 * 0.6).child(spinner()))
                                 .child(
                                     item_content()
                                         .child(item_title("Downloading..."))
                                         .child(item_description("129 MB / 1000 MB")),
                                 )
                                 .child(
-                                    item_actions()
-                                        .child(button(ButtonVariant::Outline, ButtonSize::Sm).child("Cancel")),
+                                    item_actions().child(
+                                        button(ButtonVariant::Outline, ButtonSize::Sm)
+                                            .radius(16.0 * 0.8)
+                                            .child("Cancel"),
+                                    ),
                                 )
                                 .child(item_footer().child(progress(75.0))),
                         ),

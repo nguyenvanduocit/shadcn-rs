@@ -27,6 +27,9 @@ svgtypes = "0.16"
 # `GlobalAlloc` wrapper, since the workspace forbids `unsafe`.
 smelt-perf = "0.3"
 taffy = "0.15"
+# Shadows, filters and grid tracks are kept inline in a node's style, so a
+# binding that writes them allocates nothing (ADR-0022).
+smallvec = { version = "1", features = ["const_generics", "const_new"] }
 # Layout's thread pool (ADR-0014): dirty subtrees lay out as parallel jobs.
 rayon = "1"
 # Without `wayland-csd-adwaita`: on Wayland, when the compositor leaves the

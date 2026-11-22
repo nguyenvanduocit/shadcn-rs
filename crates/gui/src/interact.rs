@@ -12,7 +12,8 @@ use crate::element::{InputMode, InputType};
 use crate::events::{ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey};
 use crate::focus::{self, FocusId};
 use crate::geometry::{Bounds, NodePath};
-use crate::layout::{Content, Frame, UiState, input_text};
+use crate::layout::{Content, Frame, LayoutTree, UiState, input_text};
+use crate::reactive::Signal;
 use crate::scroll::ScrollHandle;
 use crate::style::{Cursor, ResolvedText};
 use crate::text::Step;
@@ -20,6 +21,178 @@ use crate::text::TextSystem;
 
 /// Pixels scrolled per wheel line.
 pub const LINE_SCROLL: f32 = 40.0;
+
+/// What the pointer and the keyboard are doing to one node, one signal per
+/// flag (ADR-0022): a binding that reads [`Self::focus_visible`] runs again
+/// when focus shows or hides, not when the pointer comes over the node.
+///
+/// A component makes one ([`Interaction::new`], owned by the scope it is
+/// made in), gives it to its node ([`crate::Div::interaction`]) and reads it
+/// in that node's bindings, or in its children's for what a container's
+/// state changes below it (`.background(move || if i.hovered() { a } else { b })`).
+/// Hit testing and focus write the flags, each only when it changes; the
+/// layout tree writes all of them from the window's input state when the
+/// node is built, or patched from a new element, so a handle made by a
+/// render starts as the node is. Read where no reader runs, a flag is the
+/// value it holds now.
+///
+/// It names one node: given to two, it holds the flags of whichever was
+/// built or acted on last.
+///
+/// A handle made in a render ends with that render's scope, while the node
+/// it was given to may still be on screen leaving (its exit transition
+/// replays the element it had): an ended handle reads every flag off, the
+/// look of a node at rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Interaction {
+    hovered: Signal<bool>,
+    pressed: Signal<bool>,
+    focused: Signal<bool>,
+    focus_visible: Signal<bool>,
+    focus_within: Signal<bool>,
+    disabled: Signal<bool>,
+}
+
+/// A flag, tracked; off once its handle has ended.
+fn read(flag: Signal<bool>) -> bool {
+    flag.is_alive() && flag.get()
+}
+
+impl Default for Interaction {
+    #[track_caller]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Interaction {
+    /// The flags of a node not built yet: all off.
+    #[track_caller]
+    #[must_use]
+    pub fn new() -> Self {
+        crate::reactive::reserve_owned(6);
+        Self {
+            hovered: Signal::new(false),
+            pressed: Signal::new(false),
+            focused: Signal::new(false),
+            focus_visible: Signal::new(false),
+            focus_within: Signal::new(false),
+            disabled: Signal::new(false),
+        }
+    }
+
+    /// The pointer is over the node or one of its descendants, and the node
+    /// is not disabled (CSS `:hover`, of a node that takes the pointer).
+    #[must_use]
+    pub fn hovered(self) -> bool {
+        read(self.hovered)
+    }
+
+    /// The primary button went down on the node or one of its descendants
+    /// and is still held, and the node is not disabled (`:active`).
+    #[must_use]
+    pub fn pressed(self) -> bool {
+        read(self.pressed)
+    }
+
+    /// The node holds keyboard focus (`:focus`).
+    #[must_use]
+    pub fn focused(self) -> bool {
+        read(self.focused)
+    }
+
+    /// The node holds focus and shows it: focus came by keyboard, or the
+    /// node is a text input, which shows focus however it came
+    /// (`:focus-visible`).
+    #[must_use]
+    pub fn focus_visible(self) -> bool {
+        read(self.focus_visible)
+    }
+
+    /// The node or one of its descendants holds focus (`:focus-within`).
+    #[must_use]
+    pub fn focus_within(self) -> bool {
+        read(self.focus_within)
+    }
+
+    /// The node is disabled ([`crate::Div::disabled`], `:disabled`): it takes
+    /// no clicks, keys or focus, and is never hovered or pressed.
+    #[must_use]
+    pub fn disabled(self) -> bool {
+        read(self.disabled)
+    }
+
+    /// Write the flags that differ from `flags` (the layout tree, building
+    /// the node); a handle whose scope is gone takes nothing.
+    pub(crate) fn write(self, flags: Flags) {
+        crate::reactive::batch(|| {
+            put(self.hovered, flags.hovered);
+            put(self.pressed, flags.pressed);
+            put(self.focused, flags.focused);
+            put(self.focus_visible, flags.focus_visible);
+            put(self.focus_within, flags.focus_within);
+            put(self.disabled, flags.disabled);
+        });
+    }
+
+    /// Hit testing: the pointer came over the node or left it.
+    pub(crate) fn set_hovered(self, on: bool) {
+        put(self.hovered, on);
+    }
+
+    /// Hit testing: the button went down on the node or came up.
+    pub(crate) fn set_pressed(self, on: bool) {
+        put(self.pressed, on);
+    }
+
+    /// Focus moved, or came to show or hide.
+    pub(crate) fn set_focus(self, focused: bool, visible: bool, within: bool) {
+        crate::reactive::batch(|| {
+            put(self.focused, focused);
+            put(self.focus_visible, visible);
+            put(self.focus_within, within);
+        });
+    }
+}
+
+/// Write `on` to `flag` if it holds something else and still lives.
+fn put(flag: Signal<bool>, on: bool) {
+    if flag.is_alive() && flag.get_untracked() != on {
+        flag.set(on);
+    }
+}
+
+/// The value of each of an [`Interaction`]'s flags.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Flags {
+    pub(crate) hovered: bool,
+    pub(crate) pressed: bool,
+    pub(crate) focused: bool,
+    pub(crate) focus_visible: bool,
+    pub(crate) focus_within: bool,
+    pub(crate) disabled: bool,
+}
+
+/// The focus flags (`focused`, `focus_visible`, `focus_within`) of the
+/// node at `path` in `layer`, which holds the focus or not (`focused`) and
+/// is a text field or not, while the focused node is at `focus` (its path
+/// and layer) and focus came by keyboard or not. One rule for the layout
+/// tree, which writes them where it builds a node, and for the input
+/// state, which writes them where focus moves: focus shows on a node the
+/// keyboard focused, and on a text field however it was focused, as
+/// Chrome's `:focus-visible`; it is within a node it is in or under, in
+/// the node's layer.
+pub(crate) fn focus_flags(
+    path: &NodePath,
+    layer: usize,
+    focused: bool,
+    field: bool,
+    focus: Option<(&NodePath, usize)>,
+    by_keyboard: bool,
+) -> (bool, bool, bool) {
+    let within = focused || focus.is_some_and(|(f, l)| l == layer && f.0.starts_with(&path.0));
+    (focused, focused && (by_keyboard || field), within)
+}
 
 struct Press {
     /// The node under the pointer when the button went down.
@@ -30,9 +203,9 @@ struct Press {
     selecting: Option<usize>,
 }
 
-/// Interactive state that lives between frames.
+/// The window's input state that lives between frames: pointer, press, drag, selection, focus.
 #[derive(Default)]
-pub struct Interaction {
+pub struct InputState {
     pub(crate) state: UiState,
     pointer: Option<(f32, f32)>,
     press: Option<Press>,
@@ -46,6 +219,62 @@ pub struct Interaction {
     shift: Vec<(f32, f32)>,
     /// The scroll handles the last main frame gave a reach (ADR-0015).
     reaching: Vec<ScrollHandle>,
+    /// The focus and whether it showed when the nodes' [`Interaction`]s
+    /// were last written: focus moved since when it differs.
+    shown_focus: Option<(Option<FocusId>, bool)>,
+    /// The nodes hit testing wrote hovered, pressed, and focused or with
+    /// focus within: a change writes the nodes that left the chain and
+    /// those that came to it, not the frame.
+    hover_marks: Marked,
+    press_marks: Marked,
+    focus_marks: Marked,
+    /// Room for a chain of nodes, kept so a pointer move allocates nothing.
+    chain: Vec<usize>,
+    was: Vec<usize>,
+}
+
+/// Nodes of a frame a flag was written on, by index, and the frame they
+/// index: the [`Frame::epoch`] it had then.
+#[derive(Default)]
+struct Marked {
+    epoch: Option<u64>,
+    nodes: Vec<usize>,
+}
+
+impl Marked {
+    /// The nodes marked, as indices of `frame`, into `into`: those kept
+    /// when `frame` has not been rebuilt since they were marked, else the
+    /// nodes `rest` picks (one walk of the frame, as its rebuild was).
+    fn take(&self, frame: &Frame, into: &mut Vec<usize>, rest: impl Fn(usize) -> bool) {
+        into.clear();
+        if self.epoch == Some(frame.epoch()) {
+            into.extend_from_slice(&self.nodes);
+        } else if self.epoch.is_some() {
+            into.extend((0..frame.nodes.len()).filter(|&i| rest(i)));
+        }
+    }
+
+    /// Mark `nodes` of `frame`.
+    fn mark(&mut self, frame: &Frame, nodes: &[usize]) {
+        self.epoch = Some(frame.epoch());
+        self.nodes.clear();
+        self.nodes.extend_from_slice(nodes);
+    }
+}
+
+/// Call `f(i, on)` for each node in one of `was` and `now` alone: on when
+/// it is in `now`. Both are chains of ancestors, a few nodes each.
+fn each_change(was: &[usize], now: &[usize], mut f: impl FnMut(usize, bool)) {
+    for &i in was {
+        if !now.contains(&i) {
+            f(i, false);
+        }
+    }
+    for &i in now {
+        if !was.contains(&i) {
+            f(i, true);
+        }
+    }
 }
 
 /// Where an input method types, in window coordinates, and the input it
@@ -115,7 +344,14 @@ pub fn hit_shifted(frame: &Frame, shift: &[(f32, f32)], x: f32, y: f32) -> Optio
         let takes = frame.behaviour(i).is_some_and(|b| !b.pass_through) && !n.look.invisible;
         let (dx, dy) = by(Some(i));
         let (cx, cy) = by(n.clipper);
-        let inside = n.bounds.contains(x - dx, y - dy) && n.clip.is_none_or(|c| c.contains(x - cx, y - cy));
+        // Its shape decides, corners included, grown by its hit slop; and
+        // the clip it paints under, rounded corners included, as Chrome
+        // clips hit testing to a rounded `overflow: hidden`.
+        let inside = crate::shape::takes_pointer(&n.look.shape, n.bounds, n.look.hit_slop, x - dx, y - dy)
+            && n.clip.is_none_or(|c| {
+                c.contains(x - cx, y - cy)
+                    && crate::shape::corners_contain(c, n.clip_radius, n.clip_curve, x - cx, y - cy)
+            });
         (takes && inside).then_some((i, x - dx, y - dy))
     })
 }
@@ -152,7 +388,7 @@ pub fn shift_of(frame: &Frame, presented: &crate::compositor::Presented) -> Vec<
     if any { own } else { Vec::new() }
 }
 
-impl Interaction {
+impl InputState {
     #[must_use]
     pub fn state(&self) -> &UiState {
         &self.state
@@ -244,10 +480,102 @@ impl Interaction {
         self.modifiers = m;
     }
 
-    /// Refresh the focus part of the state from the focus signals.
-    pub fn sync_focus(&mut self) {
+    /// Refresh the focus part of the state from the focus signals, and,
+    /// when focus moved or came to show or hide since, the focus flags of
+    /// the [`Interaction`]s of the nodes of `tree`'s frame (the frame the
+    /// next is built over; the layout tree writes those of the nodes it
+    /// builds): the nodes that held focus or focus within and those that
+    /// hold it now.
+    pub fn sync_focus(&mut self, tree: &LayoutTree) {
         self.state.focused = focus::focused();
         self.state.focus_visible = focus::focus_visible();
+        let now = (self.state.focused, self.state.focus_visible);
+        if self.shown_focus == Some(now) {
+            return;
+        }
+        self.shown_focus = Some(now);
+        let frame = tree.frame();
+        let at = self.state.focused.and_then(|id| tree.focus_index(id));
+        let (mut chain, mut was) = (std::mem::take(&mut self.chain), std::mem::take(&mut self.was));
+        chain.clear();
+        chain.extend(at.into_iter().flat_map(|at| frame.ancestors(at)));
+        // Rebuilt since: every node with an `Interaction` may hold focus.
+        self.focus_marks.take(frame, &mut was, |i| {
+            frame.behaviour(i).is_some_and(|b| b.interaction.is_some())
+        });
+        let focus = at.and_then(|at| frame.nodes.get(at)).map(|n| (&n.path, n.layer));
+        let keyboard = self.state.focus_visible;
+        let write = |i: usize| {
+            let (Some(b), Some(node)) = (frame.behaviour(i), frame.nodes.get(i)) else {
+                return;
+            };
+            let Some(it) = b.interaction else { return };
+            let (focused, visible, within) = focus_flags(
+                &node.path,
+                node.layer,
+                at == Some(i),
+                b.field.is_some(),
+                focus,
+                keyboard,
+            );
+            it.set_focus(focused, visible, within);
+        };
+        for &i in &was {
+            if !chain.contains(&i) {
+                write(i);
+            }
+        }
+        // Whether focus shows may have changed without it moving.
+        for &i in &chain {
+            write(i);
+        }
+        self.focus_marks.mark(frame, &chain);
+        (self.chain, self.was) = (chain, was);
+    }
+
+    /// The chain of nodes from `h` up, in `self.chain`.
+    fn chain_from(&mut self, frame: &Frame, h: Option<usize>) {
+        self.chain.clear();
+        self.chain.extend(h.into_iter().flat_map(|h| frame.ancestors(h)));
+    }
+
+    /// Whether `self.chain` holds other nodes than `paths` names.
+    fn chain_differs(&self, frame: &Frame, marks: &Marked, paths: &HashSet<NodePath>) -> bool {
+        if marks.epoch == Some(frame.epoch()) {
+            return marks.nodes != self.chain;
+        }
+        self.chain.len() != paths.len()
+            || self
+                .chain
+                .iter()
+                .any(|&i| frame.nodes.get(i).is_none_or(|n| !paths.contains(&n.path)))
+    }
+
+    /// `paths` as the nodes of `self.chain` (kept, so a change allocates
+    /// nothing once it has held as many).
+    fn set_paths(frame: &Frame, chain: &[usize], paths: &mut HashSet<NodePath>) {
+        paths.clear();
+        paths.extend(chain.iter().filter_map(|&i| frame.nodes.get(i).map(|n| n.path.clone())));
+    }
+
+    /// Write `self.chain` as the nodes pressed: the flags of those that
+    /// left it or came to it, and the paths the next frame is built with.
+    fn write_pressed(&mut self, frame: &Frame) {
+        let mut was = std::mem::take(&mut self.was);
+        let active = &self.state.active;
+        self.press_marks.take(frame, &mut was, |i| {
+            frame.nodes.get(i).is_some_and(|n| active.contains(&n.path))
+        });
+        each_change(&was, &self.chain, |i, on| {
+            if let Some(b) = frame.behaviour(i)
+                && let Some(it) = b.interaction
+            {
+                it.set_pressed(on && !b.disabled);
+            }
+        });
+        Self::set_paths(frame, &self.chain, &mut self.state.active);
+        self.press_marks.mark(frame, &self.chain);
+        self.was = was;
     }
 
     /// The pointer's position, if it is over the window.
@@ -274,16 +602,6 @@ impl Interaction {
             .unwrap_or_default()
     }
 
-    fn chain_paths(frame: &Frame, from: Option<usize>) -> HashSet<NodePath> {
-        from.map(|h| {
-            frame
-                .ancestors(h)
-                .filter_map(|i| frame.nodes.get(i).map(|n| n.path.clone()))
-                .collect()
-        })
-        .unwrap_or_default()
-    }
-
     /// Re-run hover against a new frame (the pointer has not moved but the
     /// boxes under it may have).
     pub fn rehover(&mut self, frame: &Frame, text: &mut TextSystem) -> Outcome {
@@ -296,20 +614,32 @@ impl Interaction {
     pub fn pointer_moved(&mut self, frame: &Frame, text: &mut TextSystem, x: f32, y: f32) -> Outcome {
         self.pointer = Some((x, y));
         let (h, ..) = self.locate(frame, x, y);
-        let hovered = Self::chain_paths(frame, h);
+        self.chain_from(frame, h);
         let mut out = Outcome::default();
-        if hovered != self.state.hovered {
-            for (i, n) in frame.nodes.iter().enumerate() {
-                let (was, is) = (self.state.hovered.contains(&n.path), hovered.contains(&n.path));
-                if was != is
-                    && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.hover.clone())
+        if self.chain_differs(frame, &self.hover_marks, &self.state.hovered) {
+            let mut was = std::mem::take(&mut self.was);
+            let hovered = &self.state.hovered;
+            self.hover_marks.take(frame, &mut was, |i| {
+                frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
+            });
+            // The flags first, then the handlers, which may read them.
+            each_change(&was, &self.chain, |i, on| {
+                if let Some(b) = frame.behaviour(i)
+                    && let Some(it) = b.interaction
                 {
-                    f(is);
+                    it.set_hovered(on && !b.disabled);
                 }
-            }
-            self.state.hovered = hovered;
+            });
+            each_change(&was, &self.chain, |i, on| {
+                if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.hover.clone()) {
+                    f(on);
+                }
+            });
+            Self::set_paths(frame, &self.chain, &mut self.state.hovered);
+            self.was = was;
             out = Outcome::redraw();
         }
+        self.hover_marks.mark(frame, &self.chain);
         if let Some(h) = h {
             for i in frame.ancestors(h) {
                 if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.pointer.clone())
@@ -350,13 +680,23 @@ impl Interaction {
         if self.state.hovered.is_empty() {
             return Outcome::default();
         }
-        for (i, n) in frame.nodes.iter().enumerate() {
-            if self.state.hovered.contains(&n.path)
-                && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.hover.clone())
-            {
+        let mut was = std::mem::take(&mut self.was);
+        let hovered = &self.state.hovered;
+        self.hover_marks.take(frame, &mut was, |i| {
+            frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
+        });
+        each_change(&was, &[], |i, _| {
+            if let Some(it) = frame.behaviour(i).and_then(|b| b.interaction) {
+                it.set_hovered(false);
+            }
+        });
+        each_change(&was, &[], |i, _| {
+            if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.hover.clone()) {
                 f(false);
             }
-        }
+        });
+        self.was = was;
+        self.hover_marks.mark(frame, &[]);
         self.state.hovered.clear();
         Outcome::redraw()
     }
@@ -405,7 +745,8 @@ impl Interaction {
         if !disabled {
             focus::set_focus(focus_target, false);
         }
-        self.state.active = Self::chain_paths(frame, h);
+        self.chain_from(frame, h);
+        self.write_pressed(frame);
 
         let mut press = Press {
             hit: h.and_then(|i| frame.nodes.get(i)).map(|n| n.path.clone()),
@@ -459,7 +800,8 @@ impl Interaction {
         let Some(press) = self.press.take() else {
             return Outcome::default();
         };
-        self.state.active.clear();
+        self.chain.clear();
+        self.write_pressed(frame);
         let mut out = Outcome::redraw();
         if let Some((i, bounds)) = press.drag
             && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.drag.clone())
@@ -1108,12 +1450,12 @@ mod tests {
     #[test]
     fn keys_move_and_delete_by_graphemes_and_words_as_laid_out() {
         let field = TextField::new("hello wide world e\u{301}");
-        let root = text_input(&field).w_px(300.0).into_element();
+        let root = text_input(&field).width(300.0).into_element();
         let mut text = TextSystem::new();
-        let mut ui = Interaction::default();
+        let mut ui = InputState::default();
         field.focus.focus();
         let mut press = |k: NamedKey, word: bool, shift: bool| {
-            ui.sync_focus();
+            ui.sync_focus(&crate::layout::LayoutTree::default());
             let frame = layout(
                 &root,
                 400.0,
@@ -1146,13 +1488,13 @@ mod tests {
         let field = TextField::new("");
         let root = text_input(&field)
             .input_type(InputType::Password)
-            .w_px(200.0)
+            .width(200.0)
             .into_element();
         let mut text = TextSystem::new();
-        let mut ui = Interaction::default();
+        let mut ui = InputState::default();
         field.focus.focus();
         for c in ["s", "3", "c"] {
-            ui.sync_focus();
+            ui.sync_focus(&crate::layout::LayoutTree::default());
             let frame = layout(
                 &root,
                 400.0,
@@ -1163,7 +1505,7 @@ mod tests {
             );
             ui.key(&frame, &mut text, &key(c, false));
         }
-        ui.sync_focus();
+        ui.sync_focus(&crate::layout::LayoutTree::default());
         let frame = layout(
             &root,
             400.0,
@@ -1191,13 +1533,13 @@ mod tests {
     fn an_input_method_composes_at_the_caret_and_types_only_what_it_commits() {
         let (field, other) = (TextField::new("xin chào "), TextField::new(""));
         let root = crate::element::div()
-            .child(text_input(&field).w_px(200.0))
-            .child(text_input(&other).w_px(200.0))
+            .child(text_input(&field).width(200.0))
+            .child(text_input(&other).width(200.0))
             .into_element();
         let mut text = TextSystem::new();
-        let mut ui = Interaction::default();
-        let frame = |ui: &mut Interaction, text: &mut TextSystem| {
-            ui.sync_focus();
+        let mut ui = InputState::default();
+        let frame = |ui: &mut InputState, text: &mut TextSystem| {
+            ui.sync_focus(&crate::layout::LayoutTree::default());
             layout(
                 &root,
                 400.0,
@@ -1227,7 +1569,7 @@ mod tests {
         // The area holds the composition and about three characters either
         // side, inside the input (Parley's `PlainEditor::ime_cursor_area`).
         let i = focused_node(&f, field.focus.id()).expect("the input");
-        let (_, t, input, ..) = Interaction::input_geometry(&f, i).expect("an input");
+        let (_, t, input, ..) = InputState::input_geometry(&f, i).expect("an input");
         let before = text.measure("xin chào ", &t, None).0;
         let whole = text.measure("xin chào việt", &t, None).0;
         let inflate = 3.0 * 0.6 * t.size;

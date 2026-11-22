@@ -12,16 +12,24 @@ pub fn render() -> Render {
         page(
             "Shimmer",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "ShimmerDemo.vue",
-                    div().flex().items_center().justify_center().h_full().w_full().child(
-                        text(LABEL)
-                            .text_sm()
-                            .text_color(theme().muted_foreground)
-                            .shimmer(Shimmer::default()),
-                    ),
+                    div()
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .justify_content(Justify::Center)
+                        .height(pct(100.0))
+                        .width(pct(100.0))
+                        .child(
+                            text(LABEL)
+                                .text_size(14.0)
+                                .line_height(20.0)
+                                .text_color(theme().muted_foreground)
+                                .shimmer(Shimmer::default()),
+                        ),
                 ))
                 .child(demo(
                     "ShimmerAngleDemo.vue",
@@ -32,16 +40,28 @@ pub fn render() -> Render {
                 ))
                 .child(demo(
                     "ShimmerColorDemo.vue",
-                    muted(div().flex_col().items_center().gap(2.0))
-                        .child(text(LABEL).shimmer(Shimmer::default().color(blue_500().opacity(0.6))))
-                        .child(text(LABEL).shimmer(Shimmer::default().color(Color::hex(0x0037_8add)))),
+                    muted(
+                        div()
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .align_items(Align::Center)
+                            .gap(8.0),
+                    )
+                    .child(text(LABEL).shimmer(Shimmer::default().color(blue_500().opacity(0.6))))
+                    .child(text(LABEL).shimmer(Shimmer::default().color(Color::hex(0x0037_8add)))),
                 ))
                 .child(demo(
                     "ShimmerDisablingDemo.vue",
                     // `md:shimmer-none`: the verdict's 1280px viewport is past `md`.
-                    muted(div().flex_col().items_center().gap(3.0))
-                        .child(text(LABEL))
-                        .child(caption("shimmer md:shimmer-none")),
+                    muted(
+                        div()
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .align_items(Align::Center)
+                            .gap(12.0),
+                    )
+                    .child(text(LABEL))
+                    .child(caption("shimmer md:shimmer-none")),
                 ))
                 .child(demo(
                     "ShimmerDurationDemo.vue",
@@ -53,14 +73,16 @@ pub fn render() -> Render {
                 .child(demo(
                     "ShimmerPlayOnceDemo.vue",
                     div()
-                        .flex_col()
-                        .items_center()
-                        .gap(4.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .align_items(Align::Center)
+                        .gap(16.0)
                         .child(
                             // Vue's `:key="key"`: a new node, a new sweep.
                             text(LABEL)
                                 .key(replayed.get())
-                                .text_sm()
+                                .text_size(14.0)
+                                .line_height(20.0)
                                 .text_color(theme().muted_foreground)
                                 .shimmer(Shimmer::default().duration_ms(1100.0).once()),
                         )
@@ -74,28 +96,30 @@ pub fn render() -> Render {
                     "ShimmerRTLDemo.vue",
                     muted(
                         div()
-                            .mx_auto()
-                            .grid()
-                            .w_full()
-                            .max_w_px(512.0)
-                            .gap(6.0)
-                            .text_center()
-                            .grid_cols(2),
+                            .margin_x(Length::Auto)
+                            .display(Display::Grid)
+                            .width(pct(100.0))
+                            .max_width(512.0)
+                            .gap(24.0)
+                            .text_align(TextAlign::Center)
+                            .grid_columns(Tracks::repeat(2, Track::Fr(1.0))),
                     )
                     .child(
                         div()
-                            .flex_col()
-                            .gap(3.0)
-                            .child(text(LABEL).dir_ltr().shimmer(Shimmer::default()))
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .gap(12.0)
+                            .child(text(LABEL).direction(Direction::Ltr).shimmer(Shimmer::default()))
                             .child(caption("dir=\"ltr\"")),
                     )
                     .child(
                         div()
-                            .flex_col()
-                            .gap(3.0)
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
+                            .gap(12.0)
                             .child(
                                 text("جارٍ إنشاء الرد\u{2026}")
-                                    .dir_rtl()
+                                    .direction(Direction::Rtl)
                                     .shimmer(Shimmer::default().reverse()),
                             )
                             .child(caption("dir=\"rtl\"")),
@@ -104,8 +128,8 @@ pub fn render() -> Render {
                 .child(demo(
                     "ShimmerSpreadDemo.vue",
                     pair(
-                        (Shimmer::default().spread(4.0), "shimmer-spread-4"),
-                        (Shimmer::default().spread(24.0), "shimmer-spread-24"),
+                        (Shimmer::default().spread(16.0), "shimmer-spread-4"),
+                        (Shimmer::default().spread(96.0), "shimmer-spread-24"),
                     ),
                 )),
         )
@@ -119,12 +143,15 @@ fn blue_500() -> Color {
 
 /// `text-sm text-muted-foreground`, which the demos set on their root.
 fn muted(d: Div) -> Div {
-    d.text_sm().text_color(theme().muted_foreground)
+    d.text_size(14.0).line_height(20.0).text_color(theme().muted_foreground)
 }
 
 /// `<p class="font-mono text-xs">`: the class a column demonstrates.
 fn caption(label: &str) -> Text {
-    text(label).font_mono().text_xs()
+    text(label)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(12.0)
+        .line_height(16.0)
 }
 
 /// Two shimmers side by side, each over the class it shows
@@ -132,20 +159,21 @@ fn caption(label: &str) -> Text {
 fn pair(left: (Shimmer, &str), right: (Shimmer, &str)) -> Div {
     let column = |(shimmer, label): (Shimmer, &str)| {
         div()
-            .flex_col()
-            .gap(3.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(text(LABEL).shimmer(shimmer))
             .child(caption(label))
     };
     muted(
         div()
-            .mx_auto()
-            .grid()
-            .w_full()
-            .max_w_px(512.0)
-            .gap(6.0)
-            .text_center()
-            .grid_cols(2),
+            .margin_x(Length::Auto)
+            .display(Display::Grid)
+            .width(pct(100.0))
+            .max_width(512.0)
+            .gap(24.0)
+            .text_align(TextAlign::Center)
+            .grid_columns(Tracks::repeat(2, Track::Fr(1.0))),
     )
     .child(column(left))
     .child(column(right))

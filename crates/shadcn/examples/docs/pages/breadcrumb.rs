@@ -24,19 +24,27 @@ pub fn render() -> Render {
             dropdown_menu().child(dropdown_menu_trigger(trigger)).child(content)
         };
         // The demos' `DropdownMenuTrigger class="flex items-center gap-1"`.
-        let trigger = || div().flex().items_center().gap(1.0).cursor_pointer().focusable();
+        let trigger = || {
+            div()
+                .display(Display::Flex)
+                .align_items(Align::Center)
+                .gap(4.0)
+                .cursor(Cursor::Pointer)
+                .focusable()
+        };
         page(
             "Breadcrumb",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "BreadcrumbDemo.vue",
                     breadcrumb().child(
                         breadcrumb_list()
                             .child(breadcrumb_item().child(link("Home")))
                             .child(breadcrumb_separator())
-                            .child(breadcrumb_item().child(trigger().child(breadcrumb_ellipsis().size(4.0))))
+                            .child(breadcrumb_item().child(trigger().child(breadcrumb_ellipsis().size(16.0))))
                             .child(breadcrumb_separator())
                             .child(breadcrumb_item().child(link("Components")))
                             .child(breadcrumb_separator())
@@ -78,7 +86,7 @@ pub fn render() -> Render {
                                     // `[&_svg:not([class*='size-'])]:size-3.5`.
                                     trigger()
                                         .child(text("Components"))
-                                        .child(icon(Icon::ChevronDown).size(3.5)),
+                                        .child(icon(Icon::ChevronDown).size(14.0)),
                                     &["Documentation", "Themes", "GitHub"],
                                 )),
                             )
@@ -106,7 +114,7 @@ pub fn render() -> Render {
                             .child(breadcrumb_item().child(link("Home")))
                             .child(breadcrumb_separator())
                             .child(breadcrumb_item().child(menu(
-                                trigger().child(breadcrumb_ellipsis().size(4.0)),
+                                trigger().child(breadcrumb_ellipsis().size(16.0)),
                                 &["Documentation", "Building Your Application"],
                             )))
                             .child(breadcrumb_separator())
@@ -119,7 +127,11 @@ pub fn render() -> Render {
                             .child(breadcrumb_item().child(breadcrumb_page("Caching and Revalidating"))),
                     ),
                 ))
-                .child(text(format!("Clicked: {}", visited.get())).text_sm()),
+                .child(
+                    text(format!("Clicked: {}", visited.get()))
+                        .text_size(14.0)
+                        .line_height(20.0),
+                ),
         )
     })
 }

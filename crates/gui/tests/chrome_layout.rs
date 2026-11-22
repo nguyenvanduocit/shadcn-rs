@@ -38,7 +38,8 @@ use std::path::{Path, PathBuf};
 
 use gui::layout::{FrameNode, UiState, layout};
 use gui::style::{
-    Align, Display, Edges, FlexDirection, GridSpan, Justify, Length, LineHeight, Overflow, Position, Style, Track,
+    Align, Display, Edges, FlexDirection, GridAutoFlow, GridSpan, Justify, Length, LineHeight, Overflow, Position,
+    Style, Track,
 };
 use gui::text::TextSystem;
 use gui::{Element, IntoElement, Motion, Styled, div, text};
@@ -180,7 +181,7 @@ fn track(v: &str) -> Track {
     }
 }
 
-fn tracks(v: &str) -> Vec<Track> {
+fn tracks(v: &str) -> gui::style::Tracks {
     v.split_whitespace().map(track).collect()
 }
 
@@ -304,7 +305,13 @@ fn declare(s: &mut Style, property: &str, v: &str) {
         "grid-template-columns" => s.grid_columns = tracks(v),
         "grid-template-rows" => s.grid_rows = tracks(v),
         "grid-auto-rows" => s.grid_auto_rows = tracks(v),
-        "grid-auto-flow" => s.grid_flow_column = v == "column",
+        "grid-auto-flow" => {
+            s.grid_auto_flow = if v == "column" {
+                GridAutoFlow::Column
+            } else {
+                GridAutoFlow::Row
+            }
+        }
         "grid-column" => s.grid_column = grid_span(v),
         "grid-row" => s.grid_row = grid_span(v),
         "overflow" => {
@@ -313,18 +320,18 @@ fn declare(s: &mut Style, property: &str, v: &str) {
         }
         "overflow-x" => s.overflow_x = overflow(v),
         "overflow-y" => s.overflow_y = overflow(v),
-        "font-size" => s.text.size = Some(pixels(v)),
+        "font-size" => s.content.text.size = Some(pixels(v)),
         "line-height" => {
-            s.text.line_height = Some(if v.ends_with("px") {
+            s.content.text.line_height = Some(if v.ends_with("px") {
                 LineHeight::Px(pixels(v))
             } else {
                 LineHeight::Relative(number(v))
             });
         }
-        "font-weight" => s.text.weight = Some(number(v) as u16),
-        "white-space" => s.text.nowrap = Some(v == "nowrap"),
+        "font-weight" => s.content.text.weight = Some(number(v) as u16),
+        "white-space" => s.content.text.nowrap = Some(v == "nowrap"),
         "letter-spacing" => {
-            s.text.tracking = Some(number(v.strip_suffix("em").expect("letter-spacing in em")));
+            s.content.text.tracking = Some(number(v.strip_suffix("em").expect("letter-spacing in em")));
         }
         other => panic!("the fixtures do not use {other:?}"),
     }

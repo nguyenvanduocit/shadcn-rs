@@ -1,0 +1,51 @@
+//! Phosphor, regular weight (@phosphor-icons/core 2.1.1, MIT). Its glyphs are filled outlines on a 256 view box.
+
+library! {
+    "phosphor";
+    glyphs {
+        CHECK => "check",
+        X => "x",
+        CARET_DOWN => "caret-down",
+        CARET_UP => "caret-up",
+        CARET_LEFT => "caret-left",
+        CARET_RIGHT => "caret-right",
+        CARET_DOUBLE_LEFT => "caret-double-left",
+        CARET_DOUBLE_RIGHT => "caret-double-right",
+        CHECK_CIRCLE => "check-circle",
+        INFO => "info",
+        WARNING => "warning",
+        X_CIRCLE => "x-circle",
+        SPINNER_GAP => "spinner-gap",
+        CIRCLE => "circle",
+        COPY => "copy",
+        MINUS => "minus",
+        PLUS => "plus",
+        MAGNIFYING_GLASS => "magnifying-glass",
+        DOTS_THREE => "dots-three",
+        SIDEBAR => "sidebar",
+    }
+    roles {
+        Check => CHECK,
+        Close => X,
+        ChevronDown => CARET_DOWN,
+        ChevronUp => CARET_UP,
+        ChevronLeft => CARET_LEFT,
+        ChevronRight => CARET_RIGHT,
+        ChevronsLeft => CARET_DOUBLE_LEFT,
+        ChevronsRight => CARET_DOUBLE_RIGHT,
+        Selector => CARET_DOWN,
+        Success => CHECK_CIRCLE,
+        Info => INFO,
+        Warning => WARNING,
+        Error => X_CIRCLE,
+        Loading => SPINNER_GAP,
+        Circle => CIRCLE,
+        Copy => COPY,
+        Minus => MINUS,
+        Plus => PLUS,
+        Search => MAGNIFYING_GLASS,
+        More => DOTS_THREE,
+        Sidebar => SIDEBAR,
+        ArrowDown => super::ARROW_DOWN,
+    }
+}

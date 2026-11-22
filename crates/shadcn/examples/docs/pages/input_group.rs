@@ -27,16 +27,17 @@ pub fn render() -> Render {
         page(
             "Input Group",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("InputGroupDemo.vue", overview(&f)))
                 .child(demo(
                     "InputGroupWithIcon.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(6.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(24.0)
                         .child(
                             input_group(input_group_input(&f[4]).placeholder("Search..."))
                                 .addon(input_group_addon(START).child(icon(Icon::Search))),
@@ -58,17 +59,17 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputGroupWithText.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(6.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(24.0)
                         .child(
                             input_group(input_group_input(&f[8]).placeholder("0.00"))
                                 .addon(input_group_addon(START).child(input_group_text().child("$")))
                                 .addon(input_group_addon(END).child(input_group_text().child("USD"))),
                         )
                         .child(
-                            input_group(input_group_input(&f[10]).placeholder("example.com").pl(0.5))
+                            input_group(input_group_input(&f[10]).placeholder("example.com").padding_left(2.0))
                                 .addon(input_group_addon(START).child(input_group_text().child("https://")))
                                 .addon(input_group_addon(END).child(input_group_text().child(".com"))),
                         )
@@ -80,7 +81,8 @@ pub fn render() -> Render {
                             input_group(input_group_textarea(&f[12]).placeholder("Enter your message")).addon(
                                 input_group_addon(BELOW).child(
                                     input_group_text()
-                                        .text_xs()
+                                        .text_size(12.0)
+                                        .line_height(16.0)
                                         .text_color(t.muted_foreground)
                                         .child("120 characters left"),
                                 ),
@@ -90,10 +92,10 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputGroupWithButton.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(6.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(24.0)
                         .child(
                             input_group(input_group_input(&f[9]).placeholder("https://x.com/shadcn")).addon(
                                 input_group_addon(END).button(
@@ -104,24 +106,27 @@ pub fn render() -> Render {
                             ),
                         )
                         .child(
+                            // `--radius: 9999px`: the group (`rounded-md`) and its
+                            // first button (`calc(var(--radius) - 5px)`) follow it.
                             input_group(input_group_input(&f[13]))
-                                .radius_var(9999.0)
+                                .radius(9999.0 * 0.8)
                                 .addon(
                                     input_group_addon(START).button(
                                         input_group_button(ButtonVariant::Secondary, InputGroupButtonSize::IconXs)
+                                            .radius(9999.0 - 5.0)
                                             .child(icon(Icon::Info)),
                                     ),
                                 )
                                 .addon(
                                     input_group_addon(START)
                                         .text_color(t.muted_foreground)
-                                        .pl(1.5)
+                                        .padding_left(6.0)
                                         .child("https://"),
                                 )
                                 .addon(
                                     input_group_addon(END).button(
                                         input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs)
-                                            .rounded_full()
+                                            .radius(9999.0)
                                             .on_click(move |_| fav.update(|v| *v = !*v))
                                             .child(icon(Icon::Star)),
                                     ),
@@ -139,10 +144,10 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputGroupWithLabel.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(4.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(16.0)
                         .child(
                             input_group(input_group_input(&f[15]).placeholder("shadcn"))
                                 .addon(input_group_addon(START).child(label("@"))),
@@ -151,17 +156,17 @@ pub fn render() -> Render {
                             input_group(input_group_input(&f[16]).placeholder("shadcn@vercel.com")).addon(
                                 input_group_addon(ABOVE)
                                     .child(label("Email").text_color(t.foreground))
-                                    .button(ghost_icon(Icon::Info).ml_auto().rounded_full()),
+                                    .button(ghost_icon(Icon::Info).margin_left(Length::Auto).radius(9999.0)),
                             ),
                         ),
                 ))
                 .child(demo(
                     "InputGroupWithTooltip.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(4.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(16.0)
                         .child(
                             input_group(input_group_input(&f[17]).placeholder("Enter password"))
                                 .addon(input_group_addon(END).button(ghost_icon(Icon::Info))),
@@ -178,26 +183,30 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputGroupWithDropdown.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(4.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(16.0)
                         .child(
                             input_group(input_group_input(&f[20]).placeholder("Enter file name"))
                                 .addon(input_group_addon(END).button(ghost_icon(Icon::Ellipsis))),
                         )
                         .child(
+                            // `--radius: 1rem`: the group (`rounded-md`) and its
+                            // button (`calc(var(--radius) - 5px)`) follow it.
                             input_group(input_group_input(&f[21]).placeholder("Enter search query"))
-                                .radius_var(16.0)
+                                .radius(16.0 * 0.8)
                                 .addon(
                                     input_group_addon(END).button(
                                         input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::Xs)
-                                            // `!pr-1.5`: important, so it beats `has-[>svg]:px-2` too.
-                                            .pr(1.5)
-                                            .has_icon(|s| s.px(2.0).pr(1.5))
-                                            .text_xs()
+                                            .radius(16.0 - 5.0)
+                                            // `!pr-1.5`: important, so it beats `has-[>svg]:px-2`
+                                            // too (the `xs` size pads the same with an icon).
+                                            .padding_right(6.0)
+                                            .text_size(12.0)
+                                            .line_height(16.0)
                                             .child("Search In...")
-                                            .child(icon(Icon::ChevronDown).size(3.0)),
+                                            .child(icon(Icon::ChevronDown).size(12.0)),
                                     ),
                                 ),
                         ),
@@ -205,10 +214,10 @@ pub fn render() -> Render {
                 .child(demo(
                     "InputGroupWithSpinner.vue",
                     div()
-                        .grid()
-                        .w_full()
-                        .max_w_px(384.0)
-                        .gap(4.0)
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(16.0)
                         .child(
                             input_group(input_group_input(&f[23]).placeholder("Searching...").disabled(true))
                                 .addon(input_group_addon(END).child(spinner())),
@@ -248,72 +257,89 @@ pub fn render() -> Render {
                 ))
                 .child(demo(
                     "InputGroupWithTextarea.vue",
-                    div().grid().w_full().max_w_px(448.0).gap(4.0).child(
-                        input_group(
-                            input_group_textarea(&f[22])
-                                .placeholder("console.log('Hello, world!');")
-                                .min_h_px(200.0),
-                        )
-                        .addon(
-                            input_group_addon(BELOW)
-                                .border_t()
-                                .border_color(t.border)
-                                .child(input_group_text().child("Line 1, Column 1"))
-                                .button(
-                                    input_group_button(ButtonVariant::Default, InputGroupButtonSize::Sm)
-                                        .ml_auto()
-                                        .child("Run")
-                                        .child(icon(Icon::CornerDownLeft)),
-                                ),
-                        )
-                        .addon(
-                            input_group_addon(ABOVE)
-                                .border_b()
-                                .border_color(t.border)
-                                .child(
-                                    input_group_text()
-                                        .font_mono()
-                                        .font_medium()
-                                        .child(icon(Icon::Braces))
-                                        .child(text("script.js")),
-                                )
-                                .button(ghost_icon(Icon::RefreshCw).ml_auto())
-                                .button(ghost_icon(Icon::Copy)),
+                    div()
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(448.0)
+                        .gap(16.0)
+                        .child(
+                            input_group(
+                                input_group_textarea(&f[22])
+                                    .placeholder("console.log('Hello, world!');")
+                                    .min_height(200.0),
+                            )
+                            .addon(
+                                input_group_addon(BELOW)
+                                    .border_top(1.0)
+                                    .border_color(t.border)
+                                    .child(input_group_text().child("Line 1, Column 1"))
+                                    .button(
+                                        input_group_button(ButtonVariant::Default, InputGroupButtonSize::Sm)
+                                            .margin_left(Length::Auto)
+                                            .child("Run")
+                                            .child(icon(Icon::CornerDownLeft)),
+                                    ),
+                            )
+                            .addon(
+                                input_group_addon(ABOVE)
+                                    .border_bottom(1.0)
+                                    .border_color(t.border)
+                                    .child(
+                                        input_group_text()
+                                            .font_family(FontFamily::GEIST_MONO)
+                                            .font_weight(500)
+                                            .child(icon(Icon::Braces))
+                                            .child(text("script.js")),
+                                    )
+                                    .button(ghost_icon(Icon::RefreshCw).margin_left(Length::Auto))
+                                    .button(ghost_icon(Icon::Copy)),
+                            ),
                         ),
-                    ),
                 ))
                 .child(demo(
                     "InputGroupWithButtonGroup.vue",
-                    div().grid().w_full().max_w_px(384.0).child(button_group(
-                        Orientation::Horizontal,
-                        [
-                            // `ButtonGroupText as-child` on a `Label`: the label's `leading-none`.
-                            button_group_text().leading_none().child("https://").into_element(),
-                            input_group(input_group_input(&f[27]))
-                                .addon(input_group_addon(END).child(icon(Icon::Link2)))
-                                .into_element(),
-                            button_group_text().child(".com").into_element(),
-                        ],
-                    )),
+                    div()
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .child(button_group(
+                            Orientation::Horizontal,
+                            [
+                                // `ButtonGroupText as-child` on a `Label`: the label's `leading-none`.
+                                button_group_text()
+                                    .line_height(LineHeight::Relative(1.0))
+                                    .child("https://")
+                                    .into_element(),
+                                input_group(input_group_input(&f[27]))
+                                    .addon(input_group_addon(END).child(icon(Icon::Link2)))
+                                    .into_element(),
+                                button_group_text().child(".com").into_element(),
+                            ],
+                        )),
                 ))
                 .child(demo(
                     "InputGroupWithCustomInput.vue",
                     // The demo's own `<textarea data-slot="input-group-control">`:
                     // `min-h-16 px-3 py-2.5 md:text-sm`, grown to its text.
-                    div().grid().w_full().max_w_px(384.0).gap(6.0).child(
-                        input_group(
-                            input_group_textarea(&f[28])
-                                .placeholder("Autoresize textarea...")
-                                .py(2.5),
-                        )
-                        .addon(
-                            input_group_addon(BELOW).button(
-                                input_group_button(ButtonVariant::Default, InputGroupButtonSize::Sm)
-                                    .ml_auto()
-                                    .child("Submit"),
+                    div()
+                        .display(Display::Grid)
+                        .width(pct(100.0))
+                        .max_width(384.0)
+                        .gap(24.0)
+                        .child(
+                            input_group(
+                                input_group_textarea(&f[28])
+                                    .placeholder("Autoresize textarea...")
+                                    .padding_y(10.0),
+                            )
+                            .addon(
+                                input_group_addon(BELOW).button(
+                                    input_group_button(ButtonVariant::Default, InputGroupButtonSize::Sm)
+                                        .margin_left(Length::Auto)
+                                        .child("Submit"),
+                                ),
                             ),
                         ),
-                    ),
                 )),
         )
     })
@@ -323,22 +349,22 @@ pub fn render() -> Render {
 fn overview(f: &[TextField; 29]) -> gui::Div {
     let t = theme();
     div()
-        .grid()
-        .w_full()
-        .max_w_px(384.0)
-        .gap(6.0)
+        .display(Display::Grid)
+        .width(pct(100.0))
+        .max_width(384.0)
+        .gap(24.0)
         .child(
             input_group(input_group_input(&f[0]).placeholder("Search..."))
                 .addon(input_group_addon(START).child(icon(Icon::Search)))
                 .addon(input_group_addon(END).child("12 results")),
         )
         .child(
-            input_group(input_group_input(&f[1]).placeholder("example.com").pl(1.0))
+            input_group(input_group_input(&f[1]).placeholder("example.com").padding_left(4.0))
                 .addon(input_group_addon(START).child(input_group_text().child("https://")))
                 .addon(
                     input_group_addon(END).button(
                         input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs)
-                            .rounded_full()
+                            .radius(9999.0)
                             .child(icon(Icon::Info)),
                     ),
                 ),
@@ -348,15 +374,15 @@ fn overview(f: &[TextField; 29]) -> gui::Div {
                 input_group_addon(BELOW)
                     .button(
                         input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconXs)
-                            .rounded_full()
+                            .radius(9999.0)
                             .child(icon(Icon::Plus)),
                     )
                     .button(input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::Xs).child("Auto"))
-                    .child(input_group_text().ml_auto().child("52% used"))
-                    .child(separator(Orientation::Vertical).h(4.0))
+                    .child(input_group_text().margin_left(Length::Auto).child("52% used"))
+                    .child(separator(Orientation::Vertical).height(16.0))
                     .button(
                         input_group_button(ButtonVariant::Default, InputGroupButtonSize::IconXs)
-                            .rounded_full()
+                            .radius(9999.0)
                             .disabled(true)
                             .child(icon(Icon::ArrowUp)),
                     ),
@@ -366,14 +392,14 @@ fn overview(f: &[TextField; 29]) -> gui::Div {
             input_group(input_group_input(&f[3]).placeholder("@shadcn")).addon(
                 input_group_addon(END).child(
                     div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_full()
-                        .bg(t.primary)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .justify_content(Justify::Center)
+                        .radius(9999.0)
+                        .background(t.primary)
                         .text_color(t.primary_foreground)
-                        .size(4.0)
-                        .child(icon(Icon::Check).size(3.0)),
+                        .size(16.0)
+                        .child(icon(Icon::Check).size(12.0)),
                 ),
             ),
         )

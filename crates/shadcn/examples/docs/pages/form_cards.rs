@@ -4,11 +4,11 @@
 //! its fields ([`FormField`]) and draws itself with `view`.
 
 use gui::prelude::*;
-use gui::{Color, Div, Icon, Radius, ScenarioError, Signal, TextField, div, icon, text};
+use gui::{Color, Div, Icon, ScenarioError, Signal, TextField, div, icon, text};
 
 use crate::{Shot, demo};
 use shadcn::{
-    ButtonSize, ButtonVariant, Checks, FieldLegendVariant, FieldOrientation, FieldStack, FormEntry, FormField,
+    Button, ButtonSize, ButtonVariant, Checks, FieldLegendVariant, FieldOrientation, FieldStack, FormEntry, FormField,
     FormValue, InputGroupAlign, InputGroupButtonSize, OnChange, SelectPosition, Toast, ToastKind, button, card,
     card_content, card_description, card_footer, card_header, card_title, checkbox, field, field_checkbox_group,
     field_choices, field_content, field_description, field_error, field_group, field_label, field_label_card,
@@ -111,21 +111,37 @@ pub fn submitted(values: &Json, pre: Pre) {
     values.write(0, &mut json);
     let toast = Toast::new(ToastKind::Default, "You submitted the following values:").description_view(move || {
         let t = theme();
-        let block = div().mt(2.0).rounded_md().p(4.0).font_mono();
+        let block = div()
+            .margin_top(8.0)
+            .radius(8.0)
+            .padding(16.0)
+            .font_family(FontFamily::GEIST_MONO);
         match pre {
             Pre::Code => block
-                .bg(t.code)
+                .background(t.code)
                 .text_color(t.code_foreground)
-                .w_px(320.0)
-                .overflow_x_scroll(),
-            Pre::Neutral950 => block.bg(Color::hex(0x000a_0a0a)).text_color(Color::WHITE).w_px(320.0),
-            Pre::Neutral900 => block.bg(Color::hex(0x0017_1717)).text_color(t.code_foreground).w_full(),
+                .width(320.0)
+                .overflow_x(Overflow::Scroll)
+                .overflow_y(Overflow::Hidden),
+            Pre::Neutral950 => block
+                .background(Color::hex(0x000a_0a0a))
+                .text_color(Color::WHITE)
+                .width(320.0),
+            Pre::Neutral900 => block
+                .background(Color::hex(0x0017_1717))
+                .text_color(t.code_foreground)
+                .width(pct(100.0)),
         }
-        .child(text(json.clone()).whitespace_nowrap())
+        .child(text(json.clone()).nowrap(true))
         .into_element()
     });
     shadcn::toast(if pre == Pre::Code {
-        toast.class(|d| d.flex_col().gap(2.0).rounded(Radius::var(4.0)))
+        toast.class(|d| {
+            d.display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(8.0)
+                .radius(14.0)
+        })
     } else {
         toast
     });
@@ -179,12 +195,14 @@ fn shell(
 ) -> Div {
     let t = theme();
     card()
-        .w_full()
-        .max_w_px(width)
+        .width(pct(100.0))
+        .max_width(width)
         .when_some(header, |c, (title, description)| {
             c.child(
                 card_header()
-                    .when(divided, |h| h.border_b().border_color(t.border).pb(6.0))
+                    .when(divided, |h| {
+                        h.border_bottom(1.0).border_color(t.border).padding_bottom(24.0)
+                    })
                     .child(card_title(title.to_owned()))
                     .child(card_description(description.to_owned())),
             )
@@ -192,16 +210,16 @@ fn shell(
         .child(card_content().child(content))
         .child(
             card_footer()
-                .when(divided, |f| f.border_t().border_color(t.border).pt(6.0))
+                .when(divided, |f| f.border_top(1.0).border_color(t.border).padding_top(24.0))
                 .child(footer),
         )
 }
 
-fn outline(label: &str) -> Div {
+fn outline(label: &str) -> Button {
     button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned())
 }
 
-fn primary(label: &str) -> Div {
+fn primary(label: &str) -> Button {
     button(ButtonVariant::Default, ButtonSize::Default).child(label.to_owned())
 }
 
@@ -326,7 +344,7 @@ impl BugCard {
                             input_group(
                                 input_group_textarea(&description.control())
                                     .placeholder("I'm having an issue with the login button on mobile.")
-                                    .min_h(24.0)
+                                    .min_height(96.0)
                                     .invalid(description_invalid),
                             )
                             .addon(
@@ -395,7 +413,7 @@ impl TextareaCard {
                         textarea()
                             .field(about.control())
                             .placeholder("I'm a software engineer...")
-                            .min_h_px(120.0),
+                            .min_height(120.0),
                         invalid,
                     ))
                     .child(field_description(
@@ -530,7 +548,7 @@ impl SelectCard {
                     .child(form_control(
                         select()
                             .model(f.control())
-                            .min_w_px(120.0)
+                            .min_width(120.0)
                             .child(select_value("Select"))
                             .child(content),
                         invalid,
@@ -692,7 +710,7 @@ impl FormValue for Checklist {
 fn check(name: &str, checked: &Signal<bool>, invalid: bool) -> FieldStack {
     field(H, invalid)
         .child(form_control(checkbox().model(*checked), invalid))
-        .child(label_for(name, checked).font_normal())
+        .child(label_for(name, checked).font_weight(400))
 }
 
 pub struct CheckboxCard {
@@ -733,7 +751,7 @@ impl CheckboxCard {
         // own (a group in a group is `gap-4`); the others put it in the set.
         let tasks = if self.library == Library::Formisch {
             field_group()
-                .gap(4.0)
+                .gap(16.0)
                 .child(tasks)
                 .child(field_error(f.errors()))
                 .into_element()
@@ -756,7 +774,7 @@ impl CheckboxCard {
                             field_checkbox_group().child(
                                 field(H, false)
                                     .child(checkbox().model(self.responses).disabled(true))
-                                    .child(field_label("Push notifications").font_normal()),
+                                    .child(field_label("Push notifications").font_weight(400)),
                             ),
                         ),
                 )
@@ -867,12 +885,12 @@ impl ArrayCard {
             Some(("Contact Emails", "Manage your contact email addresses.")),
             true,
             field_set()
-                .gap(4.0)
+                .gap(16.0)
                 .child(field_legend("Email Addresses", Some(FieldLegendVariant::Label)))
                 .child(field_description(
                     "Add up to 5 email addresses where we can contact you.",
                 ))
-                .child(field_group().gap(4.0).children(rows).child(add)),
+                .child(field_group().gap(16.0).children(rows).child(add)),
             reset_then(
                 "Save",
                 move || reset.replace(Self::initial(library)),
@@ -1024,7 +1042,13 @@ impl ComplexCard {
         };
         let save = primary("Save Preferences").on_click(move |_| submit());
         if tanstack {
-            shell(384.0, None, false, content, field(H, false).justify_end().child(save))
+            shell(
+                384.0,
+                None,
+                false,
+                content,
+                field(H, false).justify_content(Justify::End).child(save),
+            )
         } else {
             let (plan, billing, addons, email) = (self.plan, billing, addons, self.email_notifications);
             let reset = outline("Reset").on_click(move |_| {
@@ -1092,8 +1116,9 @@ impl Cards {
     /// Each card in its demo, one under the other.
     pub fn view(&self, files: &Files) -> Div {
         gui::div()
-            .flex_col()
-            .gap(8.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(32.0)
             .child(demo(files.demo, self.bug.view()))
             .child(demo(files.input, self.input.view()))
             .child(demo(files.textarea, self.textarea.view()))

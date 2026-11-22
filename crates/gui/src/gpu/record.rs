@@ -10,10 +10,13 @@
 //! | glyph or icon from an atlas | 8 | 32 |
 //! | rectangle | 8 | 32 |
 //! | rounded rectangle | 12 | 48 |
+//! | its corners a superellipse | +1 | +4 |
 //! | band (border, ring) | 20 | 80 |
 //! | shadow | 21 | 84 |
 //! | image | 16 | 64 |
+//! | its corners a superellipse (shadow, image) | +1 | +4 |
 //! | gradient | 16 + 3 a stop | |
+//! | what lies below, read back (backdrop, blended border) | 27 | 108 |
 //!
 //! The 256-byte primitive it replaces held all of them in sixteen `vec4`s.
 
@@ -27,11 +30,19 @@ pub(crate) const KIND_MASK: u32 = 6;
 pub(crate) const KIND_LAYER: u32 = 7;
 pub(crate) const KIND_TEXT_THROUGH: u32 = 8;
 pub(crate) const KIND_LCD: u32 = 9;
+pub(crate) const KIND_READ: u32 = 10;
+
+/// What a read record does with what lies below (its head's bits 16..24).
+pub(crate) const READ_BACKDROP: u32 = 0;
+pub(crate) const READ_DARKEN: u32 = 1;
+pub(crate) const READ_LIGHTEN: u32 = 2;
 
 /// A solid record has radii (a text-through one: a background; a layer: a mask).
 pub(crate) const F_RADII: u32 = 1 << 8;
 /// A solid record has an inner rectangle cut out (a text-through one: a gradient).
 pub(crate) const F_INNER: u32 = 1 << 9;
+/// A solid record's corners curve as CSS's `superellipse(k)`, `k` its last word.
+pub(crate) const F_CURVE: u32 = 1 << 10;
 
 /// `v` as an IEEE half, rounded to nearest, ties to even.
 pub(crate) fn half(v: f32) -> u16 {
@@ -130,12 +141,17 @@ pub(crate) struct Solid {
     pub radii: Option<[f32; 4]>,
     /// The rectangle cut out of it and its radii.
     pub inner: Option<([f32; 4], [f32; 4])>,
+    /// Its corners' curve, CSS's superellipse parameter; `None` is round.
+    pub curve: Option<f32>,
 }
 
 impl Solid {
     pub(crate) fn push(&self, out: &mut Vec<u32>) {
-        let radii = self.radii.or(self.inner.map(|_| [0.0; 4]));
-        let flags = radii.map_or(0, |_| F_RADII) | self.inner.map_or(0, |_| F_INNER);
+        let curve = self.curve.filter(|k| (k - 1.0).abs() > f32::EPSILON);
+        let radii = self
+            .radii
+            .or((self.inner.is_some() || curve.is_some()).then_some([0.0; 4]));
+        let flags = radii.map_or(0, |_| F_RADII) | self.inner.map_or(0, |_| F_INNER) | curve.map_or(0, |_| F_CURVE);
         let [c0, c1] = color(self.color);
         out.extend([KIND_SOLID | flags, self.slot, c0, c1]);
         out.extend(f(self.rect));
@@ -145,6 +161,9 @@ impl Solid {
         if let Some((rect, r)) = self.inner {
             out.extend(f(rect));
             out.extend(f(r));
+        }
+        if let Some(k) = curve {
+            out.push(k.to_bits());
         }
     }
 }
@@ -160,17 +179,23 @@ pub(crate) struct Shadow {
     pub caster: [f32; 4],
     pub caster_radii: [f32; 4],
     pub sigma: f32,
+    /// The corners' curve (the caster's and the shadow's); `None` is round.
+    pub curve: Option<f32>,
 }
 
 impl Shadow {
     pub(crate) fn push(&self, out: &mut Vec<u32>) {
+        let curve = self.curve.filter(|k| (k - 1.0).abs() > f32::EPSILON);
         let [c0, c1] = color(self.color);
-        out.extend([KIND_SHADOW, self.slot, c0, c1]);
+        out.extend([KIND_SHADOW | curve.map_or(0, |_| F_CURVE), self.slot, c0, c1]);
         out.extend(f(self.shape));
         out.extend(f(self.shape_radii));
         out.extend(f(self.caster));
         out.extend(f(self.caster_radii));
         out.push(self.sigma.to_bits());
+        if let Some(k) = curve {
+            out.push(k.to_bits());
+        }
     }
 }
 
@@ -210,14 +235,66 @@ pub(crate) struct Image {
     pub rect: [f32; 4],
     pub radii: [f32; 4],
     pub placed: [f32; 4],
+    /// The corners' curve; `None` is round.
+    pub curve: Option<f32>,
 }
 
 impl Image {
     pub(crate) fn push(&self, out: &mut Vec<u32>) {
-        out.extend([KIND_IMAGE, self.slot, 0, 0]);
+        let curve = self.curve.filter(|k| (k - 1.0).abs() > f32::EPSILON);
+        out.extend([KIND_IMAGE | curve.map_or(0, |_| F_CURVE), self.slot, 0, 0]);
         out.extend(f(self.rect));
         out.extend(f(self.radii));
         out.extend(f(self.placed));
+        if let Some(k) = curve {
+            out.push(k.to_bits());
+        }
+    }
+}
+
+/// What lies below a box, read back into a texture (`frame.rs`'s `Read`)
+/// and shown inside its shape: filtered (a backdrop), or blended with a
+/// colour (a border, `inner` cut out of it).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Read {
+    pub slot: u32,
+    /// [`READ_BACKDROP`], [`READ_DARKEN`] or [`READ_LIGHTEN`].
+    pub mode: u32,
+    /// The colour blended (straight).
+    pub color: [f32; 4],
+    pub rect: [f32; 4],
+    pub radii: [f32; 4],
+    pub inner: Option<([f32; 4], [f32; 4])>,
+    /// Where the texture's first texel lies in the window, physical.
+    pub origin: [f32; 2],
+    /// Window pixels a texel of the texture covers (a blur reads it scaled down).
+    pub level: f32,
+    /// `saturate(k)` of a backdrop.
+    pub saturate: f32,
+    pub curve: f32,
+    /// The texels of the texture that hold what was read.
+    pub valid: [f32; 2],
+}
+
+impl Read {
+    pub(crate) fn push(&self, out: &mut Vec<u32>) {
+        let flags = self.inner.map_or(0, |_| F_INNER) | ((self.mode & 0xff) << 16);
+        let [c0, c1] = color(self.color);
+        out.extend([KIND_READ | flags, self.slot, c0, c1]);
+        out.extend(f(self.rect));
+        out.extend(f(self.radii));
+        let (inner, inner_radii) = self.inner.unwrap_or(([0.0; 4], [0.0; 4]));
+        out.extend(f(inner));
+        out.extend(f(inner_radii));
+        out.extend([
+            self.origin[0].to_bits(),
+            self.origin[1].to_bits(),
+            self.level.to_bits(),
+            self.saturate.to_bits(),
+            self.curve.to_bits(),
+            self.valid[0].to_bits(),
+            self.valid[1].to_bits(),
+        ]);
     }
 }
 
@@ -335,8 +412,23 @@ mod tests {
             rect: [0.0, 0.0, 10.0, 10.0],
             radii: Some([2.0; 4]),
             inner: None,
+            curve: None,
         }
         .push(&mut out);
         assert_eq!(out.len(), 12);
+        // A squircle carries its curve in one word more.
+        let mut out = Vec::new();
+        Solid {
+            slot: 0,
+            color: [1.0; 4],
+            rect: [0.0, 0.0, 10.0, 10.0],
+            radii: Some([2.0; 4]),
+            inner: None,
+            curve: Some(2.0),
+        }
+        .push(&mut out);
+        assert_eq!(out.len(), 13);
+        assert_eq!(out[0] & F_CURVE, F_CURVE);
+        assert_eq!(f32::from_bits(out[12]), 2.0);
     }
 }

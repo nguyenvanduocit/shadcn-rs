@@ -30,6 +30,12 @@ const SPEED_WINDOW: f32 = 0.1;
 /// that stopped before lifting fling slower, and not at all past it.
 const FLING_WINDOW: f32 = 0.15;
 
+/// How long an overlay scrollbar stays shown after the user last scrolled
+/// its container, then how long it takes to fade out, seconds (cc's
+/// overlay scrollbar fade delay and duration, `ScrollbarAnimationController`).
+pub(super) const THUMB_SHOWN: f32 = 0.5;
+pub(super) const THUMB_FADE: f32 = 0.2;
+
 /// One scroll container's synced offset.
 #[derive(Clone, Debug, Default)]
 struct Synced {
@@ -207,6 +213,9 @@ pub(super) struct Scrolls {
     /// Whether a trackpad gesture is flung on after the fingers lift: the
     /// platform sends no momentum of its own.
     flings: bool,
+    /// When the user last scrolled each container: its overlay scrollbar
+    /// shows from then, and fades. A program's scroll shows none.
+    touched: HashMap<NodeKey, f32>,
 }
 
 impl Default for Scrolls {
@@ -216,6 +225,7 @@ impl Default for Scrolls {
             gesture: None,
             moves: HashMap::default(),
             flings: PLATFORM_FLINGS_NOT,
+            touched: HashMap::default(),
         }
     }
 }
@@ -268,8 +278,28 @@ impl Scrolls {
             let m = self.moves.entry(node.key).or_default();
             m.retain(|(t, _)| at - *t < SPEED_WINDOW);
             m.push((at, moved));
+            self.touched.insert(node.key, at);
         }
         moved
+    }
+
+    /// The opacity of `key`'s overlay scrollbar at `at`: 1 while the user
+    /// scrolls it and for [`THUMB_SHOWN`] after, then down to 0 over
+    /// [`THUMB_FADE`]; 0 at rest.
+    pub(super) fn thumb_opacity(&self, key: NodeKey, at: f32) -> f32 {
+        self.touched.get(&key).map_or(0.0, |&t| {
+            let idle = at - t - THUMB_SHOWN;
+            if idle <= 0.0 {
+                1.0
+            } else {
+                (1.0 - idle / THUMB_FADE).max(0.0)
+            }
+        })
+    }
+
+    /// Whether an overlay scrollbar is still shown or fading at `at`.
+    fn thumbs_shown(&self, at: f32) -> bool {
+        self.touched.values().any(|&t| at < t + THUMB_SHOWN + THUMB_FADE)
     }
 
     /// How fast the compositor scrolls `key` at `at`, offset pixels a
@@ -344,6 +374,7 @@ impl Scrolls {
     /// Move the gesture's scroll container to where its events, resampled
     /// at `at`, or its fling put it.
     pub(super) fn tick(&mut self, scrollers: &[ScrollNode], at: f32) {
+        self.touched.retain(|_, t| at < *t + THUMB_SHOWN + THUMB_FADE);
         let Some(mut g) = self.gesture.take() else { return };
         let Some(node) = scrollers.iter().find(|s| s.key == g.target) else {
             return;
@@ -382,10 +413,11 @@ impl Scrolls {
 
     /// Whether a gesture is still resampled or a fling moves at `at`.
     pub(super) fn animating(&self, at: f32) -> bool {
-        self.gesture.as_ref().is_some_and(|g| match &g.fling {
-            Some((f, _)) => f.moving(at),
-            None => g.predictor.last().is_some_and(|l| at < l + PREDICT_FOR),
-        })
+        self.thumbs_shown(at)
+            || self.gesture.as_ref().is_some_and(|g| match &g.fling {
+                Some((f, _)) => f.moving(at),
+                None => g.predictor.last().is_some_and(|l| at < l + PREDICT_FOR),
+            })
     }
 
     /// Hand what was scrolled since to the main frame `sequence`, granted

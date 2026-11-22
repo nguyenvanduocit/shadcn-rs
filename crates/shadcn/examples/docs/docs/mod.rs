@@ -25,11 +25,11 @@ use gui::layout::{Content, FrameNode};
 use gui::prelude::*;
 use gui::{
     Div, Element, ElementKey, Icon, KeyEvent, Modifiers, NamedKey, RunOptions, Scenario, ScenarioError, ScrollHandle,
-    Signal, div, icon, key_of, text, use_context,
+    Signal, div, icon, key_of, text,
 };
 use shadcn::{
     ButtonSize, ButtonVariant, CommandItem, CommandSection, Orientation, SidebarCollapsible, SidebarMenuButtonProps,
-    SidebarMenuButtonSize, Theme, breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page,
+    SidebarMenuButtonSize, breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page,
     breadcrumb_separator, button, command, command_input, command_list, dialog, dialog_content, kbd, kbd_group,
     separator, sidebar, sidebar_content, sidebar_group, sidebar_group_content, sidebar_group_label, sidebar_header,
     sidebar_inset, sidebar_menu, sidebar_menu_button, sidebar_menu_item, sidebar_provider, sidebar_trigger, theme,
@@ -39,6 +39,7 @@ use self::catalog::{Catalog, Route};
 use self::component::DemoStates;
 use self::fidelity::Verdicts;
 use crate::{Host, Render};
+use shadcn::focus::StateLook;
 
 pub use self::export::export;
 
@@ -176,8 +177,8 @@ impl Docs {
         let t = theme();
         div()
             .named("docs")
-            .size_full()
-            .bg(t.background)
+            .size(pct(100.0))
+            .background(t.background)
             .text_color(t.foreground)
             .on_key_down(move |e| {
                 let hit = is_search_key(e);
@@ -190,7 +191,7 @@ impl Docs {
                 sidebar_provider()
                     .collapsible(SidebarCollapsible::Offcanvas)
                     .child(self.side(route))
-                    .child(sidebar_inset().min_h(0.0).child(self.header(route)).child(body)),
+                    .child(sidebar_inset().min_height(0.0).child(self.header(route)).child(body)),
             )
             .child(self.palette())
             .into_element()
@@ -224,16 +225,22 @@ impl Docs {
                     is_active: route == current,
                     ..SidebarMenuButtonProps::default()
                 })
-                .h(7.5)
+                .height(30.0)
                 .on_click(move |_| nav.go(route))
-                .child(text(title).truncate()),
+                .child(
+                    text(title)
+                        .truncate(true)
+                        .nowrap(true)
+                        .overflow_x(Overflow::Hidden)
+                        .min_width(0.0),
+                ),
             )
         };
         let group = |label: &str, routes: &[Route]| {
             sidebar_group()
-                .py(1.0)
+                .padding_y(4.0)
                 .child(sidebar_group_label().child(label.to_owned()))
-                .child(sidebar_group_content().child(sidebar_menu().gap(0.5).children(routes.iter().map(|&r| item(r)))))
+                .child(sidebar_group_content().child(sidebar_menu().gap(2.0).children(routes.iter().map(|&r| item(r)))))
         };
         let home = self.nav.clone();
         let brand = sidebar_menu().child(
@@ -245,25 +252,27 @@ impl Docs {
                 .on_click(move |_| home.go(Route::Introduction))
                 .child(
                     div()
-                        .size(8.0)
-                        .shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_lg()
-                        .bg(t.sidebar_primary)
+                        .size(32.0)
+                        .flex_shrink(0.0)
+                        .display(Display::Flex)
+                        .align_items(Align::Center)
+                        .justify_content(Justify::Center)
+                        .radius(10.0)
+                        .background(t.sidebar_primary)
                         .text_color(t.sidebar_primary_foreground)
                         .child(icon(Icon::Layers)),
                 )
                 .child(
                     div()
-                        .flex_col()
-                        .min_w(0.0)
-                        .leading_tight()
-                        .child(text("shadcn-rs").font_semibold())
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .min_width(0.0)
+                        .line_height(LineHeight::Relative(1.25))
+                        .child(text("shadcn-rs").font_weight(600))
                         .child(
                             text(format!("Docs · {} components", self.catalog.components.len()))
-                                .text_xs()
+                                .text_size(12.0)
+                                .line_height(16.0)
                                 .text_color(t.muted_foreground),
                         ),
                 ),
@@ -272,7 +281,7 @@ impl Docs {
         sidebar().child(sidebar_header().child(brand)).child(
             sidebar_content()
                 .gap(0.0)
-                .pb(4.0)
+                .padding_bottom(16.0)
                 .child(group("Getting Started", &self.catalog.getting_started))
                 .child(group("Components", &self.catalog.components)),
         )
@@ -294,46 +303,57 @@ impl Docs {
             )
         };
         let search = self.search.clone();
-        let find = button(ButtonVariant::Outline, ButtonSize::Sm)
+        let find = button(ButtonVariant::Outline, ButtonSize::Sm);
+        let i = find.interaction();
+        // The outline button's hover (its fill and text) over the fixed look.
+        let find = find
             .named("docs-search")
-            .w_px(256.0)
-            .justify_start()
-            .font_normal()
+            .width(256.0)
+            .justify_content(Justify::Start)
+            .font_weight(400)
             .text_color(t.muted_foreground)
-            .when(!t.dark, |b| b.bg(t.muted.opacity(0.5)))
+            .text_color_while(move || i.hovered(), t.accent_foreground)
+            .when(!t.dark, |b| {
+                b.background(t.muted.opacity(0.5))
+                    .background_while(move || i.hovered(), t.accent)
+            })
             .on_click(move |_| search.open())
             .child(icon(Icon::Search))
             .child(text("Search documentation..."))
             .child(
                 kbd_group()
-                    .ml_auto()
+                    .margin_left(Length::Auto)
                     .child(kbd().child(if cfg!(target_os = "macos") { "⌘" } else { "Ctrl" }))
                     .child(kbd().child("K")),
             );
-        let themes = use_context::<Signal<Theme>>();
+        let themes = shadcn::use_theme();
         let toggle = button(ButtonVariant::Ghost, ButtonSize::Icon)
             .named("theme-toggle")
-            .size(8.0)
-            .on_click(move |_| {
-                if let Some(s) = &themes {
-                    s.update(|t| *t = if t.dark { Theme::light() } else { Theme::dark() });
-                }
-            })
+            .size(32.0)
+            .on_click(move |_| themes.update(|t| t.scheme = t.scheme.toggled()))
             .child(icon(if t.dark { Icon::Sun } else { Icon::Moon }));
         div()
             .named("docs-header")
-            .flex()
-            .items_center()
-            .gap(2.0)
-            .h(14.0)
-            .shrink_0()
-            .px(4.0)
-            .border_b()
+            .display(Display::Flex)
+            .align_items(Align::Center)
+            .gap(8.0)
+            .height(56.0)
+            .flex_shrink(0.0)
+            .padding_x(16.0)
+            .border_bottom(1.0)
             .border_color(t.border)
-            .child(sidebar_trigger().ml(-1.0))
-            .child(separator(Orientation::Vertical).h(4.0).mr(2.0))
+            .child(sidebar_trigger().margin_left(-4.0))
+            .child(separator(Orientation::Vertical).height(16.0).margin_right(8.0))
             .child(crumbs)
-            .child(div().ml_auto().flex().items_center().gap(2.0).child(find).child(toggle))
+            .child(
+                div()
+                    .margin_left(Length::Auto)
+                    .display(Display::Flex)
+                    .align_items(Align::Center)
+                    .gap(8.0)
+                    .child(find)
+                    .child(toggle),
+            )
     }
 
     /// The page's column, and "On this page" beside it.
@@ -388,10 +408,10 @@ impl Docs {
             .child(
                 dialog_content()
                     .map_root(|d| d.named("docs-palette"))
-                    .p(0.0)
+                    .padding(0.0)
                     .gap(0.0)
-                    .max_w_px(560.0)
-                    .overflow_hidden()
+                    .max_width(560.0)
+                    .overflow(Overflow::Hidden)
                     .child(
                         command()
                             .child(command_input("Search documentation..."))
@@ -642,12 +662,12 @@ fn pager(catalog: &Catalog, nav: &Nav, route: Route) -> Div {
             .when(!before, |b| b.child(icon(glyph)))
     };
     div()
-        .flex()
-        .items_center()
-        .pt(6.0)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .padding_top(24.0)
         .when_some(prev, |d, r| d.child(link(r, Icon::ArrowLeft, true)))
         .when_some(next, |d, r| {
-            d.child(div().ml_auto().child(link(r, Icon::ArrowRight, false)))
+            d.child(div().margin_left(Length::Auto).child(link(r, Icon::ArrowRight, false)))
         })
 }
 
@@ -662,53 +682,75 @@ fn body(nav: &Nav, parts: Vec<Part>) -> Div {
     let reading = nav.reading(&keys);
     let column = div()
         .named("docs-main")
-        .flex_1()
-        .min_w(0.0)
-        .h_full()
-        .overflow_y_scroll()
+        .flex(Flex::grow(1.0))
+        .min_width(0.0)
+        .height(pct(100.0))
+        .overflow_y(Overflow::Scroll)
+        .overflow_x(Overflow::Hidden)
         .track_scroll(&nav.scroll)
-        .flex_col()
-        .items_center()
-        .gap(14.0)
-        .px(10.0)
-        .pt(8.0)
-        .pb(16.0)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .align_items(Align::Center)
+        .gap(56.0)
+        .padding_x(40.0)
+        .padding_top(32.0)
+        .padding_bottom(64.0)
         .children(parts.into_iter().map(|p| {
             div()
                 .key(p.key)
-                .w_full()
-                .max_w_px(CONTENT_WIDTH)
-                .flex_col()
+                .width(pct(100.0))
+                .max_width(CONTENT_WIDTH)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
                 .child(p.body)
         }));
     let toc = (!listed.is_empty()).then(|| {
         div()
             .named("docs-toc")
-            .w(56.0)
-            .shrink_0()
-            .h_full()
-            .min_h(0.0)
-            .overflow_y_scroll()
-            .scrollbar_none()
-            .flex_col()
-            .gap(2.0)
-            .pt(8.0)
-            .pr(6.0)
-            .pb(8.0)
-            .text_sm()
-            .child(text("On this page").font_medium().mb(1.0))
+            .width(224.0)
+            .flex_shrink(0.0)
+            .height(pct(100.0))
+            .min_height(0.0)
+            .overflow_y(Overflow::Scroll)
+            .overflow_x(Overflow::Hidden)
+            .scrollbar_hidden(true)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(8.0)
+            .padding_top(32.0)
+            .padding_right(24.0)
+            .padding_bottom(32.0)
+            .text_size(14.0)
+            .line_height(20.0)
+            .child(text("On this page").font_weight(500).margin_bottom(4.0))
             .children(listed.into_iter().map(|(key, label)| {
                 let nav = nav.clone();
                 let on = reading == Some(key);
                 text(label)
                     .text_color(if on { t.foreground } else { t.muted_foreground })
-                    .when(on, |l| l.font_medium())
-                    .cursor_pointer()
+                    .when(on, |l| l.font_weight(500))
+                    .cursor(Cursor::Pointer)
                     .focusable()
-                    .hover(move |s| s.text_color(t.foreground))
-                    .focus_visible(move |s| s.ring(2.0, t.ring).rounded_sm())
+                    .with_interaction(|mut d, i| {
+                        let (ring, shape) = (d.style_mut().ring, d.style_mut().shape);
+                        let shown = Ring::new(2.0, t.ring);
+                        d.text_color_while(move || i.hovered(), t.foreground)
+                            .ring(move || if i.focus_visible() { Some(shown) } else { ring })
+                            .shape(move || {
+                                if i.focus_visible() {
+                                    Shape::Rounded(Corners::all(6.0))
+                                } else {
+                                    shape
+                                }
+                            })
+                    })
                     .on_click(move |_| nav.reveal(key))
             }))
     });
-    div().flex().flex_1().min_h(0.0).child(column).child(toc)
+    div()
+        .display(Display::Flex)
+        .flex(Flex::grow(1.0))
+        .min_height(0.0)
+        .child(column)
+        .child(toc)
 }

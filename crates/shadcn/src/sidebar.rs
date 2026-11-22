@@ -12,16 +12,17 @@
 
 use gui::prelude::*;
 use gui::{
-    Bind, ComponentElement, Div, Element, Key, KeyEvent, Model, Properties, Shadow, Side, Signal, TextField, UseModel,
-    component, div, icon, provide, px, relative, text, use_context, use_model,
+    Bind, Color, ComponentElement, Div, Element, Key, KeyEvent, Model, Properties, Shadow, Side, Signal, TextField,
+    UseModel, component, div, icon, provide, px, text, use_context, use_model,
 };
 
 use crate::button::{ButtonSize, ButtonVariant, button};
+use crate::focus::StateLook;
 use crate::input::input;
 use crate::part::{Part, PartProps};
 use crate::separator::{Orientation, separator};
 use crate::skeleton::skeleton;
-use crate::theme::{Theme, theme};
+use crate::theme::{Colors, theme};
 use crate::tooltip::{tooltip, tooltip_content, tooltip_trigger};
 
 /// `--sidebar-width`: 16rem.
@@ -128,13 +129,15 @@ fn is_shortcut(e: &KeyEvent) -> bool {
 }
 
 /// `focus-visible:ring-2 ring-sidebar-ring`.
-fn ring(s: gui::Style, t: &Theme) -> gui::Style {
-    s.ring(2.0, t.sidebar_ring)
+fn ring_on<S: Styled>(mut el: S, i: Interaction, t: &Colors) -> S {
+    let (base, ring) = (el.style_mut().ring, Ring::new(2.0, t.sidebar_ring));
+    el.ring(move || if i.focus_visible() { Some(ring) } else { base })
 }
 
-/// `hover:bg-sidebar-accent hover:text-sidebar-accent-foreground`.
-fn accent(s: gui::Style, t: &Theme) -> gui::Style {
-    s.bg(t.sidebar_accent).text_color(t.sidebar_accent_foreground)
+/// `hover:bg-sidebar-accent hover:text-sidebar-accent-foreground`, while `on` holds.
+fn accent_while<S: Styled>(el: S, on: impl Fn() -> bool + Clone + 'static, t: &Colors) -> S {
+    el.background_while(on.clone(), t.sidebar_accent)
+        .text_color_while(on, t.sidebar_accent_foreground)
 }
 
 /// A 1px outline drawn as a shadow (`shadow-[0_0_0_1px_<color>]`).
@@ -153,7 +156,7 @@ fn outline(color: gui::Color) -> Shadow {
 /// unless told otherwise.
 #[must_use]
 pub fn sidebar_provider() -> Part<SidebarProps> {
-    let root = div().named("sidebar-wrapper").flex().size_full();
+    let root = div().named("sidebar-wrapper").display(Display::Flex).size(pct(100.0));
     Part::new(SidebarProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -167,7 +170,7 @@ pub fn sidebar_provider() -> Part<SidebarProps> {
                 let keys = ctx.clone();
                 props
                     .with(|p| p.slot.0.clone())
-                    .when(ctx.variant() == SidebarVariant::Inset, |d| d.bg(t.sidebar))
+                    .when(ctx.variant() == SidebarVariant::Inset, |d| d.background(t.sidebar))
                     .on_key_down(move |e| {
                         let hit = is_shortcut(e);
                         if hit {
@@ -226,20 +229,27 @@ impl Part<SidebarProps> {
 /// The sidebar; its header, content, footer and rail go inside.
 #[must_use]
 pub fn sidebar() -> Part<()> {
-    Part::new((), div().flex_col().size_full(), |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let ctx = SidebarContext::find();
-            move || {
-                let inner = props.with(|p| p.slot.0.clone());
-                match &ctx {
-                    Some(ctx) => frame(ctx, inner),
-                    None => inner,
+    Part::new(
+        (),
+        div()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .size(pct(100.0)),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let ctx = SidebarContext::find();
+                move || {
+                    let inner = props.with(|p| p.slot.0.clone());
+                    match &ctx {
+                        Some(ctx) => frame(ctx, inner),
+                        None => inner,
+                    }
+                    .into_element()
                 }
-                .into_element()
-            }
-        })
-    })
+            })
+        },
+    )
 }
 
 /// The sidebar's boxes around `inner`, the panel holding its parts.
@@ -248,11 +258,11 @@ fn frame(sb: &SidebarContext, inner: Div) -> Div {
     if sb.collapsible() == SidebarCollapsible::None {
         return inner
             .named("sidebar")
-            .bg(t.sidebar)
+            .background(t.sidebar)
             .text_color(t.sidebar_foreground)
-            .w_px(SIDEBAR_WIDTH)
-            .h_full()
-            .shrink_0();
+            .width(SIDEBAR_WIDTH)
+            .height(pct(100.0))
+            .flex_shrink(0.0);
     }
     let collapsed = !sb.is_open();
     let padded = sb.padded();
@@ -272,37 +282,52 @@ fn frame(sb: &SidebarContext, inner: Div) -> Div {
     let left = sb.side() == SidebarSide::Left;
     let panel = inner
         .named("sidebar-inner")
-        .relative()
-        .bg(t.sidebar)
+        .position(Position::Relative)
+        .background(t.sidebar)
         .when(sb.variant() == SidebarVariant::Floating, |d| {
-            d.border().border_color(t.sidebar_border).rounded_lg().shadow_sm()
+            d.border(1.0).border_color(t.sidebar_border).radius(10.0).shadow([
+                Shadow {
+                    x: 0.0,
+                    y: 1.0,
+                    blur: 3.0,
+                    spread: 0.0,
+                    color: Color::BLACK.opacity(0.1),
+                },
+                Shadow {
+                    x: 0.0,
+                    y: 1.0,
+                    blur: 2.0,
+                    spread: -1.0,
+                    color: Color::BLACK.opacity(0.1),
+                },
+            ])
         });
     let container = div()
         .named("sidebar-container")
-        .transition_props(Properties::INSET | Properties::WIDTH)
+        .transition(Properties::INSET | Properties::WIDTH)
         .duration_ms(200.0)
-        .ease_linear()
-        .absolute()
+        .ease(Easing::Linear)
+        .position(Position::Absolute)
         .top(0.0)
         .bottom(0.0)
-        .w_px(width)
-        .flex()
-        .when(left, |d| d.left_len(px(offset)))
-        .when(!left, |d| d.right_len(px(offset)))
-        .when(padded, |d| d.p(2.0))
-        .when(!padded && left, |d| d.border_r().border_color(t.border))
-        .when(!padded && !left, |d| d.border_l().border_color(t.border))
+        .width(width)
+        .display(Display::Flex)
+        .when(left, |d| d.left(px(offset)))
+        .when(!left, |d| d.right(px(offset)))
+        .when(padded, |d| d.padding(8.0))
+        .when(!padded && left, |d| d.border_right(1.0).border_color(t.border))
+        .when(!padded && !left, |d| d.border_left(1.0).border_color(t.border))
         .child(panel);
     // The gap holds the sidebar's place in the row; the container is drawn over it.
     div()
         .named("sidebar")
-        .transition_props(Properties::WIDTH)
+        .transition(Properties::WIDTH)
         .duration_ms(200.0)
-        .ease_linear()
-        .relative()
-        .h_full()
-        .w_px(gap)
-        .shrink_0()
+        .ease(Easing::Linear)
+        .position(Position::Relative)
+        .height(pct(100.0))
+        .width(gap)
+        .flex_shrink(0.0)
         .text_color(t.sidebar_foreground)
         .child(container)
 }
@@ -312,8 +337,9 @@ fn frame(sb: &SidebarContext, inner: Div) -> Div {
 pub fn sidebar_trigger() -> Part<()> {
     let root = button(ButtonVariant::Ghost, ButtonSize::Icon)
         .named("sidebar-trigger")
-        .size(7.0)
-        .child(icon(gui::Icon::PanelLeft));
+        .size(28.0)
+        .child(icon(gui::Icon::PanelLeft))
+        .into_div();
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -336,7 +362,7 @@ pub fn sidebar_trigger() -> Part<()> {
 pub fn sidebar_rail() -> ComponentElement {
     component((), |_| {
         let ctx = SidebarContext::find();
-        let hovered = Signal::labeled("sidebar rail hovered", false);
+        let i = Interaction::new();
         move || {
             let Some(sb) = ctx.clone() else {
                 return Element::Empty;
@@ -347,26 +373,26 @@ pub fn sidebar_rail() -> ComponentElement {
             let reach = px(if sb.padded() { -16.0 } else { -8.0 });
             let side = sb.side();
             let line = div()
-                .absolute()
+                .position(Position::Absolute)
                 .top(0.0)
                 .bottom(0.0)
-                .w(0.5)
-                .left_len(relative(if offcanvas { 1.0 } else { 0.5 }))
-                .when(hovered.get(), |d| d.bg(t.sidebar_border));
+                .width(2.0)
+                .left(Length::Fraction(if offcanvas { 1.0 } else { 0.5 }))
+                .background(move || i.hovered().then_some(t.sidebar_border));
             div()
                 .named("sidebar-rail")
-                .transition_all()
-                .ease_linear()
-                .absolute()
+                .interaction(i)
+                .transition(Properties::ALL)
+                .ease(Easing::Linear)
+                .position(Position::Absolute)
                 .top(0.0)
                 .bottom(0.0)
-                .w(4.0)
-                .flex()
+                .width(16.0)
+                .display(Display::Flex)
                 .cursor(gui::Cursor::ResizeColumn)
-                .when(side == SidebarSide::Left, |d| d.right_len(reach))
-                .when(side == SidebarSide::Right, |d| d.left_len(reach))
-                .when(offcanvas, |d| d.hover(move |s| s.bg(t.sidebar)))
-                .on_hover(move |inside| hovered.set(inside))
+                .when(side == SidebarSide::Left, |d| d.right(reach))
+                .when(side == SidebarSide::Right, |d| d.left(reach))
+                .when(offcanvas, |d| d.background_while(move || i.hovered(), t.sidebar))
                 .on_click(move |_| sb.toggle())
                 .child(line)
                 .into_element()
@@ -380,12 +406,13 @@ pub fn sidebar_inset() -> Part<()> {
     let t = theme();
     let root = div()
         .named("sidebar-inset")
-        .bg(t.background)
-        .relative()
-        .flex_col()
-        .w_full()
-        .flex_1()
-        .min_w(0.0);
+        .background(t.background)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .flex(Flex::grow(1.0))
+        .min_width(0.0);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -395,10 +422,25 @@ pub fn sidebar_inset() -> Part<()> {
                 match &ctx {
                     Some(sb) if sb.variant() == SidebarVariant::Inset => {
                         let collapsed = !sb.is_open();
-                        root.m(2.0)
-                            .ml(if collapsed { 2.0 } else { 0.0 })
-                            .rounded_xl()
-                            .shadow_sm()
+                        root.margin(8.0)
+                            .margin_left(if collapsed { 8.0 } else { 0.0 })
+                            .radius(14.0)
+                            .shadow([
+                                Shadow {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    blur: 3.0,
+                                    spread: 0.0,
+                                    color: Color::BLACK.opacity(0.1),
+                                },
+                                Shadow {
+                                    x: 0.0,
+                                    y: 1.0,
+                                    blur: 2.0,
+                                    spread: -1.0,
+                                    color: Color::BLACK.opacity(0.1),
+                                },
+                            ])
                     }
                     _ => root,
                 }
@@ -410,18 +452,34 @@ pub fn sidebar_inset() -> Part<()> {
 
 #[must_use]
 pub fn sidebar_header() -> Div {
-    div().named("sidebar-header").flex_col().gap(2.0).p(2.0)
+    div()
+        .named("sidebar-header")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .padding(8.0)
 }
 
 #[must_use]
 pub fn sidebar_footer() -> Div {
-    div().named("sidebar-footer").flex_col().gap(2.0).p(2.0)
+    div()
+        .named("sidebar-footer")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .padding(8.0)
 }
 
 /// The scrolling middle of the sidebar, between header and footer.
 #[must_use]
 pub fn sidebar_content() -> Part<()> {
-    let root = div().named("sidebar-content").flex_col().min_h(0.0).flex_1().gap(2.0);
+    let root = div()
+        .named("sidebar-content")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .min_height(0.0)
+        .flex(Flex::grow(1.0))
+        .gap(8.0);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -429,9 +487,9 @@ pub fn sidebar_content() -> Part<()> {
             move || {
                 let d = props.with(|p| p.slot.0.clone());
                 if icon_collapsed(ctx.as_ref()) {
-                    d.overflow_hidden()
+                    d.overflow(Overflow::Hidden)
                 } else {
-                    d.overflow_y_scroll()
+                    d.overflow_y(Overflow::Scroll).overflow_x(Overflow::Hidden)
                 }
                 .into_element()
             }
@@ -444,9 +502,9 @@ pub fn sidebar_separator() -> Div {
     let t = theme();
     separator(Orientation::Horizontal)
         .named("sidebar-separator")
-        .bg(t.sidebar_border)
-        .mx(2.0)
-        .w_auto()
+        .background(t.sidebar_border)
+        .margin_x(8.0)
+        .width(Length::Auto)
 }
 
 /// A search field sized for the sidebar.
@@ -456,21 +514,22 @@ pub fn sidebar_input(field: &TextField) -> crate::input::Input {
     input()
         .field(*field)
         .named("sidebar-input")
-        .bg(t.background)
-        .h(8.0)
-        .w_full()
-        .shadow_none()
+        .background(t.background)
+        .height(32.0)
+        .width(pct(100.0))
+        .shadow(Shadows::new())
 }
 
 #[must_use]
 pub fn sidebar_group() -> Div {
     div()
         .named("sidebar-group")
-        .relative()
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
-        .p(2.0)
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .padding(8.0)
 }
 
 /// A group's heading; slides up out of sight when collapsed to icons.
@@ -479,19 +538,20 @@ pub fn sidebar_group_label() -> Part<()> {
     let t = theme();
     let root = div()
         .named("sidebar-group-label")
-        .transition_props(Properties::MARGIN | Properties::OPACITY)
+        .transition(Properties::MARGIN | Properties::OPACITY)
         .duration_ms(200.0)
-        .ease_linear()
+        .ease(Easing::Linear)
         .text_color(t.sidebar_foreground.opacity(0.7))
-        .flex()
-        .h(8.0)
-        .shrink_0()
-        .items_center()
-        .rounded_md()
-        .px(2.0)
-        .text_xs()
-        .font_medium()
-        .focus_visible(move |s| ring(s, &t));
+        .display(Display::Flex)
+        .height(32.0)
+        .flex_shrink(0.0)
+        .align_items(Align::Center)
+        .radius(8.0)
+        .padding_x(8.0)
+        .text_size(12.0)
+        .line_height(16.0)
+        .font_weight(500)
+        .with_interaction(|d, i| ring_on(d, i, &t));
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
@@ -499,7 +559,9 @@ pub fn sidebar_group_label() -> Part<()> {
             move || {
                 props
                     .with(|p| p.slot.0.clone())
-                    .when(icon_collapsed(ctx.as_ref()), |d| d.mt(-8.0).opacity(0.0).pass_through())
+                    .when(icon_collapsed(ctx.as_ref()), |d| {
+                        d.margin_top(-32.0).opacity(0.0).pass_through()
+                    })
                     .into_element()
             }
         })
@@ -515,7 +577,7 @@ fn hidden_when_icons(root: Div) -> Part<()> {
             move || {
                 props
                     .with(|p| p.slot.0.clone())
-                    .when(icon_collapsed(ctx.as_ref()), Styled::hidden)
+                    .when(icon_collapsed(ctx.as_ref()), |e| e.display(Display::None))
                     .into_element()
             }
         })
@@ -529,59 +591,64 @@ pub fn sidebar_group_action() -> Part<()> {
     hidden_when_icons(
         div()
             .named("sidebar-group-action")
-            .transition_transform()
+            .transition(Properties::TRANSFORM)
             .text_color(t.sidebar_foreground)
-            .absolute()
-            .top(3.5)
-            .right(3.0)
-            .flex()
-            .size(5.0)
-            .items_center()
-            .justify_center()
-            .rounded_md()
+            .position(Position::Absolute)
+            .top(14.0)
+            .right(12.0)
+            .display(Display::Flex)
+            .size(20.0)
+            .align_items(Align::Center)
+            .justify_content(Justify::Center)
+            .radius(8.0)
             .focusable()
-            .hover(move |s| accent(s, &t))
-            .focus_visible(move |s| ring(s, &t)),
+            .with_interaction(|d, i| ring_on(accent_while(d, move || i.hovered(), &t), i, &t)),
     )
 }
 
 #[must_use]
 pub fn sidebar_group_content() -> Div {
-    div().named("sidebar-group-content").w_full().text_sm()
+    div()
+        .named("sidebar-group-content")
+        .width(pct(100.0))
+        .text_size(14.0)
+        .line_height(20.0)
 }
 
 #[must_use]
 pub fn sidebar_menu() -> Div {
-    div().named("sidebar-menu").flex_col().w_full().min_w(0.0).gap(1.0)
+    div()
+        .named("sidebar-menu")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .gap(4.0)
 }
 
 /// What a menu item's action and badge read: whether the pointer is in it.
 #[derive(Clone, Copy)]
 struct ItemContext {
-    hovered: Signal<bool>,
+    /// The item's: its action and badge show while the pointer is on it.
+    item: Interaction,
 }
 
 /// One entry of a menu: its button, and an action or a badge, go inside.
 /// The action and badge follow the pointer in it.
 #[must_use]
 pub fn sidebar_menu_item() -> Part<()> {
-    Part::new((), div().named("sidebar-menu-item").relative(), |p| {
+    Part::new((), div().named("sidebar-menu-item").position(Position::Relative), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let hovered = Signal::labeled("sidebar item hovered", false);
-            provide(ItemContext { hovered });
-            move || {
-                props
-                    .with(|p| p.slot.0.clone())
-                    .on_hover(move |inside| hovered.set(inside))
-                    .into_element()
-            }
+            let item = Interaction::new();
+            provide(ItemContext { item });
+            move || props.with(|p| p.slot.0.clone()).interaction(item).into_element()
         })
     })
 }
 
-fn item_hovered() -> Option<Signal<bool>> {
-    use_context::<ItemContext>().map(|i| i.hovered)
+fn item_interaction() -> Option<Interaction> {
+    use_context::<ItemContext>().map(|i| i.item)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -600,12 +667,12 @@ pub enum SidebarMenuButtonSize {
 }
 
 impl SidebarMenuButtonSize {
-    /// How far below the item's top its action and badge sit (`top-1` … `top-2.5`).
+    /// How far below the item's top its action and badge sit, in pixels (`top-1` … `top-2.5`).
     fn inner_top(self) -> f32 {
         match self {
-            Self::Sm => 1.0,
-            Self::Default => 1.5,
-            Self::Lg => 2.5,
+            Self::Sm => 4.0,
+            Self::Default => 6.0,
+            Self::Lg => 10.0,
         }
     }
 }
@@ -621,42 +688,49 @@ pub struct SidebarMenuButtonProps {
 }
 
 /// The button of a menu item; add its icon and label with `.child` (give
-/// the label `.truncate()`), and `.pr(8.0)` when the item has an action.
+/// the label `.truncate(true).nowrap(true).overflow_x(Overflow::Hidden).min_width(0.0)`), and `.padding_right(32.0)` when the item has an action.
 #[must_use]
 pub fn sidebar_menu_button(props: SidebarMenuButtonProps) -> Part<SidebarMenuButtonProps> {
     let t = theme();
     let base = div()
         .named("sidebar-menu-button")
-        .transition_props(Properties::WIDTH | Properties::HEIGHT | Properties::PADDING)
-        .flex()
-        .w_full()
-        .items_center()
-        .gap(2.0)
-        .overflow_hidden()
-        .rounded_md()
-        .p(2.0)
-        .text_left()
-        .text_sm()
+        .transition(Properties::WIDTH | Properties::HEIGHT | Properties::PADDING)
+        .display(Display::Flex)
+        .width(pct(100.0))
+        .align_items(Align::Center)
+        .gap(8.0)
+        .overflow(Overflow::Hidden)
+        .radius(8.0)
+        .padding(8.0)
+        .text_align(TextAlign::Left)
+        .text_size(14.0)
+        .line_height(20.0)
         .focusable()
-        .focus_visible(move |s| ring(s, &t))
-        .active(move |s| accent(s, &t))
-        .disabled_style(|s| s.opacity(0.5))
         .when(props.is_active, |d| {
-            d.bg(t.sidebar_accent)
-                .font_medium()
+            d.background(t.sidebar_accent)
+                .font_weight(500)
                 .text_color(t.sidebar_accent_foreground)
         });
+    let i = Interaction::new();
+    let base = base.interaction(i);
     let styled = match props.variant {
-        SidebarMenuButtonVariant::Default => base.hover(move |s| accent(s, &t)),
-        SidebarMenuButtonVariant::Outline => base
-            .when(!props.is_active, |d| d.bg(t.background))
-            .shadow(outline(t.sidebar_border))
-            .hover(move |s| accent(s, &t).shadow_none().shadow(outline(t.sidebar_accent))),
+        SidebarMenuButtonVariant::Default => base,
+        SidebarMenuButtonVariant::Outline => {
+            base.when(!props.is_active, |d| d.background(t.background))
+                .shadow(move || {
+                    outline(if i.hovered() {
+                        t.sidebar_accent
+                    } else {
+                        t.sidebar_border
+                    })
+                })
+        }
     };
+    let styled = ring_on(accent_while(styled, move || i.hovered() || i.pressed(), &t), i, &t).dim_disabled(i, 0.5);
     let sized = match props.size {
-        SidebarMenuButtonSize::Default => styled.h(8.0).text_sm(),
-        SidebarMenuButtonSize::Sm => styled.h(7.0).text_xs(),
-        SidebarMenuButtonSize::Lg => styled.h(12.0).text_sm(),
+        SidebarMenuButtonSize::Default => styled.height(32.0).text_size(14.0).line_height(20.0),
+        SidebarMenuButtonSize::Sm => styled.height(28.0).text_size(12.0).line_height(16.0),
+        SidebarMenuButtonSize::Lg => styled.height(48.0).text_size(14.0).line_height(20.0),
     };
     Part::new(props, sized, |p| {
         component(p, |cx| {
@@ -667,14 +741,14 @@ pub fn sidebar_menu_button(props: SidebarMenuButtonProps) -> Part<SidebarMenuBut
                 let icons = icon_collapsed(ctx.as_ref());
                 let collapsed = ctx.as_ref().is_some_and(|c| !c.is_open());
                 let root = root.when(icons, |d| {
-                    d.size(8.0)
-                        .when(size == SidebarMenuButtonSize::Lg, |d| d.p(0.0))
-                        .when(size != SidebarMenuButtonSize::Lg, |d| d.p(2.0))
+                    d.size(32.0)
+                        .when(size == SidebarMenuButtonSize::Lg, |d| d.padding(0.0))
+                        .when(size != SidebarMenuButtonSize::Lg, |d| d.padding(8.0))
                 });
                 match tip {
                     // The tooltip shows only while collapsed.
                     Some(label) => tooltip()
-                        .w_full()
+                        .width(pct(100.0))
                         .child(tooltip_trigger(root))
                         .child(collapsed.then(|| tooltip_content().side(Side::Right).child(text(label))))
                         .into_element(),
@@ -692,18 +766,23 @@ pub fn sidebar_menu_action(size: SidebarMenuButtonSize, show_on_hover: bool) -> 
     let t = theme();
     let root = div()
         .named("sidebar-menu-action")
-        .transition_transform()
-        .absolute()
+        .transition(Properties::TRANSFORM)
+        .position(Position::Absolute)
         .top(size.inner_top())
-        .right(1.0)
-        .flex()
-        .size(5.0)
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .focusable()
-        .hover(move |s| accent(s, &t))
-        .focus_visible(move |s| ring(s, &t));
+        .right(4.0)
+        .display(Display::Flex)
+        .size(20.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(8.0)
+        .focusable();
+    let i = Interaction::new();
+    let root = ring_on(
+        root.interaction(i)
+            .background_while(move || i.hovered(), t.sidebar_accent),
+        i,
+        &t,
+    );
     aside(SidebarMenuAside { show_on_hover }, root)
 }
 
@@ -713,18 +792,19 @@ pub fn sidebar_menu_badge(size: SidebarMenuButtonSize) -> Part<SidebarMenuAside>
     let root = div()
         .named("sidebar-menu-badge")
         .pass_through()
-        .absolute()
+        .position(Position::Absolute)
         .top(size.inner_top())
-        .right(1.0)
-        .flex()
-        .h(5.0)
-        .min_w(5.0)
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .px(1.0)
-        .text_xs()
-        .font_medium();
+        .right(4.0)
+        .display(Display::Flex)
+        .height(20.0)
+        .min_width(20.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .radius(8.0)
+        .padding_x(4.0)
+        .text_size(12.0)
+        .line_height(16.0)
+        .font_weight(500);
     aside(SidebarMenuAside { show_on_hover: false }, root)
 }
 
@@ -741,18 +821,23 @@ fn aside(props: SidebarMenuAside, root: Div) -> Part<SidebarMenuAside> {
         component(p, |cx| {
             let props = cx.props();
             let ctx = SidebarContext::find();
-            let hovered = item_hovered();
+            let item = item_interaction();
             move || {
                 let t = theme();
                 let (show_on_hover, root) = props.with(|p| (p.props.show_on_hover, p.slot.0.clone()));
-                let hovered = hovered.is_some_and(|h| h.get());
-                root.text_color(if hovered {
-                    t.sidebar_accent_foreground
-                } else {
-                    t.sidebar_foreground
+                let on_item = move || item.is_some_and(Interaction::hovered);
+                // Its own hover (an action's `hover:text-sidebar-accent-foreground`) or the item's.
+                root.with_interaction(|d, own| {
+                    d.text_color(move || {
+                        if own.hovered() || on_item() {
+                            t.sidebar_accent_foreground
+                        } else {
+                            t.sidebar_foreground
+                        }
+                    })
                 })
-                .when(show_on_hover && !hovered, |d| d.opacity(0.0))
-                .when(icon_collapsed(ctx.as_ref()), Styled::hidden)
+                .when(show_on_hover, |d| d.opacity(move || if on_item() { 1.0 } else { 0.0 }))
+                .when(icon_collapsed(ctx.as_ref()), |e| e.display(Display::None))
                 .into_element()
             }
         })
@@ -764,14 +849,19 @@ fn aside(props: SidebarMenuAside, root: Div) -> Part<SidebarMenuAside> {
 pub fn sidebar_menu_skeleton(id: &str, show_icon: bool) -> Div {
     div()
         .named("sidebar-menu-skeleton")
-        .flex()
-        .h(8.0)
-        .items_center()
-        .gap(2.0)
-        .rounded_md()
-        .px(2.0)
-        .when(show_icon, |d| d.child(skeleton().size(4.0)))
-        .child(skeleton().h(4.0).w_len(relative(skeleton_width(id))).min_w(0.0))
+        .display(Display::Flex)
+        .height(32.0)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .radius(8.0)
+        .padding_x(8.0)
+        .when(show_icon, |d| d.child(skeleton().size(16.0)))
+        .child(
+            skeleton()
+                .height(16.0)
+                .width(Length::Fraction(skeleton_width(id)))
+                .min_width(0.0),
+        )
 }
 
 /// shadcn's id hash, giving a stable width between 50% and 90%.
@@ -793,22 +883,23 @@ pub fn sidebar_menu_sub() -> Part<()> {
     hidden_when_icons(
         div()
             .named("sidebar-menu-sub")
-            .border_l()
+            .border_left(1.0)
             .border_color(t.sidebar_border)
-            .mx(3.5)
-            .relative()
-            .left_len(px(1.0))
-            .flex_col()
-            .min_w(0.0)
-            .gap(1.0)
-            .px(2.5)
-            .py(0.5),
+            .margin_x(14.0)
+            .position(Position::Relative)
+            .left(px(1.0))
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .min_width(0.0)
+            .gap(4.0)
+            .padding_x(10.0)
+            .padding_y(2.0),
     )
 }
 
 #[must_use]
 pub fn sidebar_menu_sub_item() -> Div {
-    div().named("sidebar-menu-sub-item").relative()
+    div().named("sidebar-menu-sub-item").position(Position::Relative)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -818,7 +909,7 @@ pub enum SidebarMenuSubButtonSize {
     Md,
 }
 
-/// A link in a sub menu; add its label with `.child` (give it `.truncate()`).
+/// A link in a sub menu; add its label with `.child` (give it `.truncate(true).nowrap(true).overflow_x(Overflow::Hidden).min_width(0.0)`).
 /// Its [`sidebar_menu_sub`] hides it when collapsed to icons.
 #[must_use]
 pub fn sidebar_menu_sub_button(size: SidebarMenuSubButtonSize, is_active: bool) -> Div {
@@ -826,24 +917,27 @@ pub fn sidebar_menu_sub_button(size: SidebarMenuSubButtonSize, is_active: bool) 
     div()
         .named("sidebar-menu-sub-button")
         .text_color(t.sidebar_foreground)
-        .flex()
-        .h(7.0)
-        .min_w(0.0)
-        .relative()
-        .left_len(px(-1.0))
-        .items_center()
-        .gap(2.0)
-        .overflow_hidden()
-        .rounded_md()
-        .px(2.0)
+        .display(Display::Flex)
+        .height(28.0)
+        .min_width(0.0)
+        .position(Position::Relative)
+        .left(px(-1.0))
+        .align_items(Align::Center)
+        .gap(8.0)
+        .overflow(Overflow::Hidden)
+        .radius(8.0)
+        .padding_x(8.0)
         .focusable()
-        .hover(move |s| accent(s, &t))
-        .active(move |s| accent(s, &t))
-        .focus_visible(move |s| ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5))
         .when(is_active, |d| {
-            d.bg(t.sidebar_accent).text_color(t.sidebar_accent_foreground)
+            d.background(t.sidebar_accent).text_color(t.sidebar_accent_foreground)
         })
-        .when(size == SidebarMenuSubButtonSize::Sm, Styled::text_xs)
-        .when(size == SidebarMenuSubButtonSize::Md, Styled::text_sm)
+        .with_interaction(|d, i| {
+            ring_on(accent_while(d, move || i.hovered() || i.pressed(), &t), i, &t).dim_disabled(i, 0.5)
+        })
+        .when(size == SidebarMenuSubButtonSize::Sm, |e| {
+            e.text_size(12.0).line_height(16.0)
+        })
+        .when(size == SidebarMenuSubButtonSize::Md, |e| {
+            e.text_size(14.0).line_height(20.0)
+        })
 }

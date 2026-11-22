@@ -22,30 +22,38 @@ pub fn render() -> Render {
                         button(ButtonVariant::Outline, ButtonSize::Default).child("Open popover"),
                     ))
                     .child(
-                        popover_content().w(80.0).child(
+                        popover_content().width(320.0).child(
                             div()
-                                .grid()
-                                .gap(4.0)
+                                .display(Display::Grid)
+                                .gap(16.0)
                                 .child(
                                     div()
-                                        .flex_col()
-                                        .gap(2.0)
-                                        .child(text("Dimensions").font_medium().leading_none())
+                                        .display(Display::Flex)
+                                        .flex_direction(FlexDirection::Column)
+                                        .gap(8.0)
+                                        .child(
+                                            text("Dimensions")
+                                                .font_weight(500)
+                                                .line_height(LineHeight::Relative(1.0)),
+                                        )
                                         .child(
                                             text("Set the dimensions for the layer.")
-                                                .text_sm()
+                                                .text_size(14.0)
+                                                .line_height(20.0)
                                                 .text_color(t.muted_foreground),
                                         ),
                                 )
-                                .child(div().grid().gap(2.0).children(fields.iter().map(|(name, f)| {
-                                    div()
-                                        .grid()
-                                        .grid_cols_tracks(vec![Track::Fr(1.0); 3])
-                                        .items_center()
-                                        .gap(4.0)
-                                        .child(label(*name))
-                                        .child(input().field(*f).col_span(2).h(8.0))
-                                }))),
+                                .child(div().display(Display::Grid).gap(8.0).children(fields.iter().map(
+                                    |(name, f)| {
+                                        div()
+                                            .display(Display::Grid)
+                                            .grid_columns(vec![Track::Fr(1.0); 3])
+                                            .align_items(Align::Center)
+                                            .gap(16.0)
+                                            .child(label(*name))
+                                            .child(input().field(*f).grid_column_span(2).height(32.0))
+                                    },
+                                ))),
                         ),
                     ),
             ),

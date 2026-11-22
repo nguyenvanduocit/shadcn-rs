@@ -10,8 +10,9 @@ pub fn render() -> Render {
         page(
             "Textarea",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "TextareaDemo.vue",
                     textarea().placeholder("Type your message here."),
@@ -23,14 +24,15 @@ pub fn render() -> Render {
                 .child(section(
                     "With label and description",
                     div()
-                        .grid()
-                        .gap(3.0)
-                        .max_w_px(448.0)
+                        .display(Display::Grid)
+                        .gap(12.0)
+                        .max_width(448.0)
                         .child(label("Your message"))
                         .child(textarea().placeholder("Type your message here."))
                         .child(
                             text("Type your message and press enter to send.")
-                                .text_sm()
+                                .text_size(14.0)
+                                .line_height(20.0)
                                 .text_color(t.muted_foreground),
                         ),
                 )),

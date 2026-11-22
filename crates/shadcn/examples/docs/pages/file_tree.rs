@@ -4,10 +4,13 @@
 use std::collections::HashMap;
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon};
-use shadcn::{ButtonSize, ButtonVariant, button, collapsible, collapsible_content, collapsible_trigger_as, theme};
+use gui::{Element, Icon, Model, ScenarioError, Signal, div, icon};
+use shadcn::{
+    Button, ButtonSize, ButtonVariant, button, collapsible, collapsible_content, collapsible_trigger_as, theme,
+};
 
 use crate::{Render, Shot, demo, page};
+use shadcn::focus::StateLook;
 
 /// A file or a folder of them.
 enum Node {
@@ -74,11 +77,11 @@ struct Tree {
 }
 
 /// A row: `<Button variant="ghost" size="sm" class="w-full justify-start font-normal">`.
-fn row() -> Div {
+fn row() -> Button {
     button(ButtonVariant::Ghost, ButtonSize::Sm)
-        .w_full()
-        .justify_start()
-        .font_normal()
+        .width(pct(100.0))
+        .justify_content(Justify::Start)
+        .font_weight(400)
 }
 
 fn node(tree: &Tree, n: &Node) -> Element {
@@ -95,8 +98,11 @@ fn node(tree: &Tree, n: &Node) -> Element {
                     row()
                         .when(expanded, |b| {
                             // `aria-expanded:bg-transparent aria-expanded:hover:bg-muted`.
+                            // Its own hover, in place of the ghost button's.
                             let hover = if t.dark { t.muted.opacity(0.5) } else { t.muted };
-                            b.hover(move |s| s.bg(hover))
+                            let i = b.interaction();
+                            b.background_while(move || i.hovered(), hover)
+                                .text_color(None::<gui::Color>)
                         })
                         .child(icon(Icon::ChevronRight).rotate(if expanded { 90.0 } else { 0.0 }))
                         .child(icon(Icon::Folder))
@@ -105,8 +111,9 @@ fn node(tree: &Tree, n: &Node) -> Element {
                 .child(
                     collapsible_content().child(
                         div()
-                            .ml(4.0)
-                            .flex_col()
+                            .margin_left(16.0)
+                            .display(Display::Flex)
+                            .flex_direction(FlexDirection::Column)
                             .children(children.iter().map(|c| node(tree, c))),
                     ),
                 )
@@ -117,7 +124,15 @@ fn node(tree: &Tree, n: &Node) -> Element {
             let selected = tree.selected;
             let path = *path;
             row()
-                .when(current, |b| b.bg(t.accent).text_color(t.accent_foreground))
+                .when(current, |b| {
+                    // Over the ghost button's rest: its hover fill stays over it.
+                    let i = b.node_interaction();
+                    let b = b.background(t.accent).text_color(t.accent_foreground);
+                    match i {
+                        Some(i) if t.dark => b.background_while(move || i.hovered(), t.accent.opacity(0.5)),
+                        _ => b,
+                    }
+                })
                 .on_click(move |_| selected.set(path))
                 .child(icon(Icon::File))
                 .child(*name)
@@ -143,11 +158,13 @@ pub fn render() -> Render {
             demo(
                 "FileTreeDemo.vue",
                 div()
-                    .flex_col()
-                    .w_full()
-                    .max_w(80.0)
-                    .py(6.0)
-                    .text_sm()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .width(pct(100.0))
+                    .max_width(320.0)
+                    .padding_y(24.0)
+                    .text_size(14.0)
+                    .line_height(20.0)
                     .children(FILES.iter().map(|n| node(&tree, n))),
             ),
         )

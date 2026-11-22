@@ -4,11 +4,12 @@
 //! to the caller's (`model`, `v-model`), or shows one the caller keeps
 //! (`pressed`, `:model-value`); `on_change` hears each click.
 
+use gui::Color;
 use gui::Properties;
 use gui::prelude::*;
 use gui::{Bind, Div, Element, Model, Slot, component, div, use_model};
 
-use crate::focus::focus_ring;
+use crate::focus::StateLook;
 use crate::theme::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -126,39 +127,51 @@ impl IntoElement for Toggle {
 #[must_use]
 pub fn toggle_variants(variant: ToggleVariant, size: ToggleSize, on: bool) -> Div {
     let t = theme();
+    let i = Interaction::new();
     let d = div()
         .named("toggle")
+        .interaction(i)
         .role(gui::Role::Button)
         .aria_checked(on)
-        .transition_props(Properties::COLOR | Properties::SHADOW)
-        .inline_flex()
-        .items_center()
-        .justify_center()
-        .gap(2.0)
-        .rounded_md()
-        .text_sm()
-        .font_medium()
-        .whitespace_nowrap()
+        .transition(Properties::COLOR | Properties::SHADOW)
+        .display(Display::Flex)
+        .inline(true)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(8.0)
+        .radius(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500)
+        .nowrap(true)
         .border_color(t.border)
         .focusable()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5));
+        .dim_disabled(i, 0.5);
     let d = match variant {
         ToggleVariant::Default => d,
-        ToggleVariant::Outline => d.border().border_color(t.input).shadow_xs(),
+        ToggleVariant::Outline => d.border(1.0).border_color(t.input).shadow(Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: 0.0,
+            color: Color::BLACK.opacity(0.05),
+        }),
     };
     // `data-[state=on]:` outranks `hover:`, so a pressed toggle keeps its look under the pointer.
     let d = if on {
-        d.bg(t.accent).text_color(t.accent_foreground)
+        d.background(t.accent).text_color(t.accent_foreground)
     } else {
-        match variant {
-            ToggleVariant::Default => d.hover(move |s| s.bg(t.muted).text_color(t.muted_foreground)),
-            ToggleVariant::Outline => d.hover(move |s| s.bg(t.accent).text_color(t.accent_foreground)),
-        }
+        let (bg, fg) = match variant {
+            ToggleVariant::Default => (t.muted, t.muted_foreground),
+            ToggleVariant::Outline => (t.accent, t.accent_foreground),
+        };
+        d.background(move || i.hovered().then_some(bg))
+            .text_color(move || i.hovered().then_some(fg))
     };
+    let d = d.focus_ring_on(i, &t);
     match size {
-        ToggleSize::Default => d.h(9.0).px(2.0).min_w(9.0),
-        ToggleSize::Sm => d.h(8.0).px(1.5).min_w(8.0),
-        ToggleSize::Lg => d.h(10.0).px(2.5).min_w(10.0),
+        ToggleSize::Default => d.height(36.0).padding_x(8.0).min_width(36.0),
+        ToggleSize::Sm => d.height(32.0).padding_x(6.0).min_width(32.0),
+        ToggleSize::Lg => d.height(40.0).padding_x(10.0).min_width(40.0),
     }
 }

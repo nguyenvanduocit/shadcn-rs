@@ -25,10 +25,17 @@ pub struct MessageProps {
 
 #[must_use]
 pub fn message(p: MessageProps) -> Div {
-    let d = div().named("message").relative().w_full().min_w(0.0).gap(2.0).text_sm();
+    let d = div()
+        .named("message")
+        .position(Position::Relative)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .gap(8.0)
+        .text_size(14.0)
+        .line_height(20.0);
     match p.align {
-        BubbleAlign::Start => d.flex(),
-        BubbleAlign::End => d.flex_row_reverse(),
+        BubbleAlign::Start => d.display(Display::Flex),
+        BubbleAlign::End => d.display(Display::Flex).flex_direction(FlexDirection::RowReverse),
     }
 }
 
@@ -38,18 +45,18 @@ pub fn message_avatar(p: MessageProps) -> Div {
     let t = theme();
     div()
         .named("message-avatar")
-        .flex()
-        .min_w(8.0)
-        .shrink_0()
-        .items_center()
-        .justify_center()
-        .self_end()
-        .overflow_hidden()
-        .rounded_full()
-        .bg(t.muted)
+        .display(Display::Flex)
+        .min_width(32.0)
+        .flex_shrink(0.0)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .align_self(Align::End)
+        .overflow(Overflow::Hidden)
+        .radius(9999.0)
+        .background(t.muted)
         // Vue lifts it with `-translate-y-8`; a bottom margin moves a
         // bottom-aligned box the same 32px.
-        .when(p.footer, |d| d.mb(8.0))
+        .when(p.footer, |d| d.margin_bottom(32.0))
 }
 
 /// The column of header, bubbles and footer.
@@ -57,11 +64,12 @@ pub fn message_avatar(p: MessageProps) -> Div {
 pub fn message_content(p: MessageProps) -> Div {
     div()
         .named("message-content")
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
-        .gap(2.5)
-        .when(p.align == BubbleAlign::End, Styled::items_end)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .gap(10.0)
+        .when(p.align == BubbleAlign::End, |e| e.align_items(Align::End))
 }
 
 /// The sender's name above the bubbles.
@@ -75,23 +83,29 @@ pub fn message_header(p: MessageProps) -> Div {
 pub fn message_footer(p: MessageProps) -> Div {
     caption(p)
         .named("message-footer")
-        .when(p.align == BubbleAlign::End, Styled::justify_end)
+        .when(p.align == BubbleAlign::End, |e| e.justify_content(Justify::End))
 }
 
 fn caption(p: MessageProps) -> Div {
     div()
-        .flex()
-        .items_center()
-        .max_w_full()
-        .min_w(0.0)
-        .px(if p.bubble == BubbleVariant::Ghost { 0.0 } else { 3.0 })
-        .text_xs()
-        .font_medium()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .max_width(pct(100.0))
+        .min_width(0.0)
+        .padding_x(if p.bubble == BubbleVariant::Ghost { 0.0 } else { 12.0 })
+        .text_size(12.0)
+        .line_height(16.0)
+        .font_weight(500)
         .text_color(theme().muted_foreground)
 }
 
 /// Consecutive messages, stacked.
 #[must_use]
 pub fn message_group() -> Div {
-    div().named("message-group").flex_col().gap(2.0).min_w(0.0)
+    div()
+        .named("message-group")
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .gap(8.0)
+        .min_width(0.0)
 }

@@ -531,8 +531,8 @@ mod plots {
     use crate::app::Scenario;
     use crate::color::Color;
     use crate::element::{IntoElement, div, text_bound};
+    use crate::prelude::*;
     use crate::reactive::Signal;
-    use crate::styled::Styled;
 
     fn ramp(s: Series, n: i64) {
         let xs: Vec<i64> = (0..n).collect();
@@ -547,16 +547,17 @@ mod plots {
         let mut sc = Scenario::measuring(
             move || {
                 div()
-                    .size_full()
-                    .flex_col()
+                    .size(pct(100.0))
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
                     .child("a label beside the plot")
                     .child(
                         plot()
                             .y_auto(Default::default())
                             .mark(line(s).color(Color::BLACK))
                             .build()
-                            .w_px(300.0)
-                            .h_px(100.0),
+                            .width(300.0)
+                            .height(100.0),
                     )
                     .into_element()
             },
@@ -585,8 +586,9 @@ mod plots {
         let mut sc = Scenario::measuring(
             move || {
                 div()
-                    .size_full()
-                    .flex_col()
+                    .size(pct(100.0))
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
                     .child(
                         plot()
                             .x(0, 100)
@@ -595,8 +597,8 @@ mod plots {
                             .mark(scatter(dots).radius(4.0))
                             .on_hover(12.0, move |h| hovered.set(h))
                             .build()
-                            .w_px(400.0)
-                            .h_px(200.0),
+                            .width(400.0)
+                            .height(200.0),
                     )
                     .child(text_bound(move || match hovered.get() {
                         Some(h) => format!("mark {} point {} at {}", h.mark, h.index, h.x),
@@ -642,7 +644,7 @@ mod plots {
         let mut sc = Scenario::measuring(
             move || {
                 div()
-                    .size_full()
+                    .size(pct(100.0))
                     .child(
                         plot()
                             .x(0, 100)
@@ -655,8 +657,8 @@ mod plots {
                                     .dash(&[4.0, 4.0], 0.0),
                             )
                             .build()
-                            .w_px(200.0)
-                            .h_px(100.0),
+                            .width(200.0)
+                            .height(100.0),
                     )
                     .into_element()
             },
@@ -698,7 +700,7 @@ mod plots {
         let mut sc = Scenario::measuring(
             move || {
                 div()
-                    .size_full()
+                    .size(pct(100.0))
                     .child(
                         plot()
                             .x_with(move || view.get())
@@ -714,8 +716,8 @@ mod plots {
                             )
                             .mark(super::super::plot::rule_y(&[0.0]).dash(&[2.0, 2.0], 0.0))
                             .build()
-                            .w_px(300.0)
-                            .h_px(120.0),
+                            .width(300.0)
+                            .height(120.0),
                     )
                     .into_element()
             },

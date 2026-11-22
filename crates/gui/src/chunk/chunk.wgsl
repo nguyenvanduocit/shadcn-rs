@@ -34,7 +34,7 @@ struct ChunkItem {
 @group(0) @binding(0) var<uniform> chunk_globals: ChunkGlobals;
 @group(0) @binding(1) var<uniform> chunk_item: ChunkItem;
 // Four vec4s per clip: rect, radii, the map from the window into the
-// clip's space (a, b, c, d), (e, f, its scale, 0). Clip 0 is none.
+// clip's space (a, b, c, d), (e, f, its scale, its corners' curve). Clip 0 is none.
 @group(0) @binding(2) var<storage, read> chunk_clips: array<vec4<f32>>;
 
 // Texture pixel `p` as a clip-space position in the pass.
@@ -52,15 +52,8 @@ fn chunk_clip_coverage(id: u32, p: vec2<f32>) -> f32 {
     if (id == 0u) {
         return 1.0;
     }
-    let rect = chunk_clips[id * 4u];
-    let radii = chunk_clips[id * 4u + 1u];
-    let m = chunk_clips[id * 4u + 2u];
-    let t = chunk_clips[id * 4u + 3u];
-    let q = vec2<f32>(m.x * p.x + m.z * p.y + t.x, m.y * p.x + m.w * p.y + t.y);
-    if (t.z == 1.0 && m.y == 0.0 && m.z == 0.0) {
-        return rrect_cov(q, rect, radii);
-    }
-    return saturate(0.5 - rrect_sdf(q, rect, radii) * t.z);
+    let at = id * 4u;
+    return clip_entry_cov(chunk_clips[at], chunk_clips[at + 1u], chunk_clips[at + 2u], chunk_clips[at + 3u], p);
 }
 
 // What a fragment at `frag` keeps of its colour: the clip and the fade.

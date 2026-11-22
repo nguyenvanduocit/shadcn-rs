@@ -6,21 +6,23 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
+use gui::Color;
 use gui::Properties;
 use gui::prelude::*;
 use gui::{
     Bind, Bounds, Div, DragEvent, DragPhase, FocusHandle, Key, KeyEvent, Model, NamedKey, UseModel, component, div, px,
-    relative, use_model,
+    use_model,
 };
 
+use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::separator::Orientation;
 use crate::theme::theme;
 
 /// How far a thumb (`size-4`) reaches past the `h-1.5` track on each side.
-const THUMB_OVERHANG: f32 = (1.5 - 4.0) / 2.0 * gui::styled::UNIT;
+const THUMB_OVERHANG: f32 = (6.0 - 16.0) / 2.0;
 /// The thumb's size in pixels; thumbs travel the track less this.
-const THUMB: f32 = 4.0 * gui::styled::UNIT;
+const THUMB: f32 = 16.0;
 
 /// What [`slider`] is given: its values (one per thumb, ascending), their
 /// bounds and step, and its orientation.
@@ -159,12 +161,18 @@ pub fn slider(orientation: Orientation) -> Part<SliderProps> {
     let horizontal = orientation == Orientation::Horizontal;
     let root = div()
         .named("slider")
-        .relative()
-        .flex()
-        .items_center()
-        .when(horizontal, |d| d.w_full())
-        .when(!horizontal, |d| d.flex_col().h_full().min_h(44.0).w_auto())
-        .disabled_style(|s| s.opacity(0.5));
+        .position(Position::Relative)
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .when(horizontal, |d| d.width(pct(100.0)))
+        .when(!horizontal, |d| {
+            d.display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .height(pct(100.0))
+                .min_height(176.0)
+                .width(Length::Auto)
+        })
+        .with_interaction(|d, i| d.dim_disabled(i, 0.5));
     let props = SliderProps {
         value: Bind::default_value(vec![0.0]),
         range: Range {
@@ -245,58 +253,77 @@ fn render(p: &SliderProps, root: Div, values: &[f32], thumbs: &Thumbs) -> Div {
         ),
     };
     let horizontal = orientation == Orientation::Horizontal;
-    let range = div().named("slider-range").absolute().bg(t.primary);
+    let range = div()
+        .named("slider-range")
+        .position(Position::Absolute)
+        .background(t.primary);
     let range = if horizontal {
         range
             .top(0.0)
             .bottom(0.0)
-            .left_len(relative(lo))
-            .right_len(relative(1.0 - hi))
+            .left(Length::Fraction(lo))
+            .right(Length::Fraction(1.0 - hi))
     } else {
         range
             .left(0.0)
             .right(0.0)
-            .bottom_len(relative(lo))
-            .top_len(relative(1.0 - hi))
+            .bottom(Length::Fraction(lo))
+            .top(Length::Fraction(1.0 - hi))
     };
     let track = div()
         .named("slider-track")
-        .relative()
-        .grow()
-        .overflow_hidden()
-        .rounded_full()
-        .bg(t.muted)
-        .when(horizontal, |d| d.h(1.5).w_full())
-        .when(!horizontal, |d| d.h_full().w(1.5))
+        .position(Position::Relative)
+        .flex_grow(1.0)
+        .overflow(Overflow::Hidden)
+        .radius(9999.0)
+        .background(t.muted)
+        .when(horizontal, |d| d.height(6.0).width(pct(100.0)))
+        .when(!horizontal, |d| d.height(pct(100.0)).width(6.0))
         .child(range);
     // Thumbs stay inside the track: each travels its length less one thumb.
-    let rail = div().named("slider-thumbs").absolute().inset(0.0);
+    let rail = div().named("slider-thumbs").position(Position::Absolute).inset(0.0);
     let rail = if horizontal {
-        rail.right_len(px(THUMB))
+        rail.right(px(THUMB))
     } else {
-        rail.top_len(px(THUMB))
+        rail.top(px(THUMB))
     };
     let thumb_els = values.iter().enumerate().map(|(i, v)| {
         let f = r.fraction(*v);
         let keys = thumbs.clone();
         div()
             .named("slider-thumb")
-            .transition_props(Properties::COLOR | Properties::SHADOW)
-            .absolute()
-            .when(horizontal, |d| d.left_len(relative(f)).top_len(px(THUMB_OVERHANG)))
-            .when(!horizontal, |d| d.bottom_len(relative(f)).left_len(px(THUMB_OVERHANG)))
-            .block()
-            .size(4.0)
-            .shrink_0()
-            .rounded_full()
-            .border()
+            .transition(Properties::COLOR | Properties::SHADOW)
+            .position(Position::Absolute)
+            .when(horizontal, |d| d.left(Length::Fraction(f)).top(px(THUMB_OVERHANG)))
+            .when(!horizontal, |d| d.bottom(Length::Fraction(f)).left(px(THUMB_OVERHANG)))
+            .display(Display::Block)
+            .size(16.0)
+            .flex_shrink(0.0)
+            .radius(9999.0)
+            .border(1.0)
             .border_color(t.primary)
-            .bg(gui::Color::WHITE)
-            .shadow_sm()
+            .background(gui::Color::WHITE)
+            .shadow([
+                Shadow {
+                    x: 0.0,
+                    y: 1.0,
+                    blur: 3.0,
+                    spread: 0.0,
+                    color: Color::BLACK.opacity(0.1),
+                },
+                Shadow {
+                    x: 0.0,
+                    y: 1.0,
+                    blur: 2.0,
+                    spread: -1.0,
+                    color: Color::BLACK.opacity(0.1),
+                },
+            ])
             .when_some(thumbs.focus.get(i).copied(), Div::track_focus)
             .disabled(disabled)
-            .hover(move |s| s.ring(4.0, t.ring.opacity(0.5)))
-            .focus_visible(move |s| s.ring(4.0, t.ring.opacity(0.5)))
+            .with_interaction(|d, it| {
+                d.ring(move || (it.hovered() || it.focus_visible()).then(|| Ring::new(4.0, t.ring.opacity(0.5))))
+            })
             .on_key_down(move |ev| keys.key(i, ev))
     });
     let drags = thumbs.clone();

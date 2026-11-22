@@ -11,12 +11,13 @@
 use std::rc::Rc;
 
 use crate::component::{Bind, Model, component, use_model};
-use crate::element::{Div, Element, IntoElement, Refine, div, text};
+use crate::element::{Div, Element, IntoElement, div, text};
 use crate::events::{KeyEvent, NamedKey};
 use crate::focus::{self, FocusHandle};
+use crate::interact::Interaction;
+use crate::prelude::*;
 use crate::reactive::{Signal, watch};
 use crate::style::Style;
-use crate::styled::{Fluent, Styled};
 
 /// The largest value of each field: hour, minute, second.
 const MAX: [u8; 3] = [23, 59, 59];
@@ -28,7 +29,7 @@ const PLACEHOLDER: &str = "--";
 /// value it can show (`DateTimeFieldElement::MaximumWidth`), while drawing
 /// it with 1 px of padding a side: at the 2x a Retina screen and the
 /// reference draw at, 2 px a side, the rest left empty after the fields.
-const SIZING_PADDING: f32 = 0.5;
+const SIZING_PADDING: f32 = 2.0;
 
 /// What an instance holds: each field's value and focus.
 #[derive(Clone, Copy)]
@@ -66,8 +67,7 @@ impl Fields {
         }
     }
 
-    /// Whether one of its fields holds focus (reactive), for the box's
-    /// `:focus-within` look.
+    /// Whether one of its fields holds focus (reactive).
     fn focused(&self) -> bool {
         self.focus.iter().any(|f| f.is_focused())
     }
@@ -170,9 +170,11 @@ fn shown(value: Option<u8>) -> String {
 pub fn time_input() -> TimeInput {
     TimeInput {
         value: Bind::default(),
-        root: div().named("time-input").flex().items_center(),
-        focused: None,
-        within: None,
+        root: div()
+            .named("time-input")
+            .display(Display::Flex)
+            .align_items(Align::Center),
+        field: None,
     }
 }
 
@@ -181,9 +183,11 @@ pub fn time_input() -> TimeInput {
 pub struct TimeInput {
     value: Bind<String>,
     root: Div,
-    focused: Option<Refine>,
-    within: Option<Rc<dyn Fn(Div) -> Div>>,
+    field: Option<FieldLook>,
 }
+
+/// What the caller adds to each field's box, given the field's [`Interaction`].
+type FieldLook = Rc<dyn Fn(Div, Interaction) -> Div>;
 
 /// Built anew by each render of its parent, it is never equal: the instance
 /// renders again with what its parent passes now.
@@ -216,17 +220,14 @@ impl TimeInput {
         self
     }
 
-    /// How the field holding focus looks (`::-webkit-datetime-edit-hour-field:focus`).
+    /// Add to each field's box, given the [`Interaction`] its bindings
+    /// read: the field holding focus is the one whose `i.focused()` holds
+    /// (`::-webkit-datetime-edit-hour-field:focus`). The box holds focus
+    /// within while a field does: give it an [`Interaction`] of its own
+    /// with [`Self::map_root`] (`:focus-within`).
     #[must_use]
-    pub fn focused_field(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
-        self.focused = Some(Rc::new(f));
-        self
-    }
-
-    /// What the box adds while one of its fields holds focus (`:focus-within`).
-    #[must_use]
-    pub fn focus_within(mut self, f: impl Fn(Div) -> Div + 'static) -> Self {
-        self.within = Some(Rc::new(f));
+    pub fn map_field(mut self, f: impl Fn(Div, Interaction) -> Div + 'static) -> Self {
+        self.field = Some(Rc::new(f));
         self
     }
 
@@ -241,8 +242,8 @@ impl TimeInput {
 impl Fluent for TimeInput {}
 
 impl Styled for TimeInput {
-    fn style_mut(&mut self) -> &mut Style {
-        self.root.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut crate::value::Bindings>) {
+        self.root.style_and_bindings()
     }
 }
 
@@ -278,34 +279,44 @@ impl IntoElement for TimeInput {
 
 /// The fields in a box as wide as Chrome makes a time input's.
 fn render(field: &Fields, p: &TimeInput) -> Div {
-    let focused: Refine = p.focused.clone().unwrap_or_else(|| Rc::new(|s| s));
     let values = field.values.get();
     let between = || text(":");
-    let mut fields = div().flex().items_center().row_start(1).col_start(1);
-    let mut sizer = div().flex().items_center().row_start(1).col_start(1).invisible();
+    let mut fields = div()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .grid_row_start(1)
+        .grid_column_start(1);
+    let mut sizer = div()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .grid_row_start(1)
+        .grid_column_start(1)
+        .invisible(true);
     for (i, (value, max)) in values.into_iter().zip(MAX).enumerate() {
         if i > 0 {
             fields = fields.child(between());
             sizer = sizer.child(between());
         }
-        let (me, look) = (*field, Rc::clone(&focused));
+        let me = *field;
         let handle = field.focus.get(i).copied().unwrap_or_default();
-        fields = fields.child(
-            div()
-                .p(0.25)
-                .track_focus(handle)
-                .focus(move |s| look(s))
-                .on_key_down(move |ev| me.key(i, ev))
-                .child(shown(value)),
-        );
+        let it = Interaction::new();
+        let one = div()
+            .interaction(it)
+            .padding(1.0)
+            .track_focus(handle)
+            .on_key_down(move |ev| me.key(i, ev))
+            .child(shown(value));
+        fields = fields.child(match &p.field {
+            Some(f) => f(one, it),
+            None => one,
+        });
         // The widest of what the field can show, stacked in one cell.
         let widest = [PLACEHOLDER.to_owned(), format!("{max:02}"), shown(value)]
-            .map(|t| text(t).row_start(1).col_start(1).into_element());
-        sizer = sizer.child(div().grid().px(SIZING_PADDING).children(widest));
+            .map(|t| text(t).grid_row_start(1).grid_column_start(1).into_element());
+        sizer = sizer.child(div().display(Display::Grid).padding_x(SIZING_PADDING).children(widest));
     }
     let first = *field;
-    let root = p
-        .root
+    p.root
         .clone()
         .on_mouse_down(move |_| {
             // A press beside the fields focuses the first, as Chrome's does.
@@ -313,11 +324,7 @@ fn render(field: &Fields, p: &TimeInput) -> Div {
                 first.focus_field(Some(0));
             }
         })
-        .child(div().grid().child(sizer).child(fields));
-    match &p.within {
-        Some(f) if field.focused() => f(root),
-        _ => root,
-    }
+        .child(div().display(Display::Grid).child(sizer).child(fields))
 }
 
 #[cfg(test)]

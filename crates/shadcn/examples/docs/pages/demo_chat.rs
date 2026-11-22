@@ -165,7 +165,7 @@ pub fn animated(m: &DemoMessage, user: BubbleVariant, assistant: BubbleVariant) 
                 bubble_content(b).children(
                     paragraphs
                         .enumerate()
-                        .map(|(i, para)| text(para).when(i > 0, |t| t.mt(2.0))),
+                        .map(|(i, para)| text(para).when(i > 0, |t| t.margin_top(8.0))),
                 ),
             ),
         ),

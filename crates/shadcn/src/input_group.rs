@@ -8,11 +8,10 @@
 
 use gui::Properties;
 use gui::prelude::*;
-use gui::{Color, Div, Element, FocusHandle, InputType, NamedKey, Radius, Style, TextField, div};
+use gui::{Color, Div, Element, FocusHandle, InputType, NamedKey, Style, TextField, div};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
-use crate::button_group::with_style;
-use crate::focus::{destructive_ring, focus_ring};
+use crate::focus::{StateLook, destructive_ring, focus_ring};
 use crate::input::{Input, input};
 use crate::textarea::textarea;
 use crate::theme::theme;
@@ -100,8 +99,8 @@ impl InputGroupControl {
 impl Fluent for InputGroupControl {}
 
 impl Styled for InputGroupControl {
-    fn style_mut(&mut self) -> &mut Style {
-        self.el.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.el.style_and_bindings()
     }
 }
 
@@ -120,7 +119,7 @@ pub fn input_group_input(field: &TextField) -> InputGroupControl {
 #[must_use]
 pub fn input_group_textarea(field: &TextField) -> InputGroupControl {
     control(
-        frameless(textarea().field(*field).named("input-group-control")).py(3.0),
+        frameless(textarea().field(*field).named("input-group-control")).padding_y(12.0),
         field.focus,
         true,
     )
@@ -139,12 +138,17 @@ fn control(mut el: Input, focus: FocusHandle, multiline: bool) -> InputGroupCont
 
 /// `flex-1 rounded-none border-0 bg-transparent shadow-none focus-visible:ring-0`.
 fn frameless(el: Input) -> Input {
-    el.flex_1()
-        .rounded_none()
-        .border_0()
-        .bg(Color::TRANSPARENT)
-        .shadow_none()
-        .map(|el| el.focus_visible(|s| s.ring_none()))
+    el.flex(Flex::grow(1.0))
+        .radius(0.0)
+        .border(0.0)
+        .background(Color::TRANSPARENT)
+        .shadow(Shadows::new())
+        // No focus ring: the border colour and ring stay as the input
+        // writes them, focused or not (the frame shows focus instead).
+        .map(|mut el| {
+            let (border, ring) = (el.style_mut().border_color, el.style_mut().ring);
+            el.border_color(border).ring(ring)
+        })
 }
 
 /// One addon; fill it with `.child`, and add a button or a key with
@@ -180,7 +184,7 @@ impl InputGroupAddon {
     #[must_use]
     pub fn kbd(self, kbd: Div) -> Self {
         Self {
-            el: self.el.child(kbd.rounded(Radius::var(-5.0))),
+            el: self.el.child(kbd.radius(5.0)),
             has_kbd: true,
             ..self
         }
@@ -190,8 +194,8 @@ impl InputGroupAddon {
 impl Fluent for InputGroupAddon {}
 
 impl Styled for InputGroupAddon {
-    fn style_mut(&mut self) -> &mut Style {
-        self.el.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.el.style_and_bindings()
     }
 }
 
@@ -202,19 +206,22 @@ pub fn input_group_addon(align: InputGroupAlign) -> InputGroupAddon {
     let el = div()
         .named("input-group-addon")
         .text_color(t.muted_foreground)
-        .flex()
-        .h_auto()
-        .cursor_text()
-        .items_center()
-        .justify_center()
-        .gap(2.0)
-        .py(1.5)
-        .text_sm()
-        .font_medium();
+        .display(Display::Flex)
+        .height(Length::Auto)
+        .cursor(Cursor::Text)
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .gap(8.0)
+        .padding_y(6.0)
+        .text_size(14.0)
+        .line_height(20.0)
+        .font_weight(500);
     let el = match align {
-        InputGroupAlign::InlineStart => el.pl(3.0),
-        InputGroupAlign::InlineEnd => el.pr(3.0),
-        InputGroupAlign::BlockStart | InputGroupAlign::BlockEnd => el.w_full().justify_start().px(3.0),
+        InputGroupAlign::InlineStart => el.padding_left(12.0),
+        InputGroupAlign::InlineEnd => el.padding_right(12.0),
+        InputGroupAlign::BlockStart | InputGroupAlign::BlockEnd => {
+            el.width(pct(100.0)).justify_content(Justify::Start).padding_x(12.0)
+        }
     };
     InputGroupAddon {
         align,
@@ -257,18 +264,24 @@ fn frame(body: Body) -> InputGroup {
     InputGroup {
         root: div()
             .named("input-group")
-            .transition_props(Properties::COLOR | Properties::SHADOW)
+            .transition(Properties::COLOR | Properties::SHADOW)
             .border_color(t.input)
-            .when(t.dark, |d| d.bg(t.input.opacity(0.3)))
-            .relative()
-            .flex()
-            .w_full()
-            .items_center()
-            .rounded_md()
-            .border()
-            .shadow_xs()
-            .h(9.0)
-            .min_w(0.0),
+            .when(t.dark, |d| d.background(t.input.opacity(0.3)))
+            .position(Position::Relative)
+            .display(Display::Flex)
+            .width(pct(100.0))
+            .align_items(Align::Center)
+            .radius(8.0)
+            .border(1.0)
+            .shadow(Shadow {
+                x: 0.0,
+                y: 1.0,
+                blur: 2.0,
+                spread: 0.0,
+                color: Color::BLACK.opacity(0.05),
+            })
+            .height(36.0)
+            .min_width(0.0),
         body,
         addons: Vec::new(),
         disabled: false,
@@ -292,8 +305,8 @@ impl InputGroup {
 impl Fluent for InputGroup {}
 
 impl Styled for InputGroup {
-    fn style_mut(&mut self) -> &mut Style {
-        self.root.style_mut()
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut gui::value::Bindings>) {
+        self.root.style_and_bindings()
     }
 }
 
@@ -309,8 +322,10 @@ impl IntoElement for InputGroup {
         let has = |a: InputGroupAlign| addons.iter().any(|x| x.align == a);
         let (block_start, block_end) = (has(InputGroupAlign::BlockStart), has(InputGroupAlign::BlockEnd));
         let root = root
-            .when(block_start || block_end, Div::h_auto)
-            .when(block_start || block_end, Div::flex_col);
+            .when(block_start || block_end, |d| d.height(Length::Auto))
+            .when(block_start || block_end, |d| {
+                d.display(Display::Flex).flex_direction(FlexDirection::Column)
+            });
         let control = match body {
             Body::Control(control) => *control,
             Body::Content(content) => {
@@ -328,12 +343,17 @@ impl IntoElement for InputGroup {
         };
         let (inline_start, inline_end) = (has(InputGroupAlign::InlineStart), has(InputGroupAlign::InlineEnd));
         let one_line = !control.multiline;
-        let root = root.when(control.multiline, Div::h_auto);
-        let root = match (control.focus.is_focused(), control.invalid) {
-            (true, false) => with_style(root, |s| focus_ring(s, &t)),
-            (true, true) => with_style(root, |s| destructive_ring(s, &t).border_color(t.destructive)),
-            (false, true) => root.border_color(t.destructive),
-            (false, false) => root,
+        let root = root.when(control.multiline, |d| d.height(Length::Auto));
+        // The control's `:focus-visible` (a text control shows focus however
+        // it came), bound to the frame's border and ring: focus moving
+        // reruns those bindings, not this render.
+        let focus = control.focus;
+        let root = if control.invalid {
+            let ring = destructive_ring(Style::default(), &t).border_color(t.destructive);
+            root.border_color(t.destructive)
+                .ring_while(move || focus.is_focused(), &ring)
+        } else {
+            root.ring_while(move || focus.is_focused(), &focus_ring(Style::default(), &t))
         };
         let InputGroupControl {
             mut el,
@@ -344,15 +364,25 @@ impl IntoElement for InputGroup {
         let own = el.style_mut().padding;
         let field = el
             .when(disabled, |c| c.disabled(true))
-            .when(one_line && inline_start && own.left == made_with.left, |c| c.pl(2.0))
-            .when(one_line && inline_end && own.right == made_with.right, |c| c.pr(2.0))
-            .when(one_line && block_start && own.bottom == made_with.bottom, |c| c.pb(3.0))
-            .when(one_line && block_end && own.top == made_with.top, |c| c.pt(3.0))
+            .when(one_line && inline_start && own.left == made_with.left, |c| {
+                c.padding_left(8.0)
+            })
+            .when(one_line && inline_end && own.right == made_with.right, |c| {
+                c.padding_right(8.0)
+            })
+            .when(one_line && block_start && own.bottom == made_with.bottom, |c| {
+                c.padding_bottom(12.0)
+            })
+            .when(one_line && block_end && own.top == made_with.top, |c| {
+                c.padding_top(12.0)
+            })
             // In the column a block addon makes, the input's `flex-1` basis
             // overrides its `h-9`: it is as tall as its text, and a browser
             // input's text box is the font's own height (Inter's 1.21em, 17px
             // at text-sm), not its line height.
-            .when(one_line && (block_start || block_end), |c| c.h_auto().leading_px(17.0));
+            .when(one_line && (block_start || block_end), |c| {
+                c.height(Length::Auto).line_height(17.0)
+            });
         let (mut above, mut before, mut after, mut below) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for a in addons {
             let list = match a.align {
@@ -387,17 +417,21 @@ fn place(addon: InputGroupAddon, one_line: bool, focus: Option<FocusHandle>) -> 
     let border_b = el.style_mut().border_widths.bottom > 0.0;
     let border_t = el.style_mut().border_widths.top > 0.0;
     let pull = if has_button {
-        -1.8
+        -7.2
     } else if has_kbd {
-        -1.4
+        -5.6
     } else {
         0.0
     };
     let el = match align {
-        InputGroupAlign::InlineStart => el.ml(pull),
-        InputGroupAlign::InlineEnd => el.mr(pull),
-        InputGroupAlign::BlockStart => el.pt(if one_line { 2.5 } else { 3.0 }).when(border_b, |e| e.pb(3.0)),
-        InputGroupAlign::BlockEnd => el.pb(if one_line { 2.5 } else { 3.0 }).when(border_t, |e| e.pt(3.0)),
+        InputGroupAlign::InlineStart => el.margin_left(pull),
+        InputGroupAlign::InlineEnd => el.margin_right(pull),
+        InputGroupAlign::BlockStart => el
+            .padding_top(if one_line { 10.0 } else { 12.0 })
+            .when(border_b, |e| e.padding_bottom(12.0)),
+        InputGroupAlign::BlockEnd => el
+            .padding_bottom(if one_line { 10.0 } else { 12.0 })
+            .when(border_t, |e| e.padding_top(12.0)),
     };
     match focus {
         Some(focus) => el.on_click(move |_| focus.focus()),
@@ -418,19 +452,25 @@ pub enum InputGroupButtonSize {
 /// A small button for an addon (ghost, `xs` by default in shadcn).
 #[must_use]
 pub fn input_group_button(variant: ButtonVariant, size: InputGroupButtonSize) -> Div {
-    let small_radius = Radius::var(-5.0);
+    // `rounded-[calc(var(--radius)-5px)]`.
+    let small_radius = 5.0;
+    // Each size here pads the same with an icon as without
+    // (`has-[>svg]:px-2` over `px-2`): the box is taken before any child,
+    // so the default size's icon padding never applies.
     let b = button(variant, ButtonSize::Default)
+        .into_div()
         .named("input-group-button")
-        .text_sm()
-        .shadow_none()
-        .flex()
-        .gap(2.0)
-        .items_center();
+        .text_size(14.0)
+        .line_height(20.0)
+        .shadow(Shadows::new())
+        .display(Display::Flex)
+        .gap(8.0)
+        .align_items(Align::Center);
     match size {
-        InputGroupButtonSize::Xs => b.h(6.0).gap(1.0).px(2.0).rounded(small_radius).has_icon(|s| s.px(2.0)),
-        InputGroupButtonSize::Sm => b.h(8.0).px(2.5).gap(1.5).rounded_md().has_icon(|s| s.px(2.5)),
-        InputGroupButtonSize::IconXs => b.size(6.0).rounded(small_radius).p(0.0).has_icon(|s| s.p(0.0)),
-        InputGroupButtonSize::IconSm => b.size(8.0).p(0.0).has_icon(|s| s.p(0.0)),
+        InputGroupButtonSize::Xs => b.height(24.0).gap(4.0).padding_x(8.0).radius(small_radius),
+        InputGroupButtonSize::Sm => b.height(32.0).padding_x(10.0).gap(6.0).radius(8.0),
+        InputGroupButtonSize::IconXs => b.size(24.0).radius(small_radius).padding(0.0),
+        InputGroupButtonSize::IconSm => b.size(32.0).padding(0.0),
     }
 }
 
@@ -441,8 +481,9 @@ pub fn input_group_text() -> Div {
     div()
         .named("input-group-text")
         .text_color(t.muted_foreground)
-        .flex()
-        .items_center()
-        .gap(2.0)
-        .text_sm()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .gap(8.0)
+        .text_size(14.0)
+        .line_height(20.0)
 }

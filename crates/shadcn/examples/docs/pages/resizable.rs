@@ -6,12 +6,12 @@ use crate::{Render, Shot, page, section};
 
 fn label(s: &str) -> gui::Div {
     div()
-        .flex()
-        .h_full()
-        .items_center()
-        .justify_center()
-        .p(6.0)
-        .child(text(s.to_owned()).font_semibold())
+        .display(Display::Flex)
+        .height(pct(100.0))
+        .align_items(Align::Center)
+        .justify_content(Justify::Center)
+        .padding(24.0)
+        .child(text(s.to_owned()).font_weight(600))
 }
 
 pub fn render() -> Render {
@@ -23,20 +23,20 @@ pub fn render() -> Render {
         let t = theme();
         let demo = resizable_panel_group(Orientation::Horizontal)
             .model(Model::bind(outer))
-            .max_w_px(448.0)
-            .min_w_px(450.0)
-            .rounded_lg()
-            .border()
+            .max_width(448.0)
+            .min_width(450.0)
+            .radius(10.0)
+            .border(1.0)
             .border_color(t.border)
             .child(
                 resizable_panel(0).child(
                     div()
-                        .flex()
-                        .h_px(200.0)
-                        .items_center()
-                        .justify_center()
-                        .p(6.0)
-                        .child(text("One").font_semibold()),
+                        .display(Display::Flex)
+                        .height(200.0)
+                        .align_items(Align::Center)
+                        .justify_content(Justify::Center)
+                        .padding(24.0)
+                        .child(text("One").font_weight(600)),
                 ),
             )
             .child(resizable_handle(0, false))
@@ -51,21 +51,21 @@ pub fn render() -> Render {
             );
         let handle = resizable_panel_group(Orientation::Horizontal)
             .model(Model::bind(grip))
-            .min_h_px(200.0)
-            .max_w_px(448.0)
-            .min_w_px(450.0)
-            .rounded_lg()
-            .border()
+            .min_height(200.0)
+            .max_width(448.0)
+            .min_width(450.0)
+            .radius(10.0)
+            .border(1.0)
             .border_color(t.border)
             .child(resizable_panel(0).child(label("Sidebar")))
             .child(resizable_handle(0, true))
             .child(resizable_panel(1).child(label("Content")));
         let vertical = resizable_panel_group(Orientation::Vertical)
             .model(Model::bind(grip_v))
-            .h_px(200.0)
-            .w_px(400.0)
-            .rounded_lg()
-            .border()
+            .height(200.0)
+            .width(400.0)
+            .radius(10.0)
+            .border(1.0)
             .border_color(t.border)
             .child(resizable_panel(0).child(label("Header")))
             .child(resizable_handle(0, true))
@@ -80,13 +80,14 @@ pub fn render() -> Render {
         page(
             "Resizable",
             div()
-                .flex()
-                .items_start()
-                .gap(8.0)
+                .display(Display::Flex)
+                .align_items(Align::Start)
+                .gap(32.0)
                 .child(
                     div()
-                        .flex_col()
-                        .gap(6.0)
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(24.0)
                         .child(section(
                             &format!("Demo ({})", sizes(&outer)),
                             crate::demo("ResizableDemo.vue", demo),

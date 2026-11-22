@@ -34,7 +34,7 @@ use crate::layout::{Changed, Content, Frame, FrameNode, Look, ReadAt, input_text
 use crate::scene::{
     Chunk, ChunkId, Clip, ClipNode, Display, EffectNode, GroupTransform, Item, Properties, Scene, State, TransformNode,
 };
-use crate::style::{Corners, ResolvedText};
+use crate::style::{Corners, Edges, ResolvedText};
 use crate::text::{Paragraph, Target, TextSystem, physical, physical_pos};
 
 /// The caret shows for this long, then hides for as long.
@@ -74,6 +74,9 @@ pub struct Painter {
     ends: Vec<usize>,
     chunk_of: Vec<Option<usize>>,
     thumb_of: Vec<Option<usize>>,
+    /// Per frame node, its overlay chunk's place in the scene (a border
+    /// over its content, painted after its subtree).
+    overlay_of: Vec<Option<usize>>,
     region: Vec<bool>,
     hit_rect: Vec<Option<Bounds>>,
     /// Focused inputs, whose caret blinks.
@@ -182,12 +185,16 @@ impl Ids {
 #[derive(Hash)]
 enum Role {
     Chunk,
+    /// What it paints over its subtree.
+    Overlay,
     Thumb,
     /// The transform of its own moving translation, scale or turn.
     Transform,
     /// The transform its children paint under: its scroll offset.
     Content,
     ThumbTransform,
+    /// The thumb's opacity, which the compositor fades.
+    ThumbEffect,
     Clip,
     Effect,
 }
@@ -199,15 +206,6 @@ fn key(path: &NodePath, role: Role) -> u64 {
     path.key().hash(&mut h);
     role.hash(&mut h);
     h.finish()
-}
-
-pub(crate) fn grow(r: Corners, d: f32) -> Corners {
-    Corners {
-        top_left: (r.top_left + d).max(0.0),
-        top_right: (r.top_right + d).max(0.0),
-        bottom_right: (r.bottom_right + d).max(0.0),
-        bottom_left: (r.bottom_left + d).max(0.0),
-    }
 }
 
 /// Where each node's subtree ends in the frame (one past its last node).
@@ -231,9 +229,10 @@ fn same_look(a: &Look, b: &Look) -> bool {
     a.background == b.background
         && a.border == b.border
         && a.border_color == b.border_color
-        && a.radius == b.radius
+        && a.shape == b.shape
         && a.shadows == b.shadows
         && a.ring == b.ring
+        && a.decoration == b.decoration
         && a.invisible == b.invisible
         && a.effects.background_image == b.effects.background_image
         && a.text == b.text
@@ -263,6 +262,7 @@ fn in_space(node: &FrameNode) -> FrameNode {
         moving: None,
         clip: None,
         clip_radius: Corners::default(),
+        clip_curve: crate::shape::ROUND,
         clipper: None,
         layer: node.layer,
         parent: None,
@@ -371,6 +371,24 @@ fn is_blinker(node: &FrameNode) -> bool {
     matches!(node.content, Content::Input { focused: true, .. })
 }
 
+/// The box the compositor hit-tests a node by: its border box in its
+/// paint space, grown by its hit slop.
+fn hit_box(node: &FrameNode) -> Bounds {
+    let e = node.look.hit_slop;
+    let b = node.space;
+    Bounds {
+        x: b.x - e.left,
+        y: b.y - e.top,
+        width: (b.width + e.left + e.right).max(0.0),
+        height: (b.height + e.top + e.bottom).max(0.0),
+    }
+}
+
+/// Whether the node paints over its subtree.
+fn has_overlay(node: &FrameNode) -> bool {
+    node.look.decoration.overlay.is_some()
+}
+
 /// A scroll container that shows a thumb.
 fn has_thumb(node: &FrameNode) -> bool {
     node.scroll.is_some_and(|s| s.max.1 > 0.0 && !s.thumb.is_transparent())
@@ -472,6 +490,10 @@ impl Painter {
         self.chunk_of.resize(n, None);
         self.thumb_of.clear();
         self.thumb_of.resize(n, None);
+        self.overlay_of.clear();
+        self.overlay_of.resize(n, None);
+        // Nodes whose overlay paints once their subtree has.
+        let mut over: Vec<(usize, Placed)> = Vec::new();
         self.region.clear();
         self.region.resize(n, false);
         self.blinkers.clear();
@@ -480,6 +502,7 @@ impl Painter {
         let generation = text.generation();
         let mut layer = frame.nodes.first().map_or(0, |n| n.layer);
         for (i, node) in frame.nodes.iter().enumerate() {
+            self.overlays(frame, &mut over, Some(i), &mut scene, scale, generation, text);
             if node.layer != layer {
                 // A layer's thumbs paint over all of it.
                 self.thumbs(
@@ -520,7 +543,7 @@ impl Painter {
             if has_thumb(node) {
                 thumbs.push(i);
             }
-            let display = self.chunk(node, p.snap, scale, generation, text);
+            let display = self.chunk(node, Role::Chunk, p.snap, scale, generation, text);
             if !display.items.is_empty() {
                 if let Some(c) = self.chunk_of.get_mut(i) {
                     *c = Some(scene.chunks.len());
@@ -531,7 +554,11 @@ impl Painter {
                     display,
                 });
             }
+            if has_overlay(node) {
+                over.push((i, p));
+            }
         }
+        self.overlays(frame, &mut over, None, &mut scene, scale, generation, text);
         self.thumbs(
             frame,
             &thumbs,
@@ -717,6 +744,7 @@ impl Painter {
             }
             if is_blinker(node) != self.blinkers.contains(&i)
                 || has_thumb(node) != self.thumb_of.get(i).is_some_and(Option::is_some)
+                || has_overlay(node) != self.overlay_of.get(i).is_some_and(Option::is_some)
             {
                 return Err(Whole);
             }
@@ -724,7 +752,18 @@ impl Painter {
             if has_thumb(node) {
                 thumbs.push(i);
             }
-            let display = self.chunk(node, p.snap, scale, generation, text);
+            if let Some(c) = self.overlay_of.get(i).copied().flatten() {
+                let chunk = Chunk {
+                    id: ChunkId(key(&node.path, Role::Overlay)),
+                    state: p.state(),
+                    display: self.chunk(node, Role::Overlay, p.snap, scale, generation, text),
+                };
+                let kept = self.scene.chunks.get(c);
+                if kept.is_none_or(|k| k.state != chunk.state || !Arc::ptr_eq(&k.display, &chunk.display)) {
+                    chunks.push((c, chunk));
+                }
+            }
+            let display = self.chunk(node, Role::Chunk, p.snap, scale, generation, text);
             match (self.chunk_of.get(i).copied().flatten(), display.items.is_empty()) {
                 (Some(c), false) => {
                     let chunk = Chunk {
@@ -742,7 +781,11 @@ impl Painter {
             }
         }
         // The thumbs of the scroll containers visited, at their places.
-        let mut scene = Scene::default();
+        // Sized as the frame: a thumb's region is clipped to it.
+        let mut scene = Scene {
+            size,
+            ..Scene::default()
+        };
         self.thumbs(
             frame,
             &thumbs,
@@ -769,7 +812,7 @@ impl Painter {
     /// Whether node `i`'s box the compositor hit-tests changed.
     fn hit_changed(&self, frame: &Frame, i: usize, node: &FrameNode) -> bool {
         let takes = frame.behaviour(i).is_some_and(|b| !b.pass_through) && !node.look.invisible;
-        takes.then_some(node.space) != self.hit_rect.get(i).copied().flatten()
+        takes.then(|| hit_box(node)) != self.hit_rect.get(i).copied().flatten()
     }
 
     /// Whether `node`'s caret shows otherwise than its chunk recorded it.
@@ -813,10 +856,10 @@ impl Painter {
             };
             scroller_of.push(within);
             let takes = frame.behaviour(i).is_some_and(|b| !b.pass_through) && !node.look.invisible;
-            self.hit_rect.push(takes.then_some(node.space));
+            self.hit_rect.push(takes.then(|| hit_box(node)));
             if takes {
                 hits.push(Hit {
-                    rect: node.space,
+                    rect: hit_box(node),
                     transform: p.transform,
                     clip: p.clip,
                     scroller: within,
@@ -926,6 +969,7 @@ impl Painter {
                         clip: Clip {
                             bounds,
                             radius: node.clip_radius,
+                            curve: node.clip_curve,
                         },
                         transform: space,
                     },
@@ -999,13 +1043,15 @@ impl Painter {
     fn chunk(
         &mut self,
         node: &FrameNode,
+        role: Role,
         snap: bool,
         scale: f32,
         generation: u64,
         text: &mut TextSystem,
     ) -> Arc<Display> {
         let now = self.frame;
-        let id = ChunkId(key(&node.path, Role::Chunk));
+        let overlay = matches!(role, Role::Overlay);
+        let id = ChunkId(key(&node.path, role));
         let caret = caret_on(node);
         // What it may record: what its clip shows, and a margin.
         let visible = node.clip.map(|c| c.translated(-node.offset.0, -node.offset.1));
@@ -1067,7 +1113,13 @@ impl Painter {
             cull,
             snap,
         };
-        record_node(&view, &mut target, text, cull, caret);
+        if overlay {
+            if !view.look.invisible {
+                record_overlay(&mut target, &view);
+            }
+        } else {
+            record_node(&view, &mut target, text, cull, caret);
+        }
         let pieces = text.take_drawn();
         text.pin(&pieces);
         let display = Arc::new(Display::new(items));
@@ -1092,6 +1144,38 @@ impl Painter {
             text.unpin(&old.pieces);
         }
         display
+    }
+
+    /// The overlay chunks of the nodes in `over` whose subtree ends before
+    /// node `before` (all of them at `None`), innermost first: each paints
+    /// over its whole subtree, under the node's own state.
+    #[expect(clippy::too_many_arguments, reason = "what a record reads")]
+    fn overlays(
+        &mut self,
+        frame: &Frame,
+        over: &mut Vec<(usize, Placed)>,
+        before: Option<usize>,
+        scene: &mut Scene,
+        scale: f32,
+        generation: u64,
+        text: &mut TextSystem,
+    ) {
+        while let Some(&(j, p)) = over.last() {
+            if before.is_some_and(|i| self.ends.get(j).copied().unwrap_or(0) > i) {
+                break;
+            }
+            over.pop();
+            let Some(node) = frame.nodes.get(j) else { continue };
+            let display = self.chunk(node, Role::Overlay, p.snap, scale, generation, text);
+            if let Some(c) = self.overlay_of.get_mut(j) {
+                *c = Some(scene.chunks.len());
+            }
+            scene.chunks.push(Chunk {
+                id: ChunkId(key(&node.path, Role::Overlay)),
+                state: p.state(),
+                display,
+            });
+        }
     }
 
     /// The thumbs of `scrollers`, each a chunk under a transform its scroll
@@ -1126,10 +1210,37 @@ impl Painter {
                     matrix: None,
                 },
             );
+            // An overlay scrollbar (Chrome's on macOS, cc's
+            // `ScrollbarAnimationController`): hidden at rest, shown by the
+            // compositor while the user scrolls it, then faded out. Its
+            // opacity is this effect's, which only the compositor moves.
+            let effect = self.effects.id(key(&node.path, Role::ThumbEffect), now);
+            w.effect(
+                effect,
+                EffectNode {
+                    parent: p.effect,
+                    opacity: 0.0,
+                    // The container's: its region is the track, which the
+                    // thumb moves along, not with.
+                    transform: p.transform,
+                    // The track: wherever along it the thumb is.
+                    region: effects::physical_rect(
+                        Bounds {
+                            x: node.bounds.right() - 8.0,
+                            width: 8.0,
+                            ..node.bounds
+                        },
+                        scale,
+                        scene.size,
+                    ),
+                    ..EffectNode::default()
+                },
+            );
             self.thumb_nodes.insert(
                 NodeKey::of(&node.path),
                 ThumbNode {
                     transform,
+                    effect,
                     top: node.offset,
                     travel,
                 },
@@ -1188,7 +1299,7 @@ impl Painter {
                 state: State {
                     transform,
                     clip: p.clip,
-                    effect: 0,
+                    effect,
                 },
                 display,
             });
@@ -1240,56 +1351,217 @@ fn record_box(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSystem) 
         background,
         border,
         border_color,
-        radius,
+        shape,
         shadows,
         ring,
+        decoration,
         ..
     } = &node.look;
     let b = target.snapped(node.bounds);
+    // The radii the box gets (CSS's overlapping-curves rule, against the
+    // box as painted, as Blink constrains them on the snapped border box).
+    let radius = shape.used(b.width, b.height);
+    let k = shape.curve();
+    // What lies behind, filtered, under all the node paints: its shadows
+    // fall outside the box and the backdrop only inside it.
+    if let Some(backdrop) = decoration.backdrop.filter(|d| !d.is_identity()) {
+        target.items.push(Item::Backdrop {
+            bounds: b,
+            radius,
+            curve: k,
+            backdrop,
+        });
+    }
     for s in shadows.iter().filter(|s| !s.color.is_transparent()) {
         target.items.push(Item::Shadow {
             bounds: b,
-            radius: *radius,
+            radius,
+            curve: k,
             shadow: *s,
         });
     }
     if let Some(ring) = ring.filter(|r| r.width > 0.0 && !r.color.is_transparent()) {
-        target.items.push(Item::Band {
-            outer: b.outset(ring.width),
-            outer_radius: grow(*radius, ring.width),
-            inner: b,
-            inner_radius: *radius,
-            color: ring.color,
-        });
+        // A band `offset` out from the border box, its corners grown from
+        // the shape's as Chrome grows a spread's or an outline's.
+        let (near, far) = (ring.offset, ring.offset + ring.width);
+        band(
+            target,
+            (b.outset(far), ring.radii(radius, far)),
+            (b.outset(near), ring.radii(radius, near)),
+            k,
+            ring.color,
+        );
     }
     // A background clipped to the text is painted with the text.
     if let Some(bg) = background.filter(|c| !c.is_transparent())
         && effects::text_background(node).is_none()
     {
-        target.items.push(Item::RoundedRect {
-            bounds: b,
-            radius: *radius,
-            color: bg,
-        });
+        fill(target, b, radius, k, bg);
     }
     if let Some(img) = effects::box_background(node) {
         effects::record_background(target, node, img, text);
     }
-    let has_border = border.top > 0.0 || border.right > 0.0 || border.bottom > 0.0 || border.left > 0.0;
-    if has_border && let Some(color) = border_color.filter(|c| !c.is_transparent()) {
-        let inner = b.inset(border.top, border.right, border.bottom, border.left);
-        let inner_radius = Corners {
-            top_left: (radius.top_left - border.top.max(border.left)).max(0.0),
-            top_right: (radius.top_right - border.top.max(border.right)).max(0.0),
-            bottom_right: (radius.bottom_right - border.bottom.max(border.right)).max(0.0),
-            bottom_left: (radius.bottom_left - border.bottom.max(border.left)).max(0.0),
+    if let Some(color) = border_color.filter(|c| !c.is_transparent()) {
+        border_band(target, b, radius, *border, k, color);
+    }
+    if let Some(layer) = &decoration.inset {
+        // Placed against the padding box, as an absolute pseudo-element's
+        // `inset-*` is.
+        let padding = border_inner(b, radius, *border).map_or(b, |(p, _)| p);
+        record_inset(target, padding, layer);
+    }
+    if let Some(bar) = decoration
+        .edge_bar
+        .filter(|e| e.width > 0.0 && !e.color.is_transparent())
+    {
+        use crate::element::Side;
+        let w = bar.width.min(b.width).min(b.height);
+        let bounds = match bar.side {
+            Side::Top => Bounds { height: w, ..b },
+            Side::Bottom => Bounds {
+                y: b.bottom() - w,
+                height: w,
+                ..b
+            },
+            Side::Left => Bounds { width: w, ..b },
+            Side::Right => Bounds {
+                x: b.right() - w,
+                width: w,
+                ..b
+            },
         };
-        target.items.push(Item::Band {
+        target.items.push(Item::Rect {
+            bounds,
+            color: bar.color,
+        });
+    }
+}
+
+/// `b` filled in `color`, its corners of used radii `radius` curving as `k`.
+fn fill(target: &mut Target<'_>, b: Bounds, radius: Corners, k: f32, color: Color) {
+    if (k - crate::shape::ROUND).abs() > f32::EPSILON && !radius.is_zero() {
+        target.items.push(Item::Superellipse {
             outer: b,
-            outer_radius: *radius,
+            outer_radius: radius,
+            inner: Bounds::default(),
+            inner_radius: Corners::default(),
+            k,
+            color,
+        });
+    } else {
+        target.items.push(Item::RoundedRect {
+            bounds: b,
+            radius,
+            color,
+        });
+    }
+}
+
+/// What lies between `outer` and `inner` (each a box and its radii), in `color`.
+fn band(target: &mut Target<'_>, outer: (Bounds, Corners), inner: (Bounds, Corners), k: f32, color: Color) {
+    if (k - crate::shape::ROUND).abs() > f32::EPSILON && !outer.1.is_zero() {
+        target.items.push(Item::Superellipse {
+            outer: outer.0,
+            outer_radius: outer.1,
+            inner: inner.0,
+            inner_radius: inner.1,
+            k,
+            color,
+        });
+    } else {
+        target.items.push(Item::Band {
+            outer: outer.0,
+            outer_radius: outer.1,
+            inner: inner.0,
+            inner_radius: inner.1,
+            color,
+        });
+    }
+}
+
+/// A border of `widths` inside `b` (used radii `radius`): its inner edge's
+/// corners are the outer ones less the wider of the two sides meeting there.
+fn border_band(target: &mut Target<'_>, b: Bounds, radius: Corners, widths: Edges<f32>, k: f32, color: Color) {
+    if let Some(inner) = border_inner(b, radius, widths) {
+        band(target, (b, radius), inner, k, color);
+    }
+}
+
+/// The inner edge of a border of `widths` inside `b` (used radii
+/// `radius`), `None` when no side has width.
+fn border_inner(b: Bounds, radius: Corners, widths: Edges<f32>) -> Option<(Bounds, Corners)> {
+    let w = widths;
+    if !(w.top > 0.0 || w.right > 0.0 || w.bottom > 0.0 || w.left > 0.0) {
+        return None;
+    }
+    let inner = b.inset(w.top, w.right, w.bottom, w.left);
+    let inner_radius = Corners {
+        top_left: (radius.top_left - w.top.max(w.left)).max(0.0),
+        top_right: (radius.top_right - w.top.max(w.right)).max(0.0),
+        bottom_right: (radius.bottom_right - w.bottom.max(w.right)).max(0.0),
+        bottom_left: (radius.bottom_left - w.bottom.max(w.left)).max(0.0),
+    };
+    Some((inner, inner_radius))
+}
+
+/// An inset layer of a node whose border box is `b`: its shadows, fill and
+/// border, its shape resolved against its own box.
+fn record_inset(target: &mut Target<'_>, b: Bounds, layer: &crate::shape::InsetLayer) {
+    let e = layer.inset;
+    let at = b.inset(e.top, e.right, e.bottom, e.left);
+    if at.is_empty() {
+        return;
+    }
+    let at = target.snapped(at);
+    let radius = layer.shape.used(at.width, at.height);
+    let k = layer.shape.curve();
+    for s in layer.shadows.iter().filter(|s| !s.color.is_transparent()) {
+        target.items.push(Item::Shadow {
+            bounds: at,
+            radius,
+            curve: k,
+            shadow: *s,
+        });
+    }
+    if let Some(bg) = layer.background.filter(|c| !c.is_transparent()) {
+        fill(target, at, radius, k, bg);
+    }
+    if let Some(color) = layer.border_color.filter(|c| !c.is_transparent()) {
+        border_band(target, at, radius, Edges::all(layer.border), k, color);
+    }
+}
+
+/// The border a node paints over its content and children
+/// ([`crate::shape::OverlayBorder`]), along its shape, blended with what
+/// lies below as it asks.
+pub(crate) fn record_overlay(target: &mut Target<'_>, node: &FrameNode) {
+    let Some(o) = node
+        .look
+        .decoration
+        .overlay
+        .filter(|o| o.width > 0.0 && !o.color.is_transparent())
+    else {
+        return;
+    };
+    let b = target.snapped(node.bounds);
+    let radius = node.look.shape.used(b.width, b.height);
+    let k = node.look.shape.curve();
+    // Along the padding box's edge and its inner corners, as an absolute
+    // `after:inset-0` with the node's corners is.
+    let (b, radius) = border_inner(b, radius, node.look.border).unwrap_or((b, radius));
+    if o.blend == crate::shape::Blend::Normal {
+        border_band(target, b, radius, Edges::all(o.width), k, o.color);
+        return;
+    }
+    if let Some((inner, inner_radius)) = border_inner(b, radius, Edges::all(o.width)) {
+        target.items.push(Item::Blended {
+            outer: b,
+            outer_radius: radius,
             inner,
             inner_radius,
-            color,
+            curve: k,
+            color: o.color,
+            blend: o.blend,
         });
     }
 }
@@ -1298,7 +1570,7 @@ fn record_box(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSystem) 
 fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSystem, caret_shown: bool) {
     match &node.content {
         Content::None => {}
-        Content::Shapes(shapes) => {
+        Content::Figures(shapes) => {
             let b = target.snapped(node.bounds);
             for shape in shapes {
                 target.items.push(Item::Path {
@@ -1318,11 +1590,17 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
                 source: source.clone(),
                 bounds: target.snapped(node.bounds),
                 radius: *radius,
+                curve: node.look.shape.curve(),
             });
         }
-        Content::Text { content, text: t, runs } => {
+        Content::Text {
+            content,
+            text: t,
+            runs,
+            boxes,
+        } => {
             let area = &node.content_box;
-            let p = Paragraph::new(content, runs);
+            let p = Paragraph { content, runs, boxes };
             if let Some(img) = effects::text_background(node) {
                 effects::record_text_through(target, node, img, text, p, t, text_width(t, area));
             } else {
@@ -1495,7 +1773,11 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
         frame
             .nodes
             .iter()
-            .find(|n| key(&n.path, Role::Chunk) == id.0 || key(&n.path, Role::Thumb) == id.0)
+            .find(|n| {
+                [Role::Chunk, Role::Overlay, Role::Thumb]
+                    .into_iter()
+                    .any(|r| key(&n.path, r) == id.0)
+            })
             .map_or_else(|| format!("{id:?}"), |n| n.path.to_string())
     };
     if a.background != b.background || a.size != b.size || a.scale != b.scale {

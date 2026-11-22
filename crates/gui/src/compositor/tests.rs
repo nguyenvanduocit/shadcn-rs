@@ -12,9 +12,9 @@ use crate::app::Scenario;
 use crate::clock::{self, Vsync};
 use crate::color::Color;
 use crate::element::{IntoElement, div, text};
+use crate::prelude::*;
 use crate::reactive::Signal;
 use crate::scene::Properties;
-use crate::styled::Styled;
 
 fn node(key: u64, offset: f32, max: f32) -> ScrollNode {
     ScrollNode {
@@ -168,13 +168,17 @@ fn vsync_is_fitted_to_blocked_acquires() {
 /// A list of 40 rows, 24 px each, in a 200 px scroll container; a click on
 /// a row writes its number.
 fn rows(clicked: Signal<i32>) -> impl IntoElement {
-    div().size_full().overflow_y_scroll().children((0..40).map(move |i| {
-        div()
-            .h_px(24.0)
-            .bg(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
-            .on_click(move |_| clicked.set(i))
-            .child(text(format!("row {i}")))
-    }))
+    div()
+        .size(pct(100.0))
+        .overflow_y(Overflow::Scroll)
+        .overflow_x(Overflow::Hidden)
+        .children((0..40).map(move |i| {
+            div()
+                .height(24.0)
+                .background(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
+                .on_click(move |_| clicked.set(i))
+                .child(text(format!("row {i}")))
+        }))
 }
 
 #[test]
@@ -233,18 +237,18 @@ fn a_commit_applied_is_the_ui_scene_and_composes_to_it() {
         move || {
             let on = shown.get();
             div()
-                .size_full()
+                .size(pct(100.0))
                 .child(
                     div()
-                        .w_px(120.0)
-                        .h_px(40.0)
-                        .bg(Color::hex(0x18181b))
+                        .width(120.0)
+                        .height(40.0)
+                        .background(Color::hex(0x18181b))
                         .duration_ms(200.0)
-                        .ease_linear()
-                        .transition_opacity()
+                        .ease(Easing::Linear)
+                        .transition(crate::motion::Properties::OPACITY)
                         .opacity(if on { 1.0 } else { 0.2 }),
                 )
-                .child(div().h_px(150.0).child(rows(clicked)))
+                .child(div().height(150.0).child(rows(clicked)))
                 .into_element()
         },
         300,
@@ -266,7 +270,36 @@ fn a_commit_applied_is_the_ui_scene_and_composes_to_it() {
     s.hover(100.0, 120.0);
     assert!(s.wheel(30.0));
     s.frame("scrolled").expect("a frame");
-    same_as_committed(&mut s, clock::current_seconds(), "scrolled");
+    // The user scrolled it: its overlay scrollbar shows, though committed
+    // hidden, and composes back to the commit once it has faded.
+    let now = clock::current_seconds();
+    let (_, headless) = s.parts();
+    let effect = headless
+        .compositor
+        .committed()
+        .compositing
+        .scrollers
+        .iter()
+        .find_map(|sc| sc.thumb)
+        .map(|t| t.effect)
+        .expect("a scrollbar");
+    let at = usize::try_from(effect).unwrap_or(usize::MAX);
+    let opacity = |props: &Properties| props.effects.get(at).map(|e| e.opacity);
+    assert_eq!(
+        opacity(&headless.compositor.committed().properties),
+        Some(0.0),
+        "hidden at rest"
+    );
+    let mut composed = headless.compositor.compose(now).properties.clone();
+    assert_eq!(opacity(&composed), Some(1.0), "shown as it scrolls");
+    if let Some(e) = composed.effects.get_mut(at) {
+        e.opacity = 0.0;
+    }
+    assert_eq!(
+        composed,
+        headless.compositor.committed().properties,
+        "the rest is the commit"
+    );
 }
 
 #[test]
@@ -275,15 +308,15 @@ fn an_animation_is_evenly_spaced_at_predicted_present_times() {
     let mut s = Scenario::measuring(
         move || {
             div()
-                .size_full()
+                .size(pct(100.0))
                 .child(
                     div()
-                        .w_px(120.0)
-                        .h_px(40.0)
-                        .bg(Color::BLACK)
+                        .width(120.0)
+                        .height(40.0)
+                        .background(Color::BLACK)
                         .duration_ms(500.0)
-                        .ease_linear()
-                        .transition_opacity()
+                        .ease(Easing::Linear)
+                        .transition(crate::motion::Properties::OPACITY)
                         .opacity(if shown.get() { 1.0 } else { 0.0 }),
                 )
                 .into_element()
@@ -350,15 +383,15 @@ fn a_frame_the_ui_owes_still_moves_what_the_compositor_runs() {
         move || {
             counted.set(counted.get() + 1);
             div()
-                .size_full()
+                .size(pct(100.0))
                 .child(
                     div()
-                        .w_px(120.0)
-                        .h_px(40.0)
-                        .bg(Color::BLACK)
+                        .width(120.0)
+                        .height(40.0)
+                        .background(Color::BLACK)
                         .duration_ms(300.0)
-                        .ease_linear()
-                        .transition_transform()
+                        .ease(Easing::Linear)
+                        .transition(crate::motion::Properties::TRANSFORM)
                         .translate_y(crate::style::Calc::px(if shown.get() { 0.0 } else { 60.0 })),
                 )
                 .into_element()
@@ -438,12 +471,12 @@ fn a_lost_device_or_a_render_panic_is_recovered_from_the_uis_arcs() {
             let dark = Signal::new(false);
             move || {
                 div()
-                    .size_full()
+                    .size(pct(100.0))
                     .child(
                         div()
-                            .w_px(80.0)
-                            .h_px(40.0)
-                            .bg(if dark.get() {
+                            .width(80.0)
+                            .height(40.0)
+                            .background(if dark.get() {
                                 Color::hex(0x18181b)
                             } else {
                                 Color::hex(0xe4e4e7)
@@ -498,9 +531,13 @@ fn a_tree_as_deep_as_gui_takes_runs_on_the_app_threads() {
             move || {
                 let mut e = text("leaf").into_element();
                 for _ in 0..depth {
-                    e = div().flex_col().child(e).into_element();
+                    e = div()
+                        .display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .child(e)
+                        .into_element();
                 }
-                div().size_full().child(e).into_element()
+                div().size(pct(100.0)).child(e).into_element()
             }
         },
         crate::app::RunOptions::default(),
@@ -526,15 +563,15 @@ fn a_compositor_scroll_within_its_reach_never_passes_the_rows_built() {
         let mut s = Scenario::measuring(
             move || {
                 div()
-                    .w_px(300.0)
+                    .width(300.0)
                     .child(
                         virtual_list(
                             &st,
                             1_000_000,
                             |i| i,
-                            |i| div().h_px(24.0).child(text(format!("row {i}"))).into_element(),
+                            |i| div().height(24.0).child(text(format!("row {i}"))).into_element(),
                         )
-                        .h_px(300.0),
+                        .height(300.0),
                     )
                     .into_element()
             },

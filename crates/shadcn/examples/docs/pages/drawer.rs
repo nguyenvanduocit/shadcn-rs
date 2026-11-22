@@ -32,9 +32,10 @@ fn scrolling(content: Part<DrawerContentProps>) -> Part<DrawerContentProps> {
         )
         .child(
             div()
-                .overflow_y_scroll()
-                .px(4.0)
-                .children((0..10).map(|_| text(LOREM).mb(4.0).leading_normal())),
+                .overflow_y(Overflow::Scroll)
+                .overflow_x(Overflow::Hidden)
+                .padding_x(16.0)
+                .children((0..10).map(|_| text(LOREM).margin_bottom(16.0).line_height(LineHeight::Relative(1.5)))),
         )
         .child(
             drawer_footer()
@@ -51,10 +52,10 @@ pub fn render() -> Render {
         let t = theme();
         let step = |delta: i32, glyph: Icon, disabled: bool| {
             button(ButtonVariant::Outline, ButtonSize::Icon)
-                .h(8.0)
-                .w(8.0)
-                .shrink_0()
-                .rounded_full()
+                .height(32.0)
+                .width(32.0)
+                .flex_shrink(0.0)
+                .radius(9999.0)
                 .disabled(disabled)
                 .on_click(move |_| goal.update(|g| *g = g.saturating_add(delta)))
                 .child(icon(glyph))
@@ -67,9 +68,9 @@ pub fn render() -> Render {
             .child(
                 drawer_content(DrawerDirection::Down).child(
                     div()
-                        .mx_auto()
-                        .w_full()
-                        .max_w(96.0)
+                        .margin_x(Length::Auto)
+                        .width(pct(100.0))
+                        .max_width(384.0)
                         .child(
                             drawer_header()
                                 .child(drawer_title("Move Goal"))
@@ -77,34 +78,36 @@ pub fn render() -> Render {
                         )
                         .child(
                             div()
-                                .p(4.0)
-                                .pb(0.0)
+                                .padding(16.0)
+                                .padding_bottom(0.0)
                                 .child(
                                     div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap(2.0)
+                                        .display(Display::Flex)
+                                        .align_items(Align::Center)
+                                        .justify_content(Justify::Center)
+                                        .gap(8.0)
                                         .child(step(-10, Icon::Minus, g <= 200))
                                         .child(
                                             div()
-                                                .flex_1()
-                                                .text_center()
+                                                .flex(Flex::grow(1.0))
+                                                .text_align(TextAlign::Center)
                                                 .child(
                                                     text(g.to_string())
-                                                        .text_size(72.0, 72.0)
-                                                        .font_bold()
-                                                        .tracking_tight(),
+                                                        .text_size(72.0)
+                                                        .line_height(72.0)
+                                                        .font_weight(700)
+                                                        .tracking(-0.025),
                                                 )
                                                 .child(
                                                     text("CALORIES/DAY")
-                                                        .text_size(11.2, 16.0)
+                                                        .text_size(11.2)
+                                                        .line_height(16.0)
                                                         .text_color(t.muted_foreground),
                                                 ),
                                         )
                                         .child(step(10, Icon::Plus, g >= 400)),
                                 )
-                                .child(div().mt(3.0).h_px(120.0)),
+                                .child(div().margin_top(12.0).height(120.0)),
                         )
                         .child(
                             drawer_footer()
@@ -116,9 +119,9 @@ pub fn render() -> Render {
                 ),
             );
         let sides_demo = div()
-            .flex()
-            .flex_wrap()
-            .gap(2.0)
+            .display(Display::Flex)
+            .flex_wrap(true)
+            .gap(8.0)
             .children(SIDES.iter().map(|(name, dir)| {
                 let vertical = matches!(dir, DrawerDirection::Up | DrawerDirection::Down);
                 drawer()
@@ -126,13 +129,14 @@ pub fn render() -> Render {
                         button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
                     ))
                     // `max-h-[50vh]` of the 640px gallery window.
-                    .child(scrolling(drawer_content(*dir).when(vertical, |c| c.max_h_px(320.0))))
+                    .child(scrolling(drawer_content(*dir).when(vertical, |c| c.max_height(320.0))))
             }));
         page(
             "Drawer",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo("DrawerDemo.vue", goal_demo))
                 .child(demo("DrawerSides.vue", sides_demo))
                 .child(demo(

@@ -38,22 +38,29 @@ pub fn render() -> Render {
     let username = FormField::new(TextField::new(""), checks, |v: &String| username_errors(v));
     let docs = TextField::new("https://www.shadcn-vue.com/docs/installation");
     Box::new(move || {
-        let labelled = |name: &str, f: &TextField| div().grid().gap(3.0).child(label(name)).child(input().field(*f));
+        let labelled = |name: &str, f: &TextField| {
+            div()
+                .display(Display::Grid)
+                .gap(12.0)
+                .child(label(name))
+                .child(input().field(*f))
+        };
         page(
             "Dialog",
             div()
-                .flex_col()
-                .gap(8.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(32.0)
                 .child(demo(
                     "DialogDemo.vue",
                     dialog()
-                        .flex()
+                        .display(Display::Flex)
                         .child(dialog_trigger(
                             button(ButtonVariant::Outline, ButtonSize::Default).child("Open Dialog"),
                         ))
                         .child(
                             dialog_content()
-                                .max_w_px(425.0)
+                                .max_width(425.0)
                                 .child(
                                     dialog_header()
                                         .child(dialog_title("Edit profile"))
@@ -63,8 +70,8 @@ pub fn render() -> Render {
                                 )
                                 .child(
                                     div()
-                                        .grid()
-                                        .gap(4.0)
+                                        .display(Display::Grid)
+                                        .gap(16.0)
                                         .child(labelled("Name", &name))
                                         .child(labelled("Username", &username_field)),
                                 )
@@ -82,13 +89,13 @@ pub fn render() -> Render {
                 .child(demo(
                     "DialogCloseButton.vue",
                     dialog()
-                        .flex()
+                        .display(Display::Flex)
                         .child(dialog_trigger(
                             button(ButtonVariant::Outline, ButtonSize::Default).child("Share"),
                         ))
                         .child(
                             dialog_content()
-                                .max_w(112.0)
+                                .max_width(448.0)
                                 .child(
                                     dialog_header()
                                         .child(dialog_title("Share link"))
@@ -97,13 +104,15 @@ pub fn render() -> Render {
                                         )),
                                 )
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(2.0)
-                                        .child(div().grid().flex_1().gap(2.0).child(input().field(link).read_only())),
+                                    div().display(Display::Flex).align_items(Align::Center).gap(8.0).child(
+                                        div()
+                                            .display(Display::Grid)
+                                            .flex(Flex::grow(1.0))
+                                            .gap(8.0)
+                                            .child(input().field(link).read_only()),
+                                    ),
                                 )
-                                .child(dialog_footer().justify_start().child(dialog_close(
+                                .child(dialog_footer().justify_content(Justify::Start).child(dialog_close(
                                     button(ButtonVariant::Secondary, ButtonSize::Default).child("Close"),
                                 ))),
                         ),
@@ -113,7 +122,7 @@ pub fn render() -> Render {
                     "DialogResponsive.vue",
                     // `useMediaQuery('(min-width: 640px)')` holds at the gallery's width: the dialog, not the drawer.
                     dialog()
-                        .flex()
+                        .display(Display::Flex)
                         .child(dialog_trigger(
                             button(ButtonVariant::Outline, ButtonSize::Default)
                                 .named("responsive-trigger")
@@ -121,7 +130,7 @@ pub fn render() -> Render {
                         ))
                         .child(
                             dialog_content()
-                                .max_w(112.0)
+                                .max_width(448.0)
                                 .child(
                                     dialog_header()
                                         .child(dialog_title("Share Link"))
@@ -130,13 +139,15 @@ pub fn render() -> Render {
                                         )),
                                 )
                                 .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(2.0)
-                                        .child(div().grid().flex_1().gap(2.0).child(input().field(docs).read_only())),
+                                    div().display(Display::Flex).align_items(Align::Center).gap(8.0).child(
+                                        div()
+                                            .display(Display::Grid)
+                                            .flex(Flex::grow(1.0))
+                                            .gap(8.0)
+                                            .child(input().field(docs).read_only()),
+                                    ),
                                 )
-                                .child(dialog_footer().pt(4.0).child(dialog_close(
+                                .child(dialog_footer().padding_top(16.0).child(dialog_close(
                                     button(ButtonVariant::Outline, ButtonSize::Default).child("Close"),
                                 ))),
                         ),
@@ -152,13 +163,13 @@ fn dialog_form(username: &FormField<TextField>) -> Element {
     let invalid = username.invalid();
     let submit = *username;
     dialog()
-        .flex()
+        .display(Display::Flex)
         .child(dialog_trigger(
             button(ButtonVariant::Outline, ButtonSize::Default).child("Edit Profile"),
         ))
         .child(
             dialog_content()
-                .max_w_px(425.0)
+                .max_width(425.0)
                 .child(
                     dialog_header()
                         .child(dialog_title("Edit profile"))

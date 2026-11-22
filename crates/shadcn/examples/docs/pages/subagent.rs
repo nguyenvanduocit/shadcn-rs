@@ -21,20 +21,25 @@ fn done(title: &str) -> Div {
 
 fn details(open: &Signal<bool>) -> Div {
     let head = done("Ran the research agent").child(trace_description("48s"));
-    trace().max_w(96.0).child(
+    trace().max_width(384.0).child(
         trace_collapsible()
             .model(Model::bind(*open))
             .child(trace_collapsible_trigger(false, head))
             .child(trace_collapsible_content().map_root(|c| {
-                c.flex_col()
-                    .gap(3.0)
+                c.display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .gap(12.0)
                     .child(
                         div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(1.5)
+                            .display(Display::Flex)
+                            .flex_wrap(true)
+                            .gap(6.0)
                             .child(badge(BadgeVariant::Secondary).child("anthropic/claude-sonnet-4.5"))
-                            .child(badge(BadgeVariant::Outline).font_mono().child("runCommand")),
+                            .child(
+                                badge(BadgeVariant::Outline)
+                                    .font_family(FontFamily::GEIST_MONO)
+                                    .child("runCommand"),
+                            ),
                     )
                     .child(text("Find out why image optimization reruns on every deploy."))
                     .child(
@@ -49,7 +54,7 @@ fn details(open: &Signal<bool>) -> Div {
 
 fn running(open: &Signal<bool>) -> Div {
     let head = line(Some(TraceStatus::Running), spinner(), "Running the research agent");
-    trace().max_w(96.0).child(
+    trace().max_width(384.0).child(
         trace_collapsible()
             .model(Model::bind(*open))
             .child(trace_collapsible_trigger(false, head))
@@ -188,8 +193,9 @@ impl Research {
                 .model(Model::bind(self.open))
                 .child(trace_collapsible_trigger(failed, head))
                 .child(trace_collapsible_content().map_root(|c| {
-                    c.flex_col()
-                        .gap(3.0)
+                    c.display(Display::Flex)
+                        .flex_direction(FlexDirection::Column)
+                        .gap(12.0)
                         .child(trace().children(rows))
                         .when(finished, |c| c.child(text(REPORT)))
                 })),
@@ -220,8 +226,9 @@ pub fn render() -> Render {
         page(
             "Subagent",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("SubagentDemo.vue", research.view()))
                 .child(demo("SubagentDetailsDemo.vue", details(&details_open)))
                 .child(demo("SubagentRunningDemo.vue", running(&running_open))),

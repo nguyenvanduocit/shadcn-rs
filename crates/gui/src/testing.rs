@@ -18,7 +18,7 @@ use std::time::Duration;
 use crate::clock;
 use crate::color::Color;
 use crate::element::{Element, IntoElement, div, text};
-use crate::styled::{Fluent, Styled};
+use crate::prelude::*;
 
 // ── Seeds ────────────────────────────────────────────────────────────────────
 
@@ -615,24 +615,31 @@ impl RandomTree {
                 .collect();
             return div()
                 .key(n.key)
-                .p(n.pad / 4.0)
-                .when(n.grow, Styled::flex_1)
-                .child(text(words.join(" ")).text_sm())
+                .padding(n.pad)
+                .when(n.grow, |d| d.flex(Flex::grow(1.0)))
+                .child(text(words.join(" ")).text_size(14.0).line_height(20.0))
                 .into_element();
         }
-        let mut d = div().key(n.key).bg(Color::hex(n.color)).p(n.pad / 4.0).gap(n.gap / 4.0);
+        let mut d = div()
+            .key(n.key)
+            .background(Color::hex(n.color))
+            .padding(n.pad)
+            .gap(n.gap);
         d = match n.kind {
-            Kind::Row => d.flex().flex_row(),
-            Kind::Wrap => d.flex().flex_row().flex_wrap(),
-            Kind::Grid => d.grid().grid_cols(3),
+            Kind::Row => d.display(Display::Flex).flex_direction(FlexDirection::Row),
+            Kind::Wrap => d
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Row)
+                .flex_wrap(true),
+            Kind::Grid => d.display(Display::Grid).grid_columns(Tracks::repeat(3, Track::Fr(1.0))),
             Kind::Fixed => match n.size {
-                Some((w, h)) => d.w_px(w).h_px(h),
+                Some((w, h)) => d.width(w).height(h),
                 None => d,
             },
-            Kind::Column | Kind::Text => d.flex().flex_col(),
+            Kind::Column | Kind::Text => d.display(Display::Flex).flex_direction(FlexDirection::Column),
         };
         if n.grow {
-            d = d.flex_1();
+            d = d.flex(Flex::grow(1.0));
         }
         let kids: Vec<Element> = children
             .get(i)

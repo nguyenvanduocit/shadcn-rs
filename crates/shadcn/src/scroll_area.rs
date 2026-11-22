@@ -13,9 +13,10 @@ use gui::{Div, Properties, div};
 pub fn scroll_area() -> Div {
     div()
         .named("scroll-area")
-        .transition_props(Properties::COLOR | Properties::SHADOW)
-        .relative()
-        .overflow_y_scroll()
+        .transition(Properties::COLOR | Properties::SHADOW)
+        .position(Position::Relative)
+        .overflow_y(Overflow::Scroll)
+        .overflow_x(Overflow::Hidden)
 }
 
 /// An area with a horizontal scrollbar too (`<ScrollBar orientation="horizontal" />`).
@@ -23,7 +24,7 @@ pub fn scroll_area() -> Div {
 pub fn scroll_area_horizontal() -> Div {
     div()
         .named("scroll-area")
-        .transition_props(Properties::COLOR | Properties::SHADOW)
-        .relative()
-        .overflow_scroll()
+        .transition(Properties::COLOR | Properties::SHADOW)
+        .position(Position::Relative)
+        .overflow(Overflow::Scroll)
 }

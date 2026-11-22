@@ -22,11 +22,11 @@ pub fn render() -> Render {
                         button(ButtonVariant::Link, ButtonSize::Default).child("@nuxt"),
                     ))
                     .child(
-                        hover_card_content().w(80.0).child(
+                        hover_card_content().width(320.0).child(
                             div()
-                                .flex()
-                                .justify_between()
-                                .gap(4.0)
+                                .display(Display::Flex)
+                                .justify_content(Justify::Between)
+                                .gap(16.0)
                                 .child(
                                     avatar()
                                         .child(avatar_image(vercel.as_ref()))
@@ -34,19 +34,25 @@ pub fn render() -> Render {
                                 )
                                 .child(
                                     div()
-                                        .flex_col()
-                                        .gap(1.0)
-                                        .child(text("@nuxt").text_sm().font_semibold())
-                                        .child(text("The Vue Framework – The Progressive Web Framework.").text_sm())
+                                        .display(Display::Flex)
+                                        .flex_direction(FlexDirection::Column)
+                                        .gap(4.0)
+                                        .child(text("@nuxt").text_size(14.0).line_height(20.0).font_weight(600))
+                                        .child(
+                                            text("The Vue Framework – The Progressive Web Framework.")
+                                                .text_size(14.0)
+                                                .line_height(20.0),
+                                        )
                                         .child(
                                             div()
-                                                .flex()
-                                                .items_center()
-                                                .pt(2.0)
-                                                .child(icon(Icon::CalendarDays).mr(2.0).opacity(0.7))
+                                                .display(Display::Flex)
+                                                .align_items(Align::Center)
+                                                .padding_top(8.0)
+                                                .child(icon(Icon::CalendarDays).margin_right(8.0).opacity(0.7))
                                                 .child(
                                                     text("Joined December 2021")
-                                                        .text_xs()
+                                                        .text_size(12.0)
+                                                        .line_height(16.0)
                                                         .text_color(t.muted_foreground),
                                                 ),
                                         ),

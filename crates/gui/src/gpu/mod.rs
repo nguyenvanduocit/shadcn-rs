@@ -40,6 +40,7 @@ mod cold;
 mod damage;
 mod frame;
 pub(crate) mod path;
+mod read;
 mod record;
 mod slug;
 #[cfg(test)]
@@ -63,12 +64,12 @@ use self::words::{Table, Words};
 use crate::cache::FrameCache;
 use crate::color::Color;
 use crate::convert::u32_to_f32;
+use crate::figure::{Draw as PathDraw, Path, PathStyle, Stroke};
 use crate::geometry::Bounds;
 use crate::icon::Icon;
 use crate::image::{ImageSource, Pixels};
 use crate::inspect::Raster;
 use crate::scene::{Changed, ChunkId, Drawn, Held, Renderer, Scene};
-use crate::shape::{Draw as PathDraw, Path, PathStyle, Stroke};
 use crate::style::Corners;
 use crate::text::gamma::{GammaParams, MaskGamma};
 use crate::text::settings::Subpixel;
@@ -175,7 +176,7 @@ struct IconKey {
 /// A texture an instance reads beside the atlases, with the bind group
 /// that holds it, made once with it.
 struct Texture {
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
     bind: wgpu::BindGroup,
     size: (u32, u32),
@@ -207,6 +208,8 @@ enum Extra {
     Layer(u32),
     /// A chunk's text-through mask.
     Mask(ChunkId, u32),
+    /// A scratch texture what lies below was read into (`read.rs`).
+    Read(u8),
 }
 
 /// A run of instances of one pipeline.
@@ -224,6 +227,9 @@ enum Op {
     Fill(u32),
     /// A data chunk's draws (ADR-0018), by their place in this frame's.
     Data(u32),
+    /// What lies below read back, by its place in this frame's reads
+    /// (`read.rs`): the pass ends and begins again around it.
+    Read(u32),
 }
 
 /// An icon rasterized into a coverage page: the page and the path
@@ -245,6 +251,8 @@ struct Pipelines {
     slug_full: wgpu::RenderPipeline,
     /// The canvas onto the surface.
     blit: wgpu::RenderPipeline,
+    /// What lies below, scaled down and blurred (`read.rs`).
+    read: wgpu::RenderPipeline,
     compute: ComputePipelines,
 }
 
@@ -255,6 +263,7 @@ struct Layouts {
     compute: wgpu::BindGroupLayout,
     slug: wgpu::BindGroupLayout,
     blit: wgpu::BindGroupLayout,
+    read: wgpu::BindGroupLayout,
 }
 
 /// A bind group and the generations of what it holds.
@@ -379,8 +388,12 @@ pub struct GpuRenderer {
     layered: foldhash::HashSet<u32>,
     /// Whether an effect's primitives overlap, by what they were.
     overlaps: foldhash::HashMap<u32, (u64, bool)>,
-    /// This frame's tables for paths and curve text.
+    /// This frame's tables for paths and curve text, and its reads.
     fr: FrameData,
+    /// Where reads of what lies below land (`read.rs`).
+    reads: read::Reads,
+    /// Kept chunks that blur a backdrop: canvas damage then grows around them.
+    blurring: usize,
     pclips: Scratch,
     stops: Scratch,
     slug_instances: Scratch,
@@ -684,6 +697,22 @@ impl GpuRenderer {
                 ],
             ),
             blit: layout("gui canvas", &[texture_entry(0, d2)]),
+            read: layout(
+                "gui read",
+                &[
+                    texture_entry(0, d2),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: true,
+                            min_binding_size: wgpu::BufferSize::new(32),
+                        },
+                        count: None,
+                    },
+                ],
+            ),
         };
         let pipeline_layout = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -697,6 +726,7 @@ impl GpuRenderer {
         let compute_layout = pipeline_layout("gui path passes", &[Some(&layouts.compute)]);
         let slug_layout = pipeline_layout("gui curve text", &[Some(&layouts.slug)]);
         let blit_layout = pipeline_layout("gui canvas", &[Some(&layouts.blit)]);
+        let read_layout = pipeline_layout("gui read", &[Some(&layouts.read)]);
         let common = include_str!("common.wgsl");
         let stops = include_str!("stops.wgsl");
         let quad_module = module(
@@ -726,6 +756,10 @@ impl GpuRenderer {
         let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gui canvas"),
             source: wgpu::ShaderSource::Wgsl(include_str!("blit.wgsl").into()),
+        });
+        let read_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gui read"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("read.wgsl").into()),
         });
         let compute_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("gui path passes"),
@@ -867,6 +901,16 @@ impl GpuRenderer {
                 None,
                 wgpu::PrimitiveTopology::TriangleList,
             ),
+            read: render(
+                "gui read",
+                &read_layout,
+                &read_module,
+                "vs_read",
+                "fs_read",
+                format,
+                None,
+                wgpu::PrimitiveTopology::TriangleList,
+            ),
             compute: ComputePipelines::new(&device, &compute_layout, &compute_module),
         };
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -951,6 +995,8 @@ impl GpuRenderer {
             layered: foldhash::HashSet::default(),
             overlaps: foldhash::HashMap::default(),
             fr: FrameData::default(),
+            reads: read::Reads::new(&device),
+            blurring: 0,
             pclips: Scratch::new(&device, "gui clips", storage_usage, 1 << 12),
             stops: Scratch::new(&device, "gui stops", storage_usage, 1 << 12),
             slug_instances: Scratch::new(&device, "gui curve glyphs", storage_usage, 1 << 12),
@@ -1489,6 +1535,7 @@ impl Renderer for GpuRenderer {
                     .map(|l| l.texture.bytes())
                     .sum::<usize>()
                     .saturating_add(masks)
+                    .saturating_add(self.reads.bytes())
                     .saturating_add(self.canvas.as_ref().map_or(0, |c| {
                         usize::try_from(
                             u64::from(c.size.0)
@@ -1571,12 +1618,22 @@ fn module(
 }
 
 /// Metal, Vulkan and DX12 only (`WGPU_BACKEND` may narrow them): no OpenGL.
+///
+/// One per process, as Chrome's GPU process keeps one: every renderer (each
+/// window, each headless one, a rebuilt one) asks it for its adapter and
+/// device. Drivers make and tear down an instance under process-wide state
+/// (Mesa's lavapipe crashes when several threads do it at once).
 fn instance() -> wgpu::Instance {
-    let ours = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
-    wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().map_or(ours, |b| b & ours),
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    })
+    static INSTANCE: std::sync::OnceLock<wgpu::Instance> = std::sync::OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            let ours = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
+            wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends: wgpu::Backends::from_env().map_or(ours, |b| b & ours),
+                ..wgpu::InstanceDescriptor::new_without_display_handle()
+            })
+        })
+        .clone()
 }
 
 /// A texture `size`, filled with `data` (rows of `size.0` RGBA pixels) when
@@ -1601,8 +1658,10 @@ fn texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
+        // A layer is read back by what draws over it (`read.rs`).
         usage: wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -1628,7 +1687,7 @@ fn texture(
         }],
     });
     Texture {
-        _texture: texture,
+        texture,
         view,
         bind,
         size: (extent.width, extent.height),
@@ -1701,13 +1760,13 @@ fn phys(b: Bounds, s: f32) -> [f32; 4] {
     [b.x * s, b.y * s, b.width * s, b.height * s]
 }
 
-fn radii(r: Corners, s: f32) -> [f32; 4] {
-    [
-        r.top_left.max(0.0) * s,
-        r.top_right.max(0.0) * s,
-        r.bottom_right.max(0.0) * s,
-        r.bottom_left.max(0.0) * s,
-    ]
+/// The radii `r` of box `b` (logical) as used, CSS's overlapping-curves
+/// rule applied (`Shape::used`: none below 0, two on a side never past
+/// it), in physical pixels: what the shaders' coverage assumes, whoever
+/// made the item.
+fn radii(r: Corners, b: Bounds, s: f32) -> [f32; 4] {
+    let r = crate::shape::Shape::Rounded(r).used(b.width, b.height);
+    [r.top_left * s, r.top_right * s, r.bottom_right * s, r.bottom_left * s]
 }
 
 fn rgba(c: Color) -> [f32; 4] {

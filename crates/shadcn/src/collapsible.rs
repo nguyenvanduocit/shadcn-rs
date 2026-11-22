@@ -100,8 +100,8 @@ pub fn collapsible_trigger() -> Part<()> {
 /// `control` (a button, a row) as the trigger (reka's `as-child`): pressing
 /// it opens and closes its collapsible.
 #[must_use]
-pub fn collapsible_trigger_as(control: Div) -> Part<()> {
-    Part::new((), control, |p| {
+pub fn collapsible_trigger_as(control: impl Into<Div>) -> Part<()> {
+    Part::new((), control.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
             let ctx = CollapsibleContext::find();

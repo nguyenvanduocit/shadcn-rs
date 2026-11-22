@@ -80,6 +80,8 @@ pub struct ScrollNode {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ThumbNode {
     pub transform: u32,
+    /// Its opacity: 0 as committed, raised while the user scrolls.
+    pub effect: u32,
     /// The thumb's offset at the top.
     pub top: (f32, f32),
     /// How far it travels from the top to the bottom.

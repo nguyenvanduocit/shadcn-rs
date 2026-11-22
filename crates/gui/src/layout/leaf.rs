@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use taffy::{AvailableSpace, Baselines, Size};
 
-use super::engine::{Measure, MeasureReads, Measured, Worker};
+use super::engine::{InlineBox, Measure, MeasureReads, Measured, Worker};
 use crate::style::{ResolvedText, TextAlign};
-use crate::text::{Paragraph, Run, TextMetrics, TextSystem};
+use crate::text::{InlineSlot, Paragraph, Run, TextMetrics, TextSystem};
 
 /// What a leaf is measured from; equal leaves measure alike, so a leaf that
 /// compares equal to last frame's keeps its cached layout. Made through
@@ -22,6 +22,10 @@ pub enum Leaf {
         content: String,
         text: ResolvedText,
         runs: Vec<Run>,
+        /// The [`crate::text::OBJECT`]s its atomic inlines stand on, in
+        /// order: one to each of the layout node's children, and one to
+        /// each inline that took no space, which stays empty.
+        objects: Vec<Object>,
     },
     Image(ImageMeasure),
     Input {
@@ -35,18 +39,16 @@ impl Leaf {
     /// This leaf with what only paints taken out.
     #[must_use]
     pub fn measuring(self) -> Self {
-        fn shape(t: ResolvedText) -> ResolvedText {
-            ResolvedText {
-                color: crate::color::Color::TRANSPARENT,
-                underline: false,
-                underline_offset: None,
-                line_through: false,
-                ..t
-            }
-        }
+        let shape = ResolvedText::shape;
         match self {
-            Self::Text { content, text, runs } => Self::Text {
+            Self::Text {
                 content,
+                text,
+                runs,
+                objects,
+            } => Self::Text {
+                content,
+                objects,
                 text: shape(text),
                 runs: runs
                     .into_iter()
@@ -70,6 +72,52 @@ impl Leaf {
             image @ Self::Image(_) => image,
         }
     }
+}
+
+/// The place of an atomic inline in a paragraph's content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Object {
+    /// The byte offset of its [`crate::text::OBJECT`].
+    pub at: usize,
+    /// It took space: it is the next of the layout node's children.
+    pub laid: bool,
+}
+
+/// Names a child's box in a paragraph's lines: the child's index; an
+/// inline that took no space has this bit set over its place among them.
+const EMPTY_OBJECT: u64 = 1 << 62;
+
+/// The boxes of `objects` in their paragraph, `boxes` (one to a child) the
+/// children's, each named by its child's index.
+#[must_use]
+pub fn slots(objects: &[Object], boxes: &[InlineBox]) -> Vec<InlineSlot> {
+    let mut child = 0_usize;
+    objects
+        .iter()
+        .enumerate()
+        .map(|(j, o)| {
+            if o.laid {
+                let b = boxes.get(child).copied().unwrap_or_default();
+                let id = u64::try_from(child).unwrap_or(0);
+                child = child.saturating_add(1);
+                InlineSlot {
+                    at: o.at,
+                    width: b.width,
+                    height: b.height,
+                    baseline: b.baseline,
+                    id,
+                }
+            } else {
+                InlineSlot {
+                    at: o.at,
+                    width: 0.0,
+                    height: 0.0,
+                    baseline: None,
+                    id: EMPTY_OBJECT | u64::try_from(j).unwrap_or(0),
+                }
+            }
+        })
+        .collect()
 }
 
 /// What an image's box is sized from: its natural size, and which of its
@@ -155,10 +203,34 @@ impl Measure for Leaf {
         matches!(self, Self::Image(_))
     }
 
+    fn place_inline(&self, text: &mut TextSystem, width: f32, boxes: &[InlineBox]) -> Vec<taffy::Point<f32>> {
+        self.placed(text, width, boxes)
+    }
+
     fn measure(&self, text: &mut TextSystem, known: Size<Option<f32>>, available: Size<AvailableSpace>) -> Measured {
+        self.measure_inline(text, known, available, &[])
+    }
+
+    fn measure_inline(
+        &self,
+        text: &mut TextSystem,
+        known: Size<Option<f32>>,
+        available: Size<AvailableSpace>,
+        boxes: &[InlineBox],
+    ) -> Measured {
         match self {
-            Self::Text { content, text: t, runs } => {
-                let p = Paragraph::new(content, runs);
+            Self::Text {
+                content,
+                text: t,
+                runs,
+                objects,
+            } => {
+                let boxes = slots(objects, boxes);
+                let p = Paragraph {
+                    content,
+                    runs,
+                    boxes: &boxes,
+                };
                 // The min-content width is the widest piece no line breaks.
                 let width = match (known.width, available.width) {
                     (Some(w), _) | (None, AvailableSpace::Definite(w)) => Some(w),
@@ -209,6 +281,34 @@ impl Measure for Leaf {
                 }
             }
         }
+    }
+}
+
+impl Leaf {
+    /// Where a paragraph's children sit in a content box `width` wide.
+    fn placed(&self, text: &mut TextSystem, width: f32, boxes: &[InlineBox]) -> Vec<taffy::Point<f32>> {
+        let mut at = vec![taffy::Point::ZERO; boxes.len()];
+        let Self::Text {
+            content,
+            text: t,
+            runs,
+            objects,
+        } = self
+        else {
+            return at;
+        };
+        let slots = slots(objects, boxes);
+        let p = Paragraph {
+            content,
+            runs,
+            boxes: &slots,
+        };
+        for (id, b) in text.inline_boxes(p, t, wrap_width(t, width)) {
+            if let Some(place) = usize::try_from(id).ok().and_then(|i| at.get_mut(i)) {
+                *place = taffy::Point { x: b.x, y: b.y };
+            }
+        }
+        at
     }
 }
 

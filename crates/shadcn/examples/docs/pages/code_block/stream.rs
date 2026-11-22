@@ -140,14 +140,21 @@ impl Streaming {
             }
         }
         let me = self.clone();
-        div().flex_col().w_full().max_w(112.0).gap(4.0).children(blocks).child(
-            button(ButtonVariant::Outline, ButtonSize::Sm)
-                .self_start()
-                .disabled(length < total())
-                .child(icon(Icon::RotateCcw))
-                .child("Replay")
-                .on_click(move |_| me.replay()),
-        )
+        div()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .gap(16.0)
+            .children(blocks)
+            .child(
+                button(ButtonVariant::Outline, ButtonSize::Sm)
+                    .align_self(Align::Start)
+                    .disabled(length < total())
+                    .child(icon(Icon::RotateCcw))
+                    .child("Replay")
+                    .on_click(move |_| me.replay()),
+            )
     }
 }
 
@@ -260,13 +267,15 @@ impl MarkdownChat {
         let busy = self.script.busy();
         let me = self.clone();
         div()
-            .flex_col()
-            .min_h(112.0)
-            .w_full()
-            .max_w(112.0)
-            .gap(4.0)
-            .py(6.0)
-            .text_sm()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .min_height(448.0)
+            .width(pct(100.0))
+            .max_width(448.0)
+            .gap(16.0)
+            .padding_y(24.0)
+            .text_size(14.0)
+            .line_height(20.0)
             .child(user_turn(QUESTION))
             .child(self.answer.get().map(|answer| {
                 let p = MessageProps::default();
@@ -319,18 +328,20 @@ fn typeset(source: &str, streaming: bool) -> Div {
     if !runs.is_empty() {
         blocks.push(text("").spans(runs).into_element());
     }
-    let gap = FLOW * SIZE / gui::styled::UNIT;
+    let gap = FLOW * SIZE;
     div()
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
-        .text_size(SIZE, SIZE * LEADING)
+        .display(Display::Flex)
+        .flex_direction(FlexDirection::Column)
+        .width(pct(100.0))
+        .min_width(0.0)
+        .text_size(SIZE)
+        .line_height(SIZE * LEADING)
         .text_color(theme().foreground)
         .children(
             blocks
                 .into_iter()
                 .enumerate()
-                .map(|(i, b)| div().min_w(0.0).when(i > 0, |d| d.mt(gap)).child(b)),
+                .map(|(i, b)| div().min_width(0.0).when(i > 0, |d| d.margin_top(gap)).child(b)),
         )
 }
 
@@ -338,12 +349,13 @@ fn typeset(source: &str, streaming: bool) -> Div {
 fn inline_code(code: &str) -> Span {
     let em = 0.9 * SIZE;
     span(code.to_owned())
-        .font_mono()
-        .text_size(em, em * LEADING)
-        .bg(theme().muted)
-        .rounded_sm()
-        .px(1.0)
-        .py(0.5)
+        .font_family(FontFamily::GEIST_MONO)
+        .text_size(em)
+        .line_height(em * LEADING)
+        .background(theme().muted)
+        .radius(6.0)
+        .padding_x(4.0)
+        .padding_y(2.0)
 }
 
 /// The demo's `MarkdownCodeBlock`: the language as its title, a copy button

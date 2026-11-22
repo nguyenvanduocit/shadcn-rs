@@ -1,0 +1,52 @@
+//! Tabler Icons, outline (@tabler/icons 3.52.0, MIT).
+
+library! {
+    "tabler";
+    glyphs {
+        CHECK => "check",
+        X => "x",
+        CHEVRON_DOWN => "chevron-down",
+        CHEVRON_UP => "chevron-up",
+        CHEVRON_LEFT => "chevron-left",
+        CHEVRON_RIGHT => "chevron-right",
+        CHEVRONS_LEFT => "chevrons-left",
+        CHEVRONS_RIGHT => "chevrons-right",
+        SELECTOR => "selector",
+        CIRCLE_CHECK => "circle-check",
+        INFO_CIRCLE => "info-circle",
+        ALERT_TRIANGLE => "alert-triangle",
+        OCTAGON_OFF => "octagon-off",
+        LOADER_2 => "loader-2",
+        CIRCLE => "circle",
+        COPY => "copy",
+        MINUS => "minus",
+        PLUS => "plus",
+        SEARCH => "search",
+        DOTS => "dots",
+        LAYOUT_SIDEBAR => "layout-sidebar",
+    }
+    roles {
+        Check => CHECK,
+        Close => X,
+        ChevronDown => CHEVRON_DOWN,
+        ChevronUp => CHEVRON_UP,
+        ChevronLeft => CHEVRON_LEFT,
+        ChevronRight => CHEVRON_RIGHT,
+        ChevronsLeft => CHEVRONS_LEFT,
+        ChevronsRight => CHEVRONS_RIGHT,
+        Selector => SELECTOR,
+        Success => CIRCLE_CHECK,
+        Info => INFO_CIRCLE,
+        Warning => ALERT_TRIANGLE,
+        Error => OCTAGON_OFF,
+        Loading => LOADER_2,
+        Circle => CIRCLE,
+        Copy => COPY,
+        Minus => MINUS,
+        Plus => PLUS,
+        Search => SEARCH,
+        More => DOTS,
+        Sidebar => LAYOUT_SIDEBAR,
+        ArrowDown => super::ARROW_DOWN,
+    }
+}

@@ -1,5 +1,6 @@
 use gui::prelude::*;
 use gui::{Div, Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text, text_bound};
+use shadcn::focus::StateLook;
 use shadcn::{
     navigation_menu, navigation_menu_content, navigation_menu_item, navigation_menu_link, navigation_menu_list,
     navigation_menu_trigger, navigation_menu_trigger_style, theme,
@@ -39,52 +40,78 @@ pub fn render() -> Render {
         // `NavigationMenuItem.vue`, the demo's list item.
         let list_item = |title: &'static str, body: &'static str| {
             navigation_menu_link(false, go(title))
-                .child(text(title).text_sm().leading_none().font_medium())
+                .child(
+                    text(title)
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .line_height(LineHeight::Relative(1.0))
+                        .font_weight(500),
+                )
                 .child(
                     text(body)
                         .text_color(t.muted_foreground)
                         .line_clamp(2)
-                        .text_sm()
-                        .leading_snug(),
+                        .text_size(14.0)
+                        .line_height(20.0)
+                        .line_height(LineHeight::Relative(1.375)),
                 )
         };
         let titled = |title: &'static str, body: &'static str| {
             navigation_menu_link(false, go(title))
-                .child(text(title).font_medium())
+                .child(text(title).font_weight(500))
                 .child(text(body).text_color(t.muted_foreground))
         };
         let plain = |label: &'static str| navigation_menu_link(false, go(label)).child(label);
         let with_icon = |glyph: Icon, label: &'static str| {
             navigation_menu_link(false, go(label))
-                .flex_row()
-                .items_center()
-                .gap(2.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Row)
+                .align_items(Align::Center)
+                .gap(8.0)
                 .child(icon(glyph).text_color(t.muted_foreground))
                 .child(label)
         };
-        let stack = |width: f32, links: Vec<Div>| div().grid().w_px(width).gap(4.0).child(div().children(links));
+        let stack = |width: f32, links: Vec<Div>| {
+            div()
+                .display(Display::Grid)
+                .width(width)
+                .gap(16.0)
+                .child(div().children(links))
+        };
 
         // `bg-linear-to-b from-muted/50 to-muted`: gui paints no gradients, so the end colour fills it.
         let hero = navigation_menu_link(false, go("shadcn/ui"))
-            .row_span(3)
-            .h_full()
-            .w_full()
-            .justify_end()
-            .rounded_md()
-            .bg(t.muted)
-            .p(6.0)
-            .child(text("shadcn/ui").mt(4.0).mb(2.0).text_lg().font_medium())
+            .grid_row_span(3)
+            .height(pct(100.0))
+            .width(pct(100.0))
+            .justify_content(Justify::End)
+            .radius(8.0)
+            .with_interaction(|d, i| {
+                // Over the link's rest: its hover and focus fill stay over it.
+                d.background(t.muted)
+                    .background_while(move || i.hovered() || i.focused(), t.accent)
+            })
+            .padding(24.0)
+            .child(
+                text("shadcn/ui")
+                    .margin_top(16.0)
+                    .margin_bottom(8.0)
+                    .text_size(18.0)
+                    .line_height(28.0)
+                    .font_weight(500),
+            )
             .child(
                 text("Beautifully designed components built with Tailwind CSS.")
                     .text_color(t.muted_foreground)
-                    .text_sm()
-                    .leading_tight(),
+                    .text_size(14.0)
+                    .line_height(20.0)
+                    .line_height(LineHeight::Relative(1.25)),
             );
         let home = navigation_menu_content().child(
             div()
-                .grid()
-                .gap(2.0)
-                .w_px(400.0)
+                .display(Display::Grid)
+                .gap(8.0)
+                .width(400.0)
                 .child(hero)
                 .child(list_item(
                     "Introduction",
@@ -98,10 +125,10 @@ pub fn render() -> Render {
         );
         let components = navigation_menu_content().child(
             div()
-                .grid()
-                .w_px(500.0)
-                .gap(2.0)
-                .grid_cols(2)
+                .display(Display::Grid)
+                .width(500.0)
+                .gap(8.0)
+                .grid_columns(Tracks::repeat(2, Track::Fr(1.0)))
                 .children(COMPONENTS.map(|(title, body)| list_item(title, body))),
         );
         let list = navigation_menu_content().child(stack(
@@ -146,12 +173,14 @@ pub fn render() -> Render {
         page(
             "Navigation Menu",
             div()
-                .flex_col()
-                .gap(6.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(24.0)
                 .child(demo("NavigationMenuDemo.vue", menu))
                 .child(
                     text_bound(move || format!("Visited: {}.", visited.get()))
-                        .text_sm()
+                        .text_size(14.0)
+                        .line_height(20.0)
                         .text_color(t.muted_foreground),
                 ),
         )

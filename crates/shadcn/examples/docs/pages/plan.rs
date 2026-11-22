@@ -149,9 +149,10 @@ fn plan_description(open: &Signal<bool>) -> Div {
         };
         line(status, icon(glyph), step)
     });
-    trace().max_w(96.0).child(fold(open, head, |c| {
-        c.flex_col()
-            .gap(3.0)
+    trace().max_width(384.0).child(fold(open, head, |c| {
+        c.display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(12.0)
             .child(text(
                 "Store the theme in a cookie so the server renders the right one and the page does not flash on load.",
             ))
@@ -308,7 +309,7 @@ impl Described {
         };
         let [pending, completed] = &self.sections;
         trace()
-            .max_w(96.0)
+            .max_width(384.0)
             .child(section(false, Icon::ListTodo, pending))
             .child(section(true, Icon::ListChecks, completed))
     }
@@ -457,8 +458,9 @@ pub fn render() -> Render {
         page(
             "Plan",
             div()
-                .flex_col()
-                .gap(10.0)
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .gap(40.0)
                 .child(demo("PlanDemo.vue", plan.view()))
                 .child(demo("PlanDescriptionDemo.vue", plan_description(&described_plan)))
                 .child(demo("QueueDemo.vue", queue.view()))

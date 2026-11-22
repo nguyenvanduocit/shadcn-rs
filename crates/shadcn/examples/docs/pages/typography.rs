@@ -23,52 +23,67 @@ const TREASURY: [[&str; 2]; 4] = [
 
 /// `text-4xl font-extrabold tracking-tight text-balance`.
 fn h1(title: &str) -> Text {
-    text(title).text_4xl().font_extrabold().tracking_tight().text_balance()
+    text(title)
+        .text_size(36.0)
+        .line_height(40.0)
+        .font_weight(800)
+        .tracking(-0.025)
+        .text_wrap(WrapStyle::Balance)
 }
 
 /// `border-b pb-2 text-3xl font-semibold tracking-tight`.
 fn h2(title: &str) -> Div {
     div()
-        .border_b()
+        .border_bottom(1.0)
         .border_color(theme().border)
-        .pb(2.0)
-        .child(text(title).text_3xl().font_semibold().tracking_tight())
+        .padding_bottom(8.0)
+        .child(
+            text(title)
+                .text_size(30.0)
+                .line_height(36.0)
+                .font_weight(600)
+                .tracking(-0.025),
+        )
 }
 
 /// `text-2xl font-semibold tracking-tight`.
 fn h3(title: &str) -> Text {
-    text(title).text_2xl().font_semibold().tracking_tight()
+    text(title)
+        .text_size(24.0)
+        .line_height(32.0)
+        .font_weight(600)
+        .tracking(-0.025)
 }
 
 /// `leading-7 [&:not(:first-child)]:mt-6`, after a first child.
 fn p(content: &str) -> Text {
-    text(content).leading_px(28.0).mt(6.0)
+    text(content).line_height(28.0).margin_top(24.0)
 }
 
 /// `mt-6 border-l-2 pl-6 italic`.
 fn blockquote() -> Div {
     div()
-        .mt(6.0)
-        .border_l_w(2.0)
+        .margin_top(24.0)
+        .border_left(2.0)
         .border_color(theme().border)
-        .pl(6.0)
-        .child(text(QUOTE).italic())
+        .padding_left(24.0)
+        .child(text(QUOTE).italic(true))
 }
 
 /// `my-6 ml-6 list-disc [&>li]:mt-2`: each item's disc hangs outside it,
 /// Chrome's `::marker` ("• ") ending 6px before the item starts (measured).
 fn list() -> Div {
-    div().my(6.0).ml(6.0).children(LEVELS.map(|item| {
+    div().margin_y(24.0).margin_left(24.0).children(LEVELS.map(|item| {
         div()
-            .relative()
-            .mt(2.0)
+            .position(Position::Relative)
+            .margin_top(8.0)
             .child(
                 text("\u{2022} ")
-                    .absolute()
+                    .position(Position::Absolute)
                     .top(0.0)
-                    .right_len(gui::relative(1.0))
-                    .mr(1.5)
-                    .whitespace_nowrap(),
+                    .right(gui::Length::Fraction(1.0))
+                    .margin_right(6.0)
+                    .nowrap(true),
             )
             .child(text(item))
     }))
@@ -85,22 +100,22 @@ fn table() -> Div {
     let cells = TREASURY.iter().enumerate().flat_map(|(row, cells)| {
         cells.map(|cell| {
             div()
-                .border_r()
-                .border_b()
+                .border_right(1.0)
+                .border_bottom(1.0)
                 .border_color(t.border)
-                .px(4.0)
-                .py(2.0)
-                .when(row > 0 && row % 2 == 0, |d| d.bg(t.muted))
-                .child(text(cell).when(row == 0, Styled::font_bold))
+                .padding_x(16.0)
+                .padding_y(8.0)
+                .when(row > 0 && row % 2 == 0, |d| d.background(t.muted))
+                .child(text(cell).when(row == 0, |e| e.font_weight(700)))
         })
     });
-    div().my(6.0).w_full().child(
+    div().margin_y(24.0).width(pct(100.0)).child(
         div()
-            .grid()
-            .grid_cols_tracks(vec![Track::Fr(352.0), Track::Fr(415.0)])
-            .w_full()
-            .border_t()
-            .border_l()
+            .display(Display::Grid)
+            .grid_columns(vec![Track::Fr(352.0), Track::Fr(415.0)])
+            .width(pct(100.0))
+            .border_top(1.0)
+            .border_left(1.0)
             .border_color(t.border)
             .children(cells),
     )
@@ -112,32 +127,32 @@ pub fn render() -> Render {
         let t = theme();
         let follow = followed;
         let plan = text("The king thought long and hard, and finally came up with ")
-            .leading_px(28.0)
-            .mt(6.0)
+            .line_height(28.0)
+            .margin_top(24.0)
             .span(
                 span("a brilliant plan")
                     .text_color(t.primary)
-                    .font_medium()
-                    .underline()
+                    .font_weight(500)
+                    .underline(true)
                     .underline_offset(4.0)
-                    .cursor_pointer()
+                    .cursor(Cursor::Pointer)
                     .on_click(move |_| follow.update(|n| *n = n.saturating_add(1))),
             )
             .span(": he would tax the jokes in the kingdom.");
         let story = div()
             .child(h1("Taxing Laughter: The Joke Tax Chronicles"))
-            .child(text(LEAD).text_color(t.muted_foreground).text_xl().leading_px(28.0).mt(6.0))
-            .child(h2("The King's Plan").mt(10.0))
+            .child(text(LEAD).text_color(t.muted_foreground).text_size(20.0).line_height(28.0).line_height(28.0).margin_top(24.0))
+            .child(h2("The King's Plan").margin_top(40.0))
             .child(plan)
             .child(blockquote())
-            .child(h3("The Joke Tax").mt(8.0))
+            .child(h3("The Joke Tax").margin_top(32.0))
             .child(p("The king's subjects were not amused. They grumbled and complained, but the king was firm:"))
             .child(list())
             .child(p("As a result, people stopped telling jokes, and the kingdom fell into a gloom. But there was one person who refused to let the king's foolishness get him down: a court jester named Jokester."))
-            .child(h3("Jokester's Revolt").mt(8.0))
+            .child(h3("Jokester's Revolt").margin_top(32.0))
             .child(p("Jokester began sneaking into the castle in the middle of the night and leaving jokes all over the place: under the king's pillow, in his soup, even in the royal toilet. The king was furious, but he couldn't seem to stop Jokester."))
             .child(p("And then, one day, the people of the kingdom discovered that the jokes left by Jokester were so funny that they couldn't help but laugh. And once they started laughing, they couldn't stop."))
-            .child(h3("The People's Rebellion").mt(8.0))
+            .child(h3("The People's Rebellion").margin_top(32.0))
             .child(p("The people of the kingdom, feeling uplifted by the laughter, started to tell jokes and puns again, and soon the entire kingdom was in on the joke."))
             .child(table())
             .child(p("The king, seeing how much happier his subjects were, realized the error of his ways and repealed the joke tax. Jokester was declared a hero, and the kingdom lived happily ever after."))
@@ -145,56 +160,56 @@ pub fn render() -> Render {
         page(
             "Typography",
             div()
-                .flex_col()
-                .gap(8.0)
-                .child(demo("TypographyDemo.vue", div().w_full().child(story)))
+                .display(Display::Flex).flex_direction(FlexDirection::Column)
+                .gap(32.0)
+                .child(demo("TypographyDemo.vue", div().width(pct(100.0)).child(story)))
                 .child(demo(
                     "TypographyH1.vue",
-                    h1("Taxing Laughter: The Joke Tax Chronicles").text_center(),
+                    h1("Taxing Laughter: The Joke Tax Chronicles").text_align(TextAlign::Center),
                 ))
                 .child(demo("TypographyH2.vue", h2("The People of the Kingdom")))
                 .child(demo("TypographyH3.vue", h3("The Joke Tax")))
                 .child(demo(
                     "TypographyH4.vue",
-                    text("People stopped telling jokes").text_xl().font_semibold().tracking_tight(),
+                    text("People stopped telling jokes").text_size(20.0).line_height(28.0).font_weight(600).tracking(-0.025),
                 ))
                 .child(demo(
                     "TypographyP.vue",
                     text("The king, seeing how much happier his subjects were, realized the error of his ways and repealed the joke tax.")
-                        .leading_px(28.0),
+                        .line_height(28.0),
                 ))
                 .child(demo("TypographyBlockquote.vue", blockquote()))
                 .child(demo("TypographyList.vue", list()))
                 .child(demo(
                     "TypographyInlineCode.vue",
                     div()
-                        .relative()
-                        .rounded(4.0)
-                        .bg(t.muted)
-                        .px(1.2)
-                        .py(0.8)
-                        .font_mono()
-                        .text_sm()
-                        .font_semibold()
+                        .position(Position::Relative)
+                        .radius(4.0)
+                        .background(t.muted)
+                        .padding_x(4.8)
+                        .padding_y(3.2)
+                        .font_family(FontFamily::GEIST_MONO)
+                        .text_size(14.0).line_height(20.0)
+                        .font_weight(600)
                         .child(text("reka-ui")),
                 ))
                 .child(demo(
                     "TypographyLead.vue",
                     text("A modal dialog that interrupts the user with important content and expects a response.")
-                        .text_xl()
+                        .text_size(20.0).line_height(28.0)
                         .text_color(t.muted_foreground),
                 ))
                 .child(demo(
                     "TypographyLarge.vue",
-                    text("Are you absolutely sure?").text_lg().font_semibold(),
+                    text("Are you absolutely sure?").text_size(18.0).line_height(28.0).font_weight(600),
                 ))
                 .child(demo(
                     "TypographySmall.vue",
-                    text("Email address").text_sm().font_medium().leading_none(),
+                    text("Email address").text_size(14.0).line_height(20.0).font_weight(500).line_height(LineHeight::Relative(1.0)),
                 ))
                 .child(demo(
                     "TypographyMuted.vue",
-                    text("Enter your email address.").text_sm().text_color(t.muted_foreground),
+                    text("Enter your email address.").text_size(14.0).line_height(20.0).text_color(t.muted_foreground),
                 ))
                 .child(demo("TypographyTable.vue", table())),
         )
