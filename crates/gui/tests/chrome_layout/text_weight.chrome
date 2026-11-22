@@ -1,0 +1,9 @@
+# Chrome's boxes for text_weight.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 120
+  p 0 0 121.0625 24
+  p 0 24 144.078125 24
+  p 0 48 149.5625 24
+  p 0 72 161.296875 24
+  p 0 96 125.1875 24

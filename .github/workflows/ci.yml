@@ -8,15 +8,29 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # The runner has no GPU: headless frames are painted by the CPU renderer.
     env:
-      GUI_RENDERER: cpu
+      # The adapter test fails unless lavapipe blends dual-source, so LCD text
+      # is tested on it (ADR-0023); without it, LCD goldens move to Windows.
+      GUI_REQUIRE_DUAL_SOURCE: "1"
     steps:
       - uses: actions/checkout@v7
+      # The runner has no GPU: Mesa's lavapipe is a Vulkan device wgpu
+      # paints the tests' frames on, through the same renderer as a GPU.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers libvulkan1
       # Installs the compiler rust-toolchain.toml pins.
       - run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # What the GPU can do, printed: compute and dual-source blending (ADR-0016, ADR-0019).
+      - run: cargo test -p gui --test adapter --locked -- --nocapture
       - run: cargo test --workspace --locked
+      # Allocation budgets per scene and frame on the UI thread (ADR-0023): a
+      # scene over its budget fails the run. Release: the scenes are large.
+      - run: cargo run --release --locked -p shadcn --example stress -- --run --cycles=0 --monkey=0
+      # Retired instructions beside time (ADR-0023): the same build benched
+      # twice must agree, by instructions where the VM exposes the counters
+      # (perf_event_paranoid lowered for it), else by time.
+      - run: sudo sysctl -w kernel.perf_event_paranoid=1
+      - run: crates/shadcn/bench.sh --frames=10 button card dialog table && crates/shadcn/bench.sh --frames=10 button card dialog table
       - uses: EmbarkStudios/cargo-deny-action@v2

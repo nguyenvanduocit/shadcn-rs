@@ -8,12 +8,16 @@
 //! the errors last found; [`Checks`] says which events check it, which is all
 //! those libraries differ in. [`form_submit`] checks every field as a submit
 //! does.
+//!
+//! A field holds its value where its control is bound to it (a
+//! [`TextField`] an input edits, a `Signal` a checkbox or select is bound to
+//! with `.model(…)`), so a reset writes the one value the control shows.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 
 use gui::element::Node;
-use gui::{Div, Effect, Fluent, FocusHandle, Signal, Styled, TextField, div, text};
+use gui::{Div, Fluent, FocusHandle, Signal, Styled, TextField, div, text, watch};
 
 use crate::focus::destructive_ring;
 use crate::label::label;
@@ -41,8 +45,9 @@ pub struct Checks {
     pub on_change: OnChange,
 }
 
-/// A control's state a [`FormField`] reads, watches and resets.
-pub trait FormValue: Clone + 'static {
+/// A control's state a [`FormField`] reads, watches and resets: a `Copy`
+/// handle the control is bound to.
+pub trait FormValue: Copy + 'static {
     type Value: Clone + PartialEq + 'static;
     /// The value now; reading it subscribes the reader.
     fn value(&self) -> Self::Value;
@@ -57,7 +62,7 @@ pub trait FormValue: Clone + 'static {
 impl FormValue for TextField {
     type Value = String;
     fn value(&self) -> String {
-        self.text()
+        self.edit.with(|e| e.text.clone())
     }
     fn set_value(&self, value: String) {
         self.set_text(value);
@@ -82,40 +87,48 @@ impl<T: Clone + PartialEq + 'static> FormValue for Signal<T> {
 /// A control whose form gives it no initial value (`useForm` without
 /// `initialValues`): its value is `None`, which zod reads as missing
 /// ("Required"), until the user first changes it.
-#[derive(Clone)]
 pub struct Unset<C: FormValue> {
     control: C,
     /// What the control shows while there is no value.
-    blank: C::Value,
+    blank: Signal<C::Value>,
     entered: Signal<bool>,
-    _watch: Rc<Effect>,
 }
 
+impl<C: FormValue> Clone for Unset<C> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<C: FormValue> Copy for Unset<C> {}
+
 impl<C: FormValue> Unset<C> {
+    /// `control` unset, until its value first changes; made in the
+    /// caller's setup, whose scope its watcher lives in.
     #[must_use]
     pub fn new(control: C) -> Self {
         let blank = control.value();
         let entered = Signal::new(false);
-        let watch = {
-            let (control, entered, blank) = (control.clone(), entered.clone(), blank.clone());
-            Effect::new(move || {
-                if control.value() != blank {
+        let left = blank.clone();
+        watch(
+            move || control.value(),
+            move |value, _| {
+                if *value != left {
                     entered.set(true);
                 }
-            })
-        };
+            },
+        );
         Self {
             control,
-            blank,
+            blank: Signal::new(blank),
             entered,
-            _watch: Rc::new(watch),
         }
     }
 
     /// The control's own state, to bind the control to.
     #[must_use]
-    pub fn control(&self) -> &C {
-        &self.control
+    pub fn control(&self) -> C {
+        self.control
     }
 }
 
@@ -128,8 +141,8 @@ impl<C: FormValue> FormValue for Unset<C> {
     }
 
     fn set_value(&self, value: Option<C::Value>) {
-        self.control
-            .set_value(value.clone().unwrap_or_else(|| self.blank.clone()));
+        let shown = value.clone().unwrap_or_else(|| self.blank.get_untracked());
+        self.control.set_value(shown);
         self.entered.set(value.is_some());
     }
 
@@ -142,33 +155,27 @@ impl<C: FormValue> FormValue for Unset<C> {
 type Rule<V> = Rc<dyn Fn(&V) -> Vec<String>>;
 
 /// One field of a form: its control's state, the rule it is checked by and
-/// the errors the last check found. Create it once, outside the render
-/// closure; it watches its control for the events its [`Checks`] name.
+/// the errors the last check found (vee-validate's `useField`): a `Copy`
+/// handle, made in the caller's setup, whose scope its watcher lives in.
+/// It watches its control for the events its [`Checks`] name.
 pub struct FormField<C: FormValue> {
     control: C,
-    initial: C::Value,
-    rule: Rule<C::Value>,
+    initial: Signal<C::Value>,
+    rule: Signal<Rule<C::Value>>,
     errors: Signal<Vec<String>>,
     /// Whether it was checked since the form was made or reset.
-    checked: Rc<Cell<bool>>,
+    checked: Signal<bool>,
     /// The value the watcher last saw, so a reset is no change.
-    seen: Rc<RefCell<C::Value>>,
-    _watch: Rc<Effect>,
+    seen: Signal<C::Value>,
 }
 
 impl<C: FormValue> Clone for FormField<C> {
     fn clone(&self) -> Self {
-        Self {
-            control: self.control.clone(),
-            initial: self.initial.clone(),
-            rule: Rc::clone(&self.rule),
-            errors: self.errors.clone(),
-            checked: Rc::clone(&self.checked),
-            seen: Rc::clone(&self.seen),
-            _watch: Rc::clone(&self._watch),
-        }
+        *self
     }
 }
+
+impl<C: FormValue> Copy for FormField<C> {}
 
 impl<C: FormValue> FormField<C> {
     /// A field of `control`, checked by `rule` (every message that fails,
@@ -177,62 +184,63 @@ impl<C: FormValue> FormField<C> {
     pub fn new(control: C, checks: Checks, rule: impl Fn(&C::Value) -> Vec<String> + 'static) -> Self {
         let initial = control.value();
         let rule: Rule<C::Value> = Rc::new(rule);
-        let errors = Signal::labeled("form field errors", Vec::new());
-        let checked = Rc::new(Cell::new(false));
-        let seen = Rc::new(RefCell::new(initial.clone()));
-        let was_focused = Cell::new(false);
-        let watch = {
-            let (control, rule, errors, checked, seen) = (
-                control.clone(),
-                Rc::clone(&rule),
-                errors.clone(),
-                Rc::clone(&checked),
-                Rc::clone(&seen),
-            );
-            Effect::new(move || {
-                let value = control.value();
-                let focused = control.focus().is_some_and(FocusHandle::is_focused);
-                let blurred = was_focused.replace(focused) && !focused;
-                let changed = *seen.borrow() != value;
-                if changed {
-                    seen.replace(value.clone());
+        let field = Self {
+            control,
+            initial: Signal::new(initial.clone()),
+            rule: Signal::new(rule),
+            errors: Signal::labeled("form field errors", Vec::new()),
+            checked: Signal::new(false),
+            seen: Signal::new(initial),
+        };
+        watch(
+            move || control.value(),
+            move |value, _| {
+                if field.seen.with_untracked(|seen| seen == value) {
+                    return;
                 }
-                let check = |errors: &Signal<Vec<String>>| {
-                    checked.set(true);
-                    errors.set(rule(&value));
-                };
-                if changed {
-                    match checks.on_change {
-                        OnChange::Keep => {}
-                        OnChange::Clear => errors.set(Vec::new()),
-                        OnChange::Recheck => {
-                            if checked.get() {
-                                check(&errors);
-                            }
+                field.seen.set(value.clone());
+                match checks.on_change {
+                    OnChange::Keep => {}
+                    OnChange::Clear => field.errors.set(Vec::new()),
+                    OnChange::Recheck => {
+                        if field.checked.get_untracked() {
+                            field.check_value(value);
                         }
-                        OnChange::Check => check(&errors),
+                    }
+                    OnChange::Check => {
+                        field.check_value(value);
                     }
                 }
-                if blurred && checks.on_blur {
-                    check(&errors);
-                }
-            })
-        };
-        Self {
-            control,
-            initial,
-            rule,
-            errors,
-            checked,
-            seen,
-            _watch: Rc::new(watch),
+            },
+        );
+        if checks.on_blur
+            && let Some(focus) = control.focus()
+        {
+            let was = Cell::new(false);
+            watch(
+                move || focus.is_focused(),
+                move |focused, _| {
+                    if was.replace(*focused) && !*focused {
+                        field.check();
+                    }
+                },
+            );
         }
+        field
+    }
+
+    fn check_value(&self, value: &C::Value) -> bool {
+        let found = self.rule.with_untracked(|rule| rule(value));
+        let valid = found.is_empty();
+        self.checked.set(true);
+        self.errors.set(found);
+        valid
     }
 
     /// The control's state, to bind the control to.
     #[must_use]
-    pub fn control(&self) -> &C {
-        &self.control
+    pub fn control(&self) -> C {
+        self.control
     }
 
     /// The errors the last check found (reactive).
@@ -245,14 +253,15 @@ impl<C: FormValue> FormField<C> {
     /// vee-validate's `meta.valid`, which lets a form move on.
     #[must_use]
     pub fn valid(&self) -> bool {
-        (self.rule)(&self.control.value()).is_empty()
+        let value = self.control.value();
+        self.rule.with_untracked(|rule| rule(&value)).is_empty()
     }
 
     /// Whether the last check found an error (reactive): the field's
     /// `data-invalid` and its control's `aria-invalid`.
     #[must_use]
     pub fn invalid(&self) -> bool {
-        !self.errors.get().is_empty()
+        self.errors.with(|e| !e.is_empty())
     }
 }
 
@@ -266,16 +275,14 @@ pub trait FormEntry {
 
 impl<C: FormValue> FormEntry for FormField<C> {
     fn check(&self) -> bool {
-        let found = (self.rule)(&self.control.value());
-        let valid = found.is_empty();
-        self.checked.set(true);
-        self.errors.set(found);
-        valid
+        let value = gui::untracked(|| self.control.value());
+        self.check_value(&value)
     }
 
     fn reset(&self) {
-        self.seen.replace(self.initial.clone());
-        self.control.set_value(self.initial.clone());
+        let initial = self.initial.get_untracked();
+        self.seen.set(initial.clone());
+        self.control.set_value(initial);
         self.checked.set(false);
         self.errors.set(Vec::new());
     }
@@ -309,16 +316,45 @@ pub fn form_label(name: impl Into<String>, invalid: bool) -> Div {
         .when(invalid, |d| d.text_color(t.destructive))
 }
 
-/// `control` (an input, a textarea, a select trigger) marked `invalid` as
-/// `aria-invalid` marks it: a destructive border, and a destructive ring
-/// while focused.
+/// A control a form marks `invalid` (`FormControl`'s `aria-invalid`).
+pub trait FormControl: Sized {
+    /// Marked as `aria-invalid` marks it: a destructive border, and a
+    /// destructive ring while focused.
+    #[must_use]
+    fn invalid(self, invalid: bool) -> Self;
+}
+
+impl<K> FormControl for Node<K> {
+    fn invalid(self, invalid: bool) -> Self {
+        let t = theme();
+        self.when(invalid, |c| {
+            c.border_color(t.destructive)
+                .focus_visible(move |s| destructive_ring(s, &t).border_color(t.destructive))
+        })
+    }
+}
+
+impl FormControl for crate::input::Input {
+    fn invalid(self, invalid: bool) -> Self {
+        self.when(invalid, |c| c.map(move |el| el.invalid(true)))
+    }
+}
+
+impl FormControl for crate::checkbox::Checkbox {
+    fn invalid(self, invalid: bool) -> Self {
+        if invalid {
+            self.class(|el| el.invalid(true))
+        } else {
+            self
+        }
+    }
+}
+
+/// `control` (an input, a textarea, a select trigger, a checkbox) marked
+/// `invalid` as `aria-invalid` marks it.
 #[must_use]
-pub fn form_control<K>(control: Node<K>, invalid: bool) -> Node<K> {
-    let t = theme();
-    control.when(invalid, |c| {
-        c.border_color(t.destructive)
-            .focus_visible(move |s| destructive_ring(s, &t).border_color(t.destructive))
-    })
+pub fn form_control<C: FormControl>(control: C, invalid: bool) -> C {
+    control.invalid(invalid)
 }
 
 /// Help text under the control.

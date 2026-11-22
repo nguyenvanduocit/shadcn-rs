@@ -1,18 +1,17 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, TextField, div};
 use shadcn::{
-    ButtonSize, ButtonVariant, TabsState, button, card, card_content, card_description, card_footer, card_header,
-    card_title, input, label, tabs, tabs_content, tabs_list, tabs_trigger,
+    ButtonSize, ButtonVariant, button, card, card_content, card_description, card_footer, card_header, card_title,
+    input, label, tabs, tabs_content, tabs_list, tabs_trigger,
 };
 
 use crate::{Render, Shot, demo, page};
 
 fn field(name: &str, field: &TextField) -> gui::Div {
-    div().grid().gap(3.0).child(label(name)).child(input(field))
+    div().grid().gap(3.0).child(label(name)).child(input().field(*field))
 }
 
 pub fn render() -> Render {
-    let state = TabsState::new("account");
     let name = TextField::new("Pedro Duarte");
     let username = TextField::new("@peduarte");
     let current = TextField::new("");
@@ -24,13 +23,14 @@ pub fn render() -> Render {
                 "TabsDemo.vue",
                 div().flex_col().w_full().max_w_px(384.0).gap(6.0).child(
                     tabs()
+                        .default_value("account")
                         .child(
                             tabs_list()
-                                .child(tabs_trigger(&state, "account").child("Account"))
-                                .child(tabs_trigger(&state, "password").child("Password")),
+                                .child(tabs_trigger("account").child("Account"))
+                                .child(tabs_trigger("password").child("Password")),
                         )
-                        .child(tabs_content(&state, "account").map(|c| {
-                            c.child(
+                        .child(
+                            tabs_content("account").child(
                                 card()
                                     .child(card_header().child(card_title("Account")).child(card_description(
                                         "Make changes to your account here. Click save when you're done.",
@@ -45,10 +45,10 @@ pub fn render() -> Render {
                                     .child(card_footer().child(
                                         button(ButtonVariant::Default, ButtonSize::Default).child("Save changes"),
                                     )),
-                            )
-                        }))
-                        .child(tabs_content(&state, "password").map(|c| {
-                            c.child(
+                            ),
+                        )
+                        .child(
+                            tabs_content("password").child(
                                 card()
                                     .child(card_header().child(card_title("Password")).child(card_description(
                                         "Change your password here. After saving, you'll be logged out.",
@@ -63,8 +63,8 @@ pub fn render() -> Render {
                                     .child(card_footer().child(
                                         button(ButtonVariant::Default, ButtonSize::Default).child("Save password"),
                                     )),
-                            )
-                        })),
+                            ),
+                        ),
                 ),
             ),
         )

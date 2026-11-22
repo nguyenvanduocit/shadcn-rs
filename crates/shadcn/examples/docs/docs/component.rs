@@ -8,9 +8,9 @@ use std::collections::HashMap;
 use gui::prelude::*;
 use gui::{Div, Element, Icon, div, icon, text};
 use shadcn::{
-    BadgeVariant, CodeBlockContentProps, CodeBlockCopy, CodeBlockProps, TabsState, badge, code_block,
-    code_block_actions, code_block_content, code_block_copy_button, code_block_header, code_block_title,
-    highlighted_lines, tabs, tabs_content, tabs_list, tabs_trigger, theme,
+    BadgeVariant, CodeBlockContentProps, CodeBlockProps, badge, code_block, code_block_actions, code_block_content,
+    code_block_copy_button, code_block_header, code_block_title, highlighted_lines, tabs, tabs_content, tabs_list,
+    tabs_trigger, theme,
 };
 
 use super::Part;
@@ -23,19 +23,15 @@ use super::source::{self, DemoCode};
 /// The name of the box holding the rest of the gallery page.
 pub const PLAYGROUND: &str = "docs-playground";
 
-/// What a demo's block keeps between frames.
+/// What a demo's block keeps between frames: the code its Code tab shows,
+/// cut from the page's source once.
 pub struct DemoState {
-    tabs: TabsState,
-    copy: CodeBlockCopy,
-    /// The code its Code tab shows, cut from the page's source once.
     code: Option<DemoCode>,
 }
 
 impl DemoState {
     fn new(entry: &Entry, file: &str) -> Self {
         Self {
-            tabs: TabsState::new("preview"),
-            copy: CodeBlockCopy::new(),
             code: source::demo_code(&entry.source, file),
         }
     }
@@ -172,7 +168,7 @@ fn code_view(entry: &Entry, file: &str, state: &DemoState) -> Div {
         .child(
             code_block_header(p)
                 .child(code_block_title(p, Some(Icon::FileCode), entry.path.clone()))
-                .child(code_block_actions().child(code_block_copy_button(&state.copy, found.code.clone()))),
+                .child(code_block_actions().child(code_block_copy_button(found.code.clone()))),
         )
         .child(
             code_block_content(
@@ -216,17 +212,14 @@ fn demo_block(entry: &Entry, file: &'static str, demo: Element, state: &DemoStat
                 .when_some(dark, |d, j| d.child(grade_badge(Some("Dark"), j))),
         );
     let switch = tabs_list()
-        .child(
-            tabs_trigger(&state.tabs, "preview")
-                .child(icon(Icon::Eye))
-                .child("Preview"),
-        )
-        .child(tabs_trigger(&state.tabs, "code").child(icon(Icon::Code2)).child("Code"));
+        .child(tabs_trigger("preview").child(icon(Icon::Eye)).child("Preview"))
+        .child(tabs_trigger("code").child(icon(Icon::Code2)).child("Code"));
     let shown = tabs()
+        .default_value("preview")
         .gap(3.0)
         .child(switch)
-        .child(tabs_content(&state.tabs, "preview").map(|c| c.child(preview(demo))))
-        .child(tabs_content(&state.tabs, "code").map(|c| c.child(code_view(entry, file, state))));
+        .child(tabs_content("preview").child(preview(demo)))
+        .child(tabs_content("code").child(code_view(entry, file, state)));
     div().flex_col().gap(4.0).child(heading).child(shown)
 }
 

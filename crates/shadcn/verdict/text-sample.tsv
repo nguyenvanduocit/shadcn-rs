@@ -1,0 +1,22 @@
+# The text sample (ADR-0019): one line per row, drawn by Chrome (text-sample.html)
+# and by gui (docs --text-sample), then measured (docs --text-compare, text.sh).
+# size (px)	weight	text. Sizes sit on both sides of 48/49 (LCD) and 128/129 (atlas or curve).
+11	400	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+12	400	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+13	400	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+14	400	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+14	500	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+14	600	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+16	400	Hamburgefontsiv 0123456789 The quick brown fox jumps over the lazy dog.
+18	400	Hamburgefontsiv 0123456789 The quick brown fox jumps.
+20	400	Hamburgefontsiv 0123456789 The quick brown fox.
+24	600	The Joke Tax Hamburgefontsiv 0123456789
+30	700	Hamburgefontsiv 0123456789
+36	400	Hamburgefontsiv 01234
+48	400	Hamburgefontsiv 012
+49	400	Hamburgefontsiv 012
+64	600	Hamburgefontsiv
+96	400	Hamburgefo
+128	400	Hambur
+129	400	Hambur
+160	700	Hamb

@@ -1,6 +1,6 @@
 use gui::prelude::*;
-use gui::{ScenarioError, div, text};
-use shadcn::{Orientation, ResizableState, resizable_handle, resizable_panel, resizable_panel_group, theme};
+use gui::{Model, ScenarioError, Signal, div, text};
+use shadcn::{Orientation, resizable_handle, resizable_panel, resizable_panel_group, theme};
 
 use crate::{Render, Shot, page, section};
 
@@ -15,20 +15,21 @@ fn label(s: &str) -> gui::Div {
 }
 
 pub fn render() -> Render {
-    let outer = ResizableState::new(Orientation::Horizontal, &[50.0, 50.0]);
-    let inner = ResizableState::new(Orientation::Vertical, &[25.0, 75.0]);
-    let grip = ResizableState::new(Orientation::Horizontal, &[25.0, 75.0]);
-    let grip_v = ResizableState::new(Orientation::Vertical, &[25.0, 75.0]);
+    // The page shows three groups' sizes, so it keeps them; the inner group keeps its own.
+    let outer = Signal::labeled("resizable sizes", vec![50.0_f32, 50.0]);
+    let grip = Signal::labeled("resizable sizes", vec![25.0_f32, 75.0]);
+    let grip_v = Signal::labeled("resizable sizes", vec![25.0_f32, 75.0]);
     Box::new(move || {
         let t = theme();
-        let demo = resizable_panel_group(&outer)
+        let demo = resizable_panel_group(Orientation::Horizontal)
+            .model(Model::bind(outer))
             .max_w_px(448.0)
             .min_w_px(450.0)
             .rounded_lg()
             .border()
             .border_color(t.border)
             .child(
-                resizable_panel(&outer, 0).child(
+                resizable_panel(0).child(
                     div()
                         .flex()
                         .h_px(200.0)
@@ -38,37 +39,39 @@ pub fn render() -> Render {
                         .child(text("One").font_semibold()),
                 ),
             )
-            .child(resizable_handle(&outer, 0, false))
+            .child(resizable_handle(0, false))
             .child(
-                resizable_panel(&outer, 1).child(
-                    resizable_panel_group(&inner)
-                        .child(resizable_panel(&inner, 0).child(label("Two")))
-                        .child(resizable_handle(&inner, 0, false))
-                        .child(resizable_panel(&inner, 1).child(label("Three"))),
+                resizable_panel(1).child(
+                    resizable_panel_group(Orientation::Vertical)
+                        .default_layout(&[25.0, 75.0])
+                        .child(resizable_panel(0).child(label("Two")))
+                        .child(resizable_handle(0, false))
+                        .child(resizable_panel(1).child(label("Three"))),
                 ),
             );
-        let handle = resizable_panel_group(&grip)
+        let handle = resizable_panel_group(Orientation::Horizontal)
+            .model(Model::bind(grip))
             .min_h_px(200.0)
             .max_w_px(448.0)
             .min_w_px(450.0)
             .rounded_lg()
             .border()
             .border_color(t.border)
-            .child(resizable_panel(&grip, 0).child(label("Sidebar")))
-            .child(resizable_handle(&grip, 0, true))
-            .child(resizable_panel(&grip, 1).child(label("Content")));
-        let vertical = resizable_panel_group(&grip_v)
+            .child(resizable_panel(0).child(label("Sidebar")))
+            .child(resizable_handle(0, true))
+            .child(resizable_panel(1).child(label("Content")));
+        let vertical = resizable_panel_group(Orientation::Vertical)
+            .model(Model::bind(grip_v))
             .h_px(200.0)
             .w_px(400.0)
             .rounded_lg()
             .border()
             .border_color(t.border)
-            .child(resizable_panel(&grip_v, 0).child(label("Header")))
-            .child(resizable_handle(&grip_v, 0, true))
-            .child(resizable_panel(&grip_v, 1).child(label("Content")));
-        let sizes = |s: &ResizableState| {
-            s.sizes
-                .get()
+            .child(resizable_panel(0).child(label("Header")))
+            .child(resizable_handle(0, true))
+            .child(resizable_panel(1).child(label("Content")));
+        let sizes = |s: &Signal<Vec<f32>>| {
+            s.get()
                 .iter()
                 .map(|v| format!("{v:.0}"))
                 .collect::<Vec<_>>()

@@ -1,0 +1,8 @@
+# Chrome's boxes for block_padding_border.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 234
+  div 7 12 271 40
+  div 7 52 271 30
+    div 17 62 251 10
+  div 7 82 120 120

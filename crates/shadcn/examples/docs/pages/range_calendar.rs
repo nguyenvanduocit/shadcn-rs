@@ -1,14 +1,14 @@
 use gui::layout::Content;
 use gui::prelude::*;
-use gui::{ScenarioError, div, text};
-use shadcn::{CalendarDate, RangeCalendarState, RangeCalendarValue, range_calendar, theme};
+use gui::{ScenarioError, Signal, div, text_bound};
+use shadcn::{CalendarDate, RangeCalendarValue, range_calendar, theme};
 
 use crate::{Render, Shot, demo, page, section};
 
-/// A fixed "today" so every run draws the same months; `CalendarRangeDemo.vue` uses
-/// the real one, so the verdict matches only when run on this date.
+/// The docs' fixed today (`verdict::CLOCK_MS`), so every run draws the same
+/// month; the verdict pins Chrome's clock to the same instant.
 fn today() -> CalendarDate {
-    CalendarDate::new(2026, 11, 20).unwrap_or_else(CalendarDate::today_utc)
+    crate::verdict::today()
 }
 
 fn describe(value: RangeCalendarValue) -> String {
@@ -21,9 +21,10 @@ fn describe(value: RangeCalendarValue) -> String {
 }
 
 pub fn render() -> Render {
-    let state = RangeCalendarState::new(today(), RangeCalendarValue::between(today(), today().add_days(7)))
-        .number_of_months(2)
-        .disable_days_outside_current_view();
+    let value = Signal::labeled(
+        "range calendar value",
+        RangeCalendarValue::between(today(), today().add_days(7)),
+    );
     Box::new(move || {
         let t = theme();
         page(
@@ -36,14 +37,18 @@ pub fn render() -> Render {
                     .gap(2.0)
                     .child(demo(
                         "CalendarRangeDemo.vue",
-                        range_calendar(&state)
+                        range_calendar()
+                            .model(value)
+                            .today(today())
+                            .number_of_months(2)
+                            .disable_days_outside_current_view()
                             .rounded_md()
                             .border()
                             .border_color(t.border)
                             .shadow_sm(),
                     ))
                     .child(
-                        text(describe(state.value.get()))
+                        text_bound(move || describe(value.get()))
                             .text_sm()
                             .text_color(t.muted_foreground),
                     ),

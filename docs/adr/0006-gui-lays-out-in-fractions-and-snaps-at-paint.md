@@ -1,6 +1,6 @@
 # 0006. `gui` lays out in fractional pixels and snaps at paint
 
-Status: accepted, 2026-11-20. Supersedes the baselines of ADR-0005 (their font and where they round).
+Status: accepted, 2026-11-20; its Taffy tree rebuilt each frame superseded by ADR-0014, its snapping of every box by ADR-0020, its cosmic-text patch by ADR-0019. Supersedes the baselines of ADR-0005 (their font and where they round).
 
 ## Context
 

@@ -88,10 +88,9 @@ pub(crate) fn record_background(
         return;
     };
     target.items.push(Item::Gradient {
-        bounds: node.bounds.snapped(target.scale).intersect(&tile),
+        bounds: target.snapped(node.bounds).intersect(&tile),
         radius: node.look.radius,
         gradient,
-        clip: target.clip,
     });
 }
 
@@ -119,6 +118,26 @@ fn physical_rect(rect: Bounds, scale: f32, size: (u32, u32)) -> Option<PixelRect
     })
 }
 
+/// The whole physical pixels `rect` touches, unbounded.
+fn pixel_cover(rect: Bounds, scale: f32) -> Option<PixelRect> {
+    let (l, t) = (
+        f32_to_i32((rect.x * scale).floor()),
+        f32_to_i32((rect.y * scale).floor()),
+    );
+    let (r, b) = (
+        f32_to_i32((rect.right() * scale).ceil()),
+        f32_to_i32((rect.bottom() * scale).ceil()),
+    );
+    let width = u32::try_from(r.checked_sub(l)?).ok().filter(|&w| w > 0)?;
+    let height = u32::try_from(b.checked_sub(t)?).ok().filter(|&h| h > 0)?;
+    Some(PixelRect {
+        x: l,
+        y: t,
+        width,
+        height,
+    })
+}
+
 /// Record `node`'s text with `img` showing through its glyphs, in place of
 /// the text's own colour.
 pub(crate) fn record_text_through(
@@ -132,7 +151,8 @@ pub(crate) fn record_text_through(
 ) {
     let area = node.content_box;
     let scale = target.scale;
-    let Some(region) = physical_rect(node.bounds.outset(t.line_height), scale, target.size) else {
+    // In the chunk's paint space, which the window's edges do not bound.
+    let Some(region) = pixel_cover(node.bounds.outset(t.line_height), scale) else {
         return;
     };
     // Glyph coverage only: the text's colour shows nowhere.
@@ -146,7 +166,8 @@ pub(crate) fn record_text_through(
             items: &mut mask,
             scale,
             size: target.size,
-            clip: None,
+            cull: None,
+            snap: target.snap,
         },
         p,
         &shape,
@@ -166,7 +187,6 @@ pub(crate) fn record_text_through(
             .filter(|c| !c.is_transparent())
             .map(|c| (node.bounds, c)),
         fill: gradient(&img.gradient, tile, t.color, ch).map(|g| (g, shown)),
-        clip: target.clip,
     });
 }
 

@@ -3,13 +3,12 @@
 //! `NativeSelectFormDemo`, `NumberFieldFormDemo`).
 
 use gui::prelude::*;
-use gui::{ScenarioError, TextField, div, relative};
+use gui::{ScenarioError, Signal, TextField, div, relative};
 use shadcn::{
-    ButtonSize, ButtonVariant, FieldOrientation, FormField, NativeSelectLook, NativeSelectState, NumberFieldState,
-    NumberFormat, Toaster, Unset, button, field, field_description, field_error, field_group, field_label,
-    form_control, form_description, form_item, form_label, form_message, form_submit, input, native_select,
-    native_select_option, number_field, number_field_content, number_field_decrement, number_field_increment,
-    number_field_input, textarea, toaster,
+    ButtonSize, ButtonVariant, FieldOrientation, FormField, NumberFormat, Unset, button, field, field_description,
+    field_error, field_group, field_label, form_control, form_description, form_item, form_label, form_message,
+    form_submit, input, native_select, native_select_option, number_field, number_field_content,
+    number_field_decrement, number_field_increment, number_field_input, textarea, toaster,
 };
 
 use super::form_cards::{Json, Library, Pre, failing, is_email, submitted};
@@ -57,9 +56,9 @@ fn text_item(
     let invalid = !errors.is_empty();
     let control = f.control().control();
     let control = if area {
-        textarea(control).placeholder(placeholder.to_owned())
+        textarea().field(control).placeholder(placeholder.to_owned())
     } else {
-        input(control).placeholder(placeholder.to_owned())
+        input().field(control).placeholder(placeholder.to_owned())
     };
     form_item()
         .child(form_label(name.to_owned(), invalid))
@@ -77,7 +76,6 @@ fn submit_button(on_submit: impl Fn() + 'static) -> gui::Div {
 }
 
 pub fn render() -> Render {
-    let toasts = Toaster::new();
     // FormDemo.vue
     let (demo_user, demo_email, demo_bio) = (text_field(username), text_field(email), text_field(bio));
     // InputForm.vue
@@ -85,9 +83,9 @@ pub fn render() -> Render {
     // InputFormAutoAnimate.vue
     let (animate_user, animate_email) = (text_field(username), text_field(email));
     // NativeSelectFormDemo.vue
-    let country_select = NativeSelectState::new("");
+    let country_select = Signal::labeled("native select value", String::new());
     let country = FormField::new(
-        Unset::new(country_select.value.clone()),
+        Unset::new(country_select),
         Library::Vee.checks(),
         |v: &Option<String>| {
             v.as_deref().map_or_else(
@@ -103,8 +101,8 @@ pub fn render() -> Render {
         native_select_option("ca", "Canada"),
     ];
     // NumberFieldFormDemo.vue
-    let payment_field = NumberFieldState::new(10.0, Some(0.0), None, 1.0, NumberFormat::currency("EUR", true));
-    let payment = FormField::new(payment_field.value.clone(), Library::Vee.checks(), |v: &f64| {
+    let payment_value = Signal::labeled("payment", 10.0);
+    let payment = FormField::new(payment_value, Library::Vee.checks(), |v: &f64| {
         failing(&[
             (*v >= 10.0, "Min 10 euros to send payment"),
             (*v <= 5000.0, "Max 5000 euros to send payment"),
@@ -112,7 +110,7 @@ pub fn render() -> Render {
     });
     Box::new(move || {
         let form_demo = {
-            let (u, e, b) = (demo_user.clone(), demo_email.clone(), demo_bio.clone());
+            let (u, e, b) = (demo_user, demo_email, demo_bio);
             div()
                 .w_full()
                 .max_w_px(384.0)
@@ -147,7 +145,7 @@ pub fn render() -> Render {
                 )
         };
         let input_form = {
-            let u = input_user.clone();
+            let u = input_user;
             div()
                 .w_len(relative(2.0 / 3.0))
                 .flex_col()
@@ -164,7 +162,7 @@ pub fn render() -> Render {
                 }))
         };
         let animate_form = {
-            let (u, e) = (animate_user.clone(), animate_email.clone());
+            let (u, e) = (animate_user, animate_email);
             div()
                 .w_len(relative(2.0 / 3.0))
                 .flex_col()
@@ -189,20 +187,13 @@ pub fn render() -> Render {
         };
         let native_select_form = {
             let invalid = country.invalid();
-            let (c, toasts) = (country.clone(), toasts.clone());
+            let c = country;
             div().w_full().max_w_px(384.0).child(
                 field_group()
                     .child(
                         field(FieldOrientation::Vertical, invalid)
                             .child(field_label("Country"))
-                            .child(native_select(
-                                &country_select,
-                                &countries,
-                                NativeSelectLook {
-                                    disabled: false,
-                                    invalid,
-                                },
-                            ))
+                            .child(native_select(countries.clone()).model(country_select).invalid(invalid))
                             .child(field_description("Select a country"))
                             .child(field_error(country.errors())),
                     )
@@ -211,11 +202,7 @@ pub fn render() -> Render {
                             submit_button(move || {
                                 if form_submit(&[&c]) {
                                     let value = c.control().control().get();
-                                    submitted(
-                                        &toasts,
-                                        &Json::Object(vec![("country", Json::Str(value))]),
-                                        Pre::Neutral900,
-                                    );
+                                    submitted(&Json::Object(vec![("country", Json::Str(value))]), Pre::Neutral900);
                                 }
                             })
                             .w_full(),
@@ -225,7 +212,7 @@ pub fn render() -> Render {
         };
         let number_form = {
             let invalid = payment.invalid();
-            let (p, toasts) = (payment.clone(), toasts.clone());
+            let p = payment;
             div()
                 .w_len(relative(2.0 / 3.0))
                 .flex_col()
@@ -235,12 +222,17 @@ pub fn render() -> Render {
                         .w_px(300.0)
                         .child(field_label("Payment"))
                         .child(
-                            number_field().gap(2.0).child(
-                                number_field_content()
-                                    .child(number_field_decrement(&payment_field))
-                                    .child(number_field_input(&payment_field))
-                                    .child(number_field_increment(&payment_field)),
-                            ),
+                            number_field()
+                                .model(payment_value)
+                                .min(0.0)
+                                .format(NumberFormat::currency("EUR", true))
+                                .gap(2.0)
+                                .child(
+                                    number_field_content()
+                                        .child(number_field_decrement())
+                                        .child(number_field_input())
+                                        .child(number_field_increment()),
+                                ),
                         )
                         .child(field_description("Enter value between 10 and 5000."))
                         .child(field_error(payment.errors())),
@@ -248,7 +240,6 @@ pub fn render() -> Render {
                 .child(submit_button(move || {
                     if form_submit(&[&p]) {
                         submitted(
-                            &toasts,
                             &Json::Object(vec![("payment", Json::Num(p.control().get()))]),
                             Pre::Neutral950,
                         );
@@ -265,7 +256,7 @@ pub fn render() -> Render {
                 .child(demo("InputFormAutoAnimate.vue", animate_form))
                 .child(demo("NativeSelectFormDemo.vue", native_select_form))
                 .child(demo("NumberFieldFormDemo.vue", number_form))
-                .child(toaster(&toasts)),
+                .child(toaster()),
         )
     })
 }

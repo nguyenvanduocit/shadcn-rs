@@ -2,7 +2,7 @@
 //! skipped, a step per suite, and each failing test's error.
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon};
 use shadcn::{
     TraceStatus, trace, trace_collapsible, trace_collapsible_content, trace_collapsible_trigger, trace_icon,
     trace_line, trace_title,
@@ -178,30 +178,31 @@ fn line(status: Option<TraceStatus>, glyph: Icon, title: impl Into<String>) -> D
         .child(trace_title(title))
 }
 
-fn test_row(test: &Test, open: &Signal<bool>) -> Div {
+fn test_row(test: &Test, open: &Signal<bool>) -> Element {
     match test.status {
         Status::Failed(error) => trace_collapsible()
+            .model(Model::bind(*open))
             .child(trace_collapsible_trigger(
-                open,
                 true,
                 line(Some(TraceStatus::Error), Icon::X, test.name),
             ))
-            .child(trace_collapsible_content(open, |c| c.child(output(error)))),
-        Status::Skipped => line(None, Icon::CircleDashed, format!("Skipped {}", test.name)),
-        Status::Passed => line(None, Icon::Check, test.name),
+            .child(trace_collapsible_content().map_root(|c| c.child(output(error))))
+            .into_element(),
+        Status::Skipped => line(None, Icon::CircleDashed, format!("Skipped {}", test.name)).into_element(),
+        Status::Passed => line(None, Icon::Check, test.name).into_element(),
     }
 }
 
 /// The run's step: `Ran …` over a step per suite, each over its tests.
-fn results(suites: &[Suite], folds: &Folds) -> Div {
+fn results(suites: &[Suite], folds: &Folds) -> Element {
     let summary = Counts::of(suites.iter().flat_map(|s| s.tests));
     trace_collapsible()
+        .model(Model::bind(folds.run))
         .child(trace_collapsible_trigger(
-            &folds.run,
             summary.failed > 0,
             line(summary.status(), Icon::FlaskConical, format!("Ran {}", summary.label())),
         ))
-        .child(trace_collapsible_content(&folds.run, |c| {
+        .child(trace_collapsible_content().map_root(|c| {
             c.child(
                 trace().children(
                     suites
@@ -211,8 +212,8 @@ fn results(suites: &[Suite], folds: &Folds) -> Div {
                         .map(|((suite, open), tests)| {
                             let counts = Counts::of(suite.tests);
                             trace_collapsible()
+                                .model(Model::bind(*open))
                                 .child(trace_collapsible_trigger(
-                                    open,
                                     counts.failed > 0,
                                     line(
                                         counts.status(),
@@ -220,7 +221,7 @@ fn results(suites: &[Suite], folds: &Folds) -> Div {
                                         format!("{}, {}", suite.name, counts.label()),
                                     ),
                                 ))
-                                .child(trace_collapsible_content(open, |c| {
+                                .child(trace_collapsible_content().map_root(|c| {
                                     c.child(
                                         trace().children(suite.tests.iter().zip(tests).map(|(t, o)| test_row(t, o))),
                                     )
@@ -229,6 +230,7 @@ fn results(suites: &[Suite], folds: &Folds) -> Div {
                 ),
             )
         }))
+        .into_element()
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -287,14 +289,14 @@ fn test_results_demo(turn: &Signal<Turn>, folds: &Folds, script: &Script) -> Div
     } else {
         let status = if busy { TraceStatus::Running } else { TraceStatus::Error };
         let verb = if busy { "Running" } else { "Failed to run" };
-        line(Some(status), Icon::FlaskConical, format!("{verb} {COMMAND}"))
+        line(Some(status), Icon::FlaskConical, format!("{verb} {COMMAND}")).into_element()
     };
-    let (turn, folds, play) = (turn.clone(), folds.clone(), script.clone());
+    let (turn, folds, play) = (*turn, folds.clone(), script.clone());
     thread()
         .child(user_turn(QUESTION))
         .child(assistant_turn([trace().child(step).into_element(), said(&now.text)]))
         .child(replay(script, move || {
-            let (turn, folds) = (turn.clone(), folds.clone());
+            let (turn, folds) = (turn, folds.clone());
             play.play(frames(Turn::replay(), move |step: &Turn| {
                 // The results mount anew once the tests have run.
                 if step.ran && !turn.get().ran {

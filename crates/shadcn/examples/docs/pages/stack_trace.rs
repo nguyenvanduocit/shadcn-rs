@@ -2,7 +2,7 @@
 //! frame of the app's own code, and the library frames folded away.
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
     TraceStatus, trace, trace_collapsible, trace_collapsible_content, trace_collapsible_trigger, trace_icon,
     trace_line, trace_title,
@@ -107,14 +107,14 @@ fn failure(content: Div, stack: &Stack, frames: &Signal<bool>) -> Div {
                 }))
                 .child(
                     trace_collapsible()
+                        .model(Model::bind(*frames))
                         .child(trace_collapsible_trigger(
-                            frames,
                             false,
                             trace_line(None)
                                 .child(trace_icon(icon(Icon::Layers)))
                                 .child(trace_title(format!("{} framework frames", stack.internal.len()))),
                         ))
-                        .child(trace_collapsible_content(frames, |c| {
+                        .child(trace_collapsible_content().map_root(|c| {
                             c.child(
                                 div()
                                     .flex_col()
@@ -211,28 +211,30 @@ fn called(command: &str, busy: bool) -> Div {
         )))
 }
 
-fn ran(open: &Signal<bool>, command: &str, out: &str) -> Div {
+fn ran(open: &Signal<bool>, command: &str, out: &str) -> Element {
     trace_collapsible()
+        .model(Model::bind(*open))
         .child(trace_collapsible_trigger(
-            open,
             false,
             trace_line(None)
                 .child(trace_icon(icon(Icon::Terminal)))
                 .child(trace_title(format!("Ran {command}"))),
         ))
-        .child(trace_collapsible_content(open, |c| c.child(output(out))))
+        .child(trace_collapsible_content().map_root(|c| c.child(output(out))))
+        .into_element()
 }
 
-fn failed(open: &Signal<bool>, frames: &Signal<bool>, stack: &Stack, glyph: Icon) -> Div {
+fn failed(open: &Signal<bool>, frames: &Signal<bool>, stack: &Stack, glyph: Icon) -> Element {
     trace_collapsible()
+        .model(Model::bind(*open))
         .child(trace_collapsible_trigger(
-            open,
             true,
             trace_line(Some(TraceStatus::Error))
                 .child(trace_icon(icon(glyph)))
                 .child(trace_title(format!("Failed: {}", stack.error))),
         ))
-        .child(trace_collapsible_content(open, |c| failure(c, stack, frames)))
+        .child(trace_collapsible_content().map_root(|c| failure(c, stack, frames)))
+        .into_element()
 }
 
 fn stack_trace_demo(turn: &Signal<Turn>, folds: &Folds, script: &Script) -> Div {
@@ -241,7 +243,7 @@ fn stack_trace_demo(turn: &Signal<Turn>, folds: &Folds, script: &Script) -> Div 
     let seed_stack = parse(SEED_STACK, |l| l.contains("node_modules") || l.contains("node:"));
     let part = |step: Option<Step>, command: &str| match step {
         None => None,
-        Some(Step::Called) => Some(called(command, busy)),
+        Some(Step::Called) => Some(called(command, busy).into_element()),
         Some(Step::Ran) => Some(ran(&folds.reset, command, RESET_OUTPUT)),
         Some(Step::Failed) => Some(failed(&folds.seed, &folds.frames, &seed_stack, Icon::Terminal)),
     };
@@ -249,12 +251,12 @@ fn stack_trace_demo(turn: &Signal<Turn>, folds: &Folds, script: &Script) -> Div 
         .reset
         .is_some()
         .then(|| trace().child(part(now.reset, RESET)).child(part(now.seed, SEED)));
-    let (turn, folds, play) = (turn.clone(), folds.clone(), script.clone());
+    let (turn, folds, play) = (*turn, folds.clone(), script.clone());
     thread()
         .child(user_turn(QUESTION))
         .child(assistant_turn([steps.into_element(), said(&now.text)]))
         .child(replay(script, move || {
-            let (turn, folds) = (turn.clone(), folds.clone());
+            let (turn, folds) = (turn, folds.clone());
             play.play(frames(Turn::replay(), move |step: &Turn| {
                 // A step that changes shape mounts anew, in its default state.
                 let before = turn.get();

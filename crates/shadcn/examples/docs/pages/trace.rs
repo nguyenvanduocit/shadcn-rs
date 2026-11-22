@@ -3,12 +3,12 @@ mod chat;
 use std::time::Duration;
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
     BadgeVariant, ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockLine, CodeBlockLineVariant,
-    CodeBlockProps, CodeBlockSize, CodeBlockVariant, DialogState, SheetSide, TraceStatus, badge, button, code_block,
-    code_block_content, code_block_lines, dialog_content, dialog_description, dialog_header, dialog_title,
-    dialog_trigger, sheet_content, sheet_description, sheet_header, sheet_title, spinner, trace, trace_action,
+    CodeBlockProps, CodeBlockSize, CodeBlockVariant, Part, SheetSide, TraceStatus, badge, button, code_block,
+    code_block_content, code_block_lines, dialog, dialog_content, dialog_description, dialog_header, dialog_title,
+    dialog_trigger, sheet, sheet_content, sheet_description, sheet_header, sheet_title, spinner, trace, trace_action,
     trace_collapsible, trace_collapsible_content, trace_collapsible_trigger, trace_description, trace_end_icon,
     trace_icon, trace_line, trace_title,
 };
@@ -33,16 +33,15 @@ fn output(code: &str, variant: CodeBlockVariant) -> Div {
     code_block(p).child(code_block_content(p, c, code_block_lines(code)).max_h(64.0))
 }
 
-fn ran(open: &Signal<bool>, title: &str, code: &str) -> Div {
+fn ran(open: &Signal<bool>, title: &str, code: &str) -> Element {
     trace_collapsible()
+        .model(Model::bind(*open))
         .child(trace_collapsible_trigger(
-            open,
             false,
             step(None, icon(Icon::Terminal), title),
         ))
-        .child(trace_collapsible_content(open, |c| {
-            c.child(output(code, CodeBlockVariant::Default))
-        }))
+        .child(trace_collapsible_content().map_root(|c| c.child(output(code, CodeBlockVariant::Default))))
+        .into_element()
 }
 
 /// A step that links out: globe, title, arrow (Vue's `<a target="_blank">`
@@ -64,14 +63,12 @@ fn link_to(glyph: Icon, title: &str) -> Div {
 }
 
 /// A step that opens on what it found, closed until pressed.
-fn folding(open: &Signal<bool>, status: Option<TraceStatus>, line: Div, content: impl FnOnce(Div) -> Div) -> Div {
+fn folding(open: &Signal<bool>, status: Option<TraceStatus>, line: Div, content: impl FnOnce(Div) -> Div) -> Element {
     trace_collapsible()
-        .child(trace_collapsible_trigger(
-            open,
-            status == Some(TraceStatus::Error),
-            line,
-        ))
-        .child(trace_collapsible_content(open, content))
+        .model(Model::bind(*open))
+        .child(trace_collapsible_trigger(status == Some(TraceStatus::Error), line))
+        .child(trace_collapsible_content().map_root(content))
+        .into_element()
 }
 
 /// `TraceLinkDemo.vue`: a step that opens a page of the app, and one that
@@ -199,11 +196,11 @@ fn sources_trace(titles: &[&str]) -> Div {
 }
 
 /// A step that opens a dialog or sheet: its line, and a chevron after the title.
-fn opener(state: &DialogState, line: Div) -> Div {
-    dialog_trigger(
-        state,
-        trace_action(false, line.child(trace_end_icon(icon(Icon::ChevronRight)))),
-    )
+fn opener(line: Div) -> Part<()> {
+    dialog_trigger(trace_action(
+        false,
+        line.child(trace_end_icon(icon(Icon::ChevronRight))),
+    ))
 }
 
 /// A file a commit changed, and its diff.
@@ -268,17 +265,16 @@ fn diff_lines(diff: &str) -> Vec<CodeBlockLine> {
 
 /// `TraceCommitDemo.vue`: a commit that opens to the files it changed, each
 /// opening its diff in a sheet.
-fn commit(open: &Signal<bool>, sheets: &[DialogState]) -> Div {
-    let files = CHANGED.iter().zip(sheets).map(|(f, state)| {
+fn commit(open: &Signal<bool>) -> Div {
+    let files = CHANGED.iter().map(|f| {
         let glyph = if f.added { Icon::FilePlus } else { Icon::FilePen };
         let title = format!("{} {}", if f.added { "Added" } else { "Edited" }, f.path);
         let line = step(None, icon(glyph), &title)
             .child(trace_description(format!("+{} \u{2212}{}", f.additions, f.deletions)).font_mono());
         let p = CodeBlockProps::default();
-        div()
-            .child(opener(state, line))
-            .child(sheet_content(state, SheetSide::Right, |c| {
-                c.child(
+        sheet().child(opener(line)).child(
+            sheet_content(SheetSide::Right)
+                .child(
                     sheet_header()
                         .child(sheet_title(f.path).font_mono())
                         .child(sheet_description(format!(
@@ -290,13 +286,13 @@ fn commit(open: &Signal<bool>, sheets: &[DialogState]) -> Div {
                     p,
                     CodeBlockContentProps::default(),
                     diff_lines(f.diff),
-                )))
-            }))
+                ))),
+        )
     });
     trace().max_w(96.0).child(
         trace_collapsible()
+            .model(Model::bind(*open))
             .child(trace_collapsible_trigger(
-                open,
                 false,
                 step(
                     None,
@@ -304,18 +300,17 @@ fn commit(open: &Signal<bool>, sheets: &[DialogState]) -> Div {
                     "Committed a1b2c3: Fix the login redirect",
                 ),
             ))
-            .child(trace_collapsible_content(open, |c| c.child(trace().children(files)))),
+            .child(trace_collapsible_content().map_root(|c| c.child(trace().children(files)))),
     )
 }
 
 /// `TraceDialogDemo.vue`: a web search that opens its results in a dialog.
-fn searched(state: &DialogState) -> Div {
+fn searched() -> Div {
     const TITLE: &str = "Searched the web for cache keys";
     trace().max_w(96.0).child(
-        div()
-            .child(opener(state, step(None, icon(Icon::Globe), TITLE)))
-            .child(dialog_content(state, |c| {
-                c.child(
+        dialog().child(opener(step(None, icon(Icon::Globe), TITLE))).child(
+            dialog_content()
+                .child(
                     dialog_header()
                         .child(dialog_title(TITLE))
                         .child(dialog_description("Three results were used in the response.")),
@@ -324,35 +319,36 @@ fn searched(state: &DialogState) -> Div {
                     "Caching build outputs",
                     "Image optimization reference",
                     "Deploy hooks and cache keys",
-                ]))
-            })),
+                ])),
+        ),
     )
 }
 
 /// `TraceSheetDemo.vue`: explored files listed in a sheet.
-fn explored(state: &DialogState) -> Div {
+fn explored() -> Div {
     const TITLE: &str = "Explored 4 files";
     trace().max_w(96.0).child(
-        div()
-            .child(opener(state, step(None, icon(Icon::FolderSearch), TITLE)))
-            .child(sheet_content(state, SheetSide::Right, |c| {
-                c.child(
-                    sheet_header()
-                        .child(sheet_title(TITLE))
-                        .child(sheet_description("Files read while preparing the response.")),
-                )
-                .child(
-                    div().flex_col().gap(2.0).px(6.0).font_mono().text_xs().children(
-                        [
-                            "apps/v4/lib/docs.ts",
-                            "apps/v4/lib/components.ts",
-                            "apps/v4/nuxt.config.ts",
-                            "apps/v4/package.json",
-                        ]
-                        .map(text),
+        sheet()
+            .child(opener(step(None, icon(Icon::FolderSearch), TITLE)))
+            .child(
+                sheet_content(SheetSide::Right)
+                    .child(
+                        sheet_header()
+                            .child(sheet_title(TITLE))
+                            .child(sheet_description("Files read while preparing the response.")),
+                    )
+                    .child(
+                        div().flex_col().gap(2.0).px(6.0).font_mono().text_xs().children(
+                            [
+                                "apps/v4/lib/docs.ts",
+                                "apps/v4/lib/components.ts",
+                                "apps/v4/nuxt.config.ts",
+                                "apps/v4/package.json",
+                            ]
+                            .map(text),
+                        ),
                     ),
-                )
-            })),
+            ),
     )
 }
 
@@ -365,20 +361,17 @@ fn sources(open: &Signal<bool>) -> Div {
     ];
     div().w_full().max_w(96.0).child(
         trace_collapsible()
+            .model(Model::bind(*open))
             .child(trace_collapsible_trigger(
-                open,
                 false,
                 step(None, icon(Icon::Globe), &format!("Used {} sources", titles.len())),
             ))
-            .child(trace_collapsible_content(open, |c| c.child(sources_trace(&titles)))),
+            .child(trace_collapsible_content().map_root(|c| c.child(sources_trace(&titles)))),
     )
 }
 
 pub fn render() -> Render {
     let commit_open = Signal::labeled("commit open", true);
-    let commit_sheets = [DialogState::new(), DialogState::new()];
-    let search = DialogState::new();
-    let explore = DialogState::new();
     let sources_open = Signal::labeled("sources open", true);
     let conversation = chat::TraceDemo::new();
     let thinking = chat::ThinkingDemo::new();
@@ -388,7 +381,7 @@ pub fn render() -> Render {
     let lone = Signal::labeled("lone open", false);
     let folds = Folds::new();
     Box::new(move || {
-        let toggle = pnpm.clone();
+        let toggle = pnpm;
         let opened = demo(
             "TraceOpenDemo.vue",
             div()
@@ -406,7 +399,7 @@ pub fn render() -> Render {
                         } else {
                             "Show the pnpm output"
                         })
-                        .on_click(move |_| toggle.update(|o| !o)),
+                        .on_click(move |_| toggle.update(|o| *o = !*o)),
                 ),
         );
         let collapsible = demo(
@@ -469,10 +462,10 @@ pub fn render() -> Render {
                 .child(described)
                 .child(single)
                 .child(group)
-                .child(demo("TraceCommitDemo.vue", commit(&commit_open, &commit_sheets)))
+                .child(demo("TraceCommitDemo.vue", commit(&commit_open)))
                 .child(demo("TraceDemo.vue", conversation.render()))
-                .child(demo("TraceDialogDemo.vue", searched(&search)))
-                .child(demo("TraceSheetDemo.vue", explored(&explore)))
+                .child(demo("TraceDialogDemo.vue", searched()))
+                .child(demo("TraceSheetDemo.vue", explored()))
                 .child(demo("TraceSourcesDemo.vue", sources(&sources_open)))
                 .child(demo("TraceThinkingDemo.vue", thinking.render()))
                 .child(demo("TraceToolCallsDemo.vue", tool_calls.render()))

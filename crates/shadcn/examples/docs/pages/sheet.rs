@@ -1,8 +1,8 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, TextField, div};
 use shadcn::{
-    ButtonSize, ButtonVariant, DialogState, SheetSide, button, dialog_close, dialog_trigger, input, label,
-    sheet_content, sheet_description, sheet_footer, sheet_header, sheet_title,
+    ButtonSize, ButtonVariant, SheetSide, button, dialog_close, dialog_trigger, input, label, sheet, sheet_content,
+    sheet_description, sheet_footer, sheet_header, sheet_title,
 };
 
 use crate::{Render, Shot, demo, motion_frames, page, section};
@@ -15,15 +15,13 @@ const SIDES: [(&str, SheetSide); 4] = [
 ];
 
 pub fn render() -> Render {
-    let profile_sheet = DialogState::new();
     let name = TextField::new("Pedro Duarte");
     let username = TextField::new("@peduarte");
-    let sides: Vec<DialogState> = SIDES.iter().map(|_| DialogState::new()).collect();
     Box::new(move || {
-        let field = |name: &str, f: &TextField| div().grid().gap(3.0).child(label(name)).child(input(f));
-        let profile = |state: &DialogState, side: SheetSide| {
-            sheet_content(state, side, |c| {
-                c.child(
+        let field = |name: &str, f: &TextField| div().grid().gap(3.0).child(label(name)).child(input().field(*f));
+        let profile = |side: SheetSide| {
+            sheet_content(side)
+                .child(
                     sheet_header()
                         .child(sheet_title("Edit profile"))
                         .child(sheet_description(
@@ -44,11 +42,9 @@ pub fn render() -> Render {
                     sheet_footer()
                         .child(button(ButtonVariant::Default, ButtonSize::Default).child("Save changes"))
                         .child(dialog_close(
-                            state,
                             button(ButtonVariant::Outline, ButtonSize::Default).child("Close"),
                         )),
                 )
-            })
         };
         page(
             "Sheet",
@@ -57,27 +53,22 @@ pub fn render() -> Render {
                 .gap(8.0)
                 .child(demo(
                     "SheetDemo.vue",
-                    div()
+                    sheet()
                         .flex()
                         .child(dialog_trigger(
-                            &profile_sheet,
                             button(ButtonVariant::Outline, ButtonSize::Default).child("Open"),
                         ))
-                        .child(profile(&profile_sheet, SheetSide::Right)),
+                        .child(profile(SheetSide::Right)),
                 ))
                 .child(section(
                     "Sides",
-                    div()
-                        .flex()
-                        .gap(2.0)
-                        .children(SIDES.iter().zip(&sides).map(|((name, side), state)| {
-                            div()
-                                .child(dialog_trigger(
-                                    state,
-                                    button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
-                                ))
-                                .child(profile(state, *side))
-                        })),
+                    div().flex().gap(2.0).children(SIDES.iter().map(|(name, side)| {
+                        sheet()
+                            .child(dialog_trigger(
+                                button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
+                            ))
+                            .child(profile(*side))
+                    })),
                 )),
         )
     })

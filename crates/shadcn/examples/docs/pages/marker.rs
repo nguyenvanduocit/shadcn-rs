@@ -27,7 +27,7 @@ fn busy(variant: MarkerVariant, words: &str) -> Div {
 pub fn render() -> Render {
     let reverted = Signal::labeled("reverted", 0_u32);
     Box::new(move || {
-        let r = reverted.clone();
+        let r = reverted;
         page(
             "Marker",
             div()
@@ -43,7 +43,7 @@ pub fn render() -> Render {
                         )))
                         .child(
                             marker_button(note(V::Default, Some(Icon::RotateCcw), "Revert this change"))
-                                .on_click(move |_| r.update(|n| n.saturating_add(1))),
+                                .on_click(move |_| r.update(|n| *n = n.saturating_add(1))),
                         ),
                 ))
                 .child(demo(

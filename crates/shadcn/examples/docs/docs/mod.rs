@@ -28,18 +28,17 @@ use gui::{
     Signal, div, icon, key_of, text, use_context,
 };
 use shadcn::{
-    ButtonSize, ButtonVariant, CommandState, DialogState, Orientation, SidebarCollapsible, SidebarMenuButtonProps,
-    SidebarMenuButtonSize, SidebarState, Theme, breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list,
-    breadcrumb_page, breadcrumb_separator, button, command, command_empty, command_group, command_input, command_item,
-    command_list, command_separator, dialog_content, kbd, kbd_group, separator, sidebar, sidebar_content,
-    sidebar_group, sidebar_group_content, sidebar_group_label, sidebar_header, sidebar_inset, sidebar_menu,
-    sidebar_menu_button, sidebar_menu_item, sidebar_provider, sidebar_trigger, theme,
+    ButtonSize, ButtonVariant, CommandItem, CommandSection, Orientation, SidebarCollapsible, SidebarMenuButtonProps,
+    SidebarMenuButtonSize, Theme, breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page,
+    breadcrumb_separator, button, command, command_input, command_list, dialog, dialog_content, kbd, kbd_group,
+    separator, sidebar, sidebar_content, sidebar_group, sidebar_group_content, sidebar_group_label, sidebar_header,
+    sidebar_inset, sidebar_menu, sidebar_menu_button, sidebar_menu_item, sidebar_provider, sidebar_trigger, theme,
 };
 
 use self::catalog::{Catalog, Route};
 use self::component::DemoStates;
 use self::fidelity::Verdicts;
-use crate::{Host, Render, pages};
+use crate::{Host, Render};
 
 pub use self::export::export;
 
@@ -114,23 +113,21 @@ impl Nav {
     }
 }
 
-/// The search palette: a command list over every page, in a dialog.
+/// The search palette: a command list over every page, in a dialog. Each
+/// opening mounts a fresh command, its search empty and focused.
 #[derive(Clone)]
 struct Search {
-    dialog: DialogState,
-    cmd: CommandState,
+    dialog: Signal<bool>,
 }
 
 impl Search {
     fn open(&self) {
-        self.cmd.search.set_text("");
-        self.dialog.open();
-        self.cmd.search.focus.focus();
+        self.dialog.set(true);
     }
 
     fn toggle(&self) {
-        if self.dialog.is_open() {
-            self.dialog.close();
+        if self.dialog.get_untracked() {
+            self.dialog.set(false);
         } else {
             self.open();
         }
@@ -146,10 +143,6 @@ fn is_search_key(e: &KeyEvent) -> bool {
 struct Docs {
     catalog: Rc<Catalog>,
     nav: Nav,
-    /// Each gallery page's render, built the first time it is opened.
-    renders: Vec<Option<Render>>,
-    demos: DemoStates,
-    sidebar: SidebarState,
     search: Search,
     verdicts: Signal<Rc<Verdicts>>,
 }
@@ -158,17 +151,13 @@ impl Docs {
     fn new(start: Route) -> Self {
         let catalog = Rc::new(Catalog::load());
         Self {
-            renders: pages::ALL.iter().map(|_| None).collect(),
             catalog,
             nav: Nav {
                 route: Signal::labeled("docs route", start),
                 scroll: ScrollHandle::new(),
             },
-            demos: DemoStates::new(),
-            sidebar: SidebarState::new(true).collapsible(SidebarCollapsible::Offcanvas),
             search: Search {
-                dialog: DialogState::new(),
-                cmd: CommandState::new(),
+                dialog: Signal::labeled("search open", false),
             },
             verdicts: Signal::labeled("verdicts", Rc::new(Verdicts::read())),
         }
@@ -176,7 +165,13 @@ impl Docs {
 
     fn render(&mut self) -> Element {
         let route = self.nav.route.get();
-        let parts = self.parts(route);
+        let body = match route {
+            Route::Page(i) => page_view(Rc::clone(&self.catalog), self.nav.clone(), self.verdicts, i),
+            _ => {
+                let parts = self.parts(route);
+                body(&self.nav, parts).into_element()
+            }
+        };
         let search = self.search.clone();
         let t = theme();
         div()
@@ -192,12 +187,10 @@ impl Docs {
                 hit
             })
             .child(
-                sidebar_provider(&self.sidebar).child(self.side(route)).child(
-                    sidebar_inset(&self.sidebar)
-                        .min_h(0.0)
-                        .child(self.header(route))
-                        .child(self.body(parts)),
-                ),
+                sidebar_provider()
+                    .collapsible(SidebarCollapsible::Offcanvas)
+                    .child(self.side(route))
+                    .child(sidebar_inset().min_h(0.0).child(self.header(route)).child(body)),
             )
             .child(self.palette())
             .into_element()
@@ -210,85 +203,45 @@ impl Docs {
             Route::Introduction => intro::parts(&self.catalog, &verdicts, &self.nav),
             Route::Theming => theming::parts(&source::module_doc(include_str!("../../../src/theme.rs"))),
             Route::Fidelity => {
-                let signal = self.verdicts.clone();
+                let signal = self.verdicts;
                 fidelity::parts(&self.catalog, &verdicts, &self.nav, move || {
                     signal.set(Rc::new(Verdicts::read()));
                 })
             }
-            Route::Page(i) => self.component(i, &verdicts),
+            Route::Page(_) => Vec::new(),
         };
-        parts.push(Part::new("pager", None, self.pager(route)));
+        parts.push(Part::new("pager", None, pager(&self.catalog, &self.nav, route)));
         parts
     }
 
-    fn component(&mut self, i: usize, verdicts: &Verdicts) -> Vec<Part> {
-        let (Some(entry), Some(slot)) = (self.catalog.entries.get(i), self.renders.get_mut(i)) else {
-            return Vec::new();
-        };
-        let render = slot.get_or_insert_with(|| (entry.page.render)());
-        let lifted = lift::lift(render());
-        component::parts(entry, lifted, &mut self.demos, verdicts)
-    }
-
-    /// Previous and next, as ui.shadcn.com ends each page.
-    fn pager(&self, route: Route) -> Div {
-        let (prev, next) = self.catalog.neighbours(route);
-        let link = |to: Route, glyph: Icon, before: bool| {
-            let nav = self.nav.clone();
-            let title = self.catalog.title(to);
-            button(ButtonVariant::Secondary, ButtonSize::Sm)
-                .on_click(move |_| nav.go(to))
-                .when(before, |b| b.child(icon(glyph)))
-                .child(title)
-                .when(!before, |b| b.child(icon(glyph)))
-        };
-        div()
-            .flex()
-            .items_center()
-            .pt(6.0)
-            .when_some(prev, |d, r| d.child(link(r, Icon::ArrowLeft, true)))
-            .when_some(next, |d, r| {
-                d.child(div().ml_auto().child(link(r, Icon::ArrowRight, false)))
-            })
-    }
-
-    fn side(&self, current: Route) -> Div {
-        let sb = &self.sidebar;
+    fn side(&self, current: Route) -> impl IntoElement {
         let t = theme();
         let item = |route: Route| {
             let title = self.catalog.title(route);
             let nav = self.nav.clone();
-            sidebar_menu_item(sb, &title).child(
-                sidebar_menu_button(
-                    sb,
-                    &title,
-                    SidebarMenuButtonProps {
-                        is_active: route == current,
-                        ..SidebarMenuButtonProps::default()
-                    },
-                )
+            sidebar_menu_item().child(
+                sidebar_menu_button(SidebarMenuButtonProps {
+                    is_active: route == current,
+                    ..SidebarMenuButtonProps::default()
+                })
                 .h(7.5)
                 .on_click(move |_| nav.go(route))
-                .child(text(title.clone()).truncate()),
+                .child(text(title).truncate()),
             )
         };
         let group = |label: &str, routes: &[Route]| {
             sidebar_group()
                 .py(1.0)
-                .child(sidebar_group_label(sb).child(label.to_owned()))
+                .child(sidebar_group_label().child(label.to_owned()))
                 .child(sidebar_group_content().child(sidebar_menu().gap(0.5).children(routes.iter().map(|&r| item(r)))))
         };
         let home = self.nav.clone();
         let brand = sidebar_menu().child(
-            sidebar_menu_item(sb, "brand").child(
-                sidebar_menu_button(
-                    sb,
-                    "brand",
-                    SidebarMenuButtonProps {
-                        size: SidebarMenuButtonSize::Lg,
-                        ..SidebarMenuButtonProps::default()
-                    },
-                )
+            sidebar_menu_item().child(
+                sidebar_menu_button(SidebarMenuButtonProps {
+                    size: SidebarMenuButtonSize::Lg,
+                    ..SidebarMenuButtonProps::default()
+                })
                 .on_click(move |_| home.go(Route::Introduction))
                 .child(
                     div()
@@ -316,17 +269,12 @@ impl Docs {
                 ),
             ),
         );
-        sidebar(
-            sb,
-            [
-                sidebar_header().child(brand).into_element(),
-                sidebar_content(sb)
-                    .gap(0.0)
-                    .pb(4.0)
-                    .child(group("Getting Started", &self.catalog.getting_started))
-                    .child(group("Components", &self.catalog.components))
-                    .into_element(),
-            ],
+        sidebar().child(sidebar_header().child(brand)).child(
+            sidebar_content()
+                .gap(0.0)
+                .pb(4.0)
+                .child(group("Getting Started", &self.catalog.getting_started))
+                .child(group("Components", &self.catalog.components)),
         )
     }
 
@@ -368,7 +316,7 @@ impl Docs {
             .size(8.0)
             .on_click(move |_| {
                 if let Some(s) = &themes {
-                    s.update(|t| if t.dark { Theme::light() } else { Theme::dark() });
+                    s.update(|t| *t = if t.dark { Theme::light() } else { Theme::dark() });
                 }
             })
             .child(icon(if t.dark { Icon::Sun } else { Icon::Moon }));
@@ -382,130 +330,96 @@ impl Docs {
             .px(4.0)
             .border_b()
             .border_color(t.border)
-            .child(sidebar_trigger(&self.sidebar).ml(-1.0))
+            .child(sidebar_trigger().ml(-1.0))
             .child(separator(Orientation::Vertical).h(4.0).mr(2.0))
             .child(crumbs)
             .child(div().ml_auto().flex().items_center().gap(2.0).child(find).child(toggle))
     }
 
     /// The page's column, and "On this page" beside it.
-    fn body(&self, parts: Vec<Part>) -> Div {
-        let t = theme();
-        let listed: Vec<(ElementKey, String)> = parts
-            .iter()
-            .filter_map(|p| p.toc.clone().map(|label| (p.key, label)))
-            .collect();
-        let keys: Vec<ElementKey> = listed.iter().map(|(k, _)| *k).collect();
-        let reading = self.nav.reading(&keys);
-        let column = div()
-            .named("docs-main")
-            .flex_1()
-            .min_w(0.0)
-            .h_full()
-            .overflow_y_scroll()
-            .track_scroll(&self.nav.scroll)
-            .flex_col()
-            .items_center()
-            .gap(14.0)
-            .px(10.0)
-            .pt(8.0)
-            .pb(16.0)
-            .children(parts.into_iter().map(|p| {
-                div()
-                    .key(p.key)
-                    .w_full()
-                    .max_w_px(CONTENT_WIDTH)
-                    .flex_col()
-                    .child(p.body)
-            }));
-        let toc = (!listed.is_empty()).then(|| {
-            div()
-                .named("docs-toc")
-                .w(56.0)
-                .shrink_0()
-                .h_full()
-                .min_h(0.0)
-                .overflow_y_scroll()
-                .scrollbar_none()
-                .flex_col()
-                .gap(2.0)
-                .pt(8.0)
-                .pr(6.0)
-                .pb(8.0)
-                .text_sm()
-                .child(text("On this page").font_medium().mb(1.0))
-                .children(listed.into_iter().map(|(key, label)| {
-                    let nav = self.nav.clone();
-                    let on = reading == Some(key);
-                    text(label)
-                        .text_color(if on { t.foreground } else { t.muted_foreground })
-                        .when(on, |l| l.font_medium())
-                        .cursor_pointer()
-                        .focusable()
-                        .hover(move |s| s.text_color(t.foreground))
-                        .focus_visible(move |s| s.ring(2.0, t.ring).rounded_sm())
-                        .on_click(move |_| nav.reveal(key))
-                }))
-        });
-        div().flex().flex_1().min_h(0.0).child(column).child(toc)
-    }
-
     /// The command palette over every page.
     fn palette(&self) -> Element {
-        let cmd = &self.search.cmd;
-        let item = |route: Route| {
-            let title = self.catalog.title(route);
-            let (nav, dialog) = (self.nav.clone(), self.search.dialog.clone());
-            let glyph = match route {
-                Route::Page(_) if self.catalog.group(route) == "Components" => Icon::Layers,
-                _ => Icon::FileText,
-            };
-            command_item(cmd, &title, false, move || {
-                nav.go(route);
-                dialog.close();
-            })
-            .map(|i| {
-                i.child(icon(glyph).text_color(theme().muted_foreground))
-                    .child(text(title.clone()))
-            })
+        let titled = |routes: &[Route]| -> Vec<CommandItem> {
+            routes
+                .iter()
+                .map(|&r| CommandItem::new(self.catalog.title(r)))
+                .collect()
         };
-        dialog_content(&self.search.dialog, |c| {
-            // The root first: it starts the frame the items then register in.
-            let root = command(cmd).child(command_input(cmd, "Search documentation..."));
-            let started = command_group(
-                Some("Getting Started"),
-                self.catalog.getting_started.iter().map(|&r| item(r)),
-            );
-            let components = command_group(Some("Components"), self.catalog.components.iter().map(|&r| item(r)));
-            let between = (started.is_some() && components.is_some()).then(command_separator);
-            c.named("docs-palette")
-                .p(0.0)
-                .gap(0.0)
-                .max_w_px(560.0)
-                .overflow_hidden()
-                .child(
-                    root.child(
-                        command_list()
-                            .max_h_px(360.0)
-                            .child(started)
-                            .child(between)
-                            .child(components)
-                            .child(command_empty(cmd, "No results found.")),
+        let sections = Rc::new(vec![
+            CommandSection::group(Some("Getting Started"), titled(&self.catalog.getting_started)),
+            CommandSection::Separator,
+            CommandSection::group(Some("Components"), titled(&self.catalog.components)),
+            CommandSection::empty("No results found."),
+        ]);
+        let routes: Vec<(String, Route)> = self
+            .catalog
+            .getting_started
+            .iter()
+            .chain(&self.catalog.components)
+            .map(|&r| (self.catalog.title(r), r))
+            .collect();
+        let glyphs: Vec<(String, Icon)> = routes
+            .iter()
+            .map(|(title, route)| {
+                let glyph = match route {
+                    Route::Page(_) if self.catalog.group(*route) == "Components" => Icon::Layers,
+                    _ => Icon::FileText,
+                };
+                (title.clone(), glyph)
+            })
+            .collect();
+        let (nav, open) = (self.nav.clone(), self.search.dialog);
+        let on_select = move |item: &CommandItem| {
+            if let Some(&(_, route)) = routes.iter().find(|(t, _)| *t == item.value) {
+                nav.go(route);
+                open.set(false);
+            }
+        };
+        let row = move |item: &CommandItem, row: Div| {
+            let glyph = glyphs
+                .iter()
+                .find(|(t, _)| *t == item.value)
+                .map_or(Icon::FileText, |&(_, g)| g);
+            row.child(icon(glyph).text_color(theme().muted_foreground))
+                .child(text(item.value.clone()))
+        };
+        dialog()
+            .open(self.search.dialog)
+            .child(
+                dialog_content()
+                    .map_root(|d| d.named("docs-palette"))
+                    .p(0.0)
+                    .gap(0.0)
+                    .max_w_px(560.0)
+                    .overflow_hidden()
+                    .child(
+                        command()
+                            .child(command_input("Search documentation..."))
+                            .child(command_list(sections, row).on_select(on_select).max_h_px(360.0)),
                     ),
-                )
-        })
+            )
+            .into_element()
     }
 }
 
-/// Open the docs in a window with the debug tools `debug` turns on.
-pub fn run(debug: gui::DebugTools) -> ! {
-    gui::provide(Host::Docs);
-    let mut docs = Docs::new(Route::Introduction);
+/// Open the docs in a window with the debug tools `debug` turns on;
+/// `setup` runs first on the UI thread, where the app's state lives
+/// (ADR-0015), to provide what the docs read (the theme).
+pub fn run(debug: gui::DebugTools, setup: impl FnOnce() + Send + 'static) -> ! {
     let options = RunOptions {
         debug,
         ..RunOptions::default()
     };
-    gui::run("shadcn-rs docs", move || docs.render(), options)
+    gui::run(
+        "shadcn-rs docs",
+        move || {
+            setup();
+            gui::provide(Host::Docs);
+            let mut docs = Docs::new(Route::Introduction);
+            move || docs.render()
+        },
+        options,
+    )
 }
 
 /// The docs as a page's render function, opened at the introduction: what
@@ -526,11 +440,7 @@ fn primary() -> Modifiers {
 }
 
 /// Click the centre of the first node in the last frame that `pick` takes.
-fn click_node<C: FnMut() -> Element>(
-    s: &mut Scenario<C>,
-    what: &str,
-    pick: impl Fn(&[FrameNode], usize) -> bool,
-) -> Result<(), ScenarioError> {
+fn click_node(s: &mut Scenario, what: &str, pick: impl Fn(&[FrameNode], usize) -> bool) -> Result<(), ScenarioError> {
     let nodes = &s.last().nodes;
     let b = (0..nodes.len())
         .find(|&i| pick(nodes, i))
@@ -617,7 +527,7 @@ pub fn trace(dir: &Path) -> Result<(), ScenarioError> {
 
 /// Open every component page and print each demo (or playground) whose
 /// content reaches past its box unclipped; frame the pages in [`SWEEP_FRAMES`].
-fn sweep<C: FnMut() -> Element>(s: &mut Scenario<C>, nav: &Nav, catalog: &Catalog) -> Result<(), ScenarioError> {
+fn sweep(s: &mut Scenario, nav: &Nav, catalog: &Catalog) -> Result<(), ScenarioError> {
     const SWEEP_FRAMES: &[&str] = &[
         "sidebar",
         "typography",
@@ -696,4 +606,109 @@ fn coverage() {
          {} not in their page's file {missing:?}",
         missing.len(),
     );
+}
+
+/// A gallery page (ADR-0013): an instance whose setup makes the page's state
+/// and its demos' once, unmounted (and its state dropped) when the reader
+/// leaves the page. Only it renders when what it shows changes.
+fn page_view(catalog: Rc<Catalog>, nav: Nav, verdicts: Signal<Rc<Verdicts>>, i: usize) -> Element {
+    gui::component(i, move |_| {
+        let mut render = catalog.entries.get(i).map(|e| (e.page.render)());
+        let mut demos = DemoStates::new();
+        move || {
+            let (Some(entry), Some(render)) = (catalog.entries.get(i), render.as_mut()) else {
+                return gui::Element::Empty;
+            };
+            let lifted = lift::lift(render());
+            let mut parts = component::parts(entry, lifted, &mut demos, &verdicts.get());
+            parts.push(Part::new("pager", None, pager(&catalog, &nav, Route::Page(i))));
+            body(&nav, parts).into_element()
+        }
+    })
+    .key(gui::ElementKey::try_from(i).unwrap_or(0))
+    .into_element()
+}
+
+/// Previous and next, as ui.shadcn.com ends each page.
+fn pager(catalog: &Catalog, nav: &Nav, route: Route) -> Div {
+    let (prev, next) = catalog.neighbours(route);
+    let link = |to: Route, glyph: Icon, before: bool| {
+        let nav = nav.clone();
+        let title = catalog.title(to);
+        button(ButtonVariant::Secondary, ButtonSize::Sm)
+            .on_click(move |_| nav.go(to))
+            .when(before, |b| b.child(icon(glyph)))
+            .child(title)
+            .when(!before, |b| b.child(icon(glyph)))
+    };
+    div()
+        .flex()
+        .items_center()
+        .pt(6.0)
+        .when_some(prev, |d, r| d.child(link(r, Icon::ArrowLeft, true)))
+        .when_some(next, |d, r| {
+            d.child(div().ml_auto().child(link(r, Icon::ArrowRight, false)))
+        })
+}
+
+/// The page's column and its "On this page" list.
+fn body(nav: &Nav, parts: Vec<Part>) -> Div {
+    let t = theme();
+    let listed: Vec<(ElementKey, String)> = parts
+        .iter()
+        .filter_map(|p| p.toc.clone().map(|label| (p.key, label)))
+        .collect();
+    let keys: Vec<ElementKey> = listed.iter().map(|(k, _)| *k).collect();
+    let reading = nav.reading(&keys);
+    let column = div()
+        .named("docs-main")
+        .flex_1()
+        .min_w(0.0)
+        .h_full()
+        .overflow_y_scroll()
+        .track_scroll(&nav.scroll)
+        .flex_col()
+        .items_center()
+        .gap(14.0)
+        .px(10.0)
+        .pt(8.0)
+        .pb(16.0)
+        .children(parts.into_iter().map(|p| {
+            div()
+                .key(p.key)
+                .w_full()
+                .max_w_px(CONTENT_WIDTH)
+                .flex_col()
+                .child(p.body)
+        }));
+    let toc = (!listed.is_empty()).then(|| {
+        div()
+            .named("docs-toc")
+            .w(56.0)
+            .shrink_0()
+            .h_full()
+            .min_h(0.0)
+            .overflow_y_scroll()
+            .scrollbar_none()
+            .flex_col()
+            .gap(2.0)
+            .pt(8.0)
+            .pr(6.0)
+            .pb(8.0)
+            .text_sm()
+            .child(text("On this page").font_medium().mb(1.0))
+            .children(listed.into_iter().map(|(key, label)| {
+                let nav = nav.clone();
+                let on = reading == Some(key);
+                text(label)
+                    .text_color(if on { t.foreground } else { t.muted_foreground })
+                    .when(on, |l| l.font_medium())
+                    .cursor_pointer()
+                    .focusable()
+                    .hover(move |s| s.text_color(t.foreground))
+                    .focus_visible(move |s| s.ring(2.0, t.ring).rounded_sm())
+                    .on_click(move |_| nav.reveal(key))
+            }))
+    });
+    div().flex().flex_1().min_h(0.0).child(column).child(toc)
 }

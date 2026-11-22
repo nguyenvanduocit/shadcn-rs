@@ -1,9 +1,9 @@
 use gui::prelude::*;
-use gui::{Icon, ImageSource, ScenarioError, Side, SideAlign, div, icon, image, span, text};
+use gui::{Icon, ImageSource, ScenarioError, SideAlign, div, icon, image, span, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, ItemMediaVariant, ItemSize, ItemVariant, MenuItem, MenuState, avatar, avatar_fallback,
-    avatar_image, button, dropdown_menu_content, dropdown_menu_item, dropdown_menu_trigger, item, item_actions,
-    item_content, item_description, item_group, item_header, item_link, item_media, item_media_described,
+    ButtonSize, ButtonVariant, ItemMediaVariant, ItemSize, ItemVariant, MenuItem, avatar, avatar_fallback,
+    avatar_image, button, dropdown_menu, dropdown_menu_content, dropdown_menu_item, dropdown_menu_trigger, item,
+    item_actions, item_content, item_description, item_group, item_header, item_link, item_media, item_media_described,
     item_separator, item_title, theme,
 };
 
@@ -90,7 +90,6 @@ pub fn render() -> Render {
         .collect();
     let models = MODELS.map(|(_, _, id)| photo(id));
     let covers = MUSIC.map(|(title, ..)| photo(title));
-    let select = MenuState::new();
     Box::new(move || {
         let t = theme();
         let image_of = |login: &str| photos.iter().find(|(l, _)| *l == login).and_then(|(_, p)| p.as_ref());
@@ -219,31 +218,30 @@ pub fn render() -> Render {
                 })),
             );
 
-        let menu = dropdown_menu_content(&select)
+        let menu = dropdown_menu_content()
+            .align(SideAlign::End)
             .w(72.0)
             .radius_var(0.65 * 16.0)
             .children(PEOPLE.iter().map(|(login, email)| {
-                dropdown_menu_item(&select, login, MenuItem::default(), || {})
-                    .p(0.0)
-                    .child(
-                        item(ItemVariant::Default, ItemSize::Sm)
-                            .w_full()
-                            .p(2.0)
-                            .child(
-                                item_media_described(ItemMediaVariant::Default).child(
-                                    avatar()
-                                        .size(8.0)
-                                        .child(avatar_image(image_of(login)).map(Styled::grayscale))
-                                        .child(avatar_fallback(image_of(login), initial(login))),
-                                ),
-                            )
-                            .child(
-                                item_content()
-                                    .gap(0.5)
-                                    .child(item_title(*login))
-                                    .child(item_description(*email)),
+                dropdown_menu_item(login, MenuItem::default()).p(0.0).child(
+                    item(ItemVariant::Default, ItemSize::Sm)
+                        .w_full()
+                        .p(2.0)
+                        .child(
+                            item_media_described(ItemMediaVariant::Default).child(
+                                avatar()
+                                    .size(8.0)
+                                    .child(avatar_image(image_of(login)).map(Styled::grayscale))
+                                    .child(avatar_fallback(image_of(login), initial(login))),
                             ),
-                    )
+                        )
+                        .child(
+                            item_content()
+                                .gap(0.5)
+                                .child(item_title(*login))
+                                .child(item_description(*email)),
+                        ),
+                )
             }));
         let dropdown = div()
             .flex()
@@ -253,16 +251,16 @@ pub fn render() -> Render {
             .flex_col()
             .items_center()
             .gap(6.0)
-            .child(dropdown_menu_trigger(
-                &select,
-                button(ButtonVariant::Outline, ButtonSize::Sm)
-                    .w_fit()
-                    .child("Select")
-                    .child(icon(Icon::ChevronDown)),
-                Side::Bottom,
-                SideAlign::End,
-                menu,
-            ));
+            .child(
+                dropdown_menu()
+                    .child(dropdown_menu_trigger(
+                        button(ButtonVariant::Outline, ButtonSize::Sm)
+                            .w_fit()
+                            .child("Select")
+                            .child(icon(Icon::ChevronDown)),
+                    ))
+                    .child(menu),
+            );
 
         let header = div().flex().w_full().max_w_px(576.0).flex_col().gap(6.0).child(
             item_group()

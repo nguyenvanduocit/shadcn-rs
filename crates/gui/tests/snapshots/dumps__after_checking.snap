@@ -1,0 +1,24 @@
+---
+source: crates/gui/tests/dumps.rs
+expression: "s.run(\"a11y\").expect(\"a11y\")"
+---
+Window "window"
+  Label value="Account settings"  @0/0/0
+  Label value="Choose how the app greets you and what it keeps between visits."  @0/0/1
+  Label value="Display name"  @0/0/2/0
+  TextInput "Display name" value="" selection=0..0 [focus,setvalue]  @0/0/2/1
+    TextRun value=""
+  CheckBox "Remember me" toggled=True [click]  @0/0/3
+    Label value="Remember me"  @0/0/3/1
+  List  @0/0/4
+    ListItem 1/3  @0/0/4/0
+      Label value="Profile"  @0/0/4/0/0
+    ListItem 2/3  @0/0/4/1
+      Label value="Notifications"  @0/0/4/1/0
+    ListItem 3/3  @0/0/4/2
+      Label value="Privacy"  @0/0/4/2/0
+  Button disabled  @0/0/5/0
+    Label value="Reset"  @0/0/5/0/0
+  Button [click]  @0/0/5/1
+    Label value="Save"  @0/0/5/1/0
+19 nodes heard

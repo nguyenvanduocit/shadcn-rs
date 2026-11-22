@@ -1,6 +1,6 @@
 # 0011. `gui` paints a scene on the GPU
 
-Status: accepted, 2026-11-21. Supersedes how ADR-0003 and ADR-0008 paint; keeps what they decide.
+Status: accepted, 2026-11-21 (the CPU renderer removed the same day). Supersedes how ADR-0003 and ADR-0008 paint; keeps what they decide. Its single-threaded window renderer and frame latency 2 superseded by ADR-0015; one pipeline, bytes without `bytemuck`, atlas doubling, layers every frame and `downlevel_defaults` with GL by ADR-0016; tiny-skia shapes, resvg icons and `tiny_skia::Pixmap` capture by ADR-0017.
 
 ## Context
 
@@ -34,9 +34,10 @@ Option 2. Paint is split in two, as GPUI splits it.
   rings), shadows, gradients, glyphs, icons, images, shapes, text showing a gradient through it, and groups (opacity,
   mask, filters, transform) holding their own items. Each item carries its clip (a rounded rectangle). Every decision
   of what to paint is made here, once.
-- **A `Renderer` turns a scene into pixels.** `gpu::GpuRenderer` draws in a window, or headless with read-back.
-  `cpu::CpuRenderer` is the former tiny-skia painter, moved unchanged: on all 647 docs frames it gives the same bytes
-  as before but one pixel, off by one.
+- **A `Renderer` turns a scene into pixels.** `gpu::GpuRenderer` draws in a window, or headless with read-back. It
+  is the only renderer. The former tiny-skia painter was first moved behind the same trait (on all 647 docs frames
+  it gave the same bytes as before but one pixel, off by one), held the GPU to its pixels, then was removed with
+  softbuffer.
 - **The GPU draws every primitive with one pipeline** (`gpu/shaders.wgsl`). Each instance is a quad over the pixels it
   may touch. The fragment shader picks the primitive's kind and computes coverage: GPUI's rounded-box signed distance,
   exact area for axis-aligned rectangles, GPUI's blurred rounded box for shadows (cut out by the casting box, as CSS
@@ -53,10 +54,11 @@ Option 2. Paint is split in two, as GPUI splits it.
   view.
 - **Everything paints on the GPU, headless too.** A `Scenario` (shots, verdict, bench, devtools sessions,
   `snapshot`) draws on the GPU and reads back, in bands no taller than a texture may be. A measuring scenario only
-  waits for the GPU. A live screenshot (`--attach screenshot`) reads the frame back from the GPU. The CPU renderer
-  paints only where no adapter answers, or under `GUI_RENDERER=cpu`, which CI sets: its runner has no GPU.
-  Rasters made once and then cached on the GPU are still made by the CPU: glyphs (swash), icons (resvg), shapes
-  (tiny-skia), decoded images. GPUI makes its glyphs the same way.
+  waits for the GPU. A live screenshot (`--attach screenshot`) reads the frame back from the GPU. With no adapter,
+  a window or scenario fails to start (`ScenarioError::Gpu`); a machine without a GPU installs a software Vulkan
+  driver (Mesa's lavapipe), which wgpu paints on through the same code. Rasters made once and then cached on the
+  GPU are still made by the CPU: glyphs (swash), icons (resvg), shapes (tiny-skia), decoded images. GPUI makes its
+  glyphs the same way.
 - **`unsafe` stays forbidden.** wgpu's safe API is enough; instance data is written as bytes, without `bytemuck`.
 
 ## Consequences
@@ -76,9 +78,10 @@ Option 2. Paint is split in two, as GPUI splits it.
   once, as the CPU's pool does.
 - Edges anti-aliased by area (a 1 px line at a fractional y) differ from tiny-skia's 4× supersampling by up to 30/255.
   Chrome judges both the same.
-- CI has no GPU and runs on the CPU renderer (`GUI_RENDERER=cpu`). It stays the reference the GPU is held to
-  (`gpu::tests`).
-- `Footprint`'s rasters are what the renderer holds: on the GPU, atlas pages and textures (shadows hold nothing).
+- CI has no GPU and runs the GPU renderer on lavapipe. There is no second renderer to hold the GPU to: the
+  verdict against Chrome's pixels and `gpu::tests` (exact pixels of small scenes) are the reference.
+- `Footprint`'s rasters are what the renderer holds: atlas pages and textures. Shadows are computed in the shader,
+  so the shadow cache and its `Footprint` entry are gone.
 - New dependencies: `wgpu` 30, `etagere` 0.3, `pollster` 0.4 (MIT/Apache-2.0). GPUI's signed-distance and shadow
   functions are Apache-2.0 (`THIRD_PARTY.md`).
 

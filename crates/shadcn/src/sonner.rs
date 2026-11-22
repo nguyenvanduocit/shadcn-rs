@@ -1,21 +1,26 @@
 //! Sonner (`ui/sonner`): toasts, as vue-sonner draws them with shadcn's
-//! colours. A [`Toaster`] holds the toasts; [`toaster`] renders them in the
-//! window's bottom-right corner, the newest in front and up to two peeking
-//! behind it, spread out while the pointer is over them. A toast rises in as
-//! it comes, sinks out as it goes, and slides between front and behind.
+//! colours. As there, [`toaster`] is placed once (`<Toaster />`) and holds
+//! the toasts, rendering them in the window's bottom-right corner, the newest
+//! in front and up to two peeking behind it, spread out while the pointer is
+//! over them; [`toast()`] and the functions of [`toast`](mod@toast) raise them from
+//! anywhere (`toast('…')`, `toast.success('…')`), going to the toaster
+//! mounted last. A toast rises in as it comes, sinks out as it goes, and
+//! slides between front and behind.
 //!
 //! Each toast leaves after 4 seconds (a loading toast stays until it is
-//! updated); the countdown pauses while the stack is spread out.
+//! updated); the countdown pauses while the stack is spread out. The
+//! countdowns belong to the toaster: unmounted, it cancels them.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gui::clock::{self, TimerId};
+use gui::clock;
 use gui::prelude::*;
 use gui::style::Calc;
 use gui::{
-    Animation, Color, Div, Easing, Element, Icon, Placement, Properties, Shadow, Signal, deferred, div, icon, text,
+    Animation, Color, Div, Easing, Element, Icon, Placement, Properties, Scope, Shadow, Signal, component, deferred,
+    div, icon, on_unmounted, text,
 };
 
 use crate::spinner::spinner;
@@ -121,7 +126,19 @@ impl Toast {
     }
 }
 
-/// Identifies a toast shown by a [`Toaster`], to update or dismiss it.
+impl From<&str> for Toast {
+    fn from(title: &str) -> Self {
+        Self::new(ToastKind::Default, title)
+    }
+}
+
+impl From<String> for Toast {
+    fn from(title: String) -> Self {
+        Self::new(ToastKind::Default, title)
+    }
+}
+
+/// Identifies a toast, to update or dismiss it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ToastId(u64);
 
@@ -132,8 +149,8 @@ struct Shown {
     toast: Toast,
     /// Time left before it leaves; `None` while it stays (loading).
     left: Option<Duration>,
-    /// The running countdown and when it started.
-    running: Option<(TimerId, Instant)>,
+    /// The running countdown's scope (disposing it cancels it) and when it started.
+    running: Option<(Scope, Instant)>,
 }
 
 /// What the devtools show of a toast on screen: its id, kind, title and
@@ -149,34 +166,30 @@ impl std::fmt::Debug for Shown {
     }
 }
 
-/// The toasts on screen, newest first (`<Toaster />` with vue-sonner's `toast`).
-#[derive(Clone)]
-pub struct Toaster {
+thread_local! {
+    /// The toasters mounted, last mounted last: where [`toast()`] goes.
+    static TOASTERS: RefCell<Vec<Store>> = const { RefCell::new(Vec::new()) };
+    /// The id the next toast gets.
+    static NEXT: Cell<u64> = const { Cell::new(1) };
+}
+
+/// The toasts a [`toaster`] holds, newest first. Made in its setup.
+#[derive(Clone, Copy, PartialEq)]
+struct Store {
     shown: Signal<Vec<Shown>>,
     expanded: Signal<bool>,
-    next: Rc<Cell<u64>>,
+    /// The toaster's scope, owning each countdown's: unmounted, the
+    /// toaster cancels them.
+    owner: Scope,
 }
 
-impl Default for Toaster {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Toaster {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            shown: Signal::labeled("toasts", Vec::new()),
-            expanded: Signal::labeled("toaster-expanded", false),
-            next: Rc::new(Cell::new(1)),
-        }
+impl Store {
+    fn last() -> Option<Self> {
+        TOASTERS.with(|t| t.borrow().last().copied())
     }
 
     /// Show `toast` in front of the others.
-    pub fn show(&self, toast: Toast) -> ToastId {
-        let id = ToastId(self.next.get());
-        self.next.set(self.next.get().wrapping_add(1));
+    fn show(self, id: ToastId, toast: Toast) {
         let shown = Shown {
             id,
             left: lifetime(toast.kind),
@@ -184,112 +197,153 @@ impl Toaster {
             running: None,
         };
         // While the stack is spread out every countdown waits.
-        let shown = if self.expanded.get() { shown } else { self.start(shown) };
-        self.shown.update(|mut all| {
-            all.insert(0, shown);
-            all
-        });
-        id
+        let shown = if self.expanded.get_untracked() {
+            shown
+        } else {
+            self.start(shown)
+        };
+        self.shown.update(|all| all.insert(0, shown));
     }
 
-    /// `toast(title)`.
-    pub fn toast(&self, title: impl Into<String>) -> ToastId {
-        self.show(Toast::new(ToastKind::Default, title))
-    }
-
-    /// `toast.success(title)`.
-    pub fn success(&self, title: impl Into<String>) -> ToastId {
-        self.show(Toast::new(ToastKind::Success, title))
-    }
-
-    /// `toast.info(title)`.
-    pub fn info(&self, title: impl Into<String>) -> ToastId {
-        self.show(Toast::new(ToastKind::Info, title))
-    }
-
-    /// `toast.warning(title)`.
-    pub fn warning(&self, title: impl Into<String>) -> ToastId {
-        self.show(Toast::new(ToastKind::Warning, title))
-    }
-
-    /// `toast.error(title)`.
-    pub fn error(&self, title: impl Into<String>) -> ToastId {
-        self.show(Toast::new(ToastKind::Error, title))
-    }
-
-    /// `toast.loading(title)`: stays until [`Self::update`] or [`Self::dismiss`].
-    pub fn loading(&self, title: impl Into<String>) -> ToastId {
-        self.show(Toast::new(ToastKind::Loading, title))
-    }
-
-    /// Replace what toast `id` says, in place, and restart its countdown
-    /// (how `toast.promise` turns a loading toast into its result).
-    pub fn update(&self, id: ToastId, toast: Toast) {
-        let paused = self.expanded.get();
-        self.shown.update(|all| {
-            all.into_iter()
-                .map(|s| {
-                    if s.id != id {
-                        return s;
-                    }
-                    let fresh = Shown {
-                        id,
-                        left: lifetime(toast.kind),
-                        toast: toast.clone(),
-                        running: stop(s.running),
-                    };
-                    if paused { fresh } else { self.start(fresh) }
-                })
-                .collect()
-        });
+    /// Replace what toast `id` says, in place, and restart its countdown.
+    fn update(self, id: ToastId, toast: &Toast) {
+        let paused = self.expanded.get_untracked();
+        let mut all = self.shown.get_untracked();
+        for s in &mut all {
+            if s.id != id {
+                continue;
+            }
+            stop(s.running.take());
+            let fresh = Shown {
+                id,
+                left: lifetime(toast.kind),
+                toast: toast.clone(),
+                running: None,
+            };
+            *s = if paused { fresh } else { self.start(fresh) };
+        }
+        self.shown.replace(all);
     }
 
     /// Take toast `id` off the screen.
-    pub fn dismiss(&self, id: ToastId) {
+    fn dismiss(self, id: ToastId) {
+        let mut gone = None;
         self.shown.update(|all| {
-            all.into_iter()
-                .filter(|s| {
-                    let keep = s.id != id;
-                    if !keep && let Some((timer, _)) = s.running {
-                        clock::cancel(timer);
-                    }
-                    keep
-                })
-                .collect()
+            all.retain_mut(|s| {
+                let keep = s.id != id;
+                if !keep {
+                    gone = s.running.take();
+                }
+                keep
+            });
         });
+        stop(gone);
     }
 
     /// Start `s`'s countdown, if it has one.
-    fn start(&self, mut s: Shown) -> Shown {
-        if let Some(left) = s.left {
-            let me = self.clone();
+    fn start(self, mut s: Shown) -> Shown {
+        if let Some(left) = s.left
+            && self.owner.is_alive()
+        {
             let id = s.id;
-            s.running = Some((clock::after(left, move || me.dismiss(id)), Instant::now()));
+            let scope = self.owner.run(Scope::new);
+            scope.run(|| {
+                clock::after(left, move || self.dismiss(id));
+            });
+            s.running = Some((scope, Instant::now()));
         }
         s
     }
 
     /// Spread the stack out and pause every countdown, or gather it and resume.
-    fn set_expanded(&self, expanded: bool) {
-        if self.expanded.get() == expanded {
+    fn set_expanded(self, expanded: bool) {
+        if self.expanded.get_untracked() == expanded {
             return;
         }
         self.expanded.set(expanded);
-        self.shown.update(|all| {
-            all.into_iter()
-                .map(|mut s| {
-                    if expanded {
-                        if let Some((timer, since)) = s.running.take() {
-                            clock::cancel(timer);
-                            s.left = s.left.map(|l| l.saturating_sub(since.elapsed()));
-                        }
-                        s
-                    } else {
-                        self.start(s)
+        let all: Vec<Shown> = self
+            .shown
+            .get_untracked()
+            .into_iter()
+            .map(|mut s| {
+                if expanded {
+                    if let Some((scope, since)) = s.running.take() {
+                        scope.dispose();
+                        s.left = s.left.map(|l| l.saturating_sub(since.elapsed()));
                     }
-                })
-                .collect()
-        });
+                    s
+                } else {
+                    self.start(s)
+                }
+            })
+            .collect();
+        self.shown.replace(all);
+    }
+}
+
+/// Cancel a countdown.
+fn stop(running: Option<(Scope, Instant)>) {
+    if let Some((scope, _)) = running {
+        scope.dispose();
+    }
+}
+
+/// Show `toast` (a title, or a [`Toast`]) on the toaster mounted last
+/// (vue-sonner's `toast('…')`); with none mounted it shows nowhere.
+pub fn toast(toast: impl Into<Toast>) -> ToastId {
+    let id = ToastId(NEXT.get());
+    NEXT.set(NEXT.get().wrapping_add(1));
+    if let Some(store) = Store::last() {
+        store.show(id, toast.into());
+    }
+    id
+}
+
+/// vue-sonner's `toast.success(…)` and its siblings, `toast.dismiss(id)`,
+/// and updating a toast in place.
+pub mod toast {
+    use super::{Store, Toast, ToastId, ToastKind};
+
+    /// `toast.success(title)`.
+    pub fn success(title: impl Into<String>) -> ToastId {
+        super::toast(Toast::new(ToastKind::Success, title))
+    }
+
+    /// `toast.info(title)`.
+    pub fn info(title: impl Into<String>) -> ToastId {
+        super::toast(Toast::new(ToastKind::Info, title))
+    }
+
+    /// `toast.warning(title)`.
+    pub fn warning(title: impl Into<String>) -> ToastId {
+        super::toast(Toast::new(ToastKind::Warning, title))
+    }
+
+    /// `toast.error(title)`.
+    pub fn error(title: impl Into<String>) -> ToastId {
+        super::toast(Toast::new(ToastKind::Error, title))
+    }
+
+    /// `toast.loading(title)`: stays until [`update`] or [`dismiss`].
+    pub fn loading(title: impl Into<String>) -> ToastId {
+        super::toast(Toast::new(ToastKind::Loading, title))
+    }
+
+    /// Replace what toast `id` says, in place, and restart its countdown
+    /// (`toast.success(…, { id })`, how `toast.promise` turns a loading
+    /// toast into its result).
+    pub fn update(id: ToastId, toast: impl Into<Toast>) {
+        let toast = toast.into();
+        if let Some(store) = Store::last() {
+            store.update(id, &toast);
+        }
+    }
+
+    /// Take toast `id` off the screen (`toast.dismiss(id)`).
+    pub fn dismiss(id: ToastId) {
+        if let Some(store) = Store::last() {
+            store.dismiss(id);
+        }
     }
 }
 
@@ -297,35 +351,48 @@ fn lifetime(kind: ToastKind) -> Option<Duration> {
     (kind != ToastKind::Loading).then_some(LIFETIME)
 }
 
-fn stop(running: Option<(TimerId, Instant)>) -> Option<(TimerId, Instant)> {
-    if let Some((timer, _)) = running {
-        clock::cancel(timer);
-    }
-    None
+/// The toaster (`<Toaster />`): the toasts over the window's bottom-right
+/// corner, nothing while there are none. Place it once, last in the window's
+/// tree; [`toast()`] goes to the one mounted last.
+#[must_use]
+pub fn toaster() -> Element {
+    component((), |_| {
+        let store = Store {
+            shown: Signal::labeled("toasts", Vec::new()),
+            expanded: Signal::labeled("toaster-expanded", false),
+            owner: Scope::new(),
+        };
+        TOASTERS.with(|t| t.borrow_mut().push(store));
+        on_unmounted(move || {
+            TOASTERS
+                .try_with(|t| t.borrow_mut().retain(|s| *s != store))
+                .unwrap_or(());
+        });
+        move || stack(store)
+    })
+    .named("toaster")
+    .into_element()
 }
 
-/// The toasts of `toaster` over the window's bottom-right corner; nothing
-/// while there are none. Place it once, last in the window's tree.
-#[must_use]
-pub fn toaster(toaster: &Toaster) -> Element {
-    let shown = toaster.shown.get();
+/// What `store` shows.
+fn stack(store: Store) -> Element {
+    let shown = store.shown.get();
     if shown.is_empty() {
         return Element::Empty;
     }
-    let expanded = toaster.expanded.get();
+    let expanded = store.expanded.get();
     let visible: Vec<&Shown> = shown.iter().take(VISIBLE).collect();
-    let on_hover = toaster.clone();
     let stack = div()
         .named("toaster")
         .relative()
         .w_px(WIDTH)
-        .on_hover(move |inside| on_hover.set_expanded(inside));
+        .on_hover(move |inside| store.set_expanded(inside));
     let stack = if expanded {
         // Oldest on top, the newest at the bottom edge.
         stack
             .flex_col()
             .gap(GAP / gui::styled::UNIT)
-            .children(visible.iter().rev().map(|s| toast_box(toaster, s, None)))
+            .children(visible.iter().rev().map(|s| toast_box(store, s, None)))
     } else {
         // All in one cell, the ones behind first so the front one paints
         // over them; a toast leaving shares the cell with the one taking its place.
@@ -335,7 +402,7 @@ pub fn toaster(toaster: &Toaster) -> Element {
             .map(|s| {
                 let n = behind;
                 behind += 1.0;
-                toast_box(toaster, s, (n > 0.0).then_some(n))
+                toast_box(store, s, (n > 0.0).then_some(n))
             })
             .collect();
         stack.grid().items_end().children(toasts.into_iter().rev())
@@ -382,7 +449,7 @@ fn description_color(dark: bool) -> Color {
 /// The toast `s`; `behind` is how many toasts are in front of it while the
 /// stack is gathered: then it takes the front one's height, lifted by that
 /// many gaps and narrowed, its content faded out.
-fn toast_box(toaster: &Toaster, s: &Shown, behind: Option<f32>) -> Div {
+fn toast_box(store: Store, s: &Shown, behind: Option<f32>) -> Div {
     let t = theme();
     let kind_icon = match s.toast.kind {
         ToastKind::Default => None,
@@ -415,7 +482,6 @@ fn toast_box(toaster: &Toaster, s: &Shown, behind: Option<f32>) -> Div {
                 .child(d)
         }));
     let action = s.toast.action.clone().map(|a| {
-        let me = toaster.clone();
         let id = s.id;
         div()
             .named("toast-action")
@@ -435,7 +501,7 @@ fn toast_box(toaster: &Toaster, s: &Shown, behind: Option<f32>) -> Div {
             .focus_visible(|st| st.ring(2.0, Color::BLACK.opacity(0.4)))
             .on_click(move |_| {
                 (a.on_click)();
-                me.dismiss(id);
+                store.dismiss(id);
             })
             .child(a.label)
     });

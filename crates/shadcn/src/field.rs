@@ -42,7 +42,7 @@ pub struct FieldChild(Kind);
 enum Kind {
     Legend { pulls_up: bool, el: Div },
     Description(Div),
-    Choices(Div),
+    Choices(Element),
     Content(Div),
     Other(Element),
 }
@@ -119,12 +119,13 @@ impl FieldStack {
                 Kind::Description(d) if after_legend => d.mt(-1.5).into_element(),
                 Kind::Description(d) if i.saturating_add(2) == count => d.mt(-1.0).into_element(),
                 Kind::Legend { el, .. } => el.mb(legend_mb).into_element(),
-                Kind::Description(el) | Kind::Choices(el) | Kind::Content(el) => el.into_element(),
+                Kind::Description(el) | Kind::Content(el) => el.into_element(),
+                Kind::Choices(el) => el,
                 Kind::Other(el) => el,
             });
             // `@md/field-group:[&>*]:w-auto`: a control drops its `w-full`.
-            if auto_width && let Some(style) = out.last_mut().and_then(Element::style_mut) {
-                style.width = gui::Length::Auto;
+            if auto_width && let Some(el) = out.pop() {
+                out.push(el.restyle(|s| s.w_auto()));
             }
             after_legend = pulls_up;
         }
@@ -224,31 +225,38 @@ pub fn field_checkbox_group() -> FieldChoices {
 /// Mark `group` (a radio group, a checkbox group) as the choices of a field
 /// set, which then sets its children closer.
 #[must_use]
-pub fn field_choices(group: Div) -> FieldChoices {
+pub fn field_choices<G: Styled + IntoElement>(group: G) -> FieldChoices<G> {
     FieldChoices(group)
 }
 
 /// A group of choices; add its fields with `.child`.
-pub struct FieldChoices(Div);
+pub struct FieldChoices<G = Div>(G);
 
-impl FieldChoices {
+impl FieldChoices<Div> {
     #[must_use]
     pub fn child(self, child: impl IntoElement) -> Self {
         Self(self.0.child(child))
     }
 }
 
-impl Fluent for FieldChoices {}
+impl<P: 'static> FieldChoices<crate::part::Part<P>> {
+    #[must_use]
+    pub fn child(self, child: impl IntoElement) -> Self {
+        Self(self.0.child(child))
+    }
+}
 
-impl Styled for FieldChoices {
+impl<G: Styled> Fluent for FieldChoices<G> {}
+
+impl<G: Styled> Styled for FieldChoices<G> {
     fn style_mut(&mut self) -> &mut Style {
         self.0.style_mut()
     }
 }
 
-impl IntoFieldChild for FieldChoices {
+impl<G: Styled + IntoElement> IntoFieldChild for FieldChoices<G> {
     fn into_field_child(self) -> FieldChild {
-        FieldChild(Kind::Choices(self.0))
+        FieldChild(Kind::Choices(self.0.into_element()))
     }
 }
 

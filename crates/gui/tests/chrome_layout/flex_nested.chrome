@@ -1,0 +1,15 @@
+# Chrome's boxes for flex_nested.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 200
+  div 10 10 100 180
+    div 10 10 100 30
+    div 10 44 100 146
+      div 10 44 70 146
+      div 80 44 30 146
+  div 120 10 270 180
+    div 120 10 270 50
+      div 120 10 60 50
+      div 180 10 60 50
+        div 185 15 50 10
+    div 120 60 270 130

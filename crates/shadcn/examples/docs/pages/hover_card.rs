@@ -3,14 +3,13 @@ use std::time::Duration;
 use gui::prelude::*;
 use gui::{Icon, ScenarioError, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, HoverCardState, avatar, avatar_fallback, avatar_image, button, hover_card,
-    hover_card_content, hover_card_trigger, theme,
+    ButtonSize, ButtonVariant, avatar, avatar_fallback, avatar_image, button, hover_card, hover_card_content,
+    hover_card_trigger, theme,
 };
 
 use crate::{Render, Shot, demo, page, photo};
 
 pub fn render() -> Render {
-    let state = HoverCardState::new();
     let vercel = photo("vercel");
     Box::new(move || {
         let t = theme();
@@ -20,11 +19,10 @@ pub fn render() -> Render {
                 "HoverCardDemo.vue",
                 hover_card()
                     .child(hover_card_trigger(
-                        &state,
                         button(ButtonVariant::Link, ButtonSize::Default).child("@nuxt"),
                     ))
-                    .child(hover_card_content(&state, |c| {
-                        c.w(80.0).child(
+                    .child(
+                        hover_card_content().w(80.0).child(
                             div()
                                 .flex()
                                 .justify_between()
@@ -53,8 +51,8 @@ pub fn render() -> Render {
                                                 ),
                                         ),
                                 ),
-                        )
-                    })),
+                        ),
+                    ),
             ),
         )
     })

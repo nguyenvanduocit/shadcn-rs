@@ -8,10 +8,16 @@
 //! `-- --verdict <dir> [page…] [--dark] [--color=N --shift=N --size=N --no-coverage]`
 //! judges them against shadcn-vue's own, forgiving what [`verdict::Tolerance`]
 //! says (`crates/shadcn/verdict/run.sh` runs both steps around the browser);
+//! `-- --clock` prints the instant the docs are at and its time zone
+//! ("<ms since the epoch> <IANA zone>", [`verdict::CLOCK_MS`]), which the
+//! verdict pins the browser to;
 //! `-- --bench [page…] [--budget=MS --frames=N --json=PATH --baseline=PATH]` times each page and checks
 //! it gives back what a pointer walk takes ([`bench`]); `-- --hud` opens the
 //! docs with the frame HUD (F10 toggles it); `-- --export <file>` writes the
-//! docs as JSON for the website (`site/`, [`docs::export`]).
+//! docs as JSON for the website (`site/`, [`docs::export`]);
+//! `-- --text-sample <dir>` draws the text sample at 1x and 2x and
+//! `-- --text-compare <dir>` measures it against Chrome's
+//! (`crates/shadcn/verdict/text.sh` runs both around the browser).
 //!
 //! The devtools ([`gui::devtools`], `help` lists their commands):
 //! `-- --inspect <page|docs> [--size=WxH --scale=N] [-e CMD]…` drives a page
@@ -23,6 +29,7 @@
 mod bench;
 mod docs;
 mod pages;
+mod text_sample;
 mod verdict;
 
 use std::path::PathBuf;
@@ -32,13 +39,20 @@ use gui::{Element, ImageSource, Scenario, ScenarioError, Signal, div, text, use_
 use shadcn::{Theme, provide_theme, theme};
 
 /// The heap counted, for `--bench` and the frame HUD.
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
-static HEAP: &gui::heap::Counting = gui::heap::COUNTING;
+static HEAP: gui::heap::Counting = gui::heap::COUNTING;
+
+/// Diagnosis (ADR-0023): `--features dhat-heap` writes `dhat-heap.json` on exit,
+/// for <https://nnethercote.github.io/dh_view/dh_view.html>.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static HEAP: dhat::Alloc = dhat::Alloc;
 
 /// A page's render function; it holds the page's state.
 pub type Render = Box<dyn FnMut() -> Element>;
 /// A scripted run of one page.
-pub type Shot = Scenario<Render>;
+pub type Shot = Scenario;
 
 /// One gallery page.
 pub struct Page {
@@ -338,13 +352,22 @@ fn quote(word: &str) -> String {
 }
 
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _profiler = dhat::Profiler::new_heap();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let dark = args.iter().any(|a| a == "--dark");
-    provide_theme(Signal::labeled(
-        "theme",
-        if dark { Theme::dark() } else { Theme::light() },
-    ));
+    let theme_signal = move || {
+        provide_theme(Signal::labeled(
+            "theme",
+            if dark { Theme::dark() } else { Theme::light() },
+        ));
+    };
     let rest: Vec<String> = args.iter().filter(|a| *a != "--dark").cloned().collect();
+    let windowed = rest.first().is_none_or(|f| f == "--serve" || f == "--hud");
+    if !windowed {
+        // Headless paths run here, on this thread.
+        theme_signal();
+    }
     match rest.split_first() {
         Some((flag, tail)) if flag == "--shots" => {
             let Some((dir, only)) = tail.split_first() else {
@@ -356,6 +379,7 @@ fn main() {
                 std::process::exit(1);
             }
         }
+        Some((flag, _)) if flag == "--clock" => println!("{} {}", verdict::CLOCK_MS, verdict::CLOCK_ZONE),
         Some((flag, only)) if flag == "--demos" => {
             if let Err(e) = demos(only) {
                 eprintln!("{e}");
@@ -412,6 +436,22 @@ fn main() {
                 }
             }
         }
+        Some((flag, tail)) if flag == "--text-sample" || flag == "--text-compare" => {
+            let Some(dir) = tail.first() else {
+                eprintln!("usage: docs {flag} <dir>");
+                std::process::exit(2);
+            };
+            let dir = std::path::Path::new(dir);
+            let done = if flag == "--text-sample" {
+                text_sample::render(dir)
+            } else {
+                text_sample::compare(dir).map(|report| print!("{report}"))
+            };
+            if let Err(e) = done {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }
+        }
         Some((flag, tail)) if flag == "--export" => {
             let Some(path) = tail.first() else {
                 eprintln!("usage: docs --export <docs.json>");
@@ -440,15 +480,22 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        Some((flag, tail)) if flag == "--serve" => docs::run(gui::DebugTools {
-            attach: true,
-            hud: tail.iter().any(|a| a == "--hud"),
-            ..gui::DebugTools::default()
-        }),
-        Some((flag, _)) if flag == "--hud" => docs::run(gui::DebugTools {
-            hud: true,
-            ..gui::DebugTools::default()
-        }),
-        _ => docs::run(gui::DebugTools::default()),
+        // A window's app runs on its UI thread: the theme is provided there.
+        Some((flag, tail)) if flag == "--serve" => docs::run(
+            gui::DebugTools {
+                attach: true,
+                hud: tail.iter().any(|a| a == "--hud"),
+                ..gui::DebugTools::default()
+            },
+            theme_signal,
+        ),
+        Some((flag, _)) if flag == "--hud" => docs::run(
+            gui::DebugTools {
+                hud: true,
+                ..gui::DebugTools::default()
+            },
+            theme_signal,
+        ),
+        _ => docs::run(gui::DebugTools::default(), theme_signal),
     }
 }

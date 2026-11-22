@@ -35,5 +35,3 @@ allow-wildcard-paths = true
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# cosmic-text's fix for a line-clamped last line, unreleased (ADR-0006).
-allow-git = ["https://github.com/pop-os/cosmic-text"]

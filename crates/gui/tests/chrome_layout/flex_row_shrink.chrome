@@ -1,0 +1,11 @@
+# Chrome's boxes for flex_row_shrink.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 20
+  div 0 0 300 10
+    div 0 0 125 10
+    div 125 0 50 10
+    div 175 0 125 10
+  div 0 10 300 10
+    div 0 10 200 10
+    div 200 10 100 10

@@ -12,11 +12,30 @@ use std::fmt;
 use std::path::Path;
 
 use gui::Bounds;
+use gui::Pixels;
 use gui::layout::Frame;
 use gui::text::{logical, physical, physical_pos};
-use tiny_skia::{Color, IntRect, IntSize, Mask, Paint, Pixmap, PixmapPaint, Rect, Transform};
+use shadcn::CalendarDate;
 
 use crate::{Page, Shot};
+
+/// The instant the docs are at, in ms since the Unix epoch: noon UTC on
+/// 2026-11-20, so the calendars draw the same month on every run. The
+/// verdict pins Chrome's clock and time zone to it (`docs --clock`, read by
+/// `run.sh` and handed to `shoot.mjs`), so shadcn-vue's demos, which take
+/// `today(getLocalTimeZone())`, see the same day ours do. Noon, so the
+/// seconds a run takes never cross into another day.
+pub const CLOCK_MS: u64 = 1_795_176_000_000;
+/// The IANA time zone [`CLOCK_MS`] is read in.
+pub const CLOCK_ZONE: &str = "UTC";
+
+/// The day it is at [`CLOCK_MS`] in [`CLOCK_ZONE`]: the docs' today.
+pub fn today() -> CalendarDate {
+    std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_millis(CLOCK_MS))
+        .and_then(|at| CalendarDate::at(at, CLOCK_ZONE))
+        .unwrap_or_else(CalendarDate::today)
+}
 
 /// The smallest channel difference from the background that counts as ink:
 /// low, so hairline borders (`border-input`, a few steps off white) count.
@@ -334,7 +353,7 @@ pub fn judge(
     let ours = crop(s.pixmap(), bounds, scale).ok_or_else(|| bad(format!("{demo}: our box {bounds} is off canvas")))?;
     ours.save_png(dir.join("ours.png")).map_err(bad)?;
     let (Ok(full), Ok(rect)) = (
-        Pixmap::load_png(dir.join("ref-full.png")),
+        Pixels::load_png(dir.join("ref-full.png")),
         std::fs::read_to_string(dir.join("ref.rect")),
     ) else {
         return Err(VerdictError::NoReference(demo));
@@ -410,7 +429,7 @@ impl Ink {
 }
 
 /// The smallest box holding every pixel of `p` that is not background.
-fn ink_box(p: &Pixmap, bg: Rgba) -> Option<Ink> {
+fn ink_box(p: &Pixels, bg: Rgba) -> Option<Ink> {
     let mut found: Option<Ink> = None;
     for y in 0..p.height() {
         for x in 0..p.width() {
@@ -425,19 +444,11 @@ fn ink_box(p: &Pixmap, bg: Rgba) -> Option<Ink> {
 }
 
 /// `area` of `p`, background where `p` ends.
-fn cut(p: &Pixmap, area: Ink, bg: Rgba) -> Option<Pixmap> {
-    let mut out = Pixmap::new(area.x1.saturating_sub(area.x0), area.y1.saturating_sub(area.y0))?;
-    let [r, g, b, a] = bg;
-    out.fill(Color::from_rgba8(r, g, b, a));
+fn cut(p: &Pixels, area: Ink, bg: Rgba) -> Option<Pixels> {
+    let mut out = Pixels::new(area.x1.saturating_sub(area.x0), area.y1.saturating_sub(area.y0))?;
+    out.fill(bg);
     let (dx, dy) = (i32::try_from(area.x0).ok()?, i32::try_from(area.y0).ok()?);
-    out.draw_pixmap(
-        dx.checked_neg()?,
-        dy.checked_neg()?,
-        p.as_ref(),
-        &PixmapPaint::default(),
-        Transform::identity(),
-        None,
-    );
+    out.draw(p, dx.checked_neg()?, dy.checked_neg()?, 1.0);
     Some(out)
 }
 
@@ -454,23 +465,19 @@ fn parse_rect(s: &str) -> Option<Bounds> {
     }
 }
 
-fn crop(p: &Pixmap, b: Bounds, scale: f32) -> Option<Pixmap> {
-    let rect = IntRect::from_xywh(
+fn crop(p: &Pixels, b: Bounds, scale: f32) -> Option<Pixels> {
+    p.crop(
         physical_pos(b.x, scale),
         physical_pos(b.y, scale),
         physical(b.width, scale),
         physical(b.height, scale),
-    )?;
-    p.clone_rect(rect)
+    )
 }
 
 type Rgba = [u8; 4];
 
-fn at(p: &Pixmap, x: u32, y: u32, bg: Rgba) -> Rgba {
-    p.pixel(x, y).map_or(bg, |c| {
-        let c = c.demultiply();
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    })
+fn at(p: &Pixels, x: u32, y: u32, bg: Rgba) -> Rgba {
+    p.straight(x, y).unwrap_or(bg)
 }
 
 fn distance(a: Rgba, b: Rgba) -> u8 {
@@ -479,7 +486,7 @@ fn distance(a: Rgba, b: Rgba) -> u8 {
 
 /// Whether `c` matches some pixel of `p` within `tol.shift` of `(x, y)`, or
 /// (with `tol.coverage`) a blend of two of them.
-fn near(p: &Pixmap, x: u32, y: u32, c: Rgba, bg: Rgba, tol: Tolerance) -> bool {
+fn near(p: &Pixels, x: u32, y: u32, c: Rgba, bg: Rgba, tol: Tolerance) -> bool {
     let shift = i32::from(tol.shift);
     let reach = shift.saturating_neg()..=shift;
     let window: Vec<Rgba> = reach
@@ -511,9 +518,9 @@ fn blend_of(c: Rgba, a: Rgba, b: Rgba) -> bool {
 }
 
 struct Comparison<'a> {
-    theirs: &'a Pixmap,
-    ours: &'a Pixmap,
-    size: IntSize,
+    theirs: &'a Pixels,
+    ours: &'a Pixels,
+    size: (u32, u32),
     /// The page background, taken from theirs' top-left pixel.
     bg: Rgba,
     /// 255 where the two differ, row-major over `size`.
@@ -523,7 +530,7 @@ struct Comparison<'a> {
 }
 
 impl<'a> Comparison<'a> {
-    fn new(theirs: &'a Pixmap, ours: &'a Pixmap, bg: Rgba, tol: Tolerance) -> Option<Self> {
+    fn new(theirs: &'a Pixels, ours: &'a Pixels, bg: Rgba, tol: Tolerance) -> Option<Self> {
         let (w, h) = (theirs.width().max(ours.width()), theirs.height().max(ours.height()));
         let mut mask = Vec::new();
         let (mut differing, mut ink) = (0_u32, 0_u32);
@@ -543,7 +550,7 @@ impl<'a> Comparison<'a> {
         Some(Self {
             theirs,
             ours,
-            size: IntSize::from_wh(w, h)?,
+            size: (w, h),
             bg,
             mask,
             differing,
@@ -551,60 +558,44 @@ impl<'a> Comparison<'a> {
         })
     }
 
-    fn canvas(&self) -> Option<Pixmap> {
-        let mut p = Pixmap::new(self.size.width(), self.size.height())?;
-        let [r, g, b, a] = self.bg;
-        p.fill(Color::from_rgba8(r, g, b, a));
+    fn canvas(&self) -> Option<Pixels> {
+        let mut p = Pixels::new(self.size.0, self.size.1)?;
+        p.fill(self.bg);
         Some(p)
     }
 
     /// Theirs, with ours at half opacity on top.
-    fn overlay(&self) -> Option<Pixmap> {
+    fn overlay(&self) -> Option<Pixels> {
         let mut p = self.canvas()?;
-        p.draw_pixmap(
-            0,
-            0,
-            self.theirs.as_ref(),
-            &PixmapPaint::default(),
-            Transform::identity(),
-            None,
-        );
-        let half = PixmapPaint {
-            opacity: 0.5,
-            ..PixmapPaint::default()
-        };
-        p.draw_pixmap(0, 0, self.ours.as_ref(), &half, Transform::identity(), None);
+        p.draw(self.theirs, 0, 0, 1.0);
+        p.draw(self.ours, 0, 0, 0.5);
         Some(p)
     }
 
     /// Theirs faded, the differing pixels magenta.
-    fn diff(&self) -> Option<Pixmap> {
+    fn diff(&self) -> Option<Pixels> {
         let mut p = self.canvas()?;
-        let faded = PixmapPaint {
-            opacity: 0.25,
-            ..PixmapPaint::default()
-        };
-        p.draw_pixmap(0, 0, self.theirs.as_ref(), &faded, Transform::identity(), None);
-        let mask = Mask::from_vec(self.mask.clone(), self.size)?;
-        let mut magenta = Paint::default();
-        magenta.set_color_rgba8(255, 0, 170, 255);
-        let all = Rect::from_xywh(0.0, 0.0, f32::from(u16::MAX), f32::from(u16::MAX))?;
-        p.fill_rect(all, &magenta, Transform::identity(), Some(&mask));
+        p.draw(self.theirs, 0, 0, 0.25);
+        let magenta = [255, 0, 170, 255];
+        for (px, m) in p.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(&self.mask) {
+            if *m != 0 {
+                *px = magenta;
+            }
+        }
         Some(p)
     }
 }
 
-fn stacked(panels: &[&Pixmap], bg: Rgba) -> Option<Pixmap> {
+fn stacked(panels: &[&Pixels], bg: Rgba) -> Option<Pixels> {
     let h = panels
         .iter()
         .try_fold(0_u32, |acc, p| acc.checked_add(p.height())?.checked_add(GAP))?;
     let w = panels.iter().map(|p| p.width()).max()?;
-    let mut out = Pixmap::new(w, h)?;
-    let [r, g, b, a] = bg;
-    out.fill(Color::from_rgba8(r, g, b, a));
+    let mut out = Pixels::new(w, h)?;
+    out.fill(bg);
     let mut y = 0_i32;
     for p in panels {
-        out.draw_pixmap(0, y, p.as_ref(), &PixmapPaint::default(), Transform::identity(), None);
+        out.draw(p, 0, y, 1.0);
         y = y.checked_add(i32::try_from(p.height().checked_add(GAP)?).ok()?)?;
     }
     Some(out)

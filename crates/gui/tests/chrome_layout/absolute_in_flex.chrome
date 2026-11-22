@@ -1,0 +1,8 @@
+# Chrome's boxes for absolute_in_flex.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 100
+  div 110 30 40 40
+  div 140 40 20 20
+  div 5 5 20 20
+  div 150 30 40 40

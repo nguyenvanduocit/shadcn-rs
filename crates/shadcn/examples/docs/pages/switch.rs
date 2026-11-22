@@ -19,7 +19,6 @@ pub fn render() -> Render {
     let airplane = Signal::labeled("airplane-mode", false);
     let bluetooth = Signal::labeled("bluetooth", true);
     let focus_mode = Signal::labeled("focus-mode", false);
-    let disabled = Signal::labeled("disabled", true);
     Box::new(move || {
         let t = theme();
         // Tailwind's blue-500 (blue-600 in dark) for the checked track, blue-600 for the card.
@@ -29,9 +28,9 @@ pub fn render() -> Render {
             Color::oklch(0.623, 0.214, 259.815)
         };
         let blue_600 = Color::oklch(0.546, 0.245, 262.881);
-        let (bt, fm) = (bluetooth.get(), focus_mode.get());
-        let a = airplane.clone();
-        let f = focus_mode.clone();
+        let fm = focus_mode.get();
+        let a = airplane;
+        let f = focus_mode;
         page(
             "Switch",
             div()
@@ -43,8 +42,8 @@ pub fn render() -> Render {
                         .flex()
                         .items_center()
                         .gap(2.0)
-                        .child(switch(&airplane))
-                        .child(label("Airplane Mode").on_click(move |_| a.update(|v| !v))),
+                        .child(switch().model(airplane))
+                        .child(label("Airplane Mode").on_click(move |_| a.update(|v| *v = !*v))),
                 ))
                 .child(section(
                     "Coloured, disabled and in a card",
@@ -56,7 +55,11 @@ pub fn render() -> Render {
                                 .flex()
                                 .items_center()
                                 .gap(2.0)
-                                .child(switch(&bluetooth).when(bt, |d| d.bg(blue)))
+                                .child(
+                                    switch()
+                                        .model(bluetooth)
+                                        .class(move |d| d.when(bluetooth.get(), |d| d.bg(blue))),
+                                )
                                 .child(label("Bluetooth")),
                         )
                         .child(
@@ -64,7 +67,7 @@ pub fn render() -> Render {
                                 .flex()
                                 .items_center()
                                 .gap(2.0)
-                                .child(switch(&disabled).disabled(true))
+                                .child(switch().default_checked(true).disabled(true))
                                 .child(label("Disabled")),
                         )
                         .child(
@@ -81,7 +84,7 @@ pub fn render() -> Render {
                                 .text_sm()
                                 .leading_none()
                                 .font_medium()
-                                .on_click(move |_| f.update(|v| !v))
+                                .on_click(move |_| f.update(|v| *v = !*v))
                                 .child(
                                     div()
                                         .flex_col()
@@ -96,7 +99,11 @@ pub fn render() -> Render {
                                             .text_color(t.muted_foreground),
                                         ),
                                 )
-                                .child(switch(&focus_mode).when(fm, |d| d.bg(blue))),
+                                .child(
+                                    switch()
+                                        .model(focus_mode)
+                                        .class(move |d| d.when(focus_mode.get(), |d| d.bg(blue))),
+                                ),
                         ),
                 )),
         )

@@ -1,0 +1,11 @@
+---
+source: crates/gui/tests/chrome_layout.rs
+expression: "gui::inspect::dump(&laid_out(name, &mut ts))"
+---
+0            Div 800x600 at (0,0)
+  0/0          Div 300x132 at (0,0)
+    0/0/0        Div 198x40 at (0,0)
+    0/0/1        Div 96x86 at (204,0)
+    0/0/2        Div 96x40 at (0,46)
+    0/0/3        Div 96x40 at (102,46)
+    0/0/4        Div 300x40 at (0,92)

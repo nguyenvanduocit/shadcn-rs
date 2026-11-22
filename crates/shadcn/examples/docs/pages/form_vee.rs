@@ -5,7 +5,7 @@
 use gui::prelude::*;
 use gui::{Color, Div, Icon, InputType, ScenarioError, TextField, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, FieldOrientation, FormField, InputGroupAlign, Toaster, button, card, card_content,
+    ButtonSize, ButtonVariant, FieldOrientation, FormField, InputGroupAlign, button, card, card_content,
     card_description, card_footer, card_header, card_title, field, field_error, field_group, field_label, form_reset,
     form_submit, input_group, input_group_addon, input_group_input, progress, theme, toaster,
 };
@@ -71,11 +71,10 @@ fn strength_color(met: usize) -> Color {
 
 struct PasswordCard {
     password: FormField<TextField>,
-    toasts: Toaster,
 }
 
 impl PasswordCard {
-    fn new(toasts: &Toaster) -> Self {
+    fn new() -> Self {
         Self {
             password: FormField::new(TextField::new(""), Library::Vee.checks(), |v: &String| {
                 let checks: Vec<(bool, &str)> = REQUIREMENTS
@@ -84,7 +83,6 @@ impl PasswordCard {
                     .collect();
                 failing(&checks)
             }),
-            toasts: toasts.clone(),
         }
     }
 
@@ -111,7 +109,7 @@ impl PasswordCard {
                 .child(text((*label).to_owned()).text_color(if ok { t.foreground } else { t.muted_foreground }))
         });
         let group = input_group(
-            input_group_input(f.control())
+            input_group_input(&f.control())
                 .input_type(InputType::Password)
                 .placeholder("Enter your password")
                 .invalid(invalid),
@@ -123,7 +121,7 @@ impl PasswordCard {
                 t.muted_foreground
             })),
         );
-        let (submit, reset, toasts) = (f.clone(), f.clone(), self.toasts.clone());
+        let (submit, reset) = (*f, *f);
         card()
             .w_full()
             .max_w_px(448.0)
@@ -161,7 +159,6 @@ impl PasswordCard {
                                 .on_click(move |_| {
                                     if form_submit(&[&submit]) {
                                         submitted(
-                                            &toasts,
                                             &Json::Object(vec![("password", Json::Str(submit.control().text()))]),
                                             Pre::Code,
                                         );
@@ -179,16 +176,15 @@ impl PasswordCard {
 }
 
 pub fn render() -> Render {
-    let toasts = Toaster::new();
-    let cards = Cards::new(Library::Vee, &toasts);
-    let password = PasswordCard::new(&toasts);
+    let cards = Cards::new(Library::Vee);
+    let password = PasswordCard::new();
     Box::new(move || {
         page(
             "Form (vee-validate)",
             cards
                 .view(&FILES)
                 .child(demo("VeeValidatePasswordDemo.vue", password.view()))
-                .child(toaster(&toasts)),
+                .child(toaster()),
         )
     })
 }

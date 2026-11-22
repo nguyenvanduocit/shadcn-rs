@@ -1,0 +1,11 @@
+# Chrome's boxes for text_line_height.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 158.1875
+  p 0 0 400 16
+  p 0 16 400 25
+  p 0 41 400 36
+  div 0 77 150 63
+    p 0 77 150 63
+  div 0 140 400 18.1875
+    p 0 140 87.59375 18.1875

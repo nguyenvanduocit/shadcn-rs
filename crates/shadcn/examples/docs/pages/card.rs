@@ -38,7 +38,7 @@ pub fn render() -> Render {
                                         .flex_col()
                                         .gap(1.5)
                                         .child(label("Email"))
-                                        .child(input(&email).placeholder("m@example.com")),
+                                        .child(input().field(email).placeholder("m@example.com")),
                                 )
                                 .child(
                                     div()
@@ -51,7 +51,7 @@ pub fn render() -> Render {
                                                 .child(label("Password"))
                                                 .child(text("Forgot your password?").ml_auto().text_sm().underline()),
                                         )
-                                        .child(input(&password)),
+                                        .child(input().field(password)),
                                 ),
                         ),
                     )

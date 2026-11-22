@@ -1,0 +1,11 @@
+<!-- aspect-ratio with percentage heights inside: the ratio's height is definite, so a child's percentage height resolves against it (a child `height: 100%` fills the box and does not grow it, as an image `h-full` in shadcn's AspectRatio does), in block flow and in a flex container. -->
+<div style="width: 400px">
+  <div style="width: 160px; aspect-ratio: 2"><div style="height: 100%"></div></div>
+  <div style="width: 160px; aspect-ratio: 2"><div style="height: 100%"><p>Words that wrap over many lines in a box much taller than the ratio</p></div></div>
+  <div style="width: 160px; aspect-ratio: 2"><div style="height: 150%"></div></div>
+  <div style="width: 160px; aspect-ratio: 2"><div style="height: 50%"></div><p>Words under</p></div>
+  <div style="width: 160px; aspect-ratio: 2; display: flex"><div style="height: 100%; width: 100%"></div></div>
+  <div style="width: 160px; aspect-ratio: 2; display: flex; flex-direction: column"><div style="height: 100%"></div></div>
+  <div style="width: 160px; aspect-ratio: 2; display: flex; flex-direction: column"><div style="height: 150%"></div></div>
+  <div style="aspect-ratio: 4"><div style="height: 100%; width: 100%"></div></div>
+</div>

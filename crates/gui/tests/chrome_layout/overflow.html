@@ -1,0 +1,14 @@
+<!-- overflow: hidden lets a flex item shrink below its content; scroll lays content out past the box. -->
+<div style="width: 300px">
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="overflow: hidden"><div style="width: 150px; height: 10px"></div></div>
+    <div style="width: 40px"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div><div style="width: 150px; height: 10px"></div></div>
+    <div style="width: 40px"></div>
+  </div>
+  <div style="overflow: scroll; height: 50px; width: 120px; padding: 5px">
+    <div style="height: 80px"></div><div style="height: 30px; width: 200px"></div>
+  </div>
+</div>

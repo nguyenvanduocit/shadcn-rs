@@ -1,0 +1,8 @@
+<!-- aspect-ratio on the items of a wrapping flex row and on flex containers themselves: each item's width gives its height, lines wrap on those widths, and a container with a ratio is at least as tall as its content. -->
+<div style="width: 400px">
+  <div style="display: flex; flex-wrap: wrap; align-items: flex-start"><div style="width: 150px; aspect-ratio: 3"></div><div style="width: 150px; aspect-ratio: 1"></div><div style="width: 150px; aspect-ratio: 2"></div><p style="height: 24px; aspect-ratio: 1">Words</p></div>
+  <div style="display: flex; flex-wrap: wrap"><div style="width: 250px; aspect-ratio: 5"></div><div style="width: 250px; aspect-ratio: 10"></div><div style="width: 100px; aspect-ratio: 1"></div></div>
+  <div style="display: flex; width: 100px; aspect-ratio: 4"><p>A ratio box whose words wrap over lines</p></div>
+  <div style="display: flex; width: 200px; aspect-ratio: 4; flex-direction: column"><div style="height: 20px"></div></div>
+  <div style="display: grid; width: 100px; aspect-ratio: 4"><p>A ratio box whose words wrap over lines</p></div>
+</div>

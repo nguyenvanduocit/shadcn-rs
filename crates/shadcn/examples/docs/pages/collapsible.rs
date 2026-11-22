@@ -1,6 +1,6 @@
 use gui::prelude::*;
-use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text};
-use shadcn::{ButtonSize, ButtonVariant, button, collapsible, collapsible_content, collapsible_toggle, theme};
+use gui::{Icon, Modifiers, NamedKey, ScenarioError, div, icon, text};
+use shadcn::{ButtonSize, ButtonVariant, button, collapsible, collapsible_content, collapsible_trigger_as, theme};
 
 use crate::{Render, Shot, demo, page};
 
@@ -18,7 +18,6 @@ fn repository(name: &str) -> gui::Div {
 }
 
 pub fn render() -> Render {
-    let open = Signal::labeled("open", false);
     Box::new(move || {
         page(
             "Collapsible",
@@ -36,20 +35,20 @@ pub fn render() -> Render {
                             .gap(4.0)
                             .px(4.0)
                             .child(text("@peduarte starred 3 repositories").text_sm().font_semibold())
-                            .child(
+                            .child(collapsible_trigger_as(
                                 button(ButtonVariant::Ghost, ButtonSize::Icon)
                                     .size(8.0)
-                                    .on_click(collapsible_toggle(&open))
                                     .child(icon(Icon::ChevronsUpDown)),
-                            ),
+                            )),
                     )
                     .child(repository("@radix-ui/primitives"))
-                    .child(collapsible_content(&open).map(|c| {
-                        c.flex_col()
+                    .child(
+                        collapsible_content()
+                            .flex_col()
                             .gap(2.0)
                             .child(repository("@radix-ui/colors"))
-                            .child(repository("@stitches/react"))
-                    })),
+                            .child(repository("@stitches/react")),
+                    ),
             ),
         )
     })

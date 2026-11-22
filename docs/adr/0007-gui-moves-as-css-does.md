@@ -1,6 +1,6 @@
 # 0007. `gui` moves as CSS does: transitions, keyframe animations and presence
 
-Status: accepted, 2026-11-20. Extends ADR-0003 (effects paint as groups).
+Status: accepted, 2026-11-20; its time source (the 16 ms frame clock) superseded by ADR-0015. Extends ADR-0003 (effects paint as groups).
 
 ## Context
 

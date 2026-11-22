@@ -1,41 +1,35 @@
 use gui::prelude::*;
-use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text};
+use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text_bound};
 use shadcn::{
-    ContextMenuState, MenuItem, MenuState, context_menu_checkbox_item, context_menu_content, context_menu_item,
-    context_menu_label, context_menu_radio_group, context_menu_radio_item, context_menu_separator,
-    context_menu_shortcut, context_menu_sub_content, context_menu_sub_trigger, context_menu_trigger, theme,
+    MenuItem, context_menu, context_menu_checkbox_item, context_menu_content, context_menu_item, context_menu_label,
+    context_menu_radio_group, context_menu_radio_item, context_menu_separator, context_menu_shortcut, context_menu_sub,
+    context_menu_sub_content, context_menu_sub_trigger, context_menu_trigger, theme,
 };
 
 use crate::{Render, Shot, demo, page};
 
 pub fn render() -> Render {
-    let menu = ContextMenuState::new();
-    let tools = menu.sub();
     let last = Signal::labeled("last action", String::from("nothing yet"));
     let bookmarks = Signal::labeled("show bookmarks", true);
     let full_urls = Signal::labeled("show full urls", false);
     let person = Signal::labeled("person", String::from("pedro"));
     Box::new(move || {
         let t = theme();
-        let act = |name: &'static str| {
-            let last = last.clone();
-            move || last.set(name.to_owned())
-        };
-        let item =
-            |m: &MenuState, name: &'static str, opts: MenuItem| context_menu_item(m, name, opts, act(name)).child(name);
-        let with_icon = |m: &MenuState, glyph: Icon, name: &'static str, opts: MenuItem| {
+        let act = |name: &'static str| move || last.set(name.to_owned());
+        let item = |name: &'static str, opts: MenuItem| context_menu_item(name, opts).on_select(act(name)).child(name);
+        let with_icon = |glyph: Icon, name: &'static str, opts: MenuItem| {
             let muted = opts.variant == shadcn::MenuItemVariant::Default;
-            context_menu_item(m, name, opts, act(name))
+            context_menu_item(name, opts)
+                .on_select(act(name))
                 .child(icon(glyph).when(muted, |i| i.text_color(t.muted_foreground)))
                 .child(name)
         };
 
-        let content = context_menu_content(&menu)
+        let content = context_menu_content()
             .w(52.0)
-            .child(item(&menu, "Back", MenuItem::INSET).child(context_menu_shortcut("⌘[")))
+            .child(item("Back", MenuItem::INSET).child(context_menu_shortcut("⌘[")))
             .child(
                 item(
-                    &menu,
                     "Forward",
                     MenuItem {
                         inset: true,
@@ -44,33 +38,36 @@ pub fn render() -> Render {
                 )
                 .child(context_menu_shortcut("⌘]")),
             )
-            .child(item(&menu, "Reload", MenuItem::INSET).child(context_menu_shortcut("⌘R")))
-            .child(context_menu_sub_trigger(
-                &tools,
-                "More Tools",
-                MenuItem::INSET,
-                context_menu_sub_content(&tools)
-                    .w(44.0)
-                    .child(item(&tools, "Save Page...", MenuItem::INSET).child(context_menu_shortcut("⇧⌘S")))
-                    .child(with_icon(&tools, Icon::Plus, "Create Shortcut...", MenuItem::default()))
-                    .child(item(&tools, "Name Window...", MenuItem::INSET))
-                    .child(context_menu_separator())
-                    .child(with_icon(&tools, Icon::Code2, "Developer Tools", MenuItem::default()))
-                    .child(context_menu_separator())
-                    .child(with_icon(&tools, Icon::Trash, "Delete", MenuItem::DESTRUCTIVE)),
-            ))
+            .child(item("Reload", MenuItem::INSET).child(context_menu_shortcut("⌘R")))
+            .child(
+                context_menu_sub()
+                    .child(context_menu_sub_trigger("More Tools", MenuItem::INSET))
+                    .child(
+                        context_menu_sub_content()
+                            .w(44.0)
+                            .child(item("Save Page...", MenuItem::INSET).child(context_menu_shortcut("⇧⌘S")))
+                            .child(with_icon(Icon::Plus, "Create Shortcut...", MenuItem::default()))
+                            .child(item("Name Window...", MenuItem::INSET))
+                            .child(context_menu_separator())
+                            .child(with_icon(Icon::Code2, "Developer Tools", MenuItem::default()))
+                            .child(context_menu_separator())
+                            .child(with_icon(Icon::Trash, "Delete", MenuItem::DESTRUCTIVE)),
+                    ),
+            )
             .child(context_menu_separator())
             .child(
-                context_menu_checkbox_item(&menu, "Show Bookmarks", &bookmarks, false)
+                context_menu_checkbox_item("Show Bookmarks", false)
+                    .model(bookmarks)
                     .child(context_menu_shortcut("⌘⇧B")),
             )
-            .child(context_menu_checkbox_item(&menu, "Show Full URLs", &full_urls, false))
+            .child(context_menu_checkbox_item("Show Full URLs", false).model(full_urls))
             .child(context_menu_separator())
             .child(
                 context_menu_radio_group()
+                    .model(person)
                     .child(context_menu_label("People", true))
-                    .child(context_menu_radio_item(&menu, "Pedro Duarte", "pedro", &person, false))
-                    .child(context_menu_radio_item(&menu, "Colm Tuite", "colm", &person, false)),
+                    .child(context_menu_radio_item("Pedro Duarte", "pedro", false))
+                    .child(context_menu_radio_item("Colm Tuite", "colm", false)),
             );
 
         let area = div()
@@ -90,14 +87,19 @@ pub fn render() -> Render {
             div()
                 .flex_col()
                 .gap(6.0)
-                .child(demo("ContextMenuDemo.vue", context_menu_trigger(&menu, area, content)))
+                .child(demo(
+                    "ContextMenuDemo.vue",
+                    context_menu().child(context_menu_trigger(area)).child(content),
+                ))
                 .child(
-                    text(format!(
-                        "Last action: {}. Bookmarks: {}. Person: {}.",
-                        last.get(),
-                        bookmarks.get(),
-                        person.get()
-                    ))
+                    text_bound(move || {
+                        format!(
+                            "Last action: {}. Bookmarks: {}. Person: {}.",
+                            last.get(),
+                            bookmarks.get(),
+                            person.get()
+                        )
+                    })
                     .text_sm()
                     .text_color(t.muted_foreground),
                 ),

@@ -1,13 +1,10 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, TextField, div, text};
+use gui::{Modifiers, NamedKey, ScenarioError, div, text};
 use shadcn::{label, textarea, theme};
 
 use crate::{Render, Shot, demo, page, section};
 
 pub fn render() -> Render {
-    let message = TextField::new("");
-    let disabled = TextField::new("");
-    let described = TextField::new("");
     Box::new(move || {
         let t = theme();
         page(
@@ -17,13 +14,11 @@ pub fn render() -> Render {
                 .gap(8.0)
                 .child(demo(
                     "TextareaDemo.vue",
-                    textarea(&message).placeholder("Type your message here."),
+                    textarea().placeholder("Type your message here."),
                 ))
                 .child(demo(
                     "TextareaDisabled.vue",
-                    textarea(&disabled)
-                        .placeholder("Type your message here.")
-                        .disabled(true),
+                    textarea().placeholder("Type your message here.").disabled(true),
                 ))
                 .child(section(
                     "With label and description",
@@ -32,7 +27,7 @@ pub fn render() -> Render {
                         .gap(3.0)
                         .max_w_px(448.0)
                         .child(label("Your message"))
-                        .child(textarea(&described).placeholder("Type your message here."))
+                        .child(textarea().placeholder("Type your message here."))
                         .child(
                             text("Type your message and press enter to send.")
                                 .text_sm()

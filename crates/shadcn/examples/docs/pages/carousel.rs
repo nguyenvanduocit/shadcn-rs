@@ -1,13 +1,16 @@
 use std::time::Duration;
 
 use gui::prelude::*;
-use gui::{Div, Element, ScenarioError, div, text};
+use gui::{Div, Element, Model, ScenarioError, Signal, div, text};
 use shadcn::{
-    CarouselState, Orientation, card, card_content, carousel, carousel_content, carousel_item, carousel_next,
-    carousel_previous, theme,
+    CarouselProps, Orientation, Part, card, card_content, carousel, carousel_content, carousel_item, carousel_next,
+    carousel_previous, carousel_snaps, theme,
 };
 
 use crate::{Render, Shot, demo, page};
+
+/// How many slides each demo has.
+const SLIDES: usize = 5;
 
 /// The slide every carousel demo shows: its number on a card. `square` is
 /// `aspect-square`; `number` styles the `<span>` (its text size).
@@ -27,18 +30,17 @@ fn slide(n: usize, square: bool, number: impl FnOnce(gui::Text) -> gui::Text) ->
 
 /// `<Carousel>` with its `<CarouselContent>` of numbered slides and both arrows.
 fn numbered(
-    state: &CarouselState,
-    track: impl FnOnce(Div) -> Div,
-    item: impl Fn(Div) -> Div,
+    root: Part<CarouselProps>,
+    track: impl FnOnce(Part<()>) -> Part<()>,
+    item: impl Fn(Part<()>) -> Part<()>,
     content: impl Fn(usize) -> Div,
-) -> Div {
-    let slides = (1..=state.count).map(|n| item(carousel_item(state)).child(content(n)));
-    carousel(state)
-        .w_full()
+) -> Part<CarouselProps> {
+    let slides = (1..=SLIDES).map(|n| item(carousel_item()).child(content(n)));
+    root.w_full()
         .max_w_px(320.0)
-        .child(carousel_content(state, track, slides))
-        .child(carousel_previous(state))
-        .child(carousel_next(state))
+        .child(track(carousel_content()).children(slides))
+        .child(carousel_previous())
+        .child(carousel_next())
 }
 
 fn big(n: usize) -> Div {
@@ -46,55 +48,50 @@ fn big(n: usize) -> Div {
 }
 
 pub fn render() -> Render {
-    let basic = CarouselState::new(5, Orientation::Horizontal);
-    let api = CarouselState::new(5, Orientation::Horizontal);
-    let plugin = CarouselState::new(5, Orientation::Horizontal);
-    plugin.play(Duration::from_secs(2));
-    let size = CarouselState::new(5, Orientation::Horizontal).basis(1.0 / 3.0);
-    let spacing = CarouselState::new(5, Orientation::Horizontal).basis(1.0 / 3.0);
-    let vertical = CarouselState::new(5, Orientation::Vertical).basis(0.5);
+    // The API demo shows the snap, so it keeps it.
+    let api = Signal::labeled("carousel index", 0_usize);
     Box::new(move || {
         let t = theme();
-        let on_hover = plugin.clone();
         let demos: [Element; 6] = [
-            demo("CarouselDemo.vue", numbered(&basic, |d| d, |d| d, big)).into_element(),
+            demo("CarouselDemo.vue", numbered(carousel(), |d| d, |d| d, big)).into_element(),
             demo(
                 "CarouselApi.vue",
-                div().child(numbered(&api, |d| d, |d| d, big)).child(
-                    div()
-                        .py(2.0)
-                        .text_center()
-                        .text_sm()
-                        .text_color(t.muted_foreground)
-                        .child(format!(
-                            "Slide {} of {}",
-                            api.index.get().saturating_add(1),
-                            api.snaps()
-                        )),
-                ),
+                div()
+                    .child(numbered(carousel().model(Model::bind(api)), |d| d, |d| d, big))
+                    .child(
+                        div()
+                            .py(2.0)
+                            .text_center()
+                            .text_sm()
+                            .text_color(t.muted_foreground)
+                            .child(format!(
+                                "Slide {} of {}",
+                                api.get().saturating_add(1),
+                                carousel_snaps(SLIDES, 1.0)
+                            )),
+                    ),
             )
             .into_element(),
             demo(
                 "CarouselPlugin.vue",
                 // `stopOnMouseEnter`, and the demo's own `@mouseleave` plays it again.
-                numbered(&plugin, |d| d, |d| d, big).on_hover(move |inside| {
-                    if inside {
-                        on_hover.stop();
-                    } else {
-                        on_hover.play(Duration::from_secs(2));
-                    }
-                }),
+                numbered(carousel().autoplay(Duration::from_secs(2), true), |d| d, |d| d, big),
             )
             .into_element(),
             demo(
                 "CarouselSize.vue",
-                numbered(&size, |d| d, |d| d, |n| slide(n, true, gui::Text::text_3xl)),
+                numbered(
+                    carousel().basis(1.0 / 3.0),
+                    |d| d,
+                    |d| d,
+                    |n| slide(n, true, gui::Text::text_3xl),
+                ),
             )
             .into_element(),
             demo(
                 "CarouselSpacing.vue",
                 numbered(
-                    &spacing,
+                    carousel().basis(1.0 / 3.0),
                     |d| d.ml(-1.0),
                     |d| d.pl(1.0),
                     |n| slide(n, true, gui::Text::text_2xl),
@@ -105,7 +102,7 @@ pub fn render() -> Render {
             demo(
                 "CarouselOrientation.vue",
                 numbered(
-                    &vertical,
+                    carousel().orientation(Orientation::Vertical).basis(0.5),
                     |d| d.mt(-1.0).h_px(200.0),
                     |d| d.p(1.0),
                     |n| slide(n, false, gui::Text::text_3xl),

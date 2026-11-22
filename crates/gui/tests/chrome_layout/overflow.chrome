@@ -1,0 +1,15 @@
+# Chrome's boxes for overflow.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 90
+  div 0 0 100 20
+    div 0 0 78.953125 20
+      div 0 0 150 10
+    div 78.953125 0 21.046875 20
+  div 0 20 100 20
+    div 0 20 150 20
+      div 0 20 150 10
+    div 150 20 0 20
+  div 0 40 120 50
+    div 5 45 110 80
+    div 5 125 200 30

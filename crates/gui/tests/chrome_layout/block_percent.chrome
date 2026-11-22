@@ -1,0 +1,9 @@
+# Chrome's boxes for block_percent.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 300
+  div 0 0 200 60
+  div 40 60 100 30
+  div 0 90 133.328125 50
+  div 0 140 400 100
+    div 0 140 300 50

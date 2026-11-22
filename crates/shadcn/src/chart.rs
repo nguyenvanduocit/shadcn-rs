@@ -1,13 +1,20 @@
 //! Chart (`ui/chart`): the container, tooltip and legend shadcn wraps around
 //! its charting library, and the marks that library draws (area, bar, line,
-//! pie and donut), built on `gui::shapes` and laid out as unovis lays out
-//! shadcn-vue's: grid lines, x-axis ticks and a hover tooltip per category.
-//! Charts carry a text equivalent ([`chart_summary`]).
+//! pie and donut), laid out as unovis lays out shadcn-vue's: grid lines,
+//! x-axis ticks and a hover tooltip per category. An x-y chart's marks are
+//! a `gui` plot (GPU data chunks, ADR-0018): its series live on the GPU,
+//! hovering finds the row under the pointer from them, and a change of
+//! data records the plot alone. Charts carry a text equivalent
+//! ([`chart_summary`]).
 
 use std::f32::consts::{FRAC_PI_2, TAU};
 
+use gui::chunk::plot::{Series, area, bars, line, plot, series};
 use gui::prelude::*;
-use gui::{Color, Div, Placement, Shape, Side, SideAlign, Signal, deferred, div, px, shapes, text};
+use gui::{
+    Color, ComponentElement, Div, Element, Path, PathBuilder, Placement, Shape, Side, SideAlign, Signal, component,
+    deferred, div, px, shapes, text, watch,
+};
 
 use crate::theme::theme;
 
@@ -55,13 +62,12 @@ pub enum ChartIndicator {
     Hidden,
 }
 
-/// An x-y chart: its marks, data and size. The size is in pixels because a
-/// shape is drawn in coordinates fixed when the tree is built.
-#[derive(Clone, Copy, Debug)]
-pub struct ChartXy<'a> {
+/// An x-y chart: its marks, data and size (logical pixels).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChartXy {
     pub mark: ChartMark,
-    pub config: &'a [ChartSeries],
-    pub rows: &'a [ChartRow],
+    pub config: Vec<ChartSeries>,
+    pub rows: Vec<ChartRow>,
     pub width: f32,
     pub height: f32,
     /// `VisAxis` x and y: the rows' ticks under the plot and a y grid. Without
@@ -91,27 +97,6 @@ pub struct ChartPie<'a> {
     /// Width and height of the square it fills.
     pub size: f32,
     pub arc_width: Option<f32>,
-}
-
-/// Which category the pointer is over. Created once, outside the render closure.
-#[derive(Clone)]
-pub struct ChartState {
-    pub active: Signal<Option<usize>>,
-}
-
-impl Default for ChartState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ChartState {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            active: Signal::labeled("chart active", None),
-        }
-    }
 }
 
 /// One row of a tooltip.
@@ -144,102 +129,213 @@ pub fn chart_container() -> Div {
     div().named("chart").flex_col().justify_center().text_xs()
 }
 
+/// Units of data x a day of [`ChartRow::x`]: the plot's x is whole units,
+/// this fine that a row lands within a 65536th of a day.
+const X_UNIT: f32 = 65_536.0;
+
 /// An area, bar or line chart, with a y grid and x ticks when it has axes, and a
-/// tooltip for the hovered category when it has a crosshair.
+/// tooltip for the hovered category when it has a crosshair. Its series are
+/// made when it mounts, one per config entry (give it a new key to change
+/// how many it has); new rows replace their points.
 #[must_use]
-pub fn chart_xy(chart: &ChartXy<'_>, state: &ChartState) -> Div {
+pub fn chart_xy(chart: ChartXy) -> ComponentElement {
+    component(chart, |ctx| {
+        let props = ctx.props();
+        let active: Signal<Option<usize>> = Signal::labeled("chart active", None);
+        let n = props.with_untracked(|c| c.config.len());
+        let data: Vec<Series> = (0..n).map(|_| series()).collect();
+        let fill = data.clone();
+        // The rows into the series, now and whenever they change.
+        let rows = move || props.with(|c| (c.mark, c.rows.clone()));
+        let load = move |(mark, rows): &(ChartMark, Vec<ChartRow>)| {
+            let xs: Vec<i64> = rows.iter().map(|r| data_x(r.x)).collect();
+            for (s, values) in fill.iter().zip(stacked(*mark, rows, fill.len())) {
+                s.set(&xs, &values);
+            }
+        };
+        load(&rows());
+        let _rows = watch(rows, move |_, new| load(new));
+        move || props.with(|chart| xy(chart, props, &data, active))
+    })
+}
+
+/// Each series' value per row, stacked for areas (each the sum of those
+/// before it and its own).
+fn stacked(mark: ChartMark, rows: &[ChartRow], n: usize) -> Vec<Vec<f64>> {
+    let mut below = vec![0.0_f32; rows.len()];
+    (0..n)
+        .map(|s| {
+            rows.iter()
+                .zip(below.iter_mut())
+                .map(|(row, b)| {
+                    let v = row.values.get(s).copied().unwrap_or(0.0).max(0.0);
+                    if mark == ChartMark::Area {
+                        *b += v;
+                        f64::from(*b)
+                    } else {
+                        f64::from(v)
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// A row's x in the plot's units.
+#[expect(
+    clippy::as_conversions,
+    reason = "days times 65536 as whole units, far inside an i64"
+)]
+fn data_x(x: f32) -> i64 {
+    (f64::from(x) * f64::from(X_UNIT)).round() as i64
+}
+
+/// Pixels as whole data units at `per` pixels a unit.
+#[expect(
+    clippy::as_conversions,
+    reason = "a pixel span as whole data units, far inside an i64"
+)]
+fn units(px: f32, per: f64) -> i64 {
+    (f64::from(px) / per).round() as i64
+}
+
+/// The chart's frame, grid, plot and ticks. What hovering shows (the dots
+/// and the tooltip) are instances of their own that read `active`, so
+/// hovering renders them, not the plot.
+fn xy(chart: &ChartXy, props: Signal<ChartXy>, data: &[Series], active: Signal<Option<usize>>) -> Element {
     let t = theme();
-    let plot = Plot::new(chart);
-    let active = state.active.get();
-    let mut drawn: Vec<Shape> = plot
+    let g = Geometry::new(chart);
+    let grid: Vec<Shape> = g
         .grid()
         .into_iter()
         .map(|y| {
-            Shape::path()
-                .move_to(plot.left, y)
+            Path::builder()
+                .move_to(g.left, y)
                 .line_to(chart.width, y)
                 .stroke(t.border, 1.0)
         })
         .collect();
-    drawn.extend(plot.marks());
-    if !matches!(chart.mark, ChartMark::Bar { .. })
-        && chart.crosshair.is_some()
-        && let Some(i) = active
-    {
-        drawn.extend(plot.dots(i));
-    }
+    let width = (chart.width - g.left).max(0.0);
+    let top = g.base - g.height;
+    let hovers = chart.crosshair.is_some();
     div()
         .named("chart-xy")
         .relative()
         .w_px(chart.width)
         .h_px(chart.height)
         .child(
-            shapes(drawn)
+            shapes(grid)
                 .absolute()
                 .top(0.0)
                 .left(0.0)
                 .w_px(chart.width)
                 .h_px(chart.height),
         )
-        .children(chart.rows.iter().zip(plot.xs()).filter(|_| chart.axes).map(|(row, x)| {
-            div()
+        .when(hovers && !matches!(chart.mark, ChartMark::Bar { .. }), |d| {
+            d.child(chart_dots(props, active))
+        })
+        .child(
+            g.marks(data, active)
+                .build()
+                .named("chart-plot")
                 .absolute()
-                .left_len(px(x - plot.band / 2.0))
-                .top_len(px(plot.base + TICK_TOP))
-                .w_px(plot.band)
+                .left_len(px(g.left))
+                .top_len(px(top))
+                .w_px(width)
+                .h_px(g.height),
+        )
+        .children(chart.rows.iter().zip(g.xs()).filter(|_| chart.axes).map(|(row, x)| {
+            div()
+                .named("chart-tick")
+                .absolute()
+                .left_len(px(x - g.band / 2.0))
+                .top_len(px(g.base + TICK_TOP))
+                .w_px(g.band)
                 .flex()
                 .justify_center()
                 .whitespace_nowrap()
                 .text_color(t.muted_foreground)
                 .child(row.tick.clone())
         }))
-        .children(chart.crosshair.into_iter().flat_map(|crosshair| {
-            chart
-                .rows
-                .iter()
-                .zip(plot.columns())
-                .enumerate()
-                .map(move |(i, (row, (left, right)))| {
-                    let hovered = state.active.clone();
-                    let column = div()
-                        .named("chart-category")
-                        .absolute()
-                        .left_len(px(left))
-                        .top(0.0)
-                        .w_px((right - left).max(0.0))
-                        .h_px(plot.base)
-                        .on_hover(move |inside| {
-                            if inside {
-                                hovered.set(Some(i));
-                            } else if hovered.get() == Some(i) {
-                                hovered.set(None);
-                            }
-                        });
-                    column.when(active == Some(i), |c| {
-                        let items: Vec<ChartTooltipItem> = chart
-                            .config
-                            .iter()
-                            .zip(&row.values)
-                            .map(|(s, v)| ChartTooltipItem {
-                                label: s.label.clone(),
-                                value: chart_value(*v),
-                                color: s.color,
-                            })
-                            .collect();
-                        let label = (!crosshair.hide_label).then_some(row.label.as_str());
-                        c.child(deferred(
-                            Placement::Anchored {
-                                side: Side::Right,
-                                align: SideAlign::Center,
-                                offset: 8.0,
-                                match_width: false,
-                                fit_height: false,
-                            },
-                            chart_tooltip_content(label, &items, crosshair.indicator),
-                        ))
-                    })
-                })
-        }))
+        .when(hovers, |d| d.child(chart_category(props, active)))
+        .into_element()
+}
+
+/// The crosshair's dot on each series at the hovered row, under the marks.
+fn chart_dots(chart: Signal<ChartXy>, active: Signal<Option<usize>>) -> ComponentElement {
+    component((chart, active), |cx| {
+        let props = cx.props();
+        move || {
+            let (chart, active) = props.get();
+            let Some(i) = active.get() else {
+                return Element::Empty;
+            };
+            chart.with(|chart| {
+                let g = Geometry::new(chart);
+                shapes(g.dots(i))
+                    .absolute()
+                    .top(0.0)
+                    .left(0.0)
+                    .w_px(chart.width)
+                    .h_px(chart.height)
+                    .into_element()
+            })
+        }
+    })
+}
+
+/// The hovered row's column, which the tooltip of its values stands beside;
+/// the pointer passes through it to the plot.
+fn chart_category(chart: Signal<ChartXy>, active: Signal<Option<usize>>) -> ComponentElement {
+    component((chart, active), |cx| {
+        let props = cx.props();
+        move || {
+            let (chart, active) = props.get();
+            let Some(i) = active.get() else {
+                return Element::Empty;
+            };
+            chart.with(|chart| category(chart, i)).unwrap_or_default()
+        }
+    })
+}
+
+fn category(chart: &ChartXy, i: usize) -> Option<Element> {
+    let crosshair = chart.crosshair?;
+    let g = Geometry::new(chart);
+    let row = chart.rows.get(i)?;
+    let (left, right) = g.columns().nth(i)?;
+    let items: Vec<ChartTooltipItem> = chart
+        .config
+        .iter()
+        .zip(&row.values)
+        .map(|(s, v)| ChartTooltipItem {
+            label: s.label.clone(),
+            value: chart_value(*v),
+            color: s.color,
+        })
+        .collect();
+    let label = (!crosshair.hide_label).then_some(row.label.as_str());
+    Some(
+        div()
+            .named("chart-category")
+            .pass_through()
+            .absolute()
+            .left_len(px(left))
+            .top(0.0)
+            .w_px((right - left).max(0.0))
+            .h_px(g.base)
+            .child(deferred(
+                Placement::Anchored {
+                    side: Side::Right,
+                    align: SideAlign::Center,
+                    offset: 8.0,
+                    match_width: false,
+                    fit_height: false,
+                },
+                chart_tooltip_content(label, &items, crosshair.indicator),
+            ))
+            .into_element(),
+    )
 }
 
 /// A pie or donut, slices clockwise from twelve o'clock in config order.
@@ -257,7 +353,7 @@ pub fn chart_pie(pie: &ChartPie<'_>) -> Div {
         .map(|(series, v)| {
             let end = start + v.max(0.0) / total * TAU;
             let outer = arc(
-                Shape::path().move_to(r + r * start.sin(), r - r * start.cos()),
+                Path::builder().move_to(r + r * start.sin(), r - r * start.cos()),
                 r,
                 r,
                 start,
@@ -404,8 +500,8 @@ pub fn chart_value(v: f32) -> String {
 
 /// An x-y chart's geometry as unovis' `VisXYContainer` lays it out: where
 /// each row and value lands. Rows are in x order.
-struct Plot<'a> {
-    chart: &'a ChartXy<'a>,
+struct Geometry<'a> {
+    chart: &'a ChartXy,
     /// Where the plot starts, right of the y axis.
     left: f32,
     /// The y of value 0.
@@ -424,8 +520,8 @@ struct Plot<'a> {
     band: f32,
 }
 
-impl<'a> Plot<'a> {
-    fn new(chart: &'a ChartXy<'a>) -> Self {
+impl<'a> Geometry<'a> {
+    fn new(chart: &'a ChartXy) -> Self {
         let left = if chart.axes { Y_AXIS } else { 0.0 };
         let base = chart.height - if chart.axes { X_AXIS } else { 0.0 };
         let bars = matches!(chart.mark, ChartMark::Bar { .. });
@@ -538,100 +634,72 @@ impl<'a> Plot<'a> {
             .collect()
     }
 
-    /// Each series' value per row, stacked for areas.
-    fn series(&self) -> Vec<Vec<(f32, f32)>> {
-        let mut floor: Vec<f32> = vec![0.0; self.chart.rows.len()];
-        (0..self.chart.config.len())
-            .map(|s| {
-                self.chart
-                    .rows
-                    .iter()
-                    .zip(floor.iter_mut())
-                    .map(|(row, below)| {
-                        let v = row.values.get(s).copied().unwrap_or(0.0).max(0.0);
-                        let low = *below;
-                        if self.chart.mark == ChartMark::Area {
-                            *below += v;
-                            (low, low + v)
-                        } else {
-                            (0.0, v)
-                        }
-                    })
-                    .collect()
-            })
-            .collect()
-    }
-
-    fn marks(&self) -> Vec<Shape> {
-        let series = self.series();
-        match self.chart.mark {
-            ChartMark::Bar { bar_padding, .. } => self.bars(&series, bar_padding),
-            ChartMark::Area | ChartMark::Line => self
-                .chart
-                .config
-                .iter()
-                .zip(&series)
-                .flat_map(|(s, values)| {
-                    let top: Vec<(f32, f32)> = self.xs().zip(values).map(|(x, (_, hi))| (x, self.y(*hi))).collect();
-                    let line = curve(
-                        top.first().map_or(Shape::path(), |p| Shape::path().move_to(p.0, p.1)),
-                        &top,
-                    )
-                    .stroke(s.color, if self.chart.mark == ChartMark::Area { 1.0 } else { 2.0 });
-                    let area = (self.chart.mark == ChartMark::Area).then(|| {
-                        let bottom: Vec<(f32, f32)> = self
-                            .xs
-                            .iter()
-                            .zip(values)
-                            .rev()
-                            .map(|(x, (lo, _))| (*x, self.y(*lo)))
-                            .collect();
-                        let upper = curve(
-                            top.first().map_or(Shape::path(), |p| Shape::path().move_to(p.0, p.1)),
-                            &top,
-                        );
-                        let lower = bottom
-                            .first()
-                            .map_or(upper.clone(), |p| upper.clone().line_to(p.0, p.1));
-                        curve(lower, &bottom).close().fill(s.color.opacity(0.4))
-                    });
-                    area.into_iter().chain(std::iter::once(line))
-                })
-                .collect(),
+    /// The plot of the series: its view the rows' x as [`Self::xs`] places
+    /// them (`left` its left edge) and y from 0 at `base` to `max`, its
+    /// marks the chart's, the hovered row into `active`.
+    fn marks(&self, data: &[Series], active: Signal<Option<usize>>) -> gui::chunk::plot::Plot {
+        let chart = self.chart;
+        let width = (chart.width - self.left).max(0.0);
+        let first = chart.rows.first().map_or(0, |r| data_x(r.x));
+        let last = chart.rows.last().map_or(0, |r| data_x(r.x));
+        let (from, to) = (
+            self.xs.first().copied().unwrap_or(self.left),
+            self.xs.last().copied().unwrap_or(self.left),
+        );
+        // Pixels a unit, and the units left of the first row.
+        let (per, x0) = if last > first && to > from {
+            #[expect(clippy::as_conversions, reason = "a span of units to a scale")]
+            let per = f64::from(to - from) / last.saturating_sub(first) as f64;
+            (per, first.saturating_sub(units(from - self.left, per)))
+        } else {
+            (1.0, first.saturating_sub(units(from - self.left, 1.0)))
+        };
+        let x1 = x0.saturating_add(units(width, per).max(1));
+        let mut p = plot().x(x0, x1).y(0.0, f64::from(self.max)).base(0.0);
+        for (j, (s, cfg)) in data.iter().zip(&chart.config).enumerate() {
+            p = p.mark(match chart.mark {
+                ChartMark::Area => {
+                    let a = area(*s).natural().color(cfg.color.opacity(0.4)).stroke(cfg.color, 1.0);
+                    match j.checked_sub(1).and_then(|b| data.get(b)) {
+                        Some(below) => a.on(*below),
+                        None => a,
+                    }
+                }
+                ChartMark::Line => line(*s).natural().color(cfg.color).width(2.0),
+                ChartMark::Bar { bar_padding, .. } => {
+                    let (left, width) = self.bar(j, bar_padding);
+                    bars(*s).width(width).offset(left).radius(BAR_RADIUS).color(cfg.color)
+                }
+            });
         }
+        if chart.crosshair.is_some() {
+            p = p.on_hover(24.0, move |h| active.set(h.and_then(|h| usize::try_from(h.index).ok())));
+        }
+        p
     }
 
-    /// Each group's bars across its width, on a d3 band scale whose inner and
-    /// outer padding are both `padding`.
-    fn bars(&self, series: &[Vec<(f32, f32)>], padding: f32) -> Vec<Shape> {
-        let n = count(series.len());
+    /// Bar `j` of a group: its left edge from the group's x and its width,
+    /// on a d3 band scale whose inner and outer padding are both `padding`.
+    fn bar(&self, j: usize, padding: f32) -> (f32, f32) {
+        let n = count(self.chart.config.len());
         let step = self.group / (n - padding + 2.0 * padding).max(1.0);
         let width = step * (1.0 - padding);
         let start = (self.group - step * (n - padding)) / 2.0 - self.group / 2.0;
-        self.chart
-            .config
-            .iter()
-            .zip(series)
-            .enumerate()
-            .flat_map(|(j, (s, values))| {
-                self.xs().zip(values).map(move |(x, (_, v))| {
-                    bar(x + start + count(j) * step, self.y(*v), width, self.base).fill(s.color)
-                })
-            })
-            .collect()
+        (start + count(j) * step, width)
     }
 
     /// The crosshair's dots at row `i`.
     fn dots(&self, i: usize) -> Vec<Shape> {
         let x = self.xs().nth(i).unwrap_or(0.0);
+        let values = stacked(self.chart.mark, &self.chart.rows, self.chart.config.len());
         self.chart
             .config
             .iter()
-            .zip(self.series())
-            .filter_map(|(s, values)| {
-                values
-                    .get(i)
-                    .map(|(_, hi)| Shape::circle(x, self.y(*hi), DOT).fill(s.color))
+            .zip(values)
+            .filter_map(|(s, v)| {
+                #[expect(clippy::as_conversions, reason = "a value back to the f32 it was")]
+                let v = *v.get(i)? as f32;
+                Some(Path::circle(x, self.y(v), DOT).fill(s.color))
             })
             .collect()
     }
@@ -642,88 +710,10 @@ fn count(n: usize) -> f32 {
     u16::try_from(n).map_or(f32::from(u16::MAX), f32::from)
 }
 
-/// A bar from `top` down to `base`, its top corners rounded as unovis'
-/// `roundedRectPath`: at most half the bar's width or height.
-fn bar(left: f32, top: f32, width: f32, base: f32) -> Shape {
-    /// A quarter circle's cubic control distance, per unit of radius.
-    const K: f32 = 0.552_284_8;
-    let r = BAR_RADIUS.min(width.min(base - top) / 2.0).max(0.0);
-    let k = r * (1.0 - K);
-    Shape::path()
-        .move_to(left, base)
-        .line_to(left, top + r)
-        .cubic_to(left, top + k, left + k, top, left + r, top)
-        .line_to(left + width - r, top)
-        .cubic_to(left + width - k, top, left + width, top + k, left + width, top + r)
-        .line_to(left + width, base)
-        .close()
-}
-
-/// `shape`, whose pen is at `points[0]`, continued through the rest of
-/// `points` along d3's natural cubic spline (`CurveType.Natural`).
-fn curve(shape: Shape, points: &[(f32, f32)]) -> Shape {
-    let xs: Vec<f32> = points.iter().map(|p| p.0).collect();
-    let ys: Vec<f32> = points.iter().map(|p| p.1).collect();
-    match (natural_controls(&xs), natural_controls(&ys)) {
-        (Some((x1, x2)), Some((y1, y2))) => points
-            .iter()
-            .skip(1)
-            .zip(x1.iter().zip(&x2).zip(y1.iter().zip(&y2)))
-            .fold(shape, |s, (p, ((c1x, c2x), (c1y, c2y)))| {
-                s.cubic_to(*c1x, *c1y, *c2x, *c2y, p.0, p.1)
-            }),
-        _ => points.iter().skip(1).fold(shape, |s, p| s.line_to(p.0, p.1)),
-    }
-}
-
-/// The two control points of each segment of a natural cubic spline through
-/// `k`, on one axis: d3's `controlPoints`, solved with the Thomas algorithm.
-/// `None` under three points, where the curve is a line.
-fn natural_controls(k: &[f32]) -> Option<(Vec<f32>, Vec<f32>)> {
-    let segments = k.len().checked_sub(1).filter(|n| *n >= 2)?;
-    let last = segments.saturating_sub(1);
-    let rows = k.windows(2).enumerate().filter_map(|(i, w)| match *w {
-        [x0, x1] if i == 0 => Some((0.0, 2.0, x0 + 2.0 * x1)),
-        [x0, x1] if i == last => Some((2.0, 7.0, 8.0 * x0 + x1)),
-        [x0, x1] => Some((1.0, 4.0, 4.0 * x0 + 2.0 * x1)),
-        _ => None,
-    });
-    let mut previous: Option<(f32, f32)> = None;
-    let swept: Vec<(f32, f32)> = rows
-        .map(|(a, b, r)| {
-            let row = previous.map_or((b, r), |(pb, pr)| {
-                let m = a / pb;
-                (b - m, r - m * pr)
-            });
-            previous = Some(row);
-            row
-        })
-        .collect();
-    let mut next: Option<f32> = None;
-    let mut first: Vec<f32> = swept
-        .iter()
-        .rev()
-        .map(|(b, r)| {
-            let a = next.map_or(r / b, |n| (r - n) / b);
-            next = Some(a);
-            a
-        })
-        .collect();
-    first.reverse();
-    let mut second: Vec<f32> = k
-        .iter()
-        .skip(1)
-        .zip(first.iter().skip(1))
-        .map(|(x, a)| 2.0 * x - a)
-        .collect();
-    second.push((k.last()? + first.last()?) / 2.0);
-    Some((first, second))
-}
-
 /// `shape` continued along the circle of radius `r` about `(c, c)` from angle
 /// `from` to `to` (radians clockwise from twelve o'clock), in cubic pieces of
 /// at most a quarter turn.
-fn arc(mut shape: Shape, c: f32, r: f32, from: f32, to: f32) -> Shape {
+fn arc(mut shape: PathBuilder, c: f32, r: f32, from: f32, to: f32) -> PathBuilder {
     let point = |a: f32| (c + r * a.sin(), c - r * a.cos());
     let mut at = from;
     for _ in 0..8 {

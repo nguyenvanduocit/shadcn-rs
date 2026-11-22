@@ -6,9 +6,9 @@ use gui::prelude::*;
 use gui::{Div, Element, Icon, Signal, Span, div, icon, span, text};
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use shadcn::{
-    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockCopy, CodeBlockLineVariant, CodeBlockProps,
-    MessageProps, button, code_block, code_block_actions, code_block_content, code_block_copy_button,
-    code_block_header, code_block_title, highlighted_lines, message, message_content, theme,
+    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockLineVariant, CodeBlockProps, MessageProps, button,
+    code_block, code_block_actions, code_block_content, code_block_copy_button, code_block_header, code_block_title,
+    highlighted_lines, message, message_content, theme,
 };
 
 use super::super::thread::{Script, frames, replay, user_turn};
@@ -104,7 +104,6 @@ const TICK: u64 = 16;
 pub struct Streaming {
     length: Signal<usize>,
     script: Script,
-    copies: [CodeBlockCopy; BLOCKS.len()],
 }
 
 fn total() -> usize {
@@ -117,7 +116,6 @@ impl Streaming {
         Self {
             length: Signal::labeled("streamed length", total()),
             script: Script::new("streaming"),
-            copies: std::array::from_fn(|_| CodeBlockCopy::new()),
         }
     }
 
@@ -126,7 +124,7 @@ impl Streaming {
         let steps = std::iter::successors(Some(0_usize), |n| (*n < total).then(|| n.saturating_add(STEP)))
             .map(|n| (if n == 0 { 0 } else { TICK }, n.min(total)))
             .collect();
-        let length = self.length.clone();
+        let length = self.length;
         self.script.play(frames(steps, move |n| length.set(*n)));
     }
 
@@ -134,11 +132,11 @@ impl Streaming {
         let length = self.length.get();
         let mut offset = 0_usize;
         let mut blocks = Vec::new();
-        for (block, copy) in BLOCKS.iter().zip(&self.copies) {
+        for block in &BLOCKS {
             let start = offset;
             offset = offset.saturating_add(block.code.len());
             if length > start {
-                blocks.push(streamed(block, copy, length.saturating_sub(start)));
+                blocks.push(streamed(block, length.saturating_sub(start)));
             }
         }
         let me = self.clone();
@@ -154,7 +152,7 @@ impl Streaming {
 }
 
 /// `block` with its first `written` bytes.
-fn streamed(block: &Block, copy: &CodeBlockCopy, written: usize) -> Div {
+fn streamed(block: &Block, written: usize) -> Div {
     let code = block.code.get(..written).unwrap_or(block.code);
     let rows: Vec<&str> = code.split('\n').collect();
     let source = if block.diff {
@@ -194,7 +192,7 @@ fn streamed(block: &Block, copy: &CodeBlockCopy, written: usize) -> Div {
         .child(block.title.map(|title| {
             code_block_header(p).child(code_block_title(p, None, title)).child(
                 code_block_actions()
-                    .child(code_block_copy_button(copy, source.clone()).disabled(code.len() < block.code.len())),
+                    .child(code_block_copy_button(source.clone()).disabled(code.len() < block.code.len())),
             )
         }))
         .child(code_block_content(p, c, lines))
@@ -232,7 +230,6 @@ const FLOW: f32 = 1.25;
 pub struct MarkdownChat {
     answer: Signal<Option<String>>,
     script: Script,
-    copy: CodeBlockCopy,
 }
 
 impl MarkdownChat {
@@ -241,7 +238,6 @@ impl MarkdownChat {
         Self {
             answer: Signal::labeled("markdown answer", Some(RESPONSE.to_owned())),
             script: Script::new("markdown replay"),
-            copy: CodeBlockCopy::new(),
         }
     }
 
@@ -254,7 +250,7 @@ impl MarkdownChat {
             .chain((1..=count).map(|k| (WORD, k)))
             .chain(std::iter::once((WORD, count)))
             .collect();
-        let answer = self.answer.clone();
+        let answer = self.answer;
         self.script.play(frames(steps, move |k: &usize| {
             answer.set((*k > 0).then(|| chunks.get(..*k).unwrap_or_default().concat()));
         }));
@@ -274,7 +270,7 @@ impl MarkdownChat {
             .child(user_turn(QUESTION))
             .child(self.answer.get().map(|answer| {
                 let p = MessageProps::default();
-                message(p).child(message_content(p).child(typeset(&answer, busy, &self.copy)))
+                message(p).child(message_content(p).child(typeset(&answer, busy)))
             }))
             .child(replay(&self.script, move || me.replay()).map(|b| b.named("markdown-replay")))
     }
@@ -283,7 +279,7 @@ impl MarkdownChat {
 /// `source` as the demo's comark renders it inside `.typeset`: paragraphs
 /// with inline code, and each fence as a code block whose copy button waits
 /// for the closing fence while the answer streams.
-fn typeset(source: &str, streaming: bool, copy: &CodeBlockCopy) -> Div {
+fn typeset(source: &str, streaming: bool) -> Div {
     // The trailing fence is still open when an odd number of lines start with ```.
     let fences = source.trim().lines().filter(|l| l.starts_with("```")).count();
     let open_fence = streaming && fences % 2 == 1;
@@ -310,7 +306,7 @@ fn typeset(source: &str, streaming: bool, copy: &CodeBlockCopy) -> Div {
             }
             Event::End(TagEnd::CodeBlock) => {
                 if let Some((language, code)) = fence.take() {
-                    blocks.push(code_block_of(&language, &code, false, copy).into_element());
+                    blocks.push(code_block_of(&language, &code, false).into_element());
                 }
             }
             _ => {}
@@ -318,7 +314,7 @@ fn typeset(source: &str, streaming: bool, copy: &CodeBlockCopy) -> Div {
     }
     // A stream cut mid-block shows what has arrived.
     if let Some((language, code)) = fence.take() {
-        blocks.push(code_block_of(&language, &code, open_fence, copy).into_element());
+        blocks.push(code_block_of(&language, &code, open_fence).into_element());
     }
     if !runs.is_empty() {
         blocks.push(text("").spans(runs).into_element());
@@ -352,7 +348,7 @@ fn inline_code(code: &str) -> Span {
 
 /// The demo's `MarkdownCodeBlock`: the language as its title, a copy button
 /// that waits for the closing fence (`incomplete`), the highlighted lines.
-fn code_block_of(language: &str, code: &str, incomplete: bool, copy: &CodeBlockCopy) -> Div {
+fn code_block_of(language: &str, code: &str, incomplete: bool) -> Div {
     let p = CodeBlockProps {
         header: true,
         ..CodeBlockProps::default()
@@ -363,7 +359,7 @@ fn code_block_of(language: &str, code: &str, incomplete: bool, copy: &CodeBlockC
         .child(
             code_block_header(p)
                 .child(code_block_title(p, None, title))
-                .child(code_block_actions().child(code_block_copy_button(copy, code).disabled(incomplete))),
+                .child(code_block_actions().child(code_block_copy_button(code).disabled(incomplete))),
         )
         .child(code_block_content(
             p,

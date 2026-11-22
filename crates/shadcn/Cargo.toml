@@ -12,11 +12,23 @@ workspace = true
 
 [dependencies]
 gui = { path = "../gui" }
+# The calendars' today: the day it is in the local time zone, as reka's
+# `today(getLocalTimeZone())`. The IANA database is bundled, so a zone names
+# the same days on every machine, as the browser's own ICU copy does.
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
 # Shiki's tokens and GitHub themes for code blocks, in Rust (ADR-0002).
 irosashi = "0.3.1"
+# Diagnosis only (ADR-0023): `--features dhat-heap` makes the examples
+# profile the heap with dhat instead of counting it.
+dhat = { version = "0.3", optional = true }
+
+[features]
+dhat-heap = ["dep:dhat"]
 
 [dev-dependencies]
+# The stress example's `--a11y` feeds each update to the tree a platform
+# adapter keeps, to time what a screen reader's side spends on it (ADR-0021).
+accesskit = "0.25"
+accesskit_consumer = "0.39"
 # The gallery's Markdown, as shadcn-vue's docs render agent replies (comark).
 pulldown-cmark = { version = "0.13", default-features = false }
-# The gallery's verdict crops and compares frames; same version as gui's.
-tiny-skia = "0.12"

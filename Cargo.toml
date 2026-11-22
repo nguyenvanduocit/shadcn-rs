@@ -41,11 +41,3 @@ debug = "line-tables-only"
 
 [profile.release]
 debug = "line-tables-only"
-
-# cosmic-text 0.19.0 starts a line-clamped paragraph's last line at the space
-# before its first word; upstream fixed it after the release (c5d3205, "fix
-# ellipsize on last line"). Back to crates.io at the next release (ADR-0006).
-# A workspace that depends on `gui` carries this patch too: Cargo applies only
-# the root workspace's.
-[patch.crates-io]
-cosmic-text = { git = "https://github.com/pop-os/cosmic-text", rev = "c5d32054ad0f284873e344e0ea87902d9dc2bca8" }

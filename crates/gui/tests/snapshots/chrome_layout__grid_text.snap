@@ -1,0 +1,10 @@
+---
+source: crates/gui/tests/chrome_layout.rs
+expression: "gui::inspect::dump(&laid_out(name, &mut ts))"
+---
+0            Div 800x600 at (0,0)
+  0/0          Div 260x100 at (0,0)
+    0/0/0        Text "Name" 62x24 at (0,0)  16px w400 #000000
+    0/0/1        Text "Ada Lovelace" 186x24 at (74,0)  16px w400 #000000
+    0/0/2        Text "Address" 62x72 at (0,28)  16px w400 #000000
+    0/0/3        Text "Twelve St James's Square…" 186x72 at (74,28)  16px w400 #000000

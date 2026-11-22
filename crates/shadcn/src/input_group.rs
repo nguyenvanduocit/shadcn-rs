@@ -8,12 +8,12 @@
 
 use gui::Properties;
 use gui::prelude::*;
-use gui::{Color, Div, Element, FocusHandle, InputType, NamedKey, Radius, Style, TextField, TextInput, div};
+use gui::{Color, Div, Element, FocusHandle, InputType, NamedKey, Radius, Style, TextField, div};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::button_group::with_style;
 use crate::focus::{destructive_ring, focus_ring};
-use crate::input::input;
+use crate::input::{Input, input};
 use crate::textarea::textarea;
 use crate::theme::theme;
 
@@ -33,7 +33,7 @@ pub enum InputGroupAlign {
 
 /// The input or textarea of a group.
 pub struct InputGroupControl {
-    el: TextInput,
+    el: Input,
     focus: FocusHandle,
     multiline: bool,
     invalid: bool,
@@ -82,12 +82,16 @@ impl InputGroupControl {
     /// `requestSubmit`); Shift+Enter still breaks the line.
     #[must_use]
     pub fn on_submit(self, submit: impl Fn() + 'static) -> Self {
-        let el = self.el.on_key_down(move |ev| {
-            let sends = ev.is(NamedKey::Enter) && !ev.modifiers.shift;
-            if sends {
-                submit();
-            }
-            sends
+        let submit = std::rc::Rc::new(submit);
+        let el = self.el.map(move |el| {
+            let submit = std::rc::Rc::clone(&submit);
+            el.on_key_down(move |ev| {
+                let sends = ev.is(NamedKey::Enter) && !ev.modifiers.shift;
+                if sends {
+                    submit();
+                }
+                sends
+            })
         });
         Self { el, ..self }
     }
@@ -105,20 +109,24 @@ impl Styled for InputGroupControl {
 /// draws the frame and its focus ring.
 #[must_use]
 pub fn input_group_input(field: &TextField) -> InputGroupControl {
-    control(frameless(input(field).named("input-group-control")), field.focus, false)
+    control(
+        frameless(input().field(*field).named("input-group-control")),
+        field.focus,
+        false,
+    )
 }
 
 /// A textarea that is the group's control.
 #[must_use]
 pub fn input_group_textarea(field: &TextField) -> InputGroupControl {
     control(
-        frameless(textarea(field).named("input-group-control")).py(3.0),
+        frameless(textarea().field(*field).named("input-group-control")).py(3.0),
         field.focus,
         true,
     )
 }
 
-fn control(mut el: TextInput, focus: FocusHandle, multiline: bool) -> InputGroupControl {
+fn control(mut el: Input, focus: FocusHandle, multiline: bool) -> InputGroupControl {
     let made_with = el.style_mut().padding;
     InputGroupControl {
         el,
@@ -130,13 +138,13 @@ fn control(mut el: TextInput, focus: FocusHandle, multiline: bool) -> InputGroup
 }
 
 /// `flex-1 rounded-none border-0 bg-transparent shadow-none focus-visible:ring-0`.
-fn frameless(el: TextInput) -> TextInput {
+fn frameless(el: Input) -> Input {
     el.flex_1()
         .rounded_none()
         .border_0()
         .bg(Color::TRANSPARENT)
         .shadow_none()
-        .focus_visible(|s| s.ring_none())
+        .map(|el| el.focus_visible(|s| s.ring_none()))
 }
 
 /// One addon; fill it with `.child`, and add a button or a key with
@@ -159,7 +167,7 @@ impl InputGroupAddon {
 
     /// A button (`has-[>button]`: pulled 0.45rem towards the edge).
     #[must_use]
-    pub fn button(self, button: Div) -> Self {
+    pub fn button(self, button: impl IntoElement) -> Self {
         Self {
             el: self.el.child(button),
             has_button: true,
@@ -226,22 +234,22 @@ pub struct InputGroup {
 
 /// What a group frames besides its addons.
 enum Body {
-    Control(InputGroupControl),
+    Control(Box<InputGroupControl>),
     /// Anything that is not an input (a plain `<div>` in Vue's group).
-    Content(Div),
+    Content(Box<Div>),
 }
 
 /// A group framing `control`; add addons with `.addon`.
 #[must_use]
 pub fn input_group(control: InputGroupControl) -> InputGroup {
-    frame(Body::Control(control))
+    frame(Body::Control(Box::new(control)))
 }
 
 /// A group framing `content` that is not an input (text the group shows):
 /// no control takes focus, and only the block addons' rules apply.
 #[must_use]
 pub fn input_group_content(content: Div) -> InputGroup {
-    frame(Body::Content(content))
+    frame(Body::Content(Box::new(content)))
 }
 
 fn frame(body: Body) -> InputGroup {
@@ -304,7 +312,7 @@ impl IntoElement for InputGroup {
             .when(block_start || block_end, Div::h_auto)
             .when(block_start || block_end, Div::flex_col);
         let control = match body {
-            Body::Control(control) => control,
+            Body::Control(control) => *control,
             Body::Content(content) => {
                 let (mut above, mut below) = (Vec::new(), Vec::new());
                 for a in addons {
@@ -315,7 +323,7 @@ impl IntoElement for InputGroup {
                     };
                     list.push(place(a, false, None).when(disabled, |a| a.opacity(0.5)).into_element());
                 }
-                return root.children(above).child(content).children(below).into_element();
+                return root.children(above).child(*content).children(below).into_element();
             }
         };
         let (inline_start, inline_end) = (has(InputGroupAlign::InlineStart), has(InputGroupAlign::InlineEnd));

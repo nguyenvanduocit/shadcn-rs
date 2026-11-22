@@ -1,0 +1,11 @@
+---
+source: crates/gui/tests/chrome_layout.rs
+expression: "gui::inspect::dump(&laid_out(name, &mut ts))"
+---
+0            Div 800x600 at (0,0)
+  0/0          Div 400x33 at (0,0)
+    0/0/0        Text "Small" 31x16 at (0,13)  12px w400 #000000
+    0/0/1        Text "Large" 62x32 at (35,1)  24px w400 #000000
+    0/0/2        Text "Base" 37x24 at (100,7)  16px w400 #000000
+    0/0/3        Div 51x30 at (141,0)
+      0/0/3/0      Text "Padded" 51x20 at (141,10)  14px w400 #000000

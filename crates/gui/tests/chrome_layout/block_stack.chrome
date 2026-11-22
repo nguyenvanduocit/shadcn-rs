@@ -1,0 +1,10 @@
+# Chrome's boxes for block_stack.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 80
+  div 0 0 300 20
+  div 0 20 100 30
+  div 0 50 300 20
+    div 0 50 300 15
+    div 0 65 300 5
+  div 0 70 300 10

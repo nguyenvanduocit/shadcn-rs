@@ -3,16 +3,16 @@
 //! parts sidebar-07 does not use.
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, TextField, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, TextField, div, icon, text};
 use shadcn::{
     ButtonSize, ButtonVariant, Orientation, SidebarCollapsible, SidebarMenuButtonProps, SidebarMenuButtonSize,
-    SidebarMenuButtonVariant, SidebarMenuSubButtonSize, SidebarSide, SidebarState, SidebarVariant, avatar,
-    avatar_fallback, breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page,
-    breadcrumb_separator, button, separator, sidebar, sidebar_content, sidebar_footer, sidebar_group,
-    sidebar_group_action, sidebar_group_content, sidebar_group_label, sidebar_header, sidebar_input, sidebar_inset,
-    sidebar_menu, sidebar_menu_action, sidebar_menu_badge, sidebar_menu_button, sidebar_menu_item,
-    sidebar_menu_skeleton, sidebar_menu_sub, sidebar_menu_sub_button, sidebar_menu_sub_item, sidebar_provider,
-    sidebar_rail, sidebar_separator, sidebar_trigger, theme,
+    SidebarMenuButtonVariant, SidebarMenuSubButtonSize, SidebarSide, SidebarVariant, avatar, avatar_fallback,
+    breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page, breadcrumb_separator, button,
+    separator, sidebar, sidebar_content, sidebar_footer, sidebar_group, sidebar_group_action, sidebar_group_content,
+    sidebar_group_label, sidebar_header, sidebar_input, sidebar_inset, sidebar_menu, sidebar_menu_action,
+    sidebar_menu_badge, sidebar_menu_button, sidebar_menu_item, sidebar_menu_skeleton, sidebar_menu_sub,
+    sidebar_menu_sub_button, sidebar_menu_sub_item, sidebar_provider, sidebar_rail, sidebar_separator, sidebar_trigger,
+    theme,
 };
 
 use crate::{Render, Shot, page};
@@ -36,41 +36,43 @@ const PROJECTS: [(&str, Icon); 3] = [
     ("Travel", Icon::Map),
 ];
 
+/// Whether sidebar-07 is open: the script presses ⌘B through it.
+#[derive(Clone, Copy)]
+struct SidebarOpen(Signal<bool>);
+
 /// The page's state.
 #[derive(Clone)]
 struct Demo {
-    sb: SidebarState,
+    /// sidebar-07's `v-model:open`: the page's inset follows it too.
+    open: Signal<bool>,
     variant: Signal<SidebarVariant>,
     collapsible: Signal<SidebarCollapsible>,
     side: Signal<SidebarSide>,
     open_groups: Signal<Vec<&'static str>>,
     active: Signal<&'static str>,
-    parts: SidebarState,
     search: TextField,
-    basic: SidebarState,
+}
+
+impl Demo {
+    /// sidebar-07 collapsed to its icons.
+    fn icon_collapsed(&self) -> bool {
+        self.collapsible.get() == SidebarCollapsible::Icon && !self.open.get()
+    }
 }
 
 pub fn render() -> Render {
     let demo = Demo {
-        sb: SidebarState::new(true),
+        open: Signal::labeled("sidebar open", true),
         variant: Signal::labeled("variant", SidebarVariant::Sidebar),
         collapsible: Signal::labeled("collapsible", SidebarCollapsible::Icon),
         side: Signal::labeled("side", SidebarSide::Left),
         open_groups: Signal::labeled("open groups", vec!["Playground"]),
         active: Signal::labeled("active", "History"),
-        parts: SidebarState::new(true).collapsible(SidebarCollapsible::None),
         search: TextField::new(""),
-        basic: SidebarState::new(true),
     };
     // The script reaches the sidebar through this to press ⌘B.
-    gui::provide(demo.sb.clone());
+    gui::provide(SidebarOpen(demo.open));
     Box::new(move || {
-        let sb = demo
-            .sb
-            .clone()
-            .variant(demo.variant.get())
-            .collapsible(demo.collapsible.get())
-            .side(demo.side.get());
         let t = theme();
         let frame = |w: Div| {
             w.h_full()
@@ -93,17 +95,17 @@ pub fn render() -> Render {
                         .gap(4.0)
                         .h_px(472.0)
                         .shrink_0()
-                        .child(frame(div().flex_1().min_w(0.0)).child(sidebar_07(&sb, &demo)))
+                        .child(frame(div().flex_1().min_w(0.0)).child(sidebar_07(&demo)))
                         .child(frame(div().w_px(258.0).shrink_0()).child(parts(&demo))),
                 )
-                .child(crate::demo("SidebarDemo.vue", sidebar_demo(&demo.basic))),
+                .child(crate::demo("SidebarDemo.vue", sidebar_demo())),
         )
     })
 }
 
 /// `SidebarDemo.vue`: one group of five links, and a trigger in the inset's
 /// header. Its provider is `min-h-svh`, the reference's 900px viewport.
-fn sidebar_demo(sb: &SidebarState) -> Div {
+fn sidebar_demo() -> Element {
     let items = [
         ("Home", Icon::House),
         ("Inbox", Icon::Inbox),
@@ -112,33 +114,35 @@ fn sidebar_demo(sb: &SidebarState) -> Div {
         ("Settings", Icon::Settings),
     ];
     let menu = sidebar_menu().children(items.map(|(title, glyph)| {
-        sidebar_menu_item(sb, title).child(
-            sidebar_menu_button(sb, title, SidebarMenuButtonProps::default())
+        sidebar_menu_item().child(
+            sidebar_menu_button(SidebarMenuButtonProps::default())
                 .child(icon(glyph))
                 .child(text(title).truncate()),
         )
     }));
-    sidebar_provider(sb)
+    sidebar_provider()
         .h_px(900.0)
-        .child(sidebar(
-            sb,
-            [sidebar_content(sb).child(
-                sidebar_group()
-                    .child(sidebar_group_label(sb).child("Application"))
-                    .child(sidebar_group_content().child(menu)),
-            )],
-        ))
         .child(
-            sidebar_inset(sb).child(
+            sidebar().child(
+                sidebar_content().child(
+                    sidebar_group()
+                        .child(sidebar_group_label().child("Application"))
+                        .child(sidebar_group_content().child(menu)),
+                ),
+            ),
+        )
+        .child(
+            sidebar_inset().child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .px(4.0)
                     .h(12.0)
-                    .child(sidebar_trigger(sb)),
+                    .child(sidebar_trigger()),
             ),
         )
+        .into_element()
 }
 
 /// Buttons choosing the variant, collapse mode and side.
@@ -146,7 +150,7 @@ fn controls(demo: &Demo) -> Div {
     fn choice<T: Copy + PartialEq + 'static>(signal: &Signal<T>, options: &[(&'static str, T)]) -> Div {
         let current = signal.get();
         div().flex().gap(1.0).children(options.iter().map(|&(label, value)| {
-            let signal = signal.clone();
+            let signal = *signal;
             let variant = if value == current {
                 ButtonVariant::Secondary
             } else {
@@ -188,23 +192,22 @@ fn controls(demo: &Demo) -> Div {
         ))
 }
 
-fn sidebar_07(sb: &SidebarState, demo: &Demo) -> Div {
-    let side = sidebar(
-        sb,
-        [
-            sidebar_header().child(team_switcher(sb)),
-            sidebar_content(sb)
-                .child(nav_main(sb, demo))
-                .child(nav_projects(sb, demo)),
-            sidebar_footer().child(nav_user(sb)),
-            sidebar_rail(sb),
-        ],
-    );
-    let provider = sidebar_provider(sb);
+fn sidebar_07(demo: &Demo) -> Element {
+    let side = sidebar()
+        .child(sidebar_header().child(team_switcher()))
+        .child(sidebar_content().child(nav_main(demo)).child(nav_projects(demo)))
+        .child(sidebar_footer().child(nav_user()))
+        .child(sidebar_rail());
+    let provider = sidebar_provider()
+        .model(Model::bind(demo.open))
+        .variant(demo.variant.get())
+        .collapsible(demo.collapsible.get())
+        .side(demo.side.get());
     match demo.side.get() {
-        SidebarSide::Left => provider.child(side).child(inset(sb)),
-        SidebarSide::Right => provider.child(inset(sb)).child(side),
+        SidebarSide::Left => provider.child(side).child(inset(demo)),
+        SidebarSide::Right => provider.child(inset(demo)).child(side),
     }
+    .into_element()
 }
 
 /// The square logo or avatar at the start of a large menu button.
@@ -221,17 +224,13 @@ fn tile(label: impl IntoElement) -> Div {
 }
 
 /// Two lines (name over detail) beside a tile, then the up-down chevrons.
-fn identity(sb: &SidebarState, id: &str, tile: Div, name: &str, detail: &str) -> Div {
+fn identity(tile: Div, name: &str, detail: &str) -> Div {
     sidebar_menu().child(
-        sidebar_menu_item(sb, id).child(
-            sidebar_menu_button(
-                sb,
-                id,
-                SidebarMenuButtonProps {
-                    size: SidebarMenuButtonSize::Lg,
-                    ..SidebarMenuButtonProps::default()
-                },
-            )
+        sidebar_menu_item().child(
+            sidebar_menu_button(SidebarMenuButtonProps {
+                size: SidebarMenuButtonSize::Lg,
+                ..SidebarMenuButtonProps::default()
+            })
             .child(tile)
             .child(
                 div()
@@ -249,57 +248,46 @@ fn identity(sb: &SidebarState, id: &str, tile: Div, name: &str, detail: &str) ->
     )
 }
 
-fn team_switcher(sb: &SidebarState) -> Div {
+fn team_switcher() -> Div {
     let t = theme();
     let logo = tile(icon(Icon::GalleryVerticalEnd))
         .bg(t.sidebar_primary)
         .text_color(t.sidebar_primary_foreground);
-    identity(sb, "team", logo, "Acme Inc", "Enterprise")
+    identity(logo, "Acme Inc", "Enterprise")
 }
 
-fn nav_user(sb: &SidebarState) -> Div {
+fn nav_user() -> Div {
     let initials = avatar_fallback(None, "CN").map(|f| f.rounded_lg());
-    identity(
-        sb,
-        "user",
-        avatar().rounded_lg().child(initials),
-        "shadcn",
-        "m@example.com",
-    )
+    identity(avatar().rounded_lg().child(initials), "shadcn", "m@example.com")
 }
 
-fn nav_main(sb: &SidebarState, demo: &Demo) -> Div {
+fn nav_main(demo: &Demo) -> Div {
     let open = demo.open_groups.get();
     let current = demo.active.get();
     sidebar_group()
-        .child(sidebar_group_label(sb).child("Platform"))
+        .child(sidebar_group_label().child("Platform"))
         .child(sidebar_menu().children(NAV.iter().map(|&(title, glyph, subs)| {
             let is_open = open.contains(&title);
-            let groups = demo.open_groups.clone();
-            let button = sidebar_menu_button(
-                sb,
-                title,
-                SidebarMenuButtonProps {
-                    tooltip: Some(title.to_owned()),
-                    ..SidebarMenuButtonProps::default()
-                },
-            )
+            let groups = demo.open_groups;
+            let button = sidebar_menu_button(SidebarMenuButtonProps {
+                tooltip: Some(title.to_owned()),
+                ..SidebarMenuButtonProps::default()
+            })
             .on_click(move |_| {
-                groups.update(|mut g| {
+                groups.update(|g| {
                     if g.contains(&title) {
                         g.retain(|o| *o != title);
                     } else {
                         g.push(title);
                     }
-                    g
                 });
             })
             .child(icon(glyph))
             .child(text(title).truncate())
             .child(icon(Icon::ChevronRight).ml_auto().when(is_open, |i| i.rotate(90.0)));
-            sidebar_menu_item(sb, title).child(button).when(is_open, |d| {
-                d.child(sidebar_menu_sub(sb).children(subs.iter().map(|&sub| {
-                    let active = demo.active.clone();
+            sidebar_menu_item().child(button).when(is_open, |d| {
+                d.child(sidebar_menu_sub().children(subs.iter().map(|&sub| {
+                    let active = demo.active;
                     sidebar_menu_sub_item().child(
                         sidebar_menu_sub_button(SidebarMenuSubButtonSize::Md, sub == current)
                             .on_click(move |_| active.set(sub))
@@ -310,41 +298,37 @@ fn nav_main(sb: &SidebarState, demo: &Demo) -> Div {
         })))
 }
 
-fn nav_projects(sb: &SidebarState, demo: &Demo) -> Div {
+fn nav_projects(demo: &Demo) -> Div {
     let t = theme();
     let current = demo.active.get();
     let items = PROJECTS.iter().map(|&(name, glyph)| {
-        let active = demo.active.clone();
-        sidebar_menu_item(sb, name)
+        let active = demo.active;
+        sidebar_menu_item()
             .child(
-                sidebar_menu_button(
-                    sb,
-                    name,
-                    SidebarMenuButtonProps {
-                        is_active: name == current,
-                        ..SidebarMenuButtonProps::default()
-                    },
-                )
+                sidebar_menu_button(SidebarMenuButtonProps {
+                    is_active: name == current,
+                    ..SidebarMenuButtonProps::default()
+                })
                 .pr(8.0)
                 .on_click(move |_| active.set(name))
                 .child(icon(glyph))
                 .child(text(name).truncate()),
             )
-            .child(sidebar_menu_action(sb, name, SidebarMenuButtonSize::Default, true).child(icon(Icon::Ellipsis)))
+            .child(sidebar_menu_action(SidebarMenuButtonSize::Default, true).child(icon(Icon::Ellipsis)))
     });
-    let more = sidebar_menu_item(sb, "More").child(
-        sidebar_menu_button(sb, "More", SidebarMenuButtonProps::default())
+    let more = sidebar_menu_item().child(
+        sidebar_menu_button(SidebarMenuButtonProps::default())
             .text_color(t.sidebar_foreground.opacity(0.7))
             .child(icon(Icon::Ellipsis))
             .child(text("More").truncate()),
     );
     sidebar_group()
-        .when(sb.icon_collapsed(), Styled::hidden)
-        .child(sidebar_group_label(sb).child("Projects"))
+        .when(demo.icon_collapsed(), Styled::hidden)
+        .child(sidebar_group_label().child("Projects"))
         .child(sidebar_menu().children(items).child(more))
 }
 
-fn inset(sb: &SidebarState) -> Div {
+fn inset(demo: &Demo) -> impl IntoElement {
     let t = theme();
     let placeholder = || div().bg(t.muted.opacity(0.5)).rounded_xl();
     let crumbs = breadcrumb().child(
@@ -353,11 +337,11 @@ fn inset(sb: &SidebarState) -> Div {
             .child(breadcrumb_separator())
             .child(breadcrumb_item().child(breadcrumb_page("Data Fetching"))),
     );
-    sidebar_inset(sb)
+    sidebar_inset()
         .child(
             div()
                 .flex()
-                .h(if sb.icon_collapsed() { 12.0 } else { 16.0 })
+                .h(if demo.icon_collapsed() { 12.0 } else { 16.0 })
                 .shrink_0()
                 .items_center()
                 .gap(2.0)
@@ -367,7 +351,7 @@ fn inset(sb: &SidebarState) -> Div {
                         .items_center()
                         .gap(2.0)
                         .px(4.0)
-                        .child(sidebar_trigger(sb).ml(-1.0))
+                        .child(sidebar_trigger().ml(-1.0))
                         .child(separator(Orientation::Vertical).mr(2.0).h(4.0))
                         .child(crumbs),
                 ),
@@ -392,8 +376,7 @@ fn inset(sb: &SidebarState) -> Div {
 
 /// A fixed (`collapsible: none`) sidebar with an input, a group action,
 /// badges, the outline variant, the three sizes, a small sub menu and skeletons.
-fn parts(demo: &Demo) -> Div {
-    let sb = &demo.parts;
+fn parts(demo: &Demo) -> Element {
     let props = |variant, size| SidebarMenuButtonProps {
         variant,
         size,
@@ -401,35 +384,27 @@ fn parts(demo: &Demo) -> Div {
     };
     let inbox = sidebar_menu()
         .child(
-            sidebar_menu_item(sb, "Inbox")
+            sidebar_menu_item()
                 .child(
-                    sidebar_menu_button(
-                        sb,
-                        "Inbox",
-                        SidebarMenuButtonProps {
-                            is_active: true,
-                            ..props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Default)
-                        },
-                    )
+                    sidebar_menu_button(SidebarMenuButtonProps {
+                        is_active: true,
+                        ..props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Default)
+                    })
                     .child(icon(Icon::Inbox))
                     .child(text("Inbox").truncate()),
                 )
-                .child(sidebar_menu_badge(sb, "Inbox", SidebarMenuButtonSize::Default).child("24")),
+                .child(sidebar_menu_badge(SidebarMenuButtonSize::Default).child("24")),
         )
         .child(
-            sidebar_menu_item(sb, "Drafts")
+            sidebar_menu_item()
                 .child(
-                    sidebar_menu_button(
-                        sb,
-                        "Drafts",
-                        props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Sm),
-                    )
-                    .child(icon(Icon::Pencil))
-                    .child(text("Drafts").truncate()),
+                    sidebar_menu_button(props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Sm))
+                        .child(icon(Icon::Pencil))
+                        .child(text("Drafts").truncate()),
                 )
-                .child(sidebar_menu_badge(sb, "Drafts", SidebarMenuButtonSize::Sm).child("3"))
+                .child(sidebar_menu_badge(SidebarMenuButtonSize::Sm).child("3"))
                 .child(
-                    sidebar_menu_sub(sb)
+                    sidebar_menu_sub()
                         .child(
                             sidebar_menu_sub_item().child(
                                 sidebar_menu_sub_button(SidebarMenuSubButtonSize::Sm, true)
@@ -445,48 +420,41 @@ fn parts(demo: &Demo) -> Div {
                 ),
         )
         .child(
-            sidebar_menu_item(sb, "Starred").child(
-                sidebar_menu_button(
-                    sb,
-                    "Starred",
-                    props(SidebarMenuButtonVariant::Outline, SidebarMenuButtonSize::Default),
-                )
-                .child(icon(Icon::Star))
-                .child(text("Starred").truncate()),
+            sidebar_menu_item().child(
+                sidebar_menu_button(props(SidebarMenuButtonVariant::Outline, SidebarMenuButtonSize::Default))
+                    .child(icon(Icon::Star))
+                    .child(text("Starred").truncate()),
             ),
         )
         .child(
-            sidebar_menu_item(sb, "Archive").child(
-                sidebar_menu_button(
-                    sb,
-                    "Archive",
-                    props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Lg),
-                )
-                .child(icon(Icon::Download))
-                .child(text("Archive (large)").truncate()),
+            sidebar_menu_item().child(
+                sidebar_menu_button(props(SidebarMenuButtonVariant::Default, SidebarMenuButtonSize::Lg))
+                    .child(icon(Icon::Download))
+                    .child(text("Archive (large)").truncate()),
             ),
         );
-    sidebar_provider(sb).child(sidebar(
-        sb,
-        [
-            sidebar_header().child(sidebar_input(&demo.search).placeholder("Search the docs...")),
-            sidebar_separator(),
-            sidebar_content(sb)
+    sidebar_provider()
+        .collapsible(SidebarCollapsible::None)
+        .child(
+            sidebar()
+                .child(sidebar_header().child(sidebar_input(&demo.search).placeholder("Search the docs...")))
+                .child(sidebar_separator())
                 .child(
-                    sidebar_group()
-                        .child(sidebar_group_label(sb).child("Mail"))
-                        .child(sidebar_group_action(sb).child(icon(Icon::Plus)))
-                        .child(sidebar_group_content().child(inbox)),
-                )
-                .child(
-                    sidebar_group()
-                        .child(sidebar_group_label(sb).child("Loading"))
-                        .child(sidebar_menu().children(
-                            ["one", "two"].map(|id| sidebar_menu_item(sb, id).child(sidebar_menu_skeleton(id, true))),
+                    sidebar_content()
+                        .child(
+                            sidebar_group()
+                                .child(sidebar_group_label().child("Mail"))
+                                .child(sidebar_group_action().child(icon(Icon::Plus)))
+                                .child(sidebar_group_content().child(inbox)),
+                        )
+                        .child(sidebar_group().child(sidebar_group_label().child("Loading")).child(
+                            sidebar_menu().children(
+                                ["one", "two"].map(|id| sidebar_menu_item().child(sidebar_menu_skeleton(id, true))),
+                            ),
                         )),
                 ),
-        ],
-    ))
+        )
+        .into_element()
 }
 
 pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
@@ -511,8 +479,8 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.hover(x, y);
     s.frame("collapsed tooltip")?;
     // Scenario presses only named keys, so ⌘B runs the provider's action directly.
-    let sb = gui::use_context::<SidebarState>().ok_or_else(|| ScenarioError::Unhandled("no sidebar state".into()))?;
-    s.act("⌘B", || sb.toggle());
+    let open = gui::use_context::<SidebarOpen>().ok_or_else(|| ScenarioError::Unhandled("no sidebar state".into()))?;
+    s.act("⌘B", || open.0.update(|o| *o = !*o));
     s.frame("expanded by shortcut")?;
     // The rail's right half lies under the inset, which is drawn after it.
     let (x, y) = centre(s, None, "sidebar-rail")?;

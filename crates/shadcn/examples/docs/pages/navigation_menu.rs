@@ -1,8 +1,8 @@
 use gui::prelude::*;
-use gui::{Div, Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text, text_bound};
 use shadcn::{
-    NavigationMenuState, navigation_menu, navigation_menu_content, navigation_menu_item, navigation_menu_link,
-    navigation_menu_list, navigation_menu_trigger, navigation_menu_trigger_style, theme,
+    navigation_menu, navigation_menu_content, navigation_menu_item, navigation_menu_link, navigation_menu_list,
+    navigation_menu_trigger, navigation_menu_trigger_style, theme,
 };
 
 use crate::{Render, Shot, demo, motion_frames, page};
@@ -32,14 +32,10 @@ const COMPONENTS: [(&str, &str); 6] = [
 ];
 
 pub fn render() -> Render {
-    let nav = NavigationMenuState::new();
     let visited = Signal::labeled("visited", String::from("nowhere yet"));
     Box::new(move || {
         let t = theme();
-        let go = |to: &'static str| {
-            let visited = visited.clone();
-            move || visited.set(to.to_owned())
-        };
+        let go = |to: &'static str| move || visited.set(to.to_owned());
         // `NavigationMenuItem.vue`, the demo's list item.
         let list_item = |title: &'static str, body: &'static str| {
             navigation_menu_link(false, go(title))
@@ -133,19 +129,19 @@ pub fn render() -> Render {
             move |_| go()
         });
 
+        let entry = |value: &str, label: &str, content| {
+            navigation_menu_item(value)
+                .child(navigation_menu_trigger(label))
+                .child(content)
+        };
         let menu = navigation_menu().child(
             navigation_menu_list()
-                .child(navigation_menu_item().child(navigation_menu_trigger(&nav, "home", "Home", home)))
-                .child(navigation_menu_item().child(navigation_menu_trigger(
-                    &nav,
-                    "components",
-                    "Components",
-                    components,
-                )))
-                .child(navigation_menu_item().child(docs.child("Docs")))
-                .child(navigation_menu_item().child(navigation_menu_trigger(&nav, "list", "List", list)))
-                .child(navigation_menu_item().child(navigation_menu_trigger(&nav, "simple", "Simple", simple)))
-                .child(navigation_menu_item().child(navigation_menu_trigger(&nav, "icon", "With Icon", icons))),
+                .child(entry("home", "Home", home))
+                .child(entry("components", "Components", components))
+                .child(navigation_menu_item("docs").child(docs.child("Docs")))
+                .child(entry("list", "List", list))
+                .child(entry("simple", "Simple", simple))
+                .child(entry("icon", "With Icon", icons)),
         );
         page(
             "Navigation Menu",
@@ -154,7 +150,7 @@ pub fn render() -> Render {
                 .gap(6.0)
                 .child(demo("NavigationMenuDemo.vue", menu))
                 .child(
-                    text(format!("Visited: {}.", visited.get()))
+                    text_bound(move || format!("Visited: {}.", visited.get()))
                         .text_sm()
                         .text_color(t.muted_foreground),
                 ),

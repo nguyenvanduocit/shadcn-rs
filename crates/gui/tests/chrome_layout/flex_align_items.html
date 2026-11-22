@@ -1,0 +1,12 @@
+<!-- align-items across a 100px tall row, and align-self overriding it. -->
+<div style="width: 300px">
+  <div style="display: flex; height: 100px; align-items: flex-start"><div style="width: 20px; height: 30px"></div><div style="width: 20px"></div></div>
+  <div style="display: flex; height: 100px; align-items: center"><div style="width: 20px; height: 30px"></div><div style="width: 20px; height: 15px"></div></div>
+  <div style="display: flex; height: 100px; align-items: flex-end"><div style="width: 20px; height: 30px"></div><div style="width: 20px; height: 15px"></div></div>
+  <div style="display: flex; height: 100px">
+    <div style="width: 20px"></div>
+    <div style="width: 20px; height: 30px; align-self: center"></div>
+    <div style="width: 20px; height: 30px; align-self: flex-end"></div>
+    <div style="width: 20px; height: 30px; align-self: flex-start"></div>
+  </div>
+</div>

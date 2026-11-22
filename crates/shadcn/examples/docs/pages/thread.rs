@@ -75,8 +75,8 @@ pub fn stream(into: &Signal<String>, text: &'static str, ms: u64) -> Vec<Step> {
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let into = into.clone();
-            after(if i == 0 { 0 } else { ms }, move || into.update(|t| t + chunk))
+            let into = *into;
+            after(if i == 0 { 0 } else { ms }, move || into.update(|t| t.push_str(chunk)))
         })
         .collect()
 }

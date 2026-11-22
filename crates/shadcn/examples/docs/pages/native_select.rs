@@ -1,9 +1,6 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, div, text};
-use shadcn::{
-    NativeSelectEntry, NativeSelectLook, NativeSelectState, native_select, native_select_opt_group,
-    native_select_option as option, theme,
-};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
+use shadcn::{NativeSelectEntry, native_select, native_select_opt_group, native_select_option as option, theme};
 
 use crate::{Render, Shot, demo, page};
 
@@ -68,45 +65,27 @@ fn roles() -> Vec<NativeSelectEntry> {
 }
 
 pub fn render() -> Render {
-    let status = NativeSelectState::new("");
-    let department = NativeSelectState::new("");
-    let priority = NativeSelectState::new("");
-    let role = NativeSelectState::new("");
-    let (statuses, departments, priorities, roles) = (statuses(), departments(), priorities(), roles());
+    let status = Signal::labeled("native select status", String::new());
+    let department = Signal::labeled("native select department", String::new());
     Box::new(move || {
         let t = theme();
-        let plain = NativeSelectLook::default();
         page(
             "Native Select",
             div()
                 .flex_col()
                 .gap(6.0)
-                .child(demo("NativeSelectDemo.vue", native_select(&status, &statuses, plain)))
+                .child(demo("NativeSelectDemo.vue", native_select(statuses()).model(status)))
                 .child(demo(
                     "NativeSelectGroupsDemo.vue",
-                    native_select(&department, &departments, plain),
+                    native_select(departments()).model(department),
                 ))
                 .child(demo(
                     "NativeSelectDisabledDemo.vue",
-                    native_select(
-                        &priority,
-                        &priorities,
-                        NativeSelectLook {
-                            disabled: true,
-                            invalid: false,
-                        },
-                    ),
+                    native_select(priorities()).disabled(true),
                 ))
                 .child(demo(
                     "NativeSelectInvalidDemo.vue",
-                    native_select(
-                        &role,
-                        &roles,
-                        NativeSelectLook {
-                            disabled: false,
-                            invalid: true,
-                        },
-                    ),
+                    native_select(roles()).invalid(true),
                 ))
                 // shadcn-vue has not written this one yet: its demo is the
                 // line below, in the page's text.
@@ -114,8 +93,8 @@ pub fn render() -> Render {
                 .child(
                     text(format!(
                         "Status: {:?}. Department: {:?}.",
-                        status.value.get(),
-                        department.value.get()
+                        status.get(),
+                        department.get()
                     ))
                     .text_sm()
                     .text_color(t.muted_foreground),

@@ -1,0 +1,12 @@
+<!-- aspect-ratio on containers: a block or grid container is at least as large as its content in the axis the ratio decides, a flex container takes the ratio's size as definite and lays its items out in it. -->
+<div style="width: 400px">
+  <div style="display: flex; flex-direction: column; width: 100px; aspect-ratio: 4"><p>A ratio box whose words wrap over lines</p></div>
+  <div style="display: flex; align-items: flex-start; width: 100px; aspect-ratio: 4"><p>A ratio box whose words wrap over lines</p></div>
+  <div style="display: flex; flex-wrap: wrap; width: 100px; aspect-ratio: 4"><p>A ratio box whose words wrap over lines</p></div>
+  <div style="height: 30px; aspect-ratio: 1"><p>Words</p></div>
+  <div style="display: flex; height: 30px; aspect-ratio: 1"><p>Words</p></div>
+  <div style="display: grid; height: 30px; aspect-ratio: 1"><p>Words</p></div>
+  <div style="display: grid; grid-template-columns: 50px 50px; width: 100px; aspect-ratio: 4"><p>Two words</p><p>A ratio box whose words wrap over lines</p></div>
+  <div style="display: flex; flex-direction: column; width: 100px; aspect-ratio: 1"><div style="flex-grow: 1"></div><div style="height: 30px"></div></div>
+  <div style="width: 100px; aspect-ratio: 1; display: flex; flex-direction: column"><div style="height: 300px; flex-shrink: 0"></div></div>
+</div>

@@ -9,10 +9,7 @@ use std::time::Duration;
 
 use gui::prelude::*;
 use gui::{Div, Signal, clock, text};
-use shadcn::{
-    BubbleAlign, BubbleProps, BubbleVariant, MessageProps, MessageScrollerState, bubble, bubble_content, message,
-    message_content, message_scroller_item,
-};
+use shadcn::{BubbleAlign, BubbleProps, BubbleVariant, MessageProps, bubble, bubble_content, message, message_content};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -89,13 +86,12 @@ impl DemoChat {
         let Some((Role::User, words)) = self.turns.get(index) else {
             return;
         };
-        self.messages.update(|mut m| {
+        self.messages.update(|m| {
             m.push(DemoMessage {
                 id: format!("demo-{index}"),
                 role: Role::User,
                 text: (*words).to_owned(),
             });
-            m
         });
         let next = index.saturating_add(1);
         if let Some((Role::Assistant, reply)) = self.turns.get(next) {
@@ -104,13 +100,12 @@ impl DemoChat {
     }
 
     fn stream(&self, reply: &'static str, index: usize) {
-        self.messages.update(|mut m| {
+        self.messages.update(|m| {
             m.push(DemoMessage {
                 id: format!("demo-{index}"),
                 role: Role::Assistant,
                 text: String::new(),
             });
-            m
         });
         self.streaming.set(true);
         self.tick(reply, 0, self.run.get());
@@ -126,11 +121,10 @@ impl DemoChat {
             let count = shown.saturating_add(CHUNK_SIZE);
             let end = reply.char_indices().nth(count).map_or(reply.len(), |(i, _)| i);
             let part = reply.get(..end).unwrap_or(reply).to_owned();
-            me.messages.update(|mut m| {
+            me.messages.update(|m| {
                 if let Some(last) = m.last_mut() {
                     last.text = part;
                 }
-                m
             });
             if end >= reply.len() {
                 me.streaming.set(false);
@@ -147,17 +141,11 @@ impl DemoChat {
     }
 }
 
-/// `MessageAnimated.vue`: `m` as a scroller item, its paragraphs (split on
-/// blank lines) in one bubble, a user turn at the end. `anchor` defaults to
-/// whether it is a user turn. Vue names an entrance animation per preset in a
-/// class no stylesheet defines, so nothing animates there or here.
-pub fn animated(
-    state: &MessageScrollerState,
-    m: &DemoMessage,
-    anchor: Option<bool>,
-    user: BubbleVariant,
-    assistant: BubbleVariant,
-) -> Div {
+/// `MessageAnimated.vue`: `m` as a scroller message, its paragraphs (split
+/// on blank lines) in one bubble, a user turn at the end. Vue names an
+/// entrance animation per preset in a class no stylesheet defines, so
+/// nothing animates there or here.
+pub fn animated(m: &DemoMessage, user: BubbleVariant, assistant: BubbleVariant) -> Div {
     let is_user = m.role == Role::User;
     let (align, variant) = if is_user {
         (BubbleAlign::End, user)
@@ -171,15 +159,13 @@ pub fn animated(
     };
     let b = BubbleProps { variant, align };
     let paragraphs = m.text.split("\n\n").map(str::trim).filter(|s| !s.is_empty());
-    message_scroller_item(state, &m.id, anchor.unwrap_or(is_user)).child(
-        message(p).child(
-            message_content(p).child(
-                bubble(b).child(
-                    bubble_content(b).children(
-                        paragraphs
-                            .enumerate()
-                            .map(|(i, para)| text(para).when(i > 0, |t| t.mt(2.0))),
-                    ),
+    message(p).child(
+        message_content(p).child(
+            bubble(b).child(
+                bubble_content(b).children(
+                    paragraphs
+                        .enumerate()
+                        .map(|(i, para)| text(para).when(i > 0, |t| t.mt(2.0))),
                 ),
             ),
         ),

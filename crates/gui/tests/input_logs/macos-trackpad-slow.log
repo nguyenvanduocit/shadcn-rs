@@ -1,0 +1,47 @@
+gui-input-log 1
+platform macos
+window 480 320 2
+source synthesized, not recorded: a slow two-finger scroll on a macOS trackpad (NSEvent phase Began, Changed every 8-12 ms with a few points each), a rest of 200 ms with the fingers down (no events: AppKit sends none while they do not move), more scrolling the other way, and a lift with no momentum (phase Ended, no momentumPhase follows when the fingers had stopped); then fingers resting and lifting without scrolling (phase MayBegin, then Cancelled, which winit 0.30 maps to started and ended). Phase mapping as in winit's macos/view.rs scroll_wheel.
+0.000 move 200 120
+50.000 wheel pixels 0 0 started
+60.000 wheel pixels 0 -2 started
+70.644 wheel pixels 0 -3 moved
+81.645 wheel pixels 0 -4 moved
+92.104 wheel pixels 0 -5 moved
+101.779 wheel pixels 0 -2 moved
+111.076 wheel pixels 0 -3 moved
+120.933 wheel pixels 0 -4 moved
+129.802 wheel pixels 0 -5 moved
+140.461 wheel pixels 0 -2 moved
+149.733 wheel pixels 0 -3 moved
+160.814 wheel pixels 0 -4 moved
+171.674 wheel pixels 0 -5 moved
+182.169 wheel pixels 0 -2 moved
+192.214 wheel pixels 0 -3 moved
+202.302 wheel pixels 0 -4 moved
+212.480 wheel pixels 0 -5 moved
+222.005 wheel pixels 0 -2 moved
+231.611 wheel pixels 0 -3 moved
+240.818 wheel pixels 0 -4 moved
+249.696 wheel pixels 0 -5 moved
+450.887 wheel pixels 0 1.5 moved
+460.694 wheel pixels 0 2.5 moved
+470.929 wheel pixels 0 3.5 moved
+481.214 wheel pixels 0 1.5 moved
+491.036 wheel pixels 0 2.5 moved
+501.481 wheel pixels 0 3.5 moved
+511.487 wheel pixels 0 1.5 moved
+521.174 wheel pixels 0 2.5 moved
+532.637 wheel pixels 0 3.5 moved
+544.571 wheel pixels 0 1.5 moved
+554.710 wheel pixels 0 2.5 moved
+565.115 wheel pixels 0 3.5 moved
+575.395 wheel pixels 0 1.5 moved
+587.667 wheel pixels 0 2.5 moved
+599.763 wheel pixels 0 3.5 moved
+619.513 wheel pixels 0 0 ended
+999.513 wheel pixels 0 0 started
+1119.513 wheel pixels 0 0 cancelled
+1299.513 move 200 120
+1300.513 down
+1360.513 up

@@ -1,13 +1,10 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, TextField, Track, div, text};
-use shadcn::{
-    ButtonSize, ButtonVariant, PopoverState, button, input, label, popover, popover_content, popover_trigger, theme,
-};
+use shadcn::{ButtonSize, ButtonVariant, button, input, label, popover, popover_content, popover_trigger, theme};
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page};
 
 pub fn render() -> Render {
-    let state = PopoverState::new();
     let fields = [
         ("Width", TextField::new("100%")),
         ("Max. width", TextField::new("300px")),
@@ -22,11 +19,10 @@ pub fn render() -> Render {
                 "PopoverDemo.vue",
                 popover()
                     .child(popover_trigger(
-                        &state,
                         button(ButtonVariant::Outline, ButtonSize::Default).child("Open popover"),
                     ))
-                    .child(popover_content(&state, |c| {
-                        c.w(80.0).child(
+                    .child(
+                        popover_content().w(80.0).child(
                             div()
                                 .grid()
                                 .gap(4.0)
@@ -48,10 +44,10 @@ pub fn render() -> Render {
                                         .items_center()
                                         .gap(4.0)
                                         .child(label(*name))
-                                        .child(input(f).col_span(2).h(8.0))
+                                        .child(input().field(*f).col_span(2).h(8.0))
                                 }))),
-                        )
-                    })),
+                        ),
+                    ),
             ),
         )
     })

@@ -3,15 +3,20 @@
 //! arrow keys move between them), stepped with ArrowUp and ArrowDown and
 //! typed digit by digit; a 24-hour clock, as Chrome shows it on the machine
 //! the reference is drawn on.
+//!
+//! [`time_input`] is a component instance holding its fields; its value
+//! (`HH:MM:SS`, empty until every field has one, as the input's `value` is)
+//! is its own (`default_value`) or the caller's (`model`, `v-model`).
 
 use std::rc::Rc;
 
-use crate::element::{Div, IntoElement, Refine, div, text};
+use crate::component::{Bind, Model, component, use_model};
+use crate::element::{Div, Element, IntoElement, Refine, div, text};
 use crate::events::{KeyEvent, NamedKey};
 use crate::focus::{self, FocusHandle};
-use crate::reactive::{Effect, Signal};
+use crate::reactive::{Signal, watch};
 use crate::style::Style;
-use crate::styled::Styled;
+use crate::styled::{Fluent, Styled};
 
 /// The largest value of each field: hour, minute, second.
 const MAX: [u8; 3] = [23, 59, 59];
@@ -25,51 +30,45 @@ const PLACEHOLDER: &str = "--";
 /// reference draw at, 2 px a side, the rest left empty after the fields.
 const SIZING_PADDING: f32 = 0.5;
 
-/// The state behind one time input: each field's value and focus.
-#[derive(Clone)]
-pub struct TimeField {
+/// What an instance holds: each field's value and focus.
+#[derive(Clone, Copy)]
+struct Fields {
     /// Hour, minute and second; `None` shows `--`.
     values: Signal<[Option<u8>; 3]>,
     /// The digits typed into a field since it took focus (Chrome's
     /// type-ahead): the field, their number, and the number they spell.
     typed: Signal<Option<(usize, u8, u8)>>,
     focus: [FocusHandle; 3],
-    /// Forgets `typed` whenever focus moves, as Chrome does on blur.
-    _forget: Rc<Effect>,
 }
 
-impl TimeField {
-    /// A field holding `value` (`HH:MM:SS`); a part missing, out of range or
-    /// `--` leaves its field empty.
-    #[must_use]
-    pub fn new(value: &str) -> Self {
-        let mut parts = value.split(':');
-        let values = MAX.map(|max| parts.next().and_then(|p| p.parse::<u8>().ok()).filter(|v| *v <= max));
-        let typed = Signal::labeled("time typed", None);
-        let forget = typed.clone();
-        Self {
-            values: Signal::labeled("time", values),
-            typed,
-            focus: [FocusHandle::new(), FocusHandle::new(), FocusHandle::new()],
-            _forget: Rc::new(Effect::new(move || {
-                // Read to re-run on every move of focus.
-                let _moved = focus::focused();
-                forget.update(|_| None);
-            })),
-        }
-    }
+/// `value` (`HH:MM:SS`) as the fields' values; a part missing, out of range
+/// or `--` leaves its field empty.
+fn parse(value: &str) -> [Option<u8>; 3] {
+    let mut parts = value.split(':');
+    MAX.map(|max| parts.next().and_then(|p| p.parse::<u8>().ok()).filter(|v| *v <= max))
+}
 
-    /// The value (`HH:MM:SS`) once every field has one, as the input's `value` is.
-    #[must_use]
-    pub fn value(&self) -> Option<String> {
-        let [h, m, s] = self.values.get();
-        Some(format!("{:02}:{:02}:{:02}", h?, m?, s?))
+/// The value of `values` once every field has one, else empty.
+fn written(values: [Option<u8>; 3]) -> String {
+    match values {
+        [Some(h), Some(m), Some(s)] => format!("{h:02}:{m:02}:{s:02}"),
+        _ => String::new(),
+    }
+}
+
+impl Fields {
+    /// Fields holding `value` (`HH:MM:SS`).
+    fn new(value: &str) -> Self {
+        Self {
+            values: Signal::labeled("time", parse(value)),
+            typed: Signal::labeled("time typed", None),
+            focus: [FocusHandle::new(), FocusHandle::new(), FocusHandle::new()],
+        }
     }
 
     /// Whether one of its fields holds focus (reactive), for the box's
     /// `:focus-within` look.
-    #[must_use]
-    pub fn focused(&self) -> bool {
+    fn focused(&self) -> bool {
         self.focus.iter().any(|f| f.is_focused())
     }
 
@@ -78,11 +77,10 @@ impl TimeField {
     }
 
     fn set(&self, i: usize, value: Option<u8>) {
-        self.values.update(|mut v| {
+        self.values.update(|v| {
             if let Some(slot) = v.get_mut(i) {
                 *slot = value;
             }
-            v
         });
     }
 
@@ -166,12 +164,121 @@ fn shown(value: Option<u8>) -> String {
     value.map_or_else(|| PLACEHOLDER.to_owned(), |v| format!("{v:02}"))
 }
 
-/// The fields of `field` in a box as wide as Chrome makes a time input's;
-/// the caller gives it its frame (border, padding, height). `focused` styles
-/// the field that holds focus (`::-webkit-datetime-edit-hour-field:focus`).
+/// A time input: Chrome's fields, empty until given a value. Style the box
+/// as a `Div` (the caller gives it its frame: border, padding, height).
 #[must_use]
-pub fn time_input(field: &TimeField, focused: impl Fn(Style) -> Style + 'static) -> Div {
-    let focused: Refine = Rc::new(focused);
+pub fn time_input() -> TimeInput {
+    TimeInput {
+        value: Bind::default(),
+        root: div().named("time-input").flex().items_center(),
+        focused: None,
+        within: None,
+    }
+}
+
+/// A [`time_input`] being built.
+#[derive(Clone)]
+pub struct TimeInput {
+    value: Bind<String>,
+    root: Div,
+    focused: Option<Refine>,
+    within: Option<Rc<dyn Fn(Div) -> Div>>,
+}
+
+/// Built anew by each render of its parent, it is never equal: the instance
+/// renders again with what its parent passes now.
+impl PartialEq for TimeInput {
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
+}
+
+impl TimeInput {
+    /// The value (`HH:MM:SS`, empty while a field is), kept by the caller
+    /// (`v-model`).
+    #[must_use]
+    pub fn model(mut self, model: impl Into<Model<String>>) -> Self {
+        self.value = self.value.with_model(model);
+        self
+    }
+
+    /// The value it starts at when no model is given (`default-value`).
+    #[must_use]
+    pub fn default_value(mut self, value: impl Into<String>) -> Self {
+        self.value = self.value.with_default(value.into());
+        self
+    }
+
+    /// Call `f` with each value written (`@update:model-value`).
+    #[must_use]
+    pub fn on_change(mut self, f: impl Fn(String) + 'static) -> Self {
+        self.value = self.value.on_change(f);
+        self
+    }
+
+    /// How the field holding focus looks (`::-webkit-datetime-edit-hour-field:focus`).
+    #[must_use]
+    pub fn focused_field(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
+        self.focused = Some(Rc::new(f));
+        self
+    }
+
+    /// What the box adds while one of its fields holds focus (`:focus-within`).
+    #[must_use]
+    pub fn focus_within(mut self, f: impl Fn(Div) -> Div + 'static) -> Self {
+        self.within = Some(Rc::new(f));
+        self
+    }
+
+    /// Change the box as a `Div`.
+    #[must_use]
+    pub fn map_root(mut self, f: impl FnOnce(Div) -> Div) -> Self {
+        self.root = f(self.root);
+        self
+    }
+}
+
+impl Fluent for TimeInput {}
+
+impl Styled for TimeInput {
+    fn style_mut(&mut self) -> &mut Style {
+        self.root.style_mut()
+    }
+}
+
+impl IntoElement for TimeInput {
+    fn into_element(self) -> Element {
+        component(self, |cx| {
+            let props = cx.props();
+            let value = use_model(props, |p: &TimeInput| &p.value);
+            let fields = Fields::new(&value.get_untracked());
+            // Forget what was typed whenever focus moves, as Chrome does on blur.
+            watch(focus::focused, move |_, _| fields.typed.set(None));
+            // The fields into the value: empty until each has one.
+            watch(
+                move || written(fields.values.get()),
+                move |now, _| value.set(now.clone()),
+            );
+            // A value written from outside into the fields.
+            watch(
+                move || value.get(),
+                move |v, _| {
+                    if written(fields.values.get_untracked()) != *v {
+                        fields.typed.set(None);
+                        fields.values.set(parse(v));
+                    }
+                },
+            );
+            move || props.with(|p| render(&fields, p)).into_element()
+        })
+        .named("time-input")
+        .into_element()
+    }
+}
+
+/// The fields in a box as wide as Chrome makes a time input's.
+fn render(field: &Fields, p: &TimeInput) -> Div {
+    let focused: Refine = p.focused.clone().unwrap_or_else(|| Rc::new(|s| s));
     let values = field.values.get();
     let between = || text(":");
     let mut fields = div().flex().items_center().row_start(1).col_start(1);
@@ -181,7 +288,7 @@ pub fn time_input(field: &TimeField, focused: impl Fn(Style) -> Style + 'static)
             fields = fields.child(between());
             sizer = sizer.child(between());
         }
-        let (me, look) = (field.clone(), Rc::clone(&focused));
+        let (me, look) = (*field, Rc::clone(&focused));
         let handle = field.focus.get(i).copied().unwrap_or_default();
         fields = fields.child(
             div()
@@ -196,18 +303,21 @@ pub fn time_input(field: &TimeField, focused: impl Fn(Style) -> Style + 'static)
             .map(|t| text(t).row_start(1).col_start(1).into_element());
         sizer = sizer.child(div().grid().px(SIZING_PADDING).children(widest));
     }
-    let first = field.clone();
-    div()
-        .named("time-input")
-        .flex()
-        .items_center()
+    let first = *field;
+    let root = p
+        .root
+        .clone()
         .on_mouse_down(move |_| {
             // A press beside the fields focuses the first, as Chrome's does.
             if !first.focused() {
                 first.focus_field(Some(0));
             }
         })
-        .child(div().grid().child(sizer).child(fields))
+        .child(div().grid().child(sizer).child(fields));
+    match &p.within {
+        Some(f) if field.focused() => f(root),
+        _ => root,
+    }
 }
 
 #[cfg(test)]
@@ -215,7 +325,7 @@ mod tests {
     use super::*;
     use crate::events::{Key, Modifiers};
 
-    fn press(f: &TimeField, i: usize, key: NamedKey) -> bool {
+    fn press(f: &Fields, i: usize, key: NamedKey) -> bool {
         f.key(
             i,
             &KeyEvent {
@@ -226,7 +336,7 @@ mod tests {
         )
     }
 
-    fn type_in(f: &TimeField, i: usize, digits: &str) {
+    fn type_in(f: &Fields, i: usize, digits: &str) {
         for c in digits.chars() {
             let t = c.to_string();
             f.key(
@@ -242,13 +352,13 @@ mod tests {
 
     #[test]
     fn arrows_step_and_wrap_and_digits_type_ahead_as_chrome_does() {
-        let f = TimeField::new("23:30:--");
+        let f = Fields::new("23:30:--");
         assert!(press(&f, 0, NamedKey::ArrowUp));
         assert_eq!(f.get(0), Some(0), "23 wraps to 00");
         press(&f, 2, NamedKey::ArrowDown);
         assert_eq!(
-            f.value().as_deref(),
-            Some("00:30:59"),
+            written(f.values.get()),
+            "00:30:59",
             "an empty field steps down to its highest"
         );
         type_in(&f, 1, "4");
@@ -258,7 +368,7 @@ mod tests {
         type_in(&f, 0, "7");
         assert_eq!(f.get(0), Some(7), "no hour starts with 7 and has two digits");
         assert!(press(&f, 2, NamedKey::Backspace));
-        assert_eq!(f.value(), None);
+        assert_eq!(written(f.values.get()), "");
         assert!(
             !press(&f, 0, NamedKey::ArrowLeft),
             "the first field leaves ArrowLeft to the page"

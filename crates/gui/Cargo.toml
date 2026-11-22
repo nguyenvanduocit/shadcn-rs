@@ -16,19 +16,70 @@ workspace = true
 accesskit = "0.25"
 accesskit_winit = "0.34"
 arboard = { version = "3", default-features = false }
-cosmic-text = "0.19"
 cpu-time = "1"
 memory-stats = "1"
 png = "0.18.1"
-resvg = "0.50"
-softbuffer = "0.4"
-stats_alloc = "0.1.10"
+# The embedded icons are SVG: roxmltree reads the XML, svgtypes the path
+# data (arcs as cubics); `gui` rasterizes them itself (ADR-0017).
+roxmltree = "0.21"
+svgtypes = "0.16"
+# The heap counted per process and per thread (ADR-0023): a counting
+# `GlobalAlloc` wrapper, since the workspace forbids `unsafe`.
+smelt-perf = "0.3"
 taffy = "0.15"
-tiny-skia = "0.12"
-winit = "0.30"
-# The GPU renderer: wgpu (Metal on macOS, Vulkan or GL on Linux, DX12 on
-# Windows), etagere to pack glyphs and icons into atlas pages as GPUI does,
+# Layout's thread pool (ADR-0014): dirty subtrees lay out as parallel jobs.
+rayon = "1"
+# Without `wayland-csd-adwaita`: on Wayland, when the compositor leaves the
+# decorations to the client, gui draws its own title bar and frame with its
+# GPU renderer (`window::decoration`), so sctk-adwaita and tiny-skia are not built.
+winit = { version = "0.30", default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+# The render and platform threads run at display priority, as Chromium raises
+# its compositor thread (ADR-0015): a QoS class on macOS, a thread priority on
+# Windows, a nice value (or rtkit) on Linux, behind a safe API.
+gdt-cpus = "0.2606"
+# The GPU renderer: wgpu (Metal on macOS, Vulkan on Linux, DX12 on Windows;
+# no OpenGL: compute is required, ADR-0016), etagere to pack glyphs and icons into atlas pages as GPUI does,
 # pollster to wait on the adapter and on read-backs.
 wgpu = "30"
 etagere = "0.3"
+# Instance records are plain `u32` words, cast to bytes for upload without copying (ADR-0016).
+bytemuck = "1"
 pollster = "0.4"
+# Text (ADR-0019): Parley shapes, breaks lines and edits, fontique finds and
+# falls back between system fonts; glyph outlines, hinting and colour glyphs
+# are read with skrifa and rasterised by `gui` itself.
+# Fast hashing for the glyph and shape caches (keys are ours, not attacker-chosen).
+foldhash = "0.2"
+parley = { version = "0.13", features = ["complex-scripts"] }
+skrifa = "0.49"
+# Colour glyphs (COLRv0/v1 emoji) are painted by vello_cpu, which has
+# every gradient COLRv1 needs (sweep included) and blend modes.
+vello_cpu = { version = "0.4", default-features = false, features = ["std", "f32_pipeline"] }
+
+# The user's text rendering settings, read as Chrome reads them (ADR-0019).
+[target.'cfg(target_os = "macos")'.dependencies]
+plist = "1"
+# Retired instructions for the bench (ADR-0023): the process's, from proc_pid_rusage.
+libproc = "0.15"
+
+# Retired instructions for the bench (ADR-0023): the thread's, from perf_event_open.
+[target.'cfg(target_os = "linux")'.dependencies]
+perf-event = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+x11rb = "0.13"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+# fontconfig loaded when run, not linked when built: no development package needed to build.
+fontique = { version = "0.13", features = ["fontconfig-dlopen"] }
+
+
+[dev-dependencies]
+# The tree a platform adapter keeps, to check that incremental updates keep
+# AccessKit's contract and equal the whole tree (ADR-0021).
+accesskit_consumer = "0.39"
+# Text snapshots of the layout and accessibility dumps (M9 I4), reviewed
+# with `cargo insta review` and rewritten with INSTA_UPDATE=always.
+insta = "1"

@@ -9,7 +9,7 @@ use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page, section};
 pub fn render() -> Render {
     // The demo's `onMounted` timer: 13 % now, 66 % half a second later.
     let value = Signal::labeled("progress", 13.0_f32);
-    let later = value.clone();
+    let later = value;
     gui::clock::after(Duration::from_millis(500), move || later.set(66.0));
     Box::new(move || {
         page(

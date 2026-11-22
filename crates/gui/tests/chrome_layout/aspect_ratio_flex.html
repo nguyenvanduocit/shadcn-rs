@@ -1,0 +1,8 @@
+<!-- aspect-ratio on flex row items: a definite cross size gives the flex basis, the content-based minimum keeps text whole, a stretched item takes the line's height, and each axis keeps its own min and max. -->
+<div style="width: 400px">
+  <div style="display: flex; align-items: flex-start"><div style="width: 100px; aspect-ratio: 2"></div><div style="height: 30px; aspect-ratio: 2"></div><p style="height: 24px; aspect-ratio: 1">Words</p><div style="width: 60px; aspect-ratio: 2; max-height: 20px"></div></div>
+  <div style="display: flex; height: 50px"><div style="aspect-ratio: 2"></div><div style="aspect-ratio: 1; max-width: 30px"></div><div style="aspect-ratio: 1; min-width: 70px"></div></div>
+  <div style="display: flex"><div style="width: 100px; aspect-ratio: 2"></div><div style="aspect-ratio: 1"></div></div>
+  <div style="display: flex; align-items: flex-start"><div style="flex-grow: 1; aspect-ratio: 4"></div><div style="width: 100px; aspect-ratio: 1; flex-shrink: 0"></div></div>
+  <div style="display: flex; align-items: flex-start"><p style="width: 60px; aspect-ratio: 4">Ratio words that wrap</p><p style="height: 24px; aspect-ratio: 1; overflow: hidden">Words</p><div style="height: 30px; aspect-ratio: 2; min-height: 50px"></div></div>
+</div>

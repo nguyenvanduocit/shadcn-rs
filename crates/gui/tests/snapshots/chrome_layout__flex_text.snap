@@ -1,0 +1,13 @@
+---
+source: crates/gui/tests/chrome_layout.rs
+expression: "gui::inspect::dump(&laid_out(name, &mut ts))"
+---
+0            Div 800x600 at (0,0)
+  0/0          Div 300x72 at (0,0)
+    0/0/0        Div 300x24 at (0,0)
+      0/0/0/0      Text "Save" 37x24 at (0,0)  16px w400 #000000
+      0/0/0/1      Text "Cancel" 52x24 at (45,0)  16px w400 #000000
+      0/0/0/2      Text "Settings and more" 136x24 at (105,0)  16px w400 #000000
+    0/0/1        Div 300x48 at (0,24)
+      0/0/1/0      Text "Label" 41x48 at (0,24)  16px w400 #000000
+      0/0/1/1      Text "A longer description tha…" 251x48 at (49,24)  16px w400 #000000

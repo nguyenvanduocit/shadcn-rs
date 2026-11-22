@@ -1,0 +1,9 @@
+# Chrome's boxes for grid_placement.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 90
+  div 200 0 100 30
+  div 0 30 200 30
+  div 100 60 200 30
+  div 0 0 100 30
+  div 100 0 100 30

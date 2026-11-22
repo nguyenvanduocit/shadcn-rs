@@ -66,10 +66,7 @@ pub fn render() -> Render {
                         )
                         .child(
                             button(ButtonVariant::Outline, ButtonSize::Sm)
-                                .on_click({
-                                    let replayed = replayed.clone();
-                                    move |_| replayed.update(|k| k.wrapping_add(1))
-                                })
+                                .on_click(move |_| replayed.update(|k| *k = k.wrapping_add(1)))
                                 .child("Replay"),
                         ),
                 ))

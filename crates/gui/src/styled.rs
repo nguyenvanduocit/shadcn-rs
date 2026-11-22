@@ -269,6 +269,8 @@ pub trait Styled: Sized {
         max_w(n: f32) => |s| s.max_width = units(n);
         max_w_px(v: f32) => |s| s.max_width = px(v);
         max_w_full() => |s| s.max_width = relative(1.0);
+        /// `max-w-[calc(fraction × 100% + px)]`, as `max-w-[calc(100%-2rem)]` is `max_w_calc(1.0, -32.0)`.
+        max_w_calc(fraction: f32, px: f32) => |s| s.max_width = Length::Calc { fraction, px };
         max_h(n: f32) => |s| s.max_height = units(n);
         max_h_px(v: f32) => |s| s.max_height = px(v);
         aspect_square() => |s| s.aspect_ratio = Some(1.0);

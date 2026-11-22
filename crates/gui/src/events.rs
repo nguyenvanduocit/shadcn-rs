@@ -24,6 +24,17 @@ impl Modifiers {
             self.control
         }
     }
+
+    /// The modifier that moves the caret and deletes by words: ⌥ on macOS,
+    /// Ctrl elsewhere.
+    #[must_use]
+    pub fn word(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.alt
+        } else {
+            self.control
+        }
+    }
 }
 
 /// A press or click of the primary button.
@@ -34,6 +45,26 @@ pub struct ClickEvent {
     /// The box of the node whose handler runs.
     pub bounds: Bounds,
     pub modifiers: Modifiers,
+}
+
+/// The pointer moving over a node: where (window pixels, as a click's) and
+/// the node's box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerEvent {
+    pub x: f32,
+    pub y: f32,
+    pub bounds: Bounds,
+}
+
+/// The wheel (or a trackpad's scroll) over a node: where the pointer is
+/// (window pixels), how far (pixels, down and right positive), the node's box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelEvent {
+    pub x: f32,
+    pub y: f32,
+    pub dx: f32,
+    pub dy: f32,
+    pub bounds: Bounds,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

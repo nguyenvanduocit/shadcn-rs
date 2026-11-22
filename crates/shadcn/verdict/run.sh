@@ -4,7 +4,8 @@
 #   crates/shadcn/verdict/run.sh [--dark] [--color=N --shift=N --size=N --no-coverage] [page…]
 #
 # Lists the demos each page reproduces (docs --demos), shoots shadcn-vue's
-# in a browser (shoot.mjs, reference app on 5298), then crops, overlays and
+# in a browser (shoot.mjs, reference app on 5298) pinned to the docs' clock
+# and time zone (docs --clock), then crops, overlays and
 # scores ours against theirs (docs --verdict). Each run has its own
 # directory, /tmp/shadcn-verdict[-dark]/<pages>/ (verdict.txt, verdict.json,
 # and per demo <page>/<Demo>/side.png), so parallel runs never share a file.
@@ -39,5 +40,8 @@ docs() { "$CARGO_TARGET_DIR/release/examples/docs" "$@"; }
 rm -rf "$out" && mkdir -p "$out"
 docs --demos ${pages[@]+"${pages[@]}"} $dark > "$out/demos.txt"
 echo "$(wc -l < "$out/demos.txt" | tr -d ' ') demos to judge"
-node "$here/shoot.mjs" "$out" $dark < "$out/demos.txt" | grep -v '^shot' || true
+# The instant and time zone the docs are at: the browser is pinned to them,
+# so a demo showing today shows the docs' day, not the run's.
+read -r now zone < <(docs --clock)
+node "$here/shoot.mjs" "$out" --now="$now" --zone="$zone" $dark < "$out/demos.txt" | grep -v '^shot' || true
 docs --verdict "$out" ${pages[@]+"${pages[@]}"} $dark ${tolerance[@]+"${tolerance[@]}"}

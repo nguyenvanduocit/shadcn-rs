@@ -1,0 +1,11 @@
+# Chrome's boxes for flex_text.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 72
+  div 0 0 300 24
+    p 0 0 36.71875 24
+    p 44.71875 0 52.078125 24
+    p 104.796875 0 136.34375 24
+  div 0 24 300 48
+    p 0 24 40.671875 48
+    p 48.671875 24 251.328125 48

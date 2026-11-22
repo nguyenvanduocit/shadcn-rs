@@ -141,7 +141,7 @@ là một icon chevron. Pool đã trả layer khi không dùng, nhưng khi menu 
 
 ## Trạng thái code
 
-- **Nơi có code:** worktree `/Users/firegroup/projects/shadcn-rs-stress`, detached tại `c4fb22f`, chưa commit. Thư mục
+- **Nơi có code:** worktree `../shadcn-rs-stress`, detached tại `c4fb22f`, chưa commit. Thư mục
   chính chỉ có bản devtools trước đợt stress test.
 - **Thay đổi:** example `stress` mới (`main.rs`, `scenes.rs`); `gui` sửa `paint.rs` (pool layer), `text.rs` (culling),
   `devtools.rs` (monkey, reveal, selector, actor, group, forget_log); ADR-0010 thêm mục "Found by the stress scenes";

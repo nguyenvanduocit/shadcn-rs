@@ -14,6 +14,7 @@ use crate::color::Color;
 use crate::edit::{TextEdit, TextField};
 use crate::events::{ClickEvent, DragEvent, KeyEvent};
 use crate::focus::FocusHandle;
+use crate::geometry::Bounds;
 use crate::icon::Icon;
 use crate::image::ImageSource;
 use crate::scroll::ScrollHandle;
@@ -51,12 +52,22 @@ pub struct Handlers {
     pub(crate) key_down: Option<KeyHandler>,
     pub(crate) secondary_click: Option<Handler<ClickEvent>>,
     pub(crate) hover: Option<Rc<dyn Fn(bool)>>,
+    /// Told each move of the pointer over the node, where it is.
+    pub(crate) pointer: Option<Handler<crate::events::PointerEvent>>,
+    /// Takes the wheel over it before any scroll container above it.
+    pub(crate) wheel: Option<Handler<crate::events::WheelEvent>>,
     pub(crate) click_outside: Option<Rc<dyn Fn()>>,
+    /// Told the node's box in window pixels after each layout.
+    pub(crate) measured: Option<Handler<Bounds>>,
 }
 
 /// The style refinements for each interactive state.
 #[derive(Clone, Default)]
 pub struct States {
+    /// Bound to signals (ADR-0013's bindings by phase): run where the node's
+    /// style is resolved, under layout's tracker, so a write it read lays the
+    /// frame out again without rendering the instance that built it.
+    pub(crate) bound: Option<Refine>,
     pub(crate) has_icon: Option<Refine>,
     pub(crate) hover: Option<Refine>,
     pub(crate) active: Option<Refine>,
@@ -84,6 +95,8 @@ pub struct Common {
     pub(crate) scroll: Option<ScrollHandle>,
     /// What a screen reader is told this node is.
     pub(crate) semantics: Semantics,
+    /// The lists it joins when laid out ([`crate::Members`]).
+    pub(crate) joins: Vec<crate::members::Join>,
 }
 
 /// What a node is to assistive technology, as the ARIA attributes say it on
@@ -96,6 +109,15 @@ pub struct Semantics {
     pub checked: Option<Toggled>,
     pub selected: Option<bool>,
     pub expanded: Option<bool>,
+    /// Rows in all, of which only some are built (`aria-rowcount`, `aria-setsize`).
+    pub row_count: Option<usize>,
+    /// This row's place among them, from 0 (`aria-rowindex`, and
+    /// `aria-posinset` unless [`Self::set`] says otherwise).
+    pub row_index: Option<usize>,
+    /// Its place in its set, from 1, and the set's size (`aria-posinset`,
+    /// `aria-setsize`): an option among the options of a list that holds
+    /// headings too.
+    pub set: Option<(usize, usize)>,
     /// Left out of what a screen reader reads, with its subtree.
     pub hidden: bool,
 }
@@ -121,11 +143,22 @@ pub type TextInput = Node<InputSpec>;
 pub type Shapes = Node<Vec<Shape>>;
 /// A raster image covering the node's box.
 pub type Image = Node<ImageSource>;
+/// A [`crate::chunk::Picture`] laid into the node's box (see [`drawing`]).
+pub type Drawn = Node<DrawSpec>;
+
+/// What a [`drawing`] draws: made by a closure run where the node is laid
+/// out, under a tracker of its own.
+#[derive(Clone)]
+pub struct DrawSpec {
+    pub(crate) make: Rc<dyn Fn() -> crate::chunk::Drawing>,
+}
 
 /// A paragraph's text and the spans styled inside it.
 #[derive(Clone, Default)]
 pub struct TextSpec {
     pub(crate) content: String,
+    /// Content bound to signals, read when laid out (see [`text_bound`]).
+    pub(crate) bound: Option<Rc<dyn Fn() -> String>>,
     pub(crate) spans: Vec<SpanSpec>,
 }
 
@@ -305,13 +338,17 @@ pub struct Deferred {
 /// A node in the UI tree.
 #[derive(Clone, Default)]
 pub enum Element {
-    Div(Box<Div>),
-    Text(Box<Text>),
-    Icon(Box<IconElement>),
-    Input(Box<TextInput>),
-    Shapes(Box<Shapes>),
-    Image(Box<Image>),
-    Deferred(Box<Deferred>),
+    Div(Rc<Div>),
+    Text(Rc<Text>),
+    Icon(Rc<IconElement>),
+    Input(Rc<TextInput>),
+    Shapes(Rc<Shapes>),
+    Image(Rc<Image>),
+    Drawn(Rc<Drawn>),
+    Deferred(Rc<Deferred>),
+    /// A component instance's place (ADR-0013), replaced by its output
+    /// when the frame resolves the tree.
+    Component(Rc<crate::component::ComponentElement>),
     #[default]
     Empty,
 }
@@ -325,19 +362,21 @@ impl Element {
             Self::Input(n) => Some(&n.common),
             Self::Shapes(n) => Some(&n.common),
             Self::Image(n) => Some(&n.common),
-            Self::Deferred(_) | Self::Empty => None,
+            Self::Drawn(n) => Some(&n.common),
+            Self::Deferred(_) | Self::Component(_) | Self::Empty => None,
         }
     }
 
     pub(crate) fn common_mut(&mut self) -> Option<&mut Common> {
         match self {
-            Self::Div(n) => Some(&mut n.common),
-            Self::Text(n) => Some(&mut n.common),
-            Self::Icon(n) => Some(&mut n.common),
-            Self::Input(n) => Some(&mut n.common),
-            Self::Shapes(n) => Some(&mut n.common),
-            Self::Image(n) => Some(&mut n.common),
-            Self::Deferred(_) | Self::Empty => None,
+            Self::Div(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Text(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Icon(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Input(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Shapes(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Image(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Drawn(n) => Some(&mut Rc::make_mut(n).common),
+            Self::Deferred(_) | Self::Component(_) | Self::Empty => None,
         }
     }
 
@@ -346,24 +385,76 @@ impl Element {
         self.common().and_then(|c| c.key)
     }
 
+    /// Whether `other` is this very element (the same shared node): a
+    /// subtree a clean instance gave back again is known by pointer.
+    #[must_use]
+    pub fn ptr_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Div(a), Self::Div(b)) => Rc::ptr_eq(a, b),
+            (Self::Text(a), Self::Text(b)) => Rc::ptr_eq(a, b),
+            (Self::Icon(a), Self::Icon(b)) => Rc::ptr_eq(a, b),
+            (Self::Input(a), Self::Input(b)) => Rc::ptr_eq(a, b),
+            (Self::Shapes(a), Self::Shapes(b)) => Rc::ptr_eq(a, b),
+            (Self::Image(a), Self::Image(b)) => Rc::ptr_eq(a, b),
+            (Self::Drawn(a), Self::Drawn(b)) => Rc::ptr_eq(a, b),
+            (Self::Deferred(a), Self::Deferred(b)) => Rc::ptr_eq(a, b),
+            (Self::Component(a), Self::Component(b)) => Rc::ptr_eq(a, b),
+            (Self::Empty, Self::Empty) => true,
+            _ => false,
+        }
+    }
+
     /// The node's own style, for a parent that styles its children by
     /// position (CSS `& > *`); `None` for a layer or nothing.
     pub fn style_mut(&mut self) -> Option<&mut Style> {
         match self {
-            Self::Div(n) => Some(&mut n.common.style),
-            Self::Text(n) => Some(&mut n.common.style),
-            Self::Icon(n) => Some(&mut n.common.style),
-            Self::Input(n) => Some(&mut n.common.style),
-            Self::Shapes(n) => Some(&mut n.common.style),
-            Self::Image(n) => Some(&mut n.common.style),
-            Self::Deferred(_) | Self::Empty => None,
+            Self::Div(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Text(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Icon(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Input(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Shapes(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Image(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Drawn(n) => Some(&mut Rc::make_mut(n).common.style),
+            Self::Deferred(_) | Self::Component(_) | Self::Empty => None,
         }
     }
 
-    /// The name [`Node::named`] gave the node.
+    /// The element with `f` applied to its root's style after its own, for
+    /// a parent that joins or sizes its children by position (CSS
+    /// `& > *`). A component's place keeps `f` and applies it to the root
+    /// of every output the component gives (Vue's attribute fallthrough);
+    /// a layer or nothing is returned as it is.
+    #[must_use]
+    pub fn restyle(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
+        if let Self::Component(c) = &mut self {
+            let Some(c) = Rc::get_mut(c) else {
+                eprintln!(
+                    "gui: `{}` is placed twice; only its first place can be restyled",
+                    c.name
+                );
+                return self;
+            };
+            let f: crate::component::Fallthrough = match c.fallthrough.take() {
+                Some(before) => Rc::new(move |s| f(before(s))),
+                None => Rc::new(f),
+            };
+            c.fallthrough = Some(f);
+            return self;
+        }
+        if let Some(style) = self.style_mut() {
+            *style = f(std::mem::take(style));
+        }
+        self
+    }
+
+    /// The name [`Node::named`] gave the node, or a component's place its
+    /// component's name.
     #[must_use]
     pub fn name(&self) -> Option<&'static str> {
-        self.common().and_then(|c| c.name)
+        match self {
+            Self::Component(c) => Some(c.name),
+            _ => self.common().and_then(|c| c.name),
+        }
     }
 
     /// A box's children, for a caller that reshapes a tree a component built
@@ -371,7 +462,7 @@ impl Element {
     /// other kind.
     pub fn children_mut(&mut self) -> Option<&mut Vec<Self>> {
         match self {
-            Self::Div(n) => Some(&mut n.kind),
+            Self::Div(n) => Some(&mut Rc::make_mut(n).kind),
             _ => None,
         }
     }
@@ -390,43 +481,49 @@ impl IntoElement for Element {
 
 impl IntoElement for Div {
     fn into_element(self) -> Element {
-        Element::Div(Box::new(self))
+        Element::Div(Rc::new(self))
     }
 }
 
 impl IntoElement for Text {
     fn into_element(self) -> Element {
-        Element::Text(Box::new(self))
+        Element::Text(Rc::new(self))
     }
 }
 
 impl IntoElement for IconElement {
     fn into_element(self) -> Element {
-        Element::Icon(Box::new(self))
+        Element::Icon(Rc::new(self))
     }
 }
 
 impl IntoElement for TextInput {
     fn into_element(self) -> Element {
-        Element::Input(Box::new(self))
+        Element::Input(Rc::new(self))
     }
 }
 
 impl IntoElement for Shapes {
     fn into_element(self) -> Element {
-        Element::Shapes(Box::new(self))
+        Element::Shapes(Rc::new(self))
     }
 }
 
 impl IntoElement for Image {
     fn into_element(self) -> Element {
-        Element::Image(Box::new(self))
+        Element::Image(Rc::new(self))
+    }
+}
+
+impl IntoElement for Drawn {
+    fn into_element(self) -> Element {
+        Element::Drawn(Rc::new(self))
     }
 }
 
 impl IntoElement for Deferred {
     fn into_element(self) -> Element {
-        Element::Deferred(Box::new(self))
+        Element::Deferred(Rc::new(self))
     }
 }
 
@@ -478,6 +575,24 @@ impl<K> Node<K> {
     #[must_use]
     pub fn named(mut self, name: &'static str) -> Self {
         self.common.name = Some(name);
+        self
+    }
+
+    /// Join `list` with `value` while laid out: the list holds its members'
+    /// values in tree order as last laid out ([`crate::Members`]).
+    #[must_use]
+    pub fn member<T: Clone + 'static>(mut self, list: &crate::Members<T>, value: T) -> Self {
+        self.common.joins.push(crate::members::join(list, value));
+        self
+    }
+
+    /// Style bound to signals: `f` refines the style with any setter
+    /// (`.bind(move |s| s.bg(color.get()).w(width.get()))`), and runs when
+    /// the node is laid out. A signal it reads lays the frame out again
+    /// without rendering the instance that built it.
+    #[must_use]
+    pub fn bind(mut self, f: impl Fn(Style) -> Style + 'static) -> Self {
+        self.common.states.bound = Some(Rc::new(f));
         self
     }
 
@@ -591,6 +706,28 @@ impl<K> Node<K> {
         self
     }
 
+    /// How many rows a virtual list or table has in all, built or not
+    /// (`aria-rowcount`; each row's `aria-setsize`).
+    #[must_use]
+    pub fn aria_row_count(mut self, rows: usize) -> Self {
+        self.common.semantics.row_count = Some(rows);
+        self
+    }
+
+    /// This row's index among all of them, from 0 (`aria-rowindex`, `aria-posinset`).
+    #[must_use]
+    pub fn aria_row_index(mut self, row: usize) -> Self {
+        self.common.semantics.row_index = Some(row);
+        self
+    }
+
+    /// Its place in its set, from 1, of `size` (`aria-posinset`, `aria-setsize`).
+    #[must_use]
+    pub fn aria_pos_in_set(mut self, position: usize, size: usize) -> Self {
+        self.common.semantics.set = Some((position, size));
+        self
+    }
+
     /// Leave this node and its subtree out of what a screen reader reads (`aria-hidden`).
     #[must_use]
     pub fn aria_hidden(mut self) -> Self {
@@ -621,6 +758,14 @@ impl<K> Node<K> {
     }
 
     /// Called as the pointer is pressed on this node, moved, and released.
+    /// Run `f` with the node's border box in window pixels after each
+    /// layout (a table's `Auto` columns learn their cells' widths so).
+    #[must_use]
+    pub fn on_measured(mut self, f: impl Fn(&Bounds) + 'static) -> Self {
+        self.common.handlers.measured = Some(Rc::new(f));
+        self
+    }
+
     #[must_use]
     pub fn on_drag(mut self, f: impl Fn(&DragEvent) + 'static) -> Self {
         self.common.handlers.drag = Some(Rc::new(f));
@@ -646,6 +791,22 @@ impl<K> Node<K> {
     #[must_use]
     pub fn on_hover(mut self, f: impl Fn(bool) + 'static) -> Self {
         self.common.handlers.hover = Some(Rc::new(f));
+        self
+    }
+
+    /// Called on each move of the pointer over this node (or a child), with
+    /// where it is; [`Self::on_hover`] says when it leaves.
+    #[must_use]
+    pub fn on_pointer_move(mut self, f: impl Fn(&crate::events::PointerEvent) + 'static) -> Self {
+        self.common.handlers.pointer = Some(Rc::new(f));
+        self
+    }
+
+    /// Called with the wheel over this node (or a child), which then
+    /// scrolls nothing above it.
+    #[must_use]
+    pub fn on_wheel(mut self, f: impl Fn(&crate::events::WheelEvent) + 'static) -> Self {
+        self.common.handlers.wheel = Some(Rc::new(f));
         self
     }
 
@@ -758,6 +919,22 @@ pub fn text(content: impl Into<String>) -> Text {
     Node::new(
         TextSpec {
             content: content.into(),
+            bound: None,
+            spans: Vec::new(),
+        },
+        Style::default(),
+    )
+}
+
+/// A paragraph whose content `f` gives when it is laid out: a signal `f`
+/// reads changes the text without rendering the instance that built it
+/// (Vue Vapor's and Leptos' text bindings).
+#[must_use]
+pub fn text_bound(f: impl Fn() -> String + 'static) -> Text {
+    Node::new(
+        TextSpec {
+            content: String::new(),
+            bound: Some(Rc::new(f)),
             spans: Vec::new(),
         },
         Style::default(),
@@ -783,7 +960,7 @@ pub fn text_input(field: &TextField) -> TextInput {
     let focus = field.focus;
     Node::new(
         InputSpec {
-            field: field.clone(),
+            field: *field,
             placeholder: String::new(),
             placeholder_color: None,
             selection_color: None,
@@ -803,6 +980,15 @@ pub fn text_input(field: &TextField) -> TextInput {
 #[must_use]
 pub fn shapes(shapes: Vec<Shape>) -> Shapes {
     Node::new(shapes, Style::default())
+}
+
+/// What `make` returns, drawn in the node's box (give it a size). `make`
+/// runs where the node is laid out, tracked as a bound style or text is
+/// (ADR-0013): a signal it read changing makes it run again and records
+/// the node's chunk alone, without rendering the instance that built it.
+#[must_use]
+pub fn drawing(make: impl Fn() -> crate::chunk::Drawing + 'static) -> Drawn {
+    Node::new(DrawSpec { make: Rc::new(make) }, Style::default())
 }
 
 /// `source` scaled to cover the node's box, clipped to its corners.

@@ -18,9 +18,7 @@ fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32), ScenarioError> {
 pub fn render() -> Render {
     let terms = Signal::labeled("terms", false);
     let terms2 = Signal::labeled("terms-2", true);
-    let notify = Signal::labeled("toggle", false);
     let notify2 = Signal::labeled("toggle-2", true);
-    let off = Signal::labeled("disabled", false);
     Box::new(move || {
         let t = theme();
         // Tailwind's blue-600/700 and blue-50/900/950.
@@ -39,8 +37,7 @@ pub fn render() -> Render {
         } else {
             Color::oklch(0.97, 0.014, 254.604)
         };
-        let on2 = notify2.get();
-        let (a, b, c) = (terms.clone(), terms2.clone(), notify2.clone());
+        let (a, b, c) = (terms, terms2, notify2);
         page(
             "Checkbox",
             div()
@@ -56,28 +53,36 @@ pub fn render() -> Render {
                                 .flex()
                                 .items_center()
                                 .gap(3.0)
-                                .child(checkbox(&terms))
-                                .child(label("Accept terms and conditions").on_click(move |_| a.update(|v| !v))),
-                        )
-                        .child(
-                            div().flex().items_start().gap(3.0).child(checkbox(&terms2)).child(
-                                div()
-                                    .grid()
-                                    .gap(2.0)
-                                    .child(label("Accept terms and conditions").on_click(move |_| b.update(|v| !v)))
-                                    .child(
-                                        text("By clicking this checkbox, you agree to the terms and conditions.")
-                                            .text_sm()
-                                            .text_color(t.muted_foreground),
-                                    ),
-                            ),
+                                .child(checkbox().model(terms))
+                                .child(label("Accept terms and conditions").on_click(move |_| a.update(|v| *v = !*v))),
                         )
                         .child(
                             div()
                                 .flex()
                                 .items_start()
                                 .gap(3.0)
-                                .child(checkbox(&notify).disabled(true))
+                                .child(checkbox().model(terms2))
+                                .child(
+                                    div()
+                                        .grid()
+                                        .gap(2.0)
+                                        .child(
+                                            label("Accept terms and conditions")
+                                                .on_click(move |_| b.update(|v| *v = !*v)),
+                                        )
+                                        .child(
+                                            text("By clicking this checkbox, you agree to the terms and conditions.")
+                                                .text_sm()
+                                                .text_color(t.muted_foreground),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_start()
+                                .gap(3.0)
+                                .child(checkbox().disabled(true))
                                 .child(label("Enable notifications").disabled(true)),
                         )
                         .child(
@@ -93,13 +98,14 @@ pub fn render() -> Render {
                                 .text_sm()
                                 .leading_none()
                                 .font_medium()
-                                .when(on2, |d| d.border_color(card_border).bg(card_bg))
-                                .when(!on2, |d| d.hover(move |s| s.bg(t.accent.opacity(0.5))))
-                                .on_click(move |_| c.update(|v| !v))
-                                .child(
-                                    checkbox(&notify2)
-                                        .when(on2, |d| d.border_color(blue).bg(blue).text_color(Color::WHITE)),
-                                )
+                                .when(notify2.get(), |d| d.border_color(card_border).bg(card_bg))
+                                .when(!notify2.get(), |d| d.hover(move |s| s.bg(t.accent.opacity(0.5))))
+                                .on_click(move |_| c.update(|v| *v = !*v))
+                                .child(checkbox().model(notify2).class(move |d| {
+                                    d.when(notify2.get(), |d| {
+                                        d.border_color(blue).bg(blue).text_color(Color::WHITE)
+                                    })
+                                }))
                                 .child(
                                     div()
                                         .grid()
@@ -121,7 +127,7 @@ pub fn render() -> Render {
                         .flex()
                         .items_center()
                         .gap(2.0)
-                        .child(checkbox(&off).disabled(true))
+                        .child(checkbox().disabled(true))
                         .child(label("Accept terms and conditions").disabled(true)),
                 )),
         )

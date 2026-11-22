@@ -1,0 +1,88 @@
+gui-input-log 1
+platform windows
+window 480 320 1
+source synthesized, not recorded: Windows. A notched wheel sends WM_MOUSEWHEEL with a delta of WHEEL_DELTA (120) a notch; a precision touchpad sends WM_MOUSEWHEEL with deltas under 120 while the fingers move, and Windows goes on sending smaller ones after the lift (its inertia), with no message marking either end. winit 0.30 (platform_impl/windows/event_loop.rs WM_MOUSEWHEEL) makes each a LineDelta of delta / 120 with phase moved. Notches 80 ms apart, a fast spin 12 ms apart, then the touchpad: 24-48 units every 8 ms, then inertia every 16 ms decaying by 0.93 until a delta rounds to 0.
+0.000 move 150 150
+100.000 wheel lines 0 -1 moved
+180.000 wheel lines 0 -1 moved
+260.000 wheel lines 0 -1 moved
+340.000 wheel lines 0 -1 moved
+420.000 wheel lines 0 -1 moved
+600.000 wheel lines 0 1 moved
+612.000 wheel lines 0 1 moved
+624.000 wheel lines 0 1 moved
+636.000 wheel lines 0 1 moved
+648.000 wheel lines 0 1 moved
+660.000 wheel lines 0 1 moved
+672.000 wheel lines 0 1 moved
+684.000 wheel lines 0 1 moved
+696.000 wheel lines 0 1 moved
+708.000 wheel lines 0 1 moved
+1000.000 wheel lines 0 -0.2 moved
+1007.916 wheel lines 0 -0.26666668 moved
+1016.381 wheel lines 0 -0.33333334 moved
+1024.936 wheel lines 0 -0.4 moved
+1032.592 wheel lines 0 -0.4 moved
+1039.654 wheel lines 0 -0.33333334 moved
+1047.293 wheel lines 0 -0.33333334 moved
+1056.250 wheel lines 0 -0.26666668 moved
+1063.637 wheel lines 0 -0.25 moved
+1080.048 wheel lines 0 -0.23333333 moved
+1096.002 wheel lines 0 -0.21666667 moved
+1111.585 wheel lines 0 -0.2 moved
+1127.132 wheel lines 0 -0.18333334 moved
+1143.621 wheel lines 0 -0.175 moved
+1160.097 wheel lines 0 -0.15833333 moved
+1175.833 wheel lines 0 -0.15 moved
+1191.739 wheel lines 0 -0.14166667 moved
+1207.398 wheel lines 0 -0.13333334 moved
+1223.262 wheel lines 0 -0.125 moved
+1239.614 wheel lines 0 -0.11666667 moved
+1255.695 wheel lines 0 -0.108333334 moved
+1271.608 wheel lines 0 -0.1 moved
+1287.780 wheel lines 0 -0.09166667 moved
+1303.868 wheel lines 0 -0.083333336 moved
+1320.286 wheel lines 0 -0.075 moved
+1335.881 wheel lines 0 -0.075 moved
+1352.174 wheel lines 0 -0.06666667 moved
+1368.504 wheel lines 0 -0.06666667 moved
+1384.920 wheel lines 0 -0.058333334 moved
+1401.051 wheel lines 0 -0.058333334 moved
+1417.298 wheel lines 0 -0.05 moved
+1433.055 wheel lines 0 -0.05 moved
+1448.957 wheel lines 0 -0.041666668 moved
+1464.760 wheel lines 0 -0.041666668 moved
+1480.912 wheel lines 0 -0.041666668 moved
+1496.548 wheel lines 0 -0.033333335 moved
+1512.861 wheel lines 0 -0.033333335 moved
+1528.481 wheel lines 0 -0.033333335 moved
+1544.080 wheel lines 0 -0.025 moved
+1560.128 wheel lines 0 -0.025 moved
+1576.471 wheel lines 0 -0.025 moved
+1592.629 wheel lines 0 -0.025 moved
+1608.547 wheel lines 0 -0.025 moved
+1624.366 wheel lines 0 -0.016666668 moved
+1639.926 wheel lines 0 -0.016666668 moved
+1656.213 wheel lines 0 -0.016666668 moved
+1672.187 wheel lines 0 -0.016666668 moved
+1688.059 wheel lines 0 -0.016666668 moved
+1704.299 wheel lines 0 -0.016666668 moved
+1720.681 wheel lines 0 -0.016666668 moved
+1736.847 wheel lines 0 -0.008333334 moved
+1752.784 wheel lines 0 -0.008333334 moved
+1768.462 wheel lines 0 -0.008333334 moved
+1784.611 wheel lines 0 -0.008333334 moved
+1800.225 wheel lines 0 -0.008333334 moved
+1815.744 wheel lines 0 -0.008333334 moved
+1831.763 wheel lines 0 -0.008333334 moved
+1847.470 wheel lines 0 -0.008333334 moved
+1863.235 wheel lines 0 -0.008333334 moved
+1879.465 wheel lines 0 -0.008333334 moved
+1895.882 wheel lines 0 -0.008333334 moved
+1911.480 wheel lines 0 -0.008333334 moved
+1927.058 wheel lines 0 -0.008333334 moved
+1943.473 wheel lines 0 -0.008333334 moved
+1959.613 wheel lines 0 -0.008333334 moved
+2005.657 move 150 170
+2006.657 down
+2056.657 up

@@ -1,7 +1,7 @@
 //! The trace demos that play a conversation: an agent thinks, runs tools and
 //! answers, streamed by timers in place of a model (Vue's simulated `Chat`).
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -67,8 +67,10 @@ struct Chat {
     busy: Signal<bool>,
     /// Bumped by every send, so the steps of an older stream stop.
     run: Rc<Cell<u64>>,
-    /// Each collapsible row's open state, by `<message id>-<row>`.
-    open: Rc<RefCell<HashMap<String, Signal<bool>>>>,
+    /// The collapsible rows a reader or the stream opened or closed, by
+    /// `<message id>-<row>`; a row not in it shows its default. One signal
+    /// made with the chat, so a render only reads it.
+    open: Signal<HashMap<String, bool>>,
 }
 
 /// One step of a stream: wait, then change the chat.
@@ -80,25 +82,36 @@ impl Chat {
             messages: Signal::labeled("chat messages", messages),
             busy: Signal::labeled("chat busy", false),
             run: Rc::new(Cell::new(0)),
-            open: Rc::new(RefCell::new(HashMap::new())),
+            open: Signal::labeled("chat rows open", HashMap::new()),
         }
     }
 
-    /// The open state of row `key`, made `default` the first time it is asked for.
-    fn open(&self, key: &str, default: bool) -> Signal<bool> {
-        self.open
-            .borrow_mut()
-            .entry(key.to_owned())
-            .or_insert_with(|| Signal::new(default))
-            .clone()
+    /// Whether row `key` is open: `default` until it is opened or closed.
+    fn is_open(&self, key: &str, default: bool) -> bool {
+        self.open.with(|o| o.get(key).copied().unwrap_or(default))
+    }
+
+    /// Open or close row `key`.
+    fn set_open(&self, key: &str, open: bool) {
+        self.open.update(|o| {
+            o.insert(key.to_owned(), open);
+        });
+    }
+
+    /// A collapsible row whose open state the chat keeps under `key`.
+    fn row(&self, key: &str, default: bool) -> shadcn::Part<shadcn::CollapsibleProps> {
+        let (chat, key_owned) = (self.clone(), key.to_owned());
+        trace_collapsible()
+            .open(self.is_open(key, default))
+            .on_change(move |open| chat.set_open(&key_owned, open))
     }
 
     /// Start a new stream: `messages` now, then `steps` one after another.
     fn play(&self, messages: Vec<Msg>, steps: Vec<Step>) {
         let id = self.run.get().wrapping_add(1);
         self.run.set(id);
-        self.open.borrow_mut().clear();
-        self.messages.set(messages);
+        self.open.update(HashMap::clear);
+        self.messages.replace(messages);
         self.busy.set(true);
         next(self.clone(), id, Rc::new(steps), 0);
     }
@@ -106,18 +119,17 @@ impl Chat {
     /// Stop any stream and clear the conversation.
     fn reset(&self) {
         self.run.set(self.run.get().wrapping_add(1));
-        self.open.borrow_mut().clear();
-        self.messages.set(Vec::new());
+        self.open.update(HashMap::clear);
+        self.messages.replace(Vec::new());
         self.busy.set(false);
     }
 
     /// Change the parts of the last message.
     fn edit_last(&self, f: impl FnOnce(&mut Vec<Part>)) {
-        self.messages.update(|mut m| {
+        self.messages.update(|m| {
             if let Some(last) = m.last_mut() {
                 f(&mut last.parts);
             }
-            m
         });
     }
 
@@ -226,14 +238,12 @@ fn tool_row(chat: &Chat, key: &str, look: ToolLook, command: &str, call: Call) -
     } = look;
     let glyph = glyph.unwrap_or(if failed { Icon::CircleAlert } else { Icon::CircleCheck });
     let title = format!("{} {command}", if failed { "Failed to run" } else { "Ran" });
-    let open = chat.open(key, default_open);
-    trace_collapsible()
+    chat.row(key, default_open)
         .child(trace_collapsible_trigger(
-            &open,
             failed,
             step(failed.then_some(TraceStatus::Error), icon(glyph), &title),
         ))
-        .child(trace_collapsible_content(&open, |c| c.child(output(out, variant))))
+        .child(trace_collapsible_content().map_root(|c| c.child(output(out, variant))))
         .into_element()
 }
 
@@ -270,12 +280,9 @@ fn reasoning_row(chat: &Chat, key: &str, text_so_far: &str, line: Div) -> Elemen
     if text_so_far.is_empty() {
         return line.into_element();
     }
-    let open = chat.open(key, false);
-    trace_collapsible()
-        .child(trace_collapsible_trigger(&open, false, line))
-        .child(trace_collapsible_content(&open, |c| {
-            c.child(text(text_so_far.to_owned()))
-        }))
+    chat.row(key, false)
+        .child(trace_collapsible_trigger(false, line))
+        .child(trace_collapsible_content().map_root(|c| c.child(text(text_so_far.to_owned()))))
         .into_element()
 }
 
@@ -334,7 +341,7 @@ impl TraceDemo {
                     streaming: true,
                 });
             });
-            c.open(&format!("{}-0", c.last_id()), true).set(true);
+            c.set_open(&format!("{}-0", c.last_id()), true);
         })];
         steps.extend(stream_words(TRACE_REASONING, 40));
         steps.push(step_of(0, |c| {
@@ -343,7 +350,7 @@ impl TraceDemo {
                     *streaming = false;
                 }
             });
-            c.open(&format!("{}-0", c.last_id()), false).set(false);
+            c.set_open(&format!("{}-0", c.last_id()), false);
         }));
         for (command, delay, call) in TRACE_TOOLS {
             steps.push(step_of(0, move |c| {
@@ -426,7 +433,6 @@ impl TraceDemo {
             .collect();
         if !sources.is_empty() {
             let using = live && answer.is_empty();
-            let open = chat.open(&format!("{}-sources", m.id), false);
             let mark: Element = if using {
                 spinner().into_element()
             } else {
@@ -434,15 +440,14 @@ impl TraceDemo {
             };
             let title = format!("{} {} sources", if using { "Using" } else { "Used" }, sources.len());
             rows.push(
-                trace_collapsible()
+                chat.row(&format!("{}-sources", m.id), false)
                     .child(trace_collapsible_trigger(
-                        &open,
                         false,
                         trace_line(using.then_some(TraceStatus::Running))
                             .child(trace_icon(mark))
                             .child(trace_title(title)),
                     ))
-                    .child(trace_collapsible_content(&open, |c| c.child(sources_trace(&sources))))
+                    .child(trace_collapsible_content().map_root(|c| c.child(sources_trace(&sources))))
                     .into_element(),
             );
         }
@@ -535,7 +540,7 @@ impl ThinkingDemo {
                     streaming: true,
                 });
             });
-            c.open(&open_key, true).set(true);
+            c.set_open(&open_key, true);
         })];
         steps.extend(stream_words(THINK_REASONING, 60));
         steps.push(step_of(0, move |c| {
@@ -544,7 +549,7 @@ impl ThinkingDemo {
                     *streaming = false;
                 }
             });
-            c.open(&key, false).set(false);
+            c.set_open(&key, false);
         }));
         steps.push(step_of(400, |c| c.edit_last(|p| p.push(Part::Text(String::new())))));
         steps.extend(stream_words(THINK_ANSWER, 20));

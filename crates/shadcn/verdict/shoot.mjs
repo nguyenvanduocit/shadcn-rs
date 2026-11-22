@@ -1,10 +1,13 @@
 // Shoot shadcn-vue's demos for the gallery's verdict.
 //
-//   node shoot.mjs <dir> [--dark] < demos.txt
+//   node shoot.mjs <dir> --now=<ms> --zone=<IANA zone> [--dark] < demos.txt
 //
 // Reads `<page> <Demo>.vue` lines (the gallery's `--demos`), and for each
 // writes `<dir>/<page>/<Demo>/ref-full.png` (the page at 2x) and `ref.rect`
-// (the demo's box, logical px: "x y w h"). Needs the reference app served on
+// (the demo's box, logical px: "x y w h"). The browser runs in `--zone` (its
+// TZ) and each page's clock starts at `--now` (index.html), the instant the
+// docs are at (`docs --clock`), so a demo that shows today shows the docs'
+// day, whatever the date. Needs the reference app served on
 // 5298 (`npx vite`) and agent-browser. The browser is
 // $AGENT_BROWSER_EXECUTABLE_PATH when set, else the newest CloakBrowser
 // Chromium in ~/.cloakbrowser when there is one, else agent-browser's own.
@@ -15,10 +18,17 @@ import { join } from "node:path"
 
 const [dir, ...flags] = process.argv.slice(2)
 if (!dir) {
-  console.error("usage: node shoot.mjs <dir> [--dark] < demos.txt")
+  console.error("usage: node shoot.mjs <dir> --now=<ms> --zone=<IANA zone> [--dark] < demos.txt")
   process.exit(2)
 }
 const dark = flags.includes("--dark")
+const flag = name => flags.find(f => f.startsWith(`--${name}=`))?.slice(name.length + 3)
+const now = Number(flag("now"))
+const zone = flag("zone")
+if (!Number.isSafeInteger(now) || now <= 0 || !zone) {
+  console.error("shoot.mjs: --now=<ms since the epoch> and --zone=<IANA zone> are required (docs --clock)")
+  process.exit(2)
+}
 
 function cloakBrowser() {
   const cloak = join(homedir(), ".cloakbrowser")
@@ -31,6 +41,8 @@ const env = {
   ...process.env,
   // One session per run: agents judge pages in parallel.
   AGENT_BROWSER_SESSION: `shadcn-verdict-${process.pid}`,
+  // The browser this session launches reads its time zone from TZ.
+  TZ: zone,
   ...(executable && { AGENT_BROWSER_EXECUTABLE_PATH: executable }),
 }
 const browser = (...args) => execFileSync("agent-browser", args, { env, encoding: "utf8" }).trim()
@@ -49,16 +61,24 @@ for (const line of lines) {
   const out = join(dir, page, demo)
   mkdirSync(out, { recursive: true })
   try {
-    browser("open", `http://127.0.0.1:5298/?demo=${demo}${dark ? "&dark=1" : ""}`)
+    browser("open", `http://127.0.0.1:5298/?demo=${demo}&now=${now}${dark ? "&dark=1" : ""}`)
     browser("wait", "--fn", "document.querySelector('#specimen')?.dataset.ready || document.querySelector('#specimen')?.dataset.error || document.body.dataset.error")
     const probe = JSON.parse(JSON.parse(browser("eval", `JSON.stringify((() => {
       const s = document.querySelector('#specimen')
       const err = s?.dataset.error || document.body.dataset.error
       if (err) return { err }
       const r = s.getBoundingClientRect()
-      return { rect: [r.x + scrollX, r.y + scrollY, r.width, r.height] }
+      return {
+        rect: [r.x + scrollX, r.y + scrollY, r.width, r.height],
+        zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        want: new Intl.DateTimeFormat("en", { timeZone: ${JSON.stringify(zone)} }).resolvedOptions().timeZone,
+        late: Date.now() - ${now},
+      }
     })())`, "--json")).data?.result ?? "{}")
     if (probe.err) throw new Error(probe.err)
+    // A shot on the real date or zone would score by the clock: refuse it.
+    if (probe.zone !== probe.want) throw new Error(`browser in ${probe.zone}, not ${probe.want}`)
+    if (!(probe.late >= 0 && probe.late < 600_000)) throw new Error(`clock ${probe.late}ms off the pinned instant`)
     browser("screenshot", "--full", join(out, "ref-full.png"))
     writeFileSync(join(out, "ref.rect"), probe.rect.join(" "))
     console.log(`shot  ${demo}`)

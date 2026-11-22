@@ -2,7 +2,7 @@
 //! the tasks it works through.
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
     TraceStatus, spinner, trace, trace_collapsible, trace_collapsible_content, trace_collapsible_trigger,
     trace_description, trace_icon, trace_line, trace_title,
@@ -39,10 +39,12 @@ impl Progress {
 }
 
 /// A collapsible row: `line` and, while `open`, `content`.
-fn fold(open: &Signal<bool>, line: Div, content: impl FnOnce(Div) -> Div) -> Div {
+fn fold(open: &Signal<bool>, line: Div, content: impl FnOnce(Div) -> Div) -> Element {
     trace_collapsible()
-        .child(trace_collapsible_trigger(open, false, line))
-        .child(trace_collapsible_content(open, content))
+        .model(Model::bind(*open))
+        .child(trace_collapsible_trigger(false, line))
+        .child(trace_collapsible_content().map_root(content))
+        .into_element()
 }
 
 fn line(status: Option<TraceStatus>, glyph: impl IntoElement, title: &str) -> Div {
@@ -85,13 +87,13 @@ impl Plan {
         self.done.set(None);
         self.answer.set(String::new());
         self.open.set(true);
-        let (replied, done) = (self.replied.clone(), self.done.clone());
+        let (replied, done) = (self.replied, self.done);
         let mut steps = vec![after(300, move || {
             replied.set(true);
             done.set(Some(0));
         })];
         for i in 1..=PLAN_STEPS.len() {
-            let done = self.done.clone();
+            let done = self.done;
             steps.push(after(1200, move || done.set(Some(i))));
         }
         steps.extend(stream(&self.answer, PLAN_ANSWER, 20));
@@ -195,7 +197,7 @@ impl Queue {
         }
         let mut steps = Vec::new();
         for i in 0..=TODOS.len() {
-            let done = self.done.clone();
+            let done = self.done;
             steps.push(after(if i == 0 { 0 } else { 1400 }, move || done.set(Some(i))));
         }
         steps.extend(stream(&self.answer, QUEUE_ANSWER, 20).into_iter().map(|s| s.lead(20)));
@@ -286,7 +288,7 @@ impl Described {
             let row = line(None, icon(if done { Icon::CircleCheck } else { Icon::Circle }), title);
             match description {
                 Some(d) => fold(open, row, |c| c.child(text(d))),
-                None => row,
+                None => row.into_element(),
             }
         };
         let section = |done: bool, glyph: Icon, open: &Signal<bool>| {
@@ -367,7 +369,7 @@ impl Tasks {
         let mut steps = Vec::new();
         for ((task, done), open) in TASKS.iter().zip(&self.done).zip(&self.open) {
             for n in 0..=task.steps.len() {
-                let (done, open) = (done.clone(), open.clone());
+                let (done, open) = (*done, open.clone());
                 let running = n < task.steps.len();
                 steps.push(after(if steps.is_empty() { 0 } else { 900 }, move || {
                     done.set(Some(n));
@@ -382,7 +384,7 @@ impl Tasks {
     fn view(&self) -> Div {
         let busy = self.script.busy();
         let answer = self.answer.get();
-        let rows: Vec<Div> = TASKS
+        let rows: Vec<Element> = TASKS
             .iter()
             .zip(&self.done)
             .zip(&self.open)
@@ -422,12 +424,14 @@ impl Tasks {
                 let failed = status == Some(TraceStatus::Error);
                 Some(
                     trace_collapsible()
-                        .child(trace_collapsible_trigger(&open.open, failed, head))
-                        .child(trace_collapsible_content(&open.open, |c| {
+                        .model(Model::bind(open.open))
+                        .child(trace_collapsible_trigger(failed, head))
+                        .child(trace_collapsible_content().map_root(|c| {
                             c.child(
                                 trace().children(steps.into_iter().map(|(t, s)| trace_line(s).child(trace_title(t)))),
                             )
-                        })),
+                        }))
+                        .into_element(),
                 )
             })
             .collect();

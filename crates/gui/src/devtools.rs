@@ -22,7 +22,6 @@ use accesskit::{Action, ActionData, ActionRequest, NodeId, TreeId};
 
 use crate::access;
 use crate::app::{Pipeline, Scenario, ScenarioError};
-use crate::element::Element;
 use crate::events::{Key, KeyEvent, Modifiers, NamedKey};
 use crate::focus;
 use crate::heap;
@@ -31,6 +30,7 @@ use crate::interact::{self, Outcome};
 use crate::layout::{Content, Frame};
 use crate::process;
 use crate::reactive;
+use crate::testing::Rng;
 use crate::window::Input;
 
 /// How many frame reports the log keeps.
@@ -50,6 +50,7 @@ Inspect
   find TEXT                  every node whose text, value, placeholder or label contains TEXT
   at X Y                     the node under a point and the nodes it sits in
   a11y [SEL]                 what a screen reader hears: roles, names, values, states, actions
+  a11y-update [--full]       what a screen reader is sent for this frame: nodes and time (a probe tree of its own)
   focus                      the focused node
   signals [FILTER]           the labeled signals: id, label, type, value, readers
   signal ID|LABEL            one labeled signal's whole value
@@ -59,7 +60,14 @@ Inspect
 Measure
   report [N]                 the last N frame reports (cause, signals, times, layout change, holds)
   perf                       frame times over the logged frames: total/build/layout/paint p50/p95/max
-  memory                     the process (resident, CPU), the heap, the caches, the graph
+  memory                     the process (resident, CPU), the heap (process and this thread),
+                             what each owner holds (frame, layout, paint, reactive, GPU), the graph
+  counters [N]               the last N frames (default 10) phase by phase: renders and bindings,
+                             layout calls/misses/measures/placed, text shaped, chunks recorded and
+                             moved, GPU encoded/uploaded/damage, allocations (this thread, process)
+  paints                     where the last frame's paint recorded again or only moved (what the
+                             overlay flashes), with the area
+  hangs                      every frame over 50 ms since the log started: when, its stages, why
   diff                       every node the last changing frame added, removed, moved or repainted
   bench [N]                  (headless) draw N frames of the page as it is and time them (default 60)
   monkey [N] [--seed=S] [--budget=MS] [--verbose]
@@ -68,6 +76,7 @@ Measure
                              what the heap kept, with the steps that led there
 
 Act (each draws the next frame and prints its report)
+  instances                  the component instances: renders, and what each read
   click SEL                  press and release at the node's centre
   rclick SEL                 the secondary button
   hover SEL | leave          move the pointer onto a node, or out of the window
@@ -75,6 +84,7 @@ Act (each draws the next frame and prints its report)
                              (click, rclick, hover and drag do this first, as a browser
                              automation tool does)
   drag SEL SEL               press on one, move to the other, release
+  down SEL | up SEL          press or release alone (a drag over frames: down, hover…, up)
   wheel DY [SEL]             scroll by DY pixels (positive scrolls down), over SEL if given
   type TEXT                  type TEXT into the focused node, key by key
   press KEYS...              keys such as enter, esc, tab, shift+tab, down, cmd+k, ctrl+a, space
@@ -94,18 +104,128 @@ Frames and time
 
 // ── Frame log ────────────────────────────────────────────────────────────────
 
-/// The last frames' reports, each with when it was drawn.
-#[derive(Default)]
+/// A frame past this is a hang, as Chrome counts a long task.
+pub const HANG: Duration = Duration::from_millis(50);
+
+/// How many hangs the log keeps.
+pub const LOG_HANGS: usize = 64;
+
+/// A frame that took longer than [`HANG`]: what it did, kept after its
+/// report leaves the log (ADR-0023's hang log).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hang {
+    pub number: u64,
+    /// When it was drawn, since the log started.
+    pub at: Duration,
+    pub timings: inspect::Timings,
+    pub causes: Vec<String>,
+    /// Instances rendered, layout's counters, chunks recorded, bytes uploaded.
+    pub rendered: usize,
+    pub layout: inspect::LayoutStats,
+    pub recorded: usize,
+    pub uploaded: u64,
+    pub allocations: Option<u64>,
+}
+
+impl Hang {
+    fn of(report: &FrameReport, at: Duration) -> Self {
+        Self {
+            number: report.number,
+            at,
+            timings: report.timings,
+            causes: report.causes.clone(),
+            rendered: report.rendered.len(),
+            layout: report.layout,
+            recorded: report.paint.recorded,
+            uploaded: report.drawn.uploaded,
+            allocations: report.footprint.thread.map(|t| t.allocations),
+        }
+    }
+
+    /// The stage that took longest, by name.
+    #[must_use]
+    pub fn worst(&self) -> &'static str {
+        let t = self.timings;
+        [("build", t.build), ("layout", t.layout), ("paint", t.paint)]
+            .into_iter()
+            .max_by_key(|&(_, d)| d)
+            .map_or("build", |(n, _)| n)
+    }
+}
+
+impl std::fmt::Display for Hang {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let t = self.timings;
+        let causes = if self.causes.is_empty() {
+            "redraw".to_owned()
+        } else {
+            self.causes.join("; ")
+        };
+        write!(
+            f,
+            "frame {} at {:.1}s took {} (build {} layout {} paint {}, most in {}): {causes}\n  \
+             renders {}  layout calls {} misses {} measures {} placed {}  recorded {}  uploaded {}",
+            self.number,
+            self.at.as_secs_f32(),
+            ms(t.total()),
+            ms(t.build),
+            ms(t.layout),
+            ms(t.paint),
+            self.worst(),
+            self.rendered,
+            self.layout.calls,
+            self.layout.misses,
+            self.layout.measures,
+            self.layout.placements,
+            self.recorded,
+            bytes(self.uploaded)
+        )?;
+        if let Some(a) = self.allocations {
+            write!(f, "  allocations {a}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The last frames' reports, each with when it was drawn, and the hangs
+/// since the log started.
 pub struct FrameLog {
     frames: VecDeque<(Instant, FrameReport)>,
+    hangs: VecDeque<Hang>,
+    /// Frames pushed since the log started.
+    seen: u64,
+    started: Instant,
+}
+
+impl Default for FrameLog {
+    fn default() -> Self {
+        Self {
+            frames: VecDeque::new(),
+            hangs: VecDeque::new(),
+            seen: 0,
+            started: Instant::now(),
+        }
+    }
 }
 
 impl FrameLog {
     pub fn push(&mut self, report: FrameReport) {
+        self.seen = self.seen.saturating_add(1);
+        if report.timings.total() > HANG {
+            if self.hangs.len() >= LOG_HANGS {
+                self.hangs.pop_front();
+            }
+            self.hangs.push_back(Hang::of(&report, self.started.elapsed()));
+        }
         if self.frames.len() >= LOG_FRAMES {
             self.frames.pop_front();
         }
         self.frames.push_back((Instant::now(), report));
+    }
+
+    /// The frames over [`HANG`] since the log started, the last [`LOG_HANGS`].
+    pub fn hangs(&self) -> impl DoubleEndedIterator<Item = &Hang> + ExactSizeIterator {
+        self.hangs.iter()
     }
 
     pub fn last(&self) -> Option<&FrameReport> {
@@ -115,6 +235,19 @@ impl FrameLog {
     /// The logged reports, oldest first.
     pub fn reports(&self) -> impl DoubleEndedIterator<Item = &FrameReport> + ExactSizeIterator {
         self.frames.iter().map(|(_, r)| r)
+    }
+
+    /// The bytes the logged reports hold, their own containers counted
+    /// (what the memory report charges the devtools).
+    fn held_bytes(&self) -> u64 {
+        self.frames.iter().fold(
+            inspect::bytes_of::<(Instant, FrameReport)>(self.frames.capacity()),
+            |n, (_, r)| {
+                n.saturating_add(inspect::bytes_of::<inspect::NodeChange>(r.diff.changes.len()))
+                    .saturating_add(inspect::bytes_of::<inspect::Repaint>(r.painted.capacity()))
+                    .saturating_add(inspect::bytes_of::<crate::component::Rendered>(r.rendered.capacity()))
+            },
+        )
     }
 
     /// Frames drawn in the last second (a live window's rate).
@@ -131,10 +264,17 @@ pub(crate) trait Target {
     fn frame(&self) -> &Frame;
     fn send(&mut self, input: Input) -> Outcome;
     fn footprint(&self) -> Footprint;
+    /// What each part of the pipeline holds (the memory report by owner).
+    fn owners(&self) -> Vec<inspect::Owner>;
     fn last_diff(&self) -> &LayoutDiff;
+    /// The whole tree a screen reader would be given for the last frame.
+    fn access_tree(&mut self) -> accesskit::TreeUpdate;
+    /// Bring a probe tree of its own (never the window's) up to the last
+    /// frame, from nothing when `full`: what an update costs.
+    fn access_probe(&mut self, full: bool) -> access::AccessStats;
 }
 
-impl<C: FnMut() -> Element> Target for Pipeline<C> {
+impl Target for Pipeline {
     fn frame(&self) -> &Frame {
         Pipeline::frame(self)
     }
@@ -147,8 +287,20 @@ impl<C: FnMut() -> Element> Target for Pipeline<C> {
         Pipeline::footprint(self)
     }
 
+    fn owners(&self) -> Vec<inspect::Owner> {
+        Pipeline::owners(self)
+    }
+
     fn last_diff(&self) -> &LayoutDiff {
         Pipeline::last_diff(self)
+    }
+
+    fn access_tree(&mut self) -> accesskit::TreeUpdate {
+        Pipeline::access_tree(self, 1.0, "window")
+    }
+
+    fn access_probe(&mut self, full: bool) -> access::AccessStats {
+        Pipeline::access_probe(self, full).1
     }
 }
 
@@ -228,7 +380,20 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
         }
         "a11y" | "access" => {
             let root = args.first().map(|s| node_of(target.frame(), s)).transpose()?;
-            text(a11y(target.frame(), root))
+            let update = target.access_tree();
+            text(a11y(target.frame(), &update, root))
+        }
+        "a11y-update" => {
+            let (flags, _) = flags(args);
+            let full = flags.iter().any(|(k, _)| *k == "full");
+            let s = target.access_probe(full);
+            text(format!(
+                "sent {} of {} nodes{} in {}",
+                s.sent,
+                s.nodes,
+                if s.full { " (whole tree)" } else { "" },
+                crate::inspect::ms(s.took)
+            ))
         }
         "focus" if args.is_empty() => text(focused(target.frame())),
         "signals" => text(signals(args.first().map(String::as_str))),
@@ -253,7 +418,14 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
             text(reports(log, n))
         }
         "perf" => text(perf(log)),
-        "memory" | "mem" => text(memory(&target.footprint(), target.frame())),
+        "instances" => text(instances()),
+        "memory" | "mem" => text(memory(&target.footprint(), target.frame(), &target.owners(), log)),
+        "counters" => {
+            let n = args.first().map(|s| count(s)).transpose()?.unwrap_or(10);
+            text(counters(log, n))
+        }
+        "paints" | "flash" => text(paints(log)),
+        "hangs" => text(hangs(log)),
         "diff" => text(diff(target.last_diff())),
         "click" | "rclick" => {
             let sel = arg(0, "a node (SEL)")?;
@@ -275,6 +447,19 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
             let (x, y, about) = point_of(target.frame(), sel)?;
             let about = format!("{scrolled}{about}");
             let out = target.send(Input::PointerMoved { x, y });
+            Ok(Done::Acted(format!("{about}\n{}", handled(&out))))
+        }
+        "down" | "up" => {
+            // A press or a release alone, for a drag over many frames:
+            // `down SEL`, then `hover SEL` for each move, then `up SEL`.
+            let sel = arg(0, "a node (SEL)")?;
+            let (x, y, about) = point_of(target.frame(), sel)?;
+            target.send(Input::PointerMoved { x, y });
+            let out = if verb == "down" {
+                target.send(Input::MouseDown { x, y })
+            } else {
+                target.send(Input::MouseUp { x, y })
+            };
             Ok(Done::Acted(format!("{about}\n{}", handled(&out))))
         }
         "leave" => {
@@ -967,6 +1152,9 @@ fn node_detail(frame: &Frame, i: usize) -> String {
         Content::Shapes(shapes) => {
             out.push_str(&format!("  shapes     {}\n", shapes.len()));
         }
+        Content::Drawn(d) => {
+            out.push_str(&format!("  drawing    {d:?}\n"));
+        }
         Content::None => {}
     }
     let does = behaviour(frame, i);
@@ -1061,8 +1249,7 @@ fn focused(frame: &Frame) -> String {
 
 /// What a screen reader hears, as a tree: containers without a name fold
 /// into their parent, so the meaningful nodes stand out.
-fn a11y(frame: &Frame, root: Option<usize>) -> String {
-    let update = access::tree(frame, focus::focused(), 1.0, "window");
+fn a11y(frame: &Frame, update: &accesskit::TreeUpdate, root: Option<usize>) -> String {
     let nodes: std::collections::HashMap<NodeId, &accesskit::Node> =
         update.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let start = match root {
@@ -1103,6 +1290,20 @@ fn a11y(frame: &Frame, root: Option<usize>) -> String {
             }
             if node.is_disabled() {
                 line.push_str(" disabled");
+            }
+            if let Some(rows) = node.row_count() {
+                line.push_str(&format!(" rows={rows}"));
+            }
+            if let (Some(at), Some(of)) = (node.position_in_set(), node.size_of_set()) {
+                line.push_str(&format!(" {at}/{of}"));
+            } else if let Some(at) = node.position_in_set() {
+                line.push_str(&format!(" #{at}"));
+            }
+            if let Some(sel) = node.text_selection() {
+                line.push_str(&format!(
+                    " selection={}..{}",
+                    sel.anchor.character_index, sel.focus.character_index
+                ));
             }
             if id == update.focus && id != NodeId(0) {
                 line.push_str(" FOCUSED");
@@ -1286,6 +1487,20 @@ pub fn perf_of<'a>(reports: impl IntoIterator<Item = &'a FrameReport>) -> String
             bytes(b.max)
         ));
     }
+    let threads: Vec<heap::ThreadHeap> = reports.iter().filter_map(|r| r.footprint.thread).collect();
+    if !threads.is_empty() {
+        let n = Spread::of(threads.iter().map(|h| h.allocations));
+        let b = Spread::of(threads.iter().map(|h| h.allocated));
+        out.push_str(&format!(
+            "\nthread  p50 {}  p95 {}  max {} per frame; bytes p50 {}  p95 {}  max {} (the thread that built them)",
+            n.p50,
+            n.p95,
+            n.max,
+            bytes(b.p50),
+            bytes(b.p95),
+            bytes(b.max)
+        ));
+    }
     let effects = Spread::of(reports.iter().map(|r| r.reactive.effect_runs));
     out.push_str(&format!(
         "\neffects p50 {}  p95 {}  max {} runs per frame",
@@ -1303,7 +1518,7 @@ fn perf(log: &FrameLog) -> String {
     out
 }
 
-fn memory(f: &Footprint, frame: &Frame) -> String {
+fn memory(f: &Footprint, frame: &Frame, owners: &[inspect::Owner], log: &FrameLog) -> String {
     let p = process::usage();
     let mut out = String::new();
     out.push_str(&format!(
@@ -1324,13 +1539,24 @@ fn memory(f: &Footprint, frame: &Frame) -> String {
             None => "not counted (install gui::heap::COUNTING as the #[global_allocator])".to_owned(),
         }
     ));
+    if let Some(h) = heap::now() {
+        out.push_str(&format!("         peak {} held at once\n", bytes(h.peak)));
+    }
+    if let Some(t) = log.last().and_then(|r| r.footprint.thread) {
+        out.push_str(&format!(
+            "thread   the last frame allocated {} times, {} on the thread that built it\n",
+            t.allocations,
+            bytes(t.allocated)
+        ));
+    }
+    out.push_str(&owners_table(owners, heap::now().map(|h| h.live), log));
     out.push_str(&format!(
-        "caches   {} of images: glyphs {}  icons {}  shadows {}  images {}  layers {}\n",
+        "caches   {} of images: glyphs {}  icons {}  images {}  paths {}  layers {}\n",
         bytes(u64::try_from(f.raster_bytes()).unwrap_or(u64::MAX)),
         f.glyphs,
         f.icons,
-        f.shadows,
         f.images,
+        f.paths,
         f.layers
     ));
     out.push_str(&format!("text     {} paragraphs shaped\n", f.shaped));
@@ -1350,6 +1576,133 @@ fn memory(f: &Footprint, frame: &Frame) -> String {
         frame.layers.len().saturating_add(1)
     ));
     out
+}
+
+/// The memory report by owner: heap owners largest first, what they leave
+/// unattributed of the heap, then the GPU's.
+fn owners_table(owners: &[inspect::Owner], live: Option<u64>, log: &FrameLog) -> String {
+    let mut heap_side: Vec<inspect::Owner> = owners.iter().filter(|o| !o.gpu).cloned().collect();
+    heap_side.push(inspect::Owner::heap(
+        "devtools log",
+        log.frames.len(),
+        "reports",
+        log.held_bytes(),
+    ));
+    heap_side.sort_by_key(|o| std::cmp::Reverse(o.bytes));
+    let mut gpu: Vec<&inspect::Owner> = owners.iter().filter(|o| o.gpu).collect();
+    gpu.sort_by_key(|o| std::cmp::Reverse(o.bytes));
+    let row = |o: &inspect::Owner| {
+        let size = if o.bytes == 0 { "?".to_owned() } else { bytes(o.bytes) };
+        format!("  {:<14} {:>10}  {} {}\n", o.name, size, o.count, o.unit)
+    };
+    let mut out = "owners   (heap: containers at capacity; GPU: exact)\n".to_owned();
+    for o in &heap_side {
+        out.push_str(&row(o));
+    }
+    let counted = heap_side.iter().fold(0_u64, |n, o| n.saturating_add(o.bytes));
+    if let Some(live) = live {
+        out.push_str(&format!(
+            "  {:<14} {:>10}  of {} live (what owners' elements own, fonts, the GPU driver, the rest)\n",
+            "unattributed",
+            bytes(live.saturating_sub(counted)),
+            bytes(live)
+        ));
+    }
+    let on_gpu = gpu.iter().fold(0_u64, |n, o| n.saturating_add(o.bytes));
+    out.push_str(&format!("gpu      {} held\n", bytes(on_gpu)));
+    for o in gpu {
+        out.push_str(&row(o));
+    }
+    out
+}
+
+/// `counters`: the last `n` frames phase by phase, then their spread.
+fn counters(log: &FrameLog, n: usize) -> String {
+    let reports: Vec<&FrameReport> = log.reports().rev().take(n.max(1)).collect();
+    if reports.is_empty() {
+        return "no frame drawn yet".to_owned();
+    }
+    let mut out = format!(
+        "{:>6}  {:>13}  {:>32}  {:>6}  {:>16}  {:>26}  {:>15}\n",
+        "frame",
+        "render (bind)",
+        "layout calls/miss/measure/placed",
+        "shaped",
+        "paint chunks/rec/mv",
+        "gpu encoded/upload/damage",
+        "alloc thr/proc"
+    );
+    for r in reports.iter().rev() {
+        let l = r.layout;
+        let alloc = match (r.footprint.thread, r.footprint.heap) {
+            (Some(t), Some(h)) => format!("{}/{}", t.allocations, h.allocations),
+            (None, Some(h)) => format!("-/{}", h.allocations),
+            _ => "-".to_owned(),
+        };
+        out.push_str(&format!(
+            "{:>6}  {:>13}  {:>32}  {:>6}  {:>16}  {:>26}  {:>15}\n",
+            r.number,
+            format!("{} ({})", r.rendered.len(), r.bindings),
+            format!("{}/{}/{}/{}", l.calls, l.misses, l.measures, l.placements),
+            r.shaped,
+            format!("{}/{}/{}", r.paint.chunks, r.paint.recorded, r.paint.moved),
+            format!("{}/{}/{}", r.drawn.encoded, bytes(r.drawn.uploaded), r.drawn.damage),
+            alloc
+        ));
+    }
+    let spread = |f: &dyn Fn(&FrameReport) -> u64| Spread::of(reports.iter().map(|r| f(r)));
+    let line = |name: &str, s: Spread<u64>| format!("{name:<16} p50 {}  max {}\n", s.p50, s.max);
+    let usize_u64 = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    out.push_str(&line("renders", spread(&|r| usize_u64(r.rendered.len()))));
+    out.push_str(&line("layout misses", spread(&|r| r.layout.misses)));
+    out.push_str(&line("layout measures", spread(&|r| r.layout.measures)));
+    out.push_str(&line("chunks recorded", spread(&|r| usize_u64(r.paint.recorded))));
+    out.push_str(&line("bytes uploaded", spread(&|r| r.drawn.uploaded)));
+    out.push_str(&line("damage px", spread(&|r| r.drawn.damage)));
+    out.trim_end().to_owned()
+}
+
+/// `paints`: where the last frame's paint recorded again or only moved.
+fn paints(log: &FrameLog) -> String {
+    let Some(r) = log.last() else {
+        return "no frame drawn yet".to_owned();
+    };
+    let (rec, moved) = r.painted_area();
+    let recorded = r.painted.iter().filter(|p| p.recorded).count();
+    let mut out = format!(
+        "frame {}: {recorded} recorded again ({rec:.0} px²), {} moved, faded or clipped ({moved:.0} px²); gpu {}\n",
+        r.number,
+        r.painted.len().saturating_sub(recorded),
+        r.drawn
+    );
+    for p in r.painted.iter().take(60) {
+        out.push_str(&format!(
+            "  {}  {}\n",
+            if p.recorded { "recorded" } else { "moved   " },
+            p.bounds
+        ));
+    }
+    if r.painted.len() > 60 {
+        out.push_str(&format!("  … {} more\n", r.painted.len().saturating_sub(60)));
+    }
+    out.trim_end().to_owned()
+}
+
+/// `hangs`: every frame over [`HANG`] since the log started.
+fn hangs(log: &FrameLog) -> String {
+    if log.hangs.is_empty() {
+        return format!("no frame over {} in {} frames", ms(HANG), log.seen);
+    }
+    let mut out = format!(
+        "{} frames over {} in {} (the last {LOG_HANGS} kept)\n",
+        log.hangs.len(),
+        ms(HANG),
+        log.seen
+    );
+    for h in log.hangs() {
+        out.push_str(&format!("{h}\n"));
+    }
+    out.trim_end().to_owned()
 }
 
 fn diff(d: &LayoutDiff) -> String {
@@ -1384,14 +1737,14 @@ fn diff(d: &LayoutDiff) -> String {
 
 /// A headless devtools session over a [`Scenario`]: each command runs and
 /// answers as text; input draws the next frame, as a window would.
-pub struct Session<C> {
-    scenario: Scenario<C>,
+pub struct Session {
+    scenario: Scenario,
     log: FrameLog,
 }
 
-impl<C: FnMut() -> Element> Session<C> {
+impl Session {
     /// A session on `scenario`, its first frame drawn.
-    pub fn new(mut scenario: Scenario<C>) -> Result<Self, ScenarioError> {
+    pub fn new(mut scenario: Scenario) -> Result<Self, ScenarioError> {
         let mut log = FrameLog::default();
         scenario.settle()?;
         for r in scenario.take_reports() {
@@ -1406,8 +1759,16 @@ impl<C: FnMut() -> Element> Session<C> {
         &self.log
     }
 
+    /// Bring a probe accessibility tree (a screen reader's, kept apart) up
+    /// to the last frame, from nothing when `full`: the update and its cost.
+    pub fn access_probe(&mut self, full: bool) -> (accesskit::TreeUpdate, access::AccessStats) {
+        self.scenario.pipeline_mut().access_probe(full)
+    }
+
     /// Draw `n` frames (at least one) of the page as it is, each built anew; their reports.
     pub fn bench(&mut self, n: usize) -> Result<Vec<FrameReport>, String> {
+        // A canvas still rastering tiles is not steady: its tiles finish first.
+        self.scenario.finish_raster();
         let mut drawn = Vec::with_capacity(n.max(1));
         for _ in 0..n.max(1) {
             self.scenario.act("bench", || {});
@@ -1420,7 +1781,7 @@ impl<C: FnMut() -> Element> Session<C> {
     /// does: a leak check measures after this (a report holds its layout
     /// diff and every signal its frame wrote).
     pub fn forget_log(&mut self) {
-        self.log = FrameLog::default();
+        self.log.frames.clear();
     }
 
     /// Bring the page to rest (due timers run, motion ends) and draw it.
@@ -1430,7 +1791,7 @@ impl<C: FnMut() -> Element> Session<C> {
     }
 
     /// The scenario under the session.
-    pub fn scenario(&mut self) -> &mut Scenario<C> {
+    pub fn scenario(&mut self) -> &mut Scenario {
         &mut self.scenario
     }
 
@@ -1455,11 +1816,7 @@ impl<C: FnMut() -> Element> Session<C> {
             Done::Frame => self.draw().map(|r| r.to_string()),
             Done::Screenshot { path, overlay } => {
                 let report = self.draw()?;
-                let mut pixmap = self.scenario.pixmap().clone();
-                if overlay {
-                    let scale = self.scenario.scale();
-                    self.scenario.pipeline_mut().paint_overlay(&mut pixmap, scale);
-                }
+                let pixmap = self.scenario.shot(overlay).map_err(|e| e.to_string())?;
                 save(&pixmap, &path)?;
                 Ok(format!(
                     "wrote {} ({}x{})\n{report}",
@@ -1516,7 +1873,7 @@ impl<C: FnMut() -> Element> Session<C> {
         let budget =
             flag_num(&flags, "budget")?.map_or(BUDGET, |ms| Duration::from_millis(u64::try_from(ms).unwrap_or(16)));
         let verbose = flags.iter().any(|(k, _)| *k == "verbose");
-        let mut rng = Rng(seed.max(1));
+        let mut rng = Rng::new(seed);
         let mut log: Vec<String> = Vec::new();
         let mut out = String::new();
         // What the log holds is the devtools', not the app's.
@@ -1703,37 +2060,6 @@ impl<C: FnMut() -> Element> Session<C> {
     }
 }
 
-/// A small, seeded generator (xorshift64): the same seed walks the same way.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        let mut x = self.0;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.0 = x;
-        x
-    }
-
-    /// A number below `n` (0 when `n` is 0).
-    fn below(&mut self, n: u64) -> u64 {
-        self.next().checked_rem(n).unwrap_or(0)
-    }
-
-    /// A number in `0..1`.
-    fn unit(&mut self) -> f32 {
-        // 24 bits: what an f32 holds exactly.
-        let bits = u32::try_from(self.next() >> 40).unwrap_or(0);
-        crate::convert::u32_to_f32(bits) / 16_777_216.0
-    }
-
-    fn pick<'a, T>(&mut self, from: &'a [T]) -> Option<&'a T> {
-        let n = u64::try_from(from.len()).unwrap_or(0);
-        from.get(usize::try_from(self.below(n)).unwrap_or(0))
-    }
-}
-
 /// Why a monkey run stopped, with the steps before it and how to repeat it.
 fn stopped(seed: u64, step: usize, action: &str, why: &str, log: &[String]) -> String {
     let mut out = format!("monkey seed={seed} stopped at step {step}: {action}\n  {why}\nthe steps before it:\n");
@@ -1746,7 +2072,7 @@ fn stopped(seed: u64, step: usize, action: &str, why: &str, log: &[String]) -> S
     out
 }
 
-fn save(pixmap: &tiny_skia::Pixmap, path: &Path) -> Result<(), String> {
+fn save(pixmap: &crate::image::Pixels, path: &Path) -> Result<(), String> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
@@ -1921,7 +2247,11 @@ impl Attached {
 
     /// A frame was drawn: log it and answer what waited for it. `capture`
     /// reads the frame's pixels back, the debug overlay over them when asked.
-    pub(crate) fn drawn(&mut self, report: &FrameReport, capture: &mut dyn FnMut(bool) -> Option<tiny_skia::Pixmap>) {
+    pub(crate) fn drawn(
+        &mut self,
+        report: &FrameReport,
+        capture: &mut dyn FnMut(bool) -> Option<crate::image::Pixels>,
+    ) {
         self.log.push(report.clone());
         for (req, what, shot) in self.waiting.drain(..) {
             let mut answer = String::new();
@@ -1952,6 +2282,24 @@ impl Attached {
     }
 }
 
+/// The component instances, the most rendered first: name, renders, reads.
+fn instances() -> String {
+    let mut all = crate::component::instances();
+    all.sort_by_key(|i| std::cmp::Reverse(i.renders));
+    let mut out = format!("{} instances\n", all.len());
+    for i in all.iter().take(40) {
+        let reads: Vec<String> = i.reads.iter().map(ToString::to_string).collect();
+        out.push_str(&format!(
+            "  {:>5} renders  {}{}  reads [{}]\n",
+            i.renders,
+            "  ".repeat(usize::try_from(i.depth.min(8)).unwrap_or(0)),
+            i.name,
+            reads.join(", ")
+        ));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,11 +2308,11 @@ mod tests {
     use crate::styled::Styled;
 
     /// A counter: a labeled count, a button that adds one, its text.
-    fn counter() -> Session<impl FnMut() -> Element> {
+    fn counter() -> Session {
         let count = Signal::labeled("count", 0_i32);
         let scenario = Scenario::measuring(
             move || {
-                let c = count.clone();
+                let c = count;
                 div()
                     .size_full()
                     .p(8.0)
@@ -1972,7 +2320,7 @@ mod tests {
                         div()
                             .named("add")
                             .p(4.0)
-                            .on_click(move |_| c.update(|n| n.saturating_add(1)))
+                            .on_click(move |_| c.update(|n| *n = n.saturating_add(1)))
                             .child(text("Add")),
                     )
                     .child(text(format!("count is {}", count.get())))
@@ -2012,23 +2360,150 @@ mod tests {
         assert!(s.run("frobnicate").is_err());
     }
 
+    /// A command's text with what changes between runs (times, the clock)
+    /// replaced: what a snapshot holds.
+    fn snapshot(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c.is_ascii_digit() {
+                let mut n = c.to_string();
+                while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit() || **d == '.') {
+                    n.push(d);
+                    chars.next();
+                }
+                let rest: String = chars.clone().take(2).collect();
+                if rest == "ms" || (rest.starts_with('s') && n.contains('.')) {
+                    out.push('T');
+                } else {
+                    out.push_str(&n);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// A box that changes colour when clicked, and one that never changes:
+    /// no text, so its frames are the same on every OS.
+    fn swatch() -> Session {
+        let on = Signal::labeled("on", false);
+        let scenario = Scenario::measuring(
+            move || {
+                let color = if on.get() { 0x0022_c55e } else { 0x0094_a3b8 };
+                div()
+                    .size_full()
+                    .p(8.0)
+                    .gap(8.0)
+                    .flex()
+                    .child(
+                        div()
+                            .named("swatch")
+                            .w_px(40.0)
+                            .h_px(30.0)
+                            .bg(crate::Color::hex(color))
+                            .on_click(move |_| on.update(|v| *v = !*v)),
+                    )
+                    .child(div().w_px(20.0).h_px(20.0).bg(crate::Color::hex(0x0011_1111)))
+                    .into_element()
+            },
+            200,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        Session::new(scenario).expect("a session")
+    }
+
+    #[test]
+    fn counters_show_each_phase_of_each_frame() {
+        let mut s = swatch();
+        s.run("click #swatch").expect("click");
+        s.run("frame").expect("frame");
+        assert_eq!(
+            snapshot(&s.run("counters 2").expect("counters")).trim_start(),
+            "\
+ frame  render (bind)  layout calls/miss/measure/placed  shaped  paint chunks/rec/mv   gpu encoded/upload/damage   alloc thr/proc
+     2          1 (0)                           0/0/0/0       0             2/1/0                1/124 B/1344                -
+     3          0 (0)                           0/0/0/0       0             2/0/0                     0/0 B/0                -
+renders          p50 0  max 1
+layout misses    p50 0  max 0
+layout measures  p50 0  max 0
+chunks recorded  p50 0  max 1
+bytes uploaded   p50 0  max 124
+damage px        p50 0  max 1344"
+        );
+    }
+
+    #[test]
+    fn paints_name_what_was_recorded_again() {
+        let mut s = swatch();
+        s.run("click #swatch").expect("click");
+        assert_eq!(
+            snapshot(&s.run("paints").expect("paints")),
+            "\
+frame 2: 1 recorded again (1200 px²), 0 moved, faded or clipped (0 px²); gpu signed 1  encoded 1  uploaded 124 B  damage 1344 px in 1 rects  layers 0 (kept 0)  folded 0
+  recorded  40x30 at (32,32)"
+        );
+        let mut log = FrameLog::default();
+        assert_eq!(paints(&log), "no frame drawn yet");
+        let mut slow = s.log().last().cloned().expect("a report");
+        slow.timings.layout = Duration::from_millis(70);
+        log.push(slow.clone());
+        slow.timings.layout = Duration::from_millis(5);
+        log.push(slow);
+        assert_eq!(
+            snapshot(&hangs(&log)),
+            "\
+1 frames over Tms in 2 (the last 64 kept)
+frame 2 at Ts took Tms (build Tms layout Tms paint Tms, most in layout): click (52,47) -> 0/0 swatch: Div #94a3b8
+  renders 1  layout calls 0 misses 0 measures 0 placed 0  recorded 1  uploaded 124 B"
+        );
+    }
+
+    #[test]
+    fn memory_names_each_owner() {
+        let mut s = swatch();
+        let memory = s.run("memory").expect("memory");
+        let names: Vec<&str> = memory
+            .lines()
+            .filter(|l| l.starts_with("  "))
+            .filter_map(|l| l.split("  ").nth(1))
+            .map(str::trim)
+            .collect();
+        for owner in [
+            "layout tree",
+            "frame",
+            "reactive",
+            "devtools log",
+            "paint",
+            "text",
+            "glyph atlas",
+            "chunk buffers",
+        ] {
+            assert!(names.contains(&owner), "{owner} in\n{memory}");
+        }
+        assert!(
+            memory.contains("owners   (heap: containers at capacity; GPU: exact)"),
+            "{memory}"
+        );
+        assert!(memory.contains("gpu      "), "{memory}");
+    }
+
     /// Fifty buttons `#0`…`#49` in a list 100px tall, each counting into `hits`,
     /// and an input named only by its label.
-    fn long_list() -> (Session<impl FnMut() -> Element>, Signal<Vec<usize>>) {
+    fn long_list() -> (Session, Signal<Vec<usize>>) {
         let hits = Signal::labeled("hits", Vec::<usize>::new());
         let field = crate::edit::TextField::new("");
-        let h = hits.clone();
+        let h = hits;
         let scenario = Scenario::measuring(
             move || {
                 let rows = (0..50).map(|i| {
-                    let h = h.clone();
                     div()
                         .h_px(24.0)
                         .on_click(move |_| {
-                            h.update(|mut v| {
-                                v.push(i);
-                                v
-                            });
+                            h.update(|v| v.push(i));
                         })
                         .child(text(format!("#{i}")))
                 });

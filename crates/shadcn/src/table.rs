@@ -2,10 +2,18 @@
 //!
 //! `gui` has no table layout, where every row shares column widths found from
 //! all cells; each row is a grid on the columns the caller states, so `Fr` and
-//! `Px` tracks line up across rows and an `Auto` track does not.
+//! `Px` tracks line up across rows and an `Auto` track does not. A table of
+//! many rows takes a [`Columns`] model instead (an `Auto` column as wide as
+//! the widest cell seen, only growing) and a [`table_body_virtual`], which
+//! builds only the rows in view (ADR-0014): a million rows scroll as ten do.
+//!
+//! A screen reader hears a table as `<table>` is heard: a table of row
+//! groups, rows, column headers and cells; a virtual body says how many
+//! rows it has in all and each row where it is among them (ADR-0021).
 
+use gui::list::{Columns, ListState, virtual_list};
 use gui::prelude::*;
-use gui::{Div, Track, div, text};
+use gui::{Div, ElementKey, Track, div, text};
 
 use crate::theme::theme;
 
@@ -15,6 +23,7 @@ use crate::theme::theme;
 pub fn table() -> Div {
     div()
         .named("table")
+        .role(gui::Role::Table)
         .relative()
         .w_full()
         .overflow_x_scroll()
@@ -25,13 +34,48 @@ pub fn table() -> Div {
 /// `<thead>`: every row keeps its bottom border.
 #[must_use]
 pub fn table_header(rows: impl IntoIterator<Item = Div>) -> Div {
-    div().named("table-header").flex_col().children(rows)
+    div()
+        .named("table-header")
+        .role(gui::Role::RowGroup)
+        .flex_col()
+        .children(rows)
 }
 
 /// `<tbody>`: the last row has no border (`[&_tr:last-child]:border-0`).
 #[must_use]
 pub fn table_body(rows: impl IntoIterator<Item = Div>) -> Div {
-    div().named("table-body").flex_col().children(without_last_border(rows))
+    div()
+        .named("table-body")
+        .role(gui::Role::RowGroup)
+        .flex_col()
+        .children(without_last_border(rows))
+}
+
+/// `<tbody>` of `rows` rows, `row(i)` built only for those in view and the
+/// prefetch margin around them, each keyed `key(i)`: a scroll container of
+/// its own, so give it a height (or `flex_1` in a column). The last row has
+/// no border, as in [`table_body`]. Lay each row's cells on one
+/// [`Columns`] ([`table_row_on`]) so they line up.
+#[must_use]
+pub fn table_body_virtual(
+    state: &ListState,
+    rows: u64,
+    key: impl Fn(u64) -> ElementKey,
+    row: impl Fn(u64) -> Div,
+) -> Div {
+    virtual_list(state, rows, key, move |i| {
+        row(i)
+            .when(i.saturating_add(1) == rows, Styled::border_0)
+            .into_element()
+    })
+    .named("table-body")
+    .role(gui::Role::RowGroup)
+}
+
+/// `<tr>` of `cells` on the column model `columns`; `selected` is `data-state=selected`.
+#[must_use]
+pub fn table_row_on<E: IntoElement>(columns: &Columns, selected: bool, cells: impl IntoIterator<Item = E>) -> Div {
+    table_row(&columns.tracks(), selected).children(columns.cells(cells))
 }
 
 /// `<tfoot>`: muted, bordered on top, its last row without a bottom border.
@@ -40,6 +84,7 @@ pub fn table_footer(rows: impl IntoIterator<Item = Div>) -> Div {
     let t = theme();
     div()
         .named("table-footer")
+        .role(gui::Role::RowGroup)
         .flex_col()
         .bg(t.muted.opacity(0.5))
         .border_t()
@@ -63,6 +108,8 @@ pub fn table_row(columns: &[Track], selected: bool) -> Div {
     let t = theme();
     div()
         .named("table-row")
+        .role(gui::Role::Row)
+        .when(selected, |d| d.aria_selected(true))
         .transition_colors()
         .grid()
         .grid_cols_tracks(columns.to_vec())
@@ -78,6 +125,7 @@ pub fn table_head(content: impl IntoElement) -> Div {
     let t = theme();
     div()
         .named("table-head")
+        .role(gui::Role::ColumnHeader)
         .flex_col()
         .justify_center()
         .h(10.0)
@@ -94,6 +142,7 @@ pub fn table_head(content: impl IntoElement) -> Div {
 pub fn table_cell(content: impl IntoElement) -> Div {
     div()
         .named("table-cell")
+        .role(gui::Role::Cell)
         .flex_col()
         .justify_center()
         .p(2.0)

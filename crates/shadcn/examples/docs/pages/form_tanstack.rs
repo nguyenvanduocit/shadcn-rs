@@ -2,7 +2,7 @@
 //! submit, a field's errors gone at its next change.
 
 use gui::ScenarioError;
-use shadcn::{Toaster, toaster};
+use shadcn::toaster;
 
 use super::form_cards::{self, Cards, Files, Library};
 use crate::{Render, Shot, page};
@@ -20,9 +20,8 @@ const FILES: Files = Files {
 };
 
 pub fn render() -> Render {
-    let toasts = Toaster::new();
-    let cards = Cards::new(Library::TanStack, &toasts);
-    Box::new(move || page("Form (TanStack Form)", cards.view(&FILES).child(toaster(&toasts))))
+    let cards = Cards::new(Library::TanStack);
+    Box::new(move || page("Form (TanStack Form)", cards.view(&FILES).child(toaster())))
 }
 
 pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {

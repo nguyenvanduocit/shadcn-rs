@@ -22,13 +22,14 @@ pub fn u32_to_f32(v: u32) -> f32 {
     v as f32
 }
 
+/// As `as` rounds it (to nearest), what Taffy counts items with.
 #[must_use]
-pub fn i32_to_f32(v: i32) -> f32 {
+pub fn usize_to_f32(v: usize) -> f32 {
     v as f32
 }
 
 #[must_use]
-pub fn usize_to_f32(v: usize) -> f32 {
+pub fn i32_to_f32(v: i32) -> f32 {
     v as f32
 }
 
@@ -37,9 +38,39 @@ pub fn u64_to_f64(v: u64) -> f64 {
     v as f64
 }
 
+/// Saturating, as `as` is: a negative or NaN value is 0.
+#[must_use]
+pub fn f64_to_u64(v: f64) -> u64 {
+    v as u64
+}
+
 #[must_use]
 pub fn f64_to_f32(v: f64) -> f32 {
     v as f32
+}
+
+/// Saturating, as `as` is: NaN is 0.
+#[must_use]
+pub fn f64_to_i32(v: f64) -> i32 {
+    v as i32
+}
+
+/// Saturating, as `as` is: NaN is 0 (a tile index from a position).
+#[must_use]
+pub fn f64_to_i64(v: f64) -> i64 {
+    v as i64
+}
+
+/// Exact below 2^53.
+#[must_use]
+pub fn i64_to_f64(v: i64) -> f64 {
+    v as f64
+}
+
+/// Exact below 2^53.
+#[must_use]
+pub fn usize_to_f64(v: usize) -> f64 {
+    v as f64
 }
 
 /// A colour channel in `0.0..=1.0` as a byte.

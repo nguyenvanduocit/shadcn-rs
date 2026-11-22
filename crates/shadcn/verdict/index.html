@@ -3,6 +3,25 @@
   <head>
     <meta charset="UTF-8" />
     <title>shadcn-vue reference</title>
+    <script>
+      // `?now=<ms since the epoch>` (shoot.mjs, from `docs --clock`): the page's
+      // clock starts at that instant, before any demo reads it, so the demos'
+      // `today(getLocalTimeZone())` is the docs' today. It runs on from there,
+      // as the real one does; only where it starts is pinned.
+      (() => {
+        const now = Number(new URLSearchParams(location.search).get("now"))
+        if (!Number.isFinite(now) || now <= 0)
+          return
+        const Real = Date
+        const start = performance.now()
+        const current = () => Math.floor(now + performance.now() - start)
+        window.Date = new Proxy(Real, {
+          construct: (target, args, newTarget) => Reflect.construct(target, args.length ? args : [current()], newTarget),
+          apply: () => new Real(current()).toString(),
+          get: (target, key) => (key === "now" ? current : Reflect.get(target, key)),
+        })
+      })()
+    </script>
   </head>
   <body>
     <div id="app"></div>

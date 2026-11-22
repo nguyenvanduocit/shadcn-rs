@@ -2,16 +2,17 @@
 //! send with it, and the model and effort the agent runs on.
 
 use gui::prelude::*;
-use gui::{Div, Icon, Modifiers, NamedKey, ScenarioError, Side, SideAlign, Signal, TextField, div, icon, text};
+use gui::{Div, Icon, Modifiers, NamedKey, ScenarioError, SideAlign, Signal, TextField, div, icon, text};
 use shadcn::{
-    AttachmentProps, AttachmentSize, AttachmentSlots, ButtonVariant, InputGroupAlign, InputGroupButtonSize, MenuState,
-    attachment, attachment_action, attachment_actions, attachment_content, attachment_media, attachment_title,
-    dropdown_menu_content, dropdown_menu_group, dropdown_menu_label, dropdown_menu_radio_group,
-    dropdown_menu_radio_item, dropdown_menu_separator, dropdown_menu_trigger, input_group, input_group_addon,
-    input_group_button, input_group_textarea, theme,
+    AttachmentProps, AttachmentSize, AttachmentSlots, ButtonVariant, InputGroupAlign, InputGroupButtonSize,
+    MenuRootProps, attachment, attachment_action, attachment_actions, attachment_content, attachment_media,
+    attachment_title, dropdown_menu, dropdown_menu_content, dropdown_menu_group, dropdown_menu_label,
+    dropdown_menu_radio_group, dropdown_menu_radio_item, dropdown_menu_separator, dropdown_menu_trigger, input_group,
+    input_group_addon, input_group_button, input_group_textarea, theme,
 };
 
 use crate::{Render, Shot, demo, page};
+use shadcn::part::Part;
 
 /// The models on offer, by provider: id and name.
 const PROVIDERS: [(&str, [(&str, &str); 2]); 2] = [
@@ -33,8 +34,6 @@ struct Composer {
     files: Signal<Vec<String>>,
     model: Signal<String>,
     effort: Signal<String>,
-    models: MenuState,
-    efforts: MenuState,
 }
 
 impl Composer {
@@ -44,8 +43,6 @@ impl Composer {
             files: Signal::new(Vec::new()),
             model: Signal::new("gpt-5".to_owned()),
             effort: Signal::new("medium".to_owned()),
-            models: MenuState::new(),
-            efforts: MenuState::new(),
         }
     }
 
@@ -58,67 +55,55 @@ impl Composer {
         self.files.set(Vec::new());
     }
 
-    fn model_menu(&self) -> Div {
-        let m = &self.models;
+    fn model_menu(&self) -> Part<MenuRootProps> {
         let model = self.model.get();
         let name = PROVIDERS
             .iter()
             .flat_map(|(_, ms)| ms.iter())
             .find(|(id, _)| *id == model)
             .map_or("GPT-5", |(_, n)| *n);
-        let content = dropdown_menu_content(m)
-            .w(48.0)
-            .child(dropdown_menu_radio_group().children(PROVIDERS.iter().enumerate().map(
-                |(i, (provider, models))| {
+        let content = dropdown_menu_content().align(SideAlign::Start).w(48.0).child(
+            dropdown_menu_radio_group()
+                .model(self.model)
+                .children(PROVIDERS.iter().enumerate().map(|(i, (provider, models))| {
                     div().when(i > 0, |d| d.child(dropdown_menu_separator())).child(
                         dropdown_menu_group()
                             .child(dropdown_menu_label(provider, false))
-                            .children(
-                                models
-                                    .iter()
-                                    .map(|(id, n)| dropdown_menu_radio_item(m, n, id, &self.model, false)),
-                            ),
+                            .children(models.iter().map(|(id, n)| dropdown_menu_radio_item(n, id, false))),
                     )
-                },
-            )));
-        dropdown_menu_trigger(
-            m,
-            input_group_button(ButtonVariant::Outline, InputGroupButtonSize::Sm)
-                .ml_auto()
-                .child(name)
-                .child(icon(Icon::ChevronDown)),
-            Side::Bottom,
-            SideAlign::Start,
-            content,
-        )
+                })),
+        );
+        dropdown_menu()
+            .ml_auto()
+            .child(dropdown_menu_trigger(
+                input_group_button(ButtonVariant::Outline, InputGroupButtonSize::Sm)
+                    .child(name)
+                    .child(icon(Icon::ChevronDown)),
+            ))
+            .child(content)
     }
 
-    fn effort_menu(&self) -> Div {
-        let m = &self.efforts;
+    fn effort_menu(&self) -> Part<MenuRootProps> {
         let effort = self.effort.get();
         let name = EFFORTS
             .iter()
             .find(|(id, _)| *id == effort)
             .map_or("Medium", |(_, n)| *n);
-        let content = dropdown_menu_content(m).w(36.0).child(
+        let content = dropdown_menu_content().align(SideAlign::Start).w(36.0).child(
             dropdown_menu_group().child(dropdown_menu_label("Effort", false)).child(
-                dropdown_menu_radio_group().children(
-                    EFFORTS
-                        .iter()
-                        .map(|(id, n)| dropdown_menu_radio_item(m, n, id, &self.effort, false)),
-                ),
+                dropdown_menu_radio_group()
+                    .model(self.effort)
+                    .children(EFFORTS.iter().map(|(id, n)| dropdown_menu_radio_item(n, id, false))),
             ),
         );
-        dropdown_menu_trigger(
-            m,
-            input_group_button(ButtonVariant::Outline, InputGroupButtonSize::Sm)
-                .child(text("Effort").text_color(theme().muted_foreground))
-                .child(name)
-                .child(icon(Icon::ChevronDown)),
-            Side::Bottom,
-            SideAlign::Start,
-            content,
-        )
+        dropdown_menu()
+            .child(dropdown_menu_trigger(
+                input_group_button(ButtonVariant::Outline, InputGroupButtonSize::Sm)
+                    .child(text("Effort").text_color(theme().muted_foreground))
+                    .child(name)
+                    .child(icon(Icon::ChevronDown)),
+            ))
+            .child(content)
     }
 
     /// The files picked, above the textarea; `None` while there are none.
@@ -133,18 +118,17 @@ impl Composer {
         };
         let row = input_group_addon(InputGroupAlign::BlockStart).flex_wrap();
         Some(files.into_iter().enumerate().fold(row, |row, (i, name)| {
-            let files = self.files.clone();
+            let files = self.files;
             row.child(
                 attachment(p, AttachmentSlots::default())
                     .child(attachment_media(p, shadcn::AttachmentMediaVariant::Icon).child(icon(Icon::FileText)))
                     .child(attachment_content(p).child(attachment_title(name)))
                     .child(
                         attachment_actions(p).child(attachment_action(Icon::X).on_click(move |_| {
-                            files.update(|mut f| {
+                            files.update(|f| {
                                 if i < f.len() {
                                     f.remove(i);
                                 }
-                                f
                             });
                         })),
                     ),

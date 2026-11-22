@@ -75,32 +75,11 @@ impl TextEdit {
         self.anchor = self.caret;
     }
 
-    fn prev_boundary(&self, at: usize) -> usize {
-        self.text
-            .get(..at)
-            .and_then(|s| s.char_indices().next_back())
-            .map_or(0, |(i, _)| i)
-    }
-
-    fn next_boundary(&self, at: usize) -> usize {
-        self.text
-            .get(at..)
-            .and_then(|s| s.chars().next())
-            .map_or(at, |c| at.saturating_add(c.len_utf8()))
-    }
-
-    /// Delete the selection, or the character before the caret.
-    pub fn backspace(&mut self) {
+    /// Delete the selection, or from the caret to `at` (where Backspace or
+    /// Delete reaches, by the text's graphemes or words).
+    pub fn delete_to(&mut self, at: usize) {
         if !self.has_selection() {
-            self.anchor = self.prev_boundary(self.caret);
-        }
-        self.delete_selection();
-    }
-
-    /// Delete the selection, or the character after the caret.
-    pub fn delete(&mut self) {
-        if !self.has_selection() {
-            self.anchor = self.next_boundary(self.caret);
+            self.place(at, true);
         }
         self.delete_selection();
     }
@@ -110,44 +89,6 @@ impl TextEdit {
         if !extend {
             self.anchor = at;
         }
-    }
-
-    pub fn left(&mut self, extend: bool) {
-        let at = if self.has_selection() && !extend {
-            self.selection().0
-        } else {
-            self.prev_boundary(self.caret)
-        };
-        self.move_to(at, extend);
-    }
-
-    pub fn right(&mut self, extend: bool) {
-        let at = if self.has_selection() && !extend {
-            self.selection().1
-        } else {
-            self.next_boundary(self.caret)
-        };
-        self.move_to(at, extend);
-    }
-
-    /// To the start of the caret's line.
-    pub fn home(&mut self, extend: bool) {
-        let at = self
-            .text
-            .get(..self.caret)
-            .and_then(|s| s.rfind('\n'))
-            .map_or(0, |i| i.saturating_add(1));
-        self.move_to(at, extend);
-    }
-
-    /// To the end of the caret's line.
-    pub fn end(&mut self, extend: bool) {
-        let at = self
-            .text
-            .get(self.caret..)
-            .and_then(|s| s.find('\n'))
-            .map_or(self.text.len(), |i| self.caret.saturating_add(i));
-        self.move_to(at, extend);
     }
 
     pub fn select_all(&mut self) {
@@ -248,7 +189,7 @@ impl TextEdit {
 }
 
 /// The state behind one text input: its edit and its focus.
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct TextField {
     pub edit: Signal<TextEdit>,
     pub focus: FocusHandle,
@@ -280,12 +221,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn typing_replaces_the_selection_and_backspace_respects_char_boundaries() {
+    fn typing_replaces_the_selection_and_deleting_keeps_char_boundaries() {
         let mut e = TextEdit::new("chào");
-        e.backspace();
+        // Backspace reaches the previous character's start (`TextSystem::step`).
+        e.delete_to(e.text.len() - 1);
         assert_eq!(e.text, "chà");
-        e.left(false);
-        e.left(true);
+        e.place(1, false);
+        e.place(2, true);
         assert_eq!(e.selected_text(), "h");
         e.insert("H");
         assert_eq!(e.text, "cHà");
@@ -304,15 +246,5 @@ mod tests {
         assert_eq!(m.selected_text(), "•");
         assert_eq!(e.unmasked(m.caret), e.caret);
         assert_eq!(e.unmasked(m.text.len()), e.text.len());
-    }
-
-    #[test]
-    fn home_and_end_stay_on_the_caret_line() {
-        let mut e = TextEdit::new("one\ntwo");
-        e.home(false);
-        assert_eq!(e.caret, 4);
-        e.place(1, false);
-        e.end(true);
-        assert_eq!(e.selected_text(), "ne");
     }
 }

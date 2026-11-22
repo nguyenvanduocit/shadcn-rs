@@ -3,8 +3,8 @@ use std::time::Duration;
 use gui::prelude::*;
 use gui::{ScenarioError, div};
 use shadcn::{
-    ButtonSize, ButtonVariant, DialogState, Toast, ToastKind, Toaster, button, dialog_content, dialog_description,
-    dialog_header, dialog_title, dialog_trigger, toaster,
+    ButtonSize, ButtonVariant, Toast, ToastKind, button, dialog, dialog_content, dialog_description, dialog_header,
+    dialog_title, dialog_trigger, toast, toaster,
 };
 
 use crate::{Render, Shot, demo, motion_frames, page};
@@ -17,41 +17,34 @@ fn event_created() -> Toast {
 }
 
 pub fn render() -> Render {
-    let toasts = Toaster::new();
-    let with_dialog = DialogState::new();
     Box::new(move || {
         let outline = |label: &str| button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned());
-        let on = |f: fn(&Toaster)| {
-            let toasts = toasts.clone();
-            move |_: &gui::ClickEvent| f(&toasts)
-        };
         let types = div()
             .flex()
             .flex_wrap()
             .gap(2.0)
-            .child(outline("Default").on_click(on(|t| {
-                t.toast("Event has been created");
-            })))
-            .child(outline("Success").on_click(on(|t| {
-                t.success("Event has been created");
-            })))
-            .child(outline("Info").on_click(on(|t| {
-                t.info("Be at the area 10 minutes before the event time");
-            })))
-            .child(outline("Warning").on_click(on(|t| {
-                t.warning("Event start time cannot be earlier than 8am");
-            })))
-            .child(outline("Error").on_click(on(|t| {
-                t.error("Event has not been created");
-            })))
-            .child(outline("Promise").on_click(on(|t| {
+            .child(outline("Default").on_click(|_| {
+                toast("Event has been created");
+            }))
+            .child(outline("Success").on_click(|_| {
+                toast::success("Event has been created");
+            }))
+            .child(outline("Info").on_click(|_| {
+                toast::info("Be at the area 10 minutes before the event time");
+            }))
+            .child(outline("Warning").on_click(|_| {
+                toast::warning("Event start time cannot be earlier than 8am");
+            }))
+            .child(outline("Error").on_click(|_| {
+                toast::error("Event has not been created");
+            }))
+            .child(outline("Promise").on_click(|_| {
                 // `toast.promise`: loading until the work settles, 2s later.
-                let id = t.loading("Loading...");
-                let t = t.clone();
+                let id = toast::loading("Loading...");
                 gui::clock::after(Duration::from_secs(2), move || {
-                    t.update(id, Toast::new(ToastKind::Success, "Event has been created"));
+                    toast::update(id, Toast::new(ToastKind::Success, "Event has been created"));
                 });
-            })));
+            }));
         page(
             "Sonner",
             div()
@@ -59,20 +52,19 @@ pub fn render() -> Render {
                 .gap(8.0)
                 .child(demo(
                     "SonnerDemo.vue",
-                    outline("Show Toast").on_click(on(|t| {
-                        t.show(event_created());
-                    })),
+                    outline("Show Toast").on_click(|_| {
+                        toast(event_created());
+                    }),
                 ))
                 .child(demo("SonnerTypesDemo.vue", types))
                 .child(demo(
                     "SonnerWithDialogDemo.vue",
                     // A press on a toast is no press outside the dialog: the
                     // toaster's layer is above it, so the dialog stays open.
-                    div()
-                        .flex()
-                        .child(dialog_trigger(&with_dialog, outline("Dialog with toast")))
-                        .child(dialog_content(&with_dialog, |c| {
-                            c.max_w(112.0)
+                    div().flex().child(
+                        dialog().child(dialog_trigger(outline("Dialog with toast"))).child(
+                            dialog_content()
+                                .max_w(112.0)
                                 .child(
                                     dialog_header()
                                         .child(dialog_title("Vue Sonner Toast"))
@@ -82,15 +74,16 @@ pub fn render() -> Render {
                                     div().grid().gap(4.0).child(
                                         button(ButtonVariant::Default, ButtonSize::Sm)
                                             .px(3.0)
-                                            .on_click(on(|t| {
-                                                t.show(event_created());
-                                            }))
+                                            .on_click(|_| {
+                                                toast(event_created());
+                                            })
                                             .child("Toast"),
                                     ),
-                                )
-                        })),
+                                ),
+                        ),
+                    ),
                 ))
-                .child(toaster(&toasts)),
+                .child(toaster()),
         )
     })
 }

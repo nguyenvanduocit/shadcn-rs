@@ -1,6 +1,6 @@
 # 0001. A paragraph holds inline runs, shaped as one
 
-Status: accepted, 2026-11-20.
+Status: accepted, 2026-11-20; its cosmic-text basis superseded by ADR-0019 (a paragraph is still shaped as one); the inherited text properties a span honours superseded by ADR-0022 (text reads the `ContentStyle` its container provides).
 
 ## Context
 

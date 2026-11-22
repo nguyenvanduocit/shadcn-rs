@@ -1,33 +1,53 @@
-//! The native window: winit for events, a renderer to show its frames (the
-//! GPU, or the CPU through softbuffer where no GPU answers). Positions
-//! handed on are logical pixels; the surface is physical.
+//! The native window on three threads (ADR-0015).
+//!
+//! - The **platform thread** (the main thread, as winit and AccessKit want)
+//!   runs the event loop, the accessibility adapter, the input method and
+//!   the cursor. It stamps each event with when it arrived and what was on
+//!   screen then ([`Presented`]), and forwards it: the wheel to the render
+//!   thread, everything else to the UI thread. It never runs component
+//!   code, layout or GPU work.
+//! - The **UI thread** owns the reactive runtime (thread-local, `!Send`),
+//!   the components, layout, paint recording, hit testing and the
+//!   accessibility tree. It runs a frame when the render thread grants one
+//!   and commits what changed.
+//! - The **render thread** ([`crate::compositor`]) owns the GPU, the
+//!   committed scene and the atlases, scrolls and moves what it can by
+//!   itself, and draws at the display's rate.
+//!
+//! Positions handed on are logical pixels; the surface is physical.
+//!
+//! Where the compositor leaves the window's decorations to the client
+//! (Wayland without server-side decorations), the window draws its own
+//! ([`decoration`]): the platform thread finds that out and carries out
+//! what they ask, the UI thread lays them out and hit-tests the edges.
 
-use std::num::NonZeroU32;
-use std::sync::Arc;
+pub mod decoration;
+
+pub use decoration::{Chrome, Edge, WindowAction};
+
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use softbuffer::{Context, Surface};
-use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
-use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::ModifiersState;
-use winit::window::{CursorIcon, Window, WindowAttributes, WindowId};
+use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
-use crate::convert::f64_to_f32;
-use crate::cpu::CpuRenderer;
-use crate::edit::Preedit;
+use crate::clock;
+use crate::compositor::input_log::{self, Recorder, Routed, Router};
+use crate::compositor::thread::{Feedback, FrameStat, FromRender, Pace, RenderThread, ToRender};
+use crate::compositor::{Commit, Compose, Compositor, MainFrame, Presented};
+use crate::convert::{f64_to_f32, u32_to_f32};
 use crate::events::{ImeEvent, KeyEvent, Modifiers};
 use crate::gpu::GpuRenderer;
+use crate::image::Pixels;
 use crate::interact::ImeTarget;
-use crate::interact::LINE_SCROLL;
-use crate::scene::{Held, Renderer, Scene};
+use crate::priority::{self, Applied, ThreadType};
+use crate::scene::{Drawn, Held, Scene};
 use crate::style::Cursor;
-use crate::text::TextSystem;
-
-/// How often an animating window repaints.
-const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+use crate::text::Glyphs;
 
 /// Input the window passes to its [`WindowHandler`], in logical pixels.
 #[derive(Clone, Debug, PartialEq)]
@@ -50,7 +70,9 @@ pub enum Input {
         x: f32,
         y: f32,
     },
-    /// Scroll by this many pixels (positive moves the content up / left).
+    /// Scroll by this many pixels (positive moves the content up / left)
+    /// on the UI thread: the devtools' wheel. The platform's wheel scrolls
+    /// on the render thread ([`crate::compositor`]).
     Wheel {
         dx: f32,
         dy: f32,
@@ -63,168 +85,472 @@ pub enum Input {
     Modifiers(Modifiers),
 }
 
-/// When the window should wake next.
+/// When the UI should run its next frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Wake {
     pub redraw: bool,
-    /// Paint again soon even without input (an animation is running).
+    /// Run the next frame too: something the UI lays out moves.
     pub animating: bool,
     pub next_timer: Option<Instant>,
 }
 
-/// What runs inside the window.
+/// What runs on the UI thread.
 pub trait WindowHandler {
-    /// Paint one frame `size` physical pixels with `renderer` and end its
-    /// frame; `scale` is physical pixels per logical pixel.
-    fn draw(&mut self, renderer: &mut dyn Renderer, size: (u32, u32), scale: f32);
-    /// React to `input`; return `true` when the window must be redrawn.
-    fn input(&mut self, input: Input) -> bool;
+    /// Run the frame `begin` grants, `size` physical pixels at `scale`
+    /// (physical pixels per logical pixel), and commit it to `target`.
+    fn frame(&mut self, target: &mut dyn Compose, begin: MainFrame, size: (u32, u32), scale: f32);
+    /// React to `input`, which arrived while `presented` was on screen;
+    /// return `true` when a frame must follow.
+    fn input(&mut self, input: Input, presented: &Presented) -> bool;
     /// The cursor to show where the pointer is.
     fn cursor(&self) -> Cursor;
     /// Where an input method may type, after the last frame; `None` turns
     /// the input method off.
     fn ime_target(&mut self) -> Option<ImeTarget>;
-    /// What a screen reader is told about the last frame, at `scale`.
-    fn access_tree(&self, scale: f32, title: &str) -> accesskit::TreeUpdate;
-    /// Called when the event queue is empty: run due work and say when to wake.
-    fn idle(&mut self) -> Wake;
+    /// What a screen reader must be told of the last frame, at `scale`:
+    /// what changed since the last update, the whole tree after a reset.
+    fn access_update(&mut self, scale: f32, title: &str) -> accesskit::TreeUpdate;
+    /// The screen reader connected again or went away: the next update is
+    /// the whole tree.
+    fn access_reset(&mut self);
+    /// Run due work and say when to run the next frame. `target` is where
+    /// frames go (the devtools read frames back through it).
+    fn idle(&mut self, target: &mut dyn Compose) -> Wake;
+    /// The window took focus again: settings the user may have changed
+    /// meanwhile (text smoothing) are read again. Whether to redraw.
+    fn focused(&mut self) -> bool;
+    /// The render thread was rebuilt and holds nothing (ADR-0015's
+    /// invariant 7): the next frame must commit everything.
+    fn renderer_lost(&mut self);
+    /// The window's decorations changed: whether it draws its own, and the
+    /// state they show ([`decoration::decorate`] lays them out). Whether to redraw.
+    fn chrome(&mut self, chrome: Chrome) -> bool;
+    /// What the window's own decorations asked of the platform since the
+    /// last call (a move, a resize, maximize, close), oldest first.
+    fn window_actions(&mut self) -> Vec<WindowAction>;
+}
+
+/// What the UI thread is told.
+pub(crate) enum ToUi {
+    /// An event, when it arrived and what was on screen then.
+    Input(Input, Instant, Arc<Presented>),
+    Render(FromRender),
+    Access(AccessEvent),
+    Focused,
+    /// The window is this many physical pixels at this scale.
+    Resized((u32, u32), f32),
+    /// The window's decorations changed.
+    Chrome(Chrome),
+    /// A mailbox has mail.
+    Mail,
+    Quit,
+}
+
+/// What the accessibility adapter asked.
+pub(crate) enum AccessEvent {
+    Initial,
+    Action(accesskit::ActionRequest),
+    Deactivated,
+}
+
+/// What the UI thread tells the platform thread.
+#[derive(Debug)]
+pub(crate) enum ToPlatform {
+    Cursor(CursorIcon),
+    /// The window's own decorations ask the platform to move, resize,
+    /// maximize or close the window.
+    Window(WindowAction),
+    /// The render thread could not go on: close, saying why.
+    Quit(String),
+    Ime(Option<ImeTarget>),
+    Access(Box<accesskit::TreeUpdate>),
+}
+
+/// What reaches the event loop from elsewhere: the accessibility adapter,
+/// or the UI thread.
+#[derive(Debug)]
+pub(crate) enum UserEvent {
+    Access(accesskit_winit::Event),
+    Ui(ToPlatform),
+}
+
+impl From<accesskit_winit::Event> for UserEvent {
+    fn from(event: accesskit_winit::Event) -> Self {
+        Self::Access(event)
+    }
+}
+
+/// The UI thread's way to the render thread: each commit is sent behind
+/// its `Arc`s, never waited for.
+pub(crate) struct RenderLink {
+    tx: Sender<ToRender>,
+    feedback: Feedback,
+    presented: Arc<Mutex<Arc<Presented>>>,
+}
+
+impl Compose for RenderLink {
+    fn commit(&mut self, commit: Commit, overlay: Option<Scene>) {
+        self.tx.send(ToRender::Commit(Box::new(commit), overlay)).ok();
+    }
+
+    fn overlay(&mut self, overlay: Option<Scene>) {
+        self.tx.send(ToRender::Overlay(overlay)).ok();
+    }
+
+    fn held(&self) -> Held {
+        self.feedback.held
+    }
+
+    fn drawn(&self) -> Drawn {
+        self.feedback.drawn
+    }
+
+    fn capture(&mut self, overlay: Option<Scene>) -> Option<Pixels> {
+        // The devtools' screenshot: the one time the UI waits for the render thread.
+        let (tx, rx) = mpsc::channel();
+        self.tx.send(ToRender::Capture(overlay, tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+    }
+
+    fn presented(&self) -> Arc<Presented> {
+        Arc::clone(&self.presented.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn begin(&mut self, at: f32) -> MainFrame {
+        MainFrame::at(at)
+    }
+}
+
+/// Pointer moves while a button is held, resampled at each frame (ADR-0015,
+/// Android's `InputConsumer` and Chromium's `linear_resampling`): the drag
+/// sees one move a frame, where the pointer was 5 ms before the frame is
+/// presented, interpolated between the samples around that time or
+/// extrapolated at most `min(8 ms, half the last gap)`; samples closer than
+/// 2 ms are not extrapolated from. Clicks and keys are never resampled.
+#[derive(Clone, Debug, Default)]
+pub struct PointerResampler {
+    /// (seconds on the frame clock, x, y), oldest first.
+    samples: Vec<(f32, f32, f32)>,
+    /// A sample came since the last frame took one.
+    fresh: bool,
+}
+
+/// How far before the present time a drag is sampled, seconds.
+const RESAMPLE_LATENCY: f32 = 0.005;
+const RESAMPLE_MAX_PREDICTION: f32 = 0.008;
+const RESAMPLE_MIN_DELTA: f32 = 0.002;
+
+impl PointerResampler {
+    /// The pointer was at `(x, y)` at `at` seconds.
+    pub fn push(&mut self, at: f32, x: f32, y: f32) {
+        self.samples.push((at, x, y));
+        self.fresh = true;
+        if self.samples.len() > 16 {
+            self.samples.remove(0);
+        }
+    }
+
+    /// Whether a move waits for a frame.
+    #[must_use]
+    pub fn holds(&self) -> bool {
+        self.fresh
+    }
+
+    /// Where the pointer is for a frame presented at `present_at`, when it
+    /// moved since the last frame; the samples before the one used are dropped.
+    pub fn sample(&mut self, present_at: f32) -> Option<(f32, f32)> {
+        if !std::mem::take(&mut self.fresh) {
+            return None;
+        }
+        let t = present_at - RESAMPLE_LATENCY;
+        let &(t1, x1, y1) = self.samples.last()?;
+        let at = if t <= t1 {
+            match self
+                .samples
+                .windows(2)
+                .find(|w| matches!(w, [a, b] if a.0 <= t && t <= b.0))
+            {
+                Some([(ta, xa, ya), (tb, xb, yb)]) => {
+                    let k = if tb > ta { (t - ta) / (tb - ta) } else { 1.0 };
+                    (xa + (xb - xa) * k, ya + (yb - ya) * k)
+                }
+                // Earlier than every sample: the earliest.
+                _ => self.samples.first().map_or((x1, y1), |&(_, x, y)| (x, y)),
+            }
+        } else {
+            match self.samples.len().checked_sub(2).and_then(|i| self.samples.get(i)) {
+                Some(&(t0, x0, y0)) if t1 - t0 >= RESAMPLE_MIN_DELTA => {
+                    let gap = t1 - t0;
+                    let ahead = (t - t1).min(RESAMPLE_MAX_PREDICTION).min(gap / 2.0);
+                    (x1 + (x1 - x0) / gap * ahead, y1 + (y1 - y0) / gap * ahead)
+                }
+                _ => (x1, y1),
+            }
+        };
+        // Keep the two last samples to interpolate and extrapolate from.
+        let keep = self.samples.len().saturating_sub(2);
+        self.samples.drain(..keep);
+        Some(at)
+    }
+
+    /// The last raw position, and forget the samples (the button went up).
+    pub fn flush(&mut self) -> Option<(f32, f32)> {
+        let last = self.samples.last().filter(|_| self.fresh).map(|&(_, x, y)| (x, y));
+        self.samples.clear();
+        self.fresh = false;
+        last
+    }
+}
+
+/// The UI thread's loop: run frames when granted, input as it arrives,
+/// timers and mail when due, and say what the platform must show.
+pub(crate) fn ui_loop(
+    handler: &mut dyn WindowHandler,
+    rx: &Receiver<ToUi>,
+    link: &mut RenderLink,
+    platform: &dyn Fn(ToPlatform),
+    title: &str,
+) {
+    let mut size = (0_u32, 0_u32);
+    let mut scale = 1.0_f32;
+    let mut wants = false;
+    let mut asked = false;
+    let mut access = false;
+    let mut pressed = false;
+    let mut resampler = PointerResampler::default();
+    let mut shown: Arc<Presented> = link.presented();
+    let mut cursor = None;
+    let mut chrome = Chrome::default();
+    // The resize edge under the pointer, which shows its own cursor.
+    let mut edge = None;
+    // Hand on what the decorations asked, and show the cursor: the edge's,
+    // or what the app shows there.
+    let follow = |handler: &mut dyn WindowHandler, edge: Option<Edge>, cursor: &mut Option<CursorIcon>| {
+        for action in handler.window_actions() {
+            platform(ToPlatform::Window(action));
+        }
+        let c = edge.map_or_else(|| cursor_icon(handler.cursor()), Edge::cursor);
+        if *cursor != Some(c) {
+            *cursor = Some(c);
+            platform(ToPlatform::Cursor(c));
+        }
+    };
+    loop {
+        let wake = handler.idle(link);
+        wants |= wake.redraw || wake.animating;
+        if wants && !asked && size.0 > 0 && size.1 > 0 {
+            link.tx.send(ToRender::NeedsFrame).ok();
+            asked = true;
+        }
+        let msg = match wake.next_timer {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(m) => Some(m),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match rx.recv() {
+                Ok(m) => Some(m),
+                Err(_) => return,
+            },
+        };
+        let Some(msg) = msg else { continue };
+        match msg {
+            ToUi::Input(input, at, presented) => {
+                shown = presented;
+                let logical = (u32_to_f32(size.0) / scale, u32_to_f32(size.1) / scale);
+                match input {
+                    Input::PointerMoved { x, y } if pressed => {
+                        // A drag: one move a frame, resampled.
+                        resampler.push(clock::seconds(at), x, y);
+                        wants = true;
+                        continue;
+                    }
+                    Input::PointerMoved { x, y } => edge = decoration::edge_at(&chrome, logical, x, y),
+                    Input::PointerLeft => edge = None,
+                    Input::MouseDown { x, y } => {
+                        // An edge of a window that draws its own frame resizes
+                        // it, before anything in the app sees the press.
+                        if let Some(e) = decoration::edge_at(&chrome, logical, x, y) {
+                            platform(ToPlatform::Window(WindowAction::Resize(e)));
+                            continue;
+                        }
+                        pressed = true;
+                    }
+                    Input::MouseUp { .. } => {
+                        pressed = false;
+                        if let Some((x, y)) = resampler.flush() {
+                            handler.input(Input::PointerMoved { x, y }, &shown);
+                        }
+                    }
+                    _ => {}
+                }
+                wants |= handler.input(input, &shown);
+                follow(handler, edge, &mut cursor);
+            }
+            ToUi::Render(FromRender::Begin(token)) => {
+                asked = false;
+                wants = false;
+                if let Some((x, y)) = resampler.sample(token.present_at) {
+                    handler.input(Input::PointerMoved { x, y }, &shown);
+                }
+                handler.frame(link, token, size, scale);
+                platform(ToPlatform::Ime(handler.ime_target()));
+                follow(handler, edge, &mut cursor);
+                if access {
+                    platform(ToPlatform::Access(Box::new(handler.access_update(scale, title))));
+                }
+            }
+            ToUi::Render(FromRender::Drawn(f)) => link.feedback = *f,
+            ToUi::Render(FromRender::Lost) => {
+                handler.renderer_lost();
+                wants = true;
+            }
+            ToUi::Render(FromRender::Failed(why)) => {
+                platform(ToPlatform::Quit(why));
+                return;
+            }
+            ToUi::Access(AccessEvent::Initial) => {
+                access = true;
+                handler.access_reset();
+                platform(ToPlatform::Access(Box::new(handler.access_update(scale, title))));
+            }
+            ToUi::Access(AccessEvent::Action(request)) => {
+                wants |= handler.input(Input::Act(request), &shown);
+                follow(handler, edge, &mut cursor);
+            }
+            ToUi::Access(AccessEvent::Deactivated) => {
+                access = false;
+                handler.access_reset();
+            }
+            ToUi::Focused => wants |= handler.focused(),
+            ToUi::Resized(s, k) => {
+                size = s;
+                scale = k;
+                wants = true;
+            }
+            ToUi::Chrome(c) => {
+                wants |= handler.chrome(c.clone());
+                chrome = c;
+            }
+            ToUi::Mail => {}
+            ToUi::Quit => return,
+        }
+    }
+}
+
+/// The threads of an app, and what links them.
+struct Threads {
+    to_ui: Sender<ToUi>,
+    to_render: Sender<ToRender>,
+    presented: Arc<Mutex<Arc<Presented>>>,
+    /// How the OS schedules each thread, as each set it when it started.
+    priorities: Arc<Mutex<Vec<(&'static str, Applied)>>>,
+}
+
+/// Start the render and UI threads: the render thread draws with `gpu`
+/// paced by `pace`; the UI thread runs `start`'s handler. `platform` takes
+/// what the UI thread tells the platform.
+fn spawn(
+    gpu: GpuRenderer,
+    pace: Pace,
+    interval: Duration,
+    title: String,
+    start: Box<dyn FnOnce() -> Box<dyn WindowHandler> + Send>,
+    platform: Box<dyn Fn(ToPlatform) + Send>,
+    log: Option<Arc<Mutex<Vec<FrameStat>>>>,
+) -> std::io::Result<Threads> {
+    let (to_ui, ui_rx) = mpsc::channel::<ToUi>();
+    let (to_render, render_rx) = mpsc::channel::<ToRender>();
+    let presented = Arc::new(Mutex::new(Arc::new(Presented::default())));
+    let priorities = Arc::new(Mutex::new(Vec::new()));
+    let ui = to_ui.clone();
+    let render = RenderThread::new(
+        Compositor::new(Glyphs::for_os()),
+        gpu,
+        render_rx,
+        Box::new(move |m| {
+            ui.send(ToUi::Render(m)).ok();
+        }),
+        Arc::clone(&presented),
+        interval,
+        pace,
+        log,
+    );
+    let noted = Arc::clone(&priorities);
+    std::thread::Builder::new()
+        .name("gui render".to_owned())
+        .spawn(move || {
+            note(&noted, "render", priority::set_current(ThreadType::Render));
+            render.run();
+        })?;
+    let mut link = RenderLink {
+        tx: to_render.clone(),
+        feedback: Feedback::default(),
+        presented: Arc::clone(&presented),
+    };
+    let mail = to_ui.clone();
+    let render_quit = to_render.clone();
+    let noted = Arc::clone(&priorities);
+    std::thread::Builder::new()
+        .name("gui ui".to_owned())
+        .stack_size(crate::layout::STACK)
+        .spawn(move || {
+            note(&noted, "ui", priority::set_current(ThreadType::Ui));
+            crate::mailbox::wake_with(Arc::new(move || {
+                mail.send(ToUi::Mail).ok();
+            }));
+            let mut handler = start();
+            ui_loop(handler.as_mut(), &ui_rx, &mut link, platform.as_ref(), &title);
+            render_quit.send(ToRender::Quit).ok();
+        })?;
+    Ok(Threads {
+        to_ui,
+        to_render,
+        presented,
+        priorities,
+    })
+}
+
+/// Keep what thread `name` was given, for reports.
+fn note(to: &Mutex<Vec<(&'static str, Applied)>>, name: &'static str, applied: Applied) {
+    to.lock().unwrap_or_else(PoisonError::into_inner).push((name, applied));
 }
 
 struct WindowState {
     window: Arc<Window>,
     /// Tells the platform's accessibility API what the window shows.
     access: accesskit_winit::Adapter,
-    renderer: WindowRenderer,
+    threads: Threads,
 }
 
-/// How the window shows its frames: the GPU, unless none answers (or
-/// `GUI_RENDERER=cpu` asks for the CPU).
-enum WindowRenderer {
-    Gpu(Box<GpuRenderer>),
-    Soft(Box<SoftRenderer>),
-}
-
-impl WindowRenderer {
-    fn new(window: &Arc<Window>) -> Result<Self, String> {
-        let cpu = std::env::var("GUI_RENDERER").is_ok_and(|v| v == "cpu");
-        if !cpu {
-            match GpuRenderer::for_window(Arc::clone(window)) {
-                Ok(gpu) => return Ok(Self::Gpu(Box::new(gpu))),
-                Err(e) => eprintln!("GPU renderer unavailable ({e}); painting on the CPU"),
-            }
-        }
-        SoftRenderer::new(window).map(|s| Self::Soft(Box::new(s)))
-    }
-
-    /// Make the surface `size`; false when nothing can be drawn at it.
-    fn resize(&mut self, size: (u32, u32)) -> bool {
-        match self {
-            Self::Gpu(g) => {
-                if size.0 == 0 || size.1 == 0 {
-                    return false;
-                }
-                g.resize(size);
-                true
-            }
-            Self::Soft(s) => s.resize(size),
-        }
-    }
-
-    fn renderer(&mut self) -> &mut dyn Renderer {
-        match self {
-            Self::Gpu(g) => g.as_mut(),
-            Self::Soft(s) => s.as_mut(),
-        }
-    }
-}
-
-/// The CPU renderer shown through softbuffer.
-struct SoftRenderer {
-    #[expect(
-        dead_code,
-        reason = "held as a keep-alive: the surface is valid only while its context lives"
-    )]
-    context: Context<Arc<Window>>,
-    surface: Surface<Arc<Window>, Arc<Window>>,
-    cpu: CpuRenderer,
-    pixmap: Option<Pixmap>,
-}
-
-impl SoftRenderer {
-    fn new(window: &Arc<Window>) -> Result<Self, String> {
-        let context = Context::new(Arc::clone(window)).map_err(|e| format!("softbuffer context: {e}"))?;
-        let surface = Surface::new(&context, Arc::clone(window)).map_err(|e| format!("softbuffer surface: {e}"))?;
-        Ok(Self {
-            context,
-            surface,
-            cpu: CpuRenderer::default(),
-            pixmap: None,
-        })
-    }
-
-    /// Make the surface and the pixmap `size`; false when it cannot be.
-    fn resize(&mut self, size: (u32, u32)) -> bool {
-        let (Some(w), Some(h)) = (NonZeroU32::new(size.0), NonZeroU32::new(size.1)) else {
-            return false;
-        };
-        if let Err(e) = self.surface.resize(w, h) {
-            eprintln!("surface resize: {e}");
-            return false;
-        }
-        if !self.pixmap.as_ref().is_some_and(|p| (p.width(), p.height()) == size) {
-            self.pixmap = Pixmap::new(size.0, size.1);
-        }
-        self.pixmap.is_some()
-    }
-}
-
-impl Renderer for SoftRenderer {
-    fn render(&mut self, scene: &Scene, text: &mut TextSystem) {
-        if let Some(pixmap) = self.pixmap.as_mut() {
-            self.cpu.render(scene, text, pixmap);
-        }
-    }
-
-    fn end_frame(&mut self) {
-        self.cpu.end_frame();
-        let Some(pixmap) = self.pixmap.as_ref() else { return };
-        match self.surface.buffer_mut() {
-            Ok(mut buf) => {
-                for (dst, src) in buf.iter_mut().zip(pixmap.pixels()) {
-                    *dst = u32::from_be_bytes([0, src.red(), src.green(), src.blue()]);
-                }
-                if let Err(e) = buf.present() {
-                    eprintln!("present: {e}");
-                }
-            }
-            Err(e) => eprintln!("buffer_mut: {e}"),
-        }
-    }
-
-    fn held(&self) -> Held {
-        self.cpu.held()
-    }
-
-    fn capture(&mut self, scene: &Scene, text: &mut TextSystem) -> Option<Pixmap> {
-        self.cpu.capture(scene, text)
-    }
-}
-
-struct Handler<H: WindowHandler> {
-    app: H,
+/// The platform thread's side of the window.
+struct Platform {
     title: String,
+    start: Option<Box<dyn FnOnce() -> Box<dyn WindowHandler> + Send>>,
     state: Option<WindowState>,
-    /// Last pointer position, in logical pixels.
-    cursor: (f32, f32),
-    modifiers: Modifiers,
+    /// The pointer and the modifiers, which input is routed with.
+    router: Router,
+    /// Logs the input as it comes (`GUI_RECORD_INPUT`).
+    recorder: Option<Recorder>,
     /// Where the input method was last told it may type.
     ime: Option<ImeTarget>,
-    /// Carries the accessibility adapter's requests into the event loop.
     proxy: EventLoopProxy<UserEvent>,
+    /// What the adapter last said: whether a screen reader listens.
+    listening: bool,
+    /// The render thread gave up: the app exits with an error.
+    failed: bool,
+    /// The window's decorations as the UI thread was last told.
+    chrome: Chrome,
+    /// `GUI_DECORATIONS` chose who draws them.
+    forced: Option<bool>,
+    focused: bool,
 }
 
-/// Open a window titled `title` and run `handler` until it closes.
-pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
+/// Open a window titled `title` and run the handler `start` makes, on the
+/// UI thread, until the window closes. `start` runs there, so everything
+/// the app's state holds (signals, components) is made on the thread that
+/// owns it.
+pub fn run(title: &str, start: impl FnOnce() -> Box<dyn WindowHandler> + Send + 'static) -> ! {
     let event_loop = match EventLoop::<UserEvent>::with_user_event().build() {
         Ok(el) => el,
         Err(e) => {
@@ -232,25 +558,53 @@ pub fn run(title: &str, handler: impl WindowHandler + 'static) -> ! {
             std::process::exit(1);
         }
     };
-    let mut handler = Handler {
-        app: handler,
+    let mut platform = Platform {
         title: title.to_owned(),
+        start: Some(Box::new(start)),
         state: None,
-        cursor: (0.0, 0.0),
-        modifiers: Modifiers::default(),
+        router: Router::default(),
+        recorder: None,
         ime: None,
         proxy: event_loop.create_proxy(),
+        listening: false,
+        failed: false,
+        chrome: Chrome::default(),
+        forced: forced_decorations(),
+        focused: true,
     };
-    let mail = event_loop.create_proxy();
-    crate::mailbox::wake_with(std::sync::Arc::new(move || {
-        // A closed loop has no window left to wake.
-        mail.send_event(UserEvent::Mail).ok();
-    }));
-    if let Err(e) = event_loop.run_app(&mut handler) {
+    event_loop.set_control_flow(ControlFlow::Wait);
+    // The platform thread stamps input and feeds the render thread
+    // (Chromium's browser UI thread). On macOS the main thread is already
+    // user-interactive.
+    let applied = priority::set_current(ThreadType::Platform);
+    if applied.degraded {
+        eprintln!("platform thread: {applied}");
+    }
+    if let Err(e) = event_loop.run_app(&mut platform) {
         eprintln!("event loop error: {e}");
         std::process::exit(1);
     }
-    std::process::exit(0)
+    std::process::exit(i32::from(platform.failed))
+}
+
+/// Who draws the decorations as `GUI_DECORATIONS` asks: `client` has the
+/// window draw its own on any platform (to see them off Wayland; where the
+/// platform cannot resize from an edge, the edge does nothing), `server`
+/// never. Unset, the window draws them where the compositor leaves them to it.
+fn forced_decorations() -> Option<bool> {
+    match std::env::var("GUI_DECORATIONS").ok()?.as_str() {
+        "client" => Some(true),
+        "server" => Some(false),
+        _ => None,
+    }
+}
+
+/// Whether the compositor left the decorations to the client: on Wayland,
+/// winit asks for server-side decorations (xdg-decoration) and, refused or
+/// without the protocol, puts a frame of its own around the surface, which
+/// makes the outer size larger than the inner.
+fn compositor_left_decorations(window: &Window) -> bool {
+    is_wayland(window) && window.is_decorated() && window.outer_size() != window.inner_size()
 }
 
 fn cursor_icon(c: Cursor) -> CursorIcon {
@@ -265,38 +619,207 @@ fn cursor_icon(c: Cursor) -> CursorIcon {
     }
 }
 
-impl<H: WindowHandler> Handler<H> {
-    fn send(&mut self, input: Input) {
-        let redraw = self.app.input(input);
-        if let Some(state) = self.state.as_ref() {
-            state.window.set_cursor(cursor_icon(self.app.cursor()));
-            if redraw {
-                state.window.request_redraw();
+/// Whether `window` is a Wayland surface (frame callbacks pace it).
+fn is_wayland(window: &Window) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    window
+        .window_handle()
+        .is_ok_and(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)))
+}
+
+/// The display interval of the monitor `window` is on (60 Hz when unknown).
+fn interval_of(window: &Window) -> Duration {
+    let mhz = window
+        .current_monitor()
+        .and_then(|m| m.refresh_rate_millihertz())
+        .unwrap_or(60_000);
+    clock::Vsync::from_millihertz(mhz).interval()
+}
+
+/// The input log `GUI_RECORD_INPUT` names, started for `window` (ADR-0015:
+/// a log of the platform's own events, replayed by the compositor's tests).
+fn record_input(window: &Window) -> Option<Recorder> {
+    let path = std::env::var_os("GUI_RECORD_INPUT")?;
+    let platform = if cfg!(target_os = "macos") {
+        input_log::Platform::MacOs
+    } else if cfg!(windows) {
+        input_log::Platform::Windows
+    } else if is_wayland(window) {
+        input_log::Platform::Wayland
+    } else if cfg!(unix) {
+        input_log::Platform::X11
+    } else {
+        input_log::Platform::Other
+    };
+    let scale = f64_to_f32(window.scale_factor());
+    let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let header = input_log::Header {
+        platform,
+        size: (
+            u32::try_from(crate::convert::f64_to_u64(size.width.round())).unwrap_or(u32::MAX),
+            u32::try_from(crate::convert::f64_to_u64(size.height.round())).unwrap_or(u32::MAX),
+        ),
+        scale,
+        source: format!("recorded with GUI_RECORD_INPUT, gui {}", env!("CARGO_PKG_VERSION")),
+    };
+    match Recorder::start(std::path::Path::new(&path), &header) {
+        Ok(r) => {
+            eprintln!("recording input to {}", std::path::Path::new(&path).display());
+            Some(r)
+        }
+        Err(e) => {
+            eprintln!(
+                "GUI_RECORD_INPUT: cannot write {}: {e}",
+                std::path::Path::new(&path).display()
+            );
+            None
+        }
+    }
+}
+
+impl Platform {
+    /// Log `event` if recording, and send what it becomes on: the wheel to
+    /// the render thread, the rest to the UI thread, stamped now.
+    fn forward(&mut self, event: input_log::Event) {
+        let at = Instant::now();
+        if let Some(r) = &self.recorder {
+            r.record(at, &event);
+        }
+        match self.router.route(event) {
+            Routed::Ui(input) => self.send(input),
+            Routed::Wheel {
+                point,
+                delta,
+                precise,
+                ended,
+            } => {
+                if let Some(s) = &self.state {
+                    s.threads
+                        .to_render
+                        .send(ToRender::Wheel {
+                            point,
+                            delta,
+                            at,
+                            precise,
+                            ended,
+                        })
+                        .ok();
+                }
             }
+        }
+    }
+
+    /// Forward `input` to the UI thread, stamped.
+    fn send(&self, input: Input) {
+        if let Some(s) = &self.state {
+            let shown = Arc::clone(&s.threads.presented.lock().unwrap_or_else(PoisonError::into_inner));
+            s.threads.to_ui.send(ToUi::Input(input, Instant::now(), shown)).ok();
         }
     }
 
     fn scale(&self) -> f32 {
         self.state.as_ref().map_or(1.0, |s| f64_to_f32(s.window.scale_factor()))
     }
-}
 
-/// What reaches the event loop from elsewhere: the accessibility adapter,
-/// or a mailbox that something was sent to.
-#[derive(Debug)]
-pub(crate) enum UserEvent {
-    Access(accesskit_winit::Event),
-    Mail,
-}
+    /// Tell the UI thread what the decorations show, when that changed.
+    fn follow_chrome(&mut self) {
+        let Some(s) = &self.state else { return };
+        let w = &s.window;
+        // With its own frame hidden, winit reports the window decorated
+        // again only once the compositor draws the decorations after all.
+        let client = self.chrome.client && (self.forced.is_some() || !w.is_decorated());
+        let chrome = Chrome {
+            client,
+            title: self.title.clone(),
+            maximized: w.is_maximized(),
+            fullscreen: w.fullscreen().is_some(),
+            active: self.focused,
+            dark: w.theme() == Some(Theme::Dark),
+            resizable: w.is_resizable(),
+        };
+        if chrome != self.chrome {
+            s.threads.to_ui.send(ToUi::Chrome(chrome.clone())).ok();
+            self.chrome = chrome;
+        }
+    }
 
-impl From<accesskit_winit::Event> for UserEvent {
-    fn from(event: accesskit_winit::Event) -> Self {
-        Self::Access(event)
+    /// Do what the window's own decorations asked.
+    fn act(&self, event_loop: &ActiveEventLoop, action: WindowAction) {
+        let Some(s) = &self.state else { return };
+        let w = &s.window;
+        let done = match action {
+            WindowAction::Move => w.drag_window(),
+            WindowAction::Resize(edge) => w.drag_resize_window(edge.direction()),
+            WindowAction::Minimize => {
+                w.set_minimized(true);
+                Ok(())
+            }
+            WindowAction::ToggleMaximize => {
+                w.set_maximized(!w.is_maximized());
+                Ok(())
+            }
+            WindowAction::Close => {
+                self.close(event_loop);
+                Ok(())
+            }
+            WindowAction::Menu { x, y } => {
+                w.show_window_menu(LogicalPosition::new(x, y));
+                Ok(())
+            }
+        };
+        if let Err(e) = done {
+            eprintln!("window {action:?}: {e}");
+        }
+    }
+
+    fn close(&self, event_loop: &ActiveEventLoop) {
+        if let Some(s) = &self.state {
+            s.threads.to_ui.send(ToUi::Quit).ok();
+        }
+        event_loop.exit();
+    }
+
+    fn resized(&self) {
+        let Some(s) = &self.state else { return };
+        let size = s.window.inner_size();
+        let size = (size.width, size.height);
+        s.threads.to_render.send(ToRender::Resize(size)).ok();
+        s.threads
+            .to_render
+            .send(ToRender::Interval(interval_of(&s.window)))
+            .ok();
+        s.threads.to_ui.send(ToUi::Resized(size, self.scale())).ok();
+    }
+
+    /// Tell the platform's input method where it may type: on while an
+    /// input that takes composed text has focus, its candidates at the
+    /// caret, and started afresh when focus moves to another input so a
+    /// composition never carries over.
+    fn follow_ime(&mut self, target: Option<ImeTarget>) {
+        let Some(state) = self.state.as_ref() else { return };
+        if target == self.ime {
+            return;
+        }
+        let moved = target.map(|t| t.field) != self.ime.map(|t| t.field);
+        if moved && self.ime.is_some() {
+            state.window.set_ime_allowed(false);
+        }
+        if let Some(t) = target {
+            if moved {
+                state.window.set_ime_allowed(true);
+            }
+            state.window.set_ime_cursor_area(
+                LogicalPosition::new(t.area.x, t.area.y),
+                LogicalSize::new(t.area.width, t.area.height),
+            );
+        }
+        self.ime = target;
     }
 }
 
-impl<H: WindowHandler> ApplicationHandler<UserEvent> for Handler<H> {
+impl ApplicationHandler<UserEvent> for Platform {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(start) = self.start.take() else { return };
         // Hidden until the accessibility adapter is attached, which it must
         // be before the window first shows.
         let attrs = WindowAttributes::default()
@@ -311,22 +834,59 @@ impl<H: WindowHandler> ApplicationHandler<UserEvent> for Handler<H> {
                 return;
             }
         };
-        let renderer = match WindowRenderer::new(&window) {
+        // winit has the compositor's first configure by now, so whether it
+        // took the decorations is known before the first frame: if not, the
+        // window draws its own and hides winit's.
+        let client = self.forced.unwrap_or_else(|| compositor_left_decorations(&window));
+        if client {
+            window.set_decorations(false);
+        }
+        self.focused = window.has_focus();
+        // The surface is made here, on the main thread, as Metal wants;
+        // the render thread draws into it from then on.
+        let gpu = match GpuRenderer::for_window(Arc::clone(&window)) {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("{e}");
+                eprintln!("no GPU to paint the window on: {e}");
                 event_loop.exit();
                 return;
             }
         };
         let access = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
+        let proxy = self.proxy.clone();
+        let pace = Pace::Surface {
+            callbacks: is_wayland(&window),
+            window: Arc::clone(&window),
+        };
+        let threads = match spawn(
+            gpu,
+            pace,
+            interval_of(&window),
+            self.title.clone(),
+            start,
+            Box::new(move |m| {
+                proxy.send_event(UserEvent::Ui(m)).ok();
+            }),
+            None,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("cannot start the UI and render threads: {e}");
+                event_loop.exit();
+                return;
+            }
+        };
         window.set_visible(true);
-        window.request_redraw();
+        self.recorder = record_input(&window);
         self.state = Some(WindowState {
             window,
             access,
-            renderer,
+            threads,
         });
+        // Sent before the size, so the first frame is laid out with them.
+        self.chrome.client = client;
+        self.follow_chrome();
+        self.resized();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -335,150 +895,246 @@ impl<H: WindowHandler> ApplicationHandler<UserEvent> for Handler<H> {
         }
         let scale = self.scale();
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
-                if let Some(state) = self.state.as_ref() {
-                    state.window.request_redraw();
+            WindowEvent::CloseRequested => self.close(event_loop),
+            WindowEvent::Focused(focused) => {
+                self.focused = focused;
+                if focused && let Some(s) = &self.state {
+                    s.threads.to_ui.send(ToUi::Focused).ok();
+                }
+                self.follow_chrome();
+            }
+            WindowEvent::ThemeChanged(_) => self.follow_chrome(),
+            WindowEvent::Occluded(hidden) => {
+                if let Some(s) = &self.state {
+                    s.threads.to_render.send(ToRender::Visible(!hidden)).ok();
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                let p = (f64_to_f32(position.x) / scale, f64_to_f32(position.y) / scale);
-                self.cursor = p;
-                self.send(Input::PointerMoved { x: p.0, y: p.1 });
+            WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
+                // A configure: maximized or fullscreen may have changed with the size.
+                self.follow_chrome();
+                self.resized();
             }
-            WindowEvent::CursorLeft { .. } => self.send(Input::PointerLeft),
-            WindowEvent::MouseInput {
-                state,
-                button: MouseButton::Left,
-                ..
-            } => {
-                let (x, y) = self.cursor;
-                self.send(match state {
-                    ElementState::Pressed => Input::MouseDown { x, y },
-                    ElementState::Released => Input::MouseUp { x, y },
-                });
-            }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Right,
-                ..
-            } => {
-                let (x, y) = self.cursor;
-                self.send(Input::SecondaryDown { x, y });
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (-x * LINE_SCROLL, -y * LINE_SCROLL),
-                    MouseScrollDelta::PixelDelta(p) => (-f64_to_f32(p.x) / scale, -f64_to_f32(p.y) / scale),
-                };
-                self.send(Input::Wheel { dx, dy });
-            }
-            WindowEvent::ModifiersChanged(m) => {
-                let s = m.state();
-                self.modifiers = Modifiers {
-                    shift: s.contains(ModifiersState::SHIFT),
-                    control: s.contains(ModifiersState::CONTROL),
-                    alt: s.contains(ModifiersState::ALT),
-                    command: s.contains(ModifiersState::SUPER),
-                };
-                self.send(Input::Modifiers(self.modifiers));
-            }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
-                self.send(Input::Key(KeyEvent {
-                    key: event.logical_key,
-                    text: event.text.map(|t| t.to_string()),
-                    modifiers: self.modifiers,
-                }));
-            }
-            WindowEvent::Ime(Ime::Preedit(text, cursor)) => {
-                self.send(Input::Ime(ImeEvent::Preedit(Preedit { text, cursor })));
-            }
-            WindowEvent::Ime(Ime::Commit(text)) => self.send(Input::Ime(ImeEvent::Commit(text))),
-            // Another input source was chosen mid-composition: what it held is gone.
-            WindowEvent::Ime(Ime::Disabled) => self.send(Input::Ime(ImeEvent::Preedit(Preedit::default()))),
+            // Wayland's frame callback: the render thread may draw again.
             WindowEvent::RedrawRequested => {
-                self.redraw(scale);
-                self.follow_ime();
-                self.tell_access(scale);
+                if let Some(s) = &self.state {
+                    s.threads.to_render.send(ToRender::FrameCallback).ok();
+                }
             }
-            _ => {}
+            event => {
+                if let Some(input) = input_log::from_winit(event, scale) {
+                    self.forward(input);
+                }
+            }
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
-        let UserEvent::Access(event) = event else {
-            // Mail: `about_to_wait` delivers it, as it runs due timers.
-            return;
-        };
-        match event.window_event {
-            accesskit_winit::WindowEvent::InitialTreeRequested => self.tell_access(self.scale()),
-            accesskit_winit::WindowEvent::ActionRequested(request) => self.send(Input::Act(request)),
-            accesskit_winit::WindowEvent::AccessibilityDeactivated => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        let wake = self.app.idle();
-        if let Some(state) = self.state.as_ref()
-            && (wake.redraw || wake.animating)
-        {
-            state.window.request_redraw();
-        }
-        let next = if wake.animating {
-            Instant::now().checked_add(FRAME_INTERVAL)
-        } else {
-            None
-        };
-        match next.into_iter().chain(wake.next_timer).min() {
-            Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            None => event_loop.set_control_flow(ControlFlow::Wait),
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Access(event) => {
+                let Some(s) = &self.state else { return };
+                let to_ui = &s.threads.to_ui;
+                match event.window_event {
+                    accesskit_winit::WindowEvent::InitialTreeRequested => {
+                        self.listening = true;
+                        to_ui.send(ToUi::Access(AccessEvent::Initial)).ok();
+                    }
+                    accesskit_winit::WindowEvent::ActionRequested(request) => {
+                        to_ui.send(ToUi::Access(AccessEvent::Action(request))).ok();
+                    }
+                    accesskit_winit::WindowEvent::AccessibilityDeactivated => {
+                        self.listening = false;
+                        to_ui.send(ToUi::Access(AccessEvent::Deactivated)).ok();
+                    }
+                }
+            }
+            UserEvent::Ui(ToPlatform::Cursor(c)) => {
+                if let Some(s) = &self.state {
+                    s.window.set_cursor(c);
+                }
+            }
+            UserEvent::Ui(ToPlatform::Window(action)) => self.act(event_loop, action),
+            UserEvent::Ui(ToPlatform::Ime(target)) => self.follow_ime(target),
+            UserEvent::Ui(ToPlatform::Quit(why)) => {
+                eprintln!("{why}");
+                self.failed = true;
+                event_loop.exit();
+            }
+            UserEvent::Ui(ToPlatform::Access(update)) => {
+                if let Some(s) = self.state.as_mut()
+                    && self.listening
+                {
+                    s.access.update_if_active(|| *update);
+                }
+            }
         }
     }
 }
 
-impl<H: WindowHandler> Handler<H> {
-    /// Give the accessibility adapter the frame's tree; it asks for it only
-    /// while assistive technology listens, so otherwise this costs nothing.
-    fn tell_access(&mut self, scale: f32) {
-        let (app, title) = (&self.app, self.title.as_str());
-        if let Some(state) = self.state.as_mut() {
-            state.access.update_if_active(|| app.access_tree(scale, title));
-        }
+/// An app on its UI and render threads with no window (ADR-0015): the
+/// render thread draws into its canvas at a fixed rate, and whoever holds
+/// this is the platform thread, stamping input. What the stress scenes and
+/// the threading tests measure.
+pub struct Offscreen {
+    threads: Threads,
+    log: Arc<Mutex<Vec<FrameStat>>>,
+    cursor: (f32, f32),
+}
+
+impl Offscreen {
+    /// Start `start`'s handler on a UI thread, drawn `size` physical pixels
+    /// at `scale` by a render thread ticking every `interval`.
+    ///
+    /// # Errors
+    ///
+    /// When there is no GPU or a thread cannot start.
+    pub fn start(
+        start: impl FnOnce() -> Box<dyn WindowHandler> + Send + 'static,
+        size: (u32, u32),
+        scale: f32,
+        interval: Duration,
+    ) -> Result<Self, String> {
+        let gpu = GpuRenderer::headless().map_err(|e| e.to_string())?;
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let threads = spawn(
+            gpu,
+            Pace::Ticker(interval),
+            interval,
+            "offscreen".to_owned(),
+            Box::new(start),
+            Box::new(|_| {}),
+            Some(Arc::clone(&log)),
+        )
+        .map_err(|e| e.to_string())?;
+        threads.to_render.send(ToRender::Resize(size)).ok();
+        threads.to_ui.send(ToUi::Resized(size, scale)).ok();
+        Ok(Self {
+            threads,
+            log,
+            cursor: (0.0, 0.0),
+        })
     }
 
-    /// Tell the platform's input method where it may type: on while an
-    /// input that takes composed text has focus, its candidates at the
-    /// caret, and started afresh when focus moves to another input so a
-    /// composition never carries over.
-    fn follow_ime(&mut self) {
-        let target = self.app.ime_target();
-        let Some(state) = self.state.as_ref() else { return };
-        if target == self.ime {
-            return;
+    /// Send `input` as the platform thread does, stamped now.
+    pub fn input(&mut self, input: Input) {
+        if let Input::PointerMoved { x, y } | Input::MouseDown { x, y } | Input::MouseUp { x, y } = input {
+            self.cursor = (x, y);
         }
-        let moved = target.map(|t| t.field) != self.ime.map(|t| t.field);
-        if moved && self.ime.is_some() {
-            state.window.set_ime_allowed(false);
-        }
-        if let Some(t) = target {
-            if moved {
-                state.window.set_ime_allowed(true);
-            }
-            state.window.set_ime_cursor_area(
-                LogicalPosition::new(t.caret.x, t.caret.y),
-                LogicalSize::new(t.caret.width, t.caret.height),
-            );
-        }
-        self.ime = target;
+        let shown = self.presented();
+        self.threads.to_ui.send(ToUi::Input(input, Instant::now(), shown)).ok();
     }
 
-    fn redraw(&mut self, scale: f32) {
-        let app = &mut self.app;
-        let Some(state) = self.state.as_mut() else { return };
-        let size = state.window.inner_size();
-        let size = (size.width, size.height);
-        if state.renderer.resize(size) {
-            app.draw(state.renderer.renderer(), size, scale);
-        }
+    /// Turn the wheel at the pointer by `delta` (a trackpad's when `precise`).
+    pub fn wheel(&mut self, delta: (f32, f32), precise: bool) {
+        self.threads
+            .to_render
+            .send(ToRender::Wheel {
+                point: self.cursor,
+                delta,
+                at: Instant::now(),
+                precise,
+                ended: false,
+            })
+            .ok();
+    }
+
+    /// What is on screen now.
+    #[must_use]
+    pub fn presented(&self) -> Arc<Presented> {
+        Arc::clone(&self.threads.presented.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The frames the render thread drew since the last call.
+    #[must_use]
+    pub fn take_frames(&self) -> Vec<FrameStat> {
+        std::mem::take(&mut *self.log.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// How the OS schedules the UI and render threads (ADR-0015): each
+    /// thread's name and what it was given.
+    #[must_use]
+    pub fn priorities(&self) -> Vec<(&'static str, Applied)> {
+        self.threads
+            .priorities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Lose the render thread's GPU device, as a driver reset would
+    /// (ADR-0015's invariant 7: it is made again and the window drawn whole).
+    pub fn lose_device(&self) {
+        self.threads.to_render.send(ToRender::LoseDevice).ok();
+    }
+
+    /// Make the render thread panic, as a bug in it would (invariant 7: it
+    /// starts afresh from a full commit of the UI's).
+    pub fn panic_render(&self) {
+        self.threads.to_render.send(ToRender::Panic).ok();
+    }
+
+    /// The last frame, read back.
+    #[must_use]
+    pub fn capture(&self) -> Option<Pixels> {
+        let (tx, rx) = mpsc::channel();
+        self.threads.to_render.send(ToRender::Capture(None, tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+    }
+}
+
+impl Drop for Offscreen {
+    fn drop(&mut self) {
+        self.threads.to_ui.send(ToUi::Quit).ok();
+        self.threads.to_render.send(ToRender::Quit).ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PointerResampler;
+
+    fn close(a: Option<(f32, f32)>, b: (f32, f32)) -> bool {
+        a.is_some_and(|a| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3)
+    }
+
+    #[test]
+    fn a_drag_is_sampled_5_ms_before_present() {
+        let mut r = PointerResampler::default();
+        r.push(0.000, 0.0, 0.0);
+        r.push(0.010, 10.0, 0.0);
+        r.push(0.020, 20.0, 0.0);
+        // Presented at 20 ms: where the pointer was at 15 ms.
+        let at = r.sample(0.020);
+        assert!(close(at, (15.0, 0.0)), "{at:?}");
+        assert_eq!(r.sample(0.030), None, "no move since: nothing to send");
+    }
+
+    #[test]
+    fn a_drag_is_predicted_at_most_8_ms_and_half_a_gap_ahead() {
+        let mut r = PointerResampler::default();
+        r.push(0.000, 0.0, 0.0);
+        r.push(0.020, 20.0, 0.0);
+        // Wanted at 35 ms: 15 ms past the last sample, capped at 8 ms.
+        assert!(close(r.sample(0.040), (28.0, 0.0)));
+        let mut r = PointerResampler::default();
+        r.push(0.000, 0.0, 0.0);
+        r.push(0.004, 4.0, 0.0);
+        // Half the 4 ms gap.
+        assert!(close(r.sample(0.020), (6.0, 0.0)));
+        let mut r = PointerResampler::default();
+        r.push(0.000, 0.0, 0.0);
+        r.push(0.001, 5.0, 0.0);
+        // Samples 1 ms apart are not predicted from.
+        assert!(close(r.sample(0.020), (5.0, 0.0)));
+    }
+
+    #[test]
+    fn a_release_flushes_the_last_raw_position() {
+        let mut r = PointerResampler::default();
+        r.push(0.000, 0.0, 0.0);
+        r.push(0.010, 10.0, 3.0);
+        assert!(r.holds());
+        assert_eq!(r.flush(), Some((10.0, 3.0)));
+        assert!(!r.holds());
+        assert_eq!(r.sample(0.1), None);
     }
 }

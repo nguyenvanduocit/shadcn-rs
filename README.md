@@ -3,12 +3,12 @@
 [shadcn/ui](https://ui.shadcn.com) as a native desktop GUI in Rust, on a small GUI framework of its own.
 
 - **`crates/gui`**: the framework. A retained element tree rebuilt from signals each frame, laid out by
-  [Taffy](https://github.com/DioxusLabs/taffy) with Tailwind-named styles, text set by
-  [cosmic-text](https://github.com/pop-os/cosmic-text) to match Chrome's, recorded as a scene of primitives and drawn
+  [Taffy](https://github.com/DioxusLabs/taffy) with Tailwind-named styles, text shaped by
+  [Parley](https://github.com/linebender/parley) and rasterized by its own code (skrifa outlines, Chrome's hinting and
+  gamma) to match Chrome's, recorded as a scene of primitives and drawn
   on the GPU by [wgpu](https://github.com/gfx-rs/wgpu) (as GPUI draws: signed-distance quads, analytic shadows, glyph
-  atlases) into a [winit](https://github.com/rust-windowing/winit) window, or headless and read back. Where no GPU
-  answers (CI), the same scene is painted on the CPU by [tiny-skia](https://github.com/linebender/tiny-skia); the two
-  are held to the same pixels.
+  atlases) into a [winit](https://github.com/rust-windowing/winit) window, or headless and read back. There is no
+  CPU renderer.
   CSS transitions and keyframes, gradients, masks and filters, right-to-left text, Lucide icons, and a headless
   `Scenario` that drives an app by script and writes each frame as a PNG and a report.
 - **`crates/shadcn`**: every component of shadcn-vue's `new-york-v4` registry ported to `gui`, with the same look
@@ -24,7 +24,9 @@ Each port is judged against shadcn-vue's own demo rendered in a browser, and eac
 
 ```sh
 crates/shadcn/verdict/run.sh button              # a score from 0 to 100 per demo (Node, agent-browser)
-crates/shadcn/bench.sh button card               # steady frame times, memory held, leaks; compared with the last run
+crates/shadcn/bench.sh button card               # steady frame times and instructions, memory held, leaks; compared with the last run
+cargo run --release -p shadcn --example stress -- --run   # stress scenes, each within its allocation budget per frame
+SEED=7 ITERATIONS=1 cargo test -p gui --test seeded       # a seeded run repeated by its seed
 ```
 
 And debugged from the command line, headless or attached to the running app, by a person or an agent:
@@ -38,8 +40,7 @@ works as it does.
 
 ## Using it
 
-The crates are not on crates.io yet. Depend on them from Git, pinned to a release tag, and copy the root `Cargo.toml`'s
-`[patch.crates-io]` entry for cosmic-text into your workspace (Cargo applies only the root's patches):
+The crates are not on crates.io yet. Depend on them from Git, pinned to a release tag:
 
 ```toml
 [dependencies]
@@ -49,7 +50,7 @@ shadcn = { git = "https://github.com/nguyenvanduocit/shadcn-rs", tag = "v0.1.0" 
 
 Rust 1.99.1, pinned by `rust-toolchain.toml`. Built and judged on macOS (Metal); Linux (Vulkan or GL) and Windows
 (DX12) build through winit and wgpu. Windows and headless scenarios (`docs --shots`, `--verdict`, `--bench`) paint on
-the GPU; `GUI_RENDERER=cpu` paints them on the CPU (a window through softbuffer), as happens where no GPU answers.
+the GPU; there is no CPU renderer. Without a GPU (CI), install a software Vulkan driver such as Mesa's lavapipe.
 
 ## Checking it
 

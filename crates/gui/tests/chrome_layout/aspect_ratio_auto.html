@@ -1,0 +1,8 @@
+<!-- aspect-ratio with one size auto, in block flow and in flex: a scroll container keeps the ratio's height whatever its content, max-width clamps the size the ratio starts from, and a box sized both ways keeps both sizes. -->
+<div style="width: 400px">
+  <p style="width: 100px; aspect-ratio: 4; overflow: hidden">A scroll container keeps its ratio</p>
+  <div style="width: 200px; max-width: 100px; aspect-ratio: 1"></div>
+  <div style="display: flex; flex-direction: column; align-items: flex-start"><div style="height: 40px; aspect-ratio: 2"></div></div>
+  <div style="display: flex; height: 50px"><div style="width: 120px; height: 40px; aspect-ratio: 1; align-self: flex-start"></div><div style="width: 30px; aspect-ratio: 1"></div></div>
+  <div style="display: grid; grid-template-columns: 100px"><div style="width: 100px; height: 20px; aspect-ratio: 1; align-self: start"></div></div>
+</div>

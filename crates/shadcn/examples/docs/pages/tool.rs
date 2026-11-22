@@ -2,11 +2,11 @@
 //! reader's approval, and a file read that opens in a sheet.
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockProps, DialogState, ItemMediaVariant, ItemSize,
-    ItemVariant, SheetSide, TraceStatus, button, code_block, code_block_content, code_block_lines, dialog_trigger,
-    item, item_actions, item_content, item_description, item_media, item_title, sheet_content, sheet_description,
+    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockProps, ItemMediaVariant, ItemSize, ItemVariant,
+    SheetSide, TraceStatus, button, code_block, code_block_content, code_block_lines, dialog_trigger, item,
+    item_actions, item_content, item_description, item_media, item_title, sheet, sheet_content, sheet_description,
     sheet_header, sheet_title, spinner, trace, trace_action, trace_collapsible, trace_collapsible_content,
     trace_collapsible_trigger, trace_end_icon, trace_icon, trace_line, trace_title,
 };
@@ -21,15 +21,13 @@ fn line(status: Option<TraceStatus>, glyph: Icon, title: &str) -> Div {
 }
 
 /// A command that ran (or failed) and opens to its output.
-fn ran(open: &Signal<bool>, failed: bool, title: &str, out: &str) -> Div {
+fn ran(open: &Signal<bool>, failed: bool, title: &str, out: &str) -> Element {
     let status = failed.then_some(TraceStatus::Error);
     trace_collapsible()
-        .child(trace_collapsible_trigger(
-            open,
-            failed,
-            line(status, Icon::Terminal, title),
-        ))
-        .child(trace_collapsible_content(open, |c| c.child(output(out))))
+        .model(Model::bind(*open))
+        .child(trace_collapsible_trigger(failed, line(status, Icon::Terminal, title)))
+        .child(trace_collapsible_content().map_root(|c| c.child(output(out))))
+        .into_element()
 }
 
 fn states(open: &[Signal<bool>; 2]) -> Div {
@@ -94,10 +92,10 @@ impl Commands {
         for o in &self.open {
             o.set(false);
         }
-        let replied = self.replied.clone();
+        let replied = self.replied;
         let mut steps = vec![after(300, move || replied.set(true))];
         for i in 1..=COMMANDS.len() {
-            let (started, finished) = (self.started.clone(), self.finished.clone());
+            let (started, finished) = (self.started, self.finished);
             steps.push(after(0, move || started.set(i)));
             steps.push(after(900, move || finished.set(i)));
         }
@@ -126,12 +124,14 @@ impl Commands {
                         Icon::Terminal,
                         &format!("Running {command}"),
                     )
+                    .into_element()
                 } else {
                     line(
                         Some(TraceStatus::Error),
                         Icon::Terminal,
                         &format!("Failed to run {command}"),
                     )
+                    .into_element()
                 }
             })
             .collect::<Vec<_>>();
@@ -194,26 +194,26 @@ impl Cleanup {
     fn send(&self) {
         self.asked.set(true);
         self.open.reset(false);
-        let (replied, thinking, open) = (self.replied.clone(), self.thinking.clone(), self.open.clone());
+        let (replied, thinking, open) = (self.replied, self.thinking, self.open.clone());
         let mut steps: Vec<Step> = vec![after(600, move || {
             replied.set(true);
             thinking.set(true);
             open.follow(true);
         })];
         steps.extend(stream(&self.thought, CLEANUP_REASONING, 20));
-        let (thinking, open) = (self.thinking.clone(), self.open.clone());
+        let (thinking, open) = (self.thinking, self.open.clone());
         steps.push(after(20, move || {
             thinking.set(false);
             open.follow(false);
         }));
-        let approval = self.approval.clone();
+        let approval = self.approval;
         steps.push(after(400, move || approval.set(Some(Approval::Requested))));
         self.script.play(steps);
     }
 
     fn respond(&self, approved: bool) {
         self.approval.set(Some(Approval::Responded(approved)));
-        let approval = self.approval.clone();
+        let approval = self.approval;
         let mut steps = vec![after(600, move || {
             approval.set(Some(if approved { Approval::Ran } else { Approval::Denied }));
         })];
@@ -273,14 +273,14 @@ impl Cleanup {
         let reasoning = trace()
             .child(
                 trace_collapsible()
+                    .model(Model::bind(*open))
                     .child(trace_collapsible_trigger(
-                        open,
                         false,
                         trace_line(status)
                             .child(trace_icon(mark))
                             .child(trace_title(if thinking { "Thinking" } else { "Thought" })),
                     ))
-                    .child(trace_collapsible_content(open, |c| c.child(text(self.thought.get())))),
+                    .child(trace_collapsible_content().map_root(|c| c.child(text(self.thought.get())))),
             )
             .into_element();
         let tool: Element = match self.approval.get() {
@@ -336,7 +336,6 @@ struct FileRead {
     replied: Signal<bool>,
     read: Signal<bool>,
     answer: Signal<String>,
-    sheet: DialogState,
 }
 
 impl FileRead {
@@ -347,13 +346,12 @@ impl FileRead {
             replied: Signal::new(false),
             read: Signal::new(false),
             answer: Signal::new(String::new()),
-            sheet: DialogState::new(),
         }
     }
 
     fn send(&self) {
         self.asked.set(true);
-        let (replied, read) = (self.replied.clone(), self.read.clone());
+        let (replied, read) = (self.replied, self.read);
         let mut steps = vec![
             after(300, move || replied.set(true)),
             after(900, move || read.set(true)),
@@ -378,26 +376,26 @@ impl FileRead {
             ..CodeBlockContentProps::default()
         };
         let p = CodeBlockProps::default();
-        trace()
-            .child(dialog_trigger(
-                &self.sheet,
-                trace_action(
+        trace().child(
+            sheet()
+                .child(dialog_trigger(trace_action(
                     false,
                     line(None, Icon::FileText, &format!("Read {PATH}")).child(trace_end_icon(icon(Icon::ChevronRight))),
-                ),
-            ))
-            .child(sheet_content(&self.sheet, SheetSide::Right, |c| {
-                c.child(
-                    sheet_header()
-                        .child(sheet_title(PATH).font_mono())
-                        .child(sheet_description(format!("{lines} lines"))),
-                )
-                .child(code_block(p).mx(6.0).mb(6.0).w_auto().child(code_block_content(
-                    p,
-                    content,
-                    code_block_lines(PACKAGE_JSON),
                 )))
-            }))
+                .child(
+                    sheet_content(SheetSide::Right)
+                        .child(
+                            sheet_header()
+                                .child(sheet_title(PATH).font_mono())
+                                .child(sheet_description(format!("{lines} lines"))),
+                        )
+                        .child(code_block(p).mx(6.0).mb(6.0).w_auto().child(code_block_content(
+                            p,
+                            content,
+                            code_block_lines(PACKAGE_JSON),
+                        ))),
+                ),
+        )
     }
 
     fn view(&self) -> Div {

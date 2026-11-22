@@ -1,0 +1,12 @@
+# Chrome's boxes for text_single_line.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 600 96
+  p 0 0 600 24
+  div 0 24 600 24
+    p 0 24 336.515625 24
+  div 0 48 600 24
+    p 0 48 259.390625 24
+  div 0 72 600 24
+    p 0 72 38.109375 24
+    p 38.109375 72 160.375 24

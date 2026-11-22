@@ -2,7 +2,7 @@
 //! under one line, and what it reported.
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
     BadgeVariant, TraceStatus, badge, spinner, trace, trace_collapsible, trace_collapsible_content,
     trace_collapsible_trigger, trace_description, trace_icon, trace_line, trace_title,
@@ -23,8 +23,9 @@ fn details(open: &Signal<bool>) -> Div {
     let head = done("Ran the research agent").child(trace_description("48s"));
     trace().max_w(96.0).child(
         trace_collapsible()
-            .child(trace_collapsible_trigger(open, false, head))
-            .child(trace_collapsible_content(open, |c| {
+            .model(Model::bind(*open))
+            .child(trace_collapsible_trigger(false, head))
+            .child(trace_collapsible_content().map_root(|c| {
                 c.flex_col()
                     .gap(3.0)
                     .child(
@@ -50,8 +51,9 @@ fn running(open: &Signal<bool>) -> Div {
     let head = line(Some(TraceStatus::Running), spinner(), "Running the research agent");
     trace().max_w(96.0).child(
         trace_collapsible()
-            .child(trace_collapsible_trigger(open, false, head))
-            .child(trace_collapsible_content(open, |c| {
+            .model(Model::bind(*open))
+            .child(trace_collapsible_trigger(false, head))
+            .child(trace_collapsible_content().map_root(|c| {
                 c.child(trace().child(done("Ran grep -rn cacheKey scripts")).child(line(
                     Some(TraceStatus::Running),
                     spinner(),
@@ -120,12 +122,12 @@ impl Research {
         }
         let mut steps = Vec::new();
         for i in 0..STEPS.len() {
-            let agent = self.agent.clone();
+            let agent = self.agent;
             steps.push(after(if i == 0 { 0 } else { 1000 }, move || {
                 agent.set(Some(Agent::Working(i)))
             }));
         }
-        let agent = self.agent.clone();
+        let agent = self.agent;
         steps.push(after(1000, move || agent.set(Some(Agent::Reported))));
         steps.extend(stream(&self.answer, ANSWER, 20).into_iter().map(|s| s.lead(20)));
         self.script.play(steps);
@@ -170,19 +172,22 @@ impl Research {
             .map(|(i, ((command, out), open))| {
                 if i < ran {
                     trace_collapsible()
-                        .child(trace_collapsible_trigger(open, false, done(&format!("Ran {command}"))))
-                        .child(trace_collapsible_content(open, |c| c.child(output(out))))
+                        .model(Model::bind(*open))
+                        .child(trace_collapsible_trigger(false, done(&format!("Ran {command}"))))
+                        .child(trace_collapsible_content().map_root(|c| c.child(output(out))))
+                        .into_element()
                 } else {
                     let s = if live { TraceStatus::Running } else { TraceStatus::Error };
                     let verb = if live { "Running" } else { "Failed to run" };
-                    line(Some(s), mark(Some(s)), &format!("{verb} {command}"))
+                    line(Some(s), mark(Some(s)), &format!("{verb} {command}")).into_element()
                 }
             });
         let failed = status == Some(TraceStatus::Error);
         trace().child(
             trace_collapsible()
-                .child(trace_collapsible_trigger(&self.open, failed, head))
-                .child(trace_collapsible_content(&self.open, |c| {
+                .model(Model::bind(self.open))
+                .child(trace_collapsible_trigger(failed, head))
+                .child(trace_collapsible_content().map_root(|c| {
                     c.flex_col()
                         .gap(3.0)
                         .child(trace().children(rows))

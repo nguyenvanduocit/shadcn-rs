@@ -1,0 +1,36 @@
+<!doctype html>
+<!-- The text sample (ADR-0019) as Chrome draws it: each row of
+     text-sample.tsv in Inter (gui's own file), black on white, at the place
+     docs --text-sample puts it. text.sh shoots it at 1x and 2x. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: "Inter"; src: url("../../gui/assets/Inter.ttf"); font-weight: 100 900; }
+  html, body { margin: 0; background: #fff; color: #000; }
+  body { position: relative; font-family: "Inter"; font-synthesis-weight: none; }
+  div { position: absolute; left: 16px; white-space: nowrap; }
+</style>
+</head>
+<body>
+<script type="module">
+  // Laid out as `text_sample::rows` lays it out: a line box of
+  // ceil(size * 1.25) px, 8 px between lines, from 16 px down.
+  const tsv = await (await fetch("text-sample.tsv")).text()
+  let y = 16
+  for (const line of tsv.split("\n")) {
+    if (!line || line.startsWith("#")) continue
+    const [size, weight, text] = line.split("\t")
+    const height = Math.ceil(Number(size) * 1.25)
+    const div = document.createElement("div")
+    Object.assign(div.style, { top: `${y}px`, fontSize: `${size}px`, fontWeight: weight, lineHeight: `${height}px` })
+    div.textContent = text
+    document.body.append(div)
+    y += height + 8
+  }
+  document.body.style.height = `${y + 8}px`
+  await document.fonts.ready
+  document.body.dataset.ready = "1"
+</script>
+</body>
+</html>

@@ -2,7 +2,7 @@
 //! command line and open while it runs, until the reader opens or closes it.
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon};
 use shadcn::{
     TraceStatus, trace, trace_collapsible, trace_collapsible_content, trace_collapsible_trigger, trace_icon,
     trace_line, trace_title,
@@ -147,7 +147,7 @@ impl Turn {
 
 /// A command's row, open while it runs and prints until the user opens or
 /// closes it (Vue's `openState`).
-fn command_row(c: &Command, busy: bool, fold: &Follow) -> Div {
+fn command_row(c: &Command, busy: bool, fold: &Follow) -> Element {
     let running = busy && !c.done;
     let failed = !running && !c.done;
     let title = if c.done {
@@ -165,14 +165,15 @@ fn command_row(c: &Command, busy: bool, fold: &Follow) -> Div {
         None
     };
     trace_collapsible()
+        .model(Model::bind(fold.open))
         .child(trace_collapsible_trigger(
-            &fold.open,
             failed,
             trace_line(status)
                 .child(trace_icon(icon(Icon::Terminal)))
                 .child(trace_title(title)),
         ))
-        .child(trace_collapsible_content(&fold.open, |c2| c2.child(output(&c.output))))
+        .child(trace_collapsible_content().map_root(|c2| c2.child(output(&c.output))))
+        .into_element()
 }
 
 fn terminal_demo(turn: &Signal<Turn>, folds: &[Follow], script: &Script) -> Div {
@@ -186,7 +187,7 @@ fn terminal_demo(turn: &Signal<Turn>, folds: &[Follow], script: &Script) -> Div 
                 .map(|(c, fold)| command_row(c, busy, fold)),
         )
     });
-    let (turn, folds, play) = (turn.clone(), folds.to_vec(), script.clone());
+    let (turn, folds, play) = (*turn, folds.to_vec(), script.clone());
     thread()
         .child(user_turn(QUESTION))
         .child(assistant_turn([rows.into_element(), said(&now.text)]))
@@ -194,7 +195,7 @@ fn terminal_demo(turn: &Signal<Turn>, folds: &[Follow], script: &Script) -> Div 
             for f in &folds {
                 f.reset(f.open.get());
             }
-            let (turn, folds) = (turn.clone(), folds.clone());
+            let (turn, folds) = (turn, folds.clone());
             play.play(frames(Turn::replay(), move |step: &Turn| {
                 for (c, f) in step.commands.iter().zip(&folds) {
                     f.follow(!c.done && !c.output.is_empty());
@@ -214,14 +215,14 @@ fn error_demo(open: &Signal<bool>) -> Div {
         )
         .child(
             trace_collapsible()
+                .model(Model::bind(*open))
                 .child(trace_collapsible_trigger(
-                    open,
                     true,
                     trace_line(Some(TraceStatus::Error))
                         .child(trace_icon(icon(Icon::Terminal)))
                         .child(trace_title("pnpm lint exited with code 1")),
                 ))
-                .child(trace_collapsible_content(open, |c| c.child(output(LINT_OUTPUT)))),
+                .child(trace_collapsible_content().map_root(|c| c.child(output(LINT_OUTPUT)))),
         )
 }
 

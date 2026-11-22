@@ -4,20 +4,26 @@
 //!
 //! Vue registers items and answers as they mount; here the questions are
 //! declared up front ([`QuestionnaireItem`], Vue's `items` prop) and their
-//! answers live in a [`Questionnaire`] the caller creates once. The rules
-//! (status, validity, what is submitted) are pure functions on
-//! [`ItemAnswer`]; the handle only reads and writes signals.
+//! answers live in the [`questionnaire`] instance, which its parts read (a
+//! [`Questionnaire`] is what they and its callbacks see). The open question
+//! is its own or the caller's (`v-model:item`). The rules (status,
+//! validity, what is submitted) are pure functions on [`ItemAnswer`].
 
+use std::fmt;
 use std::rc::Rc;
 
 use gui::Properties;
 use gui::prelude::*;
 use gui::style::Align;
-use gui::{Div, FocusHandle, Icon, KeyEvent, NamedKey, Signal, Text, TextField, TextInput, div, icon, text};
+use gui::{
+    Bind, Callback, ComponentElement, Div, Element, FocusHandle, Icon, KeyEvent, Model, NamedKey, Signal, Text,
+    TextField, UseModel, component, div, icon, provide, text, use_context, use_model,
+};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::focus::{destructive_ring, focus_ring};
 use crate::input::input;
+use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
 /// Which keys pick a choice.
@@ -252,17 +258,33 @@ impl ItemAnswer {
     }
 }
 
-type Submit = Rc<dyn Fn(&Questionnaire, Vec<QuestionnaireAnswer>)>;
-type Change = Rc<dyn Fn(&Questionnaire, &str, &str)>;
+/// What [`questionnaire`] is given: Vue's `items`, `default-item` and
+/// `v-model:item` (one [`Bind`]), `shortcuts`, `@submit`, `@reset` and each
+/// choice's `@change`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestionnaireProps {
+    items: Vec<QuestionnaireItem>,
+    /// The open question's name: `default-item`, or `v-model:item`.
+    item: Bind<String>,
+    shortcuts: Option<QuestionnaireShortcuts>,
+    on_submit: Option<Callback<(Questionnaire, Vec<QuestionnaireAnswer>)>>,
+    on_change: Option<Callback<(Questionnaire, String, String)>>,
+    on_reset: Option<Callback<Questionnaire>>,
+}
 
-/// The questionnaire's state; create it once, outside the render, and pass
-/// it to every part.
+/// A questionnaire's state and commands, as its parts (and its callbacks)
+/// see it. It is the [`questionnaire`] instance's: made in its setup, it
+/// lives while the questionnaire is mounted.
 #[derive(Clone)]
 pub struct Questionnaire {
+    props: Signal<PartProps<QuestionnaireProps>>,
     items: Rc<[QuestionnaireItem]>,
-    default_item: Option<String>,
-    shortcuts: Signal<Option<QuestionnaireShortcuts>>,
-    active: Signal<usize>,
+    /// The open question's name (`v-model:item`); a name that is not an
+    /// enabled question's opens `start`.
+    item: UseModel<PartProps<QuestionnaireProps>, String>,
+    /// The question it opens on, and goes back to on reset (Vue's
+    /// `getInitialItemName`).
+    start: usize,
     answers: Signal<Vec<ItemAnswer>>,
     /// Which items are left out (Vue's `disabled` on an item definition).
     disabled: Signal<Vec<bool>>,
@@ -270,22 +292,27 @@ pub struct Questionnaire {
     fields: Rc<[TextField]>,
     /// Each question's choices, to move between them with the arrow keys.
     choice_focus: Rc<[Vec<FocusHandle>]>,
-    on_submit: Submit,
-    on_change: Option<Change>,
+}
+
+impl fmt::Debug for Questionnaire {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Questionnaire").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Questionnaire {
+    fn eq(&self, other: &Self) -> bool {
+        self.answers == other.answers
+    }
 }
 
 impl Questionnaire {
-    /// `items` in order, opening on `default_item` (or the first enabled);
-    /// `on_submit` gets the questionnaire and every answer once all are valid.
-    #[must_use]
-    pub fn new(
-        items: Vec<QuestionnaireItem>,
-        default_item: Option<&str>,
-        shortcuts: Option<QuestionnaireShortcuts>,
-        on_submit: impl Fn(&Questionnaire, Vec<QuestionnaireAnswer>) + 'static,
-    ) -> Self {
+    /// Made in the questionnaire's setup from its props.
+    fn new(props: Signal<PartProps<QuestionnaireProps>>) -> Self {
+        let items = props.with_untracked(|p| p.props.items.clone());
         let disabled: Vec<bool> = items.iter().map(|i| i.disabled).collect();
-        let start = opening(&items, &disabled, default_item);
+        let item = use_model(props, |p| &p.props.item);
+        let start = opening(&items, &disabled, Some(&item.get_untracked()));
         let answers = items.iter().map(ItemAnswer::initial).collect();
         let fields = items.iter().map(|i| TextField::new(i.default_value.clone())).collect();
         let choice_focus = items
@@ -293,26 +320,14 @@ impl Questionnaire {
             .map(|i| i.choices.iter().map(|_| FocusHandle::new()).collect())
             .collect();
         Self {
+            props,
             items: items.into(),
-            default_item: default_item.map(str::to_owned),
-            shortcuts: Signal::labeled("questionnaire shortcuts", shortcuts),
-            active: Signal::labeled("questionnaire item", start),
+            item,
+            start,
             answers: Signal::labeled("questionnaire answers", answers),
             disabled: Signal::labeled("questionnaire disabled items", disabled),
             fields,
             choice_focus,
-            on_submit: Rc::new(on_submit),
-            on_change: None,
-        }
-    }
-
-    /// Call `f` with the questionnaire, the item's name and the choice's
-    /// value each time a choice is checked or unchecked (a choice's `@change`).
-    #[must_use]
-    pub fn on_change(self, f: impl Fn(&Questionnaire, &str, &str) + 'static) -> Self {
-        Self {
-            on_change: Some(Rc::new(f)),
-            ..self
         }
     }
 
@@ -320,25 +335,36 @@ impl Questionnaire {
         self.items.iter().position(|i| i.name == name)
     }
 
+    fn shortcuts(&self) -> Option<QuestionnaireShortcuts> {
+        self.props.with(|p| p.props.shortcuts)
+    }
+
+    /// The open item's index.
+    fn active(&self) -> usize {
+        self.item
+            .with(|name| self.index(name))
+            .filter(|&i| !self.is_disabled(i))
+            .unwrap_or(self.start)
+    }
+
     fn words(&self, i: usize) -> String {
         self.fields.get(i).map(TextField::text).unwrap_or_default()
     }
 
     fn answer(&self, i: usize) -> ItemAnswer {
-        self.answers.get().get(i).cloned().unwrap_or_default()
+        self.answers.with(|a| a.get(i).cloned()).unwrap_or_default()
     }
 
     fn set_answer(&self, i: usize, f: impl FnOnce(ItemAnswer) -> ItemAnswer) {
-        self.answers.update(|mut all| {
+        self.answers.update(|all| {
             if let Some(a) = all.get_mut(i) {
                 *a = f(std::mem::take(a));
             }
-            all
         });
     }
 
     fn is_disabled(&self, i: usize) -> bool {
-        self.disabled.get().get(i).copied().unwrap_or(true)
+        self.disabled.with(|d| d.get(i).copied()).unwrap_or(true)
     }
 
     /// The items taking part, in order.
@@ -351,7 +377,7 @@ impl Questionnaire {
 
     /// The open item's place among the enabled ones.
     fn position(&self) -> Option<usize> {
-        let active = self.active.get();
+        let active = self.active();
         self.enabled().iter().position(|&i| i == active)
     }
 
@@ -376,7 +402,7 @@ impl Questionnaire {
     }
 
     fn active_item(&self) -> Option<&QuestionnaireItem> {
-        self.items.get(self.active.get())
+        self.items.get(self.active())
     }
 
     /// The open question's name (`v-model:item`).
@@ -392,22 +418,16 @@ impl Questionnaire {
         }
     }
 
-    /// Change the keys that pick a choice (`:shortcuts`).
-    pub fn set_shortcuts(&self, shortcuts: Option<QuestionnaireShortcuts>) {
-        self.shortcuts.set(shortcuts);
-    }
-
     /// Leave question `name` out, or bring it back (`:disabled`).
     pub fn set_disabled(&self, name: &str, disabled: bool) {
         let Some(i) = self.index(name) else { return };
         if self.is_disabled(i) == disabled {
             return;
         }
-        self.disabled.update(|mut all| {
+        self.disabled.update(|all| {
             if let Some(d) = all.get_mut(i) {
                 *d = disabled;
             }
-            all
         });
     }
 
@@ -447,7 +467,9 @@ impl Questionnaire {
     /// Show question `i` and move focus into it (Vue focuses its fieldset),
     /// so the questionnaire's keys keep working.
     fn open(&self, i: usize) {
-        self.active.set(i);
+        if let Some(item) = self.items.get(i) {
+            self.item.set(item.name.clone());
+        }
         if let Some(first) = self.choice_focus.get(i).and_then(|f| f.first()) {
             first.focus();
         }
@@ -468,8 +490,8 @@ impl Questionnaire {
         };
         let words = self.words(i);
         self.set_answer(i, |a| a.choose(item, &words, value));
-        if let Some(f) = &self.on_change {
-            f(self, name, value);
+        if let Some(f) = self.props.with_untracked(|p| p.props.on_change.clone()) {
+            f.call((self.clone(), name.to_owned(), value.to_owned()));
         }
     }
 
@@ -482,7 +504,7 @@ impl Questionnaire {
 
     /// On to the next question, once this one is answered (or may be skipped).
     pub fn next(&self) {
-        let (Some(p), i) = (self.position(), self.active.get()) else {
+        let (Some(p), i) = (self.position(), self.active()) else {
             return;
         };
         if self.last() {
@@ -497,7 +519,7 @@ impl Questionnaire {
 
     /// Skip an optional question; on the last one, submit.
     pub fn skip(&self) {
-        let i = self.active.get();
+        let i = self.active();
         if self.items.get(i).is_none_or(|item| item.required) {
             return;
         }
@@ -512,8 +534,9 @@ impl Questionnaire {
 
     /// Next, or submit on the last question (Enter, ⌘/Ctrl+Enter).
     pub fn confirm(&self) {
-        if !self.valid(self.active.get()) {
-            self.set_answer(self.active.get(), ItemAnswer::attempt);
+        let i = self.active();
+        if !self.valid(i) {
+            self.set_answer(i, ItemAnswer::attempt);
         } else if self.last() {
             self.submit();
         } else {
@@ -531,7 +554,7 @@ impl Questionnaire {
             self.open(i);
             return;
         }
-        let answers = self.answers.get();
+        let answers = self.answers.get_untracked();
         let submitted = enabled
             .iter()
             .filter_map(|&i| {
@@ -542,17 +565,22 @@ impl Questionnaire {
                 })
             })
             .collect();
-        (self.on_submit)(self, submitted);
+        if let Some(f) = self.props.with_untracked(|p| p.props.on_submit.clone()) {
+            f.call((self.clone(), submitted));
+        }
     }
 
-    /// Back to the default answers and the opening question (a form reset).
+    /// Back to the default answers and the opening question (a form reset),
+    /// then `on_reset`.
     pub fn reset(&self) {
         self.answers.set(self.items.iter().map(ItemAnswer::initial).collect());
         for (field, item) in self.fields.iter().zip(self.items.iter()) {
             field.set_text(item.default_value.clone());
         }
-        let start = opening(&self.items, &self.disabled.get(), self.default_item.as_deref());
-        self.open(start);
+        self.open(self.start);
+        if let Some(f) = self.props.with_untracked(|p| p.props.on_reset.clone()) {
+            f.call(self.clone());
+        }
     }
 
     /// The questionnaire's keys, seen once the focus is inside it: arrows
@@ -567,7 +595,7 @@ impl Questionnaire {
         if m.command || m.control || m.alt {
             return false;
         }
-        let i = self.active.get();
+        let i = self.active();
         if ev.is(NamedKey::ArrowLeft) {
             self.previous();
             return true;
@@ -582,7 +610,7 @@ impl Questionnaire {
             return self.move_choice_focus(i, ev.is(NamedKey::ArrowDown));
         }
         let typed = ev.text.as_deref().and_then(|t| t.chars().next());
-        let picked = self.shortcuts.get().zip(typed).and_then(|(s, c)| s.index(c));
+        let picked = self.shortcuts().zip(typed).and_then(|(s, c)| s.index(c));
         let Some((k, item)) = picked.zip(self.active_item()) else {
             return false;
         };
@@ -614,6 +642,15 @@ impl Questionnaire {
     }
 }
 
+/// The questionnaire around a part (Vue's `injectQuestionnaireContext`).
+fn use_questionnaire() -> Option<Questionnaire> {
+    use_context::<Questionnaire>()
+}
+
+/// The question a part sits in (Vue's item context): its name.
+#[derive(Clone)]
+struct ItemContext(String);
+
 /// The item a questionnaire opens on: `default_item` when it takes part,
 /// else the first that does (Vue's `getInitialItemName`).
 fn opening(items: &[QuestionnaireItem], disabled: &[bool], default_item: Option<&str>) -> usize {
@@ -629,47 +666,187 @@ fn opening(items: &[QuestionnaireItem], disabled: &[bool], default_item: Option<
 const PROGRESS_MIN_WIDTH: f32 = 108.406;
 
 /// The form: a column holding progress, the items and the actions; it
-/// takes the questionnaire's keys.
+/// keeps the answers and the open question, and takes the questionnaire's
+/// keys. `items` are its questions in order (Vue's `items`).
 #[must_use]
-pub fn questionnaire(q: &Questionnaire) -> Div {
-    let q = q.clone();
-    div()
-        .named("questionnaire")
-        .flex_col()
-        .w_full()
-        .min_w(0.0)
-        .gap(6.0)
-        .on_key_down(move |ev| q.key(ev))
+pub fn questionnaire(items: Vec<QuestionnaireItem>) -> Part<QuestionnaireProps> {
+    let props = QuestionnaireProps {
+        items,
+        item: Bind::default_value(String::new()),
+        shortcuts: None,
+        on_submit: None,
+        on_change: None,
+        on_reset: None,
+    };
+    let root = div().named("questionnaire").flex_col().w_full().min_w(0.0).gap(6.0);
+    Part::new(props, root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let q = Questionnaire::new(props);
+            provide(q.clone());
+            move || {
+                let q = q.clone();
+                props
+                    .with(|p| p.slot.0.clone())
+                    .on_key_down(move |ev| q.key(ev))
+                    .into_element()
+            }
+        })
+    })
+}
+
+impl Part<QuestionnaireProps> {
+    /// The question it opens on, when it takes part (Vue's `default-item`).
+    #[must_use]
+    pub fn default_item(self, name: &str) -> Self {
+        let name = name.to_owned();
+        self.with_props(|p| p.item = p.item.clone().with_default(name))
+    }
+
+    /// The open question's name, kept by the caller both ways
+    /// (`v-model:item`).
+    #[must_use]
+    pub fn item(self, model: Model<String>) -> Self {
+        self.with_props(|p| p.item = p.item.clone().with_model(model))
+    }
+
+    /// The open question's name as the caller shows it (`:item`): a move to
+    /// another question only calls [`Self::on_item_change`].
+    #[must_use]
+    pub fn item_value(self, name: &str) -> Self {
+        let name = name.to_owned();
+        self.with_props(|p| p.item = p.item.clone().with_value(name))
+    }
+
+    /// Called with the name of each question opened (`@update:item`).
+    #[must_use]
+    pub fn on_item_change(self, f: impl Fn(String) + 'static) -> Self {
+        self.with_props(|p| p.item = p.item.clone().on_change(f))
+    }
+
+    /// The keys that pick a choice (`:shortcuts`), read as they change.
+    #[must_use]
+    pub fn shortcuts(self, shortcuts: Option<QuestionnaireShortcuts>) -> Self {
+        self.with_props(|p| p.shortcuts = shortcuts)
+    }
+
+    /// Called with the questionnaire and every answer once all are valid (`@submit`).
+    #[must_use]
+    pub fn on_submit(self, f: impl Fn(&Questionnaire, Vec<QuestionnaireAnswer>) + 'static) -> Self {
+        let f = Callback::new(move |(q, answers): (Questionnaire, Vec<QuestionnaireAnswer>)| f(&q, answers));
+        self.with_props(|p| p.on_submit = Some(f))
+    }
+
+    /// Called with the questionnaire, the item's name and the choice's value
+    /// each time a choice is checked or unchecked (a choice's `@change`).
+    #[must_use]
+    pub fn on_change(self, f: impl Fn(&Questionnaire, &str, &str) + 'static) -> Self {
+        let f = Callback::new(move |(q, name, value): (Questionnaire, String, String)| f(&q, &name, &value));
+        self.with_props(|p| p.on_change = Some(f))
+    }
+
+    /// Called after the answers are reset (`@reset`).
+    #[must_use]
+    pub fn on_reset(self, f: impl Fn(&Questionnaire) + 'static) -> Self {
+        let f = Callback::new(move |q: Questionnaire| f(&q));
+        self.with_props(|p| p.on_reset = Some(f))
+    }
+}
+
+/// Where the questionnaire stands, for a progress of one's own (the
+/// progress slot's props).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuestionnaireProgressState {
+    /// The open question's place, from 1.
+    pub current: usize,
+    pub total: usize,
+}
+
+/// What a part rendered from the questionnaire's state is given: a view of
+/// it, made anew by each render of the parent (a slot).
+#[derive(Clone)]
+pub struct QuestionnaireView<S: 'static>(Rc<dyn Fn(S) -> Element>);
+
+impl<S: 'static> PartialEq for QuestionnaireView<S> {
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
 }
 
 /// "Question 2 of 3".
 #[must_use]
-pub fn questionnaire_progress(q: &Questionnaire) -> Div {
-    questionnaire_progress_with(format!("Question {} of {}", q.current(), q.total()))
+pub fn questionnaire_progress() -> Part<QuestionnaireView<QuestionnaireProgressState>> {
+    questionnaire_progress_with(|s| text(format!("Question {} of {}", s.current, s.total)).into_element())
 }
 
-/// The progress box around `content` of one's own (Vue's progress slot,
-/// built from [`Questionnaire::current`] and [`Questionnaire::total`]).
+/// The progress box around what `content` makes of the questionnaire's
+/// place (Vue's progress slot, with its `current` and `total`).
 #[must_use]
-pub fn questionnaire_progress_with(content: impl IntoElement) -> Div {
+pub fn questionnaire_progress_with(
+    content: impl Fn(QuestionnaireProgressState) -> Element + 'static,
+) -> Part<QuestionnaireView<QuestionnaireProgressState>> {
     let t = theme();
-    div()
+    let root = div()
         .named("questionnaire-progress")
         .self_start()
         .min_w_px(PROGRESS_MIN_WIDTH)
         .text_xs()
         .font_medium()
         .text_color(t.muted_foreground)
-        .tabular_nums()
-        .child(content)
+        .tabular_nums();
+    Part::new(QuestionnaireView(Rc::new(content)), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let q = use_questionnaire();
+            move || {
+                let state = q
+                    .as_ref()
+                    .map_or(QuestionnaireProgressState { current: 0, total: 0 }, |q| {
+                        QuestionnaireProgressState {
+                            current: q.current(),
+                            total: q.total(),
+                        }
+                    });
+                props
+                    .with(|p| p.slot.0.clone().child((p.props.0)(state)))
+                    .into_element()
+            }
+        })
+    })
 }
 
-/// One question; `None` unless it is the open one (Vue hides the rest).
-/// Fill it with title, description, choices and error.
+/// What a part of one question is given: the question's name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QuestionnaireItemProps {
+    name: String,
+}
+
+/// One question, shown while it is the open one (Vue hides the rest). Fill
+/// it with title, description, choices and error: they belong to it.
 #[must_use]
-pub fn questionnaire_item(q: &Questionnaire, name: &str) -> Option<Div> {
-    let i = q.index(name)?;
-    (i == q.active.get() && !q.is_disabled(i)).then(|| div().named("questionnaire-item").flex_col().gap(5.0).min_w(0.0))
+pub fn questionnaire_item(name: &str) -> Part<QuestionnaireItemProps> {
+    let root = div().named("questionnaire-item").flex_col().gap(5.0).min_w(0.0);
+    Part::new(QuestionnaireItemProps { name: name.to_owned() }, root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let name = props.with_untracked(|p| p.props.name.clone());
+            provide(ItemContext(name));
+            let q = use_questionnaire();
+            move || {
+                props.with(|p| {
+                    let shown = q.as_ref().is_some_and(|q| {
+                        q.index(&p.props.name)
+                            .is_some_and(|i| i == q.active() && !q.is_disabled(i))
+                    });
+                    if shown {
+                        p.slot.0.clone().into_element()
+                    } else {
+                        Element::Empty
+                    }
+                })
+            }
+        })
+    })
 }
 
 /// The question.
@@ -700,17 +877,47 @@ pub fn questionnaire_choices() -> Div {
     div().named("questionnaire-choices").grid().gap(3.0).min_w(0.0)
 }
 
-/// A choice of question `name` with `value`: a box (radio or checkbox),
-/// its `label` with an optional muted second line, and its shortcut key.
+/// What a choice is given. Its label is the parent's slot, made anew by
+/// each render: never equal.
+#[derive(Clone)]
+pub struct QuestionnaireChoiceProps {
+    value: String,
+    label: Element,
+    description: Option<String>,
+}
+
+impl PartialEq for QuestionnaireChoiceProps {
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
+}
+
+/// A choice of the question it sits in, with `value`: a box (radio or
+/// checkbox), its `label` with an optional muted second line, and its
+/// shortcut key.
 #[must_use]
-pub fn questionnaire_choice(
-    q: &Questionnaire,
-    name: &str,
-    value: &str,
-    label: impl IntoElement,
-    description: Option<&str>,
-) -> Div {
+pub fn questionnaire_choice(value: &str, label: impl IntoElement, description: Option<&str>) -> ComponentElement {
+    let props = QuestionnaireChoiceProps {
+        value: value.to_owned(),
+        label: label.into_element(),
+        description: description.map(str::to_owned),
+    };
+    component(props, |cx| {
+        let props = cx.props();
+        let q = use_questionnaire();
+        let item = use_context::<ItemContext>();
+        move || {
+            let (Some(q), Some(ItemContext(name))) = (&q, &item) else {
+                return Element::Empty;
+            };
+            props.with(|p| choice(q, name, p)).into_element()
+        }
+    })
+}
+
+fn choice(q: &Questionnaire, name: &str, p: &QuestionnaireChoiceProps) -> Div {
     let t = theme();
+    let (value, description) = (p.value.as_str(), p.description.as_deref());
     let i = q.index(name).unwrap_or_default();
     let item = q.items.get(i).cloned();
     let k = item
@@ -721,7 +928,7 @@ pub fn questionnaire_choice(
     let words = q.words(i);
     let checked = item.as_ref().is_some_and(|it| q.answer(i).checked(it, &words, value));
     let invalid = q.invalid(i);
-    let shortcut = q.shortcuts.get().and_then(|s| s.key(k));
+    let shortcut = q.shortcuts().and_then(|s| s.key(k));
     let focus = q.choice_focus.get(i).and_then(|f| f.get(k)).copied();
 
     // Vue's `translate-y-[--spacing(0.45)]` (`translate-y-0.5` beside a
@@ -769,7 +976,7 @@ pub fn questionnaire_choice(
     });
 
     let (q2, name2, value2) = (q.clone(), name.to_owned(), value.to_owned());
-    let (q3, name3, value3) = (q.clone(), name.to_owned(), value.to_owned());
+    let (q3, value3) = (q.clone(), value.to_owned());
     div()
         .named("questionnaire-choice")
         .transition_colors()
@@ -802,7 +1009,6 @@ pub fn questionnaire_choice(
             if !ev.is(NamedKey::Enter) || ev.modifiers.command || ev.modifiers.control {
                 return false;
             }
-            let i = q3.index(&name3).unwrap_or_default();
             let words = q3.words(i);
             let checked = q3
                 .items
@@ -822,7 +1028,7 @@ pub fn questionnaire_choice(
                 .min_w(0.0)
                 .gap(1.0)
                 .leading_snug()
-                .child(label)
+                .child(p.label.clone())
                 .child(description.map(choice_description)),
         )
         .child(key)
@@ -835,49 +1041,111 @@ fn choice_description(description: &str) -> Text {
         .text_color(theme().muted_foreground)
 }
 
+/// What [`questionnaire_input`] is given.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct QuestionnaireInputProps {
+    placeholder: Option<String>,
+}
+
 /// The text box for an answer of one's own, after the choices of an item
 /// declared [`QuestionnaireItem::with_input`].
 #[must_use]
-pub fn questionnaire_input(q: &Questionnaire, name: &str) -> Option<TextInput> {
-    let t = theme();
-    let i = q.index(name)?;
-    let field = q.fields.get(i)?;
-    let invalid = q.invalid(i);
-    Some(
-        input(field)
-            .named("questionnaire-input")
-            .transition_props(Properties::COLOR | Properties::SHADOW | Properties::BACKGROUND)
-            .selection_color(t.primary)
-            .when(invalid, |d| {
-                d.border_color(t.destructive)
-                    .ring(3.0, t.destructive.opacity(if t.dark { 0.4 } else { 0.2 }))
-            })
-            .when(invalid, |d| d.focus_visible(move |s| destructive_ring(s, &t))),
-    )
+pub fn questionnaire_input() -> QuestionnaireInput {
+    QuestionnaireInput(QuestionnaireInputProps::default())
+}
+
+/// A [`questionnaire_input`] being built.
+pub struct QuestionnaireInput(QuestionnaireInputProps);
+
+impl QuestionnaireInput {
+    #[must_use]
+    pub fn placeholder(mut self, placeholder: impl Into<String>) -> Self {
+        self.0.placeholder = Some(placeholder.into());
+        self
+    }
+}
+
+impl IntoElement for QuestionnaireInput {
+    fn into_element(self) -> Element {
+        component(self.0, |cx| {
+            let props = cx.props();
+            let q = use_questionnaire();
+            let item = use_context::<ItemContext>();
+            move || {
+                let t = theme();
+                let (Some(q), Some(ItemContext(name))) = (&q, &item) else {
+                    return Element::Empty;
+                };
+                let Some(i) = q.index(name) else {
+                    return Element::Empty;
+                };
+                let Some(field) = q.fields.get(i) else {
+                    return Element::Empty;
+                };
+                let invalid = q.invalid(i);
+                input()
+                    .field(*field)
+                    .named("questionnaire-input")
+                    .transition_props(Properties::COLOR | Properties::SHADOW | Properties::BACKGROUND)
+                    .when_some(props.with(|p| p.placeholder.clone()), crate::input::Input::placeholder)
+                    .when(invalid, |d| {
+                        d.border_color(t.destructive)
+                            .ring(3.0, t.destructive.opacity(if t.dark { 0.4 } else { 0.2 }))
+                    })
+                    .map(move |el| {
+                        el.selection_color(t.primary)
+                            .when(invalid, |d| d.focus_visible(move |s| destructive_ring(s, &t)))
+                    })
+                    .into_element()
+            }
+        })
+        .into_element()
+    }
 }
 
 /// What is missing, shown once moving on was tried without an answer.
 #[must_use]
-pub fn questionnaire_error(q: &Questionnaire, name: &str) -> Option<Text> {
-    let required = q.items.get(q.index(name)?)?.required;
-    let message = if required {
-        "Choose an answer to continue."
-    } else {
-        "Choose an answer or skip this question."
-    };
-    questionnaire_error_with(q, name, message)
+pub fn questionnaire_error() -> ComponentElement {
+    error_part(None)
 }
 
 /// The error with a message of one's own (Vue's error slot), shown while
-/// question `name` is invalid; an empty message keeps an empty line.
+/// the question is invalid; an empty message keeps an empty line.
 #[must_use]
-pub fn questionnaire_error_with(q: &Questionnaire, name: &str, message: impl Into<String>) -> Option<Text> {
-    let i = q.index(name)?;
-    q.invalid(i).then(|| {
-        text(message)
-            .named("questionnaire-error")
-            .text_sm()
-            .text_color(theme().destructive)
+pub fn questionnaire_error_with(message: impl Into<String>) -> ComponentElement {
+    error_part(Some(message.into()))
+}
+
+fn error_part(message: Option<String>) -> ComponentElement {
+    component(message, |cx| {
+        let message = cx.props();
+        let q = use_questionnaire();
+        let item = use_context::<ItemContext>();
+        move || {
+            let (Some(q), Some(ItemContext(name))) = (&q, &item) else {
+                return Element::Empty;
+            };
+            let Some(i) = q.index(name) else {
+                return Element::Empty;
+            };
+            if !q.invalid(i) {
+                return Element::Empty;
+            }
+            let required = q.items.get(i).is_some_and(|it| it.required);
+            let message = message.get().unwrap_or_else(|| {
+                if required {
+                    "Choose an answer to continue."
+                } else {
+                    "Choose an answer or skip this question."
+                }
+                .to_owned()
+            });
+            text(message)
+                .named("questionnaire-error")
+                .text_sm()
+                .text_color(theme().destructive)
+                .into_element()
+        }
     })
 }
 
@@ -894,83 +1162,170 @@ pub fn questionnaire_actions() -> Div {
         .gap(2.0)
 }
 
-/// Back one question; hidden on the first.
-#[must_use]
-pub fn questionnaire_previous(q: &Questionnaire, label: &str) -> Option<Div> {
-    let q2 = q.clone();
-    (q.total() > 1 && !q.first()).then(|| {
-        let mut b = button(ButtonVariant::Outline, ButtonSize::Default)
-            .named("questionnaire-previous")
-            .col_start(1)
-            .row_start(1)
-            .child(label.to_owned())
-            .on_click(move |_| q2.previous());
+/// Which navigation button a part is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Nav {
+    Previous,
+    Skip,
+    Next,
+    Submit,
+}
+
+/// When a navigation button is disabled: from the open question's status
+/// (the buttons' slot `status`).
+type DisabledWhen = Rc<dyn Fn(Option<QuestionnaireStatus>) -> bool>;
+
+/// What a navigation button is given.
+#[derive(Clone)]
+pub struct QuestionnaireNavProps {
+    nav: Nav,
+    label: String,
+    variant: ButtonVariant,
+    disabled_when: Option<DisabledWhen>,
+}
+
+impl PartialEq for QuestionnaireNavProps {
+    fn eq(&self, other: &Self) -> bool {
+        // `disabled_when` is a closure the parent makes anew: never equal.
+        self.disabled_when.is_none()
+            && other.disabled_when.is_none()
+            && (self.nav, &self.label, self.variant) == (other.nav, &other.label, other.variant)
+    }
+}
+
+/// A navigation button being built.
+pub struct QuestionnaireNav(QuestionnaireNavProps);
+
+impl QuestionnaireNav {
+    fn new(nav: Nav, label: &str) -> Self {
+        Self(QuestionnaireNavProps {
+            nav,
+            label: label.to_owned(),
+            variant: ButtonVariant::Default,
+            disabled_when: None,
+        })
+    }
+
+    /// Drawn as `variant` (Vue's `variant` on the button).
+    #[must_use]
+    pub fn variant(mut self, variant: ButtonVariant) -> Self {
+        self.0.variant = variant;
+        self
+    }
+
+    /// Disabled while `f` says so of the open question's status (Vue's
+    /// `v-slot="{ status }" :disabled="…"`).
+    #[must_use]
+    pub fn disabled_when(mut self, f: impl Fn(Option<QuestionnaireStatus>) -> bool + 'static) -> Self {
+        self.0.disabled_when = Some(Rc::new(f));
+        self
+    }
+}
+
+impl IntoElement for QuestionnaireNav {
+    fn into_element(self) -> Element {
+        component(self.0, |cx| {
+            let props = cx.props();
+            let q = use_questionnaire();
+            move || {
+                let Some(q) = q.clone() else {
+                    return Element::Empty;
+                };
+                props
+                    .with(|p| nav_button(q, p))
+                    .map_or(Element::Empty, IntoElement::into_element)
+            }
+        })
+        .into_element()
+    }
+}
+
+fn nav_button(q: Questionnaire, p: &QuestionnaireNavProps) -> Option<Div> {
+    let shown = match p.nav {
+        Nav::Previous => q.total() > 1 && !q.first(),
+        Nav::Skip => q.active_item().is_some_and(|it| !it.required),
+        Nav::Next => q.total() > 1 && !q.last(),
+        Nav::Submit => q.total() > 0 && q.last(),
+    };
+    if !shown {
+        return None;
+    }
+    let disabled = p.disabled_when.as_ref().is_some_and(|f| f(q.active_status()));
+    let (name, column) = match p.nav {
+        Nav::Previous => ("questionnaire-previous", 1),
+        Nav::Skip => ("questionnaire-skip", 2),
+        Nav::Next => ("questionnaire-next", 3),
+        Nav::Submit => ("questionnaire-submit", 3),
+    };
+    let variant = match p.nav {
+        Nav::Previous | Nav::Skip => ButtonVariant::Outline,
+        Nav::Next | Nav::Submit => p.variant,
+    };
+    let nav = p.nav;
+    let b = button(variant, ButtonSize::Default)
+        .named(name)
+        .col_start(column)
+        .row_start(1)
+        .child(p.label.clone())
+        .disabled(disabled)
+        .on_click(move |_| match nav {
+            Nav::Previous => q.previous(),
+            Nav::Skip => q.skip(),
+            Nav::Next => q.next(),
+            Nav::Submit => q.submit(),
+        });
+    Some(if nav == Nav::Previous {
+        let mut b = b;
         b.style_mut().justify_self = Some(Align::Start);
         b
+    } else {
+        b.justify_self_end()
     })
+}
+
+/// Back one question; hidden on the first.
+#[must_use]
+pub fn questionnaire_previous(label: &str) -> QuestionnaireNav {
+    QuestionnaireNav::new(Nav::Previous, label)
 }
 
 /// Skip this question; shown only on optional questions.
 #[must_use]
-pub fn questionnaire_skip(q: &Questionnaire, label: &str) -> Option<Div> {
-    let q2 = q.clone();
-    let optional = q.active_item().is_some_and(|it| !it.required);
-    optional.then(|| {
-        button(ButtonVariant::Outline, ButtonSize::Default)
-            .named("questionnaire-skip")
-            .col_start(2)
-            .row_start(1)
-            .justify_self_end()
-            .child(label.to_owned())
-            .on_click(move |_| q2.skip())
-    })
+pub fn questionnaire_skip(label: &str) -> QuestionnaireNav {
+    QuestionnaireNav::new(Nav::Skip, label)
 }
 
 /// On to the next question; hidden on the last.
 #[must_use]
-pub fn questionnaire_next(q: &Questionnaire, label: &str) -> Option<Div> {
-    questionnaire_next_with(q, label, ButtonVariant::Default, false)
-}
-
-/// [`questionnaire_next`] in another `variant`, or `disabled`.
-#[must_use]
-pub fn questionnaire_next_with(q: &Questionnaire, label: &str, variant: ButtonVariant, disabled: bool) -> Option<Div> {
-    let q2 = q.clone();
-    (q.total() > 1 && !q.last()).then(|| {
-        button(variant, ButtonSize::Default)
-            .named("questionnaire-next")
-            .col_start(3)
-            .row_start(1)
-            .justify_self_end()
-            .child(label.to_owned())
-            .disabled(disabled)
-            .on_click(move |_| q2.next())
-    })
+pub fn questionnaire_next(label: &str) -> QuestionnaireNav {
+    QuestionnaireNav::new(Nav::Next, label)
 }
 
 /// Submit every answer; shown only on the last question.
 #[must_use]
-pub fn questionnaire_submit(q: &Questionnaire, label: &str) -> Option<Div> {
-    questionnaire_submit_with(q, label, ButtonVariant::Default, false)
+pub fn questionnaire_submit(label: &str) -> QuestionnaireNav {
+    QuestionnaireNav::new(Nav::Submit, label)
 }
 
-/// [`questionnaire_submit`] in another `variant`, or `disabled`.
+/// `button` as the form's reset (`type="reset"`): back to the default
+/// answers and the opening question, then the questionnaire's `on_reset`.
 #[must_use]
-pub fn questionnaire_submit_with(
-    q: &Questionnaire,
-    label: &str,
-    variant: ButtonVariant,
-    disabled: bool,
-) -> Option<Div> {
-    let q2 = q.clone();
-    (q.total() > 0 && q.last()).then(|| {
-        button(variant, ButtonSize::Default)
-            .named("questionnaire-submit")
-            .col_start(3)
-            .row_start(1)
-            .justify_self_end()
-            .child(label.to_owned())
-            .disabled(disabled)
-            .on_click(move |_| q2.submit())
+pub fn questionnaire_reset(button: Div) -> Part<()> {
+    Part::new((), button, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let q = use_questionnaire();
+            move || {
+                let q = q.clone();
+                props
+                    .with(|p| p.slot.0.clone())
+                    .on_click(move |_| {
+                        if let Some(q) = &q {
+                            q.reset();
+                        }
+                    })
+                    .into_element()
+            }
+        })
     })
 }

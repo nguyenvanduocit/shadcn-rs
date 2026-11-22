@@ -2,7 +2,7 @@
 //! and the steps it researched with.
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
     BadgeVariant, CodeBlockContentProps, CodeBlockProps, CodeBlockSize, TraceStatus, badge, code_block,
     code_block_content, code_block_lines, spinner, trace, trace_action, trace_collapsible, trace_collapsible_content,
@@ -49,7 +49,7 @@ impl Reasoning {
         self.thinking.set(true);
         self.answer.set(String::new());
         self.open.reset(false);
-        let (replied, open, thinking) = (self.replied.clone(), self.open.clone(), self.thinking.clone());
+        let (replied, open, thinking) = (self.replied, self.open.clone(), self.thinking);
         let mut steps: Vec<Step> = vec![after(300, move || replied.set(true))];
         let first = open.clone();
         steps.push(after(0, move || first.follow(true)));
@@ -73,16 +73,17 @@ impl Reasoning {
         let title = if live { "Thinking" } else { "Thought for 5s" };
         let thought = self.thought.get();
         let row = if thought.is_empty() {
-            trace_line(status).child(trace_title(title))
+            trace_line(status).child(trace_title(title)).into_element()
         } else {
             let open = &self.open.open;
             trace_collapsible()
+                .model(Model::bind(*open))
                 .child(trace_collapsible_trigger(
-                    open,
                     false,
                     trace_line(status).child(trace_title(title)),
                 ))
-                .child(trace_collapsible_content(open, |c| c.child(text(thought))))
+                .child(trace_collapsible_content().map_root(|c| c.child(text(thought))))
+                .into_element()
         };
         let me = self.clone();
         thread()
@@ -97,14 +98,14 @@ impl Reasoning {
     }
 }
 
-fn duration(open: &Signal<bool>) -> Div {
+fn duration() -> Div {
     let line = trace_line(None)
         .child(trace_icon(icon(Icon::CircleCheck)))
         .child(trace_title("Thought"))
         .child(trace_description("12s"));
     trace().max_w(96.0).child(
-        trace_collapsible().child(trace_collapsible_trigger(open, false, line)).child(
-            trace_collapsible_content(open, |c| {
+        trace_collapsible().child(trace_collapsible_trigger(false, line)).child(
+            trace_collapsible_content().map_root(|c| {
                 c.child(text(
                     "The build log shows install and compile finish in under a minute. Image optimization takes almost four, and it reruns on every deploy because the cache key includes the commit hash.",
                 ))
@@ -259,13 +260,13 @@ impl ChainOfThought {
         for (open, fresh) in self.steps.iter().zip(step_opens()) {
             open.set(fresh.get());
         }
-        let (replied, summary) = (self.replied.clone(), self.summary.clone());
+        let (replied, summary) = (self.replied, self.summary.clone());
         let mut steps = vec![after(300, move || {
             replied.set(true);
             summary.follow(true);
         })];
         for i in 1..=RESEARCH.len() {
-            let (started, finished) = (self.started.clone(), self.finished.clone());
+            let (started, finished) = (self.started, self.finished);
             steps.push(after(0, move || started.set(i)));
             steps.push(after(900, move || finished.set(i)));
         }
@@ -307,8 +308,9 @@ impl ChainOfThought {
                     return status_line(Some(status), r.title(Some(status))).into_element();
                 }
                 trace_collapsible()
-                    .child(trace_collapsible_trigger(open, false, status_line(None, r.title(None))))
-                    .child(trace_collapsible_content(open, |c| c.child(r.output())))
+                    .model(Model::bind(*open))
+                    .child(trace_collapsible_trigger(false, status_line(None, r.title(None))))
+                    .child(trace_collapsible_content().map_root(|c| c.child(r.output())))
                     .into_element()
             });
         let open = &self.summary.open;
@@ -316,12 +318,9 @@ impl ChainOfThought {
             trace()
                 .child(
                     trace_collapsible()
-                        .child(trace_collapsible_trigger(
-                            open,
-                            false,
-                            status_line(summary_status, title),
-                        ))
-                        .child(trace_collapsible_content(open, |c| c.child(trace().children(rows)))),
+                        .model(Model::bind(*open))
+                        .child(trace_collapsible_trigger(false, status_line(summary_status, title)))
+                        .child(trace_collapsible_content().map_root(|c| c.child(trace().children(rows)))),
                 )
                 .into_element()
         });
@@ -337,7 +336,6 @@ impl ChainOfThought {
 
 pub fn render() -> Render {
     let reasoning = Reasoning::new();
-    let thought = Signal::labeled("thought open", false);
     let chain = ChainOfThought::new();
     Box::new(move || {
         page(
@@ -346,7 +344,7 @@ pub fn render() -> Render {
                 .flex_col()
                 .gap(10.0)
                 .child(demo("ReasoningDemo.vue", reasoning.view()))
-                .child(demo("ReasoningDurationDemo.vue", duration(&thought)))
+                .child(demo("ReasoningDurationDemo.vue", duration()))
                 .child(demo("ChainOfThoughtDemo.vue", chain.view())),
         )
     })

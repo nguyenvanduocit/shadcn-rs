@@ -1,0 +1,10 @@
+# Chrome's boxes for fit_content.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 200 82
+  div 0 0 70 10
+    div 0 0 70 10
+  div 0 10 85.84375 24
+    p 0 10 85.84375 24
+  div 0 34 200 48
+    p 0 34 200 48

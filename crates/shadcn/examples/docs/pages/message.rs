@@ -1,13 +1,13 @@
 use gui::prelude::*;
 use gui::{Div, Icon, ScenarioError, Signal, div, icon, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, ButtonSize, ButtonVariant, CodeBlockCopy,
-    MarkerVariant, MessageProps, TooltipState, avatar, avatar_fallback, bubble, bubble_content, bubble_group,
-    bubble_reactions, button, marker, message, message_avatar, message_content, message_footer, message_group,
-    message_header, theme, tooltip, tooltip_content, tooltip_trigger,
+    BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, ButtonSize, ButtonVariant, MarkerVariant,
+    MessageProps, avatar, avatar_fallback, bubble, bubble_content, bubble_group, bubble_reactions, button, marker,
+    message, message_avatar, message_content, message_footer, message_group, message_header, theme, tooltip,
+    tooltip_content, tooltip_trigger,
 };
 
-use super::markdown::Markdown;
+use super::markdown::markdown;
 use crate::{Render, Shot, demo, page};
 
 use BubbleAlign::{End, Start};
@@ -125,34 +125,33 @@ Wrap the button in a `DialogTrigger` and put the settings form in `DialogContent
 /// MessagePatternDemo's state: the reply's code block, the copy and
 /// feedback buttons and the tooltip of each action.
 struct Pattern {
-    markdown: Markdown,
-    copied: CodeBlockCopy,
+    /// Whether the reply was copied in the last two seconds.
+    copied: Signal<bool>,
+    /// Owns the timer that clears `copied`.
+    owner: gui::Scope,
     feedback: Signal<Option<bool>>,
-    tips: [TooltipState; 6],
 }
 
 impl Pattern {
     fn new() -> Self {
         Self {
-            markdown: Markdown::new(),
-            copied: CodeBlockCopy::new(),
+            copied: Signal::labeled("reply copied", false),
+            owner: gui::Scope::new(),
             feedback: Signal::labeled("feedback", None),
-            tips: std::array::from_fn(|_| TooltipState::new()),
         }
     }
 
     /// A ghost action under a message, named by its tooltip.
-    fn action(tip: &TooltipState, label: &str, glyph: Icon, on_click: impl Fn() + 'static) -> Div {
+    fn action(label: &str, glyph: Icon, on_click: impl Fn() + 'static) -> gui::Element {
         tooltip()
             .child(tooltip_trigger(
-                tip,
                 ghost_icon(ButtonSize::IconSm, glyph).on_click(move |_| on_click()),
             ))
-            .child(tooltip_content(tip, |c| c.child(text(label.to_owned()))))
+            .child(tooltip_content().child(text(label.to_owned())))
+            .into_element()
     }
 
     fn view(&self) -> Div {
-        let [copy_ask, edit, copy_reply, like, dislike, retry] = &self.tips;
         let ask = MessageProps {
             align: End,
             ..MessageProps::default()
@@ -165,10 +164,16 @@ impl Pattern {
             bubble: BubbleVariant::Ghost,
             ..MessageProps::default()
         };
-        let copied = self.copied.copied();
-        let (copy, feedback) = (self.copied.clone(), self.feedback.clone());
-        let (up, down) = (feedback.clone(), feedback);
-        let vote = |s: &Signal<Option<bool>>, v: bool| s.update(|f| if f == Some(v) { None } else { Some(v) });
+        let copied = self.copied.get();
+        let (flag, owner, feedback) = (self.copied, self.owner, self.feedback);
+        let copy = move || {
+            if gui::clipboard::copy(REPLY) {
+                flag.set(true);
+                owner.run(|| gui::clock::after(std::time::Duration::from_secs(2), move || flag.set(false)));
+            }
+        };
+        let (up, down) = (feedback, feedback);
+        let vote = |s: &Signal<Option<bool>>, v: bool| s.update(|f| *f = if *f == Some(v) { None } else { Some(v) });
         div()
             .mx_auto()
             .flex_col()
@@ -188,32 +193,26 @@ impl Pattern {
                         ))
                         .child(
                             message_footer(ask)
-                                .child(Self::action(copy_ask, "Copy", Icon::Copy, || {}))
-                                .child(Self::action(edit, "Edit", Icon::Pencil, || {})),
+                                .child(Self::action("Copy", Icon::Copy, || {}))
+                                .child(Self::action("Edit", Icon::Pencil, || {})),
                         ),
                 ),
             )
             .child(
                 message(reply).child(
-                    message_content(reply)
-                        .gap(2.0)
-                        .child(self.markdown.render(REPLY, 14.0))
-                        .child(
-                            message_footer(reply)
-                                .child(Self::action(
-                                    copy_reply,
-                                    if copied { "Copied" } else { "Copy" },
-                                    if copied { Icon::Check } else { Icon::Copy },
-                                    move || copy.copy(REPLY),
-                                ))
-                                .child(Self::action(like, "Good response", Icon::ThumbsUp, move || {
-                                    vote(&up, true)
-                                }))
-                                .child(Self::action(dislike, "Bad response", Icon::ThumbsDown, move || {
-                                    vote(&down, false);
-                                }))
-                                .child(Self::action(retry, "Retry", Icon::RefreshCcw, || {})),
-                        ),
+                    message_content(reply).gap(2.0).child(markdown(REPLY, 14.0)).child(
+                        message_footer(reply)
+                            .child(Self::action(
+                                if copied { "Copied" } else { "Copy" },
+                                if copied { Icon::Check } else { Icon::Copy },
+                                copy,
+                            ))
+                            .child(Self::action("Good response", Icon::ThumbsUp, move || vote(&up, true)))
+                            .child(Self::action("Bad response", Icon::ThumbsDown, move || {
+                                vote(&down, false);
+                            }))
+                            .child(Self::action("Retry", Icon::RefreshCcw, || {})),
+                    ),
                 ),
             )
     }

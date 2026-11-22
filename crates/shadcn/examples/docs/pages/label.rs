@@ -7,7 +7,7 @@ use crate::{Render, Shot, demo, page};
 pub fn render() -> Render {
     let terms = Signal::labeled("terms", false);
     Box::new(move || {
-        let flip = terms.clone();
+        let flip = terms;
         page(
             "Label",
             demo(
@@ -16,9 +16,9 @@ pub fn render() -> Render {
                     .flex()
                     .items_center()
                     .gap(2.0)
-                    .child(checkbox(&terms))
+                    .child(checkbox().model(terms))
                     // `for="terms"`: a click on the label flips the checkbox.
-                    .child(label("Accept terms and conditions").on_click(move |_| flip.update(|v| !v))),
+                    .child(label("Accept terms and conditions").on_click(move |_| flip.update(|v| *v = !*v))),
             ),
         )
     })

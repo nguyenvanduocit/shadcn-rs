@@ -1,0 +1,11 @@
+# Chrome's boxes for flex_reverse.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 170
+  div 0 0 300 20
+    div 250 0 50 20
+    div 180 0 70 20
+    div 150 0 30 20
+  div 0 20 300 150
+    div 0 120 300 50
+    div 0 90 100 30

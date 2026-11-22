@@ -54,7 +54,7 @@ pub fn render() -> Render {
             ..plain
         };
         let uploading = with_state(AttachmentState::Uploading);
-        let o = opened.clone();
+        let o = opened;
         let trigger = demo(
             "AttachmentTriggerDemo.vue",
             div().mx_auto().w_full().max_w(96.0).py(12.0).child(
@@ -65,7 +65,7 @@ pub fn render() -> Render {
                     Some("Open preview dialog"),
                     &[Icon::Copy, Icon::X],
                 ))
-                .on_click(move |_| o.update(|n| n.saturating_add(1))),
+                .on_click(move |_| o.update(|n| *n = n.saturating_add(1))),
             ),
         );
         let gallery = demo(
@@ -185,7 +185,7 @@ pub fn render() -> Render {
                         .child(attachment_actions(plain).child(attachment_action(Icon::X)))
                 }))),
         );
-        let o = opened.clone();
+        let o = opened;
         let images = demo(
             "AttachmentImageDemo.vue",
             div()
@@ -197,7 +197,6 @@ pub fn render() -> Render {
                     attachment_group()
                         .w_full()
                         .children(photos.iter().map(|(name, meta, img)| {
-                            let o = o.clone();
                             attachment_trigger(
                                 attachment(vertical, AttachmentSlots::default())
                                     .flex_none()
@@ -212,7 +211,7 @@ pub fn render() -> Render {
                                     )
                                     .child(attachment_actions(vertical).child(attachment_action(Icon::X))),
                             )
-                            .on_click(move |_| o.update(|n| n.saturating_add(1)))
+                            .on_click(move |_| o.update(|n| *n = n.saturating_add(1)))
                         })),
                 ),
         );

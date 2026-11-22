@@ -1,9 +1,9 @@
 use gui::prelude::*;
 use gui::{Icon, ScenarioError, div, icon, text};
 use shadcn::{
-    ChartCrosshair, ChartIndicator, ChartMark, ChartPie, ChartRow, ChartSeries, ChartState, ChartXy, card,
-    card_content, card_description, card_footer, card_header, card_title, chart_container, chart_legend_content,
-    chart_pie, chart_summary, chart_xy, theme,
+    ChartCrosshair, ChartIndicator, ChartMark, ChartPie, ChartRow, ChartSeries, ChartXy, card, card_content,
+    card_description, card_footer, card_header, card_title, chart_container, chart_legend_content, chart_pie,
+    chart_summary, chart_xy, theme,
 };
 
 use crate::{Render, Shot, demo, page, section};
@@ -74,10 +74,6 @@ fn chart_card(title: &str, description: &str, chart: impl IntoElement, footer: &
 }
 
 pub fn render() -> Render {
-    let demo_states: [ChartState; 5] = std::array::from_fn(|_| ChartState::new());
-    let area = ChartState::new();
-    let bars = ChartState::new();
-    let line = ChartState::new();
     let stacked = rows(false);
     let grouped = rows(true);
     let visitors = ChartRow {
@@ -99,10 +95,10 @@ pub fn render() -> Render {
             series("Edge", c4),
             series("Other", c5),
         ];
-        let xy = |mark, config, rows, indicator, hide_label| ChartXy {
+        let xy = |mark, config: &[ChartSeries], rows: &[ChartRow], indicator, hide_label| ChartXy {
             mark,
-            config,
-            rows,
+            config: config.to_vec(),
+            rows: rows.to_vec(),
             width: CHART_W,
             height: CHART_H,
             axes: true,
@@ -142,21 +138,21 @@ pub fn render() -> Render {
                             .child(chart_card(
                                 "Area Chart - Stacked",
                                 "Showing total visitors for the last 6 months",
-                                chart_container().child(chart_xy(&area_chart, &area)),
+                                chart_container().child(chart_xy(area_chart)),
                                 "January - June 2024",
                             ))
                             .child(chart_card(
                                 "Bar Chart - Multiple",
                                 "January - June 2024",
                                 chart_container()
-                                    .child(chart_xy(&bar_chart, &bars))
+                                    .child(chart_xy(bar_chart))
                                     .child(chart_legend_content(&desktop_mobile)),
                                 "Showing total visitors for the last 6 months",
                             ))
                             .child(chart_card(
                                 "Line Chart",
                                 "January - June 2024",
-                                chart_container().child(chart_xy(&line_chart, &line)),
+                                chart_container().child(chart_xy(line_chart)),
                                 "Showing total visitors for the last 6 months",
                             ))
                             .child(chart_card(
@@ -174,17 +170,16 @@ pub fn render() -> Render {
                                 "Showing total visitors for the last 6 months",
                             )),
                     )
-                    .child(section("shadcn-vue demos", demos(&demo_states))),
+                    .child(section("shadcn-vue demos", demos())),
             ),
         )
     })
 }
 
 /// shadcn-vue's chart demos, one for one, for the verdict.
-fn demos(states: &[ChartState; 5]) -> gui::Div {
+fn demos() -> gui::Div {
     let t = theme();
     let [c1, c2, ..] = t.chart;
-    let [s_card, s_bar, s_axis, s_legend, s_tooltip] = states;
     let months = rows(true);
     let themed = [series("Desktop", c1), series("Mobile", c2)];
     let fixed = [
@@ -197,8 +192,8 @@ fn demos(states: &[ChartState; 5]) -> gui::Div {
             group_padding: 0.0,
             bar_padding: 0.1,
         },
-        config: &fixed,
-        rows: &months,
+        config: fixed.to_vec(),
+        rows: months.clone(),
         width: SPECIMEN_W,
         height,
         axes,
@@ -211,7 +206,7 @@ fn demos(states: &[ChartState; 5]) -> gui::Div {
             group_padding: 0.05,
             bar_padding: 0.0,
         },
-        config: &themed,
+        config: themed.to_vec(),
         width: CARD_CHART_W,
         height: CARD_CHART_W * 9.0 / 16.0,
         ..full(0.0, true, true)
@@ -234,7 +229,7 @@ fn demos(states: &[ChartState; 5]) -> gui::Div {
                         .child(card_title("Bar Chart - Multiple"))
                         .child(card_description("January - June 2024")),
                 )
-                .child(card_content().child(chart_container().child(chart_xy(&in_card, s_card))))
+                .child(card_content().child(chart_container().child(chart_xy(in_card))))
                 .child(
                     card_footer()
                         .flex_col()
@@ -257,28 +252,23 @@ fn demos(states: &[ChartState; 5]) -> gui::Div {
                         ),
                 ),
         ))
-        .child(demo(
-            "ChartBarDemo.vue",
-            chart_container().child(chart_xy(&plain, s_bar)),
-        ))
-        .child(demo(
-            "ChartBarDemoAxis.vue",
-            chart_container().child(chart_xy(&axes, s_axis)),
-        ))
+        .child(demo("ChartBarDemo.vue", chart_container().child(chart_xy(plain))))
+        .child(demo("ChartBarDemoAxis.vue", chart_container().child(chart_xy(axes))))
         .child(demo(
             "ChartBarDemoLegend.vue",
             chart_container()
-                .child(chart_xy(&legend, s_legend))
+                .child(chart_xy(legend))
                 .child(chart_legend_content(&fixed)),
         ))
         .child(demo(
             "ChartBarDemoTooltip.vue",
-            chart_container().child(chart_xy(&tooltip, s_tooltip)),
+            chart_container().child(chart_xy(tooltip)),
         ))
 }
 
-/// The centre of the `n`th (from 0) node the debug tools name `name`.
-fn nth_named(s: &Shot, name: &str, n: usize) -> Result<(f32, f32), ScenarioError> {
+/// The centre of the `n`th (from 0) node the debug tools name `name`, moved
+/// `dy` down.
+fn nth_named(s: &Shot, name: &str, n: usize, dy: f32) -> Result<(f32, f32), ScenarioError> {
     s.last()
         .nodes
         .iter()
@@ -287,7 +277,7 @@ fn nth_named(s: &Shot, name: &str, n: usize) -> Result<(f32, f32), ScenarioError
         .map(|node| {
             (
                 node.bounds.x + node.bounds.width / 2.0,
-                node.bounds.y + node.bounds.height / 2.0,
+                node.bounds.y + node.bounds.height / 2.0 + dy,
             )
         })
         .ok_or_else(|| ScenarioError::TextNotFound(name.to_owned()))
@@ -295,15 +285,16 @@ fn nth_named(s: &Shot, name: &str, n: usize) -> Result<(f32, f32), ScenarioError
 
 pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.frame("default")?;
-    let (x, y) = nth_named(s, "chart-category", 1)?;
+    // Over a row's tick, up in its plot: the row the plot finds is hovered.
+    let (x, y) = nth_named(s, "chart-tick", 1, -60.0)?;
     s.hover(x, y);
     s.frame("area hover February")?;
-    let (x, y) = nth_named(s, "chart-category", 9)?;
+    let (x, y) = nth_named(s, "chart-tick", 9, -60.0)?;
     s.hover(x, y);
     s.frame("bar hover April")?;
     s.wheel(400.0);
     s.frame("scrolled to line and donut")?;
-    let (x, y) = nth_named(s, "chart-category", 14)?;
+    let (x, y) = nth_named(s, "chart-tick", 14, -60.0)?;
     s.hover(x, y);
     s.frame("line hover March")?;
     Ok(())

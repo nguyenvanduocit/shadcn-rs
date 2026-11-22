@@ -1,87 +1,66 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text_bound};
 use shadcn::{
-    MenuItem, MenuState, MenubarState, menubar, menubar_checkbox_item, menubar_content, menubar_item,
-    menubar_radio_group, menubar_radio_item, menubar_separator, menubar_shortcut, menubar_sub_content,
-    menubar_sub_trigger, menubar_trigger, theme,
+    MenuItem, menubar, menubar_checkbox_item, menubar_content, menubar_item, menubar_menu, menubar_radio_group,
+    menubar_radio_item, menubar_separator, menubar_shortcut, menubar_sub, menubar_sub_content, menubar_sub_trigger,
+    menubar_trigger, theme,
 };
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page};
 
 pub fn render() -> Render {
-    let bar = MenubarState::new();
-    let file = bar.menu();
-    let share = file.sub();
-    let edit = bar.menu();
-    let find = edit.sub();
-    let view = bar.menu();
-    let profiles = bar.menu();
     let last = Signal::labeled("last action", String::from("nothing yet"));
     let bookmarks = Signal::labeled("bookmarks bar", false);
     let full_urls = Signal::labeled("full urls", true);
     let profile = Signal::labeled("profile", String::from("benoit"));
     Box::new(move || {
         let t = theme();
-        let act = |name: &'static str| {
-            let last = last.clone();
-            move || last.set(name.to_owned())
-        };
-        let item =
-            |m: &MenuState, name: &'static str, opts: MenuItem| menubar_item(m, name, opts, act(name)).child(name);
-        let short = |m: &MenuState, name: &'static str, opts: MenuItem, keys: &str| {
-            item(m, name, opts).child(menubar_shortcut(keys))
-        };
+        let act = |name: &'static str| move || last.set(name.to_owned());
+        let item = |name: &'static str, opts: MenuItem| menubar_item(name, opts).on_select(act(name)).child(name);
+        let short = |name: &'static str, opts: MenuItem, keys: &str| item(name, opts).child(menubar_shortcut(keys));
         let plain = MenuItem::default();
 
-        let file_menu = menubar_content(&file)
-            .child(short(&file, "New Tab", plain, "⌘T"))
-            .child(short(&file, "New Window", plain, "⌘N"))
-            .child(item(&file, "New Incognito Window", MenuItem::DISABLED))
+        let file_menu = menubar_content()
+            .child(short("New Tab", plain, "⌘T"))
+            .child(short("New Window", plain, "⌘N"))
+            .child(item("New Incognito Window", MenuItem::DISABLED))
             .child(menubar_separator())
-            .child(menubar_sub_trigger(
-                &share,
-                "Share",
-                plain,
-                menubar_sub_content(&share)
-                    .child(item(&share, "Email link", plain))
-                    .child(item(&share, "Messages", plain))
-                    .child(item(&share, "Notes", plain)),
-            ))
+            .child(
+                menubar_sub().child(menubar_sub_trigger("Share", plain)).child(
+                    menubar_sub_content()
+                        .child(item("Email link", plain))
+                        .child(item("Messages", plain))
+                        .child(item("Notes", plain)),
+                ),
+            )
             .child(menubar_separator())
-            .child(short(&file, "Print...", plain, "⌘P"));
+            .child(short("Print...", plain, "⌘P"));
 
-        let edit_menu = menubar_content(&edit)
-            .child(short(&edit, "Undo", plain, "⌘Z"))
-            .child(short(&edit, "Redo", plain, "⇧⌘Z"))
+        let edit_menu = menubar_content()
+            .child(short("Undo", plain, "⌘Z"))
+            .child(short("Redo", plain, "⇧⌘Z"))
             .child(menubar_separator())
-            .child(menubar_sub_trigger(
-                &find,
-                "Find",
-                plain,
-                menubar_sub_content(&find)
-                    .child(item(&find, "Search the web", plain))
-                    .child(menubar_separator())
-                    .child(item(&find, "Find...", plain))
-                    .child(item(&find, "Find Next", plain))
-                    .child(item(&find, "Find Previous", plain)),
-            ))
+            .child(
+                menubar_sub().child(menubar_sub_trigger("Find", plain)).child(
+                    menubar_sub_content()
+                        .child(item("Search the web", plain))
+                        .child(menubar_separator())
+                        .child(item("Find...", plain))
+                        .child(item("Find Next", plain))
+                        .child(item("Find Previous", plain)),
+                ),
+            )
             .child(menubar_separator())
-            .child(item(&edit, "Cut", plain))
-            .child(item(&edit, "Copy", plain))
-            .child(item(&edit, "Paste", plain));
+            .child(item("Cut", plain))
+            .child(item("Copy", plain))
+            .child(item("Paste", plain));
 
-        let view_menu = menubar_content(&view)
-            .child(menubar_checkbox_item(
-                &view,
-                "Always Show Bookmarks Bar",
-                &bookmarks,
-                false,
-            ))
-            .child(menubar_checkbox_item(&view, "Always Show Full URLs", &full_urls, false))
+        let view_menu = menubar_content()
+            .child(menubar_checkbox_item("Always Show Bookmarks Bar", false).model(bookmarks))
+            .child(menubar_checkbox_item("Always Show Full URLs", false).model(full_urls))
             .child(menubar_separator())
-            .child(short(&view, "Reload", MenuItem::INSET, "⌘R"))
+            .child(short("Reload", MenuItem::INSET, "⌘R"))
             .child(short(
-                &view,
                 "Force Reload",
                 MenuItem {
                     inset: true,
@@ -90,21 +69,22 @@ pub fn render() -> Render {
                 "⇧⌘R",
             ))
             .child(menubar_separator())
-            .child(item(&view, "Toggle Fullscreen", MenuItem::INSET))
+            .child(item("Toggle Fullscreen", MenuItem::INSET))
             .child(menubar_separator())
-            .child(item(&view, "Hide Sidebar", MenuItem::INSET));
+            .child(item("Hide Sidebar", MenuItem::INSET));
 
-        let profiles_menu = menubar_content(&profiles)
+        let profiles_menu = menubar_content()
             .child(
                 menubar_radio_group()
-                    .child(menubar_radio_item(&profiles, "Andy", "andy", &profile, false))
-                    .child(menubar_radio_item(&profiles, "Benoit", "benoit", &profile, false))
-                    .child(menubar_radio_item(&profiles, "Luis", "Luis", &profile, false)),
+                    .model(profile)
+                    .child(menubar_radio_item("Andy", "andy", false))
+                    .child(menubar_radio_item("Benoit", "benoit", false))
+                    .child(menubar_radio_item("Luis", "Luis", false)),
             )
             .child(menubar_separator())
-            .child(item(&profiles, "Edit...", MenuItem::INSET))
+            .child(item("Edit...", MenuItem::INSET))
             .child(menubar_separator())
-            .child(item(&profiles, "Add Profile...", MenuItem::INSET));
+            .child(item("Add Profile...", MenuItem::INSET));
 
         page(
             "Menubar",
@@ -113,19 +93,21 @@ pub fn render() -> Render {
                 .gap(6.0)
                 .child(demo(
                     "MenubarDemo.vue",
-                    menubar(&bar)
-                        .child(menubar_trigger(&bar, &file, "File", file_menu))
-                        .child(menubar_trigger(&bar, &edit, "Edit", edit_menu))
-                        .child(menubar_trigger(&bar, &view, "View", view_menu))
-                        .child(menubar_trigger(&bar, &profiles, "Profiles", profiles_menu)),
+                    menubar()
+                        .child(menubar_menu().child(menubar_trigger("File")).child(file_menu))
+                        .child(menubar_menu().child(menubar_trigger("Edit")).child(edit_menu))
+                        .child(menubar_menu().child(menubar_trigger("View")).child(view_menu))
+                        .child(menubar_menu().child(menubar_trigger("Profiles")).child(profiles_menu)),
                 ))
                 .child(
-                    text(format!(
-                        "Last action: {}. Bookmarks bar: {}. Profile: {}.",
-                        last.get(),
-                        bookmarks.get(),
-                        profile.get()
-                    ))
+                    text_bound(move || {
+                        format!(
+                            "Last action: {}. Bookmarks bar: {}. Profile: {}.",
+                            last.get(),
+                            bookmarks.get(),
+                            profile.get()
+                        )
+                    })
                     .text_sm()
                     .text_color(t.muted_foreground),
                 ),

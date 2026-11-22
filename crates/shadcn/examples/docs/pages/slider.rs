@@ -1,6 +1,6 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, div, relative, text};
-use shadcn::{Orientation, SliderState, label, slider, theme};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, relative, text};
+use shadcn::{Orientation, label, slider, theme};
 
 use crate::{Render, Shot, demo, page, section};
 
@@ -22,18 +22,10 @@ fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32, f32), ScenarioErr
 }
 
 pub fn render() -> Render {
-    let single = SliderState::new(vec![50.0], 0.0, 100.0, 1.0);
-    let range = SliderState::new(vec![25.0, 50.0], 0.0, 100.0, 1.0);
-    let stepped = SliderState::new(vec![10.0, 20.0], 0.0, 100.0, 10.0);
-    let tall = SliderState::new(vec![50.0], 0.0, 100.0, 1.0);
-    let short = SliderState::new(vec![25.0], 0.0, 100.0, 1.0);
-    let temperature = SliderState::new(vec![0.3, 0.7], 0.0, 1.0, 0.1);
-    let disabled = SliderState::new(vec![40.0], 0.0, 100.0, 1.0);
-    disabled.disabled.set(true);
+    let temperature = Signal::labeled("temperature", vec![0.3_f32, 0.7]);
     Box::new(move || {
         let t = theme();
         let shown = temperature
-            .value
             .get()
             .iter()
             .map(f32::to_string)
@@ -46,9 +38,11 @@ pub fn render() -> Render {
                 .gap(8.0)
                 .child(demo(
                     "SliderDemo.vue",
-                    div()
-                        .w_full()
-                        .child(slider(&single, Orientation::Horizontal).w_len(relative(0.6))),
+                    div().w_full().child(
+                        slider(Orientation::Horizontal)
+                            .default_value(vec![50.0])
+                            .w_len(relative(0.6)),
+                    ),
                 ))
                 .child(section(
                     "Range, steps of ten, vertical, labelled, disabled",
@@ -60,8 +54,12 @@ pub fn render() -> Render {
                                 .flex_col()
                                 .w_px(384.0)
                                 .gap(6.0)
-                                .child(slider(&range, Orientation::Horizontal))
-                                .child(slider(&stepped, Orientation::Horizontal))
+                                .child(slider(Orientation::Horizontal).default_value(vec![25.0, 50.0]))
+                                .child(
+                                    slider(Orientation::Horizontal)
+                                        .default_value(vec![10.0, 20.0])
+                                        .step(10.0),
+                                )
                                 .child(
                                     div()
                                         .grid()
@@ -76,17 +74,17 @@ pub fn render() -> Render {
                                                 .child(label("Temperature"))
                                                 .child(text(shown).text_sm().text_color(t.muted_foreground)),
                                         )
-                                        .child(slider(&temperature, Orientation::Horizontal)),
+                                        .child(slider(Orientation::Horizontal).model(temperature).max(1.0).step(0.1)),
                                 )
-                                .child(slider(&disabled, Orientation::Horizontal)),
+                                .child(slider(Orientation::Horizontal).default_value(vec![40.0]).disabled(true)),
                         )
                         .child(
                             div()
                                 .flex()
                                 .items_center()
                                 .gap(6.0)
-                                .child(slider(&tall, Orientation::Vertical))
-                                .child(slider(&short, Orientation::Vertical)),
+                                .child(slider(Orientation::Vertical).default_value(vec![50.0]))
+                                .child(slider(Orientation::Vertical).default_value(vec![25.0])),
                         ),
                 )),
         )

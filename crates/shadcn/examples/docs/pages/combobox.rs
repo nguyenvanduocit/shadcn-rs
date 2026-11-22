@@ -1,11 +1,11 @@
+use std::rc::Rc;
+
 use gui::prelude::*;
 use gui::{Icon, ImageSource, Modifiers, NamedKey, ScenarioError, SideAlign, Signal, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, ComboboxState, CommandState, PopoverState, avatar, avatar_fallback, avatar_image,
-    button, combobox_empty, combobox_group, combobox_input, combobox_item, combobox_item_indicator, combobox_item_null,
-    combobox_list, combobox_separator, combobox_trigger, combobox_trigger_aligned, combobox_viewport, command,
-    command_empty, command_group, command_input, command_item, command_list, popover, popover_content, popover_trigger,
-    theme,
+    ButtonSize, ButtonVariant, CommandItem, CommandSection, avatar, avatar_fallback, avatar_image, button, combobox,
+    combobox_input, combobox_item_indicator, combobox_items, combobox_list, combobox_trigger, command, command_input,
+    command_list, popover, popover_content, popover_trigger, theme,
 };
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page, photo};
@@ -62,47 +62,74 @@ const TIMEZONES: [(&str, [&str; 6]); 3] = [
 const USERS: [&str; 3] = ["shadcn", "leerob", "evilrabbit"];
 
 pub fn render() -> Render {
-    let framework = ComboboxState::new(None);
-    let frameworks = ComboboxState::multiple(&[]);
-    let timezone = ComboboxState::new(Some(TIMEZONES[0].1[0]));
-    let user = ComboboxState::new(None);
-    let photos: Vec<(&str, Option<ImageSource>)> = USERS.iter().map(|u| (*u, photo(u))).collect();
-    let listbox = PopoverState::new();
-    let listbox_search = CommandState::new();
+    let framework = Signal::labeled("framework", None::<String>);
+    let frameworks = Signal::labeled("frameworks", Vec::<String>::new());
+    let timezone = Signal::labeled("timezone", Some(TIMEZONES[0].1[0].to_owned()));
+    let user = Signal::labeled("user", None::<String>);
+    let photos: Rc<Vec<(&str, Option<ImageSource>)>> = Rc::new(USERS.iter().map(|u| (*u, photo(u))).collect());
+    let listbox = Signal::labeled("listbox open", false);
     let listbox_value = Signal::labeled("listbox framework", None::<String>);
+    // The lists' data, once: the items are their values.
+    let frameworks_list = Rc::new(vec![
+        CommandSection::empty("No framework found."),
+        CommandSection::group(None, FRAMEWORKS.map(CommandItem::new)),
+    ]);
+    let timezones_list: Rc<Vec<CommandSection>> = Rc::new(
+        std::iter::once(CommandSection::empty("No timezone found."))
+            .chain(TIMEZONES.map(|(region, zones)| CommandSection::group(Some(region), zones.map(CommandItem::new))))
+            .collect(),
+    );
+    let create_timezone = Rc::new(vec![
+        CommandSection::Separator,
+        CommandSection::group(None, [CommandItem::null("Create timezone")]),
+    ]);
+    let users_list = Rc::new(vec![
+        CommandSection::empty("No user found."),
+        CommandSection::group(None, USERS.map(CommandItem::new)),
+        CommandSection::Separator,
+        CommandSection::group(None, [CommandItem::null("Create user")]),
+    ]);
+    let listbox_list = Rc::new(vec![
+        CommandSection::empty("No framework found."),
+        CommandSection::group(None, FRAMEWORK_VALUES.map(|(value, _)| CommandItem::new(value))),
+    ]);
     Box::new(move || {
         let t = theme();
         // `Avatar class="size-5"` with the user's photo, or their initial.
-        let face = |login: &str| {
-            let source = photos.iter().find(|(u, _)| *u == login).and_then(|(_, p)| p.as_ref());
-            avatar()
-                .size(5.0)
-                .child(avatar_image(source))
-                .child(avatar_fallback(source, login.chars().take(1).collect::<String>()))
+        let face = {
+            let photos = Rc::clone(&photos);
+            move |login: &str| {
+                let source = photos.iter().find(|(u, _)| *u == login).and_then(|(_, p)| p.as_ref());
+                avatar()
+                    .size(5.0)
+                    .child(avatar_image(source))
+                    .child(avatar_fallback(source, login.chars().take(1).collect::<String>()))
+            }
         };
         let outline = || button(ButtonVariant::Outline, ButtonSize::Default);
 
-        let cb = &framework;
-        let list = combobox_list(cb)
-            .child(combobox_input(cb, "Search framework..."))
-            .child(combobox_empty(cb, "No framework found."))
-            .child(combobox_group(
-                None,
-                FRAMEWORKS.map(|label| {
-                    combobox_item(cb, label).map(|i| i.child(label).child(combobox_item_indicator(cb, label)))
-                }),
-            ));
-        let chosen = cb.value.get();
-        let trigger = outline()
-            .w_px(200.0)
-            .justify_between()
-            .child(chosen.unwrap_or_else(|| String::from("Select framework...")))
-            .child(icon(Icon::ChevronsUpDown).opacity(0.5));
+        let chosen = framework.get();
+        let demo_combobox = combobox()
+            .model(framework)
+            .child(combobox_trigger(
+                outline()
+                    .w_px(200.0)
+                    .justify_between()
+                    .child(chosen.unwrap_or_else(|| String::from("Select framework...")))
+                    .child(icon(Icon::ChevronsUpDown).opacity(0.5)),
+            ))
+            .child(
+                combobox_list()
+                    .child(combobox_input("Search framework..."))
+                    .child(combobox_items(Rc::clone(&frameworks_list), |item, row| {
+                        row.child(item.value.clone())
+                            .child(combobox_item_indicator(&item.value))
+                    })),
+            );
 
-        let many = &frameworks;
-        let picked = many.value.get();
+        let picked = frameworks.get();
         // The demo's checkbox look: `size-4 rounded-[4px] border`, filled when selected.
-        let tick = |on: bool| {
+        let tick = move |on: bool| {
             div()
                 .size(4.0)
                 .shrink_0()
@@ -115,31 +142,34 @@ pub fn render() -> Render {
                         .child(icon(Icon::Check).size(3.5))
                 })
         };
-        let many_list = combobox_list(many)
-            .w_px(280.0)
-            .child(combobox_input(many, "Search framework..."))
-            .child(combobox_empty(many, "No framework found."))
-            .child(combobox_group(
-                None,
-                FRAMEWORKS.map(|label| {
-                    combobox_item(many, label).map(|i| i.child(tick(picked.iter().any(|p| p == label))).child(label))
-                }),
-            ));
-        let many_trigger = outline()
-            .w_px(280.0)
-            .justify_between()
+        let many_combobox = combobox()
+            .model(frameworks)
+            .child(combobox_trigger(
+                outline()
+                    .w_px(280.0)
+                    .justify_between()
+                    .child(
+                        text(if picked.is_empty() {
+                            String::from("Select frameworks...")
+                        } else {
+                            picked.join(", ")
+                        })
+                        .truncate(),
+                    )
+                    .child(icon(Icon::ChevronsUpDown).opacity(0.5)),
+            ))
             .child(
-                text(if picked.is_empty() {
-                    String::from("Select frameworks...")
-                } else {
-                    picked.join(", ")
-                })
-                .truncate(),
-            )
-            .child(icon(Icon::ChevronsUpDown).opacity(0.5));
+                combobox_list()
+                    .align(SideAlign::Start)
+                    .w_px(280.0)
+                    .child(combobox_input("Search framework..."))
+                    .child(combobox_items(Rc::clone(&frameworks_list), move |item, row| {
+                        row.child(tick(frameworks.with(|p| p.contains(&item.value))))
+                            .child(item.value.clone())
+                    })),
+            );
 
-        let tz = &timezone;
-        let zone = tz.value.get();
+        let zone = timezone.get();
         let region = zone
             .as_deref()
             .and_then(|z| TIMEZONES.iter().find(|(_, zones)| zones.contains(&z)))
@@ -166,36 +196,27 @@ pub fn render() -> Render {
                 },
             ))
             .child(icon(Icon::ChevronDown).text_color(t.muted_foreground));
-        let tz_list = combobox_list(tz)
-            .w(72.0)
-            .child(combobox_input(tz, "Search timezone..."))
-            .child(
-                combobox_viewport()
+        let tz_combobox = combobox().model(timezone).child(combobox_trigger(tz_trigger)).child(
+            combobox_list()
+                .align(SideAlign::Start)
+                .w(72.0)
+                .child(combobox_input("Search timezone..."))
+                .child(
+                    combobox_items(Rc::clone(&timezones_list), move |item, row| {
+                        if item.null {
+                            return row
+                                .child(icon(Icon::PlusCircle).text_color(t.muted_foreground))
+                                .child(item.value.clone());
+                        }
+                        row.child(item.value.clone())
+                            .child(combobox_item_indicator(&item.value))
+                    })
                     .max_h_px(260.0)
-                    .child(combobox_empty(tz, "No timezone found."))
-                    .children(TIMEZONES.map(|(region, zones)| {
-                        combobox_group(
-                            Some(region),
-                            zones.map(|z| {
-                                combobox_item(tz, z).map(|i| i.child(z).child(combobox_item_indicator(tz, z)))
-                            }),
-                        )
-                    })),
-            )
-            .child(combobox_separator())
-            .child(
-                combobox_group(
-                    None,
-                    [combobox_item_null(tz, "Create timezone").map(|i| {
-                        i.child(icon(Icon::PlusCircle).text_color(t.muted_foreground))
-                            .child("Create timezone")
-                    })],
-                )
-                .map(|g| g.bg(t.popover)),
-            );
+                    .footer(Rc::clone(&create_timezone)),
+                ),
+        );
 
-        let u = &user;
-        let who = u.value.get();
+        let who = user.get();
         let user_trigger = outline()
             .w_px(200.0)
             .justify_between()
@@ -204,88 +225,66 @@ pub fn render() -> Render {
                 |login| div().flex().items_center().gap(2.0).child(face(&login)).child(login),
             ))
             .child(icon(Icon::ChevronsUpDown).opacity(0.5));
-        let user_list = combobox_list(u)
-            .child(combobox_input(u, "Search user..."))
-            .child(combobox_empty(u, "No user found."))
-            .child(combobox_group(
-                None,
-                USERS.map(|login| {
-                    combobox_item(u, login).map(|i| {
-                        i.child(face(login))
-                            .child(login)
-                            .child(combobox_item_indicator(u, login))
-                    })
-                }),
-            ))
-            .child(combobox_separator())
-            .child(combobox_group(
-                None,
-                [combobox_item_null(u, "Create user").map(|i| {
-                    i.child(icon(Icon::PlusCircle).text_color(t.muted_foreground))
-                        .child("Create user")
-                })],
-            ));
+        let user_combobox = combobox().model(user).child(combobox_trigger(user_trigger)).child(
+            combobox_list()
+                .child(combobox_input("Search user..."))
+                .child(combobox_items(Rc::clone(&users_list), move |item, row| {
+                    if item.null {
+                        return row
+                            .child(icon(Icon::PlusCircle).text_color(t.muted_foreground))
+                            .child(item.value.clone());
+                    }
+                    row.child(face(&item.value))
+                        .child(item.value.clone())
+                        .child(combobox_item_indicator(&item.value))
+                })),
+        );
 
         let current = listbox_value.get();
         let listbox_label = FRAMEWORK_VALUES
             .iter()
             .find(|(v, _)| current.as_deref() == Some(*v))
             .map_or("Select framework...", |(_, l)| *l);
-        // The command's root first: it starts the frame its items register in.
-        let listbox_root = command(&listbox_search);
-        let listbox_items = FRAMEWORK_VALUES.map(|(value, label)| {
-            let (pick, close) = (listbox_value.clone(), listbox.clone());
-            command_item(&listbox_search, value, false, move || {
-                pick.update(|v| (v.as_deref() != Some(value)).then(|| value.to_owned()));
-                close.close();
-            })
-            .map(|i| {
-                i.child(label).child(
-                    icon(Icon::Check)
-                        .ml_auto()
-                        .opacity(if current.as_deref() == Some(value) { 1.0 } else { 0.0 }),
-                )
-            })
+        let listbox_items = command_list(Rc::clone(&listbox_list), move |item, row| {
+            let label = FRAMEWORK_VALUES
+                .iter()
+                .find(|(v, _)| *v == item.value)
+                .map_or("", |(_, l)| *l);
+            let on = listbox_value.with(|v| v.as_deref() == Some(item.value.as_str()));
+            row.child(label)
+                .child(icon(Icon::Check).ml_auto().opacity(if on { 1.0 } else { 0.0 }))
+        })
+        .on_select(move |item| {
+            let value = item.value.clone();
+            listbox_value.update(|v| *v = (v.as_deref() != Some(value.as_str())).then(|| value.clone()));
+            listbox.set(false);
         });
         let with_listbox = popover()
+            .open(listbox)
             .child(popover_trigger(
-                &listbox,
                 outline()
                     .w_px(200.0)
                     .justify_between()
                     .child(listbox_label)
                     .child(icon(Icon::ChevronsUpDown).opacity(0.5)),
             ))
-            .child(popover_content(&listbox, |c| {
-                c.w_px(200.0).p(0.0).child(
-                    listbox_root
-                        .child(command_input(&listbox_search, "Search framework..."))
-                        .child(
-                            command_list()
-                                .child(command_empty(&listbox_search, "No framework found."))
-                                .child(command_group(None, listbox_items)),
-                        ),
-                )
-            }));
+            .child(
+                popover_content().w_px(200.0).p(0.0).child(
+                    command()
+                        .child(command_input("Search framework..."))
+                        .child(listbox_items),
+                ),
+            );
 
         page(
             "Combobox",
             div()
                 .flex_col()
                 .gap(6.0)
-                .child(demo("ComboboxDemo.vue", combobox_trigger(cb, trigger, list)))
-                .child(demo(
-                    "ComboboxMultipleDemo.vue",
-                    combobox_trigger_aligned(many, many_trigger, SideAlign::Start, many_list),
-                ))
-                .child(demo(
-                    "ComboboxTimezoneDemo.vue",
-                    combobox_trigger_aligned(tz, tz_trigger, SideAlign::Start, tz_list),
-                ))
-                .child(demo(
-                    "ComboboxUserDemo.vue",
-                    combobox_trigger(u, user_trigger, user_list),
-                ))
+                .child(demo("ComboboxDemo.vue", demo_combobox))
+                .child(demo("ComboboxMultipleDemo.vue", many_combobox))
+                .child(demo("ComboboxTimezoneDemo.vue", tz_combobox))
+                .child(demo("ComboboxUserDemo.vue", user_combobox))
                 .child(demo("ComboboxWithListboxDemo.vue", with_listbox)),
         )
     })

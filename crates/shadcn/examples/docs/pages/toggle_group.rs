@@ -1,6 +1,9 @@
 use gui::prelude::*;
-use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon};
-use shadcn::{ToggleGroupSelection, ToggleGroupState, ToggleSize, ToggleVariant, toggle_group, toggle_group_item};
+use gui::{Icon, Modifiers, NamedKey, ScenarioError, div, icon};
+use shadcn::{
+    Part, SelectModel, ToggleGroupProps, ToggleSize, ToggleVariant, toggle_group, toggle_group_item,
+    toggle_group_multiple,
+};
 
 use crate::{Render, Shot, demo, page, section};
 
@@ -21,44 +24,36 @@ const BIU: [(&str, Icon); 3] = [
     ("underline", Icon::Underline),
 ];
 
-fn multiple() -> ToggleGroupSelection {
-    ToggleGroupSelection::Multiple(Signal::new(Vec::new()))
-}
-
-fn single(value: Option<&str>) -> ToggleGroupSelection {
-    ToggleGroupSelection::Single(Signal::new(value.map(str::to_owned)))
-}
-
-fn icons(state: &ToggleGroupState) -> gui::Div {
-    toggle_group(state).children(BIU.map(|(v, i)| toggle_group_item(state, v).child(icon(i))))
+/// The bold, italic and underline items with their icons.
+fn icons<M: SelectModel>(group: Part<ToggleGroupProps<M>>) -> Part<ToggleGroupProps<M>> {
+    group.children(BIU.map(|(v, i)| toggle_group_item(v).child(icon(i))))
 }
 
 pub fn render() -> Render {
-    let values = BIU.map(|(v, _)| v);
-    let outline = ToggleGroupState::new(multiple(), &values).variant(ToggleVariant::Outline);
-    let one = ToggleGroupState::new(single(None), &values);
-    let plain = ToggleGroupState::new(multiple(), &values);
-    let disabled = ToggleGroupState::new(multiple(), &values);
-    disabled.disabled.set(true);
-    let large = ToggleGroupState::new(multiple(), &values).size(ToggleSize::Lg);
-    let small = ToggleGroupState::new(single(None), &values).size(ToggleSize::Sm);
-    let missed = ToggleGroupState::new(single(Some("all")), &["all", "missed"]).variant(ToggleVariant::Outline);
-    let spaced = ToggleGroupState::new(single(Some("last-24-hours")), &["last-24-hours", "last-7-days"])
-        .variant(ToggleVariant::Outline)
-        .size(ToggleSize::Sm)
-        .spacing(2.0);
     Box::new(move || {
         page(
             "Toggle Group",
             div()
                 .flex_col()
                 .gap(5.0)
-                .child(demo("ToggleGroupDemo.vue", icons(&outline)))
-                .child(demo("ToggleGroupSingleDemo.vue", icons(&one)))
-                .child(demo("ToggleGroupDefaultDemo.vue", icons(&plain)))
-                .child(demo("ToggleGroupDisabledDemo.vue", icons(&disabled)))
-                .child(demo("ToggleGroupLargeDemo.vue", icons(&large)))
-                .child(demo("ToggleGroupSmallDemo.vue", icons(&small)))
+                .child(demo(
+                    "ToggleGroupDemo.vue",
+                    icons(toggle_group_multiple().variant(ToggleVariant::Outline)),
+                ))
+                .child(demo("ToggleGroupSingleDemo.vue", icons(toggle_group())))
+                .child(demo("ToggleGroupDefaultDemo.vue", icons(toggle_group_multiple())))
+                .child(demo(
+                    "ToggleGroupDisabledDemo.vue",
+                    icons(toggle_group_multiple().disabled(true)),
+                ))
+                .child(demo(
+                    "ToggleGroupLargeDemo.vue",
+                    icons(toggle_group_multiple().size(ToggleSize::Lg)),
+                ))
+                .child(demo(
+                    "ToggleGroupSmallDemo.vue",
+                    icons(toggle_group().size(ToggleSize::Sm)),
+                ))
                 .child(section(
                     "Text items, joined and spaced",
                     div()
@@ -66,14 +61,20 @@ pub fn render() -> Render {
                         .items_start()
                         .gap(4.0)
                         .child(
-                            toggle_group(&missed)
-                                .child(toggle_group_item(&missed, "all").w(20.0).child("All"))
-                                .child(toggle_group_item(&missed, "missed").w(20.0).child("Missed")),
+                            toggle_group()
+                                .variant(ToggleVariant::Outline)
+                                .default_value(Some("all".to_owned()))
+                                .child(toggle_group_item("all").class(|d| d.w(20.0)).child("All"))
+                                .child(toggle_group_item("missed").class(|d| d.w(20.0)).child("Missed")),
                         )
                         .child(
-                            toggle_group(&spaced)
-                                .child(toggle_group_item(&spaced, "last-24-hours").child("Last 24 hours"))
-                                .child(toggle_group_item(&spaced, "last-7-days").child("Last 7 days")),
+                            toggle_group()
+                                .variant(ToggleVariant::Outline)
+                                .size(ToggleSize::Sm)
+                                .spacing(2.0)
+                                .default_value(Some("last-24-hours".to_owned()))
+                                .child(toggle_group_item("last-24-hours").child("Last 24 hours"))
+                                .child(toggle_group_item("last-7-days").child("Last 7 days")),
                         ),
                 )),
         )

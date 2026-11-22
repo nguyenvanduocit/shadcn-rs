@@ -1,14 +1,14 @@
 mod stream;
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon, span, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon, span, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockCopy, CodeBlockLine, CodeBlockLineVariant,
-    CodeBlockProps, CodeBlockSize, CodeBlockVariant, MessageProps, TabsState, TraceStatus, button, code_block,
-    code_block_actions, code_block_content, code_block_copy_button, code_block_floating_actions, code_block_footer,
-    code_block_header, code_block_lines, code_block_title, highlighted_lines, message, message_content, tabs,
-    tabs_content, tabs_list, tabs_trigger, theme, trace, trace_collapsible, trace_collapsible_content,
-    trace_collapsible_trigger, trace_icon, trace_line, trace_title,
+    ButtonSize, ButtonVariant, CodeBlockContentProps, CodeBlockLine, CodeBlockLineVariant, CodeBlockProps,
+    CodeBlockSize, CodeBlockVariant, MessageProps, TraceStatus, button, code_block, code_block_actions,
+    code_block_content, code_block_copy_button, code_block_floating_actions, code_block_footer, code_block_header,
+    code_block_lines, code_block_title, highlighted_lines, message, message_content, tabs, tabs_content, tabs_list,
+    tabs_trigger, theme, trace, trace_collapsible, trace_collapsible_content, trace_collapsible_trigger, trace_icon,
+    trace_line, trace_title,
 };
 
 use super::thread::{user_turn, wait};
@@ -241,7 +241,7 @@ fn titled(
     p: CodeBlockProps,
     glyph: Option<Icon>,
     title: &str,
-    copy: Option<(&CodeBlockCopy, &str)>,
+    copy: Option<&str>,
     c: CodeBlockContentProps,
     lines: Vec<CodeBlockLine>,
 ) -> Div {
@@ -250,7 +250,7 @@ fn titled(
         .child(
             code_block_header(p)
                 .child(code_block_title(p, glyph, title))
-                .child(copy.map(|(state, value)| code_block_actions().child(code_block_copy_button(state, value)))),
+                .child(copy.map(|value| code_block_actions().child(code_block_copy_button(value)))),
         )
         .child(code_block_content(p, c, lines))
 }
@@ -268,7 +268,7 @@ fn marked(code: &str, language: &str, variant: impl Fn(usize) -> CodeBlockLineVa
 }
 
 /// A header holding a title and `actions`.
-fn header(p: CodeBlockProps, glyph: Option<Icon>, title: &str, actions: Vec<Div>) -> Div {
+fn header(p: CodeBlockProps, glyph: Option<Icon>, title: &str, actions: Vec<Element>) -> Div {
     code_block_header(p)
         .child(code_block_title(p, glyph, title))
         .child(code_block_actions().children(actions))
@@ -276,12 +276,12 @@ fn header(p: CodeBlockProps, glyph: Option<Icon>, title: &str, actions: Vec<Div>
 
 /// The wrap toggle: `aria-pressed:text-foreground`.
 fn wrap_button(wrap: &Signal<bool>) -> Div {
-    let toggle = wrap.clone();
+    let toggle = *wrap;
     button(ButtonVariant::Ghost, ButtonSize::IconXs)
         .named("wrap-lines")
         .when(wrap.get(), |b| b.text_color(theme().foreground))
         .child(icon(Icon::WrapText).size(3.0))
-        .on_click(move |_| toggle.update(|w| !w))
+        .on_click(move |_| toggle.update(|w| *w = !*w))
 }
 
 /// The download button. Vue saves the code as a file; `gui` has no way to
@@ -326,7 +326,7 @@ fn logs() -> String {
 /// `CodeBlockShowMoreDemo` (`scroll: false`) and `CodeBlockShowMoreScrollDemo`:
 /// the Vue file folded to `max-h-64`; expanded it shows in full, or scrolls
 /// inside `max-h-96`.
-fn show_more(expanded: &Signal<bool>, copy: &CodeBlockCopy, scroll: bool) -> Div {
+fn show_more(expanded: &Signal<bool>, scroll: bool) -> Div {
     let p = CodeBlockProps {
         header: true,
         footer: true,
@@ -343,14 +343,14 @@ fn show_more(expanded: &Signal<bool>, copy: &CodeBlockCopy, scroll: bool) -> Div
         (true, true) => content.max_h(96.0).scroll_fade(),
         (true, false) => content,
     };
-    let toggle = expanded.clone();
+    let toggle = *expanded;
     frame().child(
         code_block(p)
             .child(header(
                 p,
                 None,
                 "components/Chat.vue",
-                vec![code_block_copy_button(copy, CHAT_COMPONENT)],
+                vec![code_block_copy_button(CHAT_COMPONENT).into_element()],
             ))
             .child(content)
             .child(
@@ -358,14 +358,14 @@ fn show_more(expanded: &Signal<bool>, copy: &CodeBlockCopy, scroll: bool) -> Div
                     button(ButtonVariant::Ghost, ButtonSize::Xs)
                         .child(icon(Icon::ChevronDown).rotate(if open { 180.0 } else { 0.0 }))
                         .child(if open { "Show less" } else { "Show more" })
-                        .on_click(move |_| toggle.update(|o| !o)),
+                        .on_click(move |_| toggle.update(|o| *o = !*o)),
                 ),
             ),
     )
 }
 
 /// One step of `CodeBlockTraceDemo`: a command, open on its output.
-fn ran(open: &Signal<bool>, failed: bool, title: &str, output: &str) -> Div {
+fn ran(open: &Signal<bool>, failed: bool, title: &str, output: &str) -> gui::Element {
     let p = CodeBlockProps {
         size: CodeBlockSize::Sm,
         variant: if failed {
@@ -379,10 +379,12 @@ fn ran(open: &Signal<bool>, failed: bool, title: &str, output: &str) -> Div {
         .child(trace_icon(icon(Icon::Terminal)))
         .child(trace_title(title));
     trace_collapsible()
-        .child(trace_collapsible_trigger(open, failed, line))
-        .child(trace_collapsible_content(open, |c| {
+        .model(Model::bind(*open))
+        .child(trace_collapsible_trigger(failed, line))
+        .child(trace_collapsible_content().map_root(|c| {
             c.child(code_block(p).child(code_block_content(p, wrapped(), code_block_lines(output)).max_h(64.0)))
         }))
+        .into_element()
 }
 
 /// typeset's inline code at `size` px: `0.85em`, `bg-muted`,
@@ -400,7 +402,7 @@ fn typeset_code(code: &str, size: f32) -> gui::Span {
 
 /// `CodeBlockTypesetDemo`: `.typeset` at 16px, its heading, prose with
 /// inline code, and a code block placed in the flow.
-fn typeset(copy: &CodeBlockCopy) -> Div {
+fn typeset() -> Div {
     const SIZE: f32 = 16.0;
     let flow = 1.25 * SIZE / gui::styled::UNIT;
     let p = with_header(CodeBlockProps::default());
@@ -427,7 +429,7 @@ fn typeset(copy: &CodeBlockCopy) -> Div {
                     p,
                     Some(Icon::FileCode),
                     "server/api/chat.post.ts",
-                    vec![code_block_copy_button(copy, CHAT_ROUTE_ONE_LINE)],
+                    vec![code_block_copy_button(CHAT_ROUTE_ONE_LINE).into_element()],
                 ))
                 .child(code_block_content(
                     p,
@@ -447,12 +449,10 @@ fn typeset(copy: &CodeBlockCopy) -> Div {
 
 /// The demo's state, kept across renders.
 struct State {
-    copies: Vec<CodeBlockCopy>,
     wrap: Signal<bool>,
     wrap_lint: Signal<bool>,
     more: Signal<bool>,
     more_scroll: Signal<bool>,
-    tabs: TabsState,
     ran: Signal<bool>,
     failed: Signal<bool>,
     streaming: stream::Streaming,
@@ -461,20 +461,16 @@ struct State {
 
 pub fn render() -> Render {
     let s = State {
-        copies: (0..20).map(|_| CodeBlockCopy::new()).collect(),
         wrap: Signal::labeled("chat route wrap", false),
         wrap_lint: Signal::labeled("lint wrap", true),
         more: Signal::labeled("show more", false),
         more_scroll: Signal::labeled("show more scroll", false),
-        tabs: TabsState::new("route"),
         ran: Signal::new(true),
         failed: Signal::new(true),
         streaming: stream::Streaming::new(),
         markdown: stream::MarkdownChat::new(),
     };
     Box::new(move || {
-        let copy = |i: usize| s.copies.get(i).cloned().unwrap_or_default();
-        let [header_copy, diff, floating, error, size, size_sm] = [0, 1, 2, 3, 4, 5].map(copy);
         let d = CodeBlockProps::default();
         let sm = CodeBlockProps {
             size: CodeBlockSize::Sm,
@@ -520,7 +516,7 @@ pub fn render() -> Render {
                         d,
                         Some(Icon::Terminal),
                         "Terminal",
-                        Some((&header_copy, COMMAND)),
+                        Some(COMMAND),
                         plain(),
                         code_block_lines(INSTALL),
                     )),
@@ -535,24 +531,14 @@ pub fn render() -> Render {
                 ))
                 .child(demo(
                     "CodeBlockDiffDemo.vue",
-                    frame().child(titled(
-                        d,
-                        None,
-                        "components/Greeting.vue",
-                        Some((&diff, PATCH)),
-                        plain(),
-                        patch,
-                    )),
+                    frame().child(titled(d, None, "components/Greeting.vue", Some(PATCH), plain(), patch)),
                 ))
                 .child(demo(
                     "CodeBlockFloatingActionsDemo.vue",
                     frame().child(
                         code_block(d)
                             .child(code_block_content(d, plain(), code_block_lines(DEPENDENCIES)))
-                            .child(code_block_floating_actions(
-                                d,
-                                [code_block_copy_button(&floating, DEPENDENCIES)],
-                            )),
+                            .child(code_block_floating_actions(d, [code_block_copy_button(DEPENDENCIES)])),
                     ),
                 ))
                 .child(demo(
@@ -561,7 +547,7 @@ pub fn render() -> Render {
                         destructive,
                         None,
                         "Error",
-                        Some((&error, ERROR)),
+                        Some(ERROR),
                         wrapped(),
                         code_block_lines(ERROR),
                     )),
@@ -575,7 +561,7 @@ pub fn render() -> Render {
                             d,
                             Some(Icon::Terminal),
                             "Terminal",
-                            Some((&size, OUTPUT)),
+                            Some(OUTPUT),
                             wrapped(),
                             code_block_lines(OUTPUT),
                         ))
@@ -583,7 +569,7 @@ pub fn render() -> Render {
                             sm,
                             Some(Icon::Terminal),
                             "Terminal",
-                            Some((&size_sm, OUTPUT)),
+                            Some(OUTPUT),
                             wrapped(),
                             code_block_lines(OUTPUT),
                         )),
@@ -624,9 +610,9 @@ pub fn render() -> Render {
                                 Some(Icon::FileCode),
                                 "server/api/chat.post.ts",
                                 vec![
-                                    wrap_button(&s.wrap),
-                                    download_button(),
-                                    code_block_copy_button(&copy(6), CHAT_ROUTE),
+                                    wrap_button(&s.wrap).into_element(),
+                                    download_button().into_element(),
+                                    code_block_copy_button(CHAT_ROUTE).into_element(),
                                 ],
                             ))
                             .child(code_block_content(
@@ -651,9 +637,9 @@ pub fn render() -> Render {
                                 Some(Icon::Terminal),
                                 "Terminal",
                                 vec![
-                                    wrap_button(&s.wrap_lint),
-                                    download_button(),
-                                    code_block_copy_button(&copy(7), LINT),
+                                    wrap_button(&s.wrap_lint).into_element(),
+                                    download_button().into_element(),
+                                    code_block_copy_button(LINT).into_element(),
                                 ],
                             ))
                             .child(code_block_content(
@@ -672,7 +658,7 @@ pub fn render() -> Render {
                         d,
                         Some(Icon::Terminal),
                         "Terminal",
-                        Some((&copy(8), &ansi_plain(TESTS))),
+                        Some(&ansi_plain(TESTS)),
                         wrapped(),
                         highlighted_lines(TESTS, "ansi"),
                     )),
@@ -686,7 +672,7 @@ pub fn render() -> Render {
                                 p,
                                 None,
                                 "Logs",
-                                vec![code_block_copy_button(&copy(9), logs.clone())],
+                                vec![code_block_copy_button(logs.clone()).into_element()],
                             ))
                             .child(
                                 code_block_content(p, plain(), code_block_lines(&logs))
@@ -731,7 +717,7 @@ pub fn render() -> Render {
                                         d,
                                         None,
                                         "server/api/chat.post.ts",
-                                        Some((&copy(10), CHAT_ROUTE_SHORT)),
+                                        Some(CHAT_ROUTE_SHORT),
                                         plain(),
                                         highlighted_lines(CHAT_ROUTE_SHORT, "ts"),
                                     ))
@@ -739,36 +725,27 @@ pub fn render() -> Render {
                             ),
                         )
                 }))
-                .child(demo("CodeBlockShowMoreDemo.vue", show_more(&s.more, &copy(11), false)))
-                .child(demo(
-                    "CodeBlockShowMoreScrollDemo.vue",
-                    show_more(&s.more_scroll, &copy(12), true),
-                ))
+                .child(demo("CodeBlockShowMoreDemo.vue", show_more(&s.more, false)))
+                .child(demo("CodeBlockShowMoreScrollDemo.vue", show_more(&s.more_scroll, true)))
                 .child(demo(
                     "CodeBlockTabsDemo.vue",
                     tabs()
+                        .default_value("route")
                         .w_full()
                         .max_w(112.0)
                         .child(tabs_list().children(FILES.map(|(value, title, _, _)| {
-                            tabs_trigger(&s.tabs, value).child(title.rsplit('/').next().unwrap_or(title))
+                            tabs_trigger(value).child(title.rsplit('/').next().unwrap_or(title))
                         })))
-                        .children(
-                            FILES
-                                .iter()
-                                .enumerate()
-                                .filter_map(|(i, (value, title, language, code))| {
-                                    tabs_content(&s.tabs, value).map(|c| {
-                                        c.child(titled(
-                                            d,
-                                            None,
-                                            title,
-                                            Some((&copy(13_usize.saturating_add(i)), code)),
-                                            numbered(),
-                                            highlighted_lines(code, language),
-                                        ))
-                                    })
-                                }),
-                        ),
+                        .children(FILES.iter().map(|(value, title, language, code)| {
+                            tabs_content(*value).child(titled(
+                                d,
+                                None,
+                                title,
+                                Some(code),
+                                numbered(),
+                                highlighted_lines(code, language),
+                            ))
+                        })),
                 ))
                 .child(demo(
                     "CodeBlockTraceDemo.vue",
@@ -790,12 +767,12 @@ pub fn render() -> Render {
                             d,
                             Some(Icon::Terminal),
                             "الطرفية",
-                            Some((&copy(17), INSTALL_AND_RUN)),
+                            Some(INSTALL_AND_RUN),
                             numbered(),
                             highlighted_lines(INSTALL_AND_RUN, "bash"),
                         )),
                 ))
-                .child(demo("CodeBlockTypesetDemo.vue", typeset(&copy(16))))
+                .child(demo("CodeBlockTypesetDemo.vue", typeset()))
                 .child(demo("CodeBlockStreamingDemo.vue", s.streaming.view()))
                 .child(demo("CodeBlockMarkdownDemo.vue", s.markdown.view())),
         )

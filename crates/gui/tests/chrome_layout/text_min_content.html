@@ -1,0 +1,9 @@
+<!-- Text's min-content width is its widest word: a min-content track and a squeezed flex item. -->
+<div style="width: 400px">
+  <div style="display: grid; grid-template-columns: min-content 1fr">
+    <p>Two words</p><div style="height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 60px">
+    <p>Squeezed text here</p>
+  </div>
+</div>

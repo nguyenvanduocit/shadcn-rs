@@ -130,16 +130,6 @@ impl Color {
         }
     }
 
-    pub(crate) fn to_skia(self) -> tiny_skia::Color {
-        tiny_skia::Color::from_rgba(
-            self.r.clamp(0.0, 1.0),
-            self.g.clamp(0.0, 1.0),
-            self.b.clamp(0.0, 1.0),
-            self.a.clamp(0.0, 1.0),
-        )
-        .unwrap_or(tiny_skia::Color::TRANSPARENT)
-    }
-
     /// The four channels as bytes, straight alpha.
     #[must_use]
     pub fn to_rgba8(self) -> [u8; 4] {

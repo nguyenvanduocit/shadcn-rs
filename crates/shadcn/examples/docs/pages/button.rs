@@ -21,7 +21,7 @@ pub fn render() -> Render {
             ("Default", ButtonSize::Default),
             ("Large", ButtonSize::Lg),
         ];
-        let c = clicks.clone();
+        let c = clicks;
         page(
             "Button",
             div()
@@ -30,10 +30,9 @@ pub fn render() -> Render {
                 .child(section(
                     "Variants",
                     div().flex().flex_wrap().gap(2.0).children(variants.map(|(name, v)| {
-                        let c = c.clone();
                         button(v, ButtonSize::Default)
                             .child(name)
-                            .on_click(move |_| c.update(|n| n.saturating_add(1)))
+                            .on_click(move |_| c.update(|n| *n = n.saturating_add(1)))
                     })),
                 ))
                 .child(section(

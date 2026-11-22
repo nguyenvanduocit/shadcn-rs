@@ -1,8 +1,8 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, div, text};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{
-    SelectSize, SelectState, select_content, select_group, select_item, select_label, select_separator, select_trigger,
-    theme,
+    SelectSize, select, select_content, select_group, select_item, select_label, select_multiple, select_separator,
+    select_value, theme,
 };
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page, section};
@@ -72,31 +72,31 @@ const ZONES: [(&str, &[(&str, &str)]); 5] = [
 ];
 
 pub fn render() -> Render {
-    let fruit = SelectState::new(None);
-    let small = SelectState::new(Some("est"));
-    let fruits_many = SelectState::multiple(&[]);
-    let zone = SelectState::new(None);
+    let fruit = Signal::labeled("fruit", None::<String>);
+    let small = Signal::labeled("timezone", Some("est".to_owned()));
     Box::new(move || {
         let t = theme();
-        let fruits = select_content(&fruit).child(
-            select_group()
-                .child(select_label("Fruits"))
-                .children(FRUITS.map(|(v, l)| select_item(&fruit, v, l, false))),
-        );
-        let zones = select_content(&small)
+        let fruits = || {
+            select_content().child(
+                select_group()
+                    .child(select_label("Fruits"))
+                    .children(FRUITS.map(|(v, l)| select_item(v, l))),
+            )
+        };
+        let zones = select_content()
             .child(
                 select_group()
                     .child(select_label("North America"))
-                    .child(select_item(&small, "est", "Eastern Standard Time (EST)", false))
-                    .child(select_item(&small, "cst", "Central Standard Time (CST)", false))
-                    .child(select_item(&small, "pst", "Pacific Standard Time (PST)", true)),
+                    .child(select_item("est", "Eastern Standard Time (EST)"))
+                    .child(select_item("cst", "Central Standard Time (CST)"))
+                    .child(select_item("pst", "Pacific Standard Time (PST)").disabled(true)),
             )
             .child(select_separator())
             .child(
                 select_group()
                     .child(select_label("Europe & Africa"))
-                    .child(select_item(&small, "gmt", "Greenwich Mean Time (GMT)", false))
-                    .child(select_item(&small, "cet", "Central European Time (CET)", false)),
+                    .child(select_item("gmt", "Greenwich Mean Time (GMT)"))
+                    .child(select_item("cet", "Central European Time (CET)")),
             );
         page(
             "Select",
@@ -105,47 +105,46 @@ pub fn render() -> Render {
                 .gap(6.0)
                 .child(demo(
                     "SelectDemo.vue",
-                    select_trigger(&fruit, "Select a fruit", SelectSize::Default, fruits).w_px(180.0),
+                    select()
+                        .model(fruit)
+                        .w_px(180.0)
+                        .child(select_value("Select a fruit"))
+                        .child(fruits()),
                 ))
                 .child(demo(
                     "SelectMultipleDemo.vue",
-                    select_trigger(
-                        &fruits_many,
-                        "Select a fruit",
-                        SelectSize::Default,
-                        select_content(&fruits_many).child(
-                            select_group()
-                                .child(select_label("Fruits"))
-                                .children(FRUITS.map(|(v, l)| select_item(&fruits_many, v, l, false))),
-                        ),
-                    )
-                    .w_px(180.0),
+                    select_multiple()
+                        .w_px(180.0)
+                        .child(select_value("Select a fruit"))
+                        .child(fruits()),
                 ))
                 .child(demo(
                     "SelectScrollable.vue",
-                    select_trigger(
-                        &zone,
-                        "Select a timezone",
-                        SelectSize::Default,
-                        select_content(&zone).children(ZONES.map(|(region, zones)| {
+                    select()
+                        .w_px(280.0)
+                        .child(select_value("Select a timezone"))
+                        .child(select_content().children(ZONES.map(|(region, zones)| {
                             select_group()
                                 .child(select_label(region))
-                                .children(zones.iter().map(|(v, l)| select_item(&zone, v, l, false)))
-                        })),
-                    )
-                    .w_px(280.0),
+                                .children(zones.iter().map(|(v, l)| select_item(*v, *l)))
+                        }))),
                 ))
                 .child(section(
                     "Small, groups, separator, disabled item",
-                    div()
-                        .flex()
-                        .child(select_trigger(&small, "Select a timezone", SelectSize::Sm, zones).w_px(280.0)),
+                    div().flex().child(
+                        select()
+                            .model(small)
+                            .size(SelectSize::Sm)
+                            .w_px(280.0)
+                            .child(select_value("Select a timezone"))
+                            .child(zones),
+                    ),
                 ))
                 .child(
                     text(format!(
                         "Fruit: {}. Timezone: {}.",
-                        fruit.value.get().unwrap_or_default(),
-                        small.value.get().unwrap_or_default()
+                        fruit.get().unwrap_or_default(),
+                        small.get().unwrap_or_default()
                     ))
                     .text_sm()
                     .text_color(t.muted_foreground),

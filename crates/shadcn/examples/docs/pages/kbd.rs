@@ -1,16 +1,14 @@
 use gui::prelude::*;
 use gui::{Icon, ScenarioError, TextField, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, InputGroupAlign, Orientation, TooltipState, button, button_group, input_group,
-    input_group_addon, input_group_input, kbd, kbd_group, kbd_on_tooltip, theme, tooltip_content, tooltip_trigger,
+    ButtonSize, ButtonVariant, InputGroupAlign, Orientation, button, button_group, input_group, input_group_addon,
+    input_group_input, kbd, kbd_group, kbd_on_tooltip, theme, tooltip, tooltip_content, tooltip_trigger,
 };
 
 use crate::{Render, Shot, demo, page};
 
 pub fn render() -> Render {
     let search = TextField::new("");
-    let save = TooltipState::new();
-    let print = TooltipState::new();
     Box::new(move || {
         let t = theme();
         page(
@@ -85,32 +83,43 @@ pub fn render() -> Render {
                 .child(demo(
                     "KbdWithTooltip.vue",
                     // `TooltipTrigger as-child`: each button is the group's
-                    // item and its tooltip's anchor.
+                    // item and its tooltip's anchor; each tooltip's anchor
+                    // holds one, so the buttons are joined here.
                     div().flex().flex_wrap().gap(4.0).child(button_group(
                         Orientation::Horizontal,
                         [
-                            tooltip_trigger(&save, button(ButtonVariant::Outline, ButtonSize::Sm).child("Save")).child(
-                                tooltip_content(&save, |c| {
-                                    c.child(
+                            tooltip()
+                                .child(tooltip_trigger(
+                                    button(ButtonVariant::Outline, ButtonSize::Sm)
+                                        .rounded_r(0.0)
+                                        .child("Save"),
+                                ))
+                                .child(
+                                    tooltip_content().child(
                                         div()
                                             .flex()
                                             .items_center()
                                             .gap(2.0)
                                             .child("Save Changes")
                                             .child(kbd_on_tooltip().child("S")),
-                                    )
-                                }),
-                            ),
-                            tooltip_trigger(&print, button(ButtonVariant::Outline, ButtonSize::Sm).child("Print"))
-                                .child(tooltip_content(&print, |c| {
-                                    c.child(
+                                    ),
+                                ),
+                            tooltip()
+                                .child(tooltip_trigger(
+                                    button(ButtonVariant::Outline, ButtonSize::Sm)
+                                        .rounded_l(0.0)
+                                        .border_l_w(0.0)
+                                        .child("Print"),
+                                ))
+                                .child(
+                                    tooltip_content().child(
                                         div().flex().items_center().gap(2.0).child("Print Document").child(
                                             kbd_group()
                                                 .child(kbd_on_tooltip().child("Ctrl"))
                                                 .child(kbd_on_tooltip().child("P")),
                                         ),
-                                    )
-                                })),
+                                    ),
+                                ),
                         ],
                     )),
                 )),

@@ -1,23 +1,22 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, div, text};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{
-    PinInputState, PinInputType, input_otp_group, label, pin_input, pin_input_separator, pin_input_slot, theme,
+    Part, PinInputProps, PinInputType, input_otp_group, label, pin_input, pin_input_separator, pin_input_slot, theme,
 };
 
 use crate::{Render, Shot, demo, page};
 
-fn group(state: &PinInputState, range: std::ops::Range<usize>) -> gui::Div {
-    input_otp_group(range.map(|i| pin_input_slot(state, i, false)))
+fn group(range: std::ops::Range<usize>) -> gui::Div {
+    input_otp_group(range.map(pin_input_slot))
 }
 
 pub fn render() -> Render {
-    let simple = PinInputState::new(6, PinInputType::Text);
-    let digits = PinInputState::new(6, PinInputType::Number);
-    let pairs = PinInputState::new(6, PinInputType::Text);
-    let spaced = PinInputState::new(4, PinInputType::Text);
+    let simple = Signal::labeled("pin", Vec::<Option<char>>::new());
     Box::new(move || {
         let t = theme();
-        let labelled = |name: &str, body: gui::Div| div().grid().gap(2.0).child(label(name.to_owned())).child(body);
+        let labelled =
+            |name: &str, body: Part<PinInputProps>| div().grid().gap(2.0).child(label(name.to_owned())).child(body);
+        let code: String = simple.with(|v| v.iter().flatten().collect());
         page(
             "Pin Input",
             div()
@@ -27,29 +26,32 @@ pub fn render() -> Render {
                 .child(demo(
                     "PinInputDemo.vue",
                     pin_input()
-                        .child(group(&simple, 0..3))
+                        .model(simple)
+                        .child(group(0..3))
                         .child(pin_input_separator())
-                        .child(group(&simple, 3..6)),
+                        .child(group(3..6)),
                 ))
-                .child(labelled("Digits Only", pin_input().child(group(&digits, 0..6))))
+                .child(labelled(
+                    "Digits Only",
+                    pin_input().kind(PinInputType::Number).child(group(0..6)),
+                ))
                 .child(labelled(
                     "With Separator",
                     pin_input()
-                        .child(group(&pairs, 0..2))
+                        .child(group(0..2))
                         .child(pin_input_separator())
-                        .child(group(&pairs, 2..4))
+                        .child(group(2..4))
                         .child(pin_input_separator())
-                        .child(group(&pairs, 4..6)),
+                        .child(group(4..6)),
                 ))
                 .child(labelled(
                     "With Spacing",
                     pin_input().child(
-                        input_otp_group((0..4).map(|i| pin_input_slot(&spaced, i, true).rounded_md().border()))
-                            .gap(2.0),
+                        input_otp_group((0..4).map(|i| pin_input_slot(i).invalid(true).rounded_md().border())).gap(2.0),
                     ),
                 ))
                 .child(
-                    text(format!("Simple: \"{}\"", simple.code()))
+                    text(format!("Simple: \"{code}\""))
                         .w_full()
                         .text_sm()
                         .text_color(t.muted_foreground),

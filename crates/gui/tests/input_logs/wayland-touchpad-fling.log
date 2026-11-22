@@ -1,0 +1,71 @@
+gui-input-log 1
+platform wayland
+window 480 320 1
+source synthesized, not recorded: a touchpad on Wayland through libinput. wl_pointer.axis events with axis_source finger, in surface pixels, one frame every 7-12 ms while the fingers move, and an axis_stop when they lift (no momentum: kinetic scrolling is the client's, as GTK's gtkeventcontrollerscroll.c does it); winit 0.30 (platform_impl/linux/wayland/seat/pointer/mod.rs) makes the first started, the rest moved, the stop ended with a zero PixelDelta. Three gestures: lifted while moving, lifted 60 ms after the fingers stopped, and lifted 200 ms after; then a wheel, whose axis_discrete steps winit makes LineDelta.
+0.000 move 180 150
+100.000 wheel pixels 0 -4 started
+109.910 wheel pixels 0 -5.87 moved
+117.830 wheel pixels 0 -7.74 moved
+127.792 wheel pixels 0 -8.5 moved
+136.220 wheel pixels 0 -10.37 moved
+145.048 wheel pixels 0 -12.24 moved
+153.326 wheel pixels 0 -13 moved
+162.185 wheel pixels 0 -13.37 moved
+172.395 wheel pixels 0 -13.74 moved
+180.697 wheel pixels 0 -13 moved
+188.815 wheel pixels 0 -13.37 moved
+196.902 wheel pixels 0 -13.74 moved
+205.056 wheel pixels 0 -13 moved
+214.728 wheel pixels 0 -13.37 moved
+222.816 wheel pixels 0 -13.74 moved
+232.013 wheel pixels 0 -13 moved
+242.389 wheel pixels 0 -13.37 moved
+250.099 wheel pixels 0 -13.74 moved
+260.484 wheel pixels 0 0 ended
+3000.000 wheel pixels 0 -4 started
+3008.285 wheel pixels 0 -5.87 moved
+3016.908 wheel pixels 0 -7.74 moved
+3026.194 wheel pixels 0 -8.5 moved
+3036.399 wheel pixels 0 -10.37 moved
+3044.703 wheel pixels 0 -12.24 moved
+3053.255 wheel pixels 0 -13 moved
+3063.746 wheel pixels 0 -13.37 moved
+3071.632 wheel pixels 0 -13.74 moved
+3079.860 wheel pixels 0 -13 moved
+3088.967 wheel pixels 0 -13.37 moved
+3098.030 wheel pixels 0 -13.74 moved
+3105.627 wheel pixels 0 -13 moved
+3113.874 wheel pixels 0 -13.37 moved
+3124.339 wheel pixels 0 -13.74 moved
+3134.731 wheel pixels 0 -13 moved
+3142.291 wheel pixels 0 -13.37 moved
+3149.796 wheel pixels 0 -13.74 moved
+3218.300 wheel pixels 0 0 ended
+6000.000 wheel pixels 0 -4 started
+6008.183 wheel pixels 0 -5.87 moved
+6017.894 wheel pixels 0 -7.74 moved
+6025.568 wheel pixels 0 -8.5 moved
+6033.134 wheel pixels 0 -10.37 moved
+6043.043 wheel pixels 0 -12.24 moved
+6050.576 wheel pixels 0 -13 moved
+6058.366 wheel pixels 0 -13.37 moved
+6066.746 wheel pixels 0 -13.74 moved
+6076.813 wheel pixels 0 -13 moved
+6085.922 wheel pixels 0 -13.37 moved
+6095.724 wheel pixels 0 -13.74 moved
+6105.623 wheel pixels 0 -13 moved
+6115.638 wheel pixels 0 -13.37 moved
+6124.618 wheel pixels 0 -13.74 moved
+6132.409 wheel pixels 0 -13 moved
+6141.332 wheel pixels 0 -13.37 moved
+6149.793 wheel pixels 0 -13.74 moved
+6357.745 wheel pixels 0 0 ended
+9000.000 wheel lines 0 -1 moved
+9040.000 wheel lines 0 -1 moved
+9080.000 wheel lines 0 -1 moved
+9120.000 wheel lines 0 -1 moved
+9160.000 wheel lines 0 -1 moved
+9200.000 wheel lines 0 -1 moved
+9500.000 move 180 150
+9501.000 down
+9551.000 up

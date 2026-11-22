@@ -1,5 +1,5 @@
 use gui::prelude::*;
-use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon};
+use gui::{Icon, Modifiers, NamedKey, ScenarioError, div, icon};
 use shadcn::{ToggleSize, ToggleVariant, toggle};
 
 use crate::{Render, Shot, demo, page};
@@ -16,9 +16,7 @@ fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32), ScenarioError> {
 }
 
 pub fn render() -> Render {
-    let states: [Signal<bool>; 6] = std::array::from_fn(|_| Signal::new(false));
     Box::new(move || {
-        let [bold, outline, disabled, small, large, text] = &states;
         page(
             "Toggle",
             div()
@@ -26,29 +24,29 @@ pub fn render() -> Render {
                 .gap(6.0)
                 .child(demo(
                     "ToggleDemo.vue",
-                    toggle(ToggleVariant::Default, ToggleSize::Default, bold).child(icon(Icon::Bold)),
+                    toggle(ToggleVariant::Default, ToggleSize::Default).child(icon(Icon::Bold)),
                 ))
                 .child(demo(
                     "ToggleOutlineDemo.vue",
-                    toggle(ToggleVariant::Outline, ToggleSize::Default, outline).child(icon(Icon::Bold)),
+                    toggle(ToggleVariant::Outline, ToggleSize::Default).child(icon(Icon::Bold)),
                 ))
                 .child(demo(
                     "ToggleDisabledDemo.vue",
-                    toggle(ToggleVariant::Default, ToggleSize::Default, disabled)
+                    toggle(ToggleVariant::Default, ToggleSize::Default)
                         .disabled(true)
                         .child(icon(Icon::Underline)),
                 ))
                 .child(demo(
                     "ToggleSmallDemo.vue",
-                    toggle(ToggleVariant::Default, ToggleSize::Sm, small).child(icon(Icon::Italic)),
+                    toggle(ToggleVariant::Default, ToggleSize::Sm).child(icon(Icon::Italic)),
                 ))
                 .child(demo(
                     "ToggleLargeDemo.vue",
-                    toggle(ToggleVariant::Default, ToggleSize::Lg, large).child(icon(Icon::Italic)),
+                    toggle(ToggleVariant::Default, ToggleSize::Lg).child(icon(Icon::Italic)),
                 ))
                 .child(demo(
                     "ToggleTextDemo.vue",
-                    toggle(ToggleVariant::Default, ToggleSize::Default, text)
+                    toggle(ToggleVariant::Default, ToggleSize::Default)
                         .child(icon(Icon::Italic))
                         .child("Italic"),
                 )),

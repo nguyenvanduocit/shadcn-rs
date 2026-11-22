@@ -1,0 +1,13 @@
+<!-- flex-grow shares free space in proportion, after a fixed item; basis 0 and basis auto. -->
+<div style="width: 400px">
+  <div style="display: flex; height: 20px">
+    <div style="width: 60px"></div>
+    <div style="flex-grow: 1; flex-basis: 0"></div>
+    <div style="flex-grow: 2; flex-basis: 0"></div>
+  </div>
+  <div style="display: flex; height: 20px">
+    <div style="flex-grow: 1; width: 50px"></div>
+    <div style="flex-grow: 1; width: 100px"></div>
+    <div style="flex: 1"></div>
+  </div>
+</div>

@@ -5,30 +5,52 @@
 //! asked, keeps the reader's place when history is prepended, and says which
 //! way there is more to read and which turn is in view.
 //!
-//! The engine reads the viewport through a [`ScrollHandle`] after each layout,
-//! where Vue reads the DOM in its observers: what it changes (the offset, the
-//! spacer that lets the last turn scroll to the top) is laid out again before
-//! the frame is painted. Vue's viewport and content are one box here, since a
-//! handle reports where a scroll container's own children lie. Scrolls jump:
-//! `gui` animates no scroll, so `behavior: "smooth"` lands at once.
+//! The thread is a virtual list ([`gui::list`], ADR-0014): a thread of a
+//! million messages builds only the rows in view and a prefetch margin, and
+//! every behaviour works on the messages' indices in the data, built or not.
+//! The list holds the scroll position as a row and an offset into it, so a
+//! message asked for lands exactly once the rows around it are measured,
+//! history prepended above keeps the reader's message where it was (the
+//! viewport reports the rows inserted to the list), and the room below the
+//! last turn that lets it scroll to the top is the list's end space.
+//!
+//! The engine reads the list after each layout ([`ListState::on_layout`]),
+//! where Vue reads the DOM in its observers: what it changes (the anchor, the
+//! end space) is laid out again before the frame is painted. The thread's
+//! gap is part of each row (room below every message but the last), so the
+//! list's offsets are its rows' boxes exactly. Scrolls jump: `gui` animates
+//! no scroll, so `behavior: "smooth"` lands at once.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
+use std::ops::Range;
 use std::rc::{Rc, Weak};
 use std::time::Duration;
 
+use gui::list::{Anchor, ListLayout, ListState, virtual_list_in};
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{Div, Easing, ElementKey, Icon, Properties, ScrollHandle, ScrollLayout, Signal, clock, div, icon, key_of};
+use gui::{
+    ComponentElement, Div, Easing, Element, ElementKey, Icon, Properties, Signal, clock, component, div, icon, key_of,
+    provide, use_context, watch,
+};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::theme::theme;
 
-const SCROLL_EPSILON: f32 = 0.5;
+const SCROLL_EPSILON: f64 = 0.5;
 const AUTOSCROLLING_TIMEOUT: Duration = Duration::from_millis(180);
-/// The content's row gap until two items show the one the caller set (`gap-8`).
-const DEFAULT_GAP: f32 = 32.0;
-const SPACER: &str = "message-scroller-spacer";
+/// The thread's gap between messages (`gap-8`), in spacing units.
+const DEFAULT_GAP: f32 = 8.0;
+/// How tall a message is taken to be until one is measured.
+const ROW_ESTIMATE: f32 = 96.0;
+
+/// A height or offset in the list's `f64` pixels as an `f32` (small: one
+/// relative to a row or the viewport).
+#[expect(clippy::as_conversions, reason = "a pixel offset local to the viewport")]
+fn local(v: f64) -> f32 {
+    v as f32
+}
 
 /// Where a thread opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -51,7 +73,7 @@ pub enum MessageScrollerScrollAlign {
     Nearest,
 }
 
-/// How [`MessageScrollerState::scroll_to_message`] places a message.
+/// How [`MessageScroller::scroll_to_message`] places a message.
 #[derive(Clone, Copy, Debug, PartialEq, Default)]
 pub struct MessageScrollerScrollOptions {
     pub align: MessageScrollerScrollAlign,
@@ -66,11 +88,15 @@ pub struct MessageScrollerScrollable {
     pub end: bool,
 }
 
-/// The messages in view and the anchored turn the reader is in.
+/// The messages in view and the anchored turn the reader is in, as indices
+/// in the thread's data.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct MessageScrollerVisibility {
-    pub current_anchor_id: Option<String>,
-    pub visible_message_ids: Vec<String>,
+    /// The last anchored turn whose top is at or above the line a new turn
+    /// settles at (built or not).
+    pub current_anchor: Option<usize>,
+    /// The messages showing below that line.
+    pub visible: Range<usize>,
 }
 
 /// Vue's `MessageScrollerProvider` props.
@@ -106,98 +132,72 @@ enum Mode {
     SettlingJump,
 }
 
-/// One item as laid out, in the content's coordinates.
-#[derive(Clone, Debug)]
-struct Item {
-    key: ElementKey,
-    id: String,
-    anchor: bool,
-    top: f32,
-    height: f32,
+/// An edge a message is placed at (`Nearest` decided).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Edge {
+    Start,
+    Center,
+    End,
 }
 
-impl Item {
-    fn bottom(&self) -> f32 {
-        self.top + self.height
-    }
+/// A message being placed: held there while its turn grows (`hold`), or
+/// until it is measured where asked.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Settle {
+    row: u64,
+    edge: Edge,
+    margin: f32,
+    hold: bool,
 }
 
-/// The viewport as last laid out, with the offset asked for since.
+/// What the data changed since the last layout.
 #[derive(Clone, Debug, Default)]
-struct View {
-    height: f32,
-    top: f32,
-    /// The content's padding at the start and the end.
-    padding: (f32, f32),
-    items: Vec<Item>,
-}
-
-impl View {
-    /// How tall the items make the content, the spacer left out.
-    fn content_height(&self) -> f32 {
-        let (start, end) = self.padding;
-        self.items.iter().fold(start + end, |h, i| h.max(i.bottom() + end))
-    }
-
-    fn item(&self, key: ElementKey) -> Option<&Item> {
-        self.items.iter().find(|i| i.key == key)
-    }
-
-    fn index(&self, key: ElementKey) -> Option<usize> {
-        self.items.iter().position(|i| i.key == key)
-    }
-
-    /// The offset that brings `item` to `align`, `margin` from the edge.
-    fn top_for(&self, item: &Item, align: MessageScrollerScrollAlign, margin: f32) -> f32 {
-        let (start, end) = self.padding;
-        match align {
-            MessageScrollerScrollAlign::Start => item.top - start - margin,
-            MessageScrollerScrollAlign::Center => {
-                let available = (self.height - start - end).max(0.0);
-                item.top - start - (available - item.height) / 2.0 - margin
-            }
-            MessageScrollerScrollAlign::End => item.top - self.height + item.height + end + margin,
-            MessageScrollerScrollAlign::Nearest => {
-                let (visible_top, visible_bottom) = (self.top + start, self.top + self.height - end);
-                if item.top >= visible_top && item.bottom() <= visible_bottom {
-                    self.top
-                } else if item.top < visible_top {
-                    item.top - start - margin
-                } else {
-                    item.bottom() - self.height + end + margin
-                }
-            }
-        }
-    }
+struct Change {
+    /// Messages before it.
+    previous: u64,
+    /// Messages inserted above the first.
+    prepended: u64,
+    /// Anchored messages appended at the end: index and key.
+    added_anchors: Vec<(u64, ElementKey)>,
+    /// The last message replaced by an anchored one, the count unchanged.
+    replaced_anchor: Option<(u64, ElementKey)>,
 }
 
 /// Vue's `createEngine`: the scroller's state between layouts.
 struct Engine {
     props: MessageScrollerProps,
-    handle: ScrollHandle,
+    list: ListState,
     me: Weak<RefCell<Engine>>,
+    /// Owns the engine's timers: they are cancelled with the provider.
+    owner: gui::Scope,
     scrollable: Signal<MessageScrollerScrollable>,
     visibility: Signal<MessageScrollerVisibility>,
     autoscrolling: Signal<bool>,
-    /// The items built this frame: id and whether each is an anchor.
-    registered: HashMap<ElementKey, (String, bool)>,
-    view: View,
-    laid: bool,
-    /// What the last layout showed, to tell what changed since: the items,
-    /// and the viewport's and the content's size.
-    keys: Vec<ElementKey>,
-    size: (f32, f32, f32),
-    shown_top: f32,
+    /// The gap below every message but the last, in pixels.
     gap: f32,
-    spacer: f32,
+    /// The data as last rendered: its length, first and last keys.
+    len: u64,
+    first: Option<ElementKey>,
+    last: Option<ElementKey>,
+    /// The rows built: the first's index and whether each is an anchor.
+    built_first: u64,
+    built_anchors: Vec<bool>,
+    /// The last anchor above the rows built.
+    anchor_before: Option<u64>,
+    /// The last anchor of the thread (for `LastAnchor`, until it is applied).
+    last_anchor: Option<u64>,
+    /// "The last anchor at or before `from` is `found`", for the data as it is.
+    anchor_cache: Option<(u64, Option<u64>)>,
+    change: Option<Change>,
+    laid: bool,
+    /// The viewport's width and height and the rows' extent, as last laid out.
+    size: (f32, f32, f64),
+    shown_top: f64,
+    last_scroll_top: f64,
     mode: Mode,
-    streaming_turn: Option<ElementKey>,
-    first_item: Option<ElementKey>,
-    item_count: usize,
-    last_scroll_top: f32,
+    settle: Option<Settle>,
     default_applied: bool,
-    prepend_restore: Option<(ElementKey, f32)>,
-    pending: Option<(String, MessageScrollerScrollOptions)>,
+    pending: Option<(u64, MessageScrollerScrollOptions)>,
     handled_anchors: HashSet<ElementKey>,
     /// Bumped by each programmatic scroll; the timer that ends autoscrolling
     /// acts only for the last.
@@ -207,122 +207,200 @@ struct Engine {
 }
 
 impl Engine {
+    // ── At render ──────────────────────────────────────────────────────────
+
+    /// The data as the viewport renders it: what changed since the last
+    /// render, reported to the list before it builds (rows inserted above,
+    /// the gap moving to the row that is no longer last).
+    fn data(&mut self, len: u64, gap: f32, key: &dyn Fn(u64) -> ElementKey, anchor: &dyn Fn(u64) -> bool) {
+        self.gap = gap;
+        let first = (len > 0).then(|| key(0));
+        let last = len.checked_sub(1).map(key);
+        if (len, first, last) != (self.len, self.first, self.last) {
+            let previous = self.len;
+            // Earlier messages came in above: the old first found further down.
+            let prepended = match self.first {
+                Some(old) if first != Some(old) && len > previous => {
+                    (1..=len.saturating_sub(previous)).find(|&k| key(k) == old).unwrap_or(0)
+                }
+                _ => 0,
+            };
+            if prepended > 0 {
+                self.list.splice(0, 0, prepended);
+                self.shift(prepended);
+            }
+            let was_last = previous.checked_sub(1).map(|r| r.saturating_add(prepended));
+            // The old last message gains the gap as messages come after it,
+            // the new last one loses it when those after it went.
+            match (was_last, self.last) {
+                (Some(r), Some(old)) if r.saturating_add(1) < len && key(r) == old => {
+                    self.list.adjust_row_height(r, gap);
+                }
+                _ if prepended == 0 && first == self.first && len > 0 && len < previous => {
+                    self.list.adjust_row_height(len.saturating_sub(1), -gap);
+                }
+                _ => {}
+            }
+            let added_anchors = if previous > 0 {
+                (previous.saturating_add(prepended)..len)
+                    .filter(|&r| anchor(r))
+                    .map(|r| (r, key(r)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let replaced_anchor = match last {
+                Some(k) if len == previous && prepended == 0 && last != self.last => len
+                    .checked_sub(1)
+                    .filter(|&r| anchor(r) && !self.handled_anchors.contains(&k))
+                    .map(|r| (r, k)),
+                _ => None,
+            };
+            let change = match self.change.take() {
+                Some(mut c) => {
+                    c.prepended = c.prepended.saturating_add(prepended);
+                    for a in &mut c.added_anchors {
+                        a.0 = a.0.saturating_add(prepended);
+                    }
+                    c.added_anchors.extend(added_anchors);
+                    c.replaced_anchor = replaced_anchor.or(c.replaced_anchor);
+                    c
+                }
+                None => Change {
+                    previous,
+                    prepended,
+                    added_anchors,
+                    replaced_anchor,
+                },
+            };
+            self.change = Some(change);
+            self.anchor_cache = None;
+            (self.len, self.first, self.last) = (len, first, last);
+        }
+        if !self.default_applied
+            && self.props.default_scroll_position == MessageScrollerDefaultScrollPosition::LastAnchor
+        {
+            self.last_anchor = len.checked_sub(1).and_then(|q| self.anchor_at_or_before(q, anchor));
+        }
+    }
+
+    /// The rows the list built this render, from `first`.
+    fn built(&mut self, first: u64, anchors: Vec<bool>, anchor: &dyn Fn(u64) -> bool) {
+        self.built_first = first;
+        self.built_anchors = anchors;
+        self.anchor_before = first.checked_sub(1).and_then(|q| self.anchor_at_or_before(q, anchor));
+    }
+
+    /// The last anchor at or before row `q`, scanning only what the last
+    /// answer does not cover.
+    fn anchor_at_or_before(&mut self, q: u64, anchor: &dyn Fn(u64) -> bool) -> Option<u64> {
+        match self.anchor_cache {
+            Some((from, found)) if from <= q => {
+                let hit = (from.saturating_add(1)..=q).rev().find(|&r| anchor(r)).or(found);
+                self.anchor_cache = Some((q, hit));
+                hit
+            }
+            // No anchor between `found` and `from`, so none after it up to `q`.
+            Some((_, Some(found))) if found <= q => Some(found),
+            _ => {
+                let hit = (0..=q).rev().find(|&r| anchor(r));
+                self.anchor_cache = Some((q, hit));
+                hit
+            }
+        }
+    }
+
+    /// Rows `k` were inserted above every row the engine holds on to.
+    fn shift(&mut self, k: u64) {
+        if let Some(s) = &mut self.settle {
+            s.row = s.row.saturating_add(k);
+        }
+        if let Some((row, _)) = &mut self.pending {
+            *row = row.saturating_add(k);
+        }
+    }
+
     // ── After layout ────────────────────────────────────────────────────────
 
     /// What the observers and the scroll events of Vue's viewport react to.
-    fn laid_out(&mut self, l: &ScrollLayout) -> bool {
+    fn laid_out(&mut self, l: &ListLayout) -> bool {
         self.dirty = false;
-        if self.handle.take_wheeled() {
+        if l.wheeled {
             self.user_scroll_intent();
-        }
-        let spacer = key_of(SPACER);
-        let items: Vec<Item> = l
-            .children
-            .iter()
-            .filter_map(|c| {
-                let key = c.key.filter(|k| *k != spacer)?;
-                let (id, anchor) = self.registered.get(&key)?.clone();
-                Some(Item {
-                    key,
-                    id,
-                    anchor,
-                    top: c.bounds.y,
-                    height: c.bounds.height,
-                })
-            })
-            .collect();
-        if let [a, b, ..] = items.as_slice() {
-            self.gap = b.top - a.bottom();
         }
         let first = !self.laid;
         self.laid = true;
-        self.view = View {
-            height: l.bounds.height,
-            top: l.offset.1,
-            padding: (l.padding.top, l.padding.bottom),
-            items,
-        };
-        let keys: Vec<ElementKey> = self.view.items.iter().map(|i| i.key).collect();
-        self.registered.retain(|k, _| keys.contains(k));
-        let size = (l.bounds.width, l.bounds.height, l.max.1 + l.bounds.height);
-        let scrolled = (l.offset.1 - self.shown_top).abs() > SCROLL_EPSILON;
-        self.shown_top = l.offset.1;
-
-        if keys != self.keys {
-            self.keys = keys;
+        let size = (l.width, l.viewport, l.extent);
+        let moved = l.top - self.shown_top;
+        self.shown_top = l.top;
+        if !first && !l.wheeled && moved > SCROLL_EPSILON && self.following() {
+            // The list followed the end down as the thread grew: Vue's autoscroll.
+            self.set_autoscrolling(true);
+        }
+        if let Some(change) = self.change.take() {
             self.size = size;
-            self.handle_content_change();
+            self.apply_content_change(&change);
         } else if size != self.size {
             self.size = size;
             self.handle_resize();
         }
-        if scrolled {
-            self.sync_after_scroll();
+        if moved.abs() > SCROLL_EPSILON {
+            self.commit_scroll_state();
         }
         if first {
             // Vue's provider, once mounted.
             self.apply_default_scroll_position();
-            self.sync_after_scroll();
+            self.commit_scroll_state();
         }
-        if self.pending.is_some() && self.flush_pending_scroll_to_message() {
-            self.capture_prepend_anchor();
+        if self.pending.is_some() {
+            self.flush_pending_scroll_to_message();
         }
-        self.sync_visibility();
+        self.hold_settle();
+        self.sync_visibility(l);
+        self.sync_follow();
         self.dirty
     }
 
-    fn handle_content_change(&mut self) {
-        let previous_count = self.item_count;
-        let previous_first = self.first_item;
-        self.item_count = self.view.items.len();
-        self.first_item = self.view.items.first().map(|i| i.key);
-        self.apply_content_change(previous_count, previous_first);
-        self.capture_prepend_anchor();
+    fn following(&self) -> bool {
+        self.props.auto_scroll && self.mode == Mode::FollowingBottom
     }
 
-    fn apply_content_change(&mut self, previous_count: usize, previous_first: Option<ElementKey>) {
+    fn apply_content_change(&mut self, c: &Change) {
         if self.flush_pending_scroll_to_message() {
             return;
         }
         let auto = self.props.auto_scroll;
-        if previous_count == 0 {
-            if self.apply_default_scroll_position() || (!self.view.items.is_empty() && auto && self.scroll_to_end()) {
+        if c.previous == 0 {
+            if self.apply_default_scroll_position() || (self.len > 0 && auto && self.scroll_to_end()) {
                 return;
             }
             self.commit_scroll_state();
             return;
         }
-        // Earlier messages came in above: keep the reader's place.
-        if previous_first.and_then(|k| self.view.index(k)).is_some_and(|i| i > 0) {
-            self.apply_prepend_restore();
+        if c.prepended > 0 {
+            // The list's anchor followed its message down: the reader's place is kept.
+            self.commit_scroll_state();
             return;
         }
-        let added = self.view.items.get(previous_count..).unwrap_or_default();
-        let len = self.view.items.len();
-        if len > previous_count
-            && let Some(anchor) = added.iter().find(|i| i.anchor).map(|i| i.key)
+        if self.len > c.previous
+            && let Some(&(row, key)) = c.added_anchors.first()
         {
-            if auto && self.mode == Mode::FollowingBottom && added.iter().filter(|i| i.anchor).count() > 1 {
+            if self.following() && c.added_anchors.len() > 1 {
                 self.scroll_to_end();
                 return;
             }
-            self.scroll_to_element(anchor, MessageScrollerScrollOptions::default(), true);
-            self.handled_anchors.insert(anchor);
+            self.scroll_to_element(row, MessageScrollerScrollOptions::default(), true);
+            self.handled_anchors.insert(key);
             return;
         }
-        if len == previous_count
-            && let Some(anchor) = self
-                .view
-                .items
-                .iter()
-                .find(|i| i.anchor && !self.handled_anchors.contains(&i.key))
-                .map(|i| i.key)
+        if self.len == c.previous
+            && let Some((row, key)) = c.replaced_anchor
         {
-            self.scroll_to_element(anchor, MessageScrollerScrollOptions::default(), true);
-            self.handled_anchors.insert(anchor);
+            self.scroll_to_element(row, MessageScrollerScrollOptions::default(), true);
+            self.handled_anchors.insert(key);
             return;
         }
-        if self.mode == Mode::FollowingBottom && auto {
+        if self.following() {
             self.scroll_to_end();
         } else {
             self.commit_scroll_state();
@@ -330,59 +408,70 @@ impl Engine {
     }
 
     fn handle_resize(&mut self) {
-        if self.mode == Mode::FollowingBottom && self.props.auto_scroll {
+        if self.following() {
             self.scroll_to_end();
             return;
         }
-        let previous_spacer = self.spacer;
-        if self.reanchor_to_anchored_message() {
-            if self.props.auto_scroll && previous_spacer > 0.0 && self.spacer == 0.0 {
-                self.scroll_to_end();
-            }
-            return;
+        // A held turn is placed again below (`hold_settle`).
+        if !self.settle.is_some_and(|s| s.hold) {
+            self.commit_scroll_state();
         }
-        self.commit_scroll_state();
-    }
-
-    fn sync_after_scroll(&mut self) {
-        self.commit_scroll_state();
-        self.capture_prepend_anchor();
     }
 
     fn user_scroll_intent(&mut self) {
+        self.settle = None;
         if self.mode != Mode::FreeScrolling {
-            self.streaming_turn = None;
             self.mode = Mode::FreeScrolling;
+        }
+    }
+
+    /// Place the message being settled again with what is measured now: a
+    /// held turn while its reply grows, a jump until its row is measured.
+    fn hold_settle(&mut self) {
+        let Some(s) = self.settle else { return };
+        if s.row >= self.list.len() {
+            self.settle = None;
+            return;
+        }
+        let before = self.list.end_space();
+        let placed = self.place(s);
+        if s.hold {
+            if self.props.auto_scroll && before > 0.0 && self.list.end_space() == 0.0 {
+                // The reply outgrew the room below: follow it from here.
+                self.scroll_to_end();
+            }
+        } else if placed && self.list.is_measured(s.row) {
+            self.settle = None;
         }
     }
 
     // ── State the view reads ───────────────────────────────────────────────
 
     fn commit_scroll_state(&mut self) {
-        let v = &self.view;
-        let edge = self.props.scroll_edge_threshold;
+        let edge = f64::from(self.props.scroll_edge_threshold);
+        let top = self.list.view_top();
         let measured = if self.laid {
             MessageScrollerScrollable {
-                start: v.top > edge,
-                end: v.content_height() - v.top - v.height > edge,
+                start: top > edge,
+                end: self.list.extent() - top - f64::from(self.list.viewport_height()) > edge,
             }
         } else {
             MessageScrollerScrollable::default()
         };
-        self.update_mode_from_scroll(measured);
+        self.update_mode_from_scroll(measured, top);
         let next = if self.mode == Mode::FollowingBottom {
             MessageScrollerScrollable { end: false, ..measured }
         } else {
             measured
         };
-        if self.scrollable.get() != next {
+        if self.scrollable.get_untracked() != next {
             self.scrollable.set(next);
             self.dirty = true;
         }
+        self.sync_follow();
     }
 
-    fn update_mode_from_scroll(&mut self, next: MessageScrollerScrollable) {
-        let top = self.view.top;
+    fn update_mode_from_scroll(&mut self, next: MessageScrollerScrollable, top: f64) {
         let scrolled_up = top < self.last_scroll_top - SCROLL_EPSILON;
         self.last_scroll_top = top;
         if self.props.auto_scroll
@@ -391,26 +480,49 @@ impl Engine {
             && self.mode != Mode::AnchoredToMessage
         {
             self.mode = Mode::FollowingBottom;
-        } else if self.mode == Mode::FollowingBottom && next.end && scrolled_up && !self.autoscrolling.get() {
+        } else if self.mode == Mode::FollowingBottom && next.end && scrolled_up && !self.autoscrolling.get_untracked() {
             self.mode = Mode::FreeScrolling;
         }
     }
 
+    /// The list follows its tail exactly while the engine follows the bottom.
+    fn sync_follow(&mut self) {
+        let follow = self.following();
+        if self.list.follows_tail() != follow {
+            self.list.follow_tail(follow);
+            self.dirty = true;
+        }
+    }
+
+    /// Whether row `row` is an anchor, for a row built this render.
+    fn built_anchor(&self, row: u64) -> bool {
+        row.checked_sub(self.built_first)
+            .and_then(|j| usize::try_from(j).ok())
+            .and_then(|j| self.built_anchors.get(j))
+            .copied()
+            .unwrap_or(false)
+    }
+
     /// Vue's `computeVisibility`: what shows below the line a new turn settles at.
-    fn sync_visibility(&mut self) {
-        let v = &self.view;
+    fn sync_visibility(&mut self, l: &ListLayout) {
         let line = self.props.scroll_margin + self.props.scroll_previous_item_peek;
-        let mut next = MessageScrollerVisibility::default();
-        for item in &v.items {
-            let top = item.top - v.top;
-            if item.bottom() - v.top > line && top < v.height {
-                next.visible_message_ids.push(item.id.clone());
+        let mut shown: Option<(u64, u64)> = None;
+        let mut current = self.anchor_before;
+        for r in &l.rows {
+            let bottom = r.top + self.visual_height_of(r.row, r.height);
+            if bottom > line && r.top < l.viewport {
+                shown = Some(shown.map_or((r.row, r.row), |(a, _)| (a, r.row)));
             }
-            if item.anchor && top <= line + SCROLL_EPSILON {
-                next.current_anchor_id = Some(item.id.clone());
+            if r.top <= line + local(SCROLL_EPSILON) && self.built_anchor(r.row) {
+                current = Some(r.row);
             }
         }
-        if self.visibility.get() != next {
+        let index = |r: u64| usize::try_from(r).unwrap_or(usize::MAX);
+        let next = MessageScrollerVisibility {
+            current_anchor: current.map(index),
+            visible: shown.map_or(0..0, |(a, b)| index(a)..index(b).saturating_add(1)),
+        };
+        if self.visibility.get_untracked() != next {
             self.visibility.set(next);
             self.dirty = true;
         }
@@ -418,60 +530,84 @@ impl Engine {
 
     fn set_autoscrolling(&mut self, active: bool) {
         self.autoscroll_run = self.autoscroll_run.wrapping_add(1);
-        if self.autoscrolling.get() != active {
+        if self.autoscrolling.get_untracked() != active {
             self.autoscrolling.set(active);
             self.dirty = true;
             self.commit_scroll_state();
         }
         if active {
             let (me, run) = (self.me.clone(), self.autoscroll_run);
-            clock::after(AUTOSCROLLING_TIMEOUT, move || {
-                if let Some(engine) = me.upgrade()
-                    && let Ok(mut e) = engine.try_borrow_mut()
-                    && e.autoscroll_run == run
-                {
-                    e.autoscrolling.set(false);
-                    e.commit_scroll_state();
-                }
+            self.owner.run(|| {
+                clock::after(AUTOSCROLLING_TIMEOUT, move || {
+                    if let Some(engine) = me.upgrade()
+                        && let Ok(mut e) = engine.try_borrow_mut()
+                        && e.autoscroll_run == run
+                    {
+                        e.autoscrolling.set(false);
+                        e.commit_scroll_state();
+                    }
+                })
             });
         }
     }
 
     // ── Moving the viewport ────────────────────────────────────────────────
 
-    fn set_spacer_height(&mut self, height: f32) {
+    /// A row's height without the gap below it.
+    fn visual_height_of(&self, row: u64, height: f32) -> f32 {
+        if row.saturating_add(1) < self.len {
+            (height - self.gap).max(0.0)
+        } else {
+            height
+        }
+    }
+
+    fn set_end_space(&mut self, height: f32) {
         let next = height.ceil().max(0.0);
-        if self.spacer != next {
-            self.spacer = next;
+        if self.list.end_space() != next {
+            self.list.set_end_space(next);
             self.dirty = true;
         }
     }
 
-    /// Put the viewport at `top`, as far as the content and spacer let it go.
-    fn scroll_to(&mut self, top: f32, autoscrolling: bool) {
-        let max = (self.view.content_height() + self.spacer - self.view.height).max(0.0);
-        let target = top.clamp(0.0, max);
-        if (self.view.top - target).abs() <= SCROLL_EPSILON {
-            self.view.top = target;
-            self.commit_scroll_state();
-            return;
+    /// Put `s.row` at its edge with what is measured now, the end space
+    /// letting it get there; whether the viewport shows it there already.
+    fn place(&mut self, s: Settle) -> bool {
+        let vp = f64::from(self.list.viewport_height());
+        let top = self.list.offset_of(s.row);
+        let h = f64::from(self.visual_height_of(s.row, self.list.row_height(s.row)));
+        let m = f64::from(s.margin);
+        let target = match s.edge {
+            Edge::Start => top - m,
+            Edge::Center => top - (vp - h) / 2.0 - m,
+            Edge::End => top + h - vp + m,
         }
-        if autoscrolling {
-            self.set_autoscrolling(true);
+        .max(0.0);
+        self.set_end_space(local(target + vp - self.list.extent()));
+        if (self.list.view_top() - target).abs() <= SCROLL_EPSILON {
+            return true;
         }
-        self.view.top = target;
-        self.handle.scroll_to((0.0, target));
+        self.list.scroll_to(Anchor {
+            row: s.row,
+            key: None,
+            offset: local(target - top),
+        });
         self.dirty = true;
+        false
     }
 
     fn scroll_to_start(&mut self) -> bool {
         if !self.laid {
             return false;
         }
-        self.set_spacer_height(0.0);
-        self.streaming_turn = None;
+        self.set_end_space(0.0);
+        self.settle = None;
         self.mode = Mode::FreeScrolling;
-        self.scroll_to(0.0, false);
+        if self.list.view_top() > SCROLL_EPSILON {
+            self.list.scroll_to_row(0);
+            self.dirty = true;
+        }
+        self.commit_scroll_state();
         true
     }
 
@@ -479,82 +615,90 @@ impl Engine {
         if !self.laid {
             return false;
         }
-        self.set_spacer_height(0.0);
-        self.streaming_turn = None;
+        self.set_end_space(0.0);
+        self.settle = None;
         self.mode = if self.props.auto_scroll {
             Mode::FollowingBottom
         } else {
             Mode::FreeScrolling
         };
-        let end = (self.view.content_height() - self.view.height).max(0.0);
-        self.scroll_to(end, true);
+        let end = (self.list.extent() - f64::from(self.list.viewport_height())).max(0.0);
+        if (self.list.view_top() - end).abs() > SCROLL_EPSILON {
+            self.set_autoscrolling(true);
+            self.list.scroll_to_end();
+            self.dirty = true;
+        }
+        self.commit_scroll_state();
         true
     }
 
-    /// Bring item `key` to `options.align`; with `keep_previous_peek`, as a new
-    /// turn, the one before it peeking in above and the turn held there while it grows.
-    fn scroll_to_element(
-        &mut self,
-        key: ElementKey,
-        options: MessageScrollerScrollOptions,
-        keep_previous_peek: bool,
-    ) -> bool {
-        let Some(item) = self.view.item(key).cloned() else {
+    /// Bring message `row` to `options.align`; with `keep_previous_peek`, as a
+    /// new turn, the one before it peeking in above and the turn held there
+    /// while it grows.
+    fn scroll_to_element(&mut self, row: u64, options: MessageScrollerScrollOptions, keep_previous_peek: bool) -> bool {
+        if !self.laid || row >= self.list.len() {
             return false;
-        };
+        }
         let margin = options.scroll_margin.unwrap_or(self.props.scroll_margin);
         let margin = if keep_previous_peek {
             margin + self.props.scroll_previous_item_peek
         } else {
             margin
         };
-        let target = self.view.top_for(&item, options.align, margin);
-        self.set_spacer_height(target + self.view.height - self.view.content_height());
-        self.prepend_restore = Some((key, item.top - self.view.top));
         self.mode = if keep_previous_peek {
             Mode::AnchoredToMessage
         } else {
             Mode::SettlingJump
         };
-        self.streaming_turn = keep_previous_peek.then_some(key);
-        self.scroll_to(target, false);
+        let edge = match options.align {
+            MessageScrollerScrollAlign::Start => Some(Edge::Start),
+            MessageScrollerScrollAlign::Center => Some(Edge::Center),
+            MessageScrollerScrollAlign::End => Some(Edge::End),
+            MessageScrollerScrollAlign::Nearest => {
+                let (view, vp) = (self.list.view_top(), f64::from(self.list.viewport_height()));
+                let top = self.list.offset_of(row);
+                let h = f64::from(self.visual_height_of(row, self.list.row_height(row)));
+                if top >= view && top + h <= view + vp {
+                    None
+                } else if top < view {
+                    Some(Edge::Start)
+                } else {
+                    Some(Edge::End)
+                }
+            }
+        };
+        self.settle = edge.map(|edge| Settle {
+            row,
+            edge,
+            margin,
+            hold: keep_previous_peek,
+        });
+        if let Some(s) = self.settle {
+            self.place(s);
+        }
+        self.commit_scroll_state();
         true
     }
 
-    fn reanchor_to_anchored_message(&mut self) -> bool {
-        match self.streaming_turn {
-            Some(key) if self.mode == Mode::AnchoredToMessage && self.view.item(key).is_some() => {
-                self.scroll_to_element(key, MessageScrollerScrollOptions::default(), true)
+    fn scroll_to_message(&mut self, row: u64, options: MessageScrollerScrollOptions) -> bool {
+        self.default_applied = true;
+        if self.laid && self.len > 0 {
+            if row >= self.len {
+                return false;
             }
-            _ => false,
+            self.pending = None;
+            return self.scroll_to_element(row, options, false);
         }
-    }
-
-    fn scroll_to_message(&mut self, id: &str, options: MessageScrollerScrollOptions) -> bool {
-        let key = key_of(id);
-        if self.registered.contains_key(&key) {
-            self.default_applied = true;
-            if self.scroll_to_element(key, options, false) {
-                self.pending = None;
-            } else {
-                // Built but not laid out yet: placed after the next layout.
-                self.pending = Some((id.to_owned(), options));
-            }
-            return true;
-        }
-        if self.item_count == 0 {
-            self.pending = Some((id.to_owned(), options));
-            self.default_applied = true;
-            return true;
-        }
-        false
+        // Before the thread has a message laid out: placed once it has.
+        self.pending = Some((row, options));
+        true
     }
 
     fn flush_pending_scroll_to_message(&mut self) -> bool {
-        let Some((id, options)) = self.pending.clone() else {
+        let Some((row, options)) = self.pending else {
             return false;
         };
-        if !self.scroll_to_element(key_of(&id), options, false) {
+        if !self.scroll_to_element(row, options, false) {
             return false;
         }
         self.pending = None;
@@ -562,48 +706,19 @@ impl Engine {
         true
     }
 
-    fn apply_prepend_restore(&mut self) -> bool {
-        let Some((key, was)) = self.prepend_restore else {
-            return false;
-        };
-        let Some(item) = self.view.item(key).cloned() else {
-            return false;
-        };
-        let delta = item.top - self.view.top - was;
-        if delta.abs() <= SCROLL_EPSILON {
-            return false;
-        }
-        self.scroll_to(self.view.top + delta, false);
-        self.prepend_restore = Some((key, item.top - self.view.top));
-        true
-    }
-
-    /// Remember the first message in view and where it shows, to keep it there
-    /// when earlier ones come in above.
-    fn capture_prepend_anchor(&mut self) {
-        let v = &self.view;
-        self.prepend_restore = v
-            .items
-            .iter()
-            .find(|i| i.bottom() - v.top > 0.0 && i.top - v.top < v.height)
-            .map(|i| (i.key, i.top - v.top));
-    }
-
     fn apply_default_scroll_position(&mut self) -> bool {
-        if self.default_applied || self.item_count == 0 {
+        if self.default_applied || self.len == 0 {
             return false;
         }
         let applied = match self.props.default_scroll_position {
             MessageScrollerDefaultScrollPosition::Start => self.scroll_to_start(),
             MessageScrollerDefaultScrollPosition::End => self.scroll_to_end(),
-            MessageScrollerDefaultScrollPosition::LastAnchor => {
-                match self.view.items.iter().rev().find(|i| i.anchor).cloned() {
-                    Some(anchor) if self.view.content_height() - anchor.top > self.view.height => {
-                        self.scroll_to_element(anchor.key, MessageScrollerScrollOptions::default(), true)
-                    }
-                    _ => self.scroll_to_end(),
+            MessageScrollerDefaultScrollPosition::LastAnchor => match self.last_anchor {
+                Some(a) if self.list.extent() - self.list.offset_of(a) > f64::from(self.list.viewport_height()) => {
+                    self.scroll_to_element(a, MessageScrollerScrollOptions::default(), true)
                 }
-            }
+                _ => self.scroll_to_end(),
+            },
         };
         if applied {
             self.default_applied = true;
@@ -612,51 +727,58 @@ impl Engine {
     }
 }
 
-/// A thread's scroll state, shared by its frame, viewport, items and button
-/// (Vue's `MessageScrollerProvider`). Clones share it.
+/// A thread's scroll state and commands, as the parts below a
+/// [`message_scroller_provider`] read it ([`use_message_scroller`], Vue's
+/// `useMessageScroller`). It is the provider's: it lives while the provider
+/// is mounted.
 #[derive(Clone)]
-pub struct MessageScrollerState {
-    handle: ScrollHandle,
+pub struct MessageScroller {
+    list: ListState,
     engine: Rc<RefCell<Engine>>,
     scrollable: Signal<MessageScrollerScrollable>,
     visibility: Signal<MessageScrollerVisibility>,
     autoscrolling: Signal<bool>,
 }
 
-impl MessageScrollerState {
-    #[must_use]
-    pub fn new(props: MessageScrollerProps) -> Self {
-        let handle = ScrollHandle::new();
+impl MessageScroller {
+    /// Made in the provider's setup: what it makes belongs to the provider.
+    fn new(props: MessageScrollerProps) -> Self {
+        let list = ListState::new(ROW_ESTIMATE);
+        list.follow_tail(props.auto_scroll);
         let scrollable = Signal::labeled("message scroller scrollable", MessageScrollerScrollable::default());
         let visibility = Signal::labeled("message scroller visibility", MessageScrollerVisibility::default());
         let autoscrolling = Signal::labeled("message scroller autoscrolling", false);
+        let owner = gui::Scope::new();
         let engine = Rc::new_cyclic(|me| {
             RefCell::new(Engine {
                 props,
-                handle: handle.clone(),
+                list: list.clone(),
                 me: me.clone(),
-                scrollable: scrollable.clone(),
-                visibility: visibility.clone(),
-                autoscrolling: autoscrolling.clone(),
-                registered: HashMap::new(),
-                view: View::default(),
+                owner,
+                scrollable,
+                visibility,
+                autoscrolling,
+                gap: DEFAULT_GAP * gui::styled::UNIT,
+                len: 0,
+                first: None,
+                last: None,
+                built_first: 0,
+                built_anchors: Vec::new(),
+                anchor_before: None,
+                last_anchor: None,
+                anchor_cache: None,
+                change: None,
                 laid: false,
-                keys: Vec::new(),
                 size: (0.0, 0.0, 0.0),
                 shown_top: 0.0,
-                gap: DEFAULT_GAP,
-                spacer: 0.0,
+                last_scroll_top: 0.0,
                 mode: if props.auto_scroll {
                     Mode::FollowingBottom
                 } else {
                     Mode::FreeScrolling
                 },
-                streaming_turn: None,
-                first_item: None,
-                item_count: 0,
-                last_scroll_top: 0.0,
+                settle: None,
                 default_applied: false,
-                prepend_restore: None,
                 pending: None,
                 handled_anchors: HashSet::new(),
                 autoscroll_run: 0,
@@ -664,13 +786,13 @@ impl MessageScrollerState {
             })
         });
         let weak = Rc::downgrade(&engine);
-        handle.on_layout(move |l| {
+        list.on_layout(move |l| {
             weak.upgrade()
                 .and_then(|e| e.try_borrow_mut().ok().map(|mut e| e.laid_out(l)))
                 .unwrap_or(false)
         });
         Self {
-            handle,
+            list,
             engine,
             scrollable,
             visibility,
@@ -678,13 +800,19 @@ impl MessageScrollerState {
         }
     }
 
-    /// Whether there is more of the thread above and below.
+    /// The virtual list the thread is laid out by.
+    #[must_use]
+    pub fn list(&self) -> &ListState {
+        &self.list
+    }
+
+    /// Whether there is more of the thread above and below (reactive).
     #[must_use]
     pub fn scrollable(&self) -> MessageScrollerScrollable {
         self.scrollable.get()
     }
 
-    /// The messages in view and the anchored turn the reader is in.
+    /// The messages in view and the anchored turn the reader is in (reactive).
     #[must_use]
     pub fn visibility(&self) -> MessageScrollerVisibility {
         self.visibility.get()
@@ -700,34 +828,61 @@ impl MessageScrollerState {
         self.engine.try_borrow_mut().is_ok_and(|mut e| e.scroll_to_end())
     }
 
-    /// Bring message `id` into view; before the thread has any item, once it has.
-    pub fn scroll_to_message(&self, id: &str, options: MessageScrollerScrollOptions) -> bool {
+    /// Bring message `index` (its place in the thread's data, built or not)
+    /// into view; before the thread has a message, once it has. False when
+    /// the thread has messages and none at `index`.
+    pub fn scroll_to_message(&self, index: usize, options: MessageScrollerScrollOptions) -> bool {
+        let row = u64::try_from(index).unwrap_or(u64::MAX);
         self.engine
             .try_borrow_mut()
-            .is_ok_and(|mut e| e.scroll_to_message(id, options))
+            .is_ok_and(|mut e| e.scroll_to_message(row, options))
     }
 
-    /// Change how much of the turn before stays in view above a new one.
-    pub fn set_scroll_previous_item_peek(&self, peek: f32) {
+    /// Take the provider's new props: those read as the thread moves (the
+    /// peek, the margin, the edge threshold, following the end).
+    fn set_props(&self, props: MessageScrollerProps) {
+        self.list.follow_tail(props.auto_scroll);
         if let Ok(mut e) = self.engine.try_borrow_mut() {
-            e.props.scroll_previous_item_peek = peek;
+            e.props = props;
         }
     }
+}
 
-    fn register(&self, id: &str, anchor: bool) -> ElementKey {
-        let key = key_of(id);
-        if let Ok(mut e) = self.engine.try_borrow_mut() {
-            e.registered.insert(key, (id.to_owned(), anchor));
-        }
-        key
-    }
+/// The scroller of the [`message_scroller_provider`] above this instance
+/// (Vue's `useMessageScroller`); call it in a component's setup.
+#[must_use]
+pub fn use_message_scroller() -> Option<MessageScroller> {
+    use_context::<MessageScroller>()
+}
 
-    /// The spacer's height and the margin that cancels the gap above it.
-    fn spacer(&self) -> (f32, f32) {
-        self.engine
-            .try_borrow()
-            .map_or((0.0, DEFAULT_GAP), |e| (e.spacer, e.gap))
-    }
+/// The provider (Vue's `MessageScrollerProvider`), around `child`: it keeps
+/// the thread's scroll state for the frame, viewport, button and any control
+/// inside it, which read it through [`use_message_scroller`]. It draws
+/// nothing of its own. Its props are read as they change; give it a new key
+/// to start afresh (Vue's `:key`).
+#[must_use]
+pub fn message_scroller_provider(props: MessageScrollerProps, child: impl IntoElement) -> ComponentElement {
+    component(
+        ProviderProps {
+            props,
+            child: gui::Slot(child.into_element()),
+        },
+        |cx| {
+            let props = cx.props();
+            let scroller = MessageScroller::new(props.with_untracked(|p| p.props));
+            provide(scroller.clone());
+            let _props = watch(move || props.with(|p| p.props), move |_, new| scroller.set_props(*new));
+            move || props.with(|p| p.child.0.clone())
+        },
+    )
+}
+
+/// What [`message_scroller_provider`] is given.
+/// Its child is the parent's slot, so it never compares equal.
+#[derive(Clone, PartialEq)]
+struct ProviderProps {
+    props: MessageScrollerProps,
+    child: gui::Slot<Element>,
 }
 
 /// The frame: it clips the [`message_scroller_viewport`] and holds the
@@ -743,44 +898,136 @@ pub fn message_scroller() -> Div {
         .overflow_hidden()
 }
 
-/// The scrolling column of [`message_scroller_item`]s (Vue's viewport and
-/// content in one box), with the spacer below them that lets the last turn
-/// scroll to the top. The thread's own padding and gap go on it.
+type Meta<T> = Rc<dyn for<'a> Fn(&'a T) -> (&'a str, bool)>;
+type Row<T> = Rc<dyn Fn(usize, &T) -> Div>;
+
+/// What [`message_scroller_viewport`] is given.
+pub struct MessageScrollerViewportProps<T: 'static> {
+    items: Rc<[T]>,
+    meta: Meta<T>,
+    row: Row<T>,
+    gap: f32,
+    viewport: Rc<dyn Fn(Div) -> Div>,
+}
+
+impl<T: 'static> Clone for MessageScrollerViewportProps<T> {
+    fn clone(&self) -> Self {
+        Self {
+            items: Rc::clone(&self.items),
+            meta: Rc::clone(&self.meta),
+            row: Rc::clone(&self.row),
+            gap: self.gap,
+            viewport: Rc::clone(&self.viewport),
+        }
+    }
+}
+
+impl<T: 'static> PartialEq for MessageScrollerViewportProps<T> {
+    fn eq(&self, _: &Self) -> bool {
+        // Its row builder is the parent's slot: made anew by each render.
+        false
+    }
+}
+
+/// The scrolling thread of `items` (Vue's viewport, content and items),
+/// laid out by a virtual list: only the messages in view and a prefetch
+/// margin are built. `meta` gives each message its id (unique in the
+/// thread) and whether it is an anchor, a turn the thread settles near the
+/// top when it comes in; `row(index, item)` builds a message, set in a
+/// `message-scroller-item` row. The thread's gap is `gap-8`; change it with
+/// [`MessageScrollerViewport::gap`].
 #[must_use]
-pub fn message_scroller_viewport(state: &MessageScrollerState, items: impl IntoIterator<Item = Div>) -> Div {
-    let (spacer, gap) = state.spacer();
-    div()
-        .named("message-scroller-viewport")
+pub fn message_scroller_viewport<T: 'static>(
+    items: impl Into<Rc<[T]>>,
+    meta: impl for<'a> Fn(&'a T) -> (&'a str, bool) + 'static,
+    row: impl Fn(usize, &T) -> Div + 'static,
+) -> MessageScrollerViewport<T> {
+    MessageScrollerViewport(MessageScrollerViewportProps {
+        items: items.into(),
+        meta: Rc::new(meta),
+        row: Rc::new(row),
+        gap: DEFAULT_GAP,
+        viewport: Rc::new(|v| v),
+    })
+}
+
+/// A [`message_scroller_viewport`] being built.
+pub struct MessageScrollerViewport<T: 'static>(MessageScrollerViewportProps<T>);
+
+impl<T: 'static> MessageScrollerViewport<T> {
+    /// The gap between messages, in spacing units (as [`Styled::gap`]).
+    #[must_use]
+    pub fn gap(mut self, gap: f32) -> Self {
+        self.0.gap = gap;
+        self
+    }
+
+    /// Style the scroll container (horizontal padding: its rows' offsets are
+    /// its messages' boxes, so the thread takes no vertical padding).
+    #[must_use]
+    pub fn viewport(mut self, f: impl Fn(Div) -> Div + 'static) -> Self {
+        self.0.viewport = Rc::new(f);
+        self
+    }
+}
+
+impl<T: 'static> IntoElement for MessageScrollerViewport<T> {
+    fn into_element(self) -> Element {
+        component(self.0, |cx| {
+            let props = cx.props();
+            let scroller = use_message_scroller();
+            move || {
+                let Some(state) = &scroller else {
+                    return Element::Empty;
+                };
+                props.with(|p| viewport(state, p)).into_element()
+            }
+        })
+        .into_element()
+    }
+}
+
+fn viewport<T>(state: &MessageScroller, p: &MessageScrollerViewportProps<T>) -> Div {
+    let items = &*p.items;
+    let (meta, row, gap) = (&*p.meta, &*p.row, p.gap);
+    let len = u64::try_from(items.len()).unwrap_or(u64::MAX);
+    let at = |i: u64| usize::try_from(i).ok().and_then(|i| items.get(i));
+    let key = |i: u64| at(i).map_or(ElementKey::default(), |t| key_of(meta(t).0));
+    let anchor = |i: u64| at(i).is_some_and(|t| meta(t).1);
+    if let Ok(mut e) = state.engine.try_borrow_mut() {
+        e.data(len, gap * gui::styled::UNIT, &key, &anchor);
+    }
+    state.list.hide_scrollbar(state.autoscrolling.get());
+    let built = RefCell::new(Vec::new());
+    let list = virtual_list_in(
+        &state.list,
+        len,
+        key,
+        |i| {
+            let Some(t) = at(i) else { return Element::Empty };
+            built.borrow_mut().push(meta(t).1);
+            div()
+                .named("message-scroller-item")
+                .w_full()
+                .min_w(0.0)
+                .shrink_0()
+                .when(i.saturating_add(1) < len, |d| d.pb(gap))
+                .child(row(usize::try_from(i).unwrap_or(usize::MAX), t))
+                .into_element()
+        },
+        // In flow, not over the list: the messages built give the thread its
+        // width, as Vue's do (a card sized by its content is as wide as them).
+        |v| (p.viewport)(v.relative().flex_1().min_h(0.0).scroll_fade_b()),
+    );
+    let window = state.list.window();
+    if let Ok(mut e) = state.engine.try_borrow_mut() {
+        e.built(window.start, built.into_inner(), &anchor);
+    }
+    list.named("message-scroller-viewport")
+        .flex_col()
         .size_full()
         .min_h(0.0)
         .min_w(0.0)
-        .overflow_y_scroll()
-        .scroll_fade_b()
-        .when(state.autoscrolling.get(), Styled::scrollbar_none)
-        .track_scroll(&state.handle)
-        .flex_col()
-        .gap(8.0)
-        .children(items)
-        .when(spacer > 0.0, |d| {
-            d.child(
-                div()
-                    .key(key_of(SPACER))
-                    .shrink_0()
-                    .h_px(spacer)
-                    .mt(-gap / gui::styled::UNIT),
-            )
-        })
-}
-
-/// One message of the thread, `id` unique in it. An `anchor` is a turn the
-/// thread settles near the top when it comes in.
-#[must_use]
-pub fn message_scroller_item(state: &MessageScrollerState, id: &str, anchor: bool) -> Div {
-    div()
-        .named("message-scroller-item")
-        .key(state.register(id, anchor))
-        .min_w(0.0)
-        .shrink_0()
 }
 
 /// Which end of the thread the button jumps to.
@@ -795,7 +1042,20 @@ pub enum MessageScrollerDirection {
 /// there is more of the thread that way, jumping there. Vue centres it with
 /// `-translate-x-1/2`; here a full-width row that lets clicks through centres it.
 #[must_use]
-pub fn message_scroller_button(state: &MessageScrollerState, direction: MessageScrollerDirection) -> Div {
+pub fn message_scroller_button(direction: MessageScrollerDirection) -> ComponentElement {
+    component(direction, |cx| {
+        let direction = cx.props();
+        let scroller = use_message_scroller();
+        move || {
+            let Some(state) = scroller.clone() else {
+                return Element::Empty;
+            };
+            scroll_button(state, direction.get()).into_element()
+        }
+    })
+}
+
+fn scroll_button(state: MessageScroller, direction: MessageScrollerDirection) -> Div {
     let t = theme();
     let scrollable = state.scrollable();
     let active = match direction {
@@ -803,7 +1063,6 @@ pub fn message_scroller_button(state: &MessageScrollerState, direction: MessageS
         MessageScrollerDirection::End => scrollable.end,
     };
     let arrow = icon(Icon::ArrowDown).when(direction == MessageScrollerDirection::Start, |i| i.rotate(180.0));
-    let s = state.clone();
     let control = button(ButtonVariant::Secondary, ButtonSize::IconSm)
         .named("message-scroller-button")
         .border()
@@ -834,8 +1093,8 @@ pub fn message_scroller_button(state: &MessageScrollerState, direction: MessageS
         .child(arrow)
         .on_click(move |_| {
             match direction {
-                MessageScrollerDirection::Start => s.scroll_to_start(),
-                MessageScrollerDirection::End => s.scroll_to_end(),
+                MessageScrollerDirection::Start => state.scroll_to_start(),
+                MessageScrollerDirection::End => state.scroll_to_end(),
             };
         });
     let row = div()
@@ -849,5 +1108,252 @@ pub fn message_scroller_button(state: &MessageScrollerState, direction: MessageS
     match direction {
         MessageScrollerDirection::End => row.bottom(4.0),
         MessageScrollerDirection::Start => row.top(4.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gui::layout::Content;
+    use gui::{Scenario, text};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const WIDTH: u32 = 400;
+    const HEIGHT: f32 = 600.0;
+
+    #[derive(Clone, PartialEq)]
+    struct Msg {
+        id: String,
+        user: bool,
+        height: f32,
+    }
+
+    /// Message `i`: a user turn on even indices, 40 px tall; a reply 120 px.
+    fn msg(i: usize) -> Msg {
+        let user = i.is_multiple_of(2);
+        Msg {
+            id: format!("m{i}"),
+            user,
+            height: if user { 40.0 } else { 120.0 },
+        }
+    }
+
+    fn thread_of(n: usize) -> Vec<Msg> {
+        (0..n).map(msg).collect()
+    }
+
+    /// A 400×600 thread of `msgs` under a provider with `props`, settled,
+    /// and the provider's scroller (as a control inside it reads it).
+    fn scenario(props: MessageScrollerProps, msgs: Signal<Vec<Msg>>) -> (Scenario, MessageScroller) {
+        let got: Rc<RefCell<Option<MessageScroller>>> = Rc::default();
+        let into = Rc::clone(&got);
+        let mut s = Scenario::measuring(
+            move || {
+                let into = Rc::clone(&into);
+                let capture = component((), move |_| {
+                    *into.borrow_mut() = use_message_scroller();
+                    || Element::Empty
+                });
+                div()
+                    .w_px(400.0)
+                    .h_px(HEIGHT)
+                    .child(message_scroller_provider(
+                        props,
+                        message_scroller()
+                            .child(message_scroller_viewport(
+                                msgs.get(),
+                                |m: &Msg| (m.id.as_str(), m.user),
+                                |_, m: &Msg| div().h_px(m.height).child(text(m.id.clone())),
+                            ))
+                            .child(capture),
+                    ))
+                    .into_element()
+            },
+            WIDTH,
+            600,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        s.settle().unwrap();
+        let state = got.borrow().clone().unwrap();
+        (s, state)
+    }
+
+    /// The messages built: id and the top of their box.
+    fn built(s: &Scenario) -> Vec<(String, f32)> {
+        s.last()
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.content {
+                Content::Text { content, .. } if content.starts_with('m') => Some((content.to_string(), n.bounds.y)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn top_of(s: &Scenario, id: &str) -> Option<f32> {
+        built(s).into_iter().find(|(m, _)| m == id).map(|(_, y)| y)
+    }
+
+    /// The message whose box holds the viewport's top, and its top.
+    fn at_top(s: &Scenario, msgs: &[Msg]) -> (String, f32) {
+        built(s)
+            .into_iter()
+            .find(|(id, y)| {
+                let h = msgs.iter().find(|m| &m.id == id).map_or(0.0, |m| m.height);
+                *y <= 0.0 && y + h > 0.0
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_hundred_thousand_messages_build_only_the_rows_in_view() {
+        let msgs = Signal::new(thread_of(100_000));
+        let (s, state) = scenario(MessageScrollerProps::default(), msgs);
+        let rows = built(&s);
+        assert!(rows.len() < 40, "{} rows built", rows.len());
+        // It opens at the end: the last message (a reply) ends at the viewport's.
+        assert_eq!(top_of(&s, "m99999"), Some(HEIGHT - 120.0));
+        assert_eq!(
+            state.scrollable(),
+            MessageScrollerScrollable {
+                start: true,
+                end: false
+            }
+        );
+        let v = state.visibility();
+        assert_eq!(v.visible.end, 100_000);
+        // Tops from the end: m99998 at 408, m99996 at 216, m99994 at -8, the
+        // last user turn at or above the 64 px line.
+        assert_eq!(v.current_anchor, Some(99_994));
+    }
+
+    #[test]
+    fn a_message_never_built_lands_exactly_at_its_edge() {
+        let msgs = Signal::new(thread_of(100_000));
+        let (mut s, state) = scenario(
+            MessageScrollerProps {
+                scroll_margin: 24.0,
+                ..MessageScrollerProps::default()
+            },
+            msgs,
+        );
+        assert!(top_of(&s, "m50000").is_none());
+        s.act("jump", || {
+            assert!(state.scroll_to_message(50_000, MessageScrollerScrollOptions::default()));
+        });
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, "m50000"), Some(24.0));
+        // The gap below the one before it is not part of it: 32 px above it.
+        assert_eq!(top_of(&s, "m49999"), Some(24.0 - 32.0 - 120.0));
+        assert_eq!(state.visibility().current_anchor, Some(50_000));
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, "m50000"), Some(24.0));
+        // To the bottom edge: the reply's own box, not its gap, ends 24 px above it.
+        s.act("jump to the end edge", || {
+            state.scroll_to_message(
+                70_001,
+                MessageScrollerScrollOptions {
+                    align: MessageScrollerScrollAlign::End,
+                    scroll_margin: None,
+                },
+            );
+        });
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, "m70001"), Some(HEIGHT - 24.0 - 120.0));
+        assert!(built(&s).len() < 40);
+    }
+
+    #[test]
+    fn a_streaming_reply_is_followed_until_the_reader_scrolls_up() {
+        let msgs = Signal::new(thread_of(30));
+        let (mut s, state) = scenario(
+            MessageScrollerProps {
+                auto_scroll: true,
+                ..MessageScrollerProps::default()
+            },
+            msgs,
+        );
+        assert_eq!(top_of(&s, "m29"), Some(HEIGHT - 120.0));
+        // A reply comes in after the last and grows.
+        s.act("reply", || {
+            msgs.update(|m| {
+                m.push(Msg {
+                    id: "m30".to_owned(),
+                    user: false,
+                    height: 20.0,
+                });
+            });
+        });
+        s.settle().unwrap();
+        for h in [60.0, 200.0, 420.0, 900.0] {
+            s.act("stream", || msgs.update(|m| m.last_mut().unwrap().height = h));
+            s.settle().unwrap();
+            assert_eq!(top_of(&s, "m30"), Some(HEIGHT - h), "at {h}");
+            assert!(!state.scrollable().end);
+        }
+        // The reader wheels up: the reply grows below without moving the view.
+        s.hover(200.0, 300.0);
+        s.wheel(-300.0);
+        s.settle().unwrap();
+        let before = top_of(&s, "m30").unwrap();
+        s.act("stream", || msgs.update(|m| m.last_mut().unwrap().height = 1000.0));
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, "m30"), Some(before));
+        assert!(state.scrollable().end);
+        // Back to the end: followed again.
+        s.act("to the end", || {
+            state.scroll_to_end();
+        });
+        s.settle().unwrap();
+        s.act("stream", || msgs.update(|m| m.last_mut().unwrap().height = 1100.0));
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, "m30"), Some(HEIGHT - 1100.0));
+    }
+
+    #[test]
+    fn a_new_anchored_turn_settles_with_a_peek_of_the_one_before() {
+        let msgs = Signal::new(thread_of(20));
+        let (mut s, state) = scenario(MessageScrollerProps::default(), msgs);
+        s.act("send", || {
+            msgs.update(|m| {
+                m.push(msg(20));
+                m.push(Msg {
+                    height: 30.0,
+                    ..msg(21)
+                });
+            });
+        });
+        s.settle().unwrap();
+        // The turn's top at the peek line (64 px), held while its reply grows.
+        assert_eq!(top_of(&s, "m20"), Some(64.0));
+        assert_eq!(top_of(&s, "m19").map(|y| y + 120.0 + 32.0), Some(64.0));
+        for h in [100.0, 300.0, 700.0] {
+            s.act("stream", || msgs.update(|m| m.last_mut().unwrap().height = h));
+            s.settle().unwrap();
+            assert_eq!(top_of(&s, "m20"), Some(64.0), "at {h}");
+        }
+        assert_eq!(state.visibility().current_anchor, Some(20));
+    }
+
+    #[test]
+    fn history_prepended_keeps_the_reader_on_the_same_message() {
+        let all = thread_of(1_200);
+        let msgs = Signal::new(all.get(1_000..).unwrap().to_vec());
+        let (mut s, _) = scenario(MessageScrollerProps::default(), msgs);
+        s.hover(200.0, 300.0);
+        for _ in 0..5 {
+            s.wheel(-170.0);
+            s.settle().unwrap();
+        }
+        let (id, y) = at_top(&s, &all);
+        s.act("history", || msgs.set(all.clone()));
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, &id), Some(y), "{id}");
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, &id), Some(y), "{id}");
+        assert!(built(&s).len() < 40);
     }
 }

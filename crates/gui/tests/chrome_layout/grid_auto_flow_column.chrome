@@ -1,0 +1,9 @@
+# Chrome's boxes for grid_auto_flow_column.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 800 40
+  div 0 0 50 20
+  div 0 20 50 20
+  div 50 0 60 20
+  div 50 20 60 20
+  div 110 0 70 20

@@ -1,6 +1,6 @@
 # 0008. `gui` measures every frame and holds what the screen shows
 
-Status: accepted, 2026-11-20. Extends ADR-0006 (the frame pipeline's caches) and ADR-0007 (what moves).
+Status: accepted, 2026-11-20; "an effect depends on what its last run read" superseded by ADR-0012, the layout rebuilt each frame by ADR-0014, the process-only heap count and time-only bench comparison by ADR-0023. Extends ADR-0006 (the frame pipeline's caches) and ADR-0007 (what moves).
 
 ## Context
 

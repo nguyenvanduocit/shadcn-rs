@@ -1,24 +1,15 @@
 use gui::prelude::*;
-use gui::{ScenarioError, div, text};
+use gui::{Model, ScenarioError, Signal, div, text};
 use shadcn::{
-    PaginationEntry, PaginationState, pagination, pagination_content, pagination_ellipsis, pagination_first,
-    pagination_item, pagination_last, pagination_next, pagination_previous,
+    pagination, pagination_content, pagination_ellipsis, pagination_first, pagination_last, pagination_list,
+    pagination_next, pagination_previous,
 };
 
 use crate::{Render, Shot, demo, page, section};
 
-fn list(state: &PaginationState) -> gui::Div {
-    pagination_content().children(state.entries().into_iter().map(|e| match e {
-        PaginationEntry::Page(n) => pagination_item(state, n),
-        PaginationEntry::Ellipsis => pagination_ellipsis(),
-    }))
-}
-
 pub fn render() -> Render {
-    // The demo: 30 items, 10 a page, opening on page 2.
-    let demo_state = PaginationState::new(30, 10, 2);
-    let mut long = PaginationState::new(200, 10, 10);
-    long.show_edges = true;
+    // The demo: 30 items, 10 a page, opening on page 2; the page below it reads it.
+    let shown = Signal::labeled("pagination page", 2_usize);
     Box::new(move || {
         page(
             "Pagination",
@@ -28,27 +19,27 @@ pub fn render() -> Render {
                 .child(demo(
                     "PaginationDemo.vue",
                     div().flex_col().gap(6.0).child(
-                        pagination().child(
+                        pagination().total(30, 10).model(Model::bind(shown)).child(
                             pagination_content()
-                                .child(pagination_previous(&demo_state))
-                                .child(list(&demo_state))
+                                .child(pagination_previous())
+                                .child(pagination_list())
                                 .child(pagination_ellipsis())
-                                .child(pagination_next(&demo_state)),
+                                .child(pagination_next()),
                         ),
                     ),
                 ))
                 .child(section(
                     "20 pages, edges shown",
-                    pagination().child(
+                    pagination().total(200, 10).default_page(10).show_edges(true).child(
                         pagination_content()
-                            .child(pagination_first(&long))
-                            .child(pagination_previous(&long))
-                            .child(list(&long))
-                            .child(pagination_next(&long))
-                            .child(pagination_last(&long)),
+                            .child(pagination_first())
+                            .child(pagination_previous())
+                            .child(pagination_list())
+                            .child(pagination_next())
+                            .child(pagination_last()),
                     ),
                 ))
-                .child(text(format!("Page {} of {}", demo_state.page.get(), demo_state.page_count())).text_sm()),
+                .child(text(format!("Page {} of 3", shown.get())).text_sm()),
         )
     })
 }

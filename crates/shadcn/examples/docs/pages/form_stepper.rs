@@ -2,11 +2,11 @@
 //! schema checked before the stepper moves on.
 
 use gui::prelude::*;
-use gui::{Div, InputType, ScenarioError, TextField, div};
+use gui::{InputType, Model, ScenarioError, Signal, TextField, div};
 use shadcn::{
-    ButtonSize, ButtonVariant, FieldOrientation, FormEntry, FormField, SelectSize, SelectState, StepState,
-    StepperState, Toaster, Unset, button, field, field_error, field_group, field_label, form_control, form_submit,
-    input, select_content, select_group, select_item, select_trigger, stepper_description, stepper_item, stepper_title,
+    ButtonSize, ButtonVariant, FieldOrientation, FormEntry, FormField, Part, StepState, StepperItem, Unset, button,
+    field, field_error, field_group, field_label, form_control, form_submit, input, select, select_content,
+    select_group, select_item, select_value, stepper as stepper_root, stepper_description, stepper_item, stepper_title,
     theme, toaster,
 };
 
@@ -36,13 +36,13 @@ fn text_field(rule: impl Fn(&str) -> Vec<String> + 'static) -> Text {
 
 /// The fields of the three steps; their values stay as the steps change
 /// (`keep-values`).
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct Fields {
     full_name: Text,
     email: Text,
     password: Text,
     confirm: Text,
-    drink_select: SelectState,
+    drink_select: gui::Signal<Option<String>>,
     drink: FormField<Unset<gui::Signal<Option<String>>>>,
 }
 
@@ -55,8 +55,8 @@ impl Fields {
                 (n <= 50, "String must contain at most 50 character(s)"),
             ])
         });
-        let typed = password.control().control().clone();
-        let drink_select = SelectState::new(None);
+        let typed = password.control().control();
+        let drink_select = gui::Signal::new(None);
         Self {
             full_name: text_field(|_| Vec::new()),
             email: text_field(|v| failing(&[(is_email(v), "Invalid email")])),
@@ -64,7 +64,7 @@ impl Fields {
             confirm: text_field(move |v| failing(&[(v == typed.text(), "Passwords must match!")])),
             password,
             drink: FormField::new(
-                Unset::new(drink_select.value.clone()),
+                Unset::new(drink_select),
                 Library::Vee.checks(),
                 |v: &Option<Option<String>>| match v.as_ref().and_then(Option::as_deref) {
                     Some("coffee" | "tea" | "soda") => Vec::new(),
@@ -101,22 +101,20 @@ impl Fields {
             ("email", text(&self.email)),
             ("password", text(&self.password)),
             ("confirmPassword", text(&self.confirm)),
-            (
-                "favoriteDrink",
-                Json::Str(self.drink_select.value.get().unwrap_or_default()),
-            ),
+            ("favoriteDrink", Json::Str(self.drink_select.get().unwrap_or_default())),
         ])
     }
 }
 
 /// The step's round button ([`round_trigger`]); a step ahead is disabled
 /// while the current one fails its schema.
-fn trigger(stepper: &StepperState, step: usize, current_valid: bool) -> Div {
-    let ahead = step > stepper.step.get();
-    round_trigger(stepper, step).when(
-        stepper.state_of(step) != StepState::Completed && ahead && !current_valid,
-        |b| b.disabled(true),
-    )
+fn trigger(item: StepperItem, current: usize, current_valid: bool) -> Part<()> {
+    let ahead = item.step > current;
+    round_trigger(item).map_root(|b| {
+        b.when(item.state != StepState::Completed && ahead && !current_valid, |b| {
+            b.disabled(true)
+        })
+    })
 }
 
 /// A labelled input holding `kind` (its `type`), with its errors.
@@ -124,53 +122,57 @@ fn text_input(name: &str, f: &Text, kind: InputType) -> gui::Element {
     let invalid = f.invalid();
     field(FieldOrientation::Vertical, invalid)
         .child(field_label(name.to_owned()))
-        .child(form_control(input(f.control().control()).input_type(kind), invalid))
+        .child(form_control(
+            input().field(f.control().control()).input_type(kind),
+            invalid,
+        ))
         .child(field_error(f.errors()))
         .into_element()
 }
 
 pub fn render() -> Render {
-    let toasts = Toaster::new();
-    let stepper = StepperState::new(1);
+    let stepper = Signal::labeled("stepper step", 1_usize);
     let fields = Fields::new();
     Box::new(move || {
-        let t = theme();
-        let step = stepper.step.get();
+        let step = stepper.get();
         let valid = fields.valid(step);
         let last = STEPS.len();
-        let header = div()
-            .flex()
-            .w_full()
-            .gap(2.0)
-            .children(STEPS.map(|(n, title, description)| {
-                let active = stepper.state_of(n) == StepState::Active;
-                stepper_item()
-                    .relative()
-                    .flex()
-                    .w_full()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .when(n != last, |d| d.child(line(&stepper, n)))
-                    .child(trigger(&stepper, n, valid))
-                    .child(
-                        div()
-                            .mt(5.0)
-                            .flex_col()
-                            .items_center()
-                            .text_center()
-                            // `text-sm lg:text-base`: the reference renders at desktop width.
-                            .child(
-                                stepper_title(title)
-                                    .text_base()
-                                    .font_semibold()
-                                    .when(active, |d| d.text_color(t.primary)),
-                            )
-                            // `text-xs lg:text-sm`; its `text-primary` loses to
-                            // `text-muted-foreground` in the stylesheet's order.
-                            .child(stepper_description(description).text_sm()),
-                    )
-            }));
+        let header =
+            stepper_root()
+                .model(Model::bind(stepper))
+                .w_full()
+                .children(STEPS.map(|(n, title, description)| {
+                    stepper_item(n)
+                        .relative()
+                        .flex()
+                        .w_full()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .fill(move |item, d| {
+                            let t = theme();
+                            let active = item.state == StepState::Active;
+                            d.when(n != last, |d| d.child(line(item)))
+                                .child(trigger(item, step, valid))
+                                .child(
+                                    div()
+                                        .mt(5.0)
+                                        .flex_col()
+                                        .items_center()
+                                        .text_center()
+                                        // `text-sm lg:text-base`: the reference renders at desktop width.
+                                        .child(
+                                            stepper_title(title)
+                                                .text_base()
+                                                .font_semibold()
+                                                .when(active, |d| d.text_color(t.primary)),
+                                        )
+                                        // `text-xs lg:text-sm`; its `text-primary` loses to
+                                        // `text-muted-foreground` in the stylesheet's order.
+                                        .child(stepper_description(description).text_sm()),
+                                )
+                        })
+                }));
         let body = match step {
             1 => field_group()
                 .mt(4.0)
@@ -181,46 +183,47 @@ pub fn render() -> Render {
                 .child(text_input("Password", &fields.password, InputType::Password))
                 .child(text_input("Confirm Password", &fields.confirm, InputType::Password)),
             _ => {
-                let s = &fields.drink_select;
                 let invalid = fields.drink.invalid();
-                let drinks = select_content(s).child(
+                let drinks = select_content().child(
                     select_group()
-                        .child(select_item(s, "coffee", "Coffee", false))
-                        .child(select_item(s, "tea", "Tea", false))
-                        .child(select_item(s, "soda", "Soda", false)),
+                        .child(select_item("coffee", "Coffee"))
+                        .child(select_item("tea", "Tea"))
+                        .child(select_item("soda", "Soda")),
                 );
                 field_group().mt(4.0).child(
                     field(FieldOrientation::Vertical, invalid)
                         .child(field_label("Drink"))
                         .child(form_control(
-                            select_trigger(s, "Select a drink", SelectSize::Default, drinks).w_full(),
+                            select()
+                                .model(fields.drink_select)
+                                .w_full()
+                                .child(select_value("Select a drink"))
+                                .child(drinks),
                             invalid,
                         ))
                         .child(field_error(fields.drink.errors())),
                 )
             }
         };
-        let back = {
-            let stepper = stepper.clone();
-            button(ButtonVariant::Outline, ButtonSize::Sm)
-                .child("Back")
-                .disabled(step <= 1)
-                .on_click(move |_| stepper.go(stepper.step.get().saturating_sub(1)))
-        };
+        // Each step's fields are their own: keyed, a step's inputs never take over the last one's.
+        let body = body.key(gui::ElementKey::try_from(step).unwrap_or(0));
+        let back = button(ButtonVariant::Outline, ButtonSize::Sm)
+            .child("Back")
+            .disabled(step <= 1)
+            .on_click(move |_| stepper.update(|s| *s = s.saturating_sub(1).max(1)));
         // Next moves on when the step passes, else submits to show why not;
         // Submit on the last step sends the whole form.
         let forward = {
-            let (stepper, fields, toasts) = (stepper.clone(), fields.clone(), toasts.clone());
             let label = if step == last { "Submit" } else { "Next" };
             button(ButtonVariant::Default, ButtonSize::Sm)
                 .child(label)
                 .on_click(move |_| {
-                    let step = stepper.step.get();
+                    let step = stepper.get_untracked();
                     let passes = form_submit(&fields.of(step));
                     if step == last && passes {
-                        submitted(&toasts, &fields.json(), Pre::Neutral950);
+                        submitted(&fields.json(), Pre::Neutral950);
                     } else if passes {
-                        stepper.go(step.saturating_add(1));
+                        stepper.set(step.saturating_add(1));
                     }
                 })
         };
@@ -241,7 +244,7 @@ pub fn render() -> Render {
                             .child(div().flex().items_center().gap(3.0).child(forward)),
                     ),
                 ))
-                .child(toaster(&toasts)),
+                .child(toaster()),
         )
     })
 }

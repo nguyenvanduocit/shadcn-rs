@@ -22,8 +22,8 @@ pub fn render() -> Render {
         let t = theme();
         let ghost_icon =
             |i: Icon| input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs).child(icon(i));
-        let copy = copied.clone();
-        let fav = favorite.clone();
+        let copy = copied;
+        let fav = favorite;
         page(
             "Input Group",
             div()
@@ -122,7 +122,7 @@ pub fn render() -> Render {
                                     input_group_addon(END).button(
                                         input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs)
                                             .rounded_full()
-                                            .on_click(move |_| fav.update(|v| !v))
+                                            .on_click(move |_| fav.update(|v| *v = !*v))
                                             .child(icon(Icon::Star)),
                                     ),
                                 ),

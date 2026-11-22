@@ -24,12 +24,19 @@
 //! headless. The best round, not all frames, because a whole round can land
 //! on a slower core (Apple silicon's efficiency cores) and double its times. Run it on a release build: a debug build's
 //! times say nothing about the app's.
+//!
+//! Beside time, each round counts retired instructions per frame where the OS
+//! lets it ([`gui::instructions`], ADR-0023: the thread on Linux, the process
+//! on macOS). When both runs have them, `--baseline` compares the best
+//! round's instructions instead of its time, past [`INSTRUCTION_NOISE`]: a
+//! core's speed does not move them.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use gui::heap::Heap;
 use gui::inspect::{Footprint, FrameReport, Spread, Timings, bytes, ms};
+use gui::instructions::Instructions;
 use gui::{Bounds, Scenario, ScenarioError};
 
 use crate::verdict::field;
@@ -50,6 +57,9 @@ const CONFIRM: usize = 2;
 /// this share of it and this much time, both. Unchanged code moved up to 35%
 /// between runs on an Apple silicon Mac mini (a 3.4ms page), so only a change past both is named.
 const NOISE: (f64, Duration) = (0.40, Duration::from_millis(1));
+/// How far a best round's instructions per frame may move before it counts:
+/// this share and this many, both.
+const INSTRUCTION_NOISE: (f64, u64) = (0.05, 200_000);
 
 /// What `--bench` judges by and where it writes.
 #[derive(Clone, Debug)]
@@ -103,6 +113,8 @@ struct Bench {
     steady: Spread,
     /// The fastest round's median frame.
     best: Duration,
+    /// The round with the fewest instructions per frame: that many.
+    instructions: Option<u64>,
     /// The steady frames' median per stage.
     stages: Timings,
     /// The steady frames' median allocations and bytes allocated.
@@ -159,6 +171,9 @@ impl Bench {
                 a.allocations, a.allocated, h.live
             ));
         }
+        if let Some(n) = self.instructions {
+            line.push_str(&format!(r#","best_instructions":{n}"#));
+        }
         if let Some((images, heap)) = self.growth {
             line.push_str(&format!(r#","growth_image_bytes":{images}"#));
             if let Some(heap) = heap {
@@ -189,8 +204,11 @@ impl Bench {
         let warmed = self
             .warmed
             .map_or_else(String::new, |g| format!(" (the first warmed heap {})", signed(g)));
+        let instructions = self
+            .instructions
+            .map_or_else(String::new, |n| format!(" {:.2}M instr", u64_to_f64(n) / 1e6));
         format!(
-            "{grade:<5}{:<22} steady p50 {} p95 {} best round {} (build {} layout {} paint {})  script p95 {} over {}  {allocations}  holds {} nodes, images {}{heap}  walk {}/{}{warmed}, again: {again}",
+            "{grade:<5}{:<22} steady p50 {} p95 {} best round {}{instructions} (build {} layout {} paint {})  script p95 {} over {}  {allocations}  holds {} nodes, images {}{heap}  walk {}/{}{warmed}, again: {again}",
             self.page,
             ms(self.steady.p50),
             ms(self.steady.p95),
@@ -206,6 +224,11 @@ impl Bench {
             self.targets,
         )
     }
+}
+
+#[expect(clippy::as_conversions, reason = "a count shown, f64 holds it closely enough")]
+fn u64_to_f64(n: u64) -> f64 {
+    n as f64
 }
 
 fn signed(n: i128) -> String {
@@ -224,6 +247,10 @@ pub fn bench(only: &[String], options: &Options) -> Result<bool, ScenarioError> 
     if cfg!(debug_assertions) {
         eprintln!("bench: a debug build; its times say nothing about a release build's");
     }
+    match Instructions::start() {
+        Ok(c) => println!("instructions counted: {}", c.scope()),
+        Err(why) => println!("instructions not counted: {why}; runs compare by time"),
+    }
     let before = match &options.baseline {
         Some(path) => baseline(path)?,
         None => Vec::new(),
@@ -232,13 +259,13 @@ pub fn bench(only: &[String], options: &Options) -> Result<bool, ScenarioError> 
     for p in selected(only) {
         let mut b = page(p, options)?;
         // A page that reads slower is measured again: a whole run can land on a slower core.
-        let was = before.iter().find(|(page, _)| page == p.name).map(|&(_, d)| d);
+        let was = before.iter().find(|w| w.page == p.name);
         for _ in 0..CONFIRM {
-            if was.is_none_or(|was| moved(was, b.best) != Some(true)) {
+            if was.is_none_or(|was| moved(was, &b) != Some(true)) {
                 break;
             }
             let again = page(p, options)?;
-            if again.best < b.best {
+            if (again.instructions, again.best) < (b.instructions, b.best) {
                 b = again;
             }
         }
@@ -267,39 +294,55 @@ pub fn bench(only: &[String], options: &Options) -> Result<bool, ScenarioError> 
     Ok(failed == 0 && slower == 0)
 }
 
-/// The best-round medians a `--json` file at `path` holds, by page.
-fn baseline(path: &std::path::Path) -> Result<Vec<(String, Duration)>, ScenarioError> {
+/// One page of an earlier run: its best round's median and instructions.
+struct Was {
+    page: String,
+    best: Duration,
+    instructions: Option<u64>,
+}
+
+/// The best rounds a `--json` file at `path` holds, by page.
+fn baseline(path: &std::path::Path) -> Result<Vec<Was>, ScenarioError> {
     let text = std::fs::read_to_string(path)?;
     Ok(text
         .lines()
         .filter_map(|l| {
             let p50: f64 = field(l, "best_p50_ms")?.parse().ok()?;
-            Some((
-                field(l, "page")?.to_owned(),
-                Duration::try_from_secs_f64(p50 / 1000.0).ok()?,
-            ))
+            Some(Was {
+                page: field(l, "page")?.to_owned(),
+                best: Duration::try_from_secs_f64(p50 / 1000.0).ok()?,
+                instructions: field(l, "best_instructions").and_then(|n| n.parse().ok()),
+            })
         })
         .collect())
 }
 
-/// Whether `now` is slower (`Some(true)`) or faster than `was` past [`NOISE`].
-fn moved(was: Duration, now: Duration) -> Option<bool> {
-    let by = now.abs_diff(was);
-    let share = by.as_secs_f64() / was.as_secs_f64().max(1e-9);
-    (share > NOISE.0 && by > NOISE.1).then_some(now > was)
+/// Whether `now` is slower (`Some(true)`) or faster than `was`: by
+/// instructions past [`INSTRUCTION_NOISE`] when both counted them, else by
+/// time past [`NOISE`].
+fn moved(was: &Was, now: &Bench) -> Option<bool> {
+    if let (Some(a), Some(b)) = (was.instructions, now.instructions) {
+        let by = a.abs_diff(b);
+        let share = u64_to_f64(by) / u64_to_f64(a.max(1));
+        return (share > INSTRUCTION_NOISE.0 && by > INSTRUCTION_NOISE.1).then_some(b > a);
+    }
+    let by = now.best.abs_diff(was.best);
+    let share = by.as_secs_f64() / was.best.as_secs_f64().max(1e-9);
+    (share > NOISE.0 && by > NOISE.1).then_some(now.best > was.best)
 }
 
 /// Print each page whose best round moved past [`NOISE`] from `before` (read
 /// from `path`), and the count; returns how many got slower.
-fn compare(benches: &[Bench], before: &[(String, Duration)], path: &std::path::Path) -> usize {
+fn compare(benches: &[Bench], before: &[Was], path: &std::path::Path) -> usize {
     let (mut slower, mut faster, mut compared) = (0_usize, 0_usize, 0_usize);
     println!("\nagainst {}:", path.display());
     for b in benches {
-        let Some(&(_, was)) = before.iter().find(|(page, _)| page == b.page) else {
+        let Some(w) = before.iter().find(|w| w.page == b.page) else {
             continue;
         };
+        let was = w.best;
         compared = compared.saturating_add(1);
-        let word = match moved(was, b.best) {
+        let word = match moved(w, b) {
             None => continue,
             Some(true) => {
                 slower = slower.saturating_add(1);
@@ -311,8 +354,18 @@ fn compare(benches: &[Bench], before: &[(String, Duration)], path: &std::path::P
             }
         };
         let share = b.best.abs_diff(was).as_secs_f64() / was.as_secs_f64().max(1e-9);
+        let instructions = match (w.instructions, b.instructions) {
+            (Some(a), Some(n)) => format!(
+                ", instructions {:.2}M -> {:.2}M ({}{:.1}%)",
+                u64_to_f64(a) / 1e6,
+                u64_to_f64(n) / 1e6,
+                if n > a { "+" } else { "-" },
+                u64_to_f64(a.abs_diff(n)) / u64_to_f64(a.max(1)) * 100.0
+            ),
+            _ => String::new(),
+        };
         println!(
-            "{word:<7}{:<22} best round p50 {} -> {} ({}{:.0}%)",
+            "{word:<7}{:<22} best round p50 {} -> {} ({}{:.0}%){instructions}",
             b.page,
             ms(was),
             ms(b.best),
@@ -321,7 +374,8 @@ fn compare(benches: &[Bench], before: &[(String, Duration)], path: &std::path::P
         );
     }
     println!(
-        "{compared} pages compared: {slower} SLOWER (each measured up to {CONFIRM} more times, the fastest kept), {faster} FASTER, the rest within {:.0}% or {} of the baseline",
+        "{compared} pages compared: {slower} SLOWER (each measured up to {CONFIRM} more times, the fastest kept), {faster} FASTER, the rest within {:.0}% of the instructions or, where not counted, {:.0}% or {} of the time",
+        INSTRUCTION_NOISE.0 * 100.0,
         NOISE.0 * 100.0,
         ms(NOISE.1)
     );
@@ -335,7 +389,9 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
 
     s.rest(Duration::from_secs(2))?;
     s.take_reports();
-    let mut rounds = vec![steady_round(&mut s, options.frames)?];
+    let mut counter = Instructions::start().ok();
+    let mut per_frame = Vec::new();
+    let mut rounds = vec![steady_round(&mut s, options.frames, &mut counter, &mut per_frame)?];
     let rest = s.footprint();
 
     let viewport = s.last().viewport;
@@ -348,10 +404,10 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
         .collect();
     walk(&mut s, &targets)?;
     let warm = s.footprint();
-    rounds.push(steady_round(&mut s, options.frames)?);
+    rounds.push(steady_round(&mut s, options.frames, &mut counter, &mut per_frame)?);
     walk(&mut s, &targets)?;
     let after = s.footprint();
-    rounds.push(steady_round(&mut s, options.frames)?);
+    rounds.push(steady_round(&mut s, options.frames, &mut counter, &mut per_frame)?);
     debug_assert_eq!(rounds.len(), ROUNDS);
     let best = rounds
         .iter()
@@ -365,6 +421,7 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
         allocations: Spread::of(heaps.iter().map(|h| h.allocations)).p50,
         allocated: Spread::of(heaps.iter().map(|h| h.allocated)).p50,
         live: 0,
+        peak: 0,
     });
     let raster = |f: &Footprint| i128::try_from(f.raster_bytes()).unwrap_or(i128::MAX);
     let heap_growth = |after: &Footprint, before: &Footprint| {
@@ -379,6 +436,7 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
         script_frames: script.len(),
         steady: Spread::of(steady.iter().map(|r| r.timings.total())),
         best,
+        instructions: per_frame.iter().copied().min(),
         stages: Timings {
             build: median(&steady, |r| r.timings.build),
             layout: median(&steady, |r| r.timings.layout),
@@ -395,17 +453,28 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
     })
 }
 
-/// `frames` frames of the page as it stands, their reports.
-fn steady_round(s: &mut Scenario<crate::Render>, frames: u32) -> Result<Vec<FrameReport>, ScenarioError> {
+/// `frames` frames of the page as it stands, their reports; the
+/// instructions they retired per frame go to `per_frame` when counted.
+fn steady_round(
+    s: &mut Scenario,
+    frames: u32,
+    counter: &mut Option<Instructions>,
+    per_frame: &mut Vec<u64>,
+) -> Result<Vec<FrameReport>, ScenarioError> {
+    let before = counter.as_mut().and_then(Instructions::read);
     for _ in 0..frames {
         s.settle()?;
+    }
+    let after = counter.as_mut().and_then(Instructions::read);
+    if let (Some(a), Some(b)) = (before, after) {
+        per_frame.push(b.saturating_sub(a).checked_div(u64::from(frames)).unwrap_or(0));
     }
     Ok(s.take_reports())
 }
 
 /// Rest the pointer on each of `targets` while motion plays, then leave and
 /// bring the page back to rest; the reports drawn on the way are dropped.
-fn walk(s: &mut Scenario<crate::Render>, targets: &[Bounds]) -> Result<(), ScenarioError> {
+fn walk(s: &mut Scenario, targets: &[Bounds]) -> Result<(), ScenarioError> {
     s.play_motion();
     for b in targets {
         s.hover(b.x + b.width / 2.0, b.y + b.height / 2.0);

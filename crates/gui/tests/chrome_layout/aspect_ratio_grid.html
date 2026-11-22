@@ -1,0 +1,6 @@
+<!-- aspect-ratio on grid items: a stretched cell takes its width and the ratio gives its height, which sizes the auto row, unless the content is taller. -->
+<div style="width: 400px">
+  <div style="display: grid; grid-template-columns: 100px 100px"><div style="aspect-ratio: 2"></div><div style="aspect-ratio: 4"></div></div>
+  <div style="display: grid; grid-template-columns: 100px 200px"><p style="aspect-ratio: 4">A ratio box whose words wrap over lines</p><div style="aspect-ratio: 2; max-height: 30px"></div></div>
+  <div style="display: grid; grid-template-columns: 100px; justify-items: start"><div style="height: 30px; aspect-ratio: 2"></div><p style="height: 24px; aspect-ratio: 1">Words</p></div>
+</div>

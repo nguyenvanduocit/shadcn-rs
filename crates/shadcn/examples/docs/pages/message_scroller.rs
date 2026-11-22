@@ -3,20 +3,22 @@
 //! a message, keep the reader's place as history loads, and say what is in view.
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Side, SideAlign, Signal, Text, div, icon, text};
+use std::rc::Rc;
+
+use gui::{Div, Element, Icon, Model, ScenarioError, Side, SideAlign, Signal, Text, component, div, icon, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, HoverCardState, InputGroupAlign,
-    InputGroupButtonSize, MarkerVariant, MenuItem, MenuState, MessageProps, MessageScrollerDefaultScrollPosition,
+    BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize,
+    MarkerVariant, MenuItem, MessageProps, MessageScroller, MessageScrollerDefaultScrollPosition,
     MessageScrollerDirection, MessageScrollerProps, MessageScrollerScrollAlign, MessageScrollerScrollOptions,
-    MessageScrollerScrollable, MessageScrollerState, Orientation, SelectSize, SelectState, SliderState, TabsState,
-    Toast, ToastKind, Toaster, ToggleGroupSelection, ToggleGroupState, TooltipState, bubble, bubble_content, button,
-    card, card_action, card_content, card_description, card_footer, card_header, card_title, dropdown_menu_content,
-    dropdown_menu_group, dropdown_menu_item, dropdown_menu_label, dropdown_menu_separator, dropdown_menu_trigger,
-    empty, empty_description, empty_header, empty_media_icon, empty_title, hover_card, hover_card_content_placed,
-    hover_card_trigger, input_group_addon, input_group_button, input_group_content, marker, marker_content, message,
-    message_content, message_header, message_scroller, message_scroller_button, message_scroller_item,
-    message_scroller_viewport, select_content, select_group, select_item, select_trigger, slider, tabs, tabs_list,
-    tabs_trigger, theme, toaster, toggle_group, toggle_group_item, tooltip, tooltip_content, tooltip_trigger,
+    MessageScrollerScrollable, Orientation, Toast, ToastKind, ToggleGroupItem, bubble, bubble_content, button, card,
+    card_action, card_content, card_description, card_footer, card_header, card_title, dropdown_menu,
+    dropdown_menu_content, dropdown_menu_group, dropdown_menu_item, dropdown_menu_label, dropdown_menu_separator,
+    dropdown_menu_trigger, empty, empty_description, empty_header, empty_media_icon, empty_title, hover_card,
+    hover_card_content, hover_card_trigger, input_group_addon, input_group_button, input_group_content, marker,
+    marker_content, message, message_content, message_header, message_scroller, message_scroller_button,
+    message_scroller_provider, message_scroller_viewport, select, select_content, select_group, select_item,
+    select_value, slider, tabs, tabs_list, tabs_trigger, theme, toast, toaster, toggle_group_item,
+    toggle_group_multiple, tooltip, tooltip_content, tooltip_trigger,
 };
 
 use super::demo_chat::{DemoChat, DemoMessage, Role, Turns, animated};
@@ -36,13 +38,36 @@ fn transcript(t: Transcript) -> Vec<DemoMessage> {
         .collect()
 }
 
-/// A provider with `props` (Vue's `MessageScrollerProvider`).
-fn provider(props: MessageScrollerProps) -> MessageScrollerState {
-    MessageScrollerState::new(props)
+/// `child` under a provider with `props` (Vue's `MessageScrollerProvider`),
+/// keyed by the demo's resets (Vue's `:key="demoKey"`).
+fn provider(props: MessageScrollerProps, key: u32, child: impl IntoElement) -> Element {
+    message_scroller_provider(props, child).key(key).into_element()
 }
 
-fn provided() -> MessageScrollerState {
-    provider(MessageScrollerProps::default())
+/// A control inside a provider, rendered by `f` with its scroller (a Vue
+/// child component calling `useMessageScroller`).
+fn scrolled(f: impl Fn(&MessageScroller) -> Element + 'static) -> Element {
+    #[derive(Clone)]
+    struct View(Rc<dyn Fn(&MessageScroller) -> Element>);
+    impl PartialEq for View {
+        fn eq(&self, _: &Self) -> bool {
+            false
+        }
+    }
+    component(View(Rc::new(f)), |cx| {
+        let view = cx.props();
+        let scroller = shadcn::use_message_scroller();
+        move || match &scroller {
+            Some(s) => view.with(|v| (v.0)(s)),
+            None => Element::Empty,
+        }
+    })
+    .into_element()
+}
+
+/// Bump a demo's reset key.
+fn bump(key: Signal<u32>) {
+    key.update(|k| *k = k.wrapping_add(1));
 }
 
 // ── The card every demo sits in ─────────────────────────────────────────────
@@ -90,17 +115,16 @@ fn caption(words: &str) -> Text {
 }
 
 /// An outline icon button resetting the demo, with a "Reset" tooltip.
-fn reset_button(tip: &TooltipState, disabled: bool, on: impl Fn() + 'static) -> Div {
+fn reset_button(disabled: bool, on: impl Fn() + 'static) -> Div {
     card_action().child(
         tooltip()
             .child(tooltip_trigger(
-                tip,
                 button(ButtonVariant::Outline, ButtonSize::Icon)
                     .disabled(disabled)
                     .child(icon(Icon::RotateCw))
                     .on_click(move |_| on()),
             ))
-            .child(tooltip_content(tip, |c| c.child(text("Reset")))),
+            .child(tooltip_content().child(text("Reset"))),
     )
 }
 
@@ -114,18 +138,31 @@ fn empty_thread(title: &str, description: &str) -> Div {
     )
 }
 
-/// `MessageScroller` holding `items` and the button back to the end.
-fn thread(state: &MessageScrollerState, items: impl IntoIterator<Item = Div>) -> Div {
+/// `MessageScroller` holding `items` (`meta`: id and anchor, `row`: the
+/// message) and the button back to the end.
+fn thread<T: 'static>(
+    items: impl Into<Rc<[T]>>,
+    meta: impl for<'a> Fn(&'a T) -> (&'a str, bool) + 'static,
+    row: impl Fn(usize, &T) -> Div + 'static,
+) -> Div {
     message_scroller()
-        .child(message_scroller_viewport(state, items))
-        .child(message_scroller_button(state, MessageScrollerDirection::End))
+        .child(message_scroller_viewport(items, meta, row))
+        .child(message_scroller_button(MessageScrollerDirection::End))
 }
 
-/// Each message of `messages` as `MessageAnimated` with Vue's default bubbles.
-fn turns<'a>(state: &'a MessageScrollerState, messages: &'a [DemoMessage]) -> impl Iterator<Item = Div> + 'a {
-    messages
-        .iter()
-        .map(move |m| animated(state, m, None, BubbleVariant::Muted, BubbleVariant::Ghost))
+/// A message's id, and whether it anchors (a user turn, as Vue's default).
+fn turn_meta(m: &DemoMessage) -> (&str, bool) {
+    (m.id.as_str(), m.role == Role::User)
+}
+
+/// A message as `MessageAnimated` with Vue's default bubbles.
+fn turn_row(_: usize, m: &DemoMessage) -> Div {
+    animated(m, BubbleVariant::Muted, BubbleVariant::Ghost)
+}
+
+/// The thread of `messages` as `MessageAnimated` turns.
+fn turns(messages: Vec<DemoMessage>) -> Div {
+    thread(messages, turn_meta, turn_row)
 }
 
 /// The send button of a footer: `size="icon" class="ml-auto"`.
@@ -139,7 +176,7 @@ fn send_button(disabled: bool, on: impl Fn() + 'static) -> Div {
 
 /// The read-only composer: the next scripted turn (or `idle` when none is
 /// left), a menu of attachments that does nothing, `extra`, and send.
-fn composer(chat: &DemoChat, menu: &MenuState, idle: &str, extra: Option<Div>) -> Div {
+fn composer(chat: &DemoChat, idle: &str, extra: Option<Div>) -> Div {
     let t = theme();
     let next = chat.next_message();
     let busy = chat.streaming.get();
@@ -150,26 +187,26 @@ fn composer(chat: &DemoChat, menu: &MenuState, idle: &str, extra: Option<Div>) -
     .line_clamp(2)
     .when(busy, |l| l.opacity(0.6));
     let attach = |glyph: Icon, label: &str| {
-        dropdown_menu_item(menu, label, MenuItem::default(), || {})
+        dropdown_menu_item(label, MenuItem::default())
             .child(icon(glyph))
             .child(label.to_owned())
     };
-    let files = dropdown_menu_content(menu)
+    let files = dropdown_menu_content()
+        .side(Side::Top)
+        .align(SideAlign::Start)
         .w(44.0)
         .child(attach(Icon::Paperclip, "Add Photos & Files"))
         .child(dropdown_menu_separator())
         .child(attach(Icon::Image, "Create Image"))
         .child(attach(Icon::Telescope, "Deep Research"))
         .child(attach(Icon::Globe, "Web Search"));
-    let addon = input_group_addon(InputGroupAlign::BlockEnd)
-        .pt(1.0)
-        .button(dropdown_menu_trigger(
-            menu,
-            input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm).child(icon(Icon::Plus)),
-            Side::Top,
-            SideAlign::Start,
-            files,
-        ));
+    let addon = input_group_addon(InputGroupAlign::BlockEnd).pt(1.0).button(
+        dropdown_menu()
+            .child(dropdown_menu_trigger(
+                input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm).child(icon(Icon::Plus)),
+            ))
+            .child(files),
+    );
     let addon = match extra {
         Some(e) => addon.child(e),
         None => addon,
@@ -206,9 +243,7 @@ struct Copy {
 /// A scripted chat sent turn by turn (the provider outlives the empty state).
 struct Chat {
     chat: DemoChat,
-    scroller: MessageScrollerState,
-    tip: TooltipState,
-    menu: MenuState,
+    props: MessageScrollerProps,
     copy: Copy,
 }
 
@@ -221,21 +256,24 @@ impl Chat {
         let body = if messages.is_empty() {
             empty_thread(c.empty_title, c.empty_description)
         } else {
-            thread(&self.scroller, turns(&self.scroller, &messages))
+            turns(messages.clone())
         };
         div()
             .relative()
             .flex_col()
             .gap(4.0)
-            .child(centred(shell(
-                header(c.title, c.description, true).child(reset_button(
-                    &self.tip,
-                    busy || (c.reset_when_empty && messages.is_empty()),
-                    move || chat.reset(),
+            .child(provider(
+                self.props,
+                0,
+                centred(shell(
+                    header(c.title, c.description, true).child(reset_button(
+                        busy || (c.reset_when_empty && messages.is_empty()),
+                        move || chat.reset(),
+                    )),
+                    body,
+                    Some(composer(&self.chat, c.idle, None)),
                 )),
-                body,
-                Some(composer(&self.chat, &self.menu, c.idle, None)),
-            )))
+            ))
             .child(caption(c.caption))
     }
 }
@@ -248,53 +286,39 @@ const DEFAULT_PEEK: f32 = 64.0;
 /// previous reply stays in view above a new turn.
 struct Context {
     chat: DemoChat,
-    /// Keyed by the demo's reset, as Vue's `:key="demoKey"` provider.
-    scroller: Signal<MessageScrollerState>,
-    tip: TooltipState,
-    menu: MenuState,
-    peek: SliderState,
-}
-
-fn context_scroller() -> MessageScrollerState {
-    provider(MessageScrollerProps {
-        scroll_margin: 24.0,
-        scroll_previous_item_peek: DEFAULT_PEEK,
-        ..MessageScrollerProps::default()
-    })
+    /// The provider's key, bumped by the demo's reset.
+    key: Signal<u32>,
+    peek: Signal<Vec<f32>>,
 }
 
 impl Context {
     fn new() -> Self {
         Self {
             chat: DemoChat::new(CONTEXT, 2, 35),
-            scroller: Signal::new(context_scroller()),
-            tip: TooltipState::new(),
-            menu: MenuState::new(),
-            peek: SliderState::new(vec![DEFAULT_PEEK], 64.0, 128.0, 1.0),
+            key: Signal::new(0),
+            peek: Signal::new(vec![DEFAULT_PEEK]),
         }
     }
 
     fn reset(&self) {
         self.chat.reset();
-        self.peek.value.set(vec![DEFAULT_PEEK]);
-        self.scroller.set(context_scroller());
+        self.peek.set(vec![DEFAULT_PEEK]);
+        bump(self.key);
     }
 
     fn view(&self) -> Div {
         let messages = self.chat.messages.get();
         let busy = self.chat.streaming.get();
-        let scroller = self.scroller.get();
-        let peek = self.peek.value.get().first().copied().unwrap_or(DEFAULT_PEEK);
-        scroller.set_scroll_previous_item_peek(peek);
-        if self.peek.disabled.get() != busy {
-            self.peek.disabled.set(busy);
-        }
+        let peek = self.peek.get().first().copied().unwrap_or(DEFAULT_PEEK);
+        let props = MessageScrollerProps {
+            scroll_margin: 24.0,
+            scroll_previous_item_peek: peek,
+            ..MessageScrollerProps::default()
+        };
         let me = Self {
             chat: self.chat.clone(),
-            scroller: self.scroller.clone(),
-            tip: self.tip.clone(),
-            menu: self.menu.clone(),
-            peek: self.peek.clone(),
+            key: self.key,
+            peek: self.peek,
         };
         let amount = div()
             .flex()
@@ -306,26 +330,35 @@ impl Context {
                     .text_xs()
                     .text_color(theme().muted_foreground),
             )
-            .child(slider(&self.peek, Orientation::Horizontal));
+            .child(
+                slider(Orientation::Horizontal)
+                    .model(self.peek)
+                    .min(64.0)
+                    .max(128.0)
+                    .disabled(busy),
+            );
         div()
             .relative()
             .flex_col()
             .gap(4.0)
-            .child(centred(shell(
-                header(
-                    "Keeping Context Visible",
-                    "New turns keep part of the previous reply in view.",
-                    true,
-                )
-                .child(reset_button(&self.tip, busy, move || me.reset())),
-                thread(&scroller, turns(&scroller, &messages)),
-                Some(composer(
-                    &self.chat,
-                    &self.menu,
-                    "No messages queued. Reset the context.",
-                    Some(amount),
+            .child(provider(
+                props,
+                self.key.get(),
+                centred(shell(
+                    header(
+                        "Keeping Context Visible",
+                        "New turns keep part of the previous reply in view.",
+                        true,
+                    )
+                    .child(reset_button(busy, move || me.reset())),
+                    turns(messages),
+                    Some(composer(
+                        &self.chat,
+                        "No messages queued. Reset the context.",
+                        Some(amount),
+                    )),
                 )),
-            )))
+            ))
             .child(caption("Adjust the slider and send. Observe the previous message peek"))
     }
 }
@@ -337,9 +370,8 @@ impl Context {
 struct Anchoring {
     messages: Signal<Vec<DemoMessage>>,
     role: Signal<Role>,
-    /// Mounted with the first message, as Vue's `v-else` provider.
-    scroller: Signal<MessageScrollerState>,
-    toggles: ToggleGroupState,
+    /// The provider's key, bumped by the demo's reset.
+    key: Signal<u32>,
 }
 
 impl Anchoring {
@@ -347,11 +379,7 @@ impl Anchoring {
         Self {
             messages: Signal::new(Vec::new()),
             role: Signal::new(Role::User),
-            scroller: Signal::new(provided()),
-            toggles: ToggleGroupState::new(
-                ToggleGroupSelection::Multiple(Signal::new(vec!["user".to_owned()])),
-                &["user", "assistant"],
-            ),
+            key: Signal::new(0),
         }
     }
 
@@ -361,14 +389,13 @@ impl Anchoring {
 
     fn reset(&self) {
         self.messages.set(Vec::new());
-        self.scroller.set(provided());
+        bump(self.key);
     }
 
     fn send(&self) {
         if let Some(m) = self.next() {
-            self.messages.update(|mut all| {
+            self.messages.update(|all| {
                 all.push(m);
-                all
             });
         }
     }
@@ -376,39 +403,35 @@ impl Anchoring {
     /// A toggle item. Vue's `onValueChange` takes the first value of the
     /// multiple group's model: pressing the other role keeps this one and
     /// resets the turns; releasing this one changes nothing.
-    fn toggle(&self, value: &str, label: &str, role: Role) -> Div {
+    fn toggle(&self, value: &str, label: &str, role: Role) -> ToggleGroupItem {
         let me = self.clone();
-        toggle_group_item(&self.toggles, value)
-            .child(label.to_owned())
-            .on_click(move |_| {
-                if me.role.get() != role {
-                    me.reset();
-                }
-            })
+        toggle_group_item(value).child(label.to_owned()).on_click(move || {
+            if me.role.get() != role {
+                me.reset();
+            }
+        })
     }
 
     fn view(&self) -> Div {
         let messages = self.messages.get();
         let role = self.role.get();
-        let scroller = self.scroller.get();
         let (reset, send) = (self.clone(), self.clone());
         let body = if messages.is_empty() {
             empty_thread(
                 "No anchored messages yet",
                 "Send the first message to see the selected role anchor.",
             )
+            .into_element()
         } else {
-            thread(
-                &scroller,
-                messages.iter().map(|m| {
-                    animated(
-                        &scroller,
-                        m,
-                        Some(m.role == role),
-                        BubbleVariant::Muted,
-                        BubbleVariant::Ghost,
-                    )
-                }),
+            // Mounted with the first message, as Vue's `v-else` provider.
+            provider(
+                MessageScrollerProps::default(),
+                self.key.get(),
+                thread(
+                    messages.clone(),
+                    move |m: &DemoMessage| (m.id.as_str(), m.role == role),
+                    turn_row,
+                ),
             )
         };
         div()
@@ -428,7 +451,8 @@ impl Anchoring {
                 Some(
                     card_footer()
                         .child(
-                            toggle_group(&self.toggles)
+                            toggle_group_multiple()
+                                .default_value(vec!["user".to_owned()])
                                 .child(self.toggle("user", "User", Role::User))
                                 .child(self.toggle("assistant", "Assistant", Role::Assistant)),
                         )
@@ -458,29 +482,24 @@ const PRESETS: [(&str, &str); 7] = [
 /// A scripted chat with a choice of entrance animation for user turns.
 struct Animation {
     chat: DemoChat,
-    scroller: Signal<MessageScrollerState>,
-    preset: SelectState,
+    /// The provider's key, bumped by the demo's reset.
+    key: Signal<u32>,
+    preset: Signal<Option<String>>,
 }
 
 impl Animation {
     fn view(&self) -> Div {
         let messages = self.chat.messages.get();
         let busy = self.chat.streaming.get();
-        let scroller = self.scroller.get();
-        let (chat, fresh) = (self.chat.clone(), self.scroller.clone());
+        let (chat, fresh) = (self.chat.clone(), self.key);
         let send = self.chat.clone();
         let body = if messages.is_empty() {
-            empty_thread("No Messages Yet", "Click the button below to send the first message.")
+            empty_thread("No Messages Yet", "Click the button below to send the first message.").into_element()
         } else {
-            thread(&scroller, turns(&scroller, &messages))
+            provider(MessageScrollerProps::default(), self.key.get(), turns(messages.clone()))
         };
-        let presets = select_content(&self.preset).child(
-            select_group().children(
-                PRESETS
-                    .iter()
-                    .map(|(id, name)| select_item(&self.preset, id, name, false)),
-            ),
-        );
+        let presets =
+            select_content().child(select_group().children(PRESETS.iter().map(|(id, name)| select_item(*id, *name))));
         div()
             .relative()
             .flex_col()
@@ -498,14 +517,14 @@ impl Animation {
                             .child(icon(Icon::RotateCw))
                             .on_click(move |_| {
                                 chat.reset();
-                                fresh.set(provided());
+                                bump(fresh);
                             }),
                     ),
                 ),
                 body,
                 Some(
                     footer_ruled()
-                        .child(select_trigger(&self.preset, "", SelectSize::Default, presets))
+                        .child(select().model(self.preset).child(select_value("")).child(presets))
                         .child(send_button(self.chat.next_message().is_none() || busy, move || {
                             send.send()
                         })),
@@ -531,50 +550,58 @@ fn trimmed(words: &str) -> String {
     }
 }
 
-fn user_turns(t: Transcript) -> impl Iterator<Item = (&'static str, &'static str)> {
+/// The user turns of `t`: their index in it, id and words.
+fn user_turns(t: Transcript) -> impl Iterator<Item = (usize, &'static str, &'static str)> {
     t.iter()
-        .filter(|(_, role, _)| *role == Role::User)
-        .map(|(id, _, words)| (*id, *words))
+        .enumerate()
+        .filter(|(_, (_, role, _))| *role == Role::User)
+        .map(|(i, (id, _, words))| (i, *id, *words))
 }
 
 /// A saved transcript driven from a menu outside it.
-struct Commands {
-    scroller: MessageScrollerState,
-    menu: MenuState,
-}
+struct Commands;
 
 impl Commands {
     fn view(&self) -> Div {
         let messages = transcript(COMMANDS);
-        let m = &self.menu;
-        let jumps = dropdown_menu_content(m).w(64.0).child(
-            dropdown_menu_group()
-                .child(dropdown_menu_label("Conversations", false))
-                .children(user_turns(COMMANDS).map(|(id, words)| {
-                    let s = self.scroller.clone();
-                    dropdown_menu_item(m, id, MenuItem::default(), move || {
-                        s.scroll_to_message(id, MessageScrollerScrollOptions::default());
-                    })
-                    .child(text(trimmed(words)).line_clamp(1).min_w(0.0))
-                })),
-        );
+        // `CommandMenu`, a child of the provider driving it.
+        let menu = scrolled(move |scroller| {
+            let jumps = dropdown_menu_content().align(SideAlign::End).w(64.0).child(
+                dropdown_menu_group()
+                    .child(dropdown_menu_label("Conversations", false))
+                    .children(user_turns(COMMANDS).map(|(index, id, words)| {
+                        let s = scroller.clone();
+                        dropdown_menu_item(id, MenuItem::default())
+                            .on_select(move || {
+                                s.scroll_to_message(index, MessageScrollerScrollOptions::default());
+                            })
+                            .child(text(trimmed(words)).line_clamp(1).min_w(0.0))
+                    })),
+            );
+            dropdown_menu()
+                .child(dropdown_menu_trigger(
+                    button(ButtonVariant::Secondary, ButtonSize::Default).child("Jump to..."),
+                ))
+                .child(jumps)
+                .into_element()
+        });
+        let props = MessageScrollerProps {
+            default_scroll_position: MessageScrollerDefaultScrollPosition::End,
+            ..MessageScrollerProps::default()
+        };
         div()
             .relative()
             .flex_col()
             .gap(4.0)
-            .child(centred(shell(
-                header("Commands", "Drive the transcript from outside.", true).child(card_action().child(
-                    dropdown_menu_trigger(
-                        m,
-                        button(ButtonVariant::Secondary, ButtonSize::Default).child("Jump to..."),
-                        Side::Bottom,
-                        SideAlign::End,
-                        jumps,
-                    ),
+            .child(provider(
+                props,
+                0,
+                centred(shell(
+                    header("Commands", "Drive the transcript from outside.", true).child(card_action().child(menu)),
+                    turns(messages),
+                    None,
                 )),
-                thread(&self.scroller, turns(&self.scroller, &messages)),
-                None,
-            )))
+            ))
             .child(
                 caption("Use the controls to jump to any message in the conversation.")
                     .mx_auto()
@@ -611,44 +638,50 @@ fn recent() -> Vec<DemoMessage> {
 #[derive(Clone)]
 struct History {
     messages: Signal<Vec<DemoMessage>>,
-    /// Keyed by the demo's reset, as Vue's `:key="demoKey"` scroller.
-    scroller: Signal<MessageScrollerState>,
-    tip: TooltipState,
-    toasts: Toaster,
+    /// The provider's key, bumped by the demo's reset.
+    key: Signal<u32>,
 }
 
 impl History {
     fn load(&self) {
         self.messages.set(history());
-        self.toasts
-            .show(Toast::new(ToastKind::Default, "History loaded").description("Scroll up to see earlier messages."));
+        toast(Toast::new(ToastKind::Default, "History loaded").description("Scroll up to see earlier messages."));
     }
 
     fn view(&self) -> Div {
         let t = theme();
         let messages = self.messages.get();
-        let scroller = self.scroller.get();
         let can_load = messages.len() < HISTORY.len();
         let (reset, load) = (self.clone(), self.clone());
-        let end = message_scroller_item(&scroller, "end-of-conversation", false).child(marker(
-            MarkerVariant::Separator,
-            Element::Empty,
-            marker_content(MarkerVariant::Separator).child("End of Conversation"),
-        ));
+        let rows: Vec<Option<DemoMessage>> = messages.iter().cloned().map(Some).chain([None]).collect();
         div()
             .relative()
             .flex_col()
             .gap(4.0)
             .child(centred(shell(
                 header("Load History", "Prepended messages keep your place.", true).child(reset_button(
-                    &self.tip,
                     messages.len() <= INITIAL_VISIBLE_COUNT,
                     move || {
                         reset.messages.set(recent());
-                        reset.scroller.set(provided());
+                        bump(reset.key);
                     },
                 )),
-                thread(&scroller, turns(&scroller, &messages).chain([end])),
+                provider(
+                    MessageScrollerProps::default(),
+                    self.key.get(),
+                    thread(
+                        rows,
+                        |r: &Option<DemoMessage>| r.as_ref().map_or(("end-of-conversation", false), turn_meta),
+                        |i, r| match r {
+                            Some(m) => turn_row(i, m),
+                            None => marker(
+                                MarkerVariant::Separator,
+                                Element::Empty,
+                                marker_content(MarkerVariant::Separator).child("End of Conversation"),
+                            ),
+                        },
+                    ),
+                ),
                 Some(
                     footer_ruled()
                         .flex_col()
@@ -679,69 +712,71 @@ impl History {
 
 // ── MessageScrollerOpeningPositionDemo ─────────────────────────────────────
 
-/// A saved transcript opened at the start, the end or its last anchored turn.
-#[derive(Clone)]
-struct Opening {
-    scroller: MessageScrollerState,
-    tabs: TabsState,
+/// Bring `scroller` to `position`: the start, the end or "open-3".
+fn apply(scroller: &MessageScroller, position: &str) {
+    match position {
+        "start" => scroller.scroll_to_start(),
+        "end" => scroller.scroll_to_end(),
+        // "open-3".
+        _ => scroller.scroll_to_message(
+            2,
+            MessageScrollerScrollOptions {
+                align: MessageScrollerScrollAlign::Start,
+                scroll_margin: Some(64.0),
+            },
+        ),
+    };
 }
 
-impl Opening {
-    fn new() -> Self {
-        let me = Self {
-            scroller: provided(),
-            tabs: TabsState::new("last-anchor"),
-        };
-        // Vue's `onMounted(applyPosition)`.
-        me.apply("last-anchor");
-        me
-    }
-
-    fn apply(&self, position: &str) {
-        match position {
-            "start" => self.scroller.scroll_to_start(),
-            "end" => self.scroller.scroll_to_end(),
-            _ => self.scroller.scroll_to_message(
-                "open-3",
-                MessageScrollerScrollOptions {
-                    align: MessageScrollerScrollAlign::Start,
-                    scroll_margin: Some(64.0),
-                },
-            ),
-        };
-    }
-
-    fn view(&self) -> Div {
-        let messages = transcript(OPENING);
-        let triggers = ["start", "end", "last-anchor"].map(|position| {
-            let me = self.clone();
-            tabs_trigger(&self.tabs, position).child(position).on_click(move |_| {
-                let value = me.tabs.value();
-                if value.get() != position {
-                    value.set(position.to_owned());
-                    me.apply(position);
+/// The position tabs, a child of the provider: they open the transcript at
+/// the last anchor as they mount (Vue's `onMounted(applyPosition)`) and move
+/// it as the reader picks another.
+fn opening_tabs(position: Signal<String>) -> Element {
+    component(position, |cx| {
+        let position = cx.props().get_untracked();
+        let scroller = shadcn::use_message_scroller();
+        if let Some(s) = &scroller {
+            apply(s, &position.get_untracked());
+        }
+        move || {
+            let s = scroller.clone();
+            let model = Model::bind(position).on_change(move |p| {
+                if let Some(s) = &s {
+                    apply(s, &p);
                 }
-            })
-        });
-        div()
-            .relative()
-            .flex_col()
-            .gap(4.0)
-            .child(centred(shell(
+            });
+            let triggers = ["start", "end", "last-anchor"].map(|p| tabs_trigger(p).child(p));
+            tabs()
+                .model(model)
+                .w_full()
+                .child(tabs_list().w_full().children(triggers))
+                .into_element()
+        }
+    })
+    .into_element()
+}
+
+/// A saved transcript opened at the start, the end or its last anchored turn.
+fn opening(position: Signal<String>) -> Div {
+    let messages = transcript(OPENING);
+    div()
+        .relative()
+        .flex_col()
+        .gap(4.0)
+        .child(provider(
+            MessageScrollerProps::default(),
+            0,
+            centred(shell(
                 header("Opening Position", "Choose where a saved transcript opens.", true),
-                thread(&self.scroller, turns(&self.scroller, &messages)),
-                Some(
-                    footer_ruled()
-                        .justify_center()
-                        .child(tabs().w_full().child(tabs_list().w_full().children(triggers))),
-                ),
-            )))
-            .child(
-                caption("Toggle the defaultScrollPosition to see where the transcript starts when you open the thread")
-                    .mx_auto()
-                    .max_w(96.0),
-            )
-    }
+                turns(messages),
+                Some(footer_ruled().justify_center().child(opening_tabs(position))),
+            )),
+        ))
+        .child(
+            caption("Toggle the defaultScrollPosition to see where the transcript starts when you open the thread")
+                .mx_auto()
+                .max_w(96.0),
+        )
 }
 
 // ── MessageScrollerScrollableDemo ──────────────────────────────────────────
@@ -774,54 +809,54 @@ fn scroll_status(s: MessageScrollerScrollable) -> &'static str {
     }
 }
 
-fn scrollable(scroller: &MessageScrollerState) -> Div {
+fn scrollable() -> Div {
     let t = theme();
     let messages = checkpoints();
+    let props = MessageScrollerProps {
+        default_scroll_position: MessageScrollerDefaultScrollPosition::Start,
+        ..MessageScrollerProps::default()
+    };
+    let card = shell(
+        header(
+            "Scroll Status",
+            "Where the reader can scroll to based on current scroll position.",
+            true,
+        ),
+        message_scroller()
+            .child(message_scroller_viewport(messages, turn_meta, turn_row).gap(4.0))
+            .child(message_scroller_button(MessageScrollerDirection::End)),
+        Some(
+            footer_ruled()
+                .justify_center()
+                .text_center()
+                .text_sm()
+                .text_color(t.muted_foreground)
+                .child(scrolled(|s| text(scroll_status(s.scrollable())).into_element())),
+        ),
+    )
+    .overflow_hidden();
     div()
         .mx_auto()
         .flex_col()
         .w_full()
         .max_w(96.0)
         .gap(4.0)
-        .child(
-            shell(
-                header(
-                    "Scroll Status",
-                    "Where the reader can scroll to based on current scroll position.",
-                    true,
-                ),
-                message_scroller()
-                    .child(message_scroller_viewport(scroller, turns(scroller, &messages)).gap(4.0))
-                    .child(message_scroller_button(scroller, MessageScrollerDirection::End)),
-                Some(
-                    footer_ruled()
-                        .justify_center()
-                        .text_center()
-                        .text_sm()
-                        .text_color(t.muted_foreground)
-                        .child(scroll_status(scroller.scrollable())),
-                ),
-            )
-            .overflow_hidden(),
-        )
+        .child(provider(props, 0, card))
         .child(caption("Scroll the transcript to see the footer update."))
 }
 
 // ── MessageScrollerVisibilityDemo ──────────────────────────────────────────
 
 /// A transcript with an outline beside it marking the turn being read.
-struct Visibility {
-    scroller: MessageScrollerState,
-    outline: HoverCardState,
-}
+struct Visibility;
 
 impl Visibility {
     /// `TranscriptOutline`: a bar per user turn, the current one dark; hovered,
     /// a card listing them to jump to.
-    fn outline(&self) -> Div {
+    fn outline(&self, scroller: &MessageScroller) -> gui::Element {
         let t = theme();
-        let current = self.scroller.visibility().current_anchor_id;
-        let is_current = |id: &str| current.as_deref() == Some(id);
+        let current = scroller.visibility().current_anchor;
+        let is_current = |index: usize| current == Some(index);
         let bars = div()
             .flex_col()
             .size(9.0)
@@ -829,47 +864,56 @@ impl Visibility {
             .justify_center()
             .gap(1.0)
             .rounded_md()
-            .children(user_turns(VISIBILITY).map(|(id, _)| {
-                div().h(0.5).w(4.0).rounded_full().bg(if is_current(id) {
+            .children(user_turns(VISIBILITY).map(|(index, _, _)| {
+                div().h(0.5).w(4.0).rounded_full().bg(if is_current(index) {
                     t.foreground
                 } else {
                     t.muted_foreground.opacity(0.4)
                 })
             }));
-        let card = hover_card_content_placed(&self.outline, Side::Left, SideAlign::Center, -28.0, |c| {
-            c.flex_col()
-                .w(64.0)
-                .gap(1.0)
-                .rounded_2xl()
-                .p(1.0)
-                .children(user_turns(VISIBILITY).map(|(id, words)| {
-                    let s = self.scroller.clone();
-                    div()
-                        .flex()
-                        .min_h(7.0)
-                        .items_center()
-                        .rounded_xl()
-                        .px(2.0)
-                        .py(1.5)
-                        .text_sm()
-                        .when(is_current(id), |d| d.bg(t.accent).text_color(t.accent_foreground))
-                        .hover(move |s| s.bg(t.accent).text_color(t.accent_foreground))
-                        .child(text(trimmed(words)).line_clamp(1).min_w(0.0))
-                        .on_click(move |_| {
-                            s.scroll_to_message(id, MessageScrollerScrollOptions::default());
-                        })
-                }))
-        });
-        hover_card().child(hover_card_trigger(&self.outline, bars)).child(card)
+        let card = hover_card_content()
+            .side(Side::Left)
+            .align(SideAlign::Center)
+            .side_offset(-28.0)
+            .flex_col()
+            .w(64.0)
+            .gap(1.0)
+            .rounded_2xl()
+            .p(1.0)
+            .children(user_turns(VISIBILITY).map(|(index, _, words)| {
+                let s = scroller.clone();
+                div()
+                    .flex()
+                    .min_h(7.0)
+                    .items_center()
+                    .rounded_xl()
+                    .px(2.0)
+                    .py(1.5)
+                    .text_sm()
+                    .when(is_current(index), |d| d.bg(t.accent).text_color(t.accent_foreground))
+                    .hover(move |s| s.bg(t.accent).text_color(t.accent_foreground))
+                    .child(text(trimmed(words)).line_clamp(1).min_w(0.0))
+                    .on_click(move |_| {
+                        s.scroll_to_message(index, MessageScrollerScrollOptions::default());
+                    })
+            }));
+        hover_card().child(hover_card_trigger(bars)).child(card).into_element()
     }
 
     fn view(&self) -> Div {
         let messages = transcript(VISIBILITY);
+        let props = MessageScrollerProps {
+            scroll_margin: 12.0,
+            ..MessageScrollerProps::default()
+        };
+        let me = Self;
         div()
             .relative()
             .flex_col()
             .gap(4.0)
-            .child(
+            .child(provider(
+                props,
+                0,
                 div()
                     .relative()
                     .mx_auto()
@@ -877,7 +921,7 @@ impl Visibility {
                     .max_w(96.0)
                     .child(shell(
                         header("Transcript Outline", "Track the current anchored turn.", true),
-                        thread(&self.scroller, turns(&self.scroller, &messages)),
+                        turns(messages),
                         None,
                     ))
                     // `absolute top-1/2 -right-12 -translate-y-1/2` around the 36px trigger.
@@ -887,9 +931,9 @@ impl Visibility {
                             .top_len(gui::relative(0.5))
                             .right(-12.0)
                             .mt(-4.5)
-                            .child(self.outline()),
+                            .child(scrolled(move |s| me.outline(s).into_element())),
                     ),
-            )
+            ))
             .child(
                 caption("Open the outline to jump between anchored turns as you read.")
                     .mx_auto()
@@ -952,19 +996,26 @@ const ROCKY: Item = Item::Said {
     anchor: false,
 };
 
-fn group_row(state: &MessageScrollerState, item: &Item) -> Div {
+/// An item's id, and whether it anchors: a marker always does.
+fn group_meta<'a>(item: &'a &'static Item) -> (&'a str, bool) {
+    match **item {
+        Item::Event { id, .. } => (id, true),
+        Item::Said { id, anchor, .. } => (id, anchor),
+    }
+}
+
+fn group_row(item: &Item) -> Div {
     match *item {
-        Item::Event { id, words } => message_scroller_item(state, id, true).child(marker(
+        Item::Event { words, .. } => marker(
             MarkerVariant::Separator,
             Element::Empty,
             marker_content(MarkerVariant::Separator).child(words),
-        )),
+        ),
         Item::Said {
-            id,
             sender,
             assistant,
             words,
-            anchor,
+            ..
         } => {
             let mine = sender == ME;
             let variant = match (mine, assistant) {
@@ -979,12 +1030,10 @@ fn group_row(state: &MessageScrollerState, item: &Item) -> Div {
                 ..MessageProps::default()
             };
             let b = BubbleProps { variant, align };
-            message_scroller_item(state, id, anchor).child(
-                message(p).child(
-                    message_content(p)
-                        .child((!mine).then(|| message_header(p).child(sender)))
-                        .child(bubble(b).child(bubble_content(b).child(words))),
-                ),
+            message(p).child(
+                message_content(p)
+                    .child((!mine).then(|| message_header(p).child(sender)))
+                    .child(bubble(b).child(bubble_content(b).child(words))),
             )
         }
     }
@@ -995,20 +1044,19 @@ fn group_row(state: &MessageScrollerState, item: &Item) -> Div {
 struct GroupChat {
     /// 0: idle, 1: Rocky joined, 2: Rocky replied.
     turn: Signal<u8>,
-    /// Keyed by the demo's reset, as Vue's `:key="demoKey"` scroller.
-    scroller: Signal<MessageScrollerState>,
-    tip: TooltipState,
+    /// The provider's key, bumped by the demo's reset.
+    key: Signal<u32>,
 }
 
 impl GroupChat {
     fn view(&self) -> Div {
         let t = theme();
         let step = self.turn.get();
-        let scroller = self.scroller.get();
-        let items = OPENING_GROUP
+        let items: Vec<&'static Item> = OPENING_GROUP
             .iter()
             .chain((step >= 1).then_some(&JOINED))
-            .chain((step >= 2).then_some(&ROCKY));
+            .chain((step >= 2).then_some(&ROCKY))
+            .collect();
         let (advance, reset) = (self.clone(), self.clone());
         div()
             .relative()
@@ -1020,11 +1068,15 @@ impl GroupChat {
                     "A group chat with several participants and an assistant. The Marker is marked as a turn.",
                     true,
                 )
-                .child(reset_button(&self.tip, step == 0, move || {
+                .child(reset_button(step == 0, move || {
                     reset.turn.set(0);
-                    reset.scroller.set(provided());
+                    bump(reset.key);
                 })),
-                thread(&scroller, items.map(|i| group_row(&scroller, i))),
+                provider(
+                    MessageScrollerProps::default(),
+                    self.key.get(),
+                    thread(items, group_meta, |_, i| group_row(i)),
+                ),
                 Some(
                     footer_ruled()
                         .flex_col()
@@ -1039,7 +1091,7 @@ impl GroupChat {
                                 } else {
                                     "Send Message as Rocky"
                                 })
-                                .on_click(move |_| advance.turn.update(|t| t.saturating_add(1).min(2))),
+                                .on_click(move |_| advance.turn.update(|t| *t = t.saturating_add(1).min(2))),
                         )
                         .child(
                             text(if step == 0 {
@@ -1066,9 +1118,7 @@ impl GroupChat {
 pub fn render() -> Render {
     let basic = Chat {
         chat: DemoChat::new(CHAT, 0, 20),
-        scroller: provided(),
-        tip: TooltipState::new(),
-        menu: MenuState::new(),
+        props: MessageScrollerProps::default(),
         copy: Copy {
             title: "New Chat",
             description: "How can I help you today?",
@@ -1081,12 +1131,10 @@ pub fn render() -> Render {
     };
     let streaming = Chat {
         chat: DemoChat::new(STREAMING, 0, 20),
-        scroller: provider(MessageScrollerProps {
+        props: MessageScrollerProps {
             auto_scroll: true,
             ..MessageScrollerProps::default()
-        }),
-        tip: TooltipState::new(),
-        menu: MenuState::new(),
+        },
         copy: Copy {
             title: "Streaming Messages",
             description: "Auto-scroll follows the live edge of the conversation.",
@@ -1101,39 +1149,19 @@ pub fn render() -> Render {
     let anchoring = Anchoring::new();
     let animation = Animation {
         chat: DemoChat::new(ANIMATION, 0, 15),
-        scroller: Signal::new(provided()),
-        preset: SelectState::new(Some("fade")),
+        key: Signal::new(0),
+        preset: Signal::new(Some("fade".to_owned())),
     };
-    let commands = Commands {
-        scroller: provider(MessageScrollerProps {
-            default_scroll_position: MessageScrollerDefaultScrollPosition::End,
-            ..MessageScrollerProps::default()
-        }),
-        menu: MenuState::new(),
-    };
-    let toasts = Toaster::new();
+    let commands = Commands;
     let history = History {
         messages: Signal::new(recent()),
-        scroller: Signal::new(provided()),
-        tip: TooltipState::new(),
-        toasts: toasts.clone(),
+        key: Signal::new(0),
     };
-    let opening = Opening::new();
-    let status = provider(MessageScrollerProps {
-        default_scroll_position: MessageScrollerDefaultScrollPosition::Start,
-        ..MessageScrollerProps::default()
-    });
-    let visibility = Visibility {
-        scroller: provider(MessageScrollerProps {
-            scroll_margin: 12.0,
-            ..MessageScrollerProps::default()
-        }),
-        outline: HoverCardState::new(),
-    };
+    let position = Signal::labeled("opening position", "last-anchor".to_owned());
+    let visibility = Visibility;
     let group = GroupChat {
         turn: Signal::labeled("rocky turn", 0_u8),
-        scroller: Signal::new(provided()),
-        tip: TooltipState::new(),
+        key: Signal::new(0),
     };
     Box::new(move || {
         page(
@@ -1148,11 +1176,11 @@ pub fn render() -> Render {
                 .child(demo("MessageScrollerAnimationDemo.vue", animation.view()))
                 .child(demo("MessageScrollerCommandsDemo.vue", commands.view()))
                 .child(demo("MessageScrollerLoadHistoryDemo.vue", history.view()))
-                .child(demo("MessageScrollerOpeningPositionDemo.vue", opening.view()))
-                .child(demo("MessageScrollerScrollableDemo.vue", scrollable(&status)))
+                .child(demo("MessageScrollerOpeningPositionDemo.vue", opening(position)))
+                .child(demo("MessageScrollerScrollableDemo.vue", scrollable()))
                 .child(demo("MessageScrollerVisibilityDemo.vue", visibility.view()))
                 .child(demo("MessageScrollerGroupChatDemo.vue", group.view()))
-                .child(toaster(&toasts)),
+                .child(toaster()),
         )
     })
 }

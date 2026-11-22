@@ -1,6 +1,6 @@
 use gui::prelude::*;
-use gui::{Color, Modifiers, NamedKey, ScenarioError, div, text};
-use shadcn::{RadioGroupState, label, radio_group, radio_group_item, theme};
+use gui::{Color, Modifiers, NamedKey, ScenarioError, Signal, div, text};
+use shadcn::{label, radio_group, radio_group_item, theme};
 
 use crate::{Render, Shot, demo, page, section};
 
@@ -29,10 +29,8 @@ const PLANS: [(&str, &str, &str); 2] = [
 ];
 
 pub fn render() -> Render {
-    let density = RadioGroupState::new(&["default", "comfortable", "compact"], Some("comfortable"));
-    let plan = RadioGroupState::new(&["starter", "pro"], Some("starter"));
-    let off = RadioGroupState::new(&["on", "off"], Some("on"));
-    off.disabled.set(true);
+    let density = Signal::labeled("density", Some("comfortable".to_owned()));
+    let plan = Signal::labeled("plan", Some("starter".to_owned()));
     Box::new(move || {
         let t = theme();
         // Tailwind's green-600 (green-900 in dark) and green-50 (green-950).
@@ -46,17 +44,16 @@ pub fn render() -> Render {
         } else {
             Color::oklch(0.982, 0.018, 155.826)
         };
-        let row = |state: &RadioGroupState, value: &str, name: &str| {
-            let pick = state.value.clone();
+        let row = |pick: Option<Signal<Option<String>>>, value: &str, name: &str| {
             let owned = value.to_owned();
             div()
                 .flex()
                 .items_center()
                 .gap(2.0)
-                .child(radio_group_item(state, value))
-                .child(label(name).on_click(move |_| pick.set(Some(owned.clone()))))
+                .child(radio_group_item(value))
+                .child(label(name).when_some(pick, |l, pick| l.on_click(move |_| pick.set(Some(owned.clone())))))
         };
-        let chosen = plan.value.get();
+        let chosen = plan.get();
         page(
             "Radio Group",
             div()
@@ -64,18 +61,20 @@ pub fn render() -> Render {
                 .gap(8.0)
                 .child(demo(
                     "RadioGroupDemo.vue",
-                    radio_group(&density)
-                        .child(row(&density, "default", "Default"))
-                        .child(row(&density, "comfortable", "Comfortable"))
-                        .child(row(&density, "compact", "Compact")),
+                    radio_group()
+                        .model(density)
+                        .child(row(Some(density), "default", "Default"))
+                        .child(row(Some(density), "comfortable", "Comfortable"))
+                        .child(row(Some(density), "compact", "Compact")),
                 ))
                 .child(section(
                     "Plans",
-                    radio_group(&plan)
+                    radio_group()
+                        .model(plan)
                         .max_w_px(384.0)
                         .children(PLANS.map(|(id, name, description)| {
                             let on = chosen.as_deref() == Some(id);
-                            let pick = plan.value.clone();
+                            let pick = plan;
                             div()
                                 .named("plan")
                                 .flex()
@@ -89,7 +88,7 @@ pub fn render() -> Render {
                                 .p(4.0)
                                 .text_sm()
                                 .on_click(move |_| pick.set(Some(id.to_owned())))
-                                .child(radio_group_item(&plan, id).shadow_none())
+                                .child(radio_group_item(id).shadow_none())
                                 .child(
                                     div()
                                         .grid()
@@ -102,9 +101,11 @@ pub fn render() -> Render {
                 ))
                 .child(section(
                     "Disabled",
-                    radio_group(&off)
-                        .child(row(&off, "on", "On"))
-                        .child(row(&off, "off", "Off")),
+                    radio_group()
+                        .default_value("on")
+                        .disabled(true)
+                        .child(row(None, "on", "On"))
+                        .child(row(None, "off", "Off")),
                 )),
         )
     })

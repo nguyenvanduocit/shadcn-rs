@@ -1,0 +1,8 @@
+# Chrome's boxes for flex_column.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 200 300
+  div 0 0 200 40
+  div 0 40 200 66.671875
+  div 0 106.671875 50 60
+  div 0 166.671875 200 133.328125

@@ -1,29 +1,28 @@
 //! Sidebar (`ui/sidebar`): a side panel that collapses off canvas, to icons,
 //! or not at all, in three looks (`sidebar`, `floating`, `inset`).
 //!
-//! [`SidebarState`] is shadcn's `SidebarProvider` context: whether the sidebar
-//! is open, its side, variant and collapse mode, and which menu item the
-//! pointer is in. The parts whose look follows it (Tailwind's
-//! `group-data-[collapsible=icon]:` selectors) take it as an argument.
-//! A desktop window has no mobile breakpoint, so the mobile sheet is not
-//! ported.
-
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+//! [`sidebar_provider`] is shadcn's `SidebarProvider`: it keeps whether the
+//! sidebar is open, its own (`default_open`) or the caller's (`.model(…)`,
+//! `v-model:open`), and here also the sidebar's side, variant and collapse
+//! mode, since the inset beside it is styled by them too (Tailwind's
+//! `peer-data-[variant=inset]:`). The parts whose look follows it
+//! (`group-data-[collapsible=icon]:`) read it; a menu item keeps whether the
+//! pointer is in it, for its action and badge. A desktop window has no
+//! mobile breakpoint, so the mobile sheet is not ported.
 
 use gui::prelude::*;
 use gui::{
-    Div, ElementKey, Key, KeyEvent, Properties, Shadow, Side, SideAlign, Signal, TextField, TextInput, div, icon,
-    key_of, px, relative, text,
+    Bind, ComponentElement, Div, Element, Key, KeyEvent, Model, Properties, Shadow, Side, Signal, TextField, UseModel,
+    component, div, icon, provide, px, relative, text, use_context, use_model,
 };
 
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::input::input;
+use crate::part::{Part, PartProps};
 use crate::separator::{Orientation, separator};
 use crate::skeleton::skeleton;
 use crate::theme::{Theme, theme};
-use crate::tooltip::{TooltipState, tooltip_content_placed, tooltip_trigger};
+use crate::tooltip::{tooltip, tooltip_content, tooltip_trigger};
 
 /// `--sidebar-width`: 16rem.
 pub const SIDEBAR_WIDTH: f32 = 256.0;
@@ -55,91 +54,72 @@ pub enum SidebarCollapsible {
     None,
 }
 
-/// What a sidebar shows and how it collapses; create once, outside the render
-/// closure, and pass to the parts.
-#[derive(Clone)]
-pub struct SidebarState {
-    /// Expanded (`true`) or collapsed; the `v-model:open` of the provider.
-    pub open: Signal<bool>,
+/// What [`sidebar_provider`] is given.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SidebarProps {
+    open: Bind<bool>,
     side: SidebarSide,
     variant: SidebarVariant,
     collapsible: SidebarCollapsible,
-    /// The menu item under the pointer, for its tooltip and show-on-hover action.
-    hovered: Signal<Option<ElementKey>>,
-    /// Each menu button's tooltip, made the first time the button is drawn.
-    tooltips: Rc<RefCell<HashMap<ElementKey, TooltipState>>>,
 }
 
-impl SidebarState {
-    /// A left, `sidebar`-variant, off-canvas sidebar, open when `default_open`.
-    #[must_use]
-    pub fn new(default_open: bool) -> Self {
+impl Default for SidebarProps {
+    fn default() -> Self {
         Self {
-            open: Signal::labeled("sidebar open", default_open),
+            open: Bind::default_value(true),
             side: SidebarSide::default(),
             variant: SidebarVariant::default(),
             collapsible: SidebarCollapsible::default(),
-            hovered: Signal::labeled("sidebar hovered item", None),
-            tooltips: Rc::default(),
         }
     }
+}
 
-    #[must_use]
-    pub fn side(mut self, side: SidebarSide) -> Self {
-        self.side = side;
-        self
+/// What the parts of a sidebar read (shadcn's `useSidebar`).
+#[derive(Clone)]
+struct SidebarContext {
+    props: Signal<PartProps<SidebarProps>>,
+    open: UseModel<PartProps<SidebarProps>, bool>,
+}
+
+impl SidebarContext {
+    fn find() -> Option<Self> {
+        use_context::<Self>()
     }
 
-    #[must_use]
-    pub fn variant(mut self, variant: SidebarVariant) -> Self {
-        self.variant = variant;
-        self
+    fn side(&self) -> SidebarSide {
+        self.props.with(|p| p.props.side)
     }
 
-    #[must_use]
-    pub fn collapsible(mut self, collapsible: SidebarCollapsible) -> Self {
-        self.collapsible = collapsible;
-        self
+    fn variant(&self) -> SidebarVariant {
+        self.props.with(|p| p.props.variant)
     }
 
-    pub fn set_open(&self, open: bool) {
-        self.open.set(open);
+    fn collapsible(&self) -> SidebarCollapsible {
+        self.props.with(|p| p.props.collapsible)
     }
 
-    pub fn toggle(&self) {
-        self.open.update(|o| !o);
+    fn is_open(&self) -> bool {
+        self.open.get()
+    }
+
+    fn toggle(&self) {
+        self.open.update(|o| *o = !*o);
     }
 
     /// Collapsed to its icon rail (`group-data-[collapsible=icon]`).
-    #[must_use]
-    pub fn icon_collapsed(&self) -> bool {
-        self.collapsible == SidebarCollapsible::Icon && !self.open.get()
+    fn icon_collapsed(&self) -> bool {
+        self.collapsible() == SidebarCollapsible::Icon && !self.is_open()
     }
 
     /// `floating` and `inset` sit in 8px of padding.
     fn padded(&self) -> bool {
-        matches!(self.variant, SidebarVariant::Floating | SidebarVariant::Inset)
+        matches!(self.variant(), SidebarVariant::Floating | SidebarVariant::Inset)
     }
+}
 
-    fn is_hovered(&self, id: &str) -> bool {
-        self.hovered.get() == Some(key_of(id))
-    }
-
-    fn tooltip(&self, id: &str) -> TooltipState {
-        self.tooltips.borrow_mut().entry(key_of(id)).or_default().clone()
-    }
-
-    fn track_hover(&self, id: &str) -> impl Fn(bool) + 'static {
-        let hovered = self.hovered.clone();
-        let key = key_of(id);
-        move |inside| {
-            if inside {
-                hovered.set(Some(key));
-            } else if hovered.get() == Some(key) {
-                hovered.set(None);
-            }
-        }
-    }
+/// Whether the sidebar around this instance is collapsed to its icons.
+fn icon_collapsed(ctx: Option<&SidebarContext>) -> bool {
+    ctx.is_some_and(SidebarContext::icon_collapsed)
 }
 
 fn is_shortcut(e: &KeyEvent) -> bool {
@@ -169,65 +149,134 @@ fn outline(color: gui::Color) -> Shadow {
 }
 
 /// The wrapper around a sidebar and its inset: lays them out in a row and
-/// toggles the sidebar on ⌘B / Ctrl+B pressed inside it.
+/// toggles the sidebar on ⌘B / Ctrl+B pressed inside it. Open at first
+/// unless told otherwise.
 #[must_use]
-pub fn sidebar_provider(sb: &SidebarState) -> Div {
-    let t = theme();
-    let state = sb.clone();
-    div()
-        .named("sidebar-wrapper")
-        .flex()
-        .size_full()
-        .when(sb.variant == SidebarVariant::Inset, |d| d.bg(t.sidebar))
-        .on_key_down(move |e| {
-            let hit = is_shortcut(e);
-            if hit {
-                state.toggle();
+pub fn sidebar_provider() -> Part<SidebarProps> {
+    let root = div().named("sidebar-wrapper").flex().size_full();
+    Part::new(SidebarProps::default(), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext {
+                props,
+                open: use_model(props, |p| &p.props.open),
+            };
+            provide(ctx.clone());
+            move || {
+                let t = theme();
+                let keys = ctx.clone();
+                props
+                    .with(|p| p.slot.0.clone())
+                    .when(ctx.variant() == SidebarVariant::Inset, |d| d.bg(t.sidebar))
+                    .on_key_down(move |e| {
+                        let hit = is_shortcut(e);
+                        if hit {
+                            keys.toggle();
+                        }
+                        hit
+                    })
+                    .into_element()
             }
-            hit
         })
+    })
 }
 
-/// The sidebar holding `children` (header, content, footer, rail).
+impl Part<SidebarProps> {
+    /// Open at first, when no model is given (`default-open`; true unless set).
+    #[must_use]
+    pub fn default_open(self, open: bool) -> Self {
+        self.with_props(|p| p.open = std::mem::take(&mut p.open).with_default(open))
+    }
+
+    /// Open or collapsed, kept by the caller (`v-model:open`).
+    #[must_use]
+    pub fn model(self, open: impl Into<Model<bool>>) -> Self {
+        self.with_props(|p| p.open = std::mem::take(&mut p.open).with_model(open))
+    }
+
+    /// Open or collapsed as the caller shows it (`:open`); a toggle only
+    /// calls `on_change`.
+    #[must_use]
+    pub fn open(self, open: bool) -> Self {
+        self.with_props(|p| p.open = std::mem::take(&mut p.open).with_value(open))
+    }
+
+    /// Called with each new open state (`@update:open`).
+    #[must_use]
+    pub fn on_change(self, f: impl Fn(bool) + 'static) -> Self {
+        self.with_props(|p| p.open = std::mem::take(&mut p.open).on_change(f))
+    }
+
+    #[must_use]
+    pub fn side(self, side: SidebarSide) -> Self {
+        self.with_props(|p| p.side = side)
+    }
+
+    #[must_use]
+    pub fn variant(self, variant: SidebarVariant) -> Self {
+        self.with_props(|p| p.variant = variant)
+    }
+
+    #[must_use]
+    pub fn collapsible(self, collapsible: SidebarCollapsible) -> Self {
+        self.with_props(|p| p.collapsible = collapsible)
+    }
+}
+
+/// The sidebar; its header, content, footer and rail go inside.
 #[must_use]
-pub fn sidebar<E: IntoElement>(sb: &SidebarState, children: impl IntoIterator<Item = E>) -> Div {
+pub fn sidebar() -> Part<()> {
+    Part::new((), div().flex_col().size_full(), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                let inner = props.with(|p| p.slot.0.clone());
+                match &ctx {
+                    Some(ctx) => frame(ctx, inner),
+                    None => inner,
+                }
+                .into_element()
+            }
+        })
+    })
+}
+
+/// The sidebar's boxes around `inner`, the panel holding its parts.
+fn frame(sb: &SidebarContext, inner: Div) -> Div {
     let t = theme();
-    if sb.collapsible == SidebarCollapsible::None {
-        return div()
+    if sb.collapsible() == SidebarCollapsible::None {
+        return inner
             .named("sidebar")
             .bg(t.sidebar)
             .text_color(t.sidebar_foreground)
-            .flex_col()
             .w_px(SIDEBAR_WIDTH)
             .h_full()
-            .shrink_0()
-            .children(children);
+            .shrink_0();
     }
-    let collapsed = !sb.open.get();
+    let collapsed = !sb.is_open();
     let padded = sb.padded();
+    let collapsible = sb.collapsible();
     // Floating and inset keep their 8px padding around the icon rail, plus the border.
-    let (gap, width) = match (collapsed, sb.collapsible) {
+    let (gap, width) = match (collapsed, collapsible) {
         (true, SidebarCollapsible::Offcanvas) => (0.0, SIDEBAR_WIDTH),
         (true, SidebarCollapsible::Icon) if padded => (SIDEBAR_WIDTH_ICON + 16.0, SIDEBAR_WIDTH_ICON + 18.0),
         (true, SidebarCollapsible::Icon) => (SIDEBAR_WIDTH_ICON, SIDEBAR_WIDTH_ICON),
         _ => (SIDEBAR_WIDTH, SIDEBAR_WIDTH),
     };
-    let offset = if collapsed && sb.collapsible == SidebarCollapsible::Offcanvas {
+    let offset = if collapsed && collapsible == SidebarCollapsible::Offcanvas {
         -SIDEBAR_WIDTH
     } else {
         0.0
     };
-    let left = sb.side == SidebarSide::Left;
-    let panel = div()
+    let left = sb.side() == SidebarSide::Left;
+    let panel = inner
         .named("sidebar-inner")
         .relative()
         .bg(t.sidebar)
-        .flex_col()
-        .size_full()
-        .when(sb.variant == SidebarVariant::Floating, |d| {
+        .when(sb.variant() == SidebarVariant::Floating, |d| {
             d.border().border_color(t.sidebar_border).rounded_lg().shadow_sm()
-        })
-        .children(children);
+        });
     let container = div()
         .named("sidebar-container")
         .transition_props(Properties::INSET | Properties::WIDTH)
@@ -260,67 +309,103 @@ pub fn sidebar<E: IntoElement>(sb: &SidebarState, children: impl IntoIterator<It
 
 /// A button that opens and closes the sidebar.
 #[must_use]
-pub fn sidebar_trigger(sb: &SidebarState) -> Div {
-    let state = sb.clone();
-    button(ButtonVariant::Ghost, ButtonSize::Icon)
+pub fn sidebar_trigger() -> Part<()> {
+    let root = button(ButtonVariant::Ghost, ButtonSize::Icon)
         .named("sidebar-trigger")
         .size(7.0)
-        .child(icon(gui::Icon::PanelLeft))
-        .on_click(move |_| state.toggle())
+        .child(icon(gui::Icon::PanelLeft));
+    Part::new((), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                let root = props.with(|p| p.slot.0.clone());
+                match ctx.clone() {
+                    Some(ctx) => root.on_click(move |_| ctx.toggle()),
+                    None => root,
+                }
+                .into_element()
+            }
+        })
+    })
 }
 
 /// The strip along the sidebar's inner edge: shows a line on hover and
 /// toggles the sidebar on click. Put it last among the sidebar's children.
 #[must_use]
-pub fn sidebar_rail(sb: &SidebarState) -> Div {
-    const ID: &str = "sidebar-rail";
-    let t = theme();
-    let offcanvas = sb.collapsible == SidebarCollapsible::Offcanvas && !sb.open.get();
-    let hovered = sb.is_hovered(ID);
-    // Centred on the container's edge, which is the panel's edge plus the padding.
-    let reach = px(if sb.padded() { -16.0 } else { -8.0 });
-    let state = sb.clone();
-    let line = div()
-        .absolute()
-        .top(0.0)
-        .bottom(0.0)
-        .w(0.5)
-        .left_len(relative(if offcanvas { 1.0 } else { 0.5 }))
-        .when(hovered, |d| d.bg(t.sidebar_border));
-    div()
-        .named("sidebar-rail")
-        .transition_all()
-        .ease_linear()
-        .absolute()
-        .top(0.0)
-        .bottom(0.0)
-        .w(4.0)
-        .flex()
-        .cursor(gui::Cursor::ResizeColumn)
-        .when(sb.side == SidebarSide::Left, |d| d.right_len(reach))
-        .when(sb.side == SidebarSide::Right, |d| d.left_len(reach))
-        .when(offcanvas, |d| d.hover(move |s| s.bg(t.sidebar)))
-        .on_hover(sb.track_hover(ID))
-        .on_click(move |_| state.toggle())
-        .child(line)
+pub fn sidebar_rail() -> ComponentElement {
+    component((), |_| {
+        let ctx = SidebarContext::find();
+        let hovered = Signal::labeled("sidebar rail hovered", false);
+        move || {
+            let Some(sb) = ctx.clone() else {
+                return Element::Empty;
+            };
+            let t = theme();
+            let offcanvas = sb.collapsible() == SidebarCollapsible::Offcanvas && !sb.is_open();
+            // Centred on the container's edge, which is the panel's edge plus the padding.
+            let reach = px(if sb.padded() { -16.0 } else { -8.0 });
+            let side = sb.side();
+            let line = div()
+                .absolute()
+                .top(0.0)
+                .bottom(0.0)
+                .w(0.5)
+                .left_len(relative(if offcanvas { 1.0 } else { 0.5 }))
+                .when(hovered.get(), |d| d.bg(t.sidebar_border));
+            div()
+                .named("sidebar-rail")
+                .transition_all()
+                .ease_linear()
+                .absolute()
+                .top(0.0)
+                .bottom(0.0)
+                .w(4.0)
+                .flex()
+                .cursor(gui::Cursor::ResizeColumn)
+                .when(side == SidebarSide::Left, |d| d.right_len(reach))
+                .when(side == SidebarSide::Right, |d| d.left_len(reach))
+                .when(offcanvas, |d| d.hover(move |s| s.bg(t.sidebar)))
+                .on_hover(move |inside| hovered.set(inside))
+                .on_click(move |_| sb.toggle())
+                .child(line)
+                .into_element()
+        }
+    })
 }
 
 /// The main area beside the sidebar; inset in a rounded card for the `inset` variant.
 #[must_use]
-pub fn sidebar_inset(sb: &SidebarState) -> Div {
+pub fn sidebar_inset() -> Part<()> {
     let t = theme();
-    let collapsed = !sb.open.get();
-    div()
+    let root = div()
         .named("sidebar-inset")
         .bg(t.background)
         .relative()
         .flex_col()
         .w_full()
         .flex_1()
-        .min_w(0.0)
-        .when(sb.variant == SidebarVariant::Inset, |d| {
-            d.m(2.0).ml(if collapsed { 2.0 } else { 0.0 }).rounded_xl().shadow_sm()
+        .min_w(0.0);
+    Part::new((), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                let root = props.with(|p| p.slot.0.clone());
+                match &ctx {
+                    Some(sb) if sb.variant() == SidebarVariant::Inset => {
+                        let collapsed = !sb.is_open();
+                        root.m(2.0)
+                            .ml(if collapsed { 2.0 } else { 0.0 })
+                            .rounded_xl()
+                            .shadow_sm()
+                    }
+                    _ => root,
+                }
+                .into_element()
+            }
         })
+    })
 }
 
 #[must_use]
@@ -335,13 +420,23 @@ pub fn sidebar_footer() -> Div {
 
 /// The scrolling middle of the sidebar, between header and footer.
 #[must_use]
-pub fn sidebar_content(sb: &SidebarState) -> Div {
-    let d = div().named("sidebar-content").flex_col().min_h(0.0).flex_1().gap(2.0);
-    if sb.icon_collapsed() {
-        d.overflow_hidden()
-    } else {
-        d.overflow_y_scroll()
-    }
+pub fn sidebar_content() -> Part<()> {
+    let root = div().named("sidebar-content").flex_col().min_h(0.0).flex_1().gap(2.0);
+    Part::new((), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                let d = props.with(|p| p.slot.0.clone());
+                if icon_collapsed(ctx.as_ref()) {
+                    d.overflow_hidden()
+                } else {
+                    d.overflow_y_scroll()
+                }
+                .into_element()
+            }
+        })
+    })
 }
 
 #[must_use]
@@ -356,9 +451,10 @@ pub fn sidebar_separator() -> Div {
 
 /// A search field sized for the sidebar.
 #[must_use]
-pub fn sidebar_input(field: &TextField) -> TextInput {
+pub fn sidebar_input(field: &TextField) -> crate::input::Input {
     let t = theme();
-    input(field)
+    input()
+        .field(*field)
         .named("sidebar-input")
         .bg(t.background)
         .h(8.0)
@@ -379,9 +475,9 @@ pub fn sidebar_group() -> Div {
 
 /// A group's heading; slides up out of sight when collapsed to icons.
 #[must_use]
-pub fn sidebar_group_label(sb: &SidebarState) -> Div {
+pub fn sidebar_group_label() -> Part<()> {
     let t = theme();
-    div()
+    let root = div()
         .named("sidebar-group-label")
         .transition_props(Properties::MARGIN | Properties::OPACITY)
         .duration_ms(200.0)
@@ -395,30 +491,58 @@ pub fn sidebar_group_label(sb: &SidebarState) -> Div {
         .px(2.0)
         .text_xs()
         .font_medium()
-        .focus_visible(move |s| ring(s, &t))
-        .when(sb.icon_collapsed(), |d| d.mt(-8.0).opacity(0.0).pass_through())
+        .focus_visible(move |s| ring(s, &t));
+    Part::new((), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                props
+                    .with(|p| p.slot.0.clone())
+                    .when(icon_collapsed(ctx.as_ref()), |d| d.mt(-8.0).opacity(0.0).pass_through())
+                    .into_element()
+            }
+        })
+    })
+}
+
+/// Hidden while the sidebar around it is collapsed to icons.
+fn hidden_when_icons(root: Div) -> Part<()> {
+    Part::new((), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                props
+                    .with(|p| p.slot.0.clone())
+                    .when(icon_collapsed(ctx.as_ref()), Styled::hidden)
+                    .into_element()
+            }
+        })
+    })
 }
 
 /// A small icon button at the right of a group's label; add its icon with `.child`.
 #[must_use]
-pub fn sidebar_group_action(sb: &SidebarState) -> Div {
+pub fn sidebar_group_action() -> Part<()> {
     let t = theme();
-    div()
-        .named("sidebar-group-action")
-        .transition_transform()
-        .text_color(t.sidebar_foreground)
-        .absolute()
-        .top(3.5)
-        .right(3.0)
-        .flex()
-        .size(5.0)
-        .items_center()
-        .justify_center()
-        .rounded_md()
-        .focusable()
-        .hover(move |s| accent(s, &t))
-        .focus_visible(move |s| ring(s, &t))
-        .when(sb.icon_collapsed(), Styled::hidden)
+    hidden_when_icons(
+        div()
+            .named("sidebar-group-action")
+            .transition_transform()
+            .text_color(t.sidebar_foreground)
+            .absolute()
+            .top(3.5)
+            .right(3.0)
+            .flex()
+            .size(5.0)
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .focusable()
+            .hover(move |s| accent(s, &t))
+            .focus_visible(move |s| ring(s, &t)),
+    )
 }
 
 #[must_use]
@@ -431,11 +555,33 @@ pub fn sidebar_menu() -> Div {
     div().named("sidebar-menu").flex_col().w_full().min_w(0.0).gap(1.0)
 }
 
-/// One entry of a menu. `id` names it among its siblings: its button's
-/// tooltip and its show-on-hover action follow the pointer by it.
+/// What a menu item's action and badge read: whether the pointer is in it.
+#[derive(Clone, Copy)]
+struct ItemContext {
+    hovered: Signal<bool>,
+}
+
+/// One entry of a menu: its button, and an action or a badge, go inside.
+/// The action and badge follow the pointer in it.
 #[must_use]
-pub fn sidebar_menu_item(sb: &SidebarState, id: &str) -> Div {
-    div().named("sidebar-menu-item").relative().on_hover(sb.track_hover(id))
+pub fn sidebar_menu_item() -> Part<()> {
+    Part::new((), div().named("sidebar-menu-item").relative(), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let hovered = Signal::labeled("sidebar item hovered", false);
+            provide(ItemContext { hovered });
+            move || {
+                props
+                    .with(|p| p.slot.0.clone())
+                    .on_hover(move |inside| hovered.set(inside))
+                    .into_element()
+            }
+        })
+    })
+}
+
+fn item_hovered() -> Option<Signal<bool>> {
+    use_context::<ItemContext>().map(|i| i.hovered)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -474,12 +620,11 @@ pub struct SidebarMenuButtonProps {
     pub tooltip: Option<String>,
 }
 
-/// The button of the menu item `id`; add its icon and label with `.child`
-/// (give the label `.truncate()`), and `.pr(8.0)` when the item has an action.
+/// The button of a menu item; add its icon and label with `.child` (give
+/// the label `.truncate()`), and `.pr(8.0)` when the item has an action.
 #[must_use]
-pub fn sidebar_menu_button(sb: &SidebarState, id: &str, props: SidebarMenuButtonProps) -> Div {
+pub fn sidebar_menu_button(props: SidebarMenuButtonProps) -> Part<SidebarMenuButtonProps> {
     let t = theme();
-    let icons = sb.icon_collapsed();
     let base = div()
         .named("sidebar-menu-button")
         .transition_props(Properties::WIDTH | Properties::HEIGHT | Properties::PADDING)
@@ -511,37 +656,43 @@ pub fn sidebar_menu_button(sb: &SidebarState, id: &str, props: SidebarMenuButton
     let sized = match props.size {
         SidebarMenuButtonSize::Default => styled.h(8.0).text_sm(),
         SidebarMenuButtonSize::Sm => styled.h(7.0).text_xs(),
-        SidebarMenuButtonSize::Lg => styled.h(12.0).text_sm().when(icons, |d| d.p(0.0)),
+        SidebarMenuButtonSize::Lg => styled.h(12.0).text_sm(),
     };
-    let collapsed = !sb.open.get();
-    let sized = sized.when(icons, |d| {
-        d.size(8.0).when(props.size != SidebarMenuButtonSize::Lg, |d| d.p(2.0))
-    });
-    match props.tooltip {
-        Some(label) => {
-            let tip = sb.tooltip(id);
-            let content = collapsed
-                .then(|| tooltip_content_placed(&tip, Side::Right, SideAlign::Center, |c| c.child(text(label))));
-            tooltip_trigger(&tip, sized).child(content)
-        }
-        None => sized,
-    }
+    Part::new(props, sized, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            move || {
+                let (size, tip, root) = props.with(|p| (p.props.size, p.props.tooltip.clone(), p.slot.0.clone()));
+                let icons = icon_collapsed(ctx.as_ref());
+                let collapsed = ctx.as_ref().is_some_and(|c| !c.is_open());
+                let root = root.when(icons, |d| {
+                    d.size(8.0)
+                        .when(size == SidebarMenuButtonSize::Lg, |d| d.p(0.0))
+                        .when(size != SidebarMenuButtonSize::Lg, |d| d.p(2.0))
+                });
+                match tip {
+                    // The tooltip shows only while collapsed.
+                    Some(label) => tooltip()
+                        .w_full()
+                        .child(tooltip_trigger(root))
+                        .child(collapsed.then(|| tooltip_content().side(Side::Right).child(text(label))))
+                        .into_element(),
+                    None => root.into_element(),
+                }
+            }
+        })
+    })
 }
 
-/// A small icon button at the right of the menu item `id`, whose button has
+/// A small icon button at the right of its menu item, whose button has
 /// `size`; with `show_on_hover` it shows only while the pointer is on the item.
 #[must_use]
-pub fn sidebar_menu_action(sb: &SidebarState, id: &str, size: SidebarMenuButtonSize, show_on_hover: bool) -> Div {
+pub fn sidebar_menu_action(size: SidebarMenuButtonSize, show_on_hover: bool) -> Part<SidebarMenuAside> {
     let t = theme();
-    let hovered = sb.is_hovered(id);
-    div()
+    let root = div()
         .named("sidebar-menu-action")
         .transition_transform()
-        .text_color(if hovered {
-            t.sidebar_accent_foreground
-        } else {
-            t.sidebar_foreground
-        })
         .absolute()
         .top(size.inner_top())
         .right(1.0)
@@ -552,23 +703,15 @@ pub fn sidebar_menu_action(sb: &SidebarState, id: &str, size: SidebarMenuButtonS
         .rounded_md()
         .focusable()
         .hover(move |s| accent(s, &t))
-        .focus_visible(move |s| ring(s, &t))
-        .when(show_on_hover && !hovered, |d| d.opacity(0.0))
-        .when(sb.icon_collapsed(), Styled::hidden)
+        .focus_visible(move |s| ring(s, &t));
+    aside(SidebarMenuAside { show_on_hover }, root)
 }
 
-/// A count at the right of the menu item `id`, whose button has `size`.
+/// A count at the right of its menu item, whose button has `size`.
 #[must_use]
-pub fn sidebar_menu_badge(sb: &SidebarState, id: &str, size: SidebarMenuButtonSize) -> Div {
-    let t = theme();
-    let hovered = sb.is_hovered(id);
-    div()
+pub fn sidebar_menu_badge(size: SidebarMenuButtonSize) -> Part<SidebarMenuAside> {
+    let root = div()
         .named("sidebar-menu-badge")
-        .text_color(if hovered {
-            t.sidebar_accent_foreground
-        } else {
-            t.sidebar_foreground
-        })
         .pass_through()
         .absolute()
         .top(size.inner_top())
@@ -581,8 +724,39 @@ pub fn sidebar_menu_badge(sb: &SidebarState, id: &str, size: SidebarMenuButtonSi
         .rounded_md()
         .px(1.0)
         .text_xs()
-        .font_medium()
-        .when(sb.icon_collapsed(), Styled::hidden)
+        .font_medium();
+    aside(SidebarMenuAside { show_on_hover: false }, root)
+}
+
+/// What a menu item's action or badge is given.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SidebarMenuAside {
+    show_on_hover: bool,
+}
+
+/// An action or badge: brighter while the pointer is on its item, hidden
+/// when collapsed to icons.
+fn aside(props: SidebarMenuAside, root: Div) -> Part<SidebarMenuAside> {
+    Part::new(props, root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = SidebarContext::find();
+            let hovered = item_hovered();
+            move || {
+                let t = theme();
+                let (show_on_hover, root) = props.with(|p| (p.props.show_on_hover, p.slot.0.clone()));
+                let hovered = hovered.is_some_and(|h| h.get());
+                root.text_color(if hovered {
+                    t.sidebar_accent_foreground
+                } else {
+                    t.sidebar_foreground
+                })
+                .when(show_on_hover && !hovered, |d| d.opacity(0.0))
+                .when(icon_collapsed(ctx.as_ref()), Styled::hidden)
+                .into_element()
+            }
+        })
+    })
 }
 
 /// A placeholder menu item while the menu loads; `id` picks its width (50–90%).
@@ -614,21 +788,22 @@ fn skeleton_width(id: &str) -> f32 {
 
 /// The nested list under a menu item; hidden when collapsed to icons.
 #[must_use]
-pub fn sidebar_menu_sub(sb: &SidebarState) -> Div {
+pub fn sidebar_menu_sub() -> Part<()> {
     let t = theme();
-    div()
-        .named("sidebar-menu-sub")
-        .border_l()
-        .border_color(t.sidebar_border)
-        .mx(3.5)
-        .relative()
-        .left_len(px(1.0))
-        .flex_col()
-        .min_w(0.0)
-        .gap(1.0)
-        .px(2.5)
-        .py(0.5)
-        .when(sb.icon_collapsed(), Styled::hidden)
+    hidden_when_icons(
+        div()
+            .named("sidebar-menu-sub")
+            .border_l()
+            .border_color(t.sidebar_border)
+            .mx(3.5)
+            .relative()
+            .left_len(px(1.0))
+            .flex_col()
+            .min_w(0.0)
+            .gap(1.0)
+            .px(2.5)
+            .py(0.5),
+    )
 }
 
 #[must_use]

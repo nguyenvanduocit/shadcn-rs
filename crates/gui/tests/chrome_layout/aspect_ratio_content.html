@@ -1,0 +1,7 @@
+<!-- aspect-ratio with one size auto: the content can make the box larger than the ratio gives (its automatic minimum), and only the ratio-determining axis's min and max carry over to the other. -->
+<div style="width: 400px">
+  <p style="width: 100px; aspect-ratio: 4">A ratio box whose words wrap over lines</p>
+  <div style="width: 100px; aspect-ratio: 2; max-height: 30px"></div>
+  <div style="width: 100px; aspect-ratio: 2; min-height: 80px"></div>
+  <div style="display: flex; flex-direction: column; align-items: flex-start"><p style="height: 24px; aspect-ratio: 1">Words</p></div>
+</div>

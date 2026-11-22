@@ -1,8 +1,8 @@
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Side, SideAlign, Signal, div, icon, text};
+use gui::{Div, Icon, ScenarioError, SideAlign, Signal, div, icon, text};
 use shadcn::{
-    MenuItem, MenuState, breadcrumb, breadcrumb_ellipsis, breadcrumb_item, breadcrumb_link, breadcrumb_list,
-    breadcrumb_page, breadcrumb_separator, breadcrumb_separator_of, dropdown_menu_content, dropdown_menu_item,
+    MenuItem, breadcrumb, breadcrumb_ellipsis, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page,
+    breadcrumb_separator, breadcrumb_separator_of, dropdown_menu, dropdown_menu_content, dropdown_menu_item,
     dropdown_menu_trigger,
 };
 
@@ -10,20 +10,18 @@ use crate::{Render, Shot, demo, page};
 
 pub fn render() -> Render {
     let visited = Signal::labeled("visited", String::from("nothing yet"));
-    let components = MenuState::new();
-    let collapsed = MenuState::new();
     Box::new(move || {
-        let link = |label: &'static str| {
-            let visited = visited.clone();
-            breadcrumb_link(label).on_click(move |_| visited.set(label.to_owned()))
-        };
+        let link = |label: &'static str| breadcrumb_link(label).on_click(move |_| visited.set(label.to_owned()));
         // A menu of pages the trail skips; picking one visits it.
-        let menu = |m: &MenuState, trigger: Div, labels: &[&'static str]| {
-            let content = dropdown_menu_content(m).children(labels.iter().map(|&label| {
-                let visited = visited.clone();
-                dropdown_menu_item(m, label, MenuItem::default(), move || visited.set(label.to_owned())).child(label)
-            }));
-            dropdown_menu_trigger(m, trigger, Side::Bottom, SideAlign::Start, content)
+        let menu = |trigger: Div, labels: &[&'static str]| {
+            let content = dropdown_menu_content()
+                .align(SideAlign::Start)
+                .children(labels.iter().map(|&label| {
+                    dropdown_menu_item(label, MenuItem::default())
+                        .on_select(move || visited.set(label.to_owned()))
+                        .child(label)
+                }));
+            dropdown_menu().child(dropdown_menu_trigger(trigger)).child(content)
         };
         // The demos' `DropdownMenuTrigger class="flex items-center gap-1"`.
         let trigger = || div().flex().items_center().gap(1.0).cursor_pointer().focusable();
@@ -77,7 +75,6 @@ pub fn render() -> Render {
                             .child(breadcrumb_separator_of(Icon::Slash))
                             .child(
                                 breadcrumb_item().child(menu(
-                                    &components,
                                     // `[&_svg:not([class*='size-'])]:size-3.5`.
                                     trigger()
                                         .child(text("Components"))
@@ -109,7 +106,6 @@ pub fn render() -> Render {
                             .child(breadcrumb_item().child(link("Home")))
                             .child(breadcrumb_separator())
                             .child(breadcrumb_item().child(menu(
-                                &collapsed,
                                 trigger().child(breadcrumb_ellipsis().size(4.0)),
                                 &["Documentation", "Building Your Application"],
                             )))

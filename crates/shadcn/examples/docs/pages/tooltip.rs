@@ -2,9 +2,7 @@ use std::time::Duration;
 
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, Side, SideAlign, div, text};
-use shadcn::{
-    ButtonSize, ButtonVariant, TooltipState, button, tooltip, tooltip_content, tooltip_content_placed, tooltip_trigger,
-};
+use shadcn::{ButtonSize, ButtonVariant, button, tooltip, tooltip_content, tooltip_trigger};
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page, section};
 
@@ -16,16 +14,9 @@ const SIDES: [(&str, Side); 4] = [
 ];
 
 pub fn render() -> Render {
-    let first = TooltipState::new();
-    let sides: Vec<TooltipState> = SIDES.iter().map(|_| TooltipState::new()).collect();
-    let delayed = TooltipState::with_delay(Duration::from_millis(700));
     Box::new(move || {
-        let hover_button = |state: &TooltipState, label: &str| {
-            tooltip_trigger(
-                state,
-                button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned()),
-            )
-        };
+        let hover_button =
+            |label: &str| tooltip_trigger(button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned()));
         page(
             "Tooltip",
             div()
@@ -34,8 +25,8 @@ pub fn render() -> Render {
                 .child(demo(
                     "TooltipDemo.vue",
                     tooltip()
-                        .child(hover_button(&first, "Hover"))
-                        .child(tooltip_content(&first, |c| c.child(text("Add to library")))),
+                        .child(hover_button("Hover"))
+                        .child(tooltip_content().child(text("Add to library"))),
                 ))
                 .child(section(
                     "Sides",
@@ -43,21 +34,22 @@ pub fn render() -> Render {
                         .flex()
                         .gap(2.0)
                         .pl(28.0)
-                        .children(SIDES.iter().zip(&sides).map(|((name, side), state)| {
-                            tooltip().child(hover_button(state, name)).child(tooltip_content_placed(
-                                state,
-                                *side,
-                                SideAlign::Center,
-                                |c| c.child(text("Add to library")),
-                            ))
+                        .children(SIDES.iter().map(|(name, side)| {
+                            tooltip().child(hover_button(name)).child(
+                                tooltip_content()
+                                    .side(*side)
+                                    .align(SideAlign::Center)
+                                    .child(text("Add to library")),
+                            )
                         })),
                 ))
                 .child(section(
                     "700ms delay",
                     div().flex().child(
                         tooltip()
-                            .child(hover_button(&delayed, "Wait for it"))
-                            .child(tooltip_content(&delayed, |c| c.child(text("Took its time")))),
+                            .delay_duration(Duration::from_millis(700))
+                            .child(hover_button("Wait for it"))
+                            .child(tooltip_content().child(text("Took its time"))),
                     ),
                 )),
         )
@@ -100,5 +92,10 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.frame("delayed, 750ms: shown")?;
     s.click(x, y);
     s.frame("press hides it")?;
+    s.hover(800.0, 600.0);
+    s.press(NamedKey::Tab, Modifiers::default());
+    s.frame("tab focus shows it")?;
+    s.press(NamedKey::Tab, Modifiers::default());
+    s.frame("tab on: the next one's")?;
     Ok(())
 }

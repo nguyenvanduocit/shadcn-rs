@@ -1,0 +1,26 @@
+---
+source: crates/gui/tests/dumps.rs
+expression: "gui::inspect::dump(&s.scenario().last().nodes)"
+---
+0            Div 400x420 at (0,0)
+  0/0          Div 320x380 at (16,16)
+    0/0/0        Text "Account settings" 270x28 at (41,41)  20px w600 #000000
+    0/0/1        Text "Choose how the app greet…" 270x40 at (41,81)  14px w400 #000000
+    0/0/2        Div 270x62 at (41,133)
+      0/0/2/0      Text "Display name" 270x20 at (41,133)  14px w500 #000000
+      0/0/2/1      Input "" 270x36 at (41,159)
+    0/0/3        Div 270x20 at (41,207)
+      0/0/3/0      Div 16x16 at (41,209)
+      0/0/3/1      Text "Remember me" 96x20 at (65,207)  14px w400 #000000
+    0/0/4        Div 270x84 at (41,239)
+      0/0/4/0      Div 270x28 at (41,239)
+        0/0/4/0/0    Text "Profile" 270x20 at (41,243)  14px w400 #000000
+      0/0/4/1      Div 270x28 at (41,267)
+        0/0/4/1/0    Text "Notifications" 270x20 at (41,271)  14px w400 #000000
+      0/0/4/2      Div 270x28 at (41,295)
+        0/0/4/2/0    Text "Privacy" 270x20 at (41,299)  14px w400 #000000
+    0/0/5        Div 270x36 at (41,335)
+      0/0/5/0      Div 69x36 at (169,335)
+        0/0/5/0/0    Text "Reset" 37x20 at (185,343)  14px w400 #000000
+      0/0/5/1      Div #000000 64x36 at (247,335)
+        0/0/5/1/0    Text "Save" 32x20 at (263,343)  14px w400 #ffffff

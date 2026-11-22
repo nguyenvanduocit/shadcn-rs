@@ -1,120 +1,177 @@
 //! Combobox (`ui/combobox`): a trigger opening a searchable list below it;
 //! picking an item sets the value and closes the list, or, holding several
 //! (`multiple`), toggles it and leaves the list open. The list is a
-//! [`CommandState`]: the same search, filter, highlight and keys.
+//! command's: the same search, filter, highlight and keys.
+//!
+//! The parts nest as in Vue: [`combobox`] keeps its value, its own
+//! (`default_value`) or the caller's (`model`, `v-model`), and whether its
+//! list is open (`open`, `v-model:open`); it is the anchor the
+//! [`combobox_list`] opens against, below its [`combobox_trigger`]. One
+//! value is an `Option<String>`, several a `Vec<String>` ([`SelectModel`]).
+
+use std::rc::Rc;
 
 use gui::prelude::*;
-use gui::{Div, FocusHandle, Icon, NamedKey, Placement, Side, SideAlign, Signal, div, icon};
+use gui::{
+    Bind, Div, Element, FocusHandle, Icon, Model, NamedKey, Placement, Side, SideAlign, TextField, component, div,
+    icon, provide, use_context, use_model,
+};
 
-use crate::command::{CommandState, command_empty_box, command_group, command_input, command_item, command_separator};
+use crate::command::{CommandContext, CommandItem, CommandList, CommandSection, Names, command_input, command_list};
 use gui::style::Origin;
 
-use crate::dropdown_menu::menu_picks;
+use crate::dropdown_menu::{OpenModel, menu_picks};
 use crate::motion::popper;
+use crate::part::{Part, PartProps};
 use crate::select::SelectModel;
 use crate::theme::theme;
 
-/// A combobox: whether its list is open, its value (`v-model`), one by
-/// default, and its list. Create it once, outside the render closure.
+/// What [`combobox`] is given: its value and whether its list is open.
+#[derive(Clone, PartialEq, Default)]
+pub struct ComboboxProps<M: SelectModel> {
+    value: Bind<M>,
+    open: Bind<bool>,
+}
+
+impl<M: SelectModel> Part<ComboboxProps<M>> {
+    /// The value, kept by the caller (`v-model`).
+    #[must_use]
+    pub fn model(self, model: impl Into<Model<M>>) -> Self {
+        self.with_props(|p| p.value = p.value.clone().with_model(model))
+    }
+
+    /// The value first chosen, when no model is given (`default-value`).
+    #[must_use]
+    pub fn default_value(self, value: M) -> Self {
+        self.with_props(|p| p.value = p.value.clone().with_default(value))
+    }
+
+    /// Call `f` with each value picked (`@update:model-value`).
+    #[must_use]
+    pub fn on_change(self, f: impl Fn(M) + 'static) -> Self {
+        self.with_props(|p| p.value = p.value.clone().on_change(f))
+    }
+
+    /// Whether the list is open, kept by the caller (`v-model:open`).
+    #[must_use]
+    pub fn open(self, open: impl Into<Model<bool>>) -> Self {
+        self.with_props(|p| p.open = p.open.clone().with_model(open))
+    }
+}
+
+/// What the parts below a [`combobox`] read; its value seen as values chosen.
 #[derive(Clone)]
-pub struct ComboboxState<M = Option<String>> {
-    pub value: Signal<M>,
-    open: Signal<bool>,
-    list: CommandState,
+struct ComboboxContext {
+    open: Rc<dyn OpenModel>,
+    /// Whether a value is chosen (tracked).
+    holds: Rc<dyn Fn(&str) -> bool>,
+    /// The first value chosen (untracked).
+    first: Rc<dyn Fn() -> Option<String>>,
+    list: CommandContext,
     trigger: FocusHandle,
 }
 
-impl ComboboxState {
-    /// A combobox of one value, `value` chosen at first.
-    #[must_use]
-    pub fn new(value: Option<&str>) -> Self {
-        Self::holding(value.map(str::to_owned))
-    }
-}
-
-impl ComboboxState<Vec<String>> {
-    /// A combobox of several values (`multiple`), `values` chosen at first.
-    #[must_use]
-    pub fn multiple(values: &[&str]) -> Self {
-        Self::holding(values.iter().map(|v| (*v).to_owned()).collect())
-    }
-}
-
-impl<M: SelectModel> ComboboxState<M> {
-    fn holding(model: M) -> Self {
-        Self {
-            value: Signal::labeled("combobox value", model),
-            open: Signal::labeled("combobox open", false),
-            list: CommandState::new(),
-            trigger: FocusHandle::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn is_open(&self) -> bool {
+impl ComboboxContext {
+    fn is_open(&self) -> bool {
         self.open.get()
     }
 
     /// Open the list on the chosen item (or the first), focus in its search.
-    pub fn open(&self) {
+    fn show(&self) {
         self.open.set(true);
         self.list.search.focus.focus();
-        self.list
-            .highlight_or_first(self.value.get().chosen().into_iter().next());
+        self.list.highlight_and_reveal((self.first)());
     }
 
     /// Close the list, clear its search and give focus back to the trigger.
-    pub fn close(&self, by_keyboard: bool) {
-        if self.open.get() {
-            self.open.set(false);
-        }
-        self.list.search.set_text("");
-        gui::focus::set_focus(Some(self.trigger.id()), by_keyboard);
+    fn close(&self, by_keyboard: bool) {
+        close(&*self.open, &self.list, self.trigger, by_keyboard);
     }
 }
 
-/// The trigger (usually an outline button): a click, Enter, Space or
-/// ArrowDown opens `list` below it, centred (`side-offset 4`).
-#[must_use]
-pub fn combobox_trigger<M: SelectModel>(combobox: &ComboboxState<M>, trigger: Div, list: Div) -> Div {
-    combobox_trigger_aligned(combobox, trigger, SideAlign::Center, list)
+fn close(open: &dyn OpenModel, list: &CommandContext, trigger: FocusHandle, by_keyboard: bool) {
+    open.set(false);
+    list.search.set_text("");
+    gui::focus::set_focus(Some(trigger.id()), by_keyboard);
 }
 
-/// [`combobox_trigger`] with the list lined up by `align`
-/// (`<ComboboxList align="…">`).
+/// A combobox: the anchor its list opens against. Give it a
+/// [`combobox_trigger`] and a [`combobox_list`]; it holds one value
+/// (`combobox::<Option<String>>()`) or several (`combobox::<Vec<String>>()`).
 #[must_use]
-pub fn combobox_trigger_aligned<M: SelectModel>(
-    combobox: &ComboboxState<M>,
-    trigger: Div,
-    align: SideAlign,
-    list: Div,
-) -> Div {
-    let (click, keys) = (combobox.clone(), combobox.clone());
-    let placement = Placement::Anchored {
-        side: Side::Bottom,
-        align,
-        offset: 4.0,
-        match_width: false,
-        fit_height: false,
-    };
-    trigger
-        .named("combobox-trigger")
-        .track_focus(combobox.trigger)
-        .on_click(move |_| {
-            if click.is_open() {
-                click.close(false);
-            } else {
-                click.open();
+pub fn combobox<M: SelectModel>() -> Part<ComboboxProps<M>> {
+    Part::new(ComboboxProps::default(), div().named("combobox").inline_flex(), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let value = use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.value);
+            let open: Rc<dyn OpenModel> = Rc::new(use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.open));
+            let trigger = FocusHandle::new();
+            // Picking clears the search itself (`CommandContext::pick`).
+            let picked = {
+                let open = Rc::clone(&open);
+                CommandContext::new(TextField::new(""), move |item: &CommandItem| {
+                    let shut = || {
+                        open.set(false);
+                        gui::focus::set_focus(Some(trigger.id()), false);
+                    };
+                    if item.null {
+                        value.set(M::default());
+                        shut();
+                        return;
+                    }
+                    value.update(|m| m.pick(&item.value));
+                    if M::CLOSES_ON_PICK {
+                        shut();
+                    }
+                })
+            };
+            provide(picked.clone());
+            provide(ComboboxContext {
+                open,
+                holds: Rc::new(move |v: &str| value.with(|m| m.holds(v))),
+                first: Rc::new(move || value.get_untracked().chosen().into_iter().next()),
+                list: picked,
+                trigger,
+            });
+            move || props.with(|p| p.slot.0.clone()).into_element()
+        })
+    })
+}
+
+/// The trigger (usually an outline button): a click, Enter, Space or
+/// ArrowDown opens the list below it.
+#[must_use]
+pub fn combobox_trigger(trigger: Div) -> Part<()> {
+    Part::new((), trigger.named("combobox-trigger"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let combobox = use_context::<ComboboxContext>();
+            move || {
+                let root = props.with(|p| p.slot.0.clone());
+                let Some(c) = combobox.clone() else {
+                    return root.into_element();
+                };
+                let (click, keys) = (c.clone(), c.clone());
+                root.track_focus(c.trigger)
+                    .aria_expanded(c.is_open())
+                    .on_click(move |_| {
+                        if gui::untracked(|| click.is_open()) {
+                            click.close(false);
+                        } else {
+                            click.show();
+                        }
+                    })
+                    .on_key_down(move |ev| {
+                        if gui::untracked(|| keys.is_open()) || !(menu_picks(ev) || ev.is(NamedKey::ArrowDown)) {
+                            return false;
+                        }
+                        keys.show();
+                        true
+                    })
+                    .into_element()
             }
         })
-        .on_key_down(move |ev| {
-            if keys.is_open() || !(menu_picks(ev) || ev.is(NamedKey::ArrowDown)) {
-                return false;
-            }
-            keys.open();
-            true
-        })
-        .child(combobox.is_open().then(|| gui::deferred(placement, list)))
+    })
 }
 
 /// `w-[200px]`: what the list lines up with.
@@ -123,15 +180,29 @@ pub fn combobox_anchor() -> Div {
     div().named("combobox-anchor").w_px(200.0)
 }
 
-/// The floating list: `w-[200px] rounded-md border bg-popover
-/// text-popover-foreground overflow-hidden shadow-md`; Escape or a click
-/// outside closes it. Add the input, empty state and groups with `.child`.
+/// What [`combobox_list`] is given: how it lines up with the trigger.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ComboboxListProps {
+    align: SideAlign,
+}
+
+impl Part<ComboboxListProps> {
+    /// Lined up with the trigger by `align` (`<ComboboxList align="…">`;
+    /// centred by default).
+    #[must_use]
+    pub fn align(self, align: SideAlign) -> Self {
+        self.with_props(|p| p.align = align)
+    }
+}
+
+/// The floating list, below the trigger (`side-offset 4`): `w-[200px]
+/// rounded-md border bg-popover text-popover-foreground overflow-hidden
+/// shadow-md`; Escape or a click outside closes it. Add the
+/// [`combobox_input`] and [`combobox_items`] with `.child`.
 #[must_use]
-pub fn combobox_list<M: SelectModel>(combobox: &ComboboxState<M>) -> Div {
+pub fn combobox_list() -> Part<ComboboxListProps> {
     let t = theme();
-    combobox.list.begin();
-    let (keys, outside) = (combobox.clone(), combobox.clone());
-    popper(div(), Origin::Anchor)
+    let root = popper(div(), Origin::Anchor)
         .named("combobox-list")
         .w_px(200.0)
         .rounded_md()
@@ -140,85 +211,95 @@ pub fn combobox_list<M: SelectModel>(combobox: &ComboboxState<M>) -> Div {
         .bg(t.popover)
         .text_color(t.popover_foreground)
         .overflow_hidden()
-        .shadow_md()
-        .on_click_outside(move || outside.close(false))
-        .on_key_down(move |ev| {
-            if ev.is(NamedKey::Escape) {
-                keys.close(true);
-                return true;
-            }
-            keys.list.key(ev)
-        })
-}
-
-/// `max-h-[300px] scroll-py-1 overflow-y-auto`.
-#[must_use]
-pub fn combobox_viewport() -> Div {
-    div()
-        .named("combobox-viewport")
-        .max_h_px(300.0)
-        .overflow_x_hidden()
-        .overflow_y_scroll()
+        .shadow_md();
+    Part::new(
+        ComboboxListProps {
+            align: SideAlign::Center,
+        },
+        root,
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let combobox = use_context::<ComboboxContext>();
+                move || {
+                    let Some(c) = combobox.clone() else {
+                        return Element::Empty;
+                    };
+                    if !c.is_open() {
+                        return Element::Empty;
+                    }
+                    let (align, root) = props.with(|p| (p.props.align, p.slot.0.clone()));
+                    let (keys, outside) = (c.clone(), c);
+                    let list = root
+                        .on_click_outside(move || outside.close(false))
+                        .on_key_down(move |ev| {
+                            if ev.is(NamedKey::Escape) {
+                                keys.close(true);
+                                return true;
+                            }
+                            keys.list.key(ev)
+                        });
+                    let placement = Placement::Anchored {
+                        side: Side::Bottom,
+                        align,
+                        offset: 4.0,
+                        match_width: false,
+                        fit_height: false,
+                    };
+                    gui::deferred(placement, list).into_element()
+                }
+            })
+        },
+    )
 }
 
 /// The search box, as a command's.
 #[must_use]
-pub fn combobox_input<M: SelectModel>(combobox: &ComboboxState<M>, placeholder: &str) -> Div {
-    command_input(&combobox.list, placeholder).named("combobox-input")
+pub fn combobox_input(placeholder: &str) -> Part<String> {
+    command_input(placeholder).map_root(|d| d.named("combobox-input"))
 }
 
-/// `py-6 text-center text-sm`, shown when no item shows.
-#[must_use]
-pub fn combobox_empty<M: SelectModel>(combobox: &ComboboxState<M>, message: &str) -> Option<Div> {
-    (!combobox.list.any_visible()).then(|| command_empty_box(message).named("combobox-empty"))
+const COMBOBOX_NAMES: Names = Names {
+    list: "combobox-viewport",
+    group: "combobox-group",
+    heading: "combobox-group-heading",
+    item: "combobox-item",
+    separator: "combobox-separator",
+    empty: "combobox-empty",
+};
+
+/// The combobox's items (`ComboboxViewport max-h-[300px]` and what is in
+/// it): `sections` filtered by the search, `row` adding each item's label and
+/// [`combobox_item_indicator`] to its row. Picking an item chooses its value
+/// (closing the list unless it holds several); picking a
+/// [`CommandItem::null`] one (a "Create …" row) clears the choice and closes
+/// it. Only the rows in view are built; `.footer(…)` adds sections below the
+/// viewport, always in view.
+pub fn combobox_items(
+    sections: impl Into<Rc<Vec<CommandSection>>>,
+    row: impl Fn(&CommandItem, Div) -> Div + 'static,
+) -> CommandList {
+    command_list(sections, row).names(COMBOBOX_NAMES)
 }
 
-/// A group under an optional heading; `None` when the search hides all its items.
+/// `ml-auto`: a check, muted as the item's `[&_svg]` rule makes it, while
+/// `value` is chosen.
 #[must_use]
-pub fn combobox_group(heading: Option<&str>, items: impl IntoIterator<Item = Option<Div>>) -> Option<Div> {
-    command_group(heading, items).map(|g| g.named("combobox-group"))
-}
-
-/// An item choosing `value`, or `None` when the search hides it; add its
-/// label and [`combobox_item_indicator`] with `.map(|i| i.child(…))`.
-#[must_use]
-pub fn combobox_item<M: SelectModel>(combobox: &ComboboxState<M>, value: &str) -> Option<Div> {
-    let (pick, chosen) = (combobox.clone(), value.to_owned());
-    command_item(&combobox.list, value, false, move || {
-        pick.value.update(|m| m.picked(&chosen));
-        if M::CLOSES_ON_PICK {
-            pick.close(false);
-        }
+pub fn combobox_item_indicator(value: &str) -> Part<String> {
+    let root = div().named("combobox-item-indicator").ml_auto().flex();
+    Part::new(value.to_owned(), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let combobox = use_context::<ComboboxContext>();
+            move || {
+                let (value, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
+                if !combobox.as_ref().is_some_and(|c| (c.holds)(&value)) {
+                    return Element::Empty;
+                }
+                let t = theme();
+                root.child(icon(Icon::Check).text_color(t.muted_foreground))
+                    .into_element()
+            }
+        })
     })
-    .map(|i| i.named("combobox-item"))
-}
-
-/// An item valued `null` (`<ComboboxItem :value="null">`, a "Create …"
-/// row), searched as `label`: picking it clears the choice and closes the list.
-#[must_use]
-pub fn combobox_item_null<M: SelectModel>(combobox: &ComboboxState<M>, label: &str) -> Option<Div> {
-    let pick = combobox.clone();
-    command_item(&combobox.list, label, false, move || {
-        pick.value.set(M::default());
-        pick.close(false);
-    })
-    .map(|i| i.named("combobox-item"))
-}
-
-/// `ml-auto`: a check, muted as the item's `[&_svg]` rule makes it, when `value` is chosen.
-#[must_use]
-pub fn combobox_item_indicator<M: SelectModel>(combobox: &ComboboxState<M>, value: &str) -> Option<Div> {
-    let t = theme();
-    combobox.value.get().holds(value).then(|| {
-        div()
-            .named("combobox-item-indicator")
-            .ml_auto()
-            .flex()
-            .child(icon(Icon::Check).text_color(t.muted_foreground))
-    })
-}
-
-#[must_use]
-pub fn combobox_separator() -> Div {
-    command_separator().named("combobox-separator")
 }

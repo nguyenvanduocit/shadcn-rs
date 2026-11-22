@@ -15,9 +15,10 @@ use std::time::Duration;
 
 use gui::clock::{self, TimerId};
 use gui::prelude::*;
-use gui::{Div, Icon, Signal, Track, div, icon, span, text};
+use gui::{Div, Icon, Signal, Track, component, div, icon, span, text};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
+use crate::part::Part;
 use crate::theme::{Theme, theme};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -153,7 +154,10 @@ pub fn code_block_actions() -> Div {
 /// is hovered or focused; `gui` has no hover state an ancestor passes to its
 /// children, so they always show, as Vue does on touch screens.
 #[must_use]
-pub fn code_block_floating_actions(p: CodeBlockProps, buttons: impl IntoIterator<Item = Div>) -> Div {
+pub fn code_block_floating_actions<B: Styled + IntoElement>(
+    p: CodeBlockProps,
+    buttons: impl IntoIterator<Item = B>,
+) -> Div {
     let t = theme();
     let inset = if p.sm() { 1.5 } else { 2.0 };
     div()
@@ -368,57 +372,51 @@ pub fn code_block_footer(p: CodeBlockProps) -> Div {
 /// How long the copy button shows its check (Vue's `copiedDuring: 2000`).
 const COPIED_FOR: Duration = Duration::from_secs(2);
 
-/// The copy button's "just copied" state; create it once, outside the render.
-#[derive(Clone)]
-pub struct CodeBlockCopy {
-    copied: Signal<bool>,
-    reset: Signal<Option<TimerId>>,
+/// What [`code_block_copy_button`] is given: the text it copies.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CodeBlockCopyProps {
+    value: String,
 }
 
-impl CodeBlockCopy {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            copied: Signal::labeled("code-block copied", false),
-            reset: Signal::new(None),
-        }
-    }
-
-    /// Whether the value was copied in the last two seconds.
-    #[must_use]
-    pub fn copied(&self) -> bool {
-        self.copied.get()
-    }
-
-    /// Put `value` on the clipboard and show the check for two seconds.
-    pub fn copy(&self, value: &str) {
-        if !gui::clipboard::copy(value) {
-            return;
-        }
-        if let Some(timer) = self.reset.get() {
-            clock::cancel(timer);
-        }
-        self.copied.set(true);
-        let copied = self.copied.clone();
-        self.reset
-            .set(Some(clock::after(COPIED_FOR, move || copied.set(false))));
-    }
-}
-
-impl Default for CodeBlockCopy {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// A ghost icon button that copies `value`, showing a check once it has.
+/// A ghost icon button that copies `value`, showing a check for two seconds
+/// once it has (its own state, as `CodeBlockCopyButton.vue`'s `useClipboard`).
 #[must_use]
-pub fn code_block_copy_button(state: &CodeBlockCopy, value: impl Into<String>) -> Div {
-    let value = value.into();
-    let state = state.clone();
-    let shown = if state.copied() { Icon::Check } else { Icon::Copy };
-    button(ButtonVariant::Ghost, ButtonSize::IconXs)
-        .named("code-block-copy-button")
-        .child(icon(shown).size(3.0))
-        .on_click(move |_| state.copy(&value))
+pub fn code_block_copy_button(value: impl Into<String>) -> Part<CodeBlockCopyProps> {
+    let root = button(ButtonVariant::Ghost, ButtonSize::IconXs).named("code-block-copy-button");
+    Part::new(CodeBlockCopyProps { value: value.into() }, root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let copied = Signal::labeled("code-block copied", false);
+            let reset: Signal<Option<TimerId>> = Signal::new(None);
+            // The reset timer belongs to the instance: it is cancelled with it.
+            let owner = gui::Scope::new();
+            let copy = move || {
+                let value = props.with_untracked(|p| p.props.value.clone());
+                if !gui::clipboard::copy(&value) {
+                    return;
+                }
+                if let Some(timer) = reset.get_untracked() {
+                    clock::cancel(timer);
+                }
+                copied.set(true);
+                reset.set(Some(owner.run(|| clock::after(COPIED_FOR, move || copied.set(false)))));
+            };
+            move || {
+                let shown = if copied.get() { Icon::Check } else { Icon::Copy };
+                props
+                    .with(|p| p.slot.0.clone())
+                    .child(icon(shown).size(3.0))
+                    .on_click(move |_| copy())
+                    .into_element()
+            }
+        })
+    })
+}
+
+impl Part<CodeBlockCopyProps> {
+    /// Greyed and not pressable (a block still streaming).
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.map_root(|d| d.disabled(disabled))
+    }
 }

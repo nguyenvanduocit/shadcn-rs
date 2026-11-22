@@ -75,7 +75,7 @@ fn root(orientation: Orientation) -> Div {
 }
 
 fn join(item: Element, orientation: Orientation, first: bool, last: bool) -> Element {
-    restyle(item, |s| {
+    restyle(item, move |s| {
         let s = match orientation {
             Orientation::Horizontal if !first => {
                 let mut s = s.rounded_l(0.0);
@@ -98,15 +98,11 @@ fn join(item: Element, orientation: Orientation, first: bool, last: bool) -> Ele
 }
 
 /// `item` with `f` applied to its style; an input also takes `flex-1`.
-fn restyle(item: Element, f: impl FnOnce(Style) -> Style) -> Element {
-    match item {
-        Element::Div(n) => with_style(*n, f).into_element(),
-        Element::Input(n) => with_style(*n, f).flex_1().into_element(),
-        Element::Text(n) => with_style(*n, f).into_element(),
-        Element::Icon(n) => with_style(*n, f).into_element(),
-        Element::Shapes(n) => with_style(*n, f).into_element(),
-        Element::Image(n) => with_style(*n, f).into_element(),
-        other @ (Element::Deferred(_) | Element::Empty) => other,
+fn restyle(item: Element, f: impl Fn(Style) -> Style + 'static) -> Element {
+    if matches!(item, Element::Input(_)) || item.name() == Some("input") {
+        item.restyle(move |s| f(s).flex_1())
+    } else {
+        item.restyle(f)
     }
 }
 

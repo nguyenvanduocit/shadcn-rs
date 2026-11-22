@@ -1,12 +1,11 @@
-//! Lucide icons (ISC licence), embedded as SVG and rasterised with resvg at
-//! the size and colour they are drawn in, cached per combination.
+//! Lucide icons (ISC licence), embedded as SVG and read once into paths
+//! ([`crate::svg`]). The renderer rasterizes an icon on the GPU, once per
+//! device size and stroke width, into the coverage atlas and tints it in
+//! the shader; a scaled or turned icon is drawn as its paths (ADR-0017).
 
-use tiny_skia::{Pixmap, Transform};
+use std::sync::OnceLock;
 
-use crate::cache::FrameCache;
-use crate::color::Color;
-use crate::convert::f32_to_u32;
-use crate::inspect::Raster;
+use crate::svg::{self, Drawing};
 
 macro_rules! icons {
     ($($variant:ident => $file:literal,)*) => {
@@ -152,6 +151,7 @@ icons! {
     Slash => "slash",
     Smile => "smile",
     Sparkles => "sparkles",
+    Square => "square",
     SquareTerminal => "square-terminal",
     Star => "star",
     Sun => "sun",
@@ -175,64 +175,18 @@ icons! {
     X => "x",
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct IconKey {
-    icon: Icon,
-    size: u32,
-    rgba: [u8; 4],
-    stroke_milli: u32,
-}
-
-/// Rasterised icons, kept while the last frames draw them.
-#[derive(Default)]
-pub struct IconCache {
-    images: FrameCache<IconKey, Option<Pixmap>>,
-}
-
-impl IconCache {
-    /// `icon` as a `size`×`size` physical-pixel image in `color`; `None` when
-    /// the SVG cannot be drawn.
-    pub fn get(&mut self, icon: Icon, size: u32, color: Color, stroke_width: f32) -> Option<&Pixmap> {
-        let key = IconKey {
-            icon,
-            size,
-            rgba: color.to_rgba8(),
-            stroke_milli: f32_to_u32(stroke_width * 1000.0),
-        };
-        self.images
-            .get_or_insert_with(key, || rasterise(icon, size, color, stroke_width))
+impl Icon {
+    /// The icon read into paths, once per process, the first time it is
+    /// drawn: each icon on its own, so the first icon a page shows does not
+    /// read the whole set (about 4 000 allocations, in the frame that shows it).
+    pub(crate) fn drawing(self) -> Option<&'static Drawing> {
+        static DRAWINGS: [OnceLock<Option<Drawing>>; Icon::ALL.len()] = [const { OnceLock::new() }; Icon::ALL.len()];
+        let index = Icon::ALL.iter().position(|i| *i == self)?;
+        DRAWINGS
+            .get(index)?
+            .get_or_init(|| svg::parse(self.svg()).ok())
             .as_ref()
     }
-
-    /// Forget the icons the last frames did not draw; call once per frame.
-    pub fn end_frame(&mut self) {
-        self.images.end_frame();
-    }
-
-    /// The icon images held.
-    pub(crate) fn footprint(&self) -> Raster {
-        Raster::of(self.images.values().flatten())
-    }
-}
-
-pub(crate) fn rasterise(icon: Icon, size: u32, color: Color, stroke_width: f32) -> Option<Pixmap> {
-    let [r, g, b, _] = color.to_rgba8();
-    let svg = icon
-        .svg()
-        .replace("currentColor", &format!("#{r:02x}{g:02x}{b:02x}"))
-        .replace("stroke-width=\"2\"", &format!("stroke-width=\"{stroke_width}\""));
-    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
-    let mut pixmap = Pixmap::new(size.max(1), size.max(1))?;
-    let scale = crate::convert::u32_to_f32(size) / tree.size().width().max(1.0);
-    resvg::render(&tree, Transform::from_scale(scale, scale), &mut pixmap.as_mut());
-    if color.a < 1.0 {
-        for px in pixmap.pixels_mut() {
-            let c = px.demultiply();
-            let a = crate::convert::unit_to_u8(f32::from(c.alpha()) / 255.0 * color.a);
-            *px = tiny_skia::ColorU8::from_rgba(c.red(), c.green(), c.blue(), a).premultiply();
-        }
-    }
-    Some(pixmap)
 }
 
 #[cfg(test)]
@@ -240,12 +194,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_embedded_icon_draws() {
-        let mut cache = IconCache::default();
+    fn every_embedded_icon_reads_into_paths() {
         for &icon in Icon::ALL {
-            let image = cache.get(icon, 24, Color::BLACK, 2.0);
-            let inked = image.is_some_and(|p| p.pixels().iter().any(|px| px.alpha() > 0));
-            assert!(inked, "{} draws nothing", icon.name());
+            let d = icon
+                .drawing()
+                .unwrap_or_else(|| panic!("{} does not read", icon.name()));
+            assert!(
+                d.parts.iter().any(|p| !p.path.is_empty() && (p.fill || p.stroke)),
+                "{} draws nothing",
+                icon.name()
+            );
         }
     }
 }

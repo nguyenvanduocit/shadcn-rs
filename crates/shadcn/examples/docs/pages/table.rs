@@ -1,7 +1,7 @@
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Side, SideAlign, Signal, TextField, Track, div, icon};
+use gui::{Div, Element, Icon, ScenarioError, SideAlign, Signal, TextField, Track, div, icon};
 use shadcn::{
-    ButtonSize, ButtonVariant, CheckedState, MenuItem, MenuState, button, checkbox_state, dropdown_menu_checkbox_item,
+    ButtonSize, ButtonVariant, CheckedState, MenuItem, button, checkbox, dropdown_menu, dropdown_menu_checkbox_item,
     dropdown_menu_content, dropdown_menu_item, dropdown_menu_label, dropdown_menu_separator, dropdown_menu_trigger,
     input, table, table_body, table_caption, table_cell, table_empty, table_footer, table_head, table_header,
     table_row, theme,
@@ -69,8 +69,6 @@ struct DataTable {
     email: Signal<bool>,
     amount: Signal<bool>,
     page: Signal<usize>,
-    columns_menu: MenuState,
-    actions: Vec<MenuState>,
 }
 
 impl DataTable {
@@ -83,8 +81,6 @@ impl DataTable {
             email: Signal::labeled("email visible", true),
             amount: Signal::labeled("amount visible", true),
             page: Signal::labeled("page", 0),
-            columns_menu: MenuState::new(),
-            actions: PAYMENTS.iter().map(|_| MenuState::new()).collect(),
         }
     }
 
@@ -120,12 +116,11 @@ impl DataTable {
 
 /// Select (or clear) every payment in `ids` (TanStack's `toggleSelected`).
 fn select(selected: &Signal<Vec<&'static str>>, ids: &[&'static str], on: bool) {
-    selected.update(|mut all| {
+    selected.update(|all| {
         all.retain(|id| !ids.contains(id));
         if on {
             all.extend_from_slice(ids);
         }
-        all
     });
 }
 
@@ -163,18 +158,22 @@ fn data_table(dt: &DataTable) -> Div {
     let head = |c: Column| -> Element {
         match c {
             Column::Select => {
-                let set = dt.selected.clone();
+                let set = dt.selected;
                 let ids = page_ids.clone();
-                table_head(checkbox_state(all_state, move |on| select(&set, &ids, on)))
-                    .pr(0.0)
-                    .into_element()
+                table_head(
+                    checkbox()
+                        .checked(all_state)
+                        .on_change(move |on| select(&set, &ids, on)),
+                )
+                .pr(0.0)
+                .into_element()
             }
             Column::Status => table_head("Status").into_element(),
             Column::Email => {
-                let sorted = dt.sorted_desc.clone();
+                let sorted = dt.sorted_desc;
                 table_head(
                     button(ButtonVariant::Ghost, ButtonSize::Default)
-                        .on_click(move |_| sorted.update(|s| Some(s == Some(false))))
+                        .on_click(move |_| sorted.update(|s| *s = Some(*s == Some(false))))
                         .child("Email")
                         .child(icon(Icon::ArrowUpDown).ml(2.0).size(4.0)),
                 )
@@ -191,10 +190,12 @@ fn data_table(dt: &DataTable) -> Div {
         };
         match c {
             Column::Select => {
-                let set = dt.selected.clone();
-                table_cell(checkbox_state(dt.is_selected(id).into(), move |on| {
-                    select(&set, &[id], on)
-                }))
+                let set = dt.selected;
+                table_cell(
+                    checkbox()
+                        .checked(dt.is_selected(id))
+                        .on_change(move |on| select(&set, &[id], on)),
+                )
                 .pr(0.0)
                 .items_start()
                 .into_element()
@@ -203,32 +204,32 @@ fn data_table(dt: &DataTable) -> Div {
             Column::Email => table_cell(email.to_lowercase()).into_element(),
             Column::Amount => table_cell(div().text_right().font_medium().child(dollars(amount))).into_element(),
             Column::Actions => {
-                let Some(menu) = dt.actions.get(i) else {
-                    return Element::Empty;
-                };
-                let menu_for =
-                    |name: &'static str| dropdown_menu_item(menu, name, MenuItem::default(), || {}).child(name);
-                table_cell(dropdown_menu_trigger(
-                    menu,
-                    button(ButtonVariant::Ghost, ButtonSize::Default)
-                        .h(8.0)
-                        .w(8.0)
-                        .p(0.0)
-                        .child(icon(Icon::Ellipsis).size(4.0)),
-                    Side::Bottom,
-                    SideAlign::End,
-                    dropdown_menu_content(menu)
-                        .child(dropdown_menu_label("Actions", false))
+                let menu_for = |name: &'static str| dropdown_menu_item(name, MenuItem::default()).child(name);
+                table_cell(
+                    dropdown_menu()
+                        .child(dropdown_menu_trigger(
+                            button(ButtonVariant::Ghost, ButtonSize::Default)
+                                .h(8.0)
+                                .w(8.0)
+                                .p(0.0)
+                                .child(icon(Icon::Ellipsis).size(4.0)),
+                        ))
                         .child(
-                            dropdown_menu_item(menu, "Copy payment ID", MenuItem::default(), move || {
-                                gui::clipboard::copy(id);
-                            })
-                            .child("Copy payment ID"),
-                        )
-                        .child(dropdown_menu_separator())
-                        .child(menu_for("View customer"))
-                        .child(menu_for("View payment details")),
-                ))
+                            dropdown_menu_content()
+                                .align(SideAlign::End)
+                                .child(dropdown_menu_label("Actions", false))
+                                .child(
+                                    dropdown_menu_item("Copy payment ID", MenuItem::default())
+                                        .on_select(move || {
+                                            gui::clipboard::copy(id);
+                                        })
+                                        .child("Copy payment ID"),
+                                )
+                                .child(dropdown_menu_separator())
+                                .child(menu_for("View customer"))
+                                .child(menu_for("View payment details")),
+                        ),
+                )
                 .items_start()
                 .into_element()
             }
@@ -247,11 +248,10 @@ fn data_table(dt: &DataTable) -> Div {
             })
             .collect()
     };
-    let menu = &dt.columns_menu;
-    let hideable = [("status", &dt.status), ("email", &dt.email), ("amount", &dt.amount)];
+    let hideable = [("status", dt.status), ("email", dt.email), ("amount", dt.amount)];
     let can_prev = dt.page.get() > 0;
     let can_next = start.saturating_add(PAGE_SIZE) < rows.len();
-    let (prev, next) = (dt.page.clone(), dt.page.clone());
+    let (prev, next) = (dt.page, dt.page);
     div()
         .w_full()
         .child(
@@ -259,20 +259,21 @@ fn data_table(dt: &DataTable) -> Div {
                 .flex()
                 .items_center()
                 .py(4.0)
-                .child(input(&dt.filter).max_w_px(384.0).placeholder("Filter emails..."))
-                .child(dropdown_menu_trigger(
-                    menu,
-                    button(ButtonVariant::Outline, ButtonSize::Default)
+                .child(input().field(dt.filter).max_w_px(384.0).placeholder("Filter emails..."))
+                .child(
+                    dropdown_menu()
                         .ml_auto()
-                        .child("Columns")
-                        .child(icon(Icon::ChevronDown).ml(2.0).size(4.0)),
-                    Side::Bottom,
-                    SideAlign::End,
-                    dropdown_menu_content(menu).children(
-                        hideable
-                            .map(|(name, shown)| dropdown_menu_checkbox_item(menu, &capitalize(name), shown, false)),
-                    ),
-                )),
+                        .child(dropdown_menu_trigger(
+                            button(ButtonVariant::Outline, ButtonSize::Default)
+                                .child("Columns")
+                                .child(icon(Icon::ChevronDown).ml(2.0).size(4.0)),
+                        ))
+                        .child(dropdown_menu_content().align(SideAlign::End).children(
+                            hideable.map(|(name, shown)| {
+                                dropdown_menu_checkbox_item(&capitalize(name), false).model(shown)
+                            }),
+                        )),
+                ),
         )
         .child(
             div().rounded_md().border().border_color(t.border).child(
@@ -304,13 +305,13 @@ fn data_table(dt: &DataTable) -> Div {
                         .child(
                             button(ButtonVariant::Outline, ButtonSize::Sm)
                                 .disabled(!can_prev)
-                                .on_click(move |_| prev.update(|p| p.saturating_sub(1)))
+                                .on_click(move |_| prev.update(|p| *p = p.saturating_sub(1)))
                                 .child("Previous"),
                         )
                         .child(
                             button(ButtonVariant::Outline, ButtonSize::Sm)
                                 .disabled(!can_next)
-                                .on_click(move |_| next.update(|p| p.saturating_add(1)))
+                                .on_click(move |_| next.update(|p| *p = p.saturating_add(1)))
                                 .child("Next"),
                         ),
                 ),

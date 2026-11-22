@@ -3,13 +3,14 @@
 //! Keyboard as reka's: Up and Down (wrapping), Home and End move between the
 //! triggers; Enter and Space open and close.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use gui::prelude::*;
-use gui::{Animation, Div, FocusHandle, Icon, KeyEvent, NamedKey, Signal, div, icon};
+use gui::{
+    Animation, Bind, Element, FocusHandle, Icon, KeyEvent, Members, Model, NamedKey, Signal, UseModel, component, div,
+    icon, provide, use_context, use_model,
+};
 
 use crate::focus::focus_ring;
+use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
 /// How many sections may be open at once (reka's `type`, with `collapsible`
@@ -22,82 +23,68 @@ pub enum AccordionKind {
     Multiple,
 }
 
-/// Which sections are open, and the triggers in the order they render.
-#[derive(Clone)]
-pub struct AccordionState {
+/// What [`accordion`] is given.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccordionProps {
     kind: AccordionKind,
-    open: Signal<Vec<String>>,
-    /// One focus handle per item value, made the first time its trigger renders.
-    triggers: Rc<RefCell<Vec<(String, FocusHandle)>>>,
+    value: Bind<Vec<String>>,
 }
 
-impl AccordionState {
-    /// One section open at a time, `default` first (reka's `type="single"`).
-    #[must_use]
-    pub fn single(default: Option<&str>, collapsible: bool) -> Self {
-        Self::with(
-            AccordionKind::Single { collapsible },
-            default.into_iter().map(str::to_owned).collect(),
-        )
-    }
-
-    /// Any number open, `defaults` first (reka's `type="multiple"`).
-    #[must_use]
-    pub fn multiple(defaults: &[&str]) -> Self {
-        Self::with(
-            AccordionKind::Multiple,
-            defaults.iter().map(|v| (*v).to_owned()).collect(),
-        )
-    }
-
-    fn with(kind: AccordionKind, open: Vec<String>) -> Self {
+impl Default for AccordionProps {
+    fn default() -> Self {
         Self {
-            kind,
-            open: Signal::labeled("accordion", open),
-            triggers: Rc::default(),
+            kind: AccordionKind::Single { collapsible: false },
+            value: Bind::default(),
         }
     }
+}
 
-    /// The open values (Vue's `v-model`).
-    #[must_use]
-    pub fn value(&self) -> Signal<Vec<String>> {
-        self.open.clone()
+/// What the parts below [`accordion`] read.
+#[derive(Clone)]
+struct AccordionContext {
+    props: Signal<PartProps<AccordionProps>>,
+    open: UseModel<PartProps<AccordionProps>, Vec<String>>,
+    /// The triggers in tree order, as last laid out.
+    triggers: Members<FocusHandle>,
+}
+
+impl AccordionContext {
+    fn is_open(&self, value: &str) -> bool {
+        self.open.with(|open| open.iter().any(|v| v == value))
     }
 
-    /// Whether the section `value` is open (reactive).
-    #[must_use]
-    pub fn is_open(&self, value: &str) -> bool {
-        self.open.get().iter().any(|v| v == value)
+    fn toggle(&self, value: &str) {
+        let kind = self.props.with_untracked(|p| p.props.kind);
+        self.open
+            .update(|open| *open = toggled(kind, std::mem::take(open), value));
     }
 
-    /// Open or close the section `value`, as pressing its trigger does.
-    pub fn toggle(&self, value: &str) {
-        let kind = self.kind;
-        self.open.update(|open| toggled(kind, open, value));
-    }
-
-    fn focus_handle(&self, value: &str) -> FocusHandle {
-        let mut triggers = self.triggers.borrow_mut();
-        if let Some((_, handle)) = triggers.iter().find(|(v, _)| v == value) {
-            return *handle;
-        }
-        let handle = FocusHandle::new();
-        triggers.push((value.to_owned(), handle));
-        handle
-    }
-
-    /// Move focus from the trigger of `from` as `key` asks; whether the key
-    /// was one of the accordion's.
-    fn navigate(&self, from: &str, key: &KeyEvent) -> bool {
-        let triggers = self.triggers.borrow();
-        let current = triggers.iter().position(|(v, _)| v == from);
-        let Some(index) = roving_target(triggers.len(), current, key) else {
+    /// Move focus from the trigger `from` as `key` asks; whether the key was
+    /// one of the accordion's.
+    fn navigate(&self, from: FocusHandle, key: &KeyEvent) -> bool {
+        let target = self.triggers.with(|triggers| {
+            let current = triggers.iter().position(|h| *h == from);
+            roving_target(triggers.len(), current, key).map(|i| triggers.get(i).copied())
+        });
+        let Some(target) = target else {
             return false;
         };
-        if let Some((_, handle)) = triggers.get(index) {
+        if let Some(handle) = target {
             gui::focus::set_focus(Some(handle.id()), true);
         }
         true
+    }
+}
+
+/// What an [`accordion_item`] gives its trigger and content: its value.
+#[derive(Clone, Copy)]
+struct ItemContext {
+    props: Signal<PartProps<AccordionItemProps>>,
+}
+
+impl ItemContext {
+    fn value(&self) -> String {
+        self.props.with(|p| p.props.value.clone())
     }
 }
 
@@ -131,31 +118,94 @@ fn roving_target(len: usize, current: Option<usize>, key: &KeyEvent) -> Option<u
     }
 }
 
+/// The accordion: its items go inside. One section opens at a time unless
+/// it is made [`multiple`](Part::multiple).
 #[must_use]
-pub fn accordion() -> Div {
-    div().named("accordion")
+pub fn accordion() -> Part<AccordionProps> {
+    Part::new(AccordionProps::default(), div().named("accordion"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            provide(AccordionContext {
+                props,
+                open: use_model(props, |p| &p.props.value),
+                triggers: Members::new(),
+            });
+            move || props.with(|p| p.slot.0.clone()).into_element()
+        })
+    })
 }
 
-/// One section: its [`accordion_trigger`] and [`accordion_content`].
-/// `border-b last:border-b-0`: give the last item `.border_0()`.
-#[must_use]
-pub fn accordion_item() -> Div {
-    let t = theme();
-    div().named("accordion-item").border_b().border_color(t.border)
+impl Part<AccordionProps> {
+    /// At most one section open (reka's `type="single"`); `collapsible` lets
+    /// the open one close, leaving none.
+    #[must_use]
+    pub fn single(self, collapsible: bool) -> Self {
+        self.with_props(|p| p.kind = AccordionKind::Single { collapsible })
+    }
+
+    /// Any number open (reka's `type="multiple"`).
+    #[must_use]
+    pub fn multiple(self) -> Self {
+        self.with_props(|p| p.kind = AccordionKind::Multiple)
+    }
+
+    /// The sections open first, when no model is given (reka's `default-value`).
+    #[must_use]
+    pub fn default_value(self, values: &[&str]) -> Self {
+        let values = values.iter().map(|v| (*v).to_owned()).collect();
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_default(values))
+    }
+
+    /// The open values, kept by the caller (`v-model`).
+    #[must_use]
+    pub fn model(self, model: impl Into<Model<Vec<String>>>) -> Self {
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_model(model))
+    }
+
+    /// The open values as the caller shows them (`:model-value`); a toggle
+    /// only calls `on_change`.
+    #[must_use]
+    pub fn value(self, values: &[&str]) -> Self {
+        let values = values.iter().map(|v| (*v).to_owned()).collect();
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_value(values))
+    }
+
+    /// Called with the open values after each toggle (`@update:model-value`).
+    #[must_use]
+    pub fn on_change(self, f: impl Fn(Vec<String>) + 'static) -> Self {
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).on_change(f))
+    }
 }
 
-/// The heading that opens and closes `value`, showing `label` and a chevron
-/// that turns over while open.
+/// What an [`accordion_item`] is given: the value it opens as.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AccordionItemProps {
+    value: String,
+}
+
+/// One section, opening as `value`: its [`accordion_trigger`] and
+/// [`accordion_content`] go inside. `border-b last:border-b-0`: give the last
+/// item `.border_0()`.
 #[must_use]
-pub fn accordion_trigger(state: &AccordionState, value: &str, label: impl IntoElement) -> Div {
+pub fn accordion_item(value: impl Into<String>) -> Part<AccordionItemProps> {
     let t = theme();
-    let open = state.is_open(value);
-    let (on_click, on_key) = (state.clone(), state.clone());
-    let (click_value, key_value) = (value.to_owned(), value.to_owned());
+    let root = div().named("accordion-item").border_b().border_color(t.border);
+    Part::new(AccordionItemProps { value: value.into() }, root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            provide(ItemContext { props });
+            move || props.with(|p| p.slot.0.clone()).into_element()
+        })
+    })
+}
+
+/// The heading that opens and closes its item, showing `label` and a
+/// chevron that turns over while open.
+#[must_use]
+pub fn accordion_trigger(label: impl IntoElement) -> Part<()> {
+    let t = theme();
     let trigger = div()
         .named("accordion-trigger")
-        .aria_expanded(open)
-        .track_focus(state.focus_handle(value))
         .flex()
         .flex_1()
         .items_start()
@@ -170,35 +220,72 @@ pub fn accordion_trigger(state: &AccordionState, value: &str, label: impl IntoEl
         .hover(|s| s.underline())
         .focus_visible(move |s| focus_ring(s, &t))
         .disabled_style(|s| s.opacity(0.5))
-        .on_click(move |_| on_click.toggle(&click_value))
-        .on_key_down(move |key| on_key.navigate(&key_value, key))
-        .child(label)
-        .child(
-            icon(Icon::ChevronDown)
-                .named("accordion-chevron")
-                .text_color(t.muted_foreground)
-                // `translate-y-0.5`: a 2px nudge that does not grow the row.
-                .mt(0.5)
-                .transition_transform()
-                .duration_ms(200.0)
-                .when(open, |i| i.rotate(180.0)),
-        );
-    div().named("accordion-header").flex().child(trigger)
+        .child(label);
+    Part::new((), trigger, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let root = use_context::<AccordionContext>();
+            let item = use_context::<ItemContext>();
+            let handle = FocusHandle::new();
+            move || {
+                let trigger = props.with(|p| p.slot.0.clone());
+                let (Some(root), Some(item)) = (root.clone(), item) else {
+                    return trigger.into_element();
+                };
+                let t = theme();
+                let value = item.value();
+                let open = root.is_open(&value);
+                let (on_click, on_key) = (root.clone(), root.clone());
+                let trigger = trigger
+                    .aria_expanded(open)
+                    .track_focus(handle)
+                    .member(&root.triggers, handle)
+                    .on_click(move |_| on_click.toggle(&value))
+                    .on_key_down(move |key| on_key.navigate(handle, key))
+                    .child(
+                        icon(Icon::ChevronDown)
+                            .named("accordion-chevron")
+                            .text_color(t.muted_foreground)
+                            // `translate-y-0.5`: a 2px nudge that does not grow the row.
+                            .mt(0.5)
+                            .transition_transform()
+                            .duration_ms(200.0)
+                            .when(open, |i| i.rotate(180.0)),
+                    );
+                div().named("accordion-header").flex().child(trigger).into_element()
+            }
+        })
+    })
 }
 
-/// The section's body, `None` while closed (reka unmounts it once it has
-/// rolled up); `body` fills its inner `pt-0 pb-4` box. It rolls down from no
-/// height as it opens and back up as it closes; one open as its item mounts
-/// shows at once.
+/// The section's body, shown while its item is open (reka unmounts it once it
+/// has rolled up); what goes in fills its inner `pt-0 pb-4` box. It rolls down
+/// from no height as it opens and back up as it closes; one open as its item
+/// mounts shows at once.
 #[must_use]
-pub fn accordion_content(state: &AccordionState, value: &str, body: impl FnOnce(Div) -> Div) -> Option<Div> {
-    state.is_open(value).then(|| {
-        div()
-            .named("accordion-content")
-            .overflow_hidden()
-            .text_sm()
-            .animate(Animation::accordion_down().after_mount())
-            .animate_out(Animation::accordion_up())
-            .child(body(div().pt(0.0).pb(4.0)))
+pub fn accordion_content() -> Part<()> {
+    Part::new((), div().pt(0.0).pb(4.0), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let root = use_context::<AccordionContext>();
+            let item = use_context::<ItemContext>();
+            move || {
+                let open = match (&root, item) {
+                    (Some(root), Some(item)) => root.is_open(&item.value()),
+                    _ => true,
+                };
+                if !open {
+                    return Element::Empty;
+                }
+                div()
+                    .named("accordion-content")
+                    .overflow_hidden()
+                    .text_sm()
+                    .animate(Animation::accordion_down().after_mount())
+                    .animate_out(Animation::accordion_up())
+                    .child(props.with(|p| p.slot.0.clone()))
+                    .into_element()
+            }
+        })
     })
 }

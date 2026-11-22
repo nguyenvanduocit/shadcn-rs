@@ -3,27 +3,18 @@
 //! agent replies use is drawn: paragraphs, lists, strong, emphasis, inline
 //! code, links and fenced code; anything else shows as its text.
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use gui::prelude::*;
 use gui::{Div, Element, Span, Text, div, span, text};
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
 use shadcn::{
-    CodeBlockContentProps, CodeBlockCopy, CodeBlockProps, code_block, code_block_actions, code_block_content,
-    code_block_copy_button, code_block_header, code_block_title, highlighted_lines, theme,
+    CodeBlockContentProps, CodeBlockProps, code_block, code_block_actions, code_block_content, code_block_copy_button,
+    code_block_header, code_block_title, highlighted_lines, theme,
 };
 
 /// typeset's `--typeset-leading`.
 const LEADING: f32 = 1.75;
 /// typeset's `--typeset-flow`, in ems: the space above every block but the first.
 const FLOW: f32 = 1.25;
-
-/// The copy buttons of a reply's code blocks, kept across renders.
-#[derive(Clone, Default)]
-pub struct Markdown {
-    copies: Rc<RefCell<Vec<CodeBlockCopy>>>,
-}
 
 /// A block being built: its kind, and the inline runs gathered so far.
 enum Open {
@@ -41,113 +32,93 @@ struct Inline {
     link: u8,
 }
 
-impl Markdown {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// `source` in a `typeset` column whose text is `size` px.
-    pub fn render(&self, source: &str, size: f32) -> Div {
-        let mut blocks: Vec<Element> = Vec::new();
-        let mut stack: Vec<Open> = Vec::new();
-        let mut inline = Inline::default();
-        let mut fences = 0_usize;
-        for event in Parser::new(source) {
-            match event {
-                Event::Start(Tag::Paragraph) => stack.push(Open::Paragraph(Vec::new())),
-                Event::Start(Tag::List(first)) => stack.push(Open::List {
-                    ordered: first,
-                    items: Vec::new(),
-                }),
-                Event::Start(Tag::Item) => stack.push(Open::Item(Vec::new(), Vec::new())),
-                Event::Start(Tag::CodeBlock(kind)) => stack.push(Open::Fence {
-                    language: match kind {
-                        CodeBlockKind::Fenced(l) => l.to_string(),
-                        CodeBlockKind::Indented => String::new(),
-                    },
-                    code: String::new(),
-                }),
-                Event::Start(Tag::Strong) => inline.strong = inline.strong.saturating_add(1),
-                Event::Start(Tag::Emphasis) => inline.emphasis = inline.emphasis.saturating_add(1),
-                Event::Start(Tag::Link { .. }) => inline.link = inline.link.saturating_add(1),
-                Event::End(TagEnd::Strong) => inline.strong = inline.strong.saturating_sub(1),
-                Event::End(TagEnd::Emphasis) => inline.emphasis = inline.emphasis.saturating_sub(1),
-                Event::End(TagEnd::Link) => inline.link = inline.link.saturating_sub(1),
-                Event::Text(t) => match stack.last_mut() {
-                    Some(Open::Fence { code, .. }) => code.push_str(&t),
-                    Some(Open::Paragraph(runs) | Open::Item(_, runs)) => runs.push(styled(span(t.to_string()), inline)),
-                    _ => {}
+/// `source` in a `typeset` column whose text is `size` px. Each fence's copy
+/// button keeps its own state, so a reply streamed in keeps it as it grows.
+pub fn markdown(source: &str, size: f32) -> Div {
+    let mut blocks: Vec<Element> = Vec::new();
+    let mut stack: Vec<Open> = Vec::new();
+    let mut inline = Inline::default();
+    for event in Parser::new(source) {
+        match event {
+            Event::Start(Tag::Paragraph) => stack.push(Open::Paragraph(Vec::new())),
+            Event::Start(Tag::List(first)) => stack.push(Open::List {
+                ordered: first,
+                items: Vec::new(),
+            }),
+            Event::Start(Tag::Item) => stack.push(Open::Item(Vec::new(), Vec::new())),
+            Event::Start(Tag::CodeBlock(kind)) => stack.push(Open::Fence {
+                language: match kind {
+                    CodeBlockKind::Fenced(l) => l.to_string(),
+                    CodeBlockKind::Indented => String::new(),
                 },
-                Event::Code(c) => {
-                    if let Some(Open::Paragraph(runs) | Open::Item(_, runs)) = stack.last_mut() {
-                        runs.push(code_span(&c, size));
-                    }
-                }
-                Event::SoftBreak | Event::HardBreak => {
-                    if let Some(Open::Paragraph(runs) | Open::Item(_, runs)) = stack.last_mut() {
-                        runs.push(span(" "));
-                    }
-                }
-                Event::End(TagEnd::Paragraph) => {
-                    if let Some(Open::Paragraph(runs)) = stack.pop() {
-                        place(&mut stack, &mut blocks, paragraph(runs).into_element());
-                    }
-                }
-                Event::End(TagEnd::Item) => {
-                    if let Some(Open::Item(mut children, runs)) = stack.pop() {
-                        // A tight list item's text comes without a paragraph.
-                        if !runs.is_empty() {
-                            children.insert(0, paragraph(runs).into_element());
-                        }
-                        if let Some(Open::List { items, .. }) = stack.last_mut() {
-                            items.push(item(children, size));
-                        }
-                    }
-                }
-                Event::End(TagEnd::List(_)) => {
-                    if let Some(Open::List { ordered, items }) = stack.pop() {
-                        place(&mut stack, &mut blocks, list(ordered, items, size).into_element());
-                    }
-                }
-                Event::End(TagEnd::CodeBlock) => {
-                    if let Some(Open::Fence { language, code }) = stack.pop() {
-                        let copy = self.copy(fences);
-                        fences = fences.saturating_add(1);
-                        place(&mut stack, &mut blocks, fence(&language, &code, &copy).into_element());
-                    }
-                }
+                code: String::new(),
+            }),
+            Event::Start(Tag::Strong) => inline.strong = inline.strong.saturating_add(1),
+            Event::Start(Tag::Emphasis) => inline.emphasis = inline.emphasis.saturating_add(1),
+            Event::Start(Tag::Link { .. }) => inline.link = inline.link.saturating_add(1),
+            Event::End(TagEnd::Strong) => inline.strong = inline.strong.saturating_sub(1),
+            Event::End(TagEnd::Emphasis) => inline.emphasis = inline.emphasis.saturating_sub(1),
+            Event::End(TagEnd::Link) => inline.link = inline.link.saturating_sub(1),
+            Event::Text(t) => match stack.last_mut() {
+                Some(Open::Fence { code, .. }) => code.push_str(&t),
+                Some(Open::Paragraph(runs) | Open::Item(_, runs)) => runs.push(styled(span(t.to_string()), inline)),
                 _ => {}
-            }
-        }
-        // A stream cut mid-block: show what has arrived.
-        while let Some(open) = stack.pop() {
-            let el = match open {
-                Open::Paragraph(runs) | Open::Item(_, runs) => paragraph(runs).into_element(),
-                Open::List { ordered, items } => list(ordered, items, size).into_element(),
-                Open::Fence { language, code } => {
-                    let copy = self.copy(fences);
-                    fences = fences.saturating_add(1);
-                    fence(&language, &code, &copy).into_element()
+            },
+            Event::Code(c) => {
+                if let Some(Open::Paragraph(runs) | Open::Item(_, runs)) = stack.last_mut() {
+                    runs.push(code_span(&c, size));
                 }
-            };
-            place(&mut stack, &mut blocks, el);
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(Open::Paragraph(runs) | Open::Item(_, runs)) = stack.last_mut() {
+                    runs.push(span(" "));
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {
+                if let Some(Open::Paragraph(runs)) = stack.pop() {
+                    place(&mut stack, &mut blocks, paragraph(runs).into_element());
+                }
+            }
+            Event::End(TagEnd::Item) => {
+                if let Some(Open::Item(mut children, runs)) = stack.pop() {
+                    // A tight list item's text comes without a paragraph.
+                    if !runs.is_empty() {
+                        children.insert(0, paragraph(runs).into_element());
+                    }
+                    if let Some(Open::List { items, .. }) = stack.last_mut() {
+                        items.push(item(children, size));
+                    }
+                }
+            }
+            Event::End(TagEnd::List(_)) => {
+                if let Some(Open::List { ordered, items }) = stack.pop() {
+                    place(&mut stack, &mut blocks, list(ordered, items, size).into_element());
+                }
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(Open::Fence { language, code }) = stack.pop() {
+                    place(&mut stack, &mut blocks, fence(&language, &code).into_element());
+                }
+            }
+            _ => {}
         }
-        flow(
-            div().named("markdown").w_full().min_w(0.0).overflow_hidden(),
-            blocks,
-            size,
-        )
-        .text_size(size, size * LEADING)
-        .text_color(theme().foreground)
     }
-
-    fn copy(&self, i: usize) -> CodeBlockCopy {
-        let mut copies = self.copies.borrow_mut();
-        while copies.len() <= i {
-            copies.push(CodeBlockCopy::new());
-        }
-        copies.get(i).cloned().unwrap_or_default()
+    // A stream cut mid-block: show what has arrived.
+    while let Some(open) = stack.pop() {
+        let el = match open {
+            Open::Paragraph(runs) | Open::Item(_, runs) => paragraph(runs).into_element(),
+            Open::List { ordered, items } => list(ordered, items, size).into_element(),
+            Open::Fence { language, code } => fence(&language, &code).into_element(),
+        };
+        place(&mut stack, &mut blocks, el);
     }
+    flow(
+        div().named("markdown").w_full().min_w(0.0).overflow_hidden(),
+        blocks,
+        size,
+    )
+    .text_size(size, size * LEADING)
+    .text_color(theme().foreground)
 }
 
 /// Put a finished block in the list item it belongs to, or at the top level.
@@ -247,7 +218,7 @@ fn list(ordered: Option<u64>, items: Vec<Element>, size: f32) -> Div {
 }
 
 /// MarkdownCodeBlock.vue: the language as title, a copy button, numbered lines.
-fn fence(language: &str, code: &str, copy: &CodeBlockCopy) -> Div {
+fn fence(language: &str, code: &str) -> Div {
     let p = CodeBlockProps {
         header: true,
         ..CodeBlockProps::default()
@@ -261,7 +232,7 @@ fn fence(language: &str, code: &str, copy: &CodeBlockCopy) -> Div {
         .child(
             code_block_header(p)
                 .child(code_block_title(p, None, title))
-                .child(code_block_actions().child(code_block_copy_button(copy, code))),
+                .child(code_block_actions().child(code_block_copy_button(code))),
         )
         .child(code_block_content(p, content, highlighted_lines(code, language)))
 }

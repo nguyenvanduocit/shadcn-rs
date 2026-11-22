@@ -48,6 +48,14 @@ impl<K: Eq + Hash, V> FrameCache<K, V> {
         self.frame = frame.saturating_add(1);
     }
 
+    /// Mark the value under `key`, if held, used this frame.
+    pub(crate) fn touch(&mut self, key: &K) {
+        let frame = self.frame;
+        if let Some(e) = self.entries.get_mut(key) {
+            e.used = frame;
+        }
+    }
+
     /// The value under `key`, if held, without marking it used.
     pub(crate) fn peek(&self, key: &K) -> Option<&V> {
         self.entries.get(key).map(|e| &e.value)

@@ -110,7 +110,7 @@ pub fn render() -> Render {
     let followed = Signal::labeled("plan link followed", 0_u32);
     Box::new(move || {
         let t = theme();
-        let follow = followed.clone();
+        let follow = followed;
         let plan = text("The king thought long and hard, and finally came up with ")
             .leading_px(28.0)
             .mt(6.0)
@@ -121,7 +121,7 @@ pub fn render() -> Render {
                     .underline()
                     .underline_offset(4.0)
                     .cursor_pointer()
-                    .on_click(move |_| follow.update(|n| n.saturating_add(1))),
+                    .on_click(move |_| follow.update(|n| *n = n.saturating_add(1))),
             )
             .span(": he would tax the jokes in the kingdom.");
         let story = div()

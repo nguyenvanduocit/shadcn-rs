@@ -1,8 +1,8 @@
 use gui::prelude::*;
 use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, DrawerDirection, DrawerState, button, drawer_close, drawer_content, drawer_description,
-    drawer_footer, drawer_header, drawer_title, drawer_trigger, theme,
+    ButtonSize, ButtonVariant, DrawerContentProps, DrawerDirection, Part, button, drawer, drawer_close, drawer_content,
+    drawer_description, drawer_footer, drawer_header, drawer_title, drawer_trigger, theme,
 };
 
 use crate::{Render, Shot, demo, motion_frames, page};
@@ -23,7 +23,7 @@ const SIDES: [(&str, DrawerDirection); 4] = [
 
 /// What `DrawerSides` and `DrawerScrollableContent` put in the drawer: a
 /// header, ten paragraphs scrolling between it and the footer, and the footer.
-fn scrolling(state: &DrawerState, content: gui::Div) -> gui::Div {
+fn scrolling(content: Part<DrawerContentProps>) -> Part<DrawerContentProps> {
     content
         .child(
             drawer_header()
@@ -40,38 +40,32 @@ fn scrolling(state: &DrawerState, content: gui::Div) -> gui::Div {
             drawer_footer()
                 .child(button(ButtonVariant::Default, ButtonSize::Default).child("Submit"))
                 .child(drawer_close(
-                    state,
                     button(ButtonVariant::Outline, ButtonSize::Default).child("Cancel"),
                 )),
         )
 }
 
 pub fn render() -> Render {
-    let goal_drawer = DrawerState::new(DrawerDirection::Down);
     let goal = Signal::labeled("goal", 350_i32);
-    let sides: Vec<DrawerState> = SIDES.iter().map(|(_, d)| DrawerState::new(*d)).collect();
-    let scrollable = DrawerState::new(DrawerDirection::Right);
     Box::new(move || {
         let t = theme();
         let step = |delta: i32, glyph: Icon, disabled: bool| {
-            let goal = goal.clone();
             button(ButtonVariant::Outline, ButtonSize::Icon)
                 .h(8.0)
                 .w(8.0)
                 .shrink_0()
                 .rounded_full()
                 .disabled(disabled)
-                .on_click(move |_| goal.update(|g| g.saturating_add(delta)))
+                .on_click(move |_| goal.update(|g| *g = g.saturating_add(delta)))
                 .child(icon(glyph))
         };
         let g = goal.get();
-        let goal_demo = div()
+        let goal_demo = drawer()
             .child(drawer_trigger(
-                &goal_drawer,
                 button(ButtonVariant::Outline, ButtonSize::Default).child("Open Drawer"),
             ))
-            .child(drawer_content(&goal_drawer, |c| {
-                c.child(
+            .child(
+                drawer_content(DrawerDirection::Down).child(
                     div()
                         .mx_auto()
                         .w_full()
@@ -116,29 +110,24 @@ pub fn render() -> Render {
                             drawer_footer()
                                 .child(button(ButtonVariant::Default, ButtonSize::Default).child("Submit"))
                                 .child(drawer_close(
-                                    &goal_drawer,
                                     button(ButtonVariant::Outline, ButtonSize::Default).child("Cancel"),
                                 )),
                         ),
-                )
+                ),
+            );
+        let sides_demo = div()
+            .flex()
+            .flex_wrap()
+            .gap(2.0)
+            .children(SIDES.iter().map(|(name, dir)| {
+                let vertical = matches!(dir, DrawerDirection::Up | DrawerDirection::Down);
+                drawer()
+                    .child(drawer_trigger(
+                        button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
+                    ))
+                    // `max-h-[50vh]` of the 640px gallery window.
+                    .child(scrolling(drawer_content(*dir).when(vertical, |c| c.max_h_px(320.0))))
             }));
-        let sides_demo =
-            div()
-                .flex()
-                .flex_wrap()
-                .gap(2.0)
-                .children(SIDES.iter().zip(&sides).map(|((name, dir), state)| {
-                    let vertical = matches!(dir, DrawerDirection::Up | DrawerDirection::Down);
-                    div()
-                        .child(drawer_trigger(
-                            state,
-                            button(ButtonVariant::Outline, ButtonSize::Default).child(*name),
-                        ))
-                        .child(drawer_content(state, |c| {
-                            // `max-h-[50vh]` of the 640px gallery window.
-                            scrolling(state, c.when(vertical, |c| c.max_h_px(320.0)))
-                        }))
-                }));
         page(
             "Drawer",
             div()
@@ -148,12 +137,11 @@ pub fn render() -> Render {
                 .child(demo("DrawerSides.vue", sides_demo))
                 .child(demo(
                     "DrawerScrollableContent.vue",
-                    div()
+                    drawer()
                         .child(drawer_trigger(
-                            &scrollable,
                             button(ButtonVariant::Outline, ButtonSize::Default).child("Scrollable Content"),
                         ))
-                        .child(drawer_content(&scrollable, |c| scrolling(&scrollable, c))),
+                        .child(scrolling(drawer_content(DrawerDirection::Right))),
                 )),
         )
     })

@@ -1,16 +1,25 @@
 //! Sheet (`ui/sheet`): a panel that slides over the page from one of its
 //! edges, on a dimmed page, with a close button in its corner.
 //!
-//! It opens and closes through a [`DialogState`] and
-//! [`dialog_trigger`](crate::dialog_trigger) / [`dialog_close`](crate::dialog_close),
-//! as shadcn builds it on Reka's `DialogRoot`.
+//! As shadcn builds it on Reka's `DialogRoot`, [`sheet`] is a
+//! [`dialog`](crate::dialog) root: it opens and closes through
+//! [`dialog_trigger`](crate::dialog_trigger) and
+//! [`dialog_close`](crate::dialog_close), and keeps its open state the same
+//! way.
 
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{Animation, Div, Element, Text, div, relative, text};
+use gui::{Animation, Div, Text, div, relative, text};
 
-use crate::dialog::{DialogState, corner_close, dialog_description, dialog_overlay, modal_layer};
+use crate::dialog::{DialogProps, ModalContentProps, ModalLook, dialog_description, modal_content, modal_root};
+use crate::part::Part;
 use crate::theme::theme;
+
+/// The sheet's root: give it a trigger and a [`sheet_content`].
+#[must_use]
+pub fn sheet() -> Part<DialogProps> {
+    modal_root(div().named("sheet"))
+}
 
 /// The window edge a sheet sits on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -22,13 +31,10 @@ pub enum SheetSide {
     Left,
 }
 
-/// The sheet on `side`; `build` adds the classes and children a caller gives
-/// `SheetContent`.
+/// The sheet on `side` (`<SheetContent side="…">`), with a close button in
+/// its corner; style and fill it as a `Div`.
 #[must_use]
-pub fn sheet_content(state: &DialogState, side: SheetSide, build: impl FnOnce(Div) -> Div) -> Element {
-    if !state.is_open() {
-        return Element::Empty;
-    }
+pub fn sheet_content(side: SheetSide) -> Part<ModalContentProps> {
     let t = theme();
     // `slide-in-from-right` and `slide-out-to-right` (and the other sides):
     // a whole width or height off the window, in over 500ms, out over 300ms,
@@ -72,12 +78,14 @@ pub fn sheet_content(state: &DialogState, side: SheetSide, build: impl FnOnce(Di
         SheetSide::Top => base.left(0.0).right(0.0).top(0.0).h_auto().border_b(),
         SheetSide::Bottom => base.left(0.0).right(0.0).bottom(0.0).h_auto().border_t(),
     };
-    modal_layer(
-        state,
-        div(),
-        dialog_overlay(),
-        build(placed).child(corner_close(state)),
-        true,
+    modal_content(
+        placed,
+        ModalLook {
+            centred: false,
+            overlay_ms: None,
+            dismiss_outside: true,
+            close_button: true,
+        },
     )
 }
 

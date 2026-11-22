@@ -9,13 +9,12 @@ use gui::{Color, Div, Icon, Radius, ScenarioError, Signal, TextField, div, icon,
 use crate::{Shot, demo};
 use shadcn::{
     ButtonSize, ButtonVariant, Checks, FieldLegendVariant, FieldOrientation, FieldStack, FormEntry, FormField,
-    FormValue, InputGroupAlign, InputGroupButtonSize, OnChange, RadioGroupState, SelectPosition, SelectSize,
-    SelectState, Toast, ToastKind, Toaster, button, card, card_content, card_description, card_footer, card_header,
-    card_title, checkbox, field, field_checkbox_group, field_choices, field_content, field_description, field_error,
-    field_group, field_label, field_label_card, field_legend, field_separator, field_set, field_title, form_control,
-    form_reset, form_submit, input, input_group, input_group_addon, input_group_button, input_group_input,
-    input_group_text, input_group_textarea, radio_group, radio_group_item, select_content, select_item,
-    select_separator, select_trigger, switch, textarea, theme,
+    FormValue, InputGroupAlign, InputGroupButtonSize, OnChange, SelectPosition, Toast, ToastKind, button, card,
+    card_content, card_description, card_footer, card_header, card_title, checkbox, field, field_checkbox_group,
+    field_choices, field_content, field_description, field_error, field_group, field_label, field_label_card,
+    field_legend, field_separator, field_set, field_title, form_control, form_reset, form_submit, input, input_group,
+    input_group_addon, input_group_button, input_group_input, input_group_text, input_group_textarea, radio_group,
+    radio_group_item, select, select_content, select_item, select_separator, select_value, switch, textarea, theme,
 };
 
 const V: FieldOrientation = FieldOrientation::Vertical;
@@ -107,7 +106,7 @@ pub enum Pre {
 }
 
 /// The toast a demo shows for a valid submit: `values` as JSON in `pre`.
-pub fn submitted(toasts: &Toaster, values: &Json, pre: Pre) {
+pub fn submitted(values: &Json, pre: Pre) {
     let mut json = String::new();
     values.write(0, &mut json);
     let toast = Toast::new(ToastKind::Default, "You submitted the following values:").description_view(move || {
@@ -125,7 +124,7 @@ pub fn submitted(toasts: &Toaster, values: &Json, pre: Pre) {
         .child(text(json.clone()).whitespace_nowrap())
         .into_element()
     });
-    toasts.show(if pre == Pre::Code {
+    shadcn::toast(if pre == Pre::Code {
         toast.class(|d| d.flex_col().gap(2.0).rounded(Radius::var(4.0)))
     } else {
         toast
@@ -215,19 +214,18 @@ fn reset_then(save: &str, reset: impl Fn() + 'static, submit: impl Fn() + 'stati
 
 /// A label that flips its checkbox or switch, as `<label for>` does.
 fn label_for(name: &str, checked: &Signal<bool>) -> Div {
-    let flip = checked.clone();
-    field_label(name.to_owned()).on_click(move |_| flip.update(|c| !c))
+    let flip = *checked;
+    field_label(name.to_owned()).on_click(move |_| flip.update(|c| *c = !*c))
 }
 
 // --- Profile Settings (`*Input`) ---
 
 pub struct InputCard {
     username: FormField<TextField>,
-    toasts: Toaster,
 }
 
 impl InputCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
             username: FormField::new(TextField::new(""), library.checks(), |v: &String| {
                 let n = v.chars().count();
@@ -240,14 +238,13 @@ impl InputCard {
                     ),
                 ])
             }),
-            toasts: toasts.clone(),
         }
     }
 
     pub fn view(&self) -> Div {
         let u = &self.username;
         let invalid = u.invalid();
-        let (reset, submit, toasts) = (u.clone(), u.clone(), self.toasts.clone());
+        let (reset, submit) = (*u, *u);
         shell(
             448.0,
             Some(("Profile Settings", "Update your profile information below.")),
@@ -255,7 +252,7 @@ impl InputCard {
             field_group().child(
                 field(V, invalid)
                     .child(field_label("Username"))
-                    .child(form_control(input(u.control()).placeholder("shadcn"), invalid))
+                    .child(form_control(input().field(u.control()).placeholder("shadcn"), invalid))
                     .child(field_description(
                         "This is your public display name. Must be between 3 and 10 characters. Must only contain letters, numbers, and underscores.",
                     ))
@@ -266,7 +263,7 @@ impl InputCard {
                 move || reset.reset(),
                 move || {
                     if form_submit(&[&submit]) {
-                        submitted(&toasts, &Json::Object(vec![("username", Json::Str(submit.control().text()))]), Pre::Code);
+                        submitted(&Json::Object(vec![("username", Json::Str(submit.control().text()))]), Pre::Code);
                     }
                 },
             ),
@@ -279,11 +276,10 @@ impl InputCard {
 pub struct BugCard {
     title: FormField<TextField>,
     description: FormField<TextField>,
-    toasts: Toaster,
 }
 
 impl BugCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
             title: FormField::new(TextField::new(""), library.checks(), |v: &String| {
                 let n = v.chars().count();
@@ -299,7 +295,6 @@ impl BugCard {
                     (n <= 100, "Description must be at most 100 characters."),
                 ])
             }),
-            toasts: toasts.clone(),
         }
     }
 
@@ -307,11 +302,7 @@ impl BugCard {
         let (title, description) = (&self.title, &self.description);
         let (title_invalid, description_invalid) = (title.invalid(), description.invalid());
         let typed = description.control().text().chars().count();
-        let (reset, submit, toasts) = (
-            (title.clone(), description.clone()),
-            (title.clone(), description.clone()),
-            self.toasts.clone(),
-        );
+        let (reset, submit) = ((*title, *description), (*title, *description));
         shell(
             448.0,
             Some(("Bug Report", "Help us improve by reporting bugs you encounter.")),
@@ -321,7 +312,9 @@ impl BugCard {
                     field(V, title_invalid)
                         .child(field_label("Bug Title"))
                         .child(form_control(
-                            input(title.control()).placeholder("Login button not working on mobile"),
+                            input()
+                                .field(title.control())
+                                .placeholder("Login button not working on mobile"),
                             title_invalid,
                         ))
                         .child(field_error(title.errors())),
@@ -331,7 +324,7 @@ impl BugCard {
                         .child(field_label("Description"))
                         .child(
                             input_group(
-                                input_group_textarea(description.control())
+                                input_group_textarea(&description.control())
                                     .placeholder("I'm having an issue with the login button on mobile.")
                                     .min_h(24.0)
                                     .invalid(description_invalid),
@@ -352,7 +345,6 @@ impl BugCard {
                 move || {
                     if form_submit(&[&submit.0, &submit.1]) {
                         submitted(
-                            &toasts,
                             &Json::Object(vec![
                                 ("title", Json::Str(submit.0.control().text())),
                                 ("description", Json::Str(submit.1.control().text())),
@@ -370,11 +362,10 @@ impl BugCard {
 
 pub struct TextareaCard {
     about: FormField<TextField>,
-    toasts: Toaster,
 }
 
 impl TextareaCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
             about: FormField::new(TextField::new(""), library.checks(), |v: &String| {
                 let n = v.chars().count();
@@ -383,14 +374,13 @@ impl TextareaCard {
                     (n <= 200, "Please keep it under 200 characters."),
                 ])
             }),
-            toasts: toasts.clone(),
         }
     }
 
     pub fn view(&self) -> Div {
         let about = &self.about;
         let invalid = about.invalid();
-        let (reset, submit, toasts) = (about.clone(), about.clone(), self.toasts.clone());
+        let (reset, submit) = (*about, *about);
         shell(
             448.0,
             Some((
@@ -402,7 +392,8 @@ impl TextareaCard {
                 field(V, invalid)
                     .child(field_label("More about you"))
                     .child(form_control(
-                        textarea(about.control())
+                        textarea()
+                            .field(about.control())
                             .placeholder("I'm a software engineer...")
                             .min_h_px(120.0),
                         invalid,
@@ -418,7 +409,6 @@ impl TextareaCard {
                 move || {
                     if form_submit(&[&submit]) {
                         submitted(
-                            &toasts,
                             &Json::Object(vec![("about", Json::Str(submit.control().text()))]),
                             Pre::Code,
                         );
@@ -433,23 +423,21 @@ impl TextareaCard {
 
 pub struct SwitchCard {
     two_factor: FormField<Signal<bool>>,
-    toasts: Toaster,
 }
 
 impl SwitchCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
             two_factor: FormField::new(Signal::new(false), library.checks(), |on: &bool| {
                 failing(&[(*on, "It is highly recommended to enable two-factor authentication.")])
             }),
-            toasts: toasts.clone(),
         }
     }
 
     pub fn view(&self) -> Div {
         let f = &self.two_factor;
         let invalid = f.invalid();
-        let (reset, submit, toasts) = (f.clone(), f.clone(), self.toasts.clone());
+        let (reset, submit) = (*f, *f);
         shell(
             448.0,
             Some(("Security Settings", "Manage your account security preferences.")),
@@ -458,13 +446,13 @@ impl SwitchCard {
                 field(H, invalid)
                     .child(
                         field_content()
-                            .child(label_for("Multi-factor authentication", f.control()))
+                            .child(label_for("Multi-factor authentication", &f.control()))
                             .child(field_description(
                                 "Enable multi-factor authentication to secure your account.",
                             ))
                             .child(field_error(f.errors())),
                     )
-                    .child(switch(f.control())),
+                    .child(switch().model(f.control())),
             ),
             reset_then(
                 "Save",
@@ -472,7 +460,6 @@ impl SwitchCard {
                 move || {
                     if form_submit(&[&submit]) {
                         submitted(
-                            &toasts,
                             &Json::Object(vec![("twoFactor", Json::Bool(submit.control().get()))]),
                             Pre::Code,
                         );
@@ -496,16 +483,13 @@ const LANGUAGES: [(&str, &str); 7] = [
 ];
 
 pub struct SelectCard {
-    select: SelectState,
     language: FormField<Signal<Option<String>>>,
-    toasts: Toaster,
 }
 
 impl SelectCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
-        let select = SelectState::new(None).positioned(SelectPosition::ItemAligned);
+    pub fn new(library: Library) -> Self {
         Self {
-            language: FormField::new(select.value.clone(), library.checks(), |v: &Option<String>| {
+            language: FormField::new(Signal::new(None), library.checks(), |v: &Option<String>| {
                 let v = v.as_deref().unwrap_or_default();
                 failing(&[
                     (!v.is_empty(), "Please select your spoken language."),
@@ -515,21 +499,20 @@ impl SelectCard {
                     ),
                 ])
             }),
-            select,
-            toasts: toasts.clone(),
         }
     }
 
     pub fn view(&self) -> Div {
-        let (s, f) = (&self.select, &self.language);
+        let f = &self.language;
         let invalid = f.invalid();
         let content = LANGUAGES.iter().fold(
-            select_content(s)
-                .child(select_item(s, "auto", "Auto", false))
+            select_content()
+                .position(SelectPosition::ItemAligned)
+                .child(select_item("auto", "Auto"))
                 .child(select_separator()),
-            |c, (value, label)| c.child(select_item(s, value, label, false)),
+            |c, (value, label)| c.child(select_item(*value, *label)),
         );
-        let (reset, submit, toasts) = (f.clone(), f.clone(), self.toasts.clone());
+        let (reset, submit) = (*f, *f);
         // `orientation="responsive"` lays the field out in a row once its
         // group is `@md` (28rem) wide; this card's content is 29rem.
         shell(
@@ -545,7 +528,11 @@ impl SelectCard {
                             .child(field_error(f.errors())),
                     )
                     .child(form_control(
-                        select_trigger(s, "Select", SelectSize::Default, content).min_w_px(120.0),
+                        select()
+                            .model(f.control())
+                            .min_w_px(120.0)
+                            .child(select_value("Select"))
+                            .child(content),
                         invalid,
                     )),
             ),
@@ -555,11 +542,7 @@ impl SelectCard {
                 move || {
                     if form_submit(&[&submit]) {
                         let language = submit.control().get().unwrap_or_default();
-                        submitted(
-                            &toasts,
-                            &Json::Object(vec![("language", Json::Str(language))]),
-                            Pre::Code,
-                        );
+                        submitted(&Json::Object(vec![("language", Json::Str(language))]), Pre::Code);
                     }
                 },
             ),
@@ -588,9 +571,9 @@ const PLANS: [(&str, &str, &str); 3] = [
 ];
 
 /// A choice card: a labelled radio, the whole card choosing it.
-fn choice(state: &RadioGroupState, value: &'static str, title: &str, description: &str, invalid: bool) -> Div {
-    let choose = state.value.clone();
-    let checked = state.value.get().as_deref() == Some(value);
+fn choice(plan: Signal<Option<String>>, value: &'static str, title: &str, description: &str, invalid: bool) -> Div {
+    let choose = plan;
+    let checked = plan.get().as_deref() == Some(value);
     field_label_card(
         field(H, invalid)
             .child(
@@ -598,7 +581,7 @@ fn choice(state: &RadioGroupState, value: &'static str, title: &str, description
                     .child(field_title(title.to_owned()))
                     .child(field_description(description.to_owned())),
             )
-            .child(form_control(radio_group_item(state, value), invalid)),
+            .child(form_control(radio_group_item(value), invalid)),
         checked,
     )
     .on_click(move |_| choose.set(Some(value.to_owned())))
@@ -606,32 +589,27 @@ fn choice(state: &RadioGroupState, value: &'static str, title: &str, description
 
 pub struct RadioCard {
     library: Library,
-    group: RadioGroupState,
     plan: FormField<Signal<Option<String>>>,
-    toasts: Toaster,
 }
 
 impl RadioCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
-        let ids: Vec<&str> = PLANS.iter().map(|(id, _, _)| *id).collect();
-        let group = RadioGroupState::new(&ids, None);
+    pub fn new(library: Library) -> Self {
         Self {
-            plan: FormField::new(group.value.clone(), library.checks(), |v: &Option<String>| {
+            plan: FormField::new(Signal::new(None), library.checks(), |v: &Option<String>| {
                 failing(&[(
                     v.as_deref().is_some_and(|p| !p.is_empty()),
                     "You must select a subscription plan to continue.",
                 )])
             }),
             library,
-            group,
-            toasts: toasts.clone(),
         }
     }
 
     pub fn view(&self) -> Div {
-        let (g, f) = (&self.group, &self.plan);
+        let f = &self.plan;
+        let g = f.control();
         let invalid = f.invalid();
-        let (reset, submit, toasts) = (f.clone(), f.clone(), self.toasts.clone());
+        let (reset, submit) = (*f, *f);
         shell(
             448.0,
             Some(("Subscription Plan", "See pricing and features for each plan.")),
@@ -641,7 +619,7 @@ impl RadioCard {
                     .child(field_legend("Plan", None))
                     .child(field_description("You can upgrade or downgrade your plan at any time."))
                     .child(field_choices(PLANS.iter().fold(
-                        radio_group(g),
+                        radio_group().model(g),
                         |r, (id, title, description)| {
                             // TanStack's demo words its starter plan as the Complex demo's Basic.
                             let description = if *id == "starter" && self.library == Library::TanStack {
@@ -660,7 +638,7 @@ impl RadioCard {
                 move || {
                     if form_submit(&[&submit]) {
                         let plan = submit.control().get().unwrap_or_default();
-                        submitted(&toasts, &Json::Object(vec![("plan", Json::Str(plan))]), Pre::Code);
+                        submitted(&Json::Object(vec![("plan", Json::Str(plan))]), Pre::Code);
                     }
                 },
             ),
@@ -671,16 +649,17 @@ impl RadioCard {
 // --- Notifications (`*Checkbox`) ---
 
 /// Checkboxes whose value is the ids of the checked ones, in their order.
-#[derive(Clone)]
-struct Checklist(Vec<(&'static str, Signal<bool>)>);
+#[derive(Clone, Copy)]
+struct Checklist(Signal<Vec<(&'static str, Signal<bool>)>>);
 
 impl Checklist {
     fn new(ids: &[&'static str]) -> Self {
-        Self(ids.iter().map(|id| (*id, Signal::new(false))).collect())
+        Self(Signal::new(ids.iter().map(|id| (*id, Signal::new(false))).collect()))
     }
 
-    fn of(&self, id: &str) -> Option<&Signal<bool>> {
-        self.0.iter().find(|(i, _)| *i == id).map(|(_, s)| s)
+    fn of(&self, id: &str) -> Option<Signal<bool>> {
+        self.0
+            .with_untracked(|all| all.iter().find(|(i, _)| *i == id).map(|(_, s)| *s))
     }
 
     fn json(&self) -> Json {
@@ -692,24 +671,27 @@ impl FormValue for Checklist {
     type Value = Vec<String>;
 
     fn value(&self) -> Vec<String> {
-        self.0
-            .iter()
-            .filter(|(_, on)| on.get())
-            .map(|(id, _)| (*id).to_owned())
-            .collect()
+        self.0.with_untracked(|all| {
+            all.iter()
+                .filter(|(_, on)| on.get())
+                .map(|(id, _)| (*id).to_owned())
+                .collect()
+        })
     }
 
     fn set_value(&self, value: Vec<String>) {
-        for (id, on) in &self.0 {
-            on.set(value.iter().any(|v| v == id));
-        }
+        self.0.with_untracked(|all| {
+            for (id, on) in all {
+                on.set(value.iter().any(|v| v == id));
+            }
+        });
     }
 }
 
 /// A checkbox beside its label, in a horizontal field.
 fn check(name: &str, checked: &Signal<bool>, invalid: bool) -> FieldStack {
     field(H, invalid)
-        .child(form_control(checkbox(checked), invalid))
+        .child(form_control(checkbox().model(*checked), invalid))
         .child(label_for(name, checked).font_normal())
 }
 
@@ -717,11 +699,10 @@ pub struct CheckboxCard {
     library: Library,
     responses: Signal<bool>,
     tasks: FormField<Checklist>,
-    toasts: Toaster,
 }
 
 impl CheckboxCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
             library,
             responses: Signal::new(true),
@@ -730,7 +711,6 @@ impl CheckboxCard {
                 library.checks(),
                 |v: &Vec<String>| failing(&[(!v.is_empty(), "Please select at least one notification type.")]),
             ),
-            toasts: toasts.clone(),
         }
     }
 
@@ -738,7 +718,7 @@ impl CheckboxCard {
         let f = &self.tasks;
         let invalid = f.invalid();
         let list = f.control();
-        let task = |id: &str, name: &str| list.of(id).map(|on| check(name, on, invalid));
+        let task = |id: &str, name: &str| list.of(id).map(|on| check(name, &on, invalid));
         let tasks = field_set()
             .child(field_legend("Tasks", Some(FieldLegendVariant::Label)))
             .child(field_description(
@@ -760,7 +740,7 @@ impl CheckboxCard {
         } else {
             tasks.child(field_error(f.errors())).into_element()
         };
-        let (responses, reset, submit, toasts) = (self.responses.clone(), f.clone(), f.clone(), self.toasts.clone());
+        let (responses, reset, submit) = (self.responses, *f, *f);
         shell(
             448.0,
             Some(("Notifications", "Manage your notification preferences.")),
@@ -775,7 +755,7 @@ impl CheckboxCard {
                         .child(
                             field_checkbox_group().child(
                                 field(H, false)
-                                    .child(checkbox(&self.responses).disabled(true))
+                                    .child(checkbox().model(self.responses).disabled(true))
                                     .child(field_label("Push notifications").font_normal()),
                             ),
                         ),
@@ -788,7 +768,6 @@ impl CheckboxCard {
                 move || {
                     if form_submit(&[&submit]) {
                         submitted(
-                            &toasts,
                             &Json::Object(vec![
                                 ("responses", Json::Bool(responses.get())),
                                 ("tasks", submit.control().json()),
@@ -807,15 +786,13 @@ impl CheckboxCard {
 pub struct ArrayCard {
     library: Library,
     emails: Signal<Vec<FormField<TextField>>>,
-    toasts: Toaster,
 }
 
 impl ArrayCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
             library,
             emails: Signal::new(Self::initial(library)),
-            toasts: toasts.clone(),
         }
     }
 
@@ -851,21 +828,20 @@ impl ArrayCard {
         let count = emails.len();
         let rows = emails.iter().enumerate().map(|(i, f)| {
             let invalid = f.invalid();
-            let list = self.emails.clone();
+            let list = self.emails;
             let remove = input_group_addon(InputGroupAlign::InlineEnd).button(
                 input_group_button(ButtonVariant::Ghost, InputGroupButtonSize::IconXs)
                     .child(icon(Icon::X))
                     .on_click(move |_| {
-                        list.update(|mut all| {
+                        list.update(|all| {
                             if i < all.len() {
                                 all.remove(i);
                             }
-                            all
                         });
                     }),
             );
             let group = input_group(
-                input_group_input(f.control())
+                input_group_input(&f.control())
                     .placeholder("name@example.com")
                     .invalid(invalid),
             );
@@ -873,20 +849,19 @@ impl ArrayCard {
             field(H, invalid).child(field_content().child(group).child(field_error(f.errors())))
         });
         let add = {
-            let list = self.emails.clone();
+            let list = self.emails;
             button(ButtonVariant::Outline, ButtonSize::Sm)
                 .child("Add Email Address")
                 .disabled(count >= 5)
                 .on_click(move |_| {
-                    list.update(|mut all| {
+                    list.update(|all| {
                         if all.len() < 5 {
                             all.push(Self::address(library));
                         }
-                        all
                     });
                 })
         };
-        let (reset, submit, toasts) = (self.emails.clone(), self.emails.clone(), self.toasts.clone());
+        let (reset, submit) = (self.emails, self.emails);
         shell(
             448.0,
             Some(("Contact Emails", "Manage your contact email addresses.")),
@@ -900,7 +875,7 @@ impl ArrayCard {
                 .child(field_group().gap(4.0).children(rows).child(add)),
             reset_then(
                 "Save",
-                move || reset.set(Self::initial(library)),
+                move || reset.replace(Self::initial(library)),
                 move || {
                     let all = submit.get();
                     let entries: Vec<&dyn FormEntry> = all.iter().map(|f| -> &dyn FormEntry { f }).collect();
@@ -909,11 +884,7 @@ impl ArrayCard {
                             .iter()
                             .map(|f| Json::Object(vec![("address", Json::Str(f.control().text()))]))
                             .collect();
-                        submitted(
-                            &toasts,
-                            &Json::Object(vec![("emails", Json::List(addresses))]),
-                            Pre::Code,
-                        );
+                        submitted(&Json::Object(vec![("emails", Json::List(addresses))]), Pre::Code);
                     }
                 },
             ),
@@ -931,53 +902,48 @@ const ADDONS: [(&str, &str, &str); 3] = [
 
 pub struct ComplexCard {
     library: Library,
-    plan: RadioGroupState,
-    billing_select: SelectState,
+    plan: Signal<Option<String>>,
     billing: FormField<Signal<Option<String>>>,
     addons: FormField<Checklist>,
     email_notifications: Signal<bool>,
-    toasts: Toaster,
 }
 
 impl ComplexCard {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         // TanStack's demo opens billed monthly; the others with no period.
-        let billing_select = SelectState::new((library == Library::TanStack).then_some("monthly"));
+        let billing_select = Signal::new((library == Library::TanStack).then(|| "monthly".to_owned()));
         let ids: Vec<&'static str> = ADDONS.iter().map(|(id, _, _)| *id).collect();
         Self {
             library,
-            plan: RadioGroupState::new(&["basic", "pro"], Some("basic")),
-            billing: FormField::new(billing_select.value.clone(), library.checks(), |v: &Option<String>| {
+            plan: Signal::new(Some("basic".to_owned())),
+            billing: FormField::new(billing_select, library.checks(), |v: &Option<String>| {
                 failing(&[(
                     v.as_deref().is_some_and(|p| !p.is_empty()),
                     "Please select a billing period",
                 )])
             }),
-            billing_select,
             addons: FormField::new(Checklist::new(&ids), library.checks(), |v: &Vec<String>| {
                 failing(&[(!v.is_empty(), "Please select at least one add-on")])
             }),
             email_notifications: Signal::new(false),
-            toasts: toasts.clone(),
         }
     }
 
     pub fn view(&self) -> Div {
         let tanstack = self.library == Library::TanStack;
-        let (billing, addons) = (&self.billing, &self.addons);
+        let (billing, addons) = (self.billing, self.addons);
         let (billing_invalid, addons_invalid) = (billing.invalid(), addons.invalid());
-        let s = &self.billing_select;
-        let periods = select_content(s)
-            .child(select_item(s, "monthly", "Monthly", false))
-            .child(select_item(s, "yearly", "Yearly", false));
+        let periods = select_content()
+            .child(select_item("monthly", "Monthly"))
+            .child(select_item("yearly", "Yearly"));
         let list = addons.control();
         let addon_rows = ADDONS.iter().filter_map(|(id, title, description)| {
             list.of(id).map(|on| {
                 field(H, addons_invalid)
-                    .child(form_control(checkbox(on), addons_invalid))
+                    .child(form_control(checkbox().model(on), addons_invalid))
                     .child(
                         field_content()
-                            .child(label_for(title, on))
+                            .child(label_for(title, &on))
                             .child(field_description((*description).to_owned())),
                     )
             })
@@ -989,16 +955,17 @@ impl ComplexCard {
                     .child(field_legend("Subscription Plan", legend_variant))
                     .child(field_description("Choose your subscription plan."))
                     .child(field_choices(
-                        radio_group(&self.plan)
+                        radio_group()
+                            .model(self.plan)
                             .child(choice(
-                                &self.plan,
+                                self.plan,
                                 "basic",
                                 "Basic",
                                 "For individuals and small teams",
                                 false,
                             ))
                             .child(choice(
-                                &self.plan,
+                                self.plan,
                                 "pro",
                                 "Pro",
                                 "For businesses with higher demands",
@@ -1012,7 +979,10 @@ impl ComplexCard {
                     .child(field_label("Billing Period"))
                     // TanStack's demo marks the select's root, not its trigger.
                     .child(form_control(
-                        select_trigger(s, "Select", SelectSize::Default, periods),
+                        select()
+                            .model(billing.control())
+                            .child(select_value("Select"))
+                            .child(periods),
                         billing_invalid && !tanstack,
                     ))
                     .child(field_description("Choose how often you want to be billed."))
@@ -1034,20 +1004,13 @@ impl ComplexCard {
                             .child(label_for("Email Notifications", &self.email_notifications))
                             .child(field_description("Receive email updates about your subscription")),
                     )
-                    .child(switch(&self.email_notifications)),
+                    .child(switch().model(self.email_notifications)),
             );
         let submit = {
-            let (plan, billing, addons, email, toasts) = (
-                self.plan.value.clone(),
-                billing.clone(),
-                addons.clone(),
-                self.email_notifications.clone(),
-                self.toasts.clone(),
-            );
+            let (plan, billing, addons, email) = (self.plan, billing, addons, self.email_notifications);
             move || {
                 if form_submit(&[&billing, &addons]) {
                     submitted(
-                        &toasts,
                         &Json::Object(vec![
                             ("plan", Json::Str(plan.get().unwrap_or_default())),
                             ("billingPeriod", Json::Str(billing.control().get().unwrap_or_default())),
@@ -1063,12 +1026,7 @@ impl ComplexCard {
         if tanstack {
             shell(384.0, None, false, content, field(H, false).justify_end().child(save))
         } else {
-            let (plan, billing, addons, email) = (
-                self.plan.value.clone(),
-                billing.clone(),
-                addons.clone(),
-                self.email_notifications.clone(),
-            );
+            let (plan, billing, addons, email) = (self.plan, billing, addons, self.email_notifications);
             let reset = outline("Reset").on_click(move |_| {
                 plan.set(Some("basic".to_owned()));
                 email.set(false);
@@ -1117,17 +1075,17 @@ pub struct Cards {
 }
 
 impl Cards {
-    pub fn new(library: Library, toasts: &Toaster) -> Self {
+    pub fn new(library: Library) -> Self {
         Self {
-            bug: BugCard::new(library, toasts),
-            input: InputCard::new(library, toasts),
-            textarea: TextareaCard::new(library, toasts),
-            select: SelectCard::new(library, toasts),
-            switch: SwitchCard::new(library, toasts),
-            radio: RadioCard::new(library, toasts),
-            checkbox: CheckboxCard::new(library, toasts),
-            array: ArrayCard::new(library, toasts),
-            complex: ComplexCard::new(library, toasts),
+            bug: BugCard::new(library),
+            input: InputCard::new(library),
+            textarea: TextareaCard::new(library),
+            select: SelectCard::new(library),
+            switch: SwitchCard::new(library),
+            radio: RadioCard::new(library),
+            checkbox: CheckboxCard::new(library),
+            array: ArrayCard::new(library),
+            complex: ComplexCard::new(library),
         }
     }
 

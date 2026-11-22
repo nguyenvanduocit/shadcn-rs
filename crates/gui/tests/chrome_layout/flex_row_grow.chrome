@@ -1,0 +1,12 @@
+# Chrome's boxes for flex_row_grow.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 40
+  div 0 0 400 20
+    div 0 0 60 20
+    div 60 0 113.328125 20
+    div 173.328125 0 226.671875 20
+  div 0 20 400 20
+    div 0 20 133.328125 20
+    div 133.328125 20 183.34375 20
+    div 316.671875 20 83.328125 20

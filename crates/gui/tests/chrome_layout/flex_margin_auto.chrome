@@ -1,0 +1,13 @@
+# Chrome's boxes for flex_margin_auto.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 120
+  div 0 0 300 40
+    div 0 0 40 40
+    div 220 0 40 40
+    div 260 0 40 40
+  div 0 40 300 40
+    div 130 50 40 20
+  div 0 80 300 40
+    div 10 80 40 40
+    div 70 110 40 10

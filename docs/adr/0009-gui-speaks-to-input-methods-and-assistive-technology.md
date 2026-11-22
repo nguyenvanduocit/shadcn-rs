@@ -1,6 +1,6 @@
 # 0009. `gui` speaks to input methods and assistive technology
 
-Status: accepted, 2026-11-20.
+Status: accepted, 2026-11-20; "a frame is an AccessKit tree" (the whole tree each frame) superseded by ADR-0021.
 
 ## Context
 

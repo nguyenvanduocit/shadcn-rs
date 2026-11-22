@@ -7,10 +7,11 @@
 //! brightens the line, as Vue's `in-[button:hover]:text-foreground` does.
 
 use gui::prelude::*;
-use gui::{Animation, Div, Icon, Signal, Text, div, icon, text};
+use gui::{Animation, Div, Element, Icon, Text, component, div, icon, text};
 
-use crate::collapsible::{collapsible, collapsible_content, collapsible_trigger};
+use crate::collapsible::{CollapsibleContext, CollapsibleProps, collapsible};
 use crate::focus::focus_ring;
+use crate::part::Part;
 use crate::theme::theme;
 
 /// A step's state; `None` on [`trace_line`] is a finished step.
@@ -114,20 +115,25 @@ pub fn trace_description(description: impl Into<String>) -> Text {
 }
 
 /// A step that opens; holds a [`trace_collapsible_trigger`] and its
-/// [`trace_collapsible_content`].
+/// [`trace_collapsible_content`]. Closed at first; `.default_open(true)` or
+/// `.model(…)` as any [`collapsible`].
 #[must_use]
-pub fn trace_collapsible() -> Div {
-    collapsible().named("trace-collapsible").flex_col().w_full().min_w(0.0)
+pub fn trace_collapsible() -> Part<CollapsibleProps> {
+    collapsible()
+        .map_root(|d| d.named("trace-collapsible"))
+        .flex_col()
+        .w_full()
+        .min_w(0.0)
 }
 
-/// The step's `line` and a chevron that turns down while `open`; pressing
-/// it flips `open`. Red when the line's step failed (`failed`).
+/// The step's `line` and a chevron that turns down while open; pressing it
+/// opens and closes the step. Red when the line's step failed (`failed`).
 #[must_use]
-pub fn trace_collapsible_trigger(open: &Signal<bool>, failed: bool, line: impl IntoElement) -> Div {
+pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<()> {
     let t = theme();
-    let turned = if open.get() { 90.0 } else { 0.0 };
-    collapsible_trigger(open)
+    let control = div()
         .named("trace-collapsible-trigger")
+        .focusable()
         .flex()
         .self_start()
         .max_w_full()
@@ -141,40 +147,67 @@ pub fn trace_collapsible_trigger(open: &Signal<bool>, failed: bool, line: impl I
         .text_color(if failed { t.destructive } else { t.muted_foreground })
         .when(!failed, |d| d.hover(move |s| s.text_color(t.foreground)))
         .focus_visible(move |s| focus_ring(s, &t))
-        .child(line)
-        .child(
-            trace_icon(icon(Icon::ChevronRight))
-                .transition_transform()
-                .rotate(turned),
-        )
+        .child(line);
+    Part::new((), control, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = CollapsibleContext::find();
+            move || {
+                let control = props.with(|p| p.slot.0.clone());
+                let Some(ctx) = ctx.clone() else {
+                    return control.into_element();
+                };
+                let open = ctx.is_open();
+                control
+                    .aria_expanded(open)
+                    .on_click(move |_| ctx.toggle())
+                    .child(
+                        trace_icon(icon(Icon::ChevronRight))
+                            .transition_transform()
+                            .rotate(if open { 90.0 } else { 0.0 }),
+                    )
+                    .into_element()
+            }
+        })
+    })
 }
 
-/// What the step produced, indented under a rule; `None` once closed and
-/// rolled up. `body` fills the ruled box; the box around it rolls down from no
-/// height as it opens and back up as it closes, 200ms (`animate-collapsible-*`).
+/// What the step produced, indented under a rule, shown while open: what
+/// goes in fills the ruled box; the box around it rolls down from no height
+/// as it opens and back up as it closes, 200ms (`animate-collapsible-*`).
 #[must_use]
-pub fn trace_collapsible_content(open: &Signal<bool>, body: impl FnOnce(Div) -> Div) -> Option<Div> {
+pub fn trace_collapsible_content() -> Part<()> {
     let t = theme();
-    collapsible_content(open).map(|c| {
-        c.named("trace-collapsible-content")
-            .min_w(0.0)
-            .overflow_hidden()
-            .animate(Animation::accordion_down().after_mount())
-            .animate_out(Animation::accordion_up())
-            .duration_ms(200.0)
-            .child(body(
+    let ruled = div()
+        .min_w(0.0)
+        .mt(2.0)
+        .mb(1.0)
+        // `ml-[calc(--spacing(2)-1px)]`: the rule under the icon's centre.
+        .ml(1.75)
+        .border_l()
+        .border_color(t.border)
+        .pr(1.0)
+        .pl(4.0)
+        .leading_relaxed()
+        .text_color(t.muted_foreground);
+    Part::new((), ruled, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = CollapsibleContext::find();
+            move || {
+                if !ctx.as_ref().is_none_or(CollapsibleContext::is_open) {
+                    return Element::Empty;
+                }
                 div()
+                    .named("trace-collapsible-content")
                     .min_w(0.0)
-                    .mt(2.0)
-                    .mb(1.0)
-                    // `ml-[calc(--spacing(2)-1px)]`: the rule under the icon's centre.
-                    .ml(1.75)
-                    .border_l()
-                    .border_color(t.border)
-                    .pr(1.0)
-                    .pl(4.0)
-                    .leading_relaxed()
-                    .text_color(t.muted_foreground),
-            ))
+                    .overflow_hidden()
+                    .animate(Animation::accordion_down().after_mount())
+                    .animate_out(Animation::accordion_up())
+                    .duration_ms(200.0)
+                    .child(props.with(|p| p.slot.0.clone()))
+                    .into_element()
+            }
+        })
     })
 }

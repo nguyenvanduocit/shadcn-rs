@@ -1,10 +1,10 @@
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon, text};
+use gui::{Div, Icon, Model, ScenarioError, Signal, div, icon, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, ButtonSize, ButtonVariant, PopoverState, Toaster,
-    TooltipState, bubble, bubble_content, bubble_content_button, bubble_group, bubble_reactions,
-    bubble_reactions_button, button, collapsible, collapsible_toggle, popover, popover_content, popover_trigger, theme,
-    toaster, tooltip, tooltip_content, tooltip_trigger,
+    BubbleAlign, BubbleProps, BubbleReactionsSide, BubbleVariant, ButtonSize, ButtonVariant, bubble, bubble_content,
+    bubble_content_button, bubble_group, bubble_reactions, bubble_reactions_button, button, collapsible,
+    collapsible_trigger_as, popover, popover_content, popover_trigger, theme, toast, toaster, tooltip, tooltip_content,
+    tooltip_trigger,
 };
 
 use crate::{Render, Shot, demo, page};
@@ -64,21 +64,29 @@ fn collapsed(open: &Signal<bool>) -> Div {
         variant: V::Muted,
         align: End,
     };
-    let toggle = button(ButtonVariant::Link, ButtonSize::Default)
-        .gap(1.0)
-        .p(0.0)
-        .text_color(theme().muted_foreground)
-        .on_click(collapsible_toggle(open))
-        .child(if shown { "Show less" } else { "Show more" })
-        .child(
-            icon(Icon::ChevronDown)
-                .size(4.0)
-                .rotate(if shown { 180.0 } else { 0.0 }),
-        );
+    let toggle = collapsible_trigger_as(
+        button(ButtonVariant::Link, ButtonSize::Default)
+            .gap(1.0)
+            .p(0.0)
+            .text_color(theme().muted_foreground)
+            .child(if shown { "Show less" } else { "Show more" })
+            .child(
+                icon(Icon::ChevronDown)
+                    .size(4.0)
+                    .rotate(if shown { 180.0 } else { 0.0 }),
+            ),
+    );
     column(8.0)
         .child(said(V::Muted, Start, "How can I help you today?"))
         .child(
-            bubble(p).child(bubble_content(p).child(collapsible().child(text(body)).when(long, |c| c.child(toggle)))),
+            bubble(p).child(
+                bubble_content(p).child(
+                    collapsible()
+                        .model(Model::bind(*open))
+                        .child(text(body))
+                        .when(long, |c| c.child(toggle)),
+                ),
+            ),
         )
 }
 
@@ -102,15 +110,14 @@ fn grouped() -> Div {
         ))
 }
 
-fn choices(toasts: &Toaster) -> Div {
+fn choices() -> Div {
     let p = BubbleProps {
         variant: V::Tinted,
         align: End,
     };
-    let choice = |words: &str, toast: &'static str| {
-        let toasts = toasts.clone();
+    let choice = |words: &str, said: &'static str| {
         bubble(p).child(bubble_content_button(p).child(words.to_owned()).on_click(move |_| {
-            toasts.toast(toast);
+            toast(said);
         }))
     };
     column(8.0)
@@ -129,36 +136,34 @@ fn choices(toasts: &Toaster) -> Div {
         )
 }
 
-fn failed(details: &PopoverState) -> Div {
+fn failed(details: Signal<bool>) -> Div {
     let t = theme();
     let info = button(ButtonVariant::Ghost, ButtonSize::IconSm)
         .rounded_full()
-        .when(details.is_open(), |b| b.text_color(t.destructive))
+        .when(details.get(), |b| b.text_color(t.destructive))
         .child(icon(Icon::Info));
     column(4.0).child(said(V::Default, End, "Run the build script.")).child(
         said(V::Destructive, Start, "Failed to run the command.").child(
             bubble_reactions_button(BubbleReactionsSide::Bottom, End).child(
-                popover()
-                    .child(popover_trigger(details, info))
-                    .child(popover_content(details, |c| {
-                        c.child(
-                            div()
-                                .flex_col()
-                                .gap(1.0)
-                                .text_sm()
-                                .child(text("Command failed with exit code 1").font_medium())
-                                .child(
-                                    text("ENOENT: no such file or directory, open pnpm-lock.yaml")
-                                        .text_color(t.muted_foreground),
-                                ),
-                        )
-                    })),
+                popover().open(details).child(popover_trigger(info)).child(
+                    popover_content().child(
+                        div()
+                            .flex_col()
+                            .gap(1.0)
+                            .text_sm()
+                            .child(text("Command failed with exit code 1").font_medium())
+                            .child(
+                                text("ENOENT: no such file or directory, open pnpm-lock.yaml")
+                                    .text_color(t.muted_foreground),
+                            ),
+                    ),
+                ),
             ),
         ),
     )
 }
 
-fn read_receipt(read: &TooltipState) -> Div {
+fn read_receipt() -> Div {
     column(4.0)
         .child(said(V::Secondary, Start, "Did you remove the stale route?"))
         .child(
@@ -166,14 +171,11 @@ fn read_receipt(read: &TooltipState) -> Div {
                 bubble_reactions_button(BubbleReactionsSide::Bottom, End).child(
                     tooltip()
                         .child(tooltip_trigger(
-                            read,
                             button(ButtonVariant::Ghost, ButtonSize::IconSm)
                                 .rounded_full()
                                 .child(icon(Icon::Check)),
                         ))
-                        .child(tooltip_content(read, |c| {
-                            c.child(text("Read on Jan 5, 2026 at 4:32 PM"))
-                        })),
+                        .child(tooltip_content().child(text("Read on Jan 5, 2026 at 4:32 PM"))),
                 ),
             ),
         )
@@ -182,9 +184,7 @@ fn read_receipt(read: &TooltipState) -> Div {
 pub fn render() -> Render {
     let ran = Signal::labeled("ran", false);
     let open = Signal::labeled("show more", false);
-    let toasts = Toaster::new();
-    let details = PopoverState::new();
-    let read = TooltipState::new();
+    let details = Signal::labeled("failure details", false);
     Box::new(move || {
         let bottom = BubbleReactionsSide::Bottom;
         let thread = demo(
@@ -249,7 +249,7 @@ pub fn render() -> Render {
                      full width of the container.",
                 )),
         );
-        let r = ran.clone();
+        let r = ran;
         let reacted = demo(
             "BubbleReactionsDemo.vue",
             column(12.0)
@@ -297,10 +297,10 @@ pub fn render() -> Render {
                 .child(demo("BubbleAlignmentDemo.vue", alignment()))
                 .child(demo("BubbleCollapsibleDemo.vue", collapsed(&open)))
                 .child(demo("BubbleGroupDemo.vue", grouped()))
-                .child(demo("BubbleLinksAndButtonsDemo.vue", choices(&toasts)))
-                .child(demo("BubblePopoverDemo.vue", failed(&details)))
-                .child(demo("BubbleTooltipDemo.vue", read_receipt(&read)))
-                .child(toaster(&toasts)),
+                .child(demo("BubbleLinksAndButtonsDemo.vue", choices()))
+                .child(demo("BubblePopoverDemo.vue", failed(details)))
+                .child(demo("BubbleTooltipDemo.vue", read_receipt()))
+                .child(toaster()),
         )
     })
 }

@@ -1,17 +1,16 @@
 use gui::prelude::*;
-use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
+use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text_bound};
 use shadcn::{
-    ButtonSize, ButtonVariant, DialogState, alert_dialog_action, alert_dialog_cancel, alert_dialog_content,
+    ButtonSize, ButtonVariant, alert_dialog, alert_dialog_action, alert_dialog_cancel, alert_dialog_content,
     alert_dialog_description, alert_dialog_footer, alert_dialog_header, alert_dialog_title, button, dialog_trigger,
 };
 
 use crate::{MOTION_MS, Render, Shot, demo, motion_frames, page};
 
 pub fn render() -> Render {
-    let state = DialogState::new();
     let confirmed = Signal::labeled("confirmed", 0_u32);
     Box::new(move || {
-        let count = confirmed.clone();
+        let count = confirmed;
         page(
             "Alert Dialog",
             div()
@@ -20,21 +19,21 @@ pub fn render() -> Render {
                 .gap(4.0)
                 .child(demo(
                     "AlertDialogDemo.vue",
-                    dialog_trigger(&state, button(ButtonVariant::Outline, ButtonSize::Default).child("Show Dialog")),
+                    alert_dialog()
+                        .child(dialog_trigger(button(ButtonVariant::Outline, ButtonSize::Default).child("Show Dialog")))
+                        .child(alert_dialog_content()
+                            .child(alert_dialog_header().child(alert_dialog_title("Are you absolutely sure?")).child(
+                                alert_dialog_description(
+                                    "This action cannot be undone. This will permanently delete your account and remove your data from our servers.",
+                                ),
+                            ))
+                            .child(
+                                alert_dialog_footer()
+                                    .child(alert_dialog_cancel().child("Cancel"))
+                                    .child(alert_dialog_action(move || count.update(|n| *n = n.saturating_add(1))).child("Continue")),
+                            )),
                 ))
-                .child(text(format!("Continued {} times", confirmed.get())).text_sm())
-                .child(alert_dialog_content(&state, |c| {
-                    c.child(alert_dialog_header().child(alert_dialog_title("Are you absolutely sure?")).child(
-                        alert_dialog_description(
-                            "This action cannot be undone. This will permanently delete your account and remove your data from our servers.",
-                        ),
-                    ))
-                    .child(
-                        alert_dialog_footer()
-                            .child(alert_dialog_cancel(&state).child("Cancel"))
-                            .child(alert_dialog_action(&state, move || count.update(|n| n.saturating_add(1))).child("Continue")),
-                    )
-                })),
+                .child(text_bound(move || format!("Continued {} times", confirmed.get())).text_sm()),
         )
     })
 }

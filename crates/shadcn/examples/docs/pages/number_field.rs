@@ -1,8 +1,8 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, div};
 use shadcn::{
-    NumberFieldState, NumberFormat, SignDisplay, label, number_field, number_field_content, number_field_decrement,
-    number_field_increment, number_field_input,
+    NumberFieldProps, NumberFormat, Part, SignDisplay, label, number_field, number_field_content,
+    number_field_decrement, number_field_increment, number_field_input,
 };
 
 use crate::{Render, Shot, demo, page, section};
@@ -18,53 +18,65 @@ fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32), ScenarioError> {
         .ok_or_else(|| ScenarioError::TextNotFound(format!("{name} #{nth}")))
 }
 
-fn field(name: &str, state: &NumberFieldState) -> gui::Div {
-    number_field().child(label(name)).child(
+fn field(name: &str, root: Part<NumberFieldProps>) -> Part<NumberFieldProps> {
+    root.child(label(name)).child(
         number_field_content()
-            .child(number_field_decrement(state))
-            .child(number_field_input(state))
-            .child(number_field_increment(state)),
+            .child(number_field_decrement())
+            .child(number_field_input())
+            .child(number_field_increment()),
     )
 }
 
 pub fn render() -> Render {
     let plain = NumberFormat::default();
-    let age = NumberFieldState::new(18.0, Some(0.0), None, 1.0, plain);
-    let off = NumberFieldState::new(18.0, None, None, 1.0, plain);
-    off.disabled.set(true);
-    let ratio = NumberFieldState::new(0.5, Some(0.0), Some(1.0), 0.1, plain);
-    let big = NumberFieldState::new(1234.0, None, None, 1.0, plain);
-    let balance = NumberFieldState::new(1500.0, None, None, 1.0, NumberFormat::currency("EUR", true));
-    let signed = NumberFieldState::new(
-        5.0,
-        None,
-        None,
-        1.0,
-        NumberFormat {
-            sign: SignDisplay::ExceptZero,
-            min_fraction: 1,
-            ..plain
-        },
-    );
-    let percent = NumberFieldState::new(0.05, None, None, 0.01, NumberFormat::PERCENT);
     Box::new(move || {
+        let age = || number_field().default_value(18.0);
         page(
             "Number Field",
             div()
                 .flex_col()
                 .gap(8.0)
-                .child(demo("NumberFieldDemo.vue", field("Age", &age)))
-                .child(demo("NumberFieldDisabledDemo.vue", field("Age", &off)))
-                .child(demo("NumberFieldCurrencyDemo.vue", field("Balance", &balance)))
-                .child(demo("NumberFieldDecimalDemo.vue", field("Number", &signed)))
-                .child(demo("NumberFieldPercentageDemo.vue", field("Percent", &percent)))
+                .child(demo("NumberFieldDemo.vue", field("Age", age().min(0.0))))
+                .child(demo("NumberFieldDisabledDemo.vue", field("Age", age().disabled(true))))
+                .child(demo(
+                    "NumberFieldCurrencyDemo.vue",
+                    field(
+                        "Balance",
+                        number_field()
+                            .default_value(1500.0)
+                            .format(NumberFormat::currency("EUR", true)),
+                    ),
+                ))
+                .child(demo(
+                    "NumberFieldDecimalDemo.vue",
+                    field(
+                        "Number",
+                        number_field().default_value(5.0).format(NumberFormat {
+                            sign: SignDisplay::ExceptZero,
+                            min_fraction: 1,
+                            ..plain
+                        }),
+                    ),
+                ))
+                .child(demo(
+                    "NumberFieldPercentageDemo.vue",
+                    field(
+                        "Percent",
+                        number_field()
+                            .default_value(0.05)
+                            .step(0.01)
+                            .format(NumberFormat::PERCENT),
+                    ),
+                ))
                 .child(section(
                     "Bounded decimals, grouped thousands",
                     div()
                         .flex()
                         .gap(6.0)
-                        .child(field("Ratio", &ratio).w_px(160.0))
-                        .child(field("Amount", &big).w_px(160.0)),
+                        .child(
+                            field("Ratio", number_field().default_value(0.5).min(0.0).max(1.0).step(0.1)).w_px(160.0),
+                        )
+                        .child(field("Amount", number_field().default_value(1234.0)).w_px(160.0)),
                 )),
         )
     })

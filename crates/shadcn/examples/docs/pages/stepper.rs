@@ -1,8 +1,9 @@
 use gui::prelude::*;
-use gui::{Icon, ScenarioError, Shadow, div, icon, relative, text};
+use gui::{Icon, Model, ScenarioError, Shadow, Signal, div, icon, relative, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, Orientation, StepState, StepperState, button, stepper, stepper_description,
-    stepper_indicator, stepper_item, stepper_separator, stepper_title, stepper_trigger, stepper_trigger_as, theme,
+    ButtonSize, ButtonVariant, Orientation, Part, StepState, StepperItem, StepperProps, button, stepper,
+    stepper_description, stepper_indicator, stepper_item, stepper_separator, stepper_title, stepper_trigger,
+    stepper_trigger_as, theme,
 };
 
 use crate::{Render, Shot, demo, page};
@@ -41,9 +42,9 @@ const DEMO_STEPS: [(usize, &str, &str); 4] = [
 
 /// The horizontal demos' line from step `step` to the next: `absolute
 /// left-[calc(50%+20px)] right-[calc(-50%+10px)] top-5 h-0.5 rounded-full`.
-pub(super) fn line(state: &StepperState, step: usize) -> gui::Div {
+pub(super) fn line(item: StepperItem) -> gui::Div {
     let t = theme();
-    stepper_separator(state, step)
+    stepper_separator(item)
         .absolute()
         .left_len(relative(0.5))
         .ml(5.0)
@@ -53,14 +54,14 @@ pub(super) fn line(state: &StepperState, step: usize) -> gui::Div {
         .h(0.5)
         .shrink_0()
         .rounded_full()
-        .when(state.state_of(step) == StepState::Completed, |d| d.bg(t.primary))
+        .when(item.state == StepState::Completed, |d| d.bg(t.primary))
 }
 
 /// The demos' trigger: a round icon button, filled once reached, ringed
 /// while active, marked with a check, a circle or a dot.
-pub(super) fn round_trigger(stepper: &StepperState, step: usize) -> gui::Div {
+pub(super) fn round_trigger(item: StepperItem) -> Part<()> {
     let t = theme();
-    let state = stepper.state_of(step);
+    let state = item.state;
     let mark = match state {
         StepState::Completed => icon(Icon::Check).size(5.0),
         StepState::Active => icon(Icon::Circle),
@@ -95,151 +96,152 @@ pub(super) fn round_trigger(stepper: &StepperState, step: usize) -> gui::Div {
             })
         })
         .child(mark),
-        stepper,
-        step,
     )
 }
 
 /// `StepperVertical.vue`: steps down a column, a line from each trigger to the next.
-fn vertical(stepper_state: &StepperState) -> gui::Div {
-    let t = theme();
+fn vertical() -> Part<StepperProps> {
     let last = VERTICAL_STEPS.len();
-    stepper(stepper_state)
+    stepper()
+        .orientation(Orientation::Vertical)
         .mx_auto()
         .w_full()
         .max_w_px(448.0)
         .justify_start()
         .gap(10.0)
         .children(VERTICAL_STEPS.map(|(step, title, description)| {
-            let active = stepper_state.state_of(step) == StepState::Active;
-            stepper_item()
+            stepper_item(step)
                 .relative()
                 .w_full()
                 .items_start()
                 .gap(6.0)
-                .when(step != last, |d| {
-                    // `absolute left-[18px] top-[38px] h-[105%] w-0.5 rounded-full`.
-                    d.child(
-                        stepper_separator(stepper_state, step)
-                            .absolute()
-                            .left_len(gui::px(18.0))
-                            .top_len(gui::px(38.0))
-                            .h_len(relative(1.05))
-                            .w(0.5)
-                            .shrink_0()
-                            .rounded_full()
-                            .when(stepper_state.state_of(step) == StepState::Completed, |d| {
-                                d.bg(t.primary)
-                            }),
+                .fill(move |item, d| {
+                    let t = theme();
+                    let active = item.state == StepState::Active;
+                    d.when(step != last, |d| {
+                        // `absolute left-[18px] top-[38px] h-[105%] w-0.5 rounded-full`.
+                        d.child(
+                            stepper_separator(item)
+                                .absolute()
+                                .left_len(gui::px(18.0))
+                                .top_len(gui::px(38.0))
+                                .h_len(relative(1.05))
+                                .w(0.5)
+                                .shrink_0()
+                                .rounded_full()
+                                .when(item.state == StepState::Completed, |d| d.bg(t.primary)),
+                        )
+                    })
+                    .child(round_trigger(item))
+                    .child(
+                        div()
+                            .flex_col()
+                            .gap(1.0)
+                            .child(
+                                // `text-sm lg:text-base`: the reference renders at desktop width.
+                                stepper_title(title)
+                                    .text_base()
+                                    .font_semibold()
+                                    .when(active, |d| d.text_color(t.primary)),
+                            )
+                            // `text-xs lg:text-sm`; its `text-primary` loses to
+                            // `text-muted-foreground` in the stylesheet's order.
+                            .child(stepper_description(description).text_sm()),
                     )
                 })
-                .child(round_trigger(stepper_state, step))
-                .child(
-                    div()
-                        .flex_col()
-                        .gap(1.0)
-                        .child(
-                            // `text-sm lg:text-base`: the reference renders at desktop width.
-                            stepper_title(title)
-                                .text_base()
-                                .font_semibold()
-                                .when(active, |d| d.text_color(t.primary)),
-                        )
-                        // `text-xs lg:text-sm`; its `text-primary` loses to
-                        // `text-muted-foreground` in the stylesheet's order.
-                        .child(stepper_description(description).text_sm()),
-                )
         }))
 }
 
 pub fn render() -> Render {
-    let horizontal = StepperState::new(1);
-    let indicator = StepperState::new(1);
-    let mut column = StepperState::new(1);
-    column.orientation = Orientation::Vertical;
+    let horizontal = Signal::labeled("stepper step", 1_usize);
+    let indicator = Signal::labeled("stepper step", 1_usize);
     Box::new(move || {
-        let t = theme();
         let last = STEPS.len();
-        let steps =
-            stepper(&horizontal)
-                .w_full()
-                .items_start()
-                .gap(2.0)
-                .children(STEPS.map(|(step, title, description)| {
-                    let state = horizontal.state_of(step);
-                    let trigger = round_trigger(&horizontal, step);
-                    stepper_item()
-                        .relative()
-                        .flex()
-                        .w_full()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .when(step != last, |d| d.child(line(&horizontal, step)))
-                        .child(trigger)
-                        .child(
-                            div()
-                                .mt(5.0)
-                                .flex_col()
-                                .items_center()
-                                .text_center()
-                                .child(
-                                    // `text-sm lg:text-base`: the reference renders at desktop width.
-                                    stepper_title(title)
-                                        .text_base()
-                                        .font_semibold()
-                                        .when(state == StepState::Active, |d| d.text_color(t.primary)),
-                                )
-                                .child(
-                                    // `text-xs lg:text-sm`; its `text-primary` loses to
-                                    // `text-muted-foreground` in the stylesheet's order.
-                                    stepper_description(description).text_sm(),
-                                ),
-                        )
-                }));
-        let demo_last = DEMO_STEPS.len();
-        let indicators = stepper(&indicator)
-            .w_px(640.0)
+        let steps = stepper()
+            .model(Model::bind(horizontal))
+            .w_full()
             .items_start()
             .gap(2.0)
-            .children(DEMO_STEPS.map(|(step, title, description)| {
-                stepper_item()
+            .children(STEPS.map(|(step, title, description)| {
+                stepper_item(step)
                     .relative()
                     .flex()
                     .w_full()
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .child(
-                        stepper_trigger(&indicator, step).child(
-                            stepper_indicator(&indicator, step)
-                                .when(indicator.state_of(step) == StepState::Inactive, |d| d.bg(t.muted))
-                                .child(match step {
-                                    1 => icon(Icon::BookUser).into_element(),
-                                    2 => icon(Icon::Truck).into_element(),
-                                    3 => icon(Icon::CreditCard).into_element(),
-                                    _ => text(step.to_string()).into_element(),
-                                }),
-                        ),
-                    )
-                    .when(step != demo_last, |d| d.child(line(&indicator, step)))
-                    .child(
-                        div()
-                            .flex_col()
-                            .items_center()
-                            .child(stepper_title(title))
-                            .child(stepper_description(description)),
-                    )
+                    .fill(move |item, d| {
+                        let t = theme();
+                        d.when(step != last, |d| d.child(line(item)))
+                            .child(round_trigger(item))
+                            .child(
+                                div()
+                                    .mt(5.0)
+                                    .flex_col()
+                                    .items_center()
+                                    .text_center()
+                                    .child(
+                                        // `text-sm lg:text-base`: the reference renders at desktop width.
+                                        stepper_title(title)
+                                            .text_base()
+                                            .font_semibold()
+                                            .when(item.state == StepState::Active, |d| d.text_color(t.primary)),
+                                    )
+                                    .child(
+                                        // `text-xs lg:text-sm`; its `text-primary` loses to
+                                        // `text-muted-foreground` in the stylesheet's order.
+                                        stepper_description(description).text_sm(),
+                                    ),
+                            )
+                    })
+            }));
+        let demo_last = DEMO_STEPS.len();
+        let indicators = stepper()
+            .model(Model::bind(indicator))
+            .w_px(640.0)
+            .items_start()
+            .gap(2.0)
+            .children(DEMO_STEPS.map(|(step, title, description)| {
+                stepper_item(step)
+                    .relative()
+                    .flex()
+                    .w_full()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .fill(move |item, d| {
+                        let t = theme();
+                        d.child(
+                            stepper_trigger().child(
+                                stepper_indicator(item)
+                                    .when(item.state == StepState::Inactive, |d| d.bg(t.muted))
+                                    .child(match step {
+                                        1 => icon(Icon::BookUser).into_element(),
+                                        2 => icon(Icon::Truck).into_element(),
+                                        3 => icon(Icon::CreditCard).into_element(),
+                                        _ => text(step.to_string()).into_element(),
+                                    }),
+                            ),
+                        )
+                        .when(step != demo_last, |d| d.child(line(item)))
+                        .child(
+                            div()
+                                .flex_col()
+                                .items_center()
+                                .child(stepper_title(title))
+                                .child(stepper_description(description)),
+                        )
+                    })
             }));
         page(
             "Stepper",
             div()
                 .flex_col()
                 .gap(10.0)
-                .child(text(format!("Steps: {} and {}", horizontal.step.get(), indicator.step.get())).text_sm())
+                .child(text(format!("Steps: {} and {}", horizontal.get(), indicator.get())).text_sm())
                 .child(demo("StepperHorizental.vue", steps))
                 .child(demo("StepperDemo.vue", indicators))
-                .child(demo("StepperVertical.vue", vertical(&column))),
+                .child(demo("StepperVertical.vue", vertical())),
         )
     })
 }

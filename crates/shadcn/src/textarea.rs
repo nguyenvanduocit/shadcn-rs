@@ -1,20 +1,21 @@
 //! Textarea (`ui/textarea`): a multi-line text field that grows with its text.
+//!
+//! An [`Input`] that wraps its lines: it keeps its own text
+//! (`default_value`) or the caller's (`model`, `v-model`), and Enter types a
+//! newline.
 
-use gui::{Color, Properties, Styled, TextField, TextInput, text_input};
+use gui::{Color, Properties, Style, Styled};
 
-use crate::focus::focus_ring;
+use crate::input::Input;
 use crate::theme::theme;
 
-/// A textarea editing `field`; Enter types a newline.
+/// A textarea (`<Textarea>`): empty, and keeping its own text, until told
+/// otherwise. Style it as any node; its own classes come first.
 #[must_use]
-pub fn textarea(field: &TextField) -> TextInput {
+pub fn textarea() -> Input {
     let t = theme();
-    text_input(field)
-        .multiline()
-        .named("textarea")
+    let style = Style::default()
         .transition_props(Properties::COLOR | Properties::SHADOW)
-        .placeholder_color(t.muted_foreground)
-        .selection_color(t.primary.opacity(0.35))
         .text_color(t.foreground)
         .border_color(t.input)
         .flex()
@@ -31,7 +32,6 @@ pub fn textarea(field: &TextField) -> TextInput {
         .py(2.0)
         // `text-base md:text-sm`: a desktop window is taken to be past `md`.
         .text_sm()
-        .shadow_xs()
-        .focus_visible(move |s| focus_ring(s, &t))
-        .disabled_style(|s| s.opacity(0.5).cursor_not_allowed())
+        .shadow_xs();
+    Input::new("textarea", style).multiline()
 }

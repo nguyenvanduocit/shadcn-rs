@@ -1,9 +1,9 @@
 use gui::prelude::*;
-use gui::{Icon, ScenarioError, TextField, div, icon, text};
+use gui::{Icon, ScenarioError, Signal, TextField, div, icon, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize, Orientation, SelectSize, SelectState, button,
-    button_group, button_group_of_groups, button_group_separator, input, input_group, input_group_addon,
-    input_group_button, input_group_input, select_content, select_item, select_trigger_showing, theme,
+    ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize, Orientation, button, button_group,
+    button_group_of_groups, button_group_separator, input, input_group, input_group_addon, input_group_button,
+    input_group_input, select, select_content, select_item, theme,
 };
 
 use crate::{Render, Shot, demo, page};
@@ -25,14 +25,15 @@ pub fn render() -> Render {
     let search = TextField::new("");
     let message = TextField::new("");
     let amount = TextField::new("");
-    let currency = SelectState::new(Some("$"));
+    let currency = Signal::labeled("currency", Some("$".to_owned()));
     Box::new(move || {
         let t = theme();
-        let currencies = select_content(&currency)
-            .min_w(24.0)
-            .children(CURRENCIES.map(|(symbol, name)| {
-                select_item(&currency, symbol, symbol, false).child(text(name).text_color(t.muted_foreground))
-            }));
+        let currencies =
+            select_content()
+                .min_w(24.0)
+                .children(CURRENCIES.map(|(symbol, name)| {
+                    select_item(symbol, symbol).child(text(name).text_color(t.muted_foreground))
+                }));
         page(
             "Button Group",
             div()
@@ -156,7 +157,7 @@ pub fn render() -> Render {
                     button_group(
                         H,
                         [
-                            input(&search).placeholder("Search...").into_element(),
+                            input().field(search).placeholder("Search...").into_element(),
                             outline_icon(Icon::Search, ButtonSize::Default).into_element(),
                         ],
                     ),
@@ -214,16 +215,14 @@ pub fn render() -> Render {
                                 H,
                                 [
                                     // The trigger's slot is the value itself, not a `SelectValue`.
-                                    select_trigger_showing(
-                                        &currency,
-                                        text(currency.value.get().unwrap_or_default()),
-                                        SelectSize::Default,
-                                        currencies,
-                                    )
-                                    .font_mono()
-                                    .w(14.0)
-                                    .into_element(),
-                                    input(&amount).placeholder("10.00").into_element(),
+                                    select()
+                                        .model(currency)
+                                        .child(text(currency.get().unwrap_or_default()))
+                                        .child(currencies)
+                                        .font_mono()
+                                        .w(14.0)
+                                        .into_element(),
+                                    input().field(amount).placeholder("10.00").into_element(),
                                 ],
                             ),
                             button_group(H, [outline_icon(Icon::ArrowRight, ButtonSize::Icon)]),

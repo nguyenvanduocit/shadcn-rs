@@ -1,0 +1,7 @@
+# Chrome's boxes for text_letter_spacing.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 800 72
+  p 0 0 110.265625 24
+  p 0 24 93.046875 24
+  p 0 48 102.40625 24

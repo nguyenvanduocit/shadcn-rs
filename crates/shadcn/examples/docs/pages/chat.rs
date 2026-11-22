@@ -6,20 +6,20 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gui::prelude::*;
-use gui::{Div, Element, Icon, ScenarioError, Side, SideAlign, Signal, TextField, div, icon, span, text};
+use gui::{Div, Element, Icon, Model, ScenarioError, Side, SideAlign, Signal, TextField, div, icon, span, text};
 use shadcn::{
-    BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, HoverCardState, InputGroupAlign,
-    InputGroupButtonSize, MarkerVariant, MenuItem, MenuState, MessageProps, MessageScrollerDirection,
-    MessageScrollerProps, MessageScrollerState, TooltipState, TraceStatus, bubble, bubble_content, button,
-    dropdown_menu_content, dropdown_menu_item, dropdown_menu_separator, dropdown_menu_trigger, empty,
-    empty_description, empty_header, empty_media_icon, empty_title, hover_card, hover_card_content, hover_card_trigger,
-    input_group, input_group_addon, input_group_button, input_group_textarea, marker, marker_content, message,
-    message_content, message_scroller, message_scroller_button, message_scroller_item, message_scroller_viewport,
-    progress, spinner, theme, tooltip, tooltip_content, tooltip_trigger, trace, trace_action, trace_collapsible,
-    trace_collapsible_content, trace_collapsible_trigger, trace_end_icon, trace_icon, trace_line, trace_title,
+    BubbleAlign, BubbleProps, BubbleVariant, ButtonSize, ButtonVariant, InputGroupAlign, InputGroupButtonSize,
+    MarkerVariant, MenuItem, MessageProps, MessageScrollerDirection, MessageScrollerProps, TraceStatus, bubble,
+    bubble_content, button, dropdown_menu, dropdown_menu_content, dropdown_menu_item, dropdown_menu_separator,
+    dropdown_menu_trigger, empty, empty_description, empty_header, empty_media_icon, empty_title, hover_card,
+    hover_card_content, hover_card_trigger, input_group, input_group_addon, input_group_button, input_group_textarea,
+    marker, marker_content, message, message_content, message_scroller, message_scroller_button,
+    message_scroller_provider, message_scroller_viewport, progress, spinner, theme, tooltip, tooltip_content,
+    tooltip_trigger, trace, trace_action, trace_collapsible, trace_collapsible_content, trace_collapsible_trigger,
+    trace_end_icon, trace_icon, trace_line, trace_title,
 };
 
-use super::markdown::Markdown;
+use super::markdown::markdown;
 use super::thread::{
     Follow, Script, after, assistant_turn, click_named, output, replay, said, stream, thread, user_turn, wait,
 };
@@ -76,7 +76,7 @@ impl Checkpoints {
         let total = words.chars().count();
         let steps = (1..=total.div_ceil(3))
             .map(|i| {
-                let shown = self.shown.clone();
+                let shown = self.shown;
                 after(20, move || shown.set(i.saturating_mul(3).min(total)))
             })
             .collect();
@@ -181,11 +181,11 @@ impl Sources {
         self.answer.set(String::new());
         self.cited.set(0);
         self.open.set(true);
-        let replied = self.replied.clone();
+        let replied = self.replied;
         let mut steps = vec![after(300, move || replied.set(true))];
         steps.extend(stream(&self.answer, SOURCES_ANSWER, 20));
         for i in 1..=SOURCES.len() {
-            let cited = self.cited.clone();
+            let cited = self.cited;
             steps.push(after(20, move || cited.set(i)));
         }
         self.script.play(steps);
@@ -214,10 +214,9 @@ impl Sources {
             trace()
                 .child(
                     trace_collapsible()
-                        .child(trace_collapsible_trigger(&self.open, false, head))
-                        .child(trace_collapsible_content(&self.open, |c| {
-                            c.child(trace().children(links))
-                        })),
+                        .model(Model::bind(self.open))
+                        .child(trace_collapsible_trigger(false, head))
+                        .child(trace_collapsible_content().map_root(|c| c.child(trace().children(links)))),
                 )
                 .into_element()
         });
@@ -420,7 +419,7 @@ fn tokens(value: u32) -> String {
     }
 }
 
-fn context(card: &HoverCardState) -> Div {
+fn context() -> Div {
     const LIMIT: u32 = 128_000;
     const ROWS: [(&str, u32); 3] = [("Input", 8420), ("Output", 1260), ("Reasoning", 980)];
     let used: u32 = ROWS.iter().map(|(_, v)| v).sum();
@@ -428,12 +427,15 @@ fn context(card: &HoverCardState) -> Div {
     let t = theme();
     div().flex().justify_center().py(12.0).child(
         hover_card()
+            // The demo's delays: open almost at once, close soon after.
+            .open_delay(Duration::from_millis(10))
+            .close_delay(Duration::from_millis(100))
             .child(hover_card_trigger(
-                card,
                 button(ButtonVariant::Outline, ButtonSize::Sm).child(format!("{percent}% context")),
             ))
-            .child(hover_card_content(card, |c| {
-                c.w(64.0)
+            .child(
+                hover_card_content()
+                    .w(64.0)
                     .flex_col()
                     .gap(3.0)
                     .child(
@@ -462,8 +464,8 @@ fn context(card: &HoverCardState) -> Div {
                                     .child(text(*label).text_color(t.muted_foreground))
                                     .child(text(tokens(*value)))
                             })),
-                    )
-            })),
+                    ),
+            ),
     )
 }
 
@@ -472,7 +474,6 @@ pub fn render() -> Render {
     let checkpoints = Checkpoints::new();
     let sources = Sources::new();
     let suggestions = Suggestions::new();
-    let card = HoverCardState::with_delays(Duration::from_millis(10), Duration::from_millis(100));
     Box::new(move || {
         page(
             "Chat",
@@ -484,7 +485,7 @@ pub fn render() -> Render {
                 .child(demo("SourcesDemo.vue", sources.view()))
                 .child(demo("SuggestionDemo.vue", suggestions.view()))
                 .child(demo("InlineCitationDemo.vue", citations()))
-                .child(demo("ContextDemo.vue", context(&card))),
+                .child(demo("ContextDemo.vue", context())),
         )
     })
 }
@@ -639,10 +640,6 @@ struct Agent {
     run: Rc<Cell<u64>>,
     /// Numbers the turns, as Vue's `Date.now()` ids.
     made: Rc<Cell<u64>>,
-    scroller: MessageScrollerState,
-    markdown: Markdown,
-    tip: TooltipState,
-    menu: MenuState,
 }
 
 impl Agent {
@@ -653,10 +650,6 @@ impl Agent {
             draft: TextField::new(AGENT_SCRIPT[0].0),
             run: Rc::new(Cell::new(0)),
             made: Rc::new(Cell::new(0)),
-            scroller: MessageScrollerState::new(MessageScrollerProps::default()),
-            markdown: Markdown::new(),
-            tip: TooltipState::new(),
-            menu: MenuState::new(),
         }
     }
 
@@ -686,13 +679,12 @@ impl Agent {
             _ => vec![Step::Text(FALLBACK)],
         };
         let id = self.id("user");
-        self.turns.update(|mut t| {
+        self.turns.update(|t| {
             t.push(Turn {
                 id,
                 user: true,
                 parts: vec![Part::Text(words)],
             });
-            t
         });
         self.draft.set_text(self.next_ask());
         self.respond(steps);
@@ -705,13 +697,12 @@ impl Agent {
         let steps: Rc<[Step]> = steps.into();
         self.after(600, run, move || {
             let id = me.id("assistant");
-            me.turns.update(|mut t| {
+            me.turns.update(|t| {
                 t.push(Turn {
                     id,
                     user: false,
                     parts: Vec::new(),
                 });
-                t
             });
             me.status.set(Status::Streaming);
             me.step(Rc::clone(&steps), 0, run);
@@ -730,20 +721,18 @@ impl Agent {
 
     /// Change the reply's last part.
     fn edit_last(&self, f: impl FnOnce(&mut Part)) {
-        self.turns.update(|mut t| {
+        self.turns.update(|t| {
             if let Some(part) = t.last_mut().and_then(|turn| turn.parts.last_mut()) {
                 f(part);
             }
-            t
         });
     }
 
     fn push(&self, part: Part) {
-        self.turns.update(|mut t| {
+        self.turns.update(|t| {
             if let Some(turn) = t.last_mut() {
                 turn.parts.push(part);
             }
-            t
         });
     }
 
@@ -823,12 +812,12 @@ impl Agent {
 
     fn reset(&self) {
         self.run.set(self.run.get().wrapping_add(1));
-        self.turns.set(Vec::new());
+        self.turns.replace(Vec::new());
         self.status.set(Status::Ready);
         self.draft.set_text(AGENT_SCRIPT[0].0);
     }
 
-    fn reasoning(text: &str, running: bool, open: &Follow) -> Div {
+    fn reasoning(text: &str, running: bool, open: &Follow) -> Element {
         let head = trace_line(running.then_some(TraceStatus::Running))
             .child(trace_icon(if running {
                 spinner().into_element()
@@ -837,19 +826,23 @@ impl Agent {
             }))
             .child(trace_title(if running { "Thinking" } else { "Thought" }));
         trace_collapsible()
-            .child(trace_collapsible_trigger(&open.open, false, head))
-            .child(trace_collapsible_content(&open.open, |c| c.child(text.to_owned())))
+            .model(Model::bind(open.open))
+            .child(trace_collapsible_trigger(false, head))
+            .child(trace_collapsible_content().map_root(|c| c.child(text.to_owned())))
+            .into_element()
     }
 
-    fn tool(command: &str, stdout: Option<&str>, open: &Signal<bool>, streaming: bool) -> Div {
+    fn tool(command: &str, stdout: Option<&str>, open: &Signal<bool>, streaming: bool) -> Element {
         match stdout {
             Some(out) => {
                 let head = trace_line(None)
                     .child(trace_icon(icon(Icon::Terminal)))
                     .child(trace_title(format!("Ran {command}")));
                 trace_collapsible()
-                    .child(trace_collapsible_trigger(open, false, head))
-                    .child(trace_collapsible_content(open, |c| c.child(output(out))))
+                    .model(Model::bind(*open))
+                    .child(trace_collapsible_trigger(false, head))
+                    .child(trace_collapsible_content().map_root(|c| c.child(output(out))))
+                    .into_element()
             }
             None => {
                 let (status, verb) = if streaming {
@@ -860,6 +853,7 @@ impl Agent {
                 trace_line(Some(status))
                     .child(trace_icon(icon(Icon::Terminal)))
                     .child(trace_title(format!("{verb} {command}")))
+                    .into_element()
             }
         }
     }
@@ -874,11 +868,9 @@ impl Agent {
                 variant: BubbleVariant::Muted,
                 align: BubbleAlign::End,
             };
-            return message_scroller_item(&self.scroller, &turn.id, true).child(
-                message(p).child(message_content(p).child(bubble(b).child(bubble_content(b).child(turn.text())))),
-            );
+            return message(p).child(message_content(p).child(bubble(b).child(bubble_content(b).child(turn.text()))));
         }
-        let steps: Vec<Div> = turn
+        let steps: Vec<Element> = turn
             .parts
             .iter()
             .filter_map(|part| match part {
@@ -889,13 +881,11 @@ impl Agent {
             .collect();
         let words = turn.text();
         let p = MessageProps::default();
-        message_scroller_item(&self.scroller, &turn.id, false).child(
-            message(p).child(
-                message_content(p)
-                    .gap(3.0)
-                    .when(!steps.is_empty(), |c| c.child(trace().children(steps)))
-                    .when(!words.is_empty(), |c| c.child(self.markdown.render(&words, 14.0))),
-            ),
+        message(p).child(
+            message_content(p)
+                .gap(3.0)
+                .when(!steps.is_empty(), |c| c.child(trace().children(steps)))
+                .when(!words.is_empty(), |c| c.child(markdown(&words, 14.0))),
         )
     }
 
@@ -916,28 +906,29 @@ impl Agent {
                     )),
             )
         } else {
+            let me = self.clone();
             message_scroller()
                 .child(
                     message_scroller_viewport(
-                        &self.scroller,
-                        turns
-                            .iter()
-                            .enumerate()
-                            .map(|(i, turn)| self.turn(turn, busy && i == last)),
+                        turns,
+                        |turn: &Turn| (turn.id.as_str(), turn.user),
+                        move |i, turn| me.turn(turn, busy && i == last),
                     )
                     .gap(6.0)
-                    .px(8.0)
-                    .py(0.0),
+                    .viewport(|v| v.px(8.0)),
                 )
-                .child(message_scroller_button(&self.scroller, MessageScrollerDirection::End))
+                .child(message_scroller_button(MessageScrollerDirection::End))
         };
-        let m = &self.menu;
+        // The provider outlives the empty state, as Vue's wraps the card.
+        let body = message_scroller_provider(MessageScrollerProps::default(), body);
         let attach = |glyph: Icon, label: &str| {
-            dropdown_menu_item(m, label, MenuItem::default(), || {})
+            dropdown_menu_item(label, MenuItem::default())
                 .child(icon(glyph))
                 .child(label.to_owned())
         };
-        let context = dropdown_menu_content(m)
+        let context = dropdown_menu_content()
+            .side(Side::Top)
+            .align(SideAlign::Start)
             .w(44.0)
             .child(attach(Icon::Paperclip, "Add Photos & Files"))
             .child(dropdown_menu_separator())
@@ -955,13 +946,14 @@ impl Agent {
         .addon(
             input_group_addon(InputGroupAlign::BlockEnd)
                 .pt(1.0)
-                .button(dropdown_menu_trigger(
-                    m,
-                    input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm).child(icon(Icon::Plus)),
-                    Side::Top,
-                    SideAlign::Start,
-                    context,
-                ))
+                .button(
+                    dropdown_menu()
+                        .child(dropdown_menu_trigger(
+                            input_group_button(ButtonVariant::Outline, InputGroupButtonSize::IconSm)
+                                .child(icon(Icon::Plus)),
+                        ))
+                        .child(context),
+                )
                 .button(
                     input_group_button(ButtonVariant::Default, InputGroupButtonSize::IconSm)
                         .ml_auto()
@@ -994,13 +986,12 @@ impl Agent {
                         .child(
                             tooltip()
                                 .child(tooltip_trigger(
-                                    &self.tip,
                                     button(ButtonVariant::Outline, ButtonSize::Icon)
                                         .disabled(busy)
                                         .child(icon(Icon::RotateCw))
                                         .on_click(move |_| reset.reset()),
                                 ))
-                                .child(tooltip_content(&self.tip, |c| c.child(text("Reset")))),
+                                .child(tooltip_content().child(text("Reset"))),
                         ),
                 )
                 .child(div().min_h(0.0).flex_1().child(body))

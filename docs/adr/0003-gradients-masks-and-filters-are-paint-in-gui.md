@@ -1,6 +1,6 @@
 # 0003. Gradients, masks and filters are paint in `gui`
 
-Status: accepted, 2026-11-20.
+Status: accepted, 2026-11-20; a group rendered into a layer every frame superseded by ADR-0016; `Ink::Current` resolved against the inherited `ResolvedText` superseded by ADR-0022 (`currentColor` reads `ContentStyle`, and `Ink` is renamed `StopColor`).
 
 ## Context
 

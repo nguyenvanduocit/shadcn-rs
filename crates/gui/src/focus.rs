@@ -10,9 +10,9 @@ use crate::reactive::Signal;
 
 thread_local! {
     static NEXT: Cell<u64> = const { Cell::new(1) };
-    static FOCUSED: Signal<Option<FocusId>> = Signal::labeled("focus", None);
+    static FOCUSED: Signal<Option<FocusId>> = crate::reactive::detached(|| Signal::labeled("focus", None));
     /// Whether the focus last moved by keyboard, which is when `focus-visible` shows.
-    static VISIBLE: Signal<bool> = Signal::labeled("focus-visible", false);
+    static VISIBLE: Signal<bool> = crate::reactive::detached(|| Signal::labeled("focus-visible", false));
 }
 
 /// The identity of one focusable element.

@@ -1,7 +1,7 @@
 //! What a node looks like and how it is laid out: the CSS subset shadcn's
 //! Tailwind classes use, as one value per node. [`crate::styled::Styled`]
-//! is the builder that writes it; [`Style::to_taffy`] hands the layout part
-//! to Taffy.
+//! is the builder that writes it; [`Style::box_style`] hands the layout part
+//! to the layout tree.
 
 use taffy as ts;
 
@@ -20,24 +20,18 @@ pub enum Length {
     /// `fit-content`: the content's size, at most the space there is. A size
     /// keyword: as a margin or an inset it is `auto`.
     FitContent,
+    /// `calc(fraction × 100% + px)` (`max-w-[calc(100%-2rem)]`).
+    Calc {
+        fraction: f32,
+        px: f32,
+    },
 }
 
 impl Length {
-    fn dimension(self) -> ts::Dimension {
-        match self {
-            Self::Auto => ts::Dimension::auto(),
-            Self::Px(v) => ts::Dimension::length(v),
-            Self::Fraction(f) => ts::Dimension::percent(f),
-            Self::FitContent => ts::Dimension::fit_content(),
-        }
-    }
-
-    fn auto_or_length(self) -> ts::LengthPercentageAuto {
-        match self {
-            Self::Auto | Self::FitContent => ts::LengthPercentageAuto::auto(),
-            Self::Px(v) => ts::LengthPercentageAuto::length(v),
-            Self::Fraction(f) => ts::LengthPercentageAuto::percent(f),
-        }
+    /// Whether it reads the containing block's size.
+    #[must_use]
+    pub fn relative(self) -> bool {
+        matches!(self, Self::Fraction(_) | Self::Calc { .. })
     }
 }
 
@@ -247,7 +241,7 @@ pub enum Track {
 }
 
 impl Track {
-    fn to_taffy(self) -> ts::TrackSizingFunction {
+    pub(crate) fn to_taffy(self) -> ts::TrackSizingFunction {
         match self {
             Self::Fr(f) => taffy::style_helpers::minmax(
                 ts::MinTrackSizingFunction::length(0.0),
@@ -1006,10 +1000,10 @@ impl Style {
         self.overflow_x != Overflow::Visible || self.overflow_y != Overflow::Visible
     }
 
-    /// The layout half of this style, as Taffy reads it, in the node's
-    /// inherited `direction`.
+    /// The layout half of this style, as the layout tree keeps it and Taffy
+    /// reads it, in the node's inherited `direction`.
     #[must_use]
-    pub fn to_taffy(&self, direction: Direction) -> ts::Style {
+    pub fn box_style(&self, direction: Direction) -> crate::layout::BoxStyle {
         let mut margin = self.margin;
         let (start, end) = match direction {
             Direction::Ltr => (&mut margin.left, &mut margin.right),
@@ -1021,7 +1015,9 @@ impl Style {
         if let Some(m) = self.margin_end {
             *end = m;
         }
-        ts::Style {
+        use crate::layout::boxstyle::Len;
+        let len = |l: Length| Len::from(l);
+        crate::layout::BoxStyle {
             direction: match direction {
                 Direction::Ltr => ts::Direction::Ltr,
                 Direction::Rtl => ts::Direction::Rtl,
@@ -1036,23 +1032,23 @@ impl Style {
                 Position::Relative => ts::Position::Relative,
                 Position::Absolute => ts::Position::Absolute,
             },
-            inset: self.inset.map(Length::auto_or_length),
+            inset: self.inset.map(len),
             size: ts::Size {
-                width: self.width.dimension(),
-                height: self.height.dimension(),
+                width: len(self.width),
+                height: len(self.height),
             },
             min_size: ts::Size {
-                width: self.min_width.auto_or_length(),
-                height: self.min_height.auto_or_length(),
+                width: len(self.min_width),
+                height: len(self.min_height),
             },
             max_size: ts::Size {
-                width: self.max_width.auto_or_length(),
-                height: self.max_height.auto_or_length(),
+                width: len(self.max_width),
+                height: len(self.max_height),
             },
             aspect_ratio: self.aspect_ratio,
-            margin: margin.map(Length::auto_or_length),
-            padding: self.padding.map(ts::LengthPercentage::length),
-            border: self.border_widths.map(ts::LengthPercentage::length),
+            margin: margin.map(len),
+            padding: self.padding.map(|v| v),
+            border: self.border_widths.map(|v| v),
             flex_direction: match self.flex_direction {
                 FlexDirection::Row => ts::FlexDirection::Row,
                 FlexDirection::Column => ts::FlexDirection::Column,
@@ -1066,7 +1062,7 @@ impl Style {
             },
             flex_grow: self.flex_grow,
             flex_shrink: self.flex_shrink,
-            flex_basis: self.flex_basis.dimension(),
+            flex_basis: len(self.flex_basis),
             align_items: self.align_items.map_or(ts::AlignItems::NORMAL, align),
             align_self: self.align_self.map(align),
             justify_items: self.justify_items.map_or(ts::AlignItems::NORMAL, align),
@@ -1074,20 +1070,12 @@ impl Style {
             justify_content: self.justify_content.map_or(ts::JustifyContent::NORMAL, justify),
             align_content: self.align_content.map_or(ts::AlignContent::NORMAL, justify),
             gap: ts::Size {
-                width: ts::LengthPercentage::length(self.column_gap),
-                height: ts::LengthPercentage::length(self.row_gap),
+                width: self.column_gap,
+                height: self.row_gap,
             },
-            grid_template_columns: self
-                .grid_columns
-                .iter()
-                .map(|t| ts::GridTemplateComponent::Single(t.to_taffy()))
-                .collect(),
-            grid_template_rows: self
-                .grid_rows
-                .iter()
-                .map(|t| ts::GridTemplateComponent::Single(t.to_taffy()))
-                .collect(),
-            grid_auto_rows: self.grid_auto_rows.iter().map(|t| t.to_taffy()).collect(),
+            grid_template_columns: self.grid_columns.to_vec(),
+            grid_template_rows: self.grid_rows.to_vec(),
+            grid_auto_rows: self.grid_auto_rows.to_vec(),
             grid_auto_flow: if self.grid_flow_column {
                 ts::GridAutoFlow::Column
             } else {
@@ -1099,8 +1087,11 @@ impl Style {
                 x: overflow(self.overflow_x),
                 y: overflow(self.overflow_y),
             },
-            scrollbar_width: 0.0,
-            ..ts::Style::default()
+            reads_parent: ts::Size {
+                width: false,
+                height: false,
+            },
         }
+        .settled()
     }
 }

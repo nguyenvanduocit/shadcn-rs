@@ -1,6 +1,6 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, text};
-use shadcn::{AccordionState, accordion, accordion_content, accordion_item, accordion_trigger};
+use shadcn::{accordion, accordion_content, accordion_item, accordion_trigger};
 
 use crate::{Render, Shot, demo, motion_frames, page};
 
@@ -32,7 +32,6 @@ const ITEMS: [(&str, &str, [&str; 2]); 3] = [
 ];
 
 pub fn render() -> Render {
-    let state = AccordionState::single(Some("item-1"), true);
     Box::new(move || {
         let last = ITEMS.len().saturating_sub(1);
         page(
@@ -40,14 +39,14 @@ pub fn render() -> Render {
             demo(
                 "AccordionDemo.vue",
                 accordion()
+                    .single(true)
+                    .default_value(&["item-1"])
                     .w_full()
                     .children(ITEMS.iter().enumerate().map(|(i, (value, title, [first, second]))| {
-                        accordion_item()
+                        accordion_item(*value)
                             .when(i == last, |d| d.border_0())
-                            .child(accordion_trigger(&state, value, *title))
-                            .child(accordion_content(&state, value, |c| {
-                                c.child(text(*first)).child(text(*second).mt(2.0))
-                            }))
+                            .child(accordion_trigger(*title))
+                            .child(accordion_content().child(text(*first)).child(text(*second).mt(2.0)))
                     })),
             ),
         )

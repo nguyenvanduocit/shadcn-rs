@@ -1,0 +1,13 @@
+# Chrome's boxes for aspect_ratio_auto.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 235
+  p 0 0 100 25
+  div 0 25 100 100
+  div 0 125 400 40
+    div 0 125 80 40
+  div 0 165 400 50
+    div 0 165 120 40
+    div 120 165 30 50
+  div 0 215 400 20
+    div 0 215 100 20

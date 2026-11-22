@@ -1,56 +1,71 @@
+use std::rc::Rc;
+
 use gui::prelude::*;
-use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text};
-use shadcn::{
-    CommandState, command, command_empty, command_group, command_input, command_item, command_list, command_separator,
-    command_shortcut, theme,
-};
+use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text, text_bound};
+use shadcn::{CommandItem, CommandSection, command, command_input, command_list, command_shortcut, theme};
 
 use crate::{Render, Shot, demo, page};
 
+/// The palette's items: value, icon, label, shortcut.
+const SUGGESTIONS: [(&str, Icon, &str, Option<&str>); 3] = [
+    ("calendar", Icon::Calendar, "Calendar", None),
+    ("emoji", Icon::Smile, "Search Emoji", None),
+    ("calculator", Icon::Calculator, "Calculator", None),
+];
+const SETTINGS: [(&str, Icon, &str, Option<&str>); 3] = [
+    ("profile", Icon::User, "Profile", Some("⌘P")),
+    ("billing", Icon::CreditCard, "Billing", Some("⌘B")),
+    ("settings", Icon::Settings, "Settings", Some("⌘S")),
+];
+
+fn find(value: &str) -> Option<&'static (&'static str, Icon, &'static str, Option<&'static str>)> {
+    SUGGESTIONS.iter().chain(SETTINGS.iter()).find(|e| e.0 == value)
+}
+
 pub fn render() -> Render {
-    let cmd = CommandState::new();
     let last = Signal::labeled("last command", String::from("nothing yet"));
+    let sections = Rc::new(vec![
+        CommandSection::group(
+            Some("Suggestions"),
+            SUGGESTIONS.iter().map(|e| {
+                if e.0 == "calculator" {
+                    CommandItem::disabled(e.0)
+                } else {
+                    CommandItem::new(e.0)
+                }
+            }),
+        ),
+        CommandSection::Separator,
+        CommandSection::group(Some("Settings"), SETTINGS.iter().map(|e| CommandItem::new(e.0))),
+        CommandSection::empty("No results found."),
+    ]);
     Box::new(move || {
         let t = theme();
-        let item = |value: &'static str, glyph: Icon, label: &'static str, disabled: bool| {
-            let last = last.clone();
-            command_item(&cmd, value, disabled, move || last.set(label.to_owned()))
-                .map(|i| i.child(icon(glyph).text_color(t.muted_foreground)).child(text(label)))
-        };
-        let with_shortcut =
-            |value, glyph, label, keys: &str| item(value, glyph, label, false).map(|i| i.child(command_shortcut(keys)));
-        let palette = command(&cmd)
+        let palette = command()
             .rounded_lg()
             .border()
             .border_color(t.border)
             .shadow_md()
             .min_w_px(450.0)
-            .child(command_input(&cmd, "Type a command or search..."))
+            .child(command_input("Type a command or search..."))
             .child(
-                command_list()
-                    .child(command_group(
-                        Some("Suggestions"),
-                        [
-                            item("calendar", Icon::Calendar, "Calendar", false),
-                            item("emoji", Icon::Smile, "Search Emoji", false),
-                            item("calculator", Icon::Calculator, "Calculator", true),
-                        ],
-                    ))
-                    .child(command_separator())
-                    .child(command_group(
-                        Some("Settings"),
-                        [
-                            with_shortcut("profile", Icon::User, "Profile", "⌘P"),
-                            with_shortcut("billing", Icon::CreditCard, "Billing", "⌘B"),
-                            with_shortcut("settings", Icon::Settings, "Settings", "⌘S"),
-                        ],
-                    ))
-                    .child(command_empty(&cmd, "No results found.")),
+                command_list(Rc::clone(&sections), move |item, row| match find(&item.value) {
+                    Some(&(_, glyph, label, keys)) => row
+                        .child(icon(glyph).text_color(t.muted_foreground))
+                        .child(text(label))
+                        .child(keys.map(command_shortcut)),
+                    None => row,
+                })
+                .on_select(move |item| {
+                    if let Some(e) = find(&item.value) {
+                        last.set(e.2.to_owned());
+                    }
+                }),
             );
         page(
             "Command",
             div().flex_col().gap(6.0).child(demo("CommandDemo.vue", palette)).child(
-                text(format!("Last command: {}.", last.get()))
+                text_bound(move || format!("Last command: {}.", last.get()))
                     .text_sm()
                     .text_color(t.muted_foreground),
             ),

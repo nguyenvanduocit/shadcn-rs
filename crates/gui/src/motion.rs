@@ -11,15 +11,15 @@
 //! what the frame held ([`Motion::finish`]), which is when a node that was
 //! there and is gone starts leaving. Time is the frame clock's.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::BitOr;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::clock;
 use crate::color::Color;
 use crate::element::Element;
 use crate::geometry::{NodePath, PathSeg};
-use crate::layout::Frame;
 use crate::style::{Calc, Edges, Length, Ring, Shadow, Style};
 
 /// A CSS timing function: how far along a value is at a share of its time.
@@ -440,6 +440,14 @@ impl Animation {
         self.iterations.map(|n| start + self.delay + duration * n)
     }
 
+    /// Whether it moves something only a UI frame paints: a height (which
+    /// lays out again) or a background's position.
+    fn paints(&self) -> bool {
+        self.keyframes
+            .iter()
+            .any(|k| k.pose.height.is_some() || k.pose.background_x.is_some())
+    }
+
     fn reads_natural_height(&self) -> bool {
         self.keyframes
             .iter()
@@ -547,6 +555,10 @@ impl Mix for Length {
         match (self, to) {
             (Self::Px(a), Self::Px(b)) => Self::Px(a.mix(b, t)),
             (Self::Fraction(a), Self::Fraction(b)) => Self::Fraction(a.mix(b, t)),
+            (Self::Calc { fraction: fa, px: pa }, Self::Calc { fraction: fb, px: pb }) => Self::Calc {
+                fraction: fa.mix(fb, t),
+                px: pa.mix(pb, t),
+            },
             _ if t < 0.5 => *self,
             _ => *to,
         }
@@ -562,7 +574,7 @@ struct Timing {
 }
 
 /// One running transition (css-transitions-1 §3).
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 struct Run<T> {
     from: T,
     to: T,
@@ -595,7 +607,15 @@ impl<T: Mix> Run<T> {
 #[derive(Clone)]
 struct Track<T> {
     target: T,
-    run: Option<Run<T>>,
+    /// Boxed: a node keeps its targets always, a run only while it eases.
+    run: Option<Box<Run<T>>>,
+}
+
+impl<T: Clone> Track<T> {
+    /// Its run, while one runs at `now`.
+    fn live(&self, now: f32) -> Option<Run<T>> {
+        self.run.as_deref().filter(|r| now < r.start + r.duration).cloned()
+    }
 }
 
 /// What the frame being built still has moving.
@@ -637,7 +657,7 @@ fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Tim
         track.run = match timing.filter(|t| t.duration + t.delay > 0.0) {
             _ if current == after => None,
             None => None,
-            Some(t) => Some(match &track.run {
+            Some(t) => Some(Box::new(match &track.run {
                 // Going back to where a run began: as much shorter as the
                 // way back is (the spec's reversing shortening factor).
                 Some(r) if r.reversing_from == after => {
@@ -663,7 +683,7 @@ fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Tim
                     reversing_from: current,
                     reversing_factor: 1.0,
                 },
-            }),
+            })),
         };
         track.target = after;
     }
@@ -686,11 +706,23 @@ struct Playing {
     leaving: bool,
 }
 
+impl Playing {
+    /// Whether it has ended by `now` and no longer sets anything: a finite
+    /// animation past its last iteration (an exit holds its last pose).
+    fn ended(&self, m: &MotionStyle, now: f32) -> bool {
+        let (duration, _) = self.animation.timing(m);
+        duration <= 0.0
+            || (!self.leaving
+                && self
+                    .animation
+                    .iterations
+                    .is_some_and(|n| now - self.start - self.animation.delay >= duration * n))
+    }
+}
+
 /// Everything [`Motion`] keeps about one node.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct NodeState {
-    /// The pass that last laid it out.
-    seen: u64,
     background: Option<Track<Option<Color>>>,
     border: Option<Track<Option<Color>>>,
     color: Option<Track<Color>>,
@@ -718,9 +750,42 @@ struct NodeState {
     /// Its [`Animation::after_mount`] animation started this pass: it stops
     /// unless its parent was shown the frame before.
     mounting: bool,
+    /// What the compositor moves it by, while only its opacity and transform move.
+    curves: Option<Arc<Curves>>,
+    /// It moves (a transition, an animation, an exit, the compositor's
+    /// curves, a height it waits for): it is sampled again next pass.
+    busy: bool,
 }
 
 impl NodeState {
+    /// Whether a transition of something only a UI frame paints (a colour,
+    /// a shadow, a size) runs at `now`.
+    fn runs_paint(&self, now: f32) -> bool {
+        fn on<T>(t: Option<&Track<T>>, now: f32) -> bool {
+            t.is_some_and(|t| t.run.as_ref().is_some_and(|r| now < r.start + r.duration))
+        }
+        on(self.background.as_ref(), now)
+            || on(self.border.as_ref(), now)
+            || on(self.color.as_ref(), now)
+            || on(self.ring.as_ref(), now)
+            || on(self.shadows.as_ref(), now)
+            || on(self.width.as_ref(), now)
+            || on(self.height.as_ref(), now)
+            || on(self.margin.as_ref(), now)
+            || on(self.padding.as_ref(), now)
+            || on(self.inset.as_ref(), now)
+    }
+
+    /// Whether a transition of its opacity or transform runs at `now`.
+    fn runs_composited(&self, now: f32) -> bool {
+        [&self.opacity, &self.scale, &self.rotate]
+            .iter()
+            .any(|t| t.as_ref().is_some_and(|t| t.live(now).is_some()))
+            || [&self.translate_x, &self.translate_y]
+                .iter()
+                .any(|t| t.as_ref().is_some_and(|t| t.live(now).is_some()))
+    }
+
     /// End its transitions and its finite animation.
     fn end_runs(&mut self) {
         fn end<T>(track: &mut Option<Track<T>>) {
@@ -750,6 +815,7 @@ impl NodeState {
 }
 
 /// A subtree that left the tree and plays its exit animations.
+#[derive(Clone)]
 struct Leaving {
     /// The path of its root, which is also its slot's in the parent.
     path: NodePath,
@@ -763,23 +829,36 @@ struct Leaving {
 }
 
 /// What runs, across frames, by node path; the pipeline owns one.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Motion {
     nodes: HashMap<NodePath, NodeState>,
     leaving: Vec<Leaving>,
-    /// The layout pass being built.
-    pass: u64,
     /// When the last finite motion of the last pass ends.
     settles_at: Option<f32>,
     reduced: bool,
     instant: bool,
     hold_loops: bool,
+    /// When the earliest motion the compositor runs alone ends: the UI
+    /// lays out once then, to show its end and drop it (ADR-0015).
+    wake_at: Option<f32>,
+    /// Nodes whose after-mount animation started this pass.
+    mounting: Vec<NodePath>,
+    /// Nodes with an exit that left the tree this pass.
+    gone: Vec<NodePath>,
+    /// A node waited for its natural height and has it now: lay out again.
+    again: bool,
+    /// Bumped when what runs changes for every node at once (reduced
+    /// motion, instant, held loops): layout samples each node again.
+    generation: u64,
 }
 
 impl Motion {
     /// `prefers-reduced-motion: reduce`: transitions and animations take no
     /// time, loops stand still, and a node leaves at once.
     pub fn set_reduced(&mut self, reduced: bool) {
+        if self.reduced != reduced {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.reduced = reduced;
     }
 
@@ -788,6 +867,9 @@ impl Motion {
     /// scripted still of each state an input leads to. Turned on, it ends
     /// what runs now too.
     pub fn set_instant(&mut self, instant: bool) {
+        if self.instant != instant {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.instant = instant;
         if instant {
             self.finish_all();
@@ -796,6 +878,7 @@ impl Motion {
 
     /// End every transition, finite animation and exit running now.
     fn finish_all(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
         let left: Vec<NodePath> = self.leaving.drain(..).map(|l| l.path).collect();
         self.nodes
             .retain(|path, _| !left.iter().any(|l| path.0.starts_with(&l.0)));
@@ -807,7 +890,57 @@ impl Motion {
     /// Hold every loop at its first frame, as a browser's paused animation
     /// at `currentTime` 0 shows (a still of the page).
     pub fn hold_loops(&mut self, hold: bool) {
+        if self.hold_loops != hold {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.hold_loops = hold;
+    }
+
+    /// What changes for every node at once (reduced motion, instant, held
+    /// loops) changed this many times: layout samples each node again when
+    /// it differs from what it saw.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The nodes it keeps a state for.
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &NodePath> {
+        self.nodes.keys()
+    }
+
+    /// Whether the node at `path` moves: it is sampled again next pass.
+    pub(crate) fn busy(&self, path: &NodePath) -> bool {
+        self.nodes.get(path).is_some_and(|s| s.busy) || self.leaving_since(path).is_some()
+    }
+
+    /// The node at `path`, laid out, is `height` tall: its natural height
+    /// when it measures one.
+    pub(crate) fn natural(&mut self, path: &NodePath, height: f32) {
+        if let Some(s) = self.nodes.get_mut(path)
+            && s.measure
+        {
+            self.again |= s.wanted_natural && s.natural.is_none();
+            s.natural = Some(height);
+        }
+    }
+
+    /// The nodes at `released` left the tree this pass (`present` says
+    /// which paths it still holds): those with an exit start leaving at
+    /// [`Motion::finish`], the others are forgotten.
+    pub(crate) fn left(&mut self, released: &[NodePath], present: &dyn Fn(&NodePath) -> bool) {
+        for path in released {
+            if present(path) {
+                continue;
+            }
+            let leaving = self.leaving.iter().any(|l| path.0.starts_with(&l.path.0));
+            match self.nodes.get(path) {
+                Some(s) if s.exit.is_some() && !leaving => self.gone.push(path.clone()),
+                Some(_) if !leaving => {
+                    self.nodes.remove(path);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// When the last transition, finite animation or exit that ran in the
@@ -817,10 +950,21 @@ impl Motion {
         self.settles_at
     }
 
+    /// When a motion the compositor runs alone ends and the UI must lay
+    /// out again, if one runs (ADR-0015: nothing else asks for UI frames).
+    #[must_use]
+    pub fn wake_at(&self) -> Option<f32> {
+        self.wake_at
+    }
+
     /// Start a layout pass.
     pub(crate) fn begin(&mut self) {
-        self.pass = self.pass.wrapping_add(1);
         self.settles_at = None;
+        self.wake_at = None;
+    }
+
+    fn wake_by(&mut self, at: f32) {
+        self.wake_at = Some(self.wake_at.map_or(at, |w| w.min(at)));
     }
 
     /// When the subtree holding `path` started leaving.
@@ -832,19 +976,22 @@ impl Motion {
     }
 
     /// Set what moves in `style`, the resolved style of the node at `path`,
-    /// to its value this frame.
-    pub(crate) fn sample(&mut self, path: &NodePath, style: &mut Style) {
+    /// to its value this frame; whether its translation is moving (a
+    /// transition or an animation set it apart from its own value), which
+    /// paint then applies as a transform rather than in the node's place
+    /// (ADR-0016: animated values beside layout values).
+    pub(crate) fn sample(&mut self, path: &NodePath, style: &mut Style) -> Sampled {
         let moves = style.motion.as_deref().is_some_and(MotionStyle::moves);
-        if !moves && !self.nodes.contains_key(path) {
-            return;
+        if !moves && (self.nodes.is_empty() || !self.nodes.contains_key(path)) {
+            return Sampled::default();
         }
+        let rest = (style.transform.translate, style.transform.toward_anchor);
         let m = style.motion.take().unwrap_or_default();
         let leaving = self.leaving_since(path);
         let now = clock::frame_time();
         let (reduced, hold) = (self.reduced, self.hold_loops);
         let finite_still = reduced || self.instant;
         let state = self.nodes.entry(path.clone()).or_default();
-        state.seen = self.pass;
         let mut busy = Busy::default();
         transitions(state, style, &m, finite_still, now, &mut busy);
 
@@ -864,6 +1011,9 @@ impl Motion {
             (None, Some(a)) => {
                 if state.playing.as_ref().is_none_or(|p| &p.animation != a) {
                     state.mounting = a.after_mount;
+                    if a.after_mount {
+                        self.mounting.push(path.clone());
+                    }
                     // One that may not run has ended as it starts, so it
                     // does not run later either (a scenario's motion played
                     // after a still).
@@ -882,38 +1032,102 @@ impl Motion {
             }
         };
         let still = |a: &Animation| reduced || (finite_still && a.iterations.is_some());
-        if let Some(p) = playing.filter(|p| !still(&p.animation)) {
-            let set_height = animate(state, style, &m, &p, hold, now, &mut busy);
+        let playing = playing.filter(|p| !still(&p.animation));
+        // Where the transitions go: what keyframes fill open ends with once
+        // they end, and what shows when nothing runs.
+        let mut own = Own::of(style);
+        let target = |t: &Option<Track<f32>>, v: &mut f32| {
+            if let Some(t) = t {
+                *v = t.target;
+            }
+        };
+        target(&state.opacity, &mut own.opacity);
+        target(&state.scale, &mut own.scale);
+        target(&state.rotate, &mut own.rotate);
+        for (t, v) in [&state.translate_x, &state.translate_y]
+            .into_iter()
+            .zip(&mut own.translate)
+        {
+            if let Some(t) = t {
+                *v = t.target;
+            }
+        }
+        if let Some(p) = &playing {
+            let set_height = animate(state, style, &m, p, hold, now, &mut busy);
             state.measure = natural_height && !set_height;
         }
+
+        // ADR-0015: a node whose opacity and transform alone move is moved by
+        // the compositor at its own frame times; the UI lays it out once more
+        // when it ends. Anything else that moves needs a UI frame each frame.
+        let main = state.runs_paint(now) || playing.as_ref().is_some_and(|p| p.animation.paints());
+        let composited = !main && (state.runs_composited(now) || playing.as_ref().is_some_and(|p| !p.ended(&m, now)));
+        let curves = composited.then(|| {
+            let curves = Curves {
+                own,
+                opacity: state.opacity.as_ref().and_then(|t| t.live(now)),
+                translate_x: state.translate_x.as_ref().and_then(|t| t.live(now)),
+                translate_y: state.translate_y.as_ref().and_then(|t| t.live(now)),
+                scale: state.scale.as_ref().and_then(|t| t.live(now)),
+                rotate: state.rotate.as_ref().and_then(|t| t.live(now)),
+                playing: playing.as_ref().map(|p| {
+                    let (duration, easing) = p.animation.timing(&m);
+                    CurvePlay {
+                        animation: Arc::new((*p.animation).clone()),
+                        start: p.start,
+                        leaving: p.leaving,
+                        duration,
+                        easing,
+                        hold,
+                    }
+                }),
+            };
+            match &state.curves {
+                Some(kept) if **kept == curves => Arc::clone(kept),
+                _ => Arc::new(curves),
+            }
+        });
+        state.curves.clone_from(&curves);
 
         if let Some(until) = busy.until.filter(|&u| u > now) {
             self.settles_at = Some(self.settles_at.map_or(until, |s| s.max(until)));
         }
-        if busy.looping || busy.until.is_some_and(|u| u > now) || leaving.is_some() {
+        let moving = busy.looping || busy.until.is_some_and(|u| u > now) || leaving.is_some();
+        state.busy = moving || curves.is_some() || state.mounting || state.wanted_natural;
+        let measures = state.measure;
+        if composited {
+            if let Some(until) = busy.until.filter(|&u| u > now) {
+                self.wake_by(until);
+            }
+            if leaving.is_some()
+                && let Some(l) = self.leaving.iter().find(|l| path.0.starts_with(&l.path.0))
+            {
+                self.wake_by(l.until);
+            }
+        } else if moving {
             clock::request_frame();
         }
         style.motion = Some(m);
+        Sampled {
+            translating: (style.transform.translate, style.transform.toward_anchor) != rest || curves.is_some(),
+            curves,
+            kept: true,
+            measures,
+        }
     }
 
     /// Take in the frame a pass laid out; `previous` is the tree the pass
     /// before it laid out. Returns whether the frame must be laid out again:
     /// a node that left starts leaving and must show, or a node waited for
     /// its natural height.
-    pub(crate) fn finish(&mut self, previous: Option<&Element>, frame: &Frame) -> bool {
-        let pass = self.pass;
-        let mut again = false;
-        if self.nodes.values().any(|s| s.seen == pass && s.measure) {
-            let at: HashMap<&NodePath, f32> = frame.nodes.iter().map(|n| (&n.path, n.bounds.height)).collect();
-            for (path, s) in self.nodes.iter_mut().filter(|(_, s)| s.seen == pass && s.measure) {
-                if let Some(&h) = at.get(path) {
-                    again |= s.wanted_natural && s.natural.is_none();
-                    s.natural = Some(h);
-                }
-            }
-        }
+    pub(crate) fn finish(&mut self, previous: Option<&Element>, present: &dyn Fn(&NodePath) -> bool) -> bool {
+        let mut again = std::mem::take(&mut self.again);
 
-        for (path, s) in self.nodes.iter_mut().filter(|(_, s)| s.mounting) {
+        for path in std::mem::take(&mut self.mounting) {
+            let Some(s) = self.nodes.get_mut(&path) else { continue };
+            if !s.mounting {
+                continue;
+            }
             s.mounting = false;
             let parent = path.0.split_last().map(|(_, p)| p);
             if !parent.is_some_and(|p| previous.is_some_and(|r| holds(r, p))) {
@@ -924,14 +1138,11 @@ impl Motion {
             }
         }
 
-        let gone: Vec<NodePath> = self
-            .nodes
-            .iter()
-            .filter(|(path, s)| s.seen != pass && s.exit.is_some() && self.leaving_since(path).is_none())
-            .map(|(path, _)| path.clone())
+        let gone: Vec<NodePath> = std::mem::take(&mut self.gone)
+            .into_iter()
+            .filter(|path| self.leaving_since(path).is_none())
             .collect();
         if !gone.is_empty() && !self.reduced && !self.instant {
-            let present: HashSet<&NodePath> = frame.nodes.iter().map(|n| &n.path).collect();
             let now = clock::frame_time();
             for path in &gone {
                 // The topmost node that left with it is the one to keep.
@@ -940,11 +1151,11 @@ impl Motion {
                     && path
                         .0
                         .get(..len.saturating_sub(1))
-                        .is_some_and(|parent| !present.contains(&NodePath(parent.to_vec())))
+                        .is_some_and(|parent| !present(&NodePath::new(parent.into())))
                 {
                     len = len.saturating_sub(1);
                 }
-                let root = NodePath(path.0.get(..len).map(<[PathSeg]>::to_vec).unwrap_or_default());
+                let root = NodePath::new(path.0.get(..len).map(Into::into).unwrap_or_default());
                 if self.leaving.iter().any(|l| root.0.starts_with(&l.path.0)) {
                     continue;
                 }
@@ -967,9 +1178,12 @@ impl Motion {
                 }
             }
         }
-        let leaving: Vec<NodePath> = self.leaving.iter().map(|l| l.path.clone()).collect();
-        self.nodes
-            .retain(|path, s| s.seen == pass || leaving.iter().any(|l| path.0.starts_with(&l.0)));
+        // What left and does not leave with an exit is forgotten.
+        for path in &gone {
+            if self.leaving_since(path).is_none() {
+                self.nodes.remove(path);
+            }
+        }
         again
     }
 
@@ -1062,50 +1276,13 @@ fn animate(
 ) -> bool {
     let a = &p.animation;
     let (duration, easing) = a.timing(m);
-    let elapsed = now - p.start - a.delay;
-    if elapsed < 0.0 || duration <= 0.0 {
+    let Some(progress) = progress(a, p.start, p.leaving, duration, hold, now, Some(busy)) else {
         return false;
-    }
-    let progress = match a.iterations {
-        Some(n) if elapsed >= duration * n => {
-            if !p.leaving {
-                return false;
-            }
-            // The end of the last iteration.
-            let last = n.fract();
-            if last == 0.0 { 1.0 } else { last }
-        }
-        Some(_) => {
-            busy.ends_at(p.start + a.delay + duration * a.iterations.unwrap_or(1.0));
-            (elapsed / duration).fract()
-        }
-        None if hold => 0.0,
-        None => {
-            busy.looping = true;
-            (elapsed / duration).fract()
-        }
     };
-    let progress = if a.reverse { 1.0 - progress } else { progress };
     let frames = &a.keyframes;
-    let f = &mut style.transform;
-    if let Some(v) = keyframed(frames, |k| k.opacity, style.opacity, progress, easing) {
-        style.opacity = v;
-    }
-    if let Some(v) = keyframed(frames, |k| k.translate_x, f.translate[0], progress, easing) {
-        f.translate[0] = v;
-    }
-    if let Some(v) = keyframed(frames, |k| k.translate_y, f.translate[1], progress, easing) {
-        f.translate[1] = v;
-    }
-    if let Some(v) = keyframed(frames, |k| k.toward_anchor, f.toward_anchor, progress, easing) {
-        f.toward_anchor = v;
-    }
-    if let Some(v) = keyframed(frames, |k| k.scale, f.scale, progress, easing) {
-        f.scale = v;
-    }
-    if let Some(v) = keyframed(frames, |k| k.rotate, f.rotate, progress, easing) {
-        f.rotate = v;
-    }
+    let mut own = Own::of(style);
+    own.keyframed(frames, progress, easing);
+    own.set(style);
     if let Some(image) = &mut style.effects.background_image {
         let [x, _] = &mut image.position;
         if let Some(v) = keyframed(frames, |k| k.background_x.map(Calc::fraction), *x, progress, easing) {
@@ -1133,6 +1310,206 @@ fn animate(
             true
         }
         None => false,
+    }
+}
+
+/// How far through its iteration animation `a`, playing since `start` for
+/// `duration` seconds an iteration, is at `now`, direction applied; `None`
+/// before it starts and after a finite one ends (an exit, `leaving`, holds
+/// its end). What still runs is noted in `busy`.
+fn progress(
+    a: &Animation,
+    start: f32,
+    leaving: bool,
+    duration: f32,
+    hold: bool,
+    now: f32,
+    busy: Option<&mut Busy>,
+) -> Option<f32> {
+    let elapsed = now - start - a.delay;
+    if elapsed < 0.0 || duration <= 0.0 {
+        return None;
+    }
+    let progress = match a.iterations {
+        Some(n) if elapsed >= duration * n => {
+            if !leaving {
+                return None;
+            }
+            // The end of the last iteration.
+            let last = n.fract();
+            if last == 0.0 { 1.0 } else { last }
+        }
+        Some(n) => {
+            if let Some(b) = busy {
+                b.ends_at(start + a.delay + duration * n);
+            }
+            (elapsed / duration).fract()
+        }
+        None if hold => 0.0,
+        None => {
+            if let Some(b) = busy {
+                b.looping = true;
+            }
+            (elapsed / duration).fract()
+        }
+    };
+    Some(if a.reverse { 1.0 - progress } else { progress })
+}
+
+/// The values the compositor moves: opacity and the transform's parts.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Own {
+    opacity: f32,
+    translate: [Calc; 2],
+    toward_anchor: f32,
+    scale: f32,
+    rotate: f32,
+}
+
+impl Own {
+    fn of(style: &Style) -> Self {
+        let t = &style.transform;
+        Self {
+            opacity: style.opacity,
+            translate: t.translate,
+            toward_anchor: t.toward_anchor,
+            scale: t.scale,
+            rotate: t.rotate,
+        }
+    }
+
+    fn set(&self, style: &mut Style) {
+        style.opacity = self.opacity;
+        let t = &mut style.transform;
+        t.translate = self.translate;
+        t.toward_anchor = self.toward_anchor;
+        t.scale = self.scale;
+        t.rotate = self.rotate;
+    }
+
+    /// Set what keyframes `frames` animate at `progress`.
+    fn keyframed(&mut self, frames: &[Keyframe], progress: f32, easing: Easing) {
+        if let Some(v) = keyframed(frames, |k| k.opacity, self.opacity, progress, easing) {
+            self.opacity = v;
+        }
+        if let Some(v) = keyframed(frames, |k| k.translate_x, self.translate[0], progress, easing) {
+            self.translate[0] = v;
+        }
+        if let Some(v) = keyframed(frames, |k| k.translate_y, self.translate[1], progress, easing) {
+            self.translate[1] = v;
+        }
+        if let Some(v) = keyframed(frames, |k| k.toward_anchor, self.toward_anchor, progress, easing) {
+            self.toward_anchor = v;
+        }
+        if let Some(v) = keyframed(frames, |k| k.scale, self.scale, progress, easing) {
+            self.scale = v;
+        }
+        if let Some(v) = keyframed(frames, |k| k.rotate, self.rotate, progress, easing) {
+            self.rotate = v;
+        }
+    }
+}
+
+/// What [`Motion::sample`] found of a node.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Sampled {
+    /// Its translation moves (a transition, an animation or the compositor
+    /// sets it apart from its own value): paint applies it as a transform.
+    pub translating: bool,
+    /// Only its opacity and transform move, and the compositor moves them
+    /// by these at its own frame times (ADR-0015).
+    pub curves: Option<Arc<Curves>>,
+    /// Motion keeps a state for the node.
+    pub kept: bool,
+    /// Its laid-out height is its natural height ([`Motion::natural`]).
+    pub measures: bool,
+}
+
+/// A node's moving opacity and transform as plain data the render thread
+/// samples at each frame's present time (ADR-0015), by the code the layout
+/// samples them with: the values with nothing running, the transitions that
+/// run and the animation that plays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Curves {
+    own: Own,
+    opacity: Option<Run<f32>>,
+    translate_x: Option<Run<Calc>>,
+    translate_y: Option<Run<Calc>>,
+    scale: Option<Run<f32>>,
+    rotate: Option<Run<f32>>,
+    playing: Option<CurvePlay>,
+}
+
+/// An animation the compositor plays: as [`Playing`], its timing resolved.
+#[derive(Clone, Debug, PartialEq)]
+struct CurvePlay {
+    animation: Arc<Animation>,
+    start: f32,
+    leaving: bool,
+    duration: f32,
+    easing: Easing,
+    hold: bool,
+}
+
+/// A node's opacity and transform at a moment.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Moment {
+    pub opacity: f32,
+    pub transform: crate::style::Transform,
+}
+
+impl Curves {
+    /// Whether it scales or turns the node (its matrix is drawn throughout).
+    #[must_use]
+    pub fn turns(&self) -> bool {
+        self.scale.is_some()
+            || self.rotate.is_some()
+            || (self.own.scale - 1.0).abs() > 1e-4
+            || self.own.rotate.rem_euclid(360.0) > 1e-4
+            || self.playing.as_ref().is_some_and(|p| {
+                p.animation
+                    .keyframes
+                    .iter()
+                    .any(|k| k.pose.scale.is_some() || k.pose.rotate.is_some())
+            })
+    }
+
+    /// The values at `now` (seconds on the frame clock), starting from the
+    /// node's `transform` (its origin and what does not move).
+    #[must_use]
+    pub fn at(&self, now: f32, transform: crate::style::Transform) -> Moment {
+        fn run<T: Mix>(r: Option<&Run<T>>, target: T, now: f32) -> T {
+            match r {
+                Some(r) if now < r.end() => r.value(now),
+                _ => target,
+            }
+        }
+        let o = self.own;
+        let mut v = Own {
+            opacity: run(self.opacity.as_ref(), o.opacity, now),
+            translate: [
+                run(self.translate_x.as_ref(), o.translate[0], now),
+                run(self.translate_y.as_ref(), o.translate[1], now),
+            ],
+            toward_anchor: o.toward_anchor,
+            scale: run(self.scale.as_ref(), o.scale, now),
+            rotate: run(self.rotate.as_ref(), o.rotate, now),
+        };
+        if let Some(p) = &self.playing
+            && let Some(at) = progress(&p.animation, p.start, p.leaving, p.duration, p.hold, now, None)
+        {
+            v.keyframed(&p.animation.keyframes, at, p.easing);
+        }
+        Moment {
+            opacity: v.opacity,
+            transform: crate::style::Transform {
+                translate: v.translate,
+                toward_anchor: v.toward_anchor,
+                scale: v.scale,
+                rotate: v.rotate,
+                ..transform
+            },
+        }
     }
 }
 
@@ -1183,8 +1560,8 @@ fn siblings_at<'a>(root: &'a mut Element, path: &[PathSeg]) -> Option<&'a mut Ve
 
 fn kids_mut(el: &mut Element) -> Option<&mut Vec<Element>> {
     match el {
-        Element::Div(d) => Some(&mut d.kind),
-        Element::Deferred(d) => kids_mut(&mut d.child),
+        Element::Div(d) => Some(&mut Rc::make_mut(d).kind),
+        Element::Deferred(d) => kids_mut(&mut Rc::make_mut(d).child),
         _ => None,
     }
 }
@@ -1270,7 +1647,7 @@ fn put_back(kids: &mut Vec<Element>, seg: PathSeg, index: usize, slot: &Element)
 /// passes through it (`pointer-events: none` while it animates out).
 fn inert(el: &mut Element) {
     if let Element::Deferred(d) = el {
-        inert(&mut d.child);
+        inert(&mut Rc::make_mut(d).child);
         return;
     }
     if let Some(c) = el.common_mut() {
@@ -1280,7 +1657,7 @@ fn inert(el: &mut Element) {
         c.pass_through = true;
     }
     if let Element::Div(d) = el {
-        d.kind.iter_mut().for_each(inert);
+        Rc::make_mut(d).kind.iter_mut().for_each(inert);
     }
 }
 

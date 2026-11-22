@@ -1,6 +1,6 @@
 # 0010. `gui` is debugged from the command line
 
-Status: accepted, 2026-11-20. Extends ADR-0008 (what a frame measures) and ADR-0009 (the accessibility tree).
+Status: accepted, 2026-11-20; commands extended by ADR-0023 (`counters`, `paints`, `hangs`, memory by owner). Extends ADR-0008 (what a frame measures) and ADR-0009 (the accessibility tree).
 
 ## Context
 

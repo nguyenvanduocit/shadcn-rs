@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use gui::prelude::*;
-use gui::{Div, Icon, ScenarioError, Signal, div, icon};
-use shadcn::{ButtonSize, ButtonVariant, button, collapsible, collapsible_content, collapsible_toggle, theme};
+use gui::{Div, Element, Icon, Model, ScenarioError, Signal, div, icon};
+use shadcn::{ButtonSize, ButtonVariant, button, collapsible, collapsible_content, collapsible_trigger_as, theme};
 
 use crate::{Render, Shot, demo, page};
 
@@ -81,45 +81,47 @@ fn row() -> Div {
         .font_normal()
 }
 
-fn node(tree: &Tree, n: &Node) -> Div {
+fn node(tree: &Tree, n: &Node) -> Element {
     let t = theme();
     match n {
         Node::Folder { name, path, children } => {
             let Some(open) = tree.open.get(path) else {
-                return div();
+                return Element::Empty;
             };
             let expanded = open.get();
             collapsible()
-                .child(
+                .model(Model::bind(*open))
+                .child(collapsible_trigger_as(
                     row()
                         .when(expanded, |b| {
                             // `aria-expanded:bg-transparent aria-expanded:hover:bg-muted`.
                             let hover = if t.dark { t.muted.opacity(0.5) } else { t.muted };
                             b.hover(move |s| s.bg(hover))
                         })
-                        .on_click(collapsible_toggle(open))
                         .child(icon(Icon::ChevronRight).rotate(if expanded { 90.0 } else { 0.0 }))
                         .child(icon(Icon::Folder))
                         .child(*name),
-                )
-                .child(collapsible_content(open).map(|c| {
-                    c.child(
+                ))
+                .child(
+                    collapsible_content().child(
                         div()
                             .ml(4.0)
                             .flex_col()
                             .children(children.iter().map(|c| node(tree, c))),
-                    )
-                }))
+                    ),
+                )
+                .into_element()
         }
         Node::File { name, path } => {
             let current = tree.selected.get() == *path;
-            let selected = tree.selected.clone();
+            let selected = tree.selected;
             let path = *path;
             row()
                 .when(current, |b| b.bg(t.accent).text_color(t.accent_foreground))
                 .on_click(move |_| selected.set(path))
                 .child(icon(Icon::File))
                 .child(*name)
+                .into_element()
         }
     }
 }

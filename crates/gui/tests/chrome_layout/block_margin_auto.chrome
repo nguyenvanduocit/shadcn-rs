@@ -1,0 +1,7 @@
+# Chrome's boxes for block_margin_auto.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 30
+  div 100 0 100 10
+  div 200 10 100 10
+  div 75 20 150 10

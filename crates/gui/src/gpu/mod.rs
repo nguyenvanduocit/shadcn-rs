@@ -1,53 +1,87 @@
-//! The GPU renderer: a [`Scene`] drawn with wgpu (Metal on macOS, Vulkan or
-//! GL on Linux, DX12 on Windows), learned from GPUI's renderers. Every
-//! primitive is an instance of one quad pipeline whose fragment shader
-//! computes coverage from signed distances (rounded boxes, borders, rings,
-//! clips) or reads it from an atlas (glyphs, icons); box shadows are
-//! Gaussian-blurred rounded boxes in closed form. Groups (opacity, masks,
-//! filters, transforms) are drawn into layer textures first and composited
-//! where the scene puts them. Per frame the CPU only lays out the
-//! instances: no pixel is touched by it.
+//! The GPU renderer: a [`Scene`] drawn with wgpu on Metal, Vulkan or DX12
+//! (no OpenGL: a machine with none of them uses lavapipe), learned from
+//! GPUI's renderers and from Chromium's compositor (ADR-0016). Three kinds
+//! of primitive share each pass, in the scene's order:
 //!
-//! The CPU renderer ([`crate::cpu`]) paints the same scene; the two are held
-//! to each other's pixels.
+//! - quads (`shaders.wgsl`): rounded boxes, borders, rings, shadows,
+//!   gradients and images, whose coverage comes from signed distances in
+//!   closed form, and glyphs and icons read from multi-page atlases;
+//! - paths (`path_render.wgsl`): vector paths flattened, stroked and binned
+//!   into tiles by compute passes (`path_compute.wgsl`, [`path`]) and
+//!   covered with exact area (ADR-0017); icons are rasterized by the same
+//!   passes once into the coverage atlas;
+//! - curve text (`slug.wgsl`, [`slug`]): glyphs above 128 device ppem or
+//!   under a transform that is not a translation, drawn from their curves.
+//!
+//! What is kept across frames:
+//!
+//! - each paint chunk's quad records ([`record`]), written once into a
+//!   buffer kept on the GPU ([`words`]) and replayed while the chunk is the
+//!   same; a scroll, a moving translation or a fade writes an entry of the
+//!   property tables (offsets, clips, folded opacity) and no record;
+//! - the frame, in a canvas texture: a frame redraws only what changed
+//!   ([`damage`]), scissored, over what the canvas holds, and is copied to
+//!   the window's surface by one triangle. A frame with nothing changed
+//!   submits nothing;
+//! - effect layers: an effect gets a layer of its own only when it needs one
+//!   (a filter, a mask, a fade over primitives that overlap, a transform of
+//!   what cannot be drawn transformed); else its opacity is multiplied into
+//!   its primitives and they draw straight. A layer whose content did not
+//!   change is composited as it was kept.
+//!
+//! Every pipeline is built when the renderer is made, bind groups are made
+//! again only when a buffer or texture they hold is replaced, and no pixel
+//! is touched by the CPU.
 
+mod arena;
 mod atlas;
+mod chunks;
+mod cold;
+mod damage;
+mod frame;
+pub(crate) mod path;
+mod record;
+mod slug;
+#[cfg(test)]
+mod tests;
+mod words;
+mod world;
+
+pub use self::world::RASTER_BUDGET;
 
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use cosmic_text::{CacheKey, SwashContent};
-use tiny_skia::Pixmap;
-
-use self::atlas::{Atlas, Slot};
+use self::arena::Scratch;
+use self::atlas::{Atlas, Made, Slot};
+use self::chunks::Kept;
+use self::damage::Rect;
+use self::frame::{CachedLayer, FrameData, MaskJob};
+use self::path::{ComputePipelines, Paint, Paths};
+use self::slug::{SLUG, SlugKey, Slugs};
+use self::words::{Table, Words};
 use crate::cache::FrameCache;
 use crate::color::Color;
-use crate::convert::{i32_to_f32, u32_to_f32};
+use crate::convert::u32_to_f32;
 use crate::geometry::Bounds;
 use crate::icon::Icon;
-use crate::image::ImageSource;
+use crate::image::{ImageSource, Pixels};
 use crate::inspect::Raster;
-use crate::paint::grow;
-use crate::scene::{Clip, Gradient, Group, Held, Item, PixelRect, Renderer, Scene};
-use crate::shape::{PathCommand, Shape};
-use crate::style::{Corners, Filter};
-use crate::text::TextSystem;
+use crate::scene::{Changed, ChunkId, Drawn, Held, Renderer, Scene};
+use crate::shape::{Draw as PathDraw, Path, PathStyle, Stroke};
+use crate::style::Corners;
+use crate::text::gamma::{GammaParams, MaskGamma};
+use crate::text::settings::Subpixel;
+use crate::text::{Coverage, GlyphContent, GlyphKey, Glyphs};
 
-/// vec4s per primitive (`PRIM` in the shader).
-const PRIM: usize = 16;
-/// Uniform offsets must be multiples of this.
-const UNIFORM_STRIDE: u64 = 256;
-
-const KIND_SOLID: f32 = 0.0;
-const KIND_SHADOW: f32 = 1.0;
-const KIND_GRADIENT: f32 = 2.0;
-const KIND_MONO: f32 = 3.0;
-const KIND_COLOR: f32 = 4.0;
-const KIND_IMAGE: f32 = 5.0;
-const KIND_RASTER: f32 = 6.0;
-const KIND_LAYER: f32 = 7.0;
-const KIND_TEXT_THROUGH: f32 = 8.0;
+/// The largest text, in device pixels per em, drawn in subpixel (LCD)
+/// coverage: Skia's `SK_MAX_SIZE_FOR_LCDTEXT`.
+const MAX_LCD_PPEM: f32 = 48.0;
+/// The largest text kept as bitmaps in the atlas; larger is drawn as
+/// curves (glifo's cap, ADR-0016).
+const MAX_ATLAS_PPEM: f32 = 128.0;
+/// Bytes of globals a pass reads (`Globals` in `shaders.wgsl`).
+const GLOBALS: u64 = 32;
 
 /// Why the GPU renderer could not start.
 #[derive(Debug)]
@@ -61,14 +95,49 @@ impl std::fmt::Display for GpuError {
 
 impl std::error::Error for GpuError {}
 
+/// How a renderer is made: what tests vary.
+#[derive(Clone, Copy, Debug)]
+pub struct GpuOptions {
+    /// Use dual-source blending where the adapter has it (subpixel text);
+    /// off, every primitive blends by its alpha and text is grey.
+    pub dual_source: bool,
+    /// An atlas page's side, in pixels (at most the adapter's texture size).
+    pub atlas_side: u32,
+    /// The most pages an atlas holds before it evicts one.
+    pub max_pages: u32,
+}
+
+impl Default for GpuOptions {
+    fn default() -> Self {
+        Self {
+            dual_source: true,
+            atlas_side: 1024,
+            max_pages: 8,
+        }
+    }
+}
+
 /// A window's surface and the frame being drawn into it.
 struct Window {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     frame: Option<wgpu::SurfaceTexture>,
+    /// The canvas was copied onto this frame's texture.
+    blitted: bool,
 }
 
-/// Which atlas page a raster went to.
+/// The frame as drawn, kept across frames: only damage is drawn into it.
+struct Canvas {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    /// What reads it onto the surface.
+    blit: wgpu::BindGroup,
+    size: (u32, u32),
+    /// The background it was cleared to; another redraws it whole.
+    background: Option<[u8; 4]>,
+}
+
+/// Which atlas a raster went to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
     Mono,
@@ -83,21 +152,44 @@ struct Placed {
     height: u32,
     left: i32,
     top: i32,
-    used: u64,
 }
 
+/// A glyph as the atlas holds it: its key, the coverage it was drawn in,
+/// and, for a colour glyph that paints with the text's colour, that colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct GlyphSlot {
+    key: GlyphKey,
+    coverage: Coverage,
+    foreground: Option<[u8; 4]>,
+}
+
+/// An icon as the coverage atlas holds it: tinted when drawn, so its colour
+/// is not part of it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 struct IconKey {
     icon: Icon,
     size: u32,
-    rgba: [u8; 4],
     stroke: u32,
 }
 
+/// A texture an instance reads beside the atlases, with the bind group
+/// that holds it, made once with it.
 struct Texture {
     _texture: wgpu::Texture,
     view: wgpu::TextureView,
+    bind: wgpu::BindGroup,
     size: (u32, u32),
+}
+
+impl Texture {
+    fn bytes(&self) -> usize {
+        usize::try_from(
+            u64::from(self.size.0)
+                .saturating_mul(u64::from(self.size.1))
+                .saturating_mul(4),
+        )
+        .unwrap_or(0)
+    }
 }
 
 /// An image on the GPU; holds the image so its address names no other.
@@ -106,100 +198,238 @@ struct ImageTexture {
     texture: Texture,
 }
 
-/// Shapes rasterised once, wherever they are drawn.
-struct ShapeRaster {
-    texture: Texture,
-}
-
-/// The texture an instance reads beside the atlases.
+/// The texture a quad reads beside the atlases.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Extra {
     None,
     Image(usize),
-    Shapes(u64),
-    Layer(usize),
+    /// An effect's layer.
+    Layer(u32),
+    /// A chunk's text-through mask.
+    Mask(ChunkId, u32),
 }
 
-struct Draw {
-    extra: Extra,
+/// A run of instances of one pipeline.
+#[derive(Clone, Debug, PartialEq)]
+enum Op {
+    /// Quads: instances are positions in the index buffer.
+    Quads {
+        extra: Extra,
+        instances: std::ops::Range<u32>,
+    },
+    Path(std::ops::Range<u32>),
+    Slug(std::ops::Range<u32>),
+    /// An opaque rectangle covering the part it is drawn in, written
+    /// without blending: the quad instance.
+    Fill(u32),
+    /// A data chunk's draws (ADR-0018), by their place in this frame's.
+    Data(u32),
+}
+
+/// An icon rasterized into a coverage page: the page and the path
+/// instances that draw it.
+struct MaskDraw {
+    page: u32,
     instances: std::ops::Range<u32>,
 }
 
-enum Target {
-    Main,
-    Layer(usize),
+/// Every pipeline, built when the renderer is made (ADR-0016).
+struct Pipelines {
+    quad: wgpu::RenderPipeline,
+    /// Opaque rectangles over a whole part, not blended ([`Op::Fill`]).
+    fill: wgpu::RenderPipeline,
+    path: wgpu::RenderPipeline,
+    /// Paths into an R8 coverage page (icons).
+    mask: wgpu::RenderPipeline,
+    slug_banded: wgpu::RenderPipeline,
+    slug_full: wgpu::RenderPipeline,
+    /// The canvas onto the surface.
+    blit: wgpu::RenderPipeline,
+    compute: ComputePipelines,
 }
 
-struct Pass {
-    target: Target,
-    origin: (i32, i32),
-    clear: wgpu::Color,
-    draws: Vec<Draw>,
+struct Layouts {
+    quad: wgpu::BindGroupLayout,
+    extra: wgpu::BindGroupLayout,
+    path: wgpu::BindGroupLayout,
+    compute: wgpu::BindGroupLayout,
+    slug: wgpu::BindGroupLayout,
+    blit: wgpu::BindGroupLayout,
 }
 
-/// Turns a scene into instances, stops and passes.
+/// A bind group and the generations of what it holds.
+struct Cached {
+    key: Vec<u64>,
+    group: wgpu::BindGroup,
+}
+
 #[derive(Default)]
-struct Encoder {
-    prims: Vec<f32>,
-    stops: Vec<f32>,
-    passes: Vec<Pass>,
-    /// The region each layer of this frame covers.
-    layers: Vec<PixelRect>,
-    /// The part of the scene drawn.
-    viewport: PixelRect,
+struct BindGroups {
+    quad: Option<Cached>,
+    path: Option<Cached>,
+    compute: Option<Cached>,
+    slug: Option<Cached>,
 }
 
-/// One primitive's sixteen vec4s.
-struct Prim([[f32; 4]; PRIM]);
+/// Ids handed out and given back (a chunk's state slot).
+#[derive(Default)]
+struct Ids {
+    free: Vec<u32>,
+    /// One past the highest handed out; 0 is the root's.
+    next: u32,
+}
 
-impl Prim {
-    fn new(kind: f32, quad: [f32; 4]) -> Self {
-        let mut f = [[0.0; 4]; PRIM];
-        f[0] = quad;
-        f[1] = [kind, 0.0, 0.0, 0.0];
-        // No clip.
-        f[7] = [0.0, 0.0, -1.0, -1.0];
-        Self(f)
+impl Ids {
+    fn take(&mut self) -> u32 {
+        self.free.pop().unwrap_or_else(|| {
+            self.next = self.next.max(1).saturating_add(1);
+            self.next.saturating_sub(1)
+        })
+    }
+
+    fn give(&mut self, id: u32) {
+        if id != 0 {
+            self.free.push(id);
+        }
+    }
+
+    fn len(&self) -> u32 {
+        self.next.max(1)
     }
 }
 
 /// The GPU renderer, for a window or headless.
 pub struct GpuRenderer {
+    /// What it was made from, to make it again when its device is lost
+    /// (ADR-0015's invariant 7).
+    instance: wgpu::Instance,
+    options: GpuOptions,
+    /// Set by the device's lost callback (a driver reset, a GPU removed).
+    lost: Arc<std::sync::atomic::AtomicBool>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
-    pipeline: wgpu::RenderPipeline,
-    globals_layout: wgpu::BindGroupLayout,
-    extra_layout: wgpu::BindGroupLayout,
+    /// Dual-source blending is on: subpixel text can be drawn.
+    dual_source: bool,
+    pipelines: Pipelines,
+    layouts: Layouts,
     sampler: wgpu::Sampler,
     /// A transparent pixel, for draws that read no extra texture.
-    blank: wgpu::BindGroup,
+    blank: Texture,
     window: Option<Window>,
+    canvas: Option<Canvas>,
     mono: Atlas,
     color: Atlas,
-    glyphs: HashMap<CacheKey, Option<Placed>>,
+    glyphs: foldhash::HashMap<GlyphSlot, Option<Placed>>,
+    /// Which colour glyphs take the text's colour (keyed by it).
+    foreground: foldhash::HashMap<GlyphKey, bool>,
+    /// The gamma table glyph coverage is corrected by, and what it was made from.
+    gamma_texture: wgpu::Texture,
+    gamma_view: wgpu::TextureView,
+    gamma: GammaParams,
+    /// Text is thickened as macOS thickens it (curve text keys on size then).
+    darkened: bool,
+    /// The stripe order subpixel text is drawn in, when it is.
+    lcd: Option<Subpixel>,
+    /// The text settings' generation the glyphs and table were made at.
+    text_generation: Option<u64>,
     icons: HashMap<IconKey, Option<Placed>>,
+    /// Icons rasterized and not yet drawn into their page.
+    masks: Vec<MaskDraw>,
     images: FrameCache<usize, Option<ImageTexture>>,
-    shapes: FrameCache<u64, Option<ShapeRaster>>,
-    /// Layer textures kept for the next frames, by size: as many as the
-    /// last two frames used at once.
-    layer_pool: Vec<Texture>,
-    /// The most layers one scene used this frame, and in the frame before.
-    layers_peak: (usize, usize),
     /// Time spent waiting for the surface's next texture, since last asked.
     waited: std::time::Duration,
-    prim_buffer: wgpu::Buffer,
-    stop_buffer: wgpu::Buffer,
-    globals_buffer: wgpu::Buffer,
+    /// The chunks' records and, one word an instance, where each starts.
+    records: Words,
+    index: Words,
+    /// The property tables (`props` in `shaders.wgsl`) on the GPU, and as
+    /// the CPU keeps them.
+    props: Table,
+    tables: frame::Tables,
+    /// The last frame's plan, which the next one brings up to date.
+    planned: Option<frame::Plan>,
+    /// Each frame planned from what changed is compared with one planned
+    /// whole (`GUI_COLD_CHECK`).
+    cold_plan: bool,
+    /// The images kept chunks show, and how many show each.
+    image_refs: foldhash::HashMap<usize, u32>,
+    /// Chunks drawn for this frame only (an overlay's).
+    transient_ids: Vec<ChunkId>,
+    /// This frame went over the whole scene: what it did not hold leaves.
+    swept: bool,
+    /// Each chunk kept on the GPU, by id.
+    kept: foldhash::HashMap<ChunkId, Kept>,
+    /// State slots, one a chunk.
+    slots: Ids,
+    /// Bumped at each encoding: a chunk's encoding has its own.
+    epoch: u64,
+    /// Records, instances and state slots of this frame only, given back
+    /// when it ends.
+    transient: Vec<words::Span>,
+    transient_index: Vec<words::Span>,
+    transient_slots: Vec<u32>,
+    /// Text-through masks to draw before what reads them.
+    pending_masks: Vec<MaskJob>,
+    /// What each part of the canvas shows: an entry's signature and the
+    /// pixels it covers (the damage of the next frame is what differs).
+    shown: foldhash::HashMap<u64, (u64, Rect)>,
+    /// Layers kept with what they hold, and the effects the last frame
+    /// drew in a layer (a layer of any other is given back).
+    layers: foldhash::HashMap<u32, CachedLayer>,
+    layered: foldhash::HashSet<u32>,
+    /// Whether an effect's primitives overlap, by what they were.
+    overlaps: foldhash::HashMap<u32, (u64, bool)>,
+    /// This frame's tables for paths and curve text.
+    fr: FrameData,
+    pclips: Scratch,
+    stops: Scratch,
+    slug_instances: Scratch,
+    globals: Scratch,
+    /// The globals as last written.
+    globals_shown: Vec<u8>,
+    /// Bytes between two passes' globals (the adapter's uniform alignment).
+    uniform_stride: u64,
+    /// Data chunks (ADR-0018): their kinds, GPU state and data.
+    data: crate::chunk::runtime::Runtime,
+    /// Canvases' tiles and re-anchored paths (ADR-0017).
+    world: world::WorldTiles,
+    paths: Paths,
+    slugs: Slugs,
+    /// Whether banded curve text matched the full scan on this adapter
+    /// (asked once, at first use).
+    banded_ok: Option<bool>,
+    bind_groups: BindGroups,
+    /// Bind groups made since the renderer was: none in a steady frame.
+    bind_groups_made: u64,
+    /// Glyphs and icons rasterized since the renderer was made.
+    rasters: u64,
+    /// What the last frame did.
+    drawn: Drawn,
+    /// An overlay was drawn over this frame, and over the last.
+    overlaid: (bool, bool),
     frame: u64,
 }
 
 impl GpuRenderer {
+    /// Wait for chunks' reads and send what came back; whether any are
+    /// still out (the chunk tests).
+    #[cfg(test)]
+    pub(crate) fn wait_reads(&mut self) -> bool {
+        self.data.deliver_reads(&self.device, true)
+    }
+
+    /// The device, queue and data-chunk runtime, for the chunk tests.
+    #[cfg(test)]
+    pub(crate) fn chunk_probe(&self) -> (&wgpu::Device, &wgpu::Queue, &crate::chunk::runtime::Runtime) {
+        (&self.device, &self.queue, &self.data)
+    }
+
     /// A renderer drawing into `window`.
     ///
     /// # Errors
     ///
-    /// When no adapter or device answers, or the surface cannot be made.
+    /// When no adapter or device answers, the adapter cannot run compute,
+    /// or the surface cannot be made.
     pub fn for_window(window: Arc<winit::window::Window>) -> Result<Self, GpuError> {
         let instance = instance();
         let size = window.inner_size();
@@ -214,22 +444,24 @@ impl GpuRenderer {
         }))
         .map_err(|e| GpuError(format!("adapter: {e}")))?;
         let caps = surface.get_capabilities(&adapter);
-        // Blending happens in the sRGB-encoded values, as tiny-skia and
-        // browsers blend: never an sRGB view, which would blend in linear light.
+        // Blending happens in the sRGB-encoded values, as browsers blend:
+        // never an sRGB view, which would blend in linear light.
         let format = caps
             .formats
             .iter()
             .copied()
             .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .ok_or_else(|| GpuError("no 8-bit unorm surface format".to_owned()))?;
-        let mut renderer = Self::with_adapter(&adapter, format)?;
+        let mut renderer = Self::with_adapter(&instance, &adapter, format, GpuOptions::default())?;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: wgpu::PresentMode::AutoVsync,
-            desired_maximum_frame_latency: 2,
+            // One frame in flight: what is drawn shows at the next vsync
+            // (ADR-0016's latency of one frame).
+            desired_maximum_frame_latency: 1,
             alpha_mode: caps
                 .alpha_modes
                 .iter()
@@ -244,175 +476,517 @@ impl GpuRenderer {
             surface,
             config,
             frame: None,
+            blitted: false,
         });
         Ok(renderer)
     }
 
-    /// A renderer with no window: it draws only what [`Renderer::capture`] reads back.
+    /// A renderer with no window: it draws into its canvas, and
+    /// [`Renderer::capture`] reads a scene back.
     ///
     /// # Errors
     ///
-    /// When no adapter or device answers.
+    /// When no adapter or device answers, or the adapter cannot run compute.
     pub fn headless() -> Result<Self, GpuError> {
+        Self::headless_with(GpuOptions::default())
+    }
+
+    /// [`Self::headless`], made as `options` say.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::headless`].
+    pub fn headless_with(options: GpuOptions) -> Result<Self, GpuError> {
         let instance = instance();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .map_err(|e| GpuError(format!("adapter: {e}")))?;
-        Self::with_adapter(&adapter, wgpu::TextureFormat::Rgba8Unorm)
+        Self::with_adapter(&instance, &adapter, wgpu::TextureFormat::Rgba8Unorm, options)
     }
 
-    fn with_adapter(adapter: &wgpu::Adapter, format: wgpu::TextureFormat) -> Result<Self, GpuError> {
+    /// Whether its device was lost: nothing it holds draws any more, and
+    /// [`Self::rebuild`] makes it anew.
+    #[must_use]
+    pub fn lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Lose the device, as a driver reset would (tests, the devtools).
+    pub fn lose(&self) {
+        self.device.destroy();
+        // The lost callback runs once the queue is drained.
+        self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
+    }
+
+    /// Make everything on a new device (ADR-0015's invariant 7): the same
+    /// instance and, for a window, the same surface, configured again. What
+    /// it kept (chunks, atlases, layers, images) is gone; the next frame
+    /// encodes and rasterizes all of it again, drawing the canvas whole.
+    ///
+    /// # Errors
+    ///
+    /// When no adapter or device answers yet (the GPU is still resetting);
+    /// it is left as it was, to try again.
+    pub fn rebuild(&mut self) -> Result<(), GpuError> {
+        let compatible = self.window.as_ref().map(|w| &w.surface);
+        let adapter = pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
+            compatible_surface: compatible,
+            ..Default::default()
+        }))
+        .map_err(|e| GpuError(format!("adapter: {e}")))?;
+        let mut fresh = Self::with_adapter(&self.instance, &adapter, self.format, self.options)?;
+        if let Some(mut w) = self.window.take() {
+            // A texture of the lost device is never presented.
+            w.frame = None;
+            w.blitted = false;
+            w.surface.configure(&fresh.device, &w.config);
+            fresh.window = Some(w);
+        }
+        fresh.frame = self.frame;
+        *self = fresh;
+        Ok(())
+    }
+
+    #[expect(clippy::too_many_lines, reason = "every pipeline and layout, made once")]
+    fn with_adapter(
+        instance: &wgpu::Instance,
+        adapter: &wgpu::Adapter,
+        format: wgpu::TextureFormat,
+        options: GpuOptions,
+    ) -> Result<Self, GpuError> {
+        let needed = wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::INDIRECT_EXECUTION;
+        if !adapter.get_downlevel_capabilities().flags.contains(needed) {
+            return Err(GpuError("the adapter cannot run compute shaders".to_owned()));
+        }
+        let dual_source = options.dual_source && adapter.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING);
+        let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gui"),
-            required_limits: wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits()),
+            // Timestamps time data chunks' passes where the adapter has them (ADR-0018).
+            required_features: if dual_source {
+                wgpu::Features::DUAL_SOURCE_BLENDING
+            } else {
+                wgpu::Features::empty()
+            } | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY),
+            required_limits: limits.clone(),
             ..Default::default()
         }))
         .map_err(|e| GpuError(format!("device: {e}")))?;
-        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gui shaders"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders.wgsl").into()),
-        });
-        let texture_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_lost = Arc::clone(&lost);
+        device.set_device_lost_callback(move |_, _| on_lost.store(true, std::sync::atomic::Ordering::Release));
+        let texture_entry = |binding: u32, dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
             ty: wgpu::BindingType::Texture {
                 sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
+                view_dimension: dimension,
                 multisampled: false,
             },
             count: None,
         };
-        let storage_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+        let storage = |binding: u32, visibility: wgpu::ShaderStages, read_only: bool| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            visibility,
             ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                ty: wgpu::BufferBindingType::Storage { read_only },
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
         };
-        let globals_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gui globals"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: wgpu::BufferSize::new(16),
+        let globals_entry = |size: u64| wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(size),
+            },
+            count: None,
+        };
+        let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
+        let d2 = wgpu::TextureViewDimension::D2;
+        let array = wgpu::TextureViewDimension::D2Array;
+        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries,
+            })
+        };
+        let layouts = Layouts {
+            quad: layout(
+                "gui quads",
+                &[
+                    globals_entry(GLOBALS),
+                    storage(1, vf, true),
+                    storage(2, vf, true),
+                    storage(3, vf, true),
+                    texture_entry(4, array),
+                    texture_entry(5, array),
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-                storage_entry(1),
-                storage_entry(2),
-                texture_entry(3),
-                texture_entry(4),
-                wgpu::BindGroupLayoutEntry {
-                    binding: 5,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
+                    texture_entry(7, d2),
+                ],
+            ),
+            extra: layout("gui extra", &[texture_entry(0, d2)]),
+            path: layout(
+                "gui paths",
+                &[
+                    globals_entry(16),
+                    storage(1, vf, true),
+                    storage(2, vf, true),
+                    storage(3, vf, true),
+                    storage(4, vf, true),
+                    storage(5, vf, true),
+                    storage(6, vf, true),
+                    storage(7, vf, true),
+                ],
+            ),
+            compute: {
+                let c = wgpu::ShaderStages::COMPUTE;
+                layout(
+                    "gui path passes",
+                    &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: c,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: wgpu::BufferSize::new(32),
+                            },
+                            count: None,
+                        },
+                        storage(1, c, true),
+                        storage(2, c, true),
+                        storage(3, c, true),
+                        storage(4, c, false),
+                        storage(5, c, false),
+                        storage(6, c, false),
+                        storage(7, c, false),
+                        storage(8, c, false),
+                        storage(9, c, false),
+                    ],
+                )
+            },
+            slug: layout(
+                "gui curve text",
+                &[
+                    globals_entry(16),
+                    storage(1, vf, true),
+                    storage(2, vf, true),
+                    storage(3, vf, true),
+                    texture_entry(4, d2),
+                ],
+            ),
+            blit: layout("gui canvas", &[texture_entry(0, d2)]),
+        };
+        let pipeline_layout = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: groups,
+                immediate_size: 0,
+            })
+        };
+        let quad_layout = pipeline_layout("gui quads", &[Some(&layouts.quad), Some(&layouts.extra)]);
+        let path_layout = pipeline_layout("gui paths", &[Some(&layouts.path)]);
+        let compute_layout = pipeline_layout("gui path passes", &[Some(&layouts.compute)]);
+        let slug_layout = pipeline_layout("gui curve text", &[Some(&layouts.slug)]);
+        let blit_layout = pipeline_layout("gui canvas", &[Some(&layouts.blit)]);
+        let common = include_str!("common.wgsl");
+        let stops = include_str!("stops.wgsl");
+        let quad_module = module(
+            &device,
+            "gui quads",
+            &[common, include_str!("shaders.wgsl")],
+            &[("fs_main", "Varying", "shade")],
+            dual_source,
+        );
+        let path_module = module(
+            &device,
+            "gui paths",
+            &[common, stops, include_str!("path_render.wgsl")],
+            &[("fs_path", "PathVarying", "shade_path")],
+            dual_source,
+        );
+        let slug_module = module(
+            &device,
+            "gui curve text",
+            &[common, include_str!("slug.wgsl")],
+            &[
+                ("fs_slug", "SlugVarying", "shade_slug_banded"),
+                ("fs_slug_full", "SlugVarying", "shade_slug_full"),
             ],
+            dual_source,
+        );
+        let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gui canvas"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("blit.wgsl").into()),
         });
-        let extra_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("gui extra"),
-            entries: &[texture_entry(0)],
+        let compute_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gui path passes"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("path_compute.wgsl").into()),
         });
-        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("gui"),
-            bind_group_layouts: &[Some(&globals_layout), Some(&extra_layout)],
-            immediate_size: 0,
-        });
-        let blend = wgpu::BlendComponent {
+        let alpha = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
             operation: wgpu::BlendOperation::Add,
         };
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("gui primitives"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &module,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
+        // What each channel keeps of the target is the second output's
+        // (ADR-0019): one blend state for every primitive.
+        let blend = wgpu::BlendState {
+            color: if dual_source {
+                wgpu::BlendComponent {
+                    dst_factor: wgpu::BlendFactor::OneMinusSrc1,
+                    ..alpha
+                }
+            } else {
+                alpha
             },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleStrip,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState {
-                        color: blend,
-                        alpha: blend,
-                    }),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+            alpha,
+        };
+        let render = |label: &str,
+                      layout: &wgpu::PipelineLayout,
+                      module: &wgpu::ShaderModule,
+                      vs: &str,
+                      fs: &str,
+                      format: wgpu::TextureFormat,
+                      blend: Option<wgpu::BlendState>,
+                      topology: wgpu::PrimitiveTopology| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module,
+                    entry_point: Some(vs),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module,
+                    entry_point: Some(fs),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let strip = wgpu::PrimitiveTopology::TriangleStrip;
+        // Coverage onto coverage: the union of an icon's parts.
+        let union = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::OneMinusSrc,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let pipelines = Pipelines {
+            quad: render(
+                "gui quads",
+                &quad_layout,
+                &quad_module,
+                "vs_main",
+                "fs_main",
+                format,
+                Some(blend),
+                strip,
+            ),
+            fill: render(
+                "gui fills",
+                &quad_layout,
+                &quad_module,
+                "vs_main",
+                "fs_fill",
+                format,
+                None,
+                strip,
+            ),
+            path: render(
+                "gui paths",
+                &path_layout,
+                &path_module,
+                "vs_path",
+                "fs_path",
+                format,
+                Some(blend),
+                strip,
+            ),
+            mask: render(
+                "gui path coverage",
+                &path_layout,
+                &path_module,
+                "vs_path",
+                "fs_mask",
+                wgpu::TextureFormat::R8Unorm,
+                Some(wgpu::BlendState {
+                    color: union,
+                    alpha: union,
+                }),
+                strip,
+            ),
+            slug_banded: render(
+                "gui curve text",
+                &slug_layout,
+                &slug_module,
+                "vs_slug",
+                "fs_slug",
+                format,
+                Some(blend),
+                strip,
+            ),
+            slug_full: render(
+                "gui curve text, full scan",
+                &slug_layout,
+                &slug_module,
+                "vs_slug",
+                "fs_slug_full",
+                format,
+                Some(blend),
+                strip,
+            ),
+            blit: render(
+                "gui canvas",
+                &blit_layout,
+                &blit_module,
+                "vs_blit",
+                "fs_blit",
+                format,
+                None,
+                wgpu::PrimitiveTopology::TriangleList,
+            ),
+            compute: ComputePipelines::new(&device, &compute_layout, &compute_module),
+        };
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("gui linear"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let blank_texture = texture(
+        let blank = texture(
             &device,
             &queue,
+            &layouts.extra,
             (1, 1),
             wgpu::TextureFormat::Rgba8Unorm,
             Some(&[0, 0, 0, 0]),
         );
-        let blank = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gui blank"),
-            layout: &extra_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(&blank_texture.view),
-            }],
+        let gamma = GammaParams::linux();
+        let gamma_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gui gamma"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
-        let buffer = |label: &str, usage: wgpu::BufferUsages, size: u64| {
-            device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some(label),
-                size,
-                usage: usage | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            })
-        };
+        let gamma_view = gamma_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let side = options.atlas_side.clamp(64, limits.max_texture_dimension_2d);
+        let max_pages = options.max_pages.clamp(1, limits.max_texture_array_layers.min(64));
+        let storage_usage = wgpu::BufferUsages::STORAGE;
         Ok(Self {
-            mono: Atlas::new(&device, wgpu::TextureFormat::R8Unorm, 1),
-            color: Atlas::new(&device, wgpu::TextureFormat::Rgba8Unorm, 4),
-            prim_buffer: buffer("gui prims", wgpu::BufferUsages::STORAGE, 1 << 16),
-            stop_buffer: buffer("gui stops", wgpu::BufferUsages::STORAGE, 1 << 12),
-            globals_buffer: buffer("gui globals", wgpu::BufferUsages::UNIFORM, UNIFORM_STRIDE * 16),
+            instance: instance.clone(),
+            options,
+            lost,
+            dual_source,
+            foreground: foldhash::HashMap::default(),
+            gamma_texture,
+            gamma_view,
+            gamma,
+            darkened: false,
+            lcd: None,
+            text_generation: None,
+            mono: Atlas::new(
+                &device,
+                "gui coverage atlas",
+                wgpu::TextureFormat::R8Unorm,
+                1,
+                side,
+                max_pages,
+            ),
+            color: Atlas::new(
+                &device,
+                "gui colour atlas",
+                wgpu::TextureFormat::Rgba8Unorm,
+                4,
+                side,
+                max_pages,
+            ),
+            records: Words::new(&device, "gui records", 1 << 16),
+            index: Words::new(&device, "gui instances", 1 << 12),
+            props: Table::new(&device, "gui properties"),
+            tables: frame::Tables::default(),
+            planned: None,
+            cold_plan: std::env::var_os("GUI_COLD_CHECK").is_some(),
+            image_refs: foldhash::HashMap::default(),
+            transient_ids: Vec::new(),
+            swept: false,
+            kept: foldhash::HashMap::default(),
+            slots: Ids::default(),
+            epoch: 0,
+            transient: Vec::new(),
+            transient_index: Vec::new(),
+            transient_slots: Vec::new(),
+            pending_masks: Vec::new(),
+            shown: foldhash::HashMap::default(),
+            layers: foldhash::HashMap::default(),
+            layered: foldhash::HashSet::default(),
+            overlaps: foldhash::HashMap::default(),
+            fr: FrameData::default(),
+            pclips: Scratch::new(&device, "gui clips", storage_usage, 1 << 12),
+            stops: Scratch::new(&device, "gui stops", storage_usage, 1 << 12),
+            slug_instances: Scratch::new(&device, "gui curve glyphs", storage_usage, 1 << 12),
+            globals: Scratch::new(&device, "gui globals", wgpu::BufferUsages::UNIFORM, 256 * 16),
+            globals_shown: Vec::new(),
+            uniform_stride: u64::from(limits.min_uniform_buffer_offset_alignment).max(GLOBALS),
+            data: crate::chunk::runtime::Runtime::new(
+                &device,
+                &queue,
+                format,
+                limits.min_uniform_buffer_offset_alignment,
+            ),
+            world: world::WorldTiles::default(),
+            paths: Paths::new(&device),
+            slugs: Slugs::new(&device),
+            banded_ok: None,
+            bind_groups: BindGroups::default(),
+            bind_groups_made: 1,
+            rasters: 0,
+            drawn: Drawn::default(),
+            overlaid: (false, false),
             device,
             queue,
             format,
-            pipeline,
-            globals_layout,
-            extra_layout,
+            pipelines,
+            layouts,
             sampler,
             blank,
             window: None,
-            glyphs: HashMap::new(),
+            canvas: None,
+            glyphs: foldhash::HashMap::default(),
             icons: HashMap::new(),
+            masks: Vec::new(),
             images: FrameCache::default(),
-            shapes: FrameCache::default(),
-            layer_pool: Vec::new(),
-            layers_peak: (0, 0),
             waited: std::time::Duration::ZERO,
-            frame: 0,
+            frame: 1,
         })
     }
 
@@ -422,10 +996,26 @@ impl GpuRenderer {
         let size = (size.0.max(1), size.1.max(1));
         if (w.config.width, w.config.height) != size {
             w.frame = None;
+            w.blitted = false;
             w.config.width = size.0;
             w.config.height = size.1;
             w.surface.configure(&self.device, &w.config);
         }
+    }
+
+    /// Take the window's next frame texture now, waiting for the display
+    /// if it has none free (ADR-0015: the render thread's vsync); how long
+    /// it waited, or `None` with no window or no texture. The frame is
+    /// presented when it ends, drawn into or not.
+    pub fn acquire(&mut self) -> Option<std::time::Duration> {
+        let before = self.waited;
+        self.window_view()?;
+        Some(self.waited.saturating_sub(before))
+    }
+
+    /// Whether a window frame texture is held for this frame.
+    fn holds_frame(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.frame.is_some())
     }
 
     /// The window's frame texture, taken from the surface when first asked for in a frame.
@@ -445,682 +1035,299 @@ impl GpuRenderer {
                 _ => return None,
             };
             w.frame = Some(texture);
+            w.blitted = false;
             self.waited = self.waited.saturating_add(asked.elapsed());
         }
         let frame = w.frame.as_ref()?;
         Some(frame.texture.create_view(&wgpu::TextureViewDescriptor::default()))
     }
 
-    /// Draw `scene` into `view` (`scene.size`), over what it holds unless
-    /// the scene has a background.
-    fn draw(&mut self, scene: &Scene, text: &mut TextSystem, view: &wgpu::TextureView) {
-        self.draw_part(scene, text, view, (0, 0), scene.size);
-    }
-
-    /// Draw the part of `scene` from `origin`, `size` physical pixels, into `view`.
-    fn draw_part(
-        &mut self,
-        scene: &Scene,
-        text: &mut TextSystem,
-        view: &wgpu::TextureView,
-        origin: (i32, i32),
-        size: (u32, u32),
-    ) {
-        // Rasters first: a page that has to grow empties, so make them again.
-        for _ in 0..3 {
-            if self.prepare(&scene.items, scene, text) {
-                break;
-            }
+    /// The canvas, `size` and cleared to `background`: made anew (and so
+    /// to be drawn whole) when either differs; whether it was.
+    fn ensure_canvas(&mut self, size: (u32, u32), background: Option<[u8; 4]>) -> bool {
+        let size = (size.0.max(1), size.1.max(1));
+        if let Some(c) = self.canvas.as_mut()
+            && c.size == size
+        {
+            let same = c.background == background;
+            c.background = background;
+            return !same;
         }
-        let mut enc = Encoder {
-            viewport: PixelRect {
-                x: origin.0,
-                y: origin.1,
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("gui canvas"),
+            size: wgpu::Extent3d {
                 width: size.0,
                 height: size.1,
+                depth_or_array_layers: 1,
             },
-            ..Encoder::default()
-        };
-        let draws = self.encode(&mut enc, &scene.items, scene);
-        enc.passes.push(Pass {
-            target: Target::Main,
-            origin,
-            clear: scene.background.map_or(wgpu::Color::TRANSPARENT, |c| {
-                let c = c.to_rgba8().map(|v| f64::from(v) / 255.0);
-                let [r, g, b, a] = c;
-                wgpu::Color {
-                    r: r * a,
-                    g: g * a,
-                    b: b * a,
-                    a,
-                }
-            }),
-            draws,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
         });
-        let load_main = scene.background.is_none();
-        let layers: Vec<Texture> = enc
-            .layers
-            .iter()
-            .map(|r| self.take_layer((r.width, r.height)))
-            .collect();
-        self.layers_peak.0 = self.layers_peak.0.max(layers.len());
-        self.upload(&enc, size, &layers);
-        let globals = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("gui globals"),
-            layout: &self.globals_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: &self.globals_buffer,
-                        offset: 0,
-                        size: wgpu::BufferSize::new(16),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.prim_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.stop_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&self.mono.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(&self.color.view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let blit = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("gui canvas"),
+            layout: &self.layouts.blit,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&view),
+            }],
         });
-        let mut extras: HashMap<Extra, wgpu::BindGroup> = HashMap::new();
-        for pass in &enc.passes {
-            for d in &pass.draws {
-                if d.extra == Extra::None || extras.contains_key(&d.extra) {
-                    continue;
-                }
-                let view = match d.extra {
-                    Extra::None => None,
-                    Extra::Image(k) => self.images.peek(&k).and_then(Option::as_ref).map(|i| &i.texture.view),
-                    Extra::Shapes(k) => self.shapes.peek(&k).and_then(Option::as_ref).map(|s| &s.texture.view),
-                    Extra::Layer(i) => layers.get(i).map(|l| &l.view),
-                };
-                if let Some(view) = view {
-                    extras.insert(
-                        d.extra,
-                        self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                            label: Some("gui extra"),
-                            layout: &self.extra_layout,
-                            entries: &[wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::TextureView(view),
-                            }],
-                        }),
-                    );
-                }
-            }
-        }
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("gui frame"),
+        self.bind_groups_made = self.bind_groups_made.saturating_add(1);
+        self.canvas = Some(Canvas {
+            texture,
+            view,
+            blit,
+            size,
+            background,
         });
-        for (i, pass) in enc.passes.iter().enumerate() {
-            let target = match pass.target {
-                Target::Main => view,
-                Target::Layer(l) => match layers.get(l) {
-                    Some(t) => &t.view,
-                    None => continue,
-                },
-            };
-            let load = match pass.target {
-                Target::Main if load_main => wgpu::LoadOp::Load,
-                _ => wgpu::LoadOp::Clear(pass.clear),
-            };
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("gui pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            rp.set_pipeline(&self.pipeline);
-            let offset = u32::try_from(u64::try_from(i).unwrap_or(0).saturating_mul(UNIFORM_STRIDE)).unwrap_or(0);
-            rp.set_bind_group(0, &globals, &[offset]);
-            for d in &pass.draws {
-                let extra = extras.get(&d.extra).unwrap_or(&self.blank);
-                rp.set_bind_group(1, extra, &[]);
-                rp.draw(0..4, d.instances.clone());
-            }
-        }
-        self.queue.submit([encoder.finish()]);
-        self.layer_pool.extend(layers);
-    }
-
-    /// Make sure every raster `items` draws is on the GPU; false when an
-    /// atlas page had to grow, which empties it (prepare again).
-    fn prepare(&mut self, items: &[Item], scene: &Scene, text: &mut TextSystem) -> bool {
-        for item in items {
-            let ok = match item {
-                Item::Glyph { key, .. } => self.glyph(*key, text).is_ok(),
-                Item::Icon {
-                    icon,
-                    size,
-                    color,
-                    stroke_width,
-                    ..
-                } => self.icon(*icon, *size, *color, *stroke_width).is_ok(),
-                Item::Image { source, .. } => {
-                    self.image(source);
-                    true
-                }
-                Item::Shapes { origin, shapes, .. } => {
-                    self.shapes(*origin, shapes, scene);
-                    true
-                }
-                Item::TextThrough { mask, .. } => self.prepare(mask, scene, text),
-                Item::Group(g) => self.prepare(&g.items, scene, text),
-                _ => true,
-            };
-            if !ok {
-                return false;
-            }
-        }
         true
     }
 
-    /// Room in `page` for `w`×`h`: what the last frames did not use is let
-    /// go first; `Err` when the page grew (and emptied).
-    fn allocate(&mut self, page: Page, w: u32, h: u32) -> Result<Option<Slot>, ()> {
-        let atlas = match page {
-            Page::Mono => &mut self.mono,
-            Page::Color => &mut self.color,
-        };
-        if let Some(slot) = atlas.allocate(w, h) {
-            return Ok(Some(slot));
-        }
-        let frame = self.frame;
-        let stale = |p: &Option<Placed>| p.is_some_and(|p| p.page == page && frame.saturating_sub(p.used) >= 2);
-        let mut freed = Vec::new();
-        self.glyphs.retain(|_, p| {
-            if stale(p) {
-                freed.extend(p.map(|p| p.slot));
-                false
-            } else {
-                true
-            }
-        });
-        self.icons.retain(|_, p| {
-            if stale(p) {
-                freed.extend(p.map(|p| p.slot));
-                false
-            } else {
-                true
-            }
-        });
-        let atlas = match page {
-            Page::Mono => &mut self.mono,
-            Page::Color => &mut self.color,
-        };
-        for s in freed {
-            atlas.free(s);
-        }
-        if let Some(slot) = atlas.allocate(w, h) {
-            return Ok(Some(slot));
-        }
-        if atlas.grow(&self.device) {
-            self.glyphs.retain(|_, p| p.is_none_or(|p| p.page != page));
-            self.icons.retain(|_, p| p.is_none_or(|p| p.page != page));
-            return Err(());
-        }
-        Ok(None)
+    /// Forget what an atlas held on a page it emptied. No chunk kept on the
+    /// GPU reads the page: pages they read are touched every frame.
+    fn evicted(&mut self, atlas: Page, page: u32) {
+        let gone = |p: &Option<Placed>| p.is_some_and(|p| p.page == atlas && p.slot.page == page);
+        self.glyphs.retain(|_, p| !gone(p));
+        self.icons.retain(|_, p| !gone(p));
     }
 
-    fn glyph(&mut self, key: CacheKey, text: &mut TextSystem) -> Result<Option<Placed>, ()> {
+    /// Room in `atlas` for `w`×`h`.
+    fn allocate(&mut self, atlas: Page, w: u32, h: u32) -> Option<Slot> {
         let frame = self.frame;
-        if let Some(p) = self.glyphs.get_mut(&key) {
+        let a = match atlas {
+            Page::Mono => &mut self.mono,
+            Page::Color => &mut self.color,
+        };
+        let (slot, made) = a.allocate(&self.device, &self.queue, w, h, frame)?;
+        if let Made::Evicted(page) = made {
+            self.evicted(atlas, page);
+        }
+        Some(slot)
+    }
+
+    /// Bring the gamma table and the glyphs up to the text settings: a
+    /// change (the user turned subpixel text on) makes them anew, and every
+    /// chunk is encoded again.
+    fn sync_text(&mut self, text: &Glyphs) {
+        if self.text_generation == Some(text.generation()) {
+            return;
+        }
+        let (params, table) = text.gamma();
+        self.gamma = *params;
+        self.upload_gamma(table);
+        let settings = text.settings();
+        self.lcd = settings.subpixel.filter(|_| self.dual_source && settings.antialias);
+        self.darkened = settings.stem_darkening;
+        let mono = &mut self.mono;
+        let color = &mut self.color;
+        for p in self.glyphs.drain().filter_map(|(_, p)| p) {
+            match p.page {
+                Page::Mono => mono.free(p.slot),
+                Page::Color => color.free(p.slot),
+            }
+        }
+        self.foreground.clear();
+        self.text_generation = Some(text.generation());
+    }
+
+    fn upload_gamma(&self, table: &MaskGamma) {
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.gamma_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &table.texture_bytes(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(8),
+            },
+            wgpu::Extent3d {
+                width: 256,
+                height: 8,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// How glyph `key` in `color` is drawn: in subpixel coverage only
+    /// under Chrome's conditions (straight onto the opaque window, at most
+    /// 48 device pixels, not a colour glyph, the user has it on), and for a
+    /// colour glyph that paints with the text's colour, keyed by it.
+    fn glyph_slot(&self, key: &GlyphKey, color: Color, straight: bool) -> GlyphSlot {
+        let coverage = match self.lcd {
+            Some(stripes) if straight && !key.is_color() && f32::from_bits(key.ppem) <= MAX_LCD_PPEM => {
+                Coverage::Lcd(stripes)
+            }
+            _ => Coverage::Gray,
+        };
+        let foreground =
+            (key.is_color() && self.foreground.get(key).copied().unwrap_or(false)).then(|| color.to_rgba8());
+        GlyphSlot {
+            key: *key,
+            coverage,
+            foreground,
+        }
+    }
+
+    fn glyph(&mut self, slot: GlyphSlot, color: Color, text: &mut Glyphs) -> Option<Placed> {
+        let frame = self.frame;
+        if let Some(p) = self.glyphs.get(&slot) {
             if let Some(p) = p {
-                p.used = frame;
+                let atlas = match p.page {
+                    Page::Mono => &mut self.mono,
+                    Page::Color => &mut self.color,
+                };
+                atlas.touch(&p.slot, frame);
             }
-            return Ok(*p);
+            return *p;
         }
-        let Some(image) = text.raster(key) else {
-            self.glyphs.insert(key, None);
-            return Ok(None);
+        self.rasters = self.rasters.saturating_add(1);
+        let Some(image) = text.raster(&slot.key, slot.coverage, color) else {
+            self.glyphs.insert(slot, None);
+            return None;
         };
-        let (w, h) = (image.placement.width, image.placement.height);
+        let (w, h) = (image.width, image.height);
         if w == 0 || h == 0 {
-            self.glyphs.insert(key, None);
-            return Ok(None);
+            self.glyphs.insert(slot, None);
+            return None;
         }
-        let (page, data) = match image.content {
-            SwashContent::Mask => (Page::Mono, image.data),
-            SwashContent::Color | SwashContent::SubpixelMask => {
-                // Straight to premultiplied, as the colour page holds.
-                let mut data = image.data;
-                for [r, g, b, a] in data.as_chunks_mut::<4>().0 {
-                    *r = crate::cpu::mul_u8(*r, *a);
-                    *g = crate::cpu::mul_u8(*g, *a);
-                    *b = crate::cpu::mul_u8(*b, *a);
-                }
-                (Page::Color, data)
-            }
+        // Subpixel coverage sits in the colour atlas too: four bytes a pixel.
+        let page = match image.content {
+            GlyphContent::Mask => Page::Mono,
+            GlyphContent::Color | GlyphContent::Lcd => Page::Color,
         };
-        let Some(slot) = self.allocate(page, w, h)? else {
-            self.glyphs.insert(key, None);
-            return Ok(None);
+        let Some(atlas_slot) = self.allocate(page, w, h) else {
+            self.glyphs.insert(slot, None);
+            return None;
         };
         match page {
-            Page::Mono => self.mono.upload(&self.queue, slot, w, h, &data),
-            Page::Color => self.color.upload(&self.queue, slot, w, h, &data),
+            Page::Mono => self.mono.upload(&self.queue, atlas_slot, w, h, &image.data),
+            Page::Color => self.color.upload(&self.queue, atlas_slot, w, h, &image.data),
         }
         let placed = Placed {
             page,
-            slot,
+            slot: atlas_slot,
             width: w,
             height: h,
-            left: image.placement.left,
-            top: image.placement.top,
-            used: frame,
+            left: image.left,
+            top: image.top,
         };
-        self.glyphs.insert(key, Some(placed));
-        Ok(Some(placed))
+        self.glyphs.insert(slot, Some(placed));
+        Some(placed)
     }
 
-    fn icon(&mut self, icon: Icon, size: u32, color: Color, stroke_width: f32) -> Result<Option<Placed>, ()> {
+    /// Icon `icon` at `size` device pixels in the coverage atlas: rasterized
+    /// once, by the path passes, the first time it is drawn.
+    fn icon(&mut self, icon: Icon, size: u32, stroke_width: f32) -> Option<Placed> {
         let key = IconKey {
             icon,
             size,
-            rgba: color.to_rgba8(),
             stroke: stroke_width.to_bits(),
         };
         let frame = self.frame;
-        if let Some(p) = self.icons.get_mut(&key) {
+        if let Some(p) = self.icons.get(&key) {
             if let Some(p) = p {
-                p.used = frame;
+                self.mono.touch(&p.slot, frame);
             }
-            return Ok(*p);
+            return *p;
         }
-        let Some(pixmap) = crate::icon::rasterise(icon, size, color, stroke_width) else {
+        let Some(drawing) = icon.drawing() else {
             self.icons.insert(key, None);
-            return Ok(None);
+            return None;
         };
-        let (w, h) = (pixmap.width(), pixmap.height());
-        let Some(slot) = self.allocate(Page::Color, w, h)? else {
+        if size == 0 {
             self.icons.insert(key, None);
-            return Ok(None);
+            return None;
+        }
+        let Some(slot) = self.allocate(Page::Mono, size, size) else {
+            self.icons.insert(key, None);
+            return None;
         };
-        self.color.upload(&self.queue, slot, w, h, pixmap.data());
+        self.rasters = self.rasters.saturating_add(1);
+        // The slot starts empty; the parts' coverages add up in it.
+        let n = usize::try_from(size.saturating_mul(size)).unwrap_or(0);
+        self.mono.upload(&self.queue, slot, size, size, &vec![0; n]);
+        let k = u32_to_f32(size) / drawing.view.max(1e-3);
+        let m = [k, 0.0, 0.0, k, u32_to_f32(slot.x), u32_to_f32(slot.y)];
+        let visible = [
+            u32_to_f32(slot.x),
+            u32_to_f32(slot.y),
+            u32_to_f32(slot.x.saturating_add(size)),
+            u32_to_f32(slot.y.saturating_add(size)),
+        ];
+        let paint = Paint {
+            color: [1.0; 4],
+            gradient: None,
+            alpha: 1.0,
+            device_clip: 0,
+            local_clip: 0,
+        };
+        for (part, style) in icon_parts(drawing, stroke_width, Color::WHITE) {
+            if let Some(d) = self
+                .paths
+                .draw(&self.device, &self.queue, &part, &style, m, visible, &paint, true)
+            {
+                self.masks.push(MaskDraw {
+                    page: slot.page,
+                    instances: d.instances,
+                });
+            }
+        }
         let placed = Placed {
-            page: Page::Color,
+            page: Page::Mono,
             slot,
-            width: w,
-            height: h,
+            width: size,
+            height: size,
             left: 0,
             top: 0,
-            used: frame,
         };
         self.icons.insert(key, Some(placed));
-        Ok(Some(placed))
+        Some(placed)
     }
 
-    fn image(&mut self, source: &ImageSource) {
-        let key = std::rc::Rc::as_ptr(&source.0).addr();
-        let (device, queue) = (&self.device, &self.queue);
-        self.images.get_or_insert_with(key, || {
-            let size = source.size();
-            (size.0 > 0 && size.1 > 0).then(|| ImageTexture {
-                _source: source.clone(),
-                texture: texture(
-                    device,
-                    queue,
-                    size,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                    Some(source.0.data()),
-                ),
+    /// `source` on the GPU, marked used this frame; whether it is.
+    fn image(&mut self, source: &ImageSource) -> bool {
+        let key = image_key(source);
+        let (device, queue, layout) = (&self.device, &self.queue, &self.layouts.extra);
+        let made = &mut self.bind_groups_made;
+        self.images
+            .get_or_insert_with(key, || {
+                let size = source.size();
+                (size.0 > 0 && size.1 > 0).then(|| {
+                    *made = made.saturating_add(1);
+                    ImageTexture {
+                        _source: source.clone(),
+                        texture: texture(
+                            device,
+                            queue,
+                            layout,
+                            size,
+                            wgpu::TextureFormat::Rgba8Unorm,
+                            Some(source.0.data()),
+                        ),
+                    }
+                })
             })
-        });
+            .is_some()
     }
 
-    fn shapes(&mut self, origin: (f32, f32), shapes: &[Shape], scene: &Scene) {
-        let Some((key, _, size, transform)) = shape_raster_key(origin, shapes, scene) else {
-            return;
-        };
-        let (device, queue) = (&self.device, &self.queue);
-        self.shapes.get_or_insert_with(key, || {
-            let mut pixmap = Pixmap::new(size.0, size.1)?;
-            crate::cpu::paint_shapes(&mut pixmap, transform, shapes, None);
-            Some(ShapeRaster {
-                texture: texture(
-                    device,
-                    queue,
-                    size,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                    Some(pixmap.data()),
-                ),
-            })
-        });
+    /// A texture `size` to draw a layer or mask into.
+    fn layer_texture(&mut self, size: (u32, u32)) -> Texture {
+        self.bind_groups_made = self.bind_groups_made.saturating_add(1);
+        texture(&self.device, &self.queue, &self.layouts.extra, size, self.format, None)
     }
 
-    /// A layer texture at least `size`, from the pool when one fits.
-    fn take_layer(&mut self, size: (u32, u32)) -> Texture {
-        // Sizes in steps of 128 pixels, so a group that grows reuses its layer.
-        let round = |v: u32| v.div_ceil(128).saturating_mul(128).max(128);
-        let want = (round(size.0), round(size.1));
-        if let Some(i) = self.layer_pool.iter().position(|t| t.size == want) {
-            return self.layer_pool.swap_remove(i);
-        }
-        texture(&self.device, &self.queue, want, self.format, None)
-    }
-
-    fn upload(&mut self, enc: &Encoder, main: (u32, u32), layers: &[Texture]) {
-        let prim_bytes = floats_to_bytes(&enc.prims);
-        let stop_bytes = floats_to_bytes(if enc.stops.is_empty() { &[0.0; 8] } else { &enc.stops });
-        grow_buffer(
-            &self.device,
-            &mut self.prim_buffer,
-            prim_bytes.len().max(16),
-            wgpu::BufferUsages::STORAGE,
-        );
-        grow_buffer(
-            &self.device,
-            &mut self.stop_buffer,
-            stop_bytes.len(),
-            wgpu::BufferUsages::STORAGE,
-        );
-        if !prim_bytes.is_empty() {
-            self.queue.write_buffer(&self.prim_buffer, 0, &prim_bytes);
-        }
-        self.queue.write_buffer(&self.stop_buffer, 0, &stop_bytes);
-        let mut globals = Vec::new();
-        for pass in &enc.passes {
-            let size = match pass.target {
-                Target::Main => main,
-                Target::Layer(i) => layers.get(i).map_or((1, 1), |t| t.size),
-            };
-            let mut block = [0.0_f32; 64];
-            block[0] = u32_to_f32(size.0);
-            block[1] = u32_to_f32(size.1);
-            block[2] = i32_to_f32(pass.origin.0);
-            block[3] = i32_to_f32(pass.origin.1);
-            globals.extend(floats_to_bytes(&block));
-        }
-        grow_buffer(
-            &self.device,
-            &mut self.globals_buffer,
-            globals.len(),
-            wgpu::BufferUsages::UNIFORM,
-        );
-        self.queue.write_buffer(&self.globals_buffer, 0, &globals);
-    }
-
-    /// The instances `items` make, grouped into draws; groups add their passes to `enc`.
-    #[expect(clippy::too_many_lines, reason = "one arm per primitive")]
-    fn encode(&self, enc: &mut Encoder, items: &[Item], scene: &Scene) -> Vec<Draw> {
-        let s = scene.scale;
-        let mut draws: Vec<Draw> = Vec::new();
-        let mut push = |enc: &mut Encoder, prim: Prim, extra: Extra, clip: Option<Clip>| {
-            let mut prim = prim;
-            if let Some(c) = clip {
-                let b = c.bounds.snapped(s);
-                let rect = phys(b, s);
-                prim.0[7] = rect;
-                prim.0[8] = radii(c.radius, s);
-                // Nothing outside the clip is drawn: neither is it shaded.
-                let quad = intersect(prim.0[0], rect);
-                if quad[2] <= 0.0 || quad[3] <= 0.0 {
-                    return;
-                }
-                prim.0[0] = quad;
-            }
-            let index = u32::try_from(enc.prims.len() / (PRIM * 4)).unwrap_or(u32::MAX);
-            for f in prim.0 {
-                enc.prims.extend_from_slice(&f);
-            }
-            match draws.last_mut() {
-                Some(d) if d.extra == extra && d.instances.end == index => d.instances.end = index.saturating_add(1),
-                _ => draws.push(Draw {
-                    extra,
-                    instances: index..index.saturating_add(1),
-                }),
-            }
-        };
-        for item in items {
-            match item {
-                Item::Rect { bounds, color, clip } => {
-                    let rect = phys(*bounds, s);
-                    let mut p = Prim::new(KIND_SOLID, outset(rect, 1.0));
-                    p.0[2] = rgba(*color);
-                    p.0[3] = rect;
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::RoundedRect {
-                    bounds,
-                    radius,
-                    color,
-                    clip,
-                } => {
-                    let rect = phys(*bounds, s);
-                    let mut p = Prim::new(KIND_SOLID, outset(rect, 1.0));
-                    p.0[2] = rgba(*color);
-                    p.0[3] = rect;
-                    p.0[4] = radii(*radius, s);
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::Band {
-                    outer,
-                    outer_radius,
-                    inner,
-                    inner_radius,
-                    color,
-                    clip,
-                } => {
-                    let rect = phys(*outer, s);
-                    let mut p = Prim::new(KIND_SOLID, outset(rect, 1.0));
-                    p.0[2] = rgba(*color);
-                    p.0[3] = rect;
-                    p.0[4] = radii(*outer_radius, s);
-                    if !inner.is_empty() {
-                        p.0[5] = phys(*inner, s);
-                        p.0[6] = radii(*inner_radius, s);
-                    }
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::Shadow {
-                    bounds,
-                    radius,
-                    shadow,
-                    clip,
-                } => {
-                    let shape = Bounds {
-                        x: bounds.x + shadow.x,
-                        y: bounds.y + shadow.y,
-                        ..*bounds
-                    }
-                    .outset(shadow.spread);
-                    if shape.is_empty() {
-                        continue;
-                    }
-                    let sigma = shadow.blur * s / 2.0;
-                    let rect = phys(shape, s);
-                    let mut p = Prim::new(KIND_SHADOW, outset(rect, sigma.mul_add(3.0, 1.0)));
-                    p.0[2] = rgba(shadow.color);
-                    p.0[3] = rect;
-                    p.0[4] = radii(grow(*radius, shadow.spread), s);
-                    p.0[5] = phys(*bounds, s);
-                    p.0[6] = radii(*radius, s);
-                    p.0[9] = [sigma, 0.0, 0.0, 0.0];
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::Gradient {
-                    bounds,
-                    radius,
-                    gradient,
-                    clip,
-                } => {
-                    let rect = phys(*bounds, s);
-                    let mut p = Prim::new(KIND_GRADIENT, outset(rect, 1.0));
-                    p.0[3] = rect;
-                    p.0[4] = radii(*radius, s);
-                    set_gradient(enc, &mut p, gradient, s, 10);
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::Glyph { key, x, y, color, clip } => {
-                    let Some(Some(g)) = self.glyphs.get(key) else { continue };
-                    let rect = [
-                        i32_to_f32(x.saturating_add(g.left)),
-                        i32_to_f32(y.saturating_sub(g.top)),
-                        u32_to_f32(g.width),
-                        u32_to_f32(g.height),
-                    ];
-                    let kind = if g.page == Page::Mono { KIND_MONO } else { KIND_COLOR };
-                    let mut p = Prim::new(kind, rect);
-                    p.0[2] = rgba(*color);
-                    p.0[3] = rect;
-                    p.0[9] = [u32_to_f32(g.slot.x), u32_to_f32(g.slot.y), 0.0, 0.0];
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::Icon {
-                    icon,
-                    size,
-                    color,
-                    stroke_width,
-                    x,
-                    y,
-                    clip,
-                } => {
-                    let key = IconKey {
-                        icon: *icon,
-                        size: *size,
-                        rgba: color.to_rgba8(),
-                        stroke: stroke_width.to_bits(),
-                    };
-                    let Some(Some(g)) = self.icons.get(&key) else { continue };
-                    let rect = [
-                        i32_to_f32(*x),
-                        i32_to_f32(*y),
-                        u32_to_f32(g.width),
-                        u32_to_f32(g.height),
-                    ];
-                    let mut p = Prim::new(KIND_COLOR, rect);
-                    p.0[2] = [1.0; 4];
-                    p.0[3] = rect;
-                    p.0[9] = [u32_to_f32(g.slot.x), u32_to_f32(g.slot.y), 0.0, 0.0];
-                    push(enc, p, Extra::None, *clip);
-                }
-                Item::Image {
-                    source,
-                    bounds,
-                    radius,
-                    clip,
-                } => {
-                    let key = std::rc::Rc::as_ptr(&source.0).addr();
-                    if !self.images.peek(&key).is_some_and(Option::is_some) {
-                        continue;
-                    }
-                    let rect = phys(*bounds, s);
-                    let (iw, ih) = source.size();
-                    let (iw, ih) = (u32_to_f32(iw).max(1.0), u32_to_f32(ih).max(1.0));
-                    let fit = (rect[2] / iw).max(rect[3] / ih);
-                    let placed = [
-                        rect[0] + (rect[2] - iw * fit) / 2.0,
-                        rect[1] + (rect[3] - ih * fit) / 2.0,
-                        iw * fit,
-                        ih * fit,
-                    ];
-                    let mut p = Prim::new(KIND_IMAGE, outset(rect, 1.0));
-                    p.0[3] = rect;
-                    p.0[4] = radii(*radius, s);
-                    p.0[9] = placed;
-                    push(enc, p, Extra::Image(key), *clip);
-                }
-                Item::Shapes { origin, shapes, clip } => {
-                    // The key holds the shapes and where they fall within a
-                    // pixel, not where: the same raster serves them anywhere.
-                    let Some((key, at, ..)) = shape_raster_key(*origin, shapes, scene) else {
-                        continue;
-                    };
-                    let Some(Some(r)) = self.shapes.peek(&key) else {
-                        continue;
-                    };
-                    let rect = [
-                        i32_to_f32(at.0),
-                        i32_to_f32(at.1),
-                        u32_to_f32(r.texture.size.0),
-                        u32_to_f32(r.texture.size.1),
-                    ];
-                    let mut p = Prim::new(KIND_RASTER, rect);
-                    p.0[3] = rect;
-                    push(enc, p, Extra::Shapes(key), *clip);
-                }
-                Item::TextThrough {
-                    region,
-                    mask,
-                    background,
-                    fill,
-                    clip,
-                } => {
-                    let layer = self.layer(enc, mask, *region, scene);
-                    let rect = pixel_rect(*region);
-                    let mut p = Prim::new(KIND_TEXT_THROUGH, rect);
-                    p.0[3] = rect;
-                    let mut flags = 0.0;
-                    if let Some((b, c)) = background {
-                        flags += 1.0;
-                        p.0[2] = rgba(*c);
-                        p.0[5] = phys(*b, s);
-                    }
-                    if let Some((g, shown)) = fill {
-                        flags += 2.0;
-                        p.0[9] = phys(*shown, s);
-                        set_gradient(enc, &mut p, g, s, 10);
-                    }
-                    p.0[1][1] = flags;
-                    push(enc, p, Extra::Layer(layer), *clip);
-                }
-                Item::Group(group) => {
-                    let layer = self.layer(enc, &group.items, group.region, scene);
-                    let p = composite(enc, group, s);
-                    push(enc, p, Extra::Layer(layer), group.clip);
-                }
-            }
-        }
-        draws
-    }
-
-    /// Encode `items` into a new layer covering `region`; its index.
-    fn layer(&self, enc: &mut Encoder, items: &[Item], region: PixelRect, scene: &Scene) -> usize {
-        // A layer larger than a texture may be keeps to the part drawn.
-        let max = self.device.limits().max_texture_dimension_2d;
-        let region = if region.width > max || region.height > max {
-            clamp_rect(region, enc.viewport)
-        } else {
-            region
-        };
-        let index = enc.layers.len();
-        enc.layers.push(region);
-        let draws = self.encode(enc, items, scene);
-        enc.passes.push(Pass {
-            target: Target::Layer(index),
-            origin: (region.x, region.y),
-            clear: wgpu::Color::TRANSPARENT,
-            draws,
-        });
-        index
-    }
-
-    /// Read `view` (`size`, this renderer's format) back as a pixmap.
-    fn read_back(&self, texture: &wgpu::Texture, size: (u32, u32)) -> Option<Pixmap> {
+    /// Read `texture` (`size`, this renderer's format) back.
+    fn read_back(&self, texture: &wgpu::Texture, size: (u32, u32)) -> Option<Pixels> {
         let row = size.0.saturating_mul(4);
         let padded = row.div_ceil(256).saturating_mul(256);
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -1169,101 +1376,40 @@ impl GpuRenderer {
         }
         drop(mapped);
         buffer.unmap();
-        Pixmap::from_vec(data, tiny_skia::IntSize::from_wh(size.0, size.1)?)
-    }
-}
-
-impl Renderer for GpuRenderer {
-    fn render(&mut self, scene: &Scene, text: &mut TextSystem) {
-        let Some(view) = self.window_view() else { return };
-        self.draw(scene, text, &view);
+        Pixels::from_vec(size.0, size.1, data)
     }
 
-    fn end_frame(&mut self) {
-        if let Some(frame) = self.window.as_mut().and_then(|w| w.frame.take()) {
-            self.queue.present(frame);
-        }
-        self.images.end_frame();
-        self.shapes.end_frame();
-        self.frame = self.frame.saturating_add(1);
-        // Layers the last two frames did not need go back to the driver, as
-        // the CPU renderer lets its layers go.
-        let (now, before) = self.layers_peak;
-        self.layer_pool.truncate(now.max(before));
-        self.layers_peak = (0, now);
-    }
-
-    fn waited(&mut self) -> std::time::Duration {
-        std::mem::take(&mut self.waited)
-    }
-
-    fn held(&self) -> Held {
-        let count = |n: usize, bytes: usize| Raster { count: n, bytes };
-        let glyphs = self.glyphs.values().flatten().count();
-        let icons = self.icons.values().flatten().count();
-        let tex_bytes = |t: &Texture| {
-            usize::try_from(
-                u64::from(t.size.0)
-                    .saturating_mul(u64::from(t.size.1))
-                    .saturating_mul(4),
-            )
-            .unwrap_or(0)
-        };
-        Held {
-            glyphs: count(glyphs, self.mono.bytes()),
-            icons: count(icons, self.color.bytes()),
-            shadows: Raster::default(),
-            images: count(
-                self.images.len(),
-                self.images
-                    .values()
-                    .flatten()
-                    .map(|i| tex_bytes(&i.texture))
-                    .chain(self.shapes.values().flatten().map(|s| tex_bytes(&s.texture)))
-                    .sum(),
-            ),
-            layers: count(self.layer_pool.len(), self.layer_pool.iter().map(tex_bytes).sum()),
-        }
-    }
-
-    fn capture(&mut self, scene: &Scene, text: &mut TextSystem) -> Option<Pixmap> {
-        // A scene taller than a texture may be (a whole page, for the
-        // verdict) is drawn in bands, each read back into its rows.
-        let (w, h) = (scene.size.0.max(1), scene.size.1.max(1));
-        let max = self.device.limits().max_texture_dimension_2d;
-        if w > max {
-            return None;
-        }
-        let band = h.min(max);
-        let mut out = Pixmap::new(w, h)?;
-        let target = self.offscreen((w, band));
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut top = 0;
-        while top < h {
-            let rows = band.min(h.saturating_sub(top));
-            let origin = (0, i32::try_from(top).ok()?);
-            self.draw_part(scene, text, &view, origin, (w, band));
-            let part = self.read_back(&target, (w, band))?;
-            let row = usize::try_from(w.saturating_mul(4)).ok()?;
-            let start = usize::try_from(top).ok()?.saturating_mul(row);
-            let len = usize::try_from(rows).ok()?.saturating_mul(row);
-            out.data_mut()
-                .get_mut(start..start.saturating_add(len))?
-                .copy_from_slice(part.data().get(..len)?);
-            top = top.saturating_add(band);
-        }
-        Some(out)
-    }
-}
-
-impl GpuRenderer {
-    /// Draw `scene` aside and wait for the GPU to finish it, reading
-    /// nothing back: what a window's frame costs, measured headless.
-    pub fn draw_and_wait(&mut self, scene: &Scene, text: &mut TextSystem) {
-        let target = self.offscreen(scene.size);
-        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        self.draw(scene, text, &view);
+    /// Draw `scene` into the canvas and wait for the GPU to finish it,
+    /// reading nothing back: what a window's frame costs, measured headless.
+    pub fn draw_and_wait(&mut self, scene: &Scene, changed: &Changed, text: &mut Glyphs) {
+        self.render(scene, changed, text);
+        let asked = std::time::Instant::now();
         drop(self.device.poll(wgpu::PollType::wait_indefinitely()));
+        self.drawn.gpu_wait = asked.elapsed();
+    }
+
+    /// The canvas as drawn, read back (tests: what damage left there).
+    pub fn read_canvas(&self) -> Option<Pixels> {
+        let c = self.canvas.as_ref()?;
+        self.read_back(&c.texture, c.size)
+    }
+
+    /// Bind groups made since the renderer was (devtools, tests).
+    #[must_use]
+    pub fn bind_groups_made(&self) -> u64 {
+        self.bind_groups_made
+    }
+
+    /// Glyphs and icons rasterized since the renderer was made.
+    #[must_use]
+    pub fn rasters(&self) -> u64 {
+        self.rasters
+    }
+
+    /// Whether dual-source blending is on (subpixel text can be drawn).
+    #[must_use]
+    pub fn dual_source(&self) -> bool {
+        self.dual_source
     }
 
     /// A texture to draw a `size` frame into aside.
@@ -1285,17 +1431,160 @@ impl GpuRenderer {
     }
 }
 
+impl Renderer for GpuRenderer {
+    fn render(&mut self, scene: &Scene, changed: &Changed, text: &mut Glyphs) {
+        self.render_scene(scene, changed, text);
+        self.check_chunks_cold();
+    }
+
+    fn overlay(&mut self, scene: &Scene, text: &mut Glyphs) {
+        self.overlay_scene(scene, text);
+    }
+
+    fn end_frame(&mut self) {
+        if let Some(w) = self.window.as_mut()
+            && let Some(frame) = w.frame.take()
+        {
+            w.blitted = false;
+            self.queue.present(frame);
+        }
+        self.images.end_frame();
+        self.paths.end_frame();
+        self.slugs.end_frame();
+        self.end_kept();
+        self.end_layers();
+        self.data.end_frame();
+        self.data.deliver_reads(&self.device, false);
+        self.drawn.raster = self.world.spent();
+        self.drawn.tiles_done = self.world.done();
+        self.world.end_frame(&mut self.data.store);
+        self.frame = self.frame.saturating_add(1);
+        self.overlaid = (false, self.overlaid.0);
+    }
+
+    fn waited(&mut self) -> std::time::Duration {
+        std::mem::take(&mut self.waited)
+    }
+
+    fn held(&self) -> Held {
+        let count = |n: usize, bytes: usize| Raster { count: n, bytes };
+        let glyphs = self.glyphs.values().flatten().count();
+        let icons = self.icons.values().flatten().count();
+        let masks: usize = self.kept.values().flat_map(|k| &k.masks).map(Texture::bytes).sum();
+        Held {
+            glyphs: count(
+                glyphs.saturating_add(self.slugs.held()),
+                self.color.bytes().saturating_add(self.slugs.bytes()),
+            ),
+            icons: count(icons, self.mono.bytes()),
+            images: count(
+                self.images.len(),
+                self.images.values().flatten().map(|i| i.texture.bytes()).sum(),
+            ),
+            paths: count(self.paths.jobs_held(), self.paths.bytes()),
+            layers: count(
+                self.layers.len(),
+                self.layers
+                    .values()
+                    .map(|l| l.texture.bytes())
+                    .sum::<usize>()
+                    .saturating_add(masks)
+                    .saturating_add(self.canvas.as_ref().map_or(0, |c| {
+                        usize::try_from(
+                            u64::from(c.size.0)
+                                .saturating_mul(u64::from(c.size.1))
+                                .saturating_mul(4),
+                        )
+                        .unwrap_or(0)
+                    })),
+            ),
+            // Data chunks (ADR-0018) are chunks too: their state and data.
+            chunks: count(
+                self.kept.len().saturating_add(self.data.held().0),
+                usize::try_from(
+                    self.records
+                        .used_bytes()
+                        .saturating_add(self.index.used_bytes())
+                        .saturating_add(self.data.held().1),
+                )
+                .unwrap_or(0),
+            ),
+        }
+    }
+
+    fn drawn(&self) -> Drawn {
+        let (gpu, gpu_passes) = self.data.gpu_times();
+        Drawn {
+            gpu,
+            gpu_passes,
+            ..self.drawn
+        }
+    }
+
+    fn capture(&mut self, scene: &Scene, overlay: Option<&Scene>, text: &mut Glyphs) -> Option<Pixels> {
+        self.capture_scene(scene, overlay, text)
+    }
+}
+
+/// A shader module of `parts` (concatenated), with a fragment entry point
+/// for each of `entries` (name, input type, shading function): with
+/// dual-source blending, whose second output is what of each channel of
+/// the target is kept (ADR-0019), or without.
+fn module(
+    device: &wgpu::Device,
+    label: &str,
+    parts: &[&str],
+    entries: &[(&str, &str, &str)],
+    dual_source: bool,
+) -> wgpu::ShaderModule {
+    let mut source = String::new();
+    if dual_source {
+        source.push_str("enable dual_source_blending;\n");
+    }
+    for p in parts {
+        source.push_str(p);
+        source.push('\n');
+    }
+    if dual_source {
+        source.push_str(
+            "struct DualOut {\n    @location(0) @blend_src(0) color: vec4<f32>,\n    \
+             @location(0) @blend_src(1) mask: vec4<f32>,\n}\n",
+        );
+    }
+    for (name, input, shade) in entries {
+        if dual_source {
+            source.push_str(&format!(
+                "@fragment\nfn {name}(input: {input}) -> DualOut {{\n    let s = {shade}(input);\n    \
+                 return DualOut(s.color, s.mask);\n}}\n"
+            ));
+        } else {
+            source.push_str(&format!(
+                "@fragment\nfn {name}(input: {input}) -> @location(0) vec4<f32> {{\n    \
+                 return {shade}(input).color;\n}}\n"
+            ));
+        }
+    }
+    device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some(label),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    })
+}
+
+/// Metal, Vulkan and DX12 only (`WGPU_BACKEND` may narrow them): no OpenGL.
 fn instance() -> wgpu::Instance {
+    let ours = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
     wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
+        backends: wgpu::Backends::from_env().map_or(ours, |b| b & ours),
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     })
 }
 
-/// A texture `size`, filled with `data` (rows of `size.0` RGBA pixels) when given.
+/// A texture `size`, filled with `data` (rows of `size.0` RGBA pixels) when
+/// given, and the bind group that reads it.
 fn texture(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
     size: (u32, u32),
     format: wgpu::TextureFormat,
     data: Option<&[u8]>,
@@ -1330,56 +1619,86 @@ fn texture(
         );
     }
     let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("gui extra"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(&view),
+        }],
+    });
     Texture {
         _texture: texture,
         view,
+        bind,
         size: (extent.width, extent.height),
     }
 }
 
-fn grow_buffer(device: &wgpu::Device, buffer: &mut wgpu::Buffer, needed: usize, usage: wgpu::BufferUsages) {
-    let needed = u64::try_from(needed).unwrap_or(u64::MAX);
-    if buffer.size() >= needed {
-        return;
-    }
-    *buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("gui buffer"),
-        size: needed.next_power_of_two(),
-        usage: usage | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
+/// What names an image on the GPU: the address of its pixels.
+fn image_key(source: &ImageSource) -> usize {
+    Arc::as_ptr(&source.0).addr()
 }
 
 fn floats_to_bytes(floats: &[f32]) -> Vec<u8> {
     floats.iter().flat_map(|f| f.to_ne_bytes()).collect()
 }
 
-/// `b` (logical) in physical pixels.
-fn phys(b: Bounds, s: f32) -> [f32; 4] {
-    [b.x * s, b.y * s, b.width * s, b.height * s]
+/// Whether glyph `key` is drawn as curves: above the atlas's largest size,
+/// or under a transform that is not a translation (`transformed`).
+fn wants_curves(key: &GlyphKey, transformed: bool) -> bool {
+    !key.is_color() && (f32::from_bits(key.ppem) > MAX_ATLAS_PPEM || transformed)
 }
 
-/// `r` inside `within`, never empty.
-fn clamp_rect(r: PixelRect, within: PixelRect) -> PixelRect {
-    let right = |q: PixelRect| q.x.saturating_add(i32::try_from(q.width).unwrap_or(i32::MAX));
-    let bottom = |q: PixelRect| q.y.saturating_add(i32::try_from(q.height).unwrap_or(i32::MAX));
-    let (x, y) = (r.x.max(within.x), r.y.max(within.y));
-    let (x1, y1) = (right(r).min(right(within)), bottom(r).min(bottom(within)));
-    PixelRect {
-        x,
-        y,
-        width: u32::try_from(x1.saturating_sub(x)).unwrap_or(0).max(1),
-        height: u32::try_from(y1.saturating_sub(y)).unwrap_or(0).max(1),
+/// The map from a glyph's curve pixels (y up, from its pen at `x`, `y`
+/// physical) to the target, through `g` when it is transformed.
+fn glyph_matrix(key: &GlyphKey, x: f32, y: f32, g: Option<[f32; 6]>) -> [f32; 6] {
+    let k = f32::from_bits(key.ppem) / crate::text::CURVE_EM;
+    let pen = x + f32::from(key.bin) / 4.0;
+    let m = [k, 0.0, 0.0, -k, pen, y];
+    g.map_or(m, |g| path::then(m, g))
+}
+
+/// An icon's parts as paths and styles, its strokes `stroke_width` wide
+/// (view-box units) in `color`.
+fn icon_parts(drawing: &crate::svg::Drawing, stroke_width: f32, color: Color) -> Vec<(Path, PathStyle)> {
+    let mut out = Vec::new();
+    for part in &drawing.parts {
+        if part.fill {
+            out.push((part.path.clone(), PathStyle::fill(crate::scene::Gradient::Solid(color))));
+        }
+        if part.stroke {
+            let stroke = Stroke::new(stroke_width).cap(drawing.cap).join(drawing.join);
+            out.push((
+                part.path.clone(),
+                PathStyle {
+                    paint: crate::scene::Gradient::Solid(color),
+                    draw: PathDraw::Stroke(stroke),
+                },
+            ));
+        }
+    }
+    out
+}
+
+/// Add `d` to `ops`, joined to the last when it continues it.
+fn push_op(ops: &mut Vec<Op>, d: Op) {
+    match (ops.last_mut(), &d) {
+        (Some(Op::Quads { extra, instances }), Op::Quads { extra: e, instances: i })
+            if extra == e && instances.end == i.start =>
+        {
+            instances.end = i.end;
+        }
+        (Some(Op::Path(r)), Op::Path(i)) | (Some(Op::Slug(r)), Op::Slug(i)) if r.end == i.start => {
+            r.end = i.end;
+        }
+        _ => ops.push(d),
     }
 }
 
-fn pixel_rect(r: PixelRect) -> [f32; 4] {
-    [
-        i32_to_f32(r.x),
-        i32_to_f32(r.y),
-        u32_to_f32(r.width),
-        u32_to_f32(r.height),
-    ]
+/// `b` (logical) in physical pixels: x, y, width, height.
+fn phys(b: Bounds, s: f32) -> [f32; 4] {
+    [b.x * s, b.y * s, b.width * s, b.height * s]
 }
 
 fn radii(r: Corners, s: f32) -> [f32; 4] {
@@ -1391,16 +1710,6 @@ fn radii(r: Corners, s: f32) -> [f32; 4] {
     ]
 }
 
-fn outset(r: [f32; 4], d: f32) -> [f32; 4] {
-    [r[0] - d, r[1] - d, d.mul_add(2.0, r[2]), d.mul_add(2.0, r[3])]
-}
-
-fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    let (x0, y0) = (a[0].max(b[0]), a[1].max(b[1]));
-    let (x1, y1) = ((a[0] + a[2]).min(b[0] + b[2]), (a[1] + a[3]).min(b[1] + b[3]));
-    [x0, y0, (x1 - x0).max(0.0), (y1 - y0).max(0.0)]
-}
-
 fn rgba(c: Color) -> [f32; 4] {
     [
         c.r.clamp(0.0, 1.0),
@@ -1408,216 +1717,4 @@ fn rgba(c: Color) -> [f32; 4] {
         c.b.clamp(0.0, 1.0),
         c.a.clamp(0.0, 1.0),
     ]
-}
-
-/// Put `g`'s stops in `enc` and its line (physical) in field `line` of `p`.
-fn set_gradient(enc: &mut Encoder, p: &mut Prim, g: &Gradient, s: f32, line: usize) {
-    let first = u32_to_f32(u32::try_from(enc.stops.len() / 8).unwrap_or(0));
-    let stops: Vec<(f32, Color)> = match g {
-        Gradient::Solid(c) => {
-            if let Some(f) = p.0.get_mut(line) {
-                *f = [0.0; 4];
-            }
-            vec![(0.0, *c)]
-        }
-        Gradient::Linear { start, end, stops } => {
-            if let Some(f) = p.0.get_mut(line) {
-                *f = [start.0 * s, start.1 * s, end.0 * s, end.1 * s];
-            }
-            stops.clone()
-        }
-    };
-    for (offset, c) in &stops {
-        enc.stops.extend_from_slice(&[*offset, 0.0, 0.0, 0.0]);
-        enc.stops.extend_from_slice(&rgba(*c));
-    }
-    p.0[1][2] = first;
-    p.0[1][3] = u32_to_f32(u32::try_from(stops.len()).unwrap_or(0));
-}
-
-/// The instance compositing `group`'s layer.
-fn composite(enc: &mut Encoder, group: &Group, s: f32) -> Prim {
-    let region = pixel_rect(group.region);
-    // Forward: q ↦ o + R·S·(q − o); the shader maps back from the window.
-    let (fwd, inv) = match group.transform {
-        None => ([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
-        Some(t) => {
-            let (sin, cos) = t.rotate.to_radians().sin_cos();
-            let k = t.scale;
-            // Columns: x' = a·x + c·y + e, y' = b·x + d·y + f.
-            let (a, b, c, d) = (cos * k, sin * k, -sin * k, cos * k);
-            let (ox, oy) = t.origin;
-            let e = ox - (a * ox + c * oy);
-            let f = oy - (b * ox + d * oy);
-            let det = a * d - b * c;
-            if det.abs() < 1e-6 {
-                ([0.0; 6], [0.0; 6])
-            } else {
-                let (ia, ib, ic, id) = (d / det, -b / det, -c / det, a / det);
-                let ie = -(ia * e + ic * f);
-                let if_ = -(ib * e + id * f);
-                ([a, b, c, d, e, f], [ia, ib, ic, id, ie, if_])
-            }
-        }
-    };
-    let corners = [
-        (region[0], region[1]),
-        (region[0] + region[2], region[1]),
-        (region[0], region[1] + region[3]),
-        (region[0] + region[2], region[1] + region[3]),
-    ]
-    .map(|(x, y)| (fwd[0] * x + fwd[2] * y + fwd[4], fwd[1] * x + fwd[3] * y + fwd[5]));
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for (x, y) in corners {
-        x0 = x0.min(x);
-        y0 = y0.min(y);
-        x1 = x1.max(x);
-        y1 = y1.max(y);
-    }
-    let mut p = Prim::new(KIND_LAYER, outset([x0, y0, x1 - x0, y1 - y0], 1.0));
-    p.0[2] = [0.0, 0.0, 0.0, group.opacity.clamp(0.0, 1.0)];
-    p.0[3] = region;
-    p.0[9] = [inv[0], inv[1], inv[2], inv[3]];
-    p.0[10] = [inv[4], inv[5], 0.0, 0.0];
-    let mut filters = [0.0; 4];
-    for (slot, f) in filters.as_chunks_mut::<2>().0.iter_mut().zip(&group.filters) {
-        *slot = match f {
-            Filter::Brightness(k) => [1.0, *k],
-            Filter::Grayscale(a) => [2.0, *a],
-        };
-    }
-    p.0[11] = filters;
-    if let Some(mask) = &group.mask {
-        set_gradient(enc, &mut p, mask, s, 12);
-    }
-    p
-}
-
-/// Shapes' raster: its cache key, top left and size (physical), and the
-/// transform that draws them into it.
-type ShapePlacement = (u64, (i32, i32), (u32, u32), tiny_skia::Transform);
-
-/// Where shapes drawn from `origin` land, and how they are rasterised:
-/// their cache key, top left and size (physical), and the transform that
-/// draws them into their raster.
-fn shape_raster_key(origin: (f32, f32), shapes: &[Shape], scene: &Scene) -> Option<ShapePlacement> {
-    let s = scene.scale;
-    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    let mut reach = 1.0_f32;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for shape in shapes {
-        if let Some((c, w)) = shape.stroke {
-            reach = reach.max(w / 2.0 + 1.0);
-            c.to_rgba8().hash(&mut hasher);
-            w.to_bits().hash(&mut hasher);
-        }
-        if let Some(c) = shape.fill {
-            c.to_rgba8().hash(&mut hasher);
-        }
-        for c in &shape.commands {
-            let points: &[f32] = match c {
-                PathCommand::MoveTo(x, y) | PathCommand::LineTo(x, y) => &[*x, *y],
-                PathCommand::QuadTo(a, b, x, y) => &[*a, *b, *x, *y],
-                PathCommand::CubicTo(a, b, c2, d, x, y) => &[*a, *b, *c2, *d, *x, *y],
-                PathCommand::Close => &[],
-            };
-            points.len().hash(&mut hasher);
-            for [x, y] in points.as_chunks::<2>().0 {
-                x0 = x0.min(*x);
-                y0 = y0.min(*y);
-                x1 = x1.max(*x);
-                y1 = y1.max(*y);
-                x.to_bits().hash(&mut hasher);
-                y.to_bits().hash(&mut hasher);
-            }
-        }
-    }
-    if x0 > x1 || y0 > y1 {
-        return None;
-    }
-    let (w, h) = (u32_to_f32(scene.size.0), u32_to_f32(scene.size.1));
-    let left = ((origin.0 + x0 - reach) * s).floor().clamp(0.0, w);
-    let top = ((origin.1 + y0 - reach) * s).floor().clamp(0.0, h);
-    let right = ((origin.0 + x1 + reach) * s).ceil().clamp(0.0, w);
-    let bottom = ((origin.1 + y1 + reach) * s).ceil().clamp(0.0, h);
-    if right <= left || bottom <= top {
-        return None;
-    }
-    let size = (
-        crate::convert::f32_to_u32(right - left),
-        crate::convert::f32_to_u32(bottom - top),
-    );
-    let (tx, ty) = (origin.0.mul_add(s, -left), origin.1.mul_add(s, -top));
-    tx.to_bits().hash(&mut hasher);
-    ty.to_bits().hash(&mut hasher);
-    s.to_bits().hash(&mut hasher);
-    size.hash(&mut hasher);
-    let at = (crate::convert::f32_to_i32(left), crate::convert::f32_to_i32(top));
-    Some((
-        hasher.finish(),
-        at,
-        size,
-        tiny_skia::Transform::from_row(s, 0.0, 0.0, s, tx, ty),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cpu::CpuRenderer;
-    use crate::scene::GroupTransform;
-
-    /// A scene painted by both renderers; `None` without a GPU.
-    fn both(scene: &Scene) -> Option<(Pixmap, Pixmap)> {
-        let mut gpu = GpuRenderer::headless().ok()?;
-        let mut text = TextSystem::new();
-        let g = gpu.capture(scene, &mut text)?;
-        let c = CpuRenderer::default().capture(scene, &mut text)?;
-        Some((c, g))
-    }
-
-    fn at(p: &Pixmap, x: u32, y: u32) -> [u8; 4] {
-        let c = p.pixel(x, y).unwrap_or_else(|| panic!("({x}, {y}) is outside"));
-        [c.red(), c.green(), c.blue(), c.alpha()]
-    }
-
-    #[test]
-    fn a_turned_group_lands_where_the_cpu_puts_it() {
-        let mut scene = Scene::new((100, 100), 1.0, Some(Color::WHITE));
-        scene.items.push(Item::Group(Box::new(Group {
-            region: PixelRect {
-                x: 40,
-                y: 40,
-                width: 20,
-                height: 20,
-            },
-            items: vec![Item::Rect {
-                bounds: Bounds {
-                    x: 40.0,
-                    y: 40.0,
-                    width: 20.0,
-                    height: 20.0,
-                },
-                color: Color::BLACK,
-                clip: None,
-            }],
-            mask: None,
-            filters: vec![],
-            opacity: 1.0,
-            transform: Some(GroupTransform {
-                origin: (50.0, 50.0),
-                scale: 1.0,
-                rotate: 45.0,
-            }),
-            clip: None,
-        })));
-        let Some((cpu, gpu)) = both(&scene) else { return };
-        for (x, y) in [(50, 50), (50, 38), (38, 50), (41, 41), (59, 59), (50, 62)] {
-            let (c, g) = (at(&cpu, x, y), at(&gpu, x, y));
-            assert!(
-                c.iter().zip(g).all(|(a, b)| a.abs_diff(b) <= 40),
-                "({x}, {y}): cpu {c:?}, gpu {g:?}"
-            );
-        }
-    }
 }

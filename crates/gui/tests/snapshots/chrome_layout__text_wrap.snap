@@ -1,0 +1,12 @@
+---
+source: crates/gui/tests/chrome_layout.rs
+expression: "gui::inspect::dump(&laid_out(name, &mut ts))"
+---
+0            Div 800x600 at (0,0)
+  0/0          Div 400x288 at (0,0)
+    0/0/0        Div 120x96 at (0,0)
+      0/0/0/0      Text "The quick brown fox jump…" 120x96 at (0,0)  16px w400 #000000
+    0/0/1        Div 200x120 at (0,96)
+      0/0/1/0      Text "Lorem ipsum dolor sit am…" 200x120 at (0,96)  16px w400 #000000
+    0/0/2        Div 150x72 at (0,216)
+      0/0/2/0      Text "Wrapped text as a flex i…" 150x72 at (0,216)  16px w400 #000000

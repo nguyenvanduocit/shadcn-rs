@@ -1,0 +1,10 @@
+# Chrome's boxes for block_min_max.html, written by crates/shadcn/verdict/layout.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 80
+  div 0 0 100 10
+  div 0 10 120 10
+  div 0 20 150 10
+  div 0 30 300 25
+  div 0 55 300 15
+  div 0 70 60 10

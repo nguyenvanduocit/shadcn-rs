@@ -1,6 +1,6 @@
 # 0005. `gui` sets text as Blink does
 
-Status: accepted, 2026-11-20; its baselines' font and rounding superseded by ADR-0006. Extends ADR-0001 (a
+Status: accepted, 2026-11-20; its baselines' font and rounding superseded by ADR-0006; its static Inter optical-size faces superseded by ADR-0019 (the Blink rules stay); its inherited `tabular_nums` superseded by ADR-0022 (a field of the text style in `ContentStyle`). Extends ADR-0001 (a
 paragraph holds inline runs).
 
 ## Context

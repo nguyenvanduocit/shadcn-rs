@@ -1,14 +1,14 @@
 use gui::prelude::*;
-use gui::{Div, FocusHandle, NamedKey, ScenarioError, Signal, div, text};
+use gui::{Div, FocusHandle, Model, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, DialogState, NativeSelectLook, Questionnaire, QuestionnaireAnswer, QuestionnaireItem,
-    QuestionnaireShortcuts, QuestionnaireStatus, Toast, ToastKind, Toaster, button, card, card_action, card_content,
-    card_description, card_footer, card_header, dialog_close, dialog_content, dialog_description, dialog_footer,
-    dialog_header, dialog_title, dialog_trigger, native_select_option, native_select_with, questionnaire,
-    questionnaire_actions, questionnaire_choice, questionnaire_choices, questionnaire_description, questionnaire_error,
-    questionnaire_error_with, questionnaire_input, questionnaire_item, questionnaire_next, questionnaire_next_with,
-    questionnaire_previous, questionnaire_progress, questionnaire_progress_with, questionnaire_skip,
-    questionnaire_submit, questionnaire_submit_with, questionnaire_title, theme, toaster,
+    ButtonSize, ButtonVariant, DialogProps, Part, QuestionnaireAnswer, QuestionnaireItem, QuestionnaireItemProps,
+    QuestionnaireProgressState, QuestionnaireProps, QuestionnaireShortcuts, QuestionnaireStatus, Toast, ToastKind,
+    button, card, card_action, card_content, card_description, card_footer, card_header, dialog, dialog_close,
+    dialog_content, dialog_description, dialog_footer, dialog_header, dialog_title, dialog_trigger, native_select,
+    native_select_option, questionnaire, questionnaire_actions, questionnaire_choice, questionnaire_choices,
+    questionnaire_description, questionnaire_error, questionnaire_error_with, questionnaire_input, questionnaire_item,
+    questionnaire_next, questionnaire_previous, questionnaire_progress, questionnaire_progress_with,
+    questionnaire_reset, questionnaire_skip, questionnaire_submit, questionnaire_title, theme, toaster,
 };
 
 use crate::{Render, Shot, demo, page};
@@ -33,85 +33,80 @@ fn values_of(answers: &[QuestionnaireAnswer], name: &str) -> String {
 }
 
 /// `toast(title, { description })`.
-fn toast(toasts: &Toaster, title: &str, description: String) {
-    toasts.show(Toast::new(ToastKind::Default, title).description(description));
+fn toast(title: &str, description: String) {
+    shadcn::toast(Toast::new(ToastKind::Default, title).description(description));
 }
 
 /// A question's choices, each `(value, label)`.
-fn choices(q: &Questionnaire, name: &str, entries: &[(&str, &str)]) -> Div {
+fn choices(entries: &[(&str, &str)]) -> Div {
     questionnaire_choices().children(
         entries
             .iter()
-            .map(|(value, label)| questionnaire_choice(q, name, value, text((*label).to_owned()), None)),
+            .map(|(value, label)| questionnaire_choice(value, text((*label).to_owned()), None)),
     )
 }
 
 /// The common item: title, an optional description, choices and the error.
 fn simple_item(
-    q: &Questionnaire,
     name: &str,
     title: &str,
     description: Option<&str>,
     entries: &[(&str, &str)],
-) -> Option<Div> {
-    questionnaire_item(q, name).map(|item| {
-        item.child(questionnaire_title(title.to_owned()))
-            .child(description.map(|d| questionnaire_description(d.to_owned())))
-            .child(choices(q, name, entries))
-            .child(questionnaire_error(q, name))
-    })
+) -> Part<QuestionnaireItemProps> {
+    questionnaire_item(name)
+        .child(questionnaire_title(title.to_owned()))
+        .child(description.map(|d| questionnaire_description(d.to_owned())))
+        .child(choices(entries))
+        .child(questionnaire_error())
 }
 
 /// Previous, next and submit.
-fn actions(q: &Questionnaire, submit: &str) -> Div {
+fn actions(submit: &str) -> Div {
     questionnaire_actions()
-        .child(questionnaire_previous(q, "Previous"))
-        .child(questionnaire_next(q, "Next"))
-        .child(questionnaire_submit(q, submit))
+        .child(questionnaire_previous("Previous"))
+        .child(questionnaire_next("Next"))
+        .child(questionnaire_submit(submit))
 }
 
 fn item(name: &str, choices: &[&str]) -> QuestionnaireItem {
     QuestionnaireItem::new(name, choices).required()
 }
 
-fn the_demo(saved: &Signal<String>) -> Questionnaire {
-    let s = saved.clone();
-    Questionnaire::new(
-        vec![
-            QuestionnaireItem::new("direction", &["tool-calls", "approvals", "handoffs"])
-                .required()
-                .with_input(),
-            QuestionnaireItem::new("signals", &["progress", "decisions", "risks", "next-step"]).multiple(),
-            QuestionnaireItem::new("timing", &["now", "next-cycle", "backlog"]).required(),
-        ],
-        Some("direction"),
-        Some(QuestionnaireShortcuts::Letters),
-        move |_, answers| {
-            let summary: Vec<String> = answers
-                .iter()
-                .map(|a| format!("{}: {}", a.name, values_of(&answers, &a.name)))
-                .collect();
-            s.set(format!("Agent plan saved · {}", summary.join(" · ")));
-        },
-    )
+fn the_demo(saved: &Signal<String>) -> Part<QuestionnaireProps> {
+    let s = *saved;
+    questionnaire(vec![
+        QuestionnaireItem::new("direction", &["tool-calls", "approvals", "handoffs"])
+            .required()
+            .with_input(),
+        QuestionnaireItem::new("signals", &["progress", "decisions", "risks", "next-step"]).multiple(),
+        QuestionnaireItem::new("timing", &["now", "next-cycle", "backlog"]).required(),
+    ])
+    .default_item("direction")
+    .shortcuts(Some(QuestionnaireShortcuts::Letters))
+    .on_submit(move |_, answers| {
+        let summary: Vec<String> = answers
+            .iter()
+            .map(|a| format!("{}: {}", a.name, values_of(&answers, &a.name)))
+            .collect();
+        s.set(format!("Agent plan saved · {}", summary.join(" · ")));
+    })
 }
 
-fn questionnaire_demo(q: &Questionnaire) -> Div {
+fn questionnaire_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
     let choice = |name: &str, value: &str, label: &str, description: Option<&str>| {
+        let _ = name;
         questionnaire_choice(
-            q,
-            name,
             value,
             text(label.to_owned()).when(description.is_some(), |t| t.font_medium()),
             description,
         )
     };
-    questionnaire(q)
-        .mx_auto()
+    root.mx_auto()
         .max_w(112.0)
-        .child(questionnaire_progress(q))
-        .child(questionnaire_item(q, "direction").map(|item| {
-            item.child(questionnaire_title("What should the agent build next?"))
+        .child(questionnaire_progress())
+        .child(
+            questionnaire_item("direction")
+                .child(questionnaire_title("What should the agent build next?"))
                 .child(questionnaire_description(
                     "Choose a direction or describe another task.",
                 ))
@@ -135,12 +130,13 @@ fn questionnaire_demo(q: &Questionnaire) -> Div {
                             "Sub-agent handoffs",
                             Some("Make delegated work and results easier to follow."),
                         ))
-                        .child(questionnaire_input(q, "direction").map(|i| i.placeholder("Describe another feature…"))),
+                        .child(questionnaire_input().placeholder("Describe another feature…")),
                 )
-                .child(questionnaire_error(q, "direction"))
-        }))
-        .child(questionnaire_item(q, "signals").map(|item| {
-            item.child(questionnaire_title("What should every progress update include?"))
+                .child(questionnaire_error()),
+        )
+        .child(
+            questionnaire_item("signals")
+                .child(questionnaire_title("What should every progress update include?"))
                 .child(questionnaire_description(
                     "Select all that apply, or skip this question.",
                 ))
@@ -151,10 +147,11 @@ fn questionnaire_demo(q: &Questionnaire) -> Div {
                         .child(choice("signals", "risks", "Risks", None))
                         .child(choice("signals", "next-step", "Next step", None)),
                 )
-                .child(questionnaire_error(q, "signals"))
-        }))
-        .child(questionnaire_item(q, "timing").map(|item| {
-            item.child(questionnaire_title("When should work begin?"))
+                .child(questionnaire_error()),
+        )
+        .child(
+            questionnaire_item("timing")
+                .child(questionnaire_title("When should work begin?"))
                 .child(questionnaire_description(
                     "Choose when the agent should begin the work.",
                 ))
@@ -164,51 +161,44 @@ fn questionnaire_demo(q: &Questionnaire) -> Div {
                         .child(choice("timing", "next-cycle", "Next development cycle", None))
                         .child(choice("timing", "backlog", "Add it to the backlog", None)),
                 )
-                .child(questionnaire_error(q, "timing"))
-        }))
+                .child(questionnaire_error()),
+        )
         .child(
             questionnaire_actions()
-                .child(questionnaire_previous(q, "Previous"))
-                .child(questionnaire_skip(q, "Skip"))
-                .child(questionnaire_next(q, "Next"))
-                .child(questionnaire_submit(q, "Save plan")),
+                .child(questionnaire_previous("Previous"))
+                .child(questionnaire_skip("Skip"))
+                .child(questionnaire_next("Next"))
+                .child(questionnaire_submit("Save plan")),
         )
 }
 
-fn animated(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("task", &["implement", "debug", "review"]),
-            item("review", &["targeted", "complete", "manual"]),
-            item("delivery", &["summary", "diff", "handoff"]),
-        ],
-        Some("task"),
-        None,
-        move |_, a| {
-            toast(
-                &toasts,
-                "Agent workflow saved",
-                format!(
-                    "Task: {} · Review: {} · Delivery: {}",
-                    value_of(&a, "task", "None"),
-                    value_of(&a, "review", "None"),
-                    value_of(&a, "delivery", "None")
-                ),
-            );
-        },
-    )
+fn animated() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("task", &["implement", "debug", "review"]),
+        item("review", &["targeted", "complete", "manual"]),
+        item("delivery", &["summary", "diff", "handoff"]),
+    ])
+    .default_item("task")
+    .on_submit(move |_, a| {
+        toast(
+            "Agent workflow saved",
+            format!(
+                "Task: {} · Review: {} · Delivery: {}",
+                value_of(&a, "task", "None"),
+                value_of(&a, "review", "None"),
+                value_of(&a, "delivery", "None")
+            ),
+        );
+    })
 }
 
 /// Vue fades and slides each item in as it opens; `gui` draws no entrance
 /// animations, so an item shows at once, as Vue does under `motion-reduce`.
-fn animated_demo(q: &Questionnaire) -> Div {
-    questionnaire(q)
-        .mx_auto()
+fn animated_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.mx_auto()
         .max_w(112.0)
-        .child(questionnaire_progress(q))
+        .child(questionnaire_progress())
         .child(simple_item(
-            q,
             "task",
             "What should the agent do?",
             Some("Choose the task for this run."),
@@ -219,7 +209,6 @@ fn animated_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "review",
             "How should the work be reviewed?",
             Some("Select the verification depth."),
@@ -230,7 +219,6 @@ fn animated_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "delivery",
             "How should the result be delivered?",
             Some("Choose the final handoff format."),
@@ -240,57 +228,47 @@ fn animated_demo(q: &Questionnaire) -> Div {
                 ("handoff", "Detailed review handoff"),
             ],
         ))
-        .child(actions(q, "Save workflow"))
+        .child(actions("Save workflow"))
 }
 
-fn card_questionnaire(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("task", &["fix", "refactor", "docs"]),
-            item("output", &["summary", "files", "review"]),
-        ],
-        Some("task"),
-        Some(QuestionnaireShortcuts::Numbers),
-        move |_, a| {
-            toast(
-                &toasts,
-                "Agent task created",
-                format!(
-                    "Task: {} · Handoff: {}",
-                    value_of(&a, "task", "None"),
-                    value_of(&a, "output", "None")
-                ),
-            );
-        },
-    )
+fn card_questionnaire() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("task", &["fix", "refactor", "docs"]),
+        item("output", &["summary", "files", "review"]),
+    ])
+    .default_item("task")
+    .shortcuts(Some(QuestionnaireShortcuts::Numbers))
+    .on_submit(move |_, a| {
+        toast(
+            "Agent task created",
+            format!(
+                "Task: {} · Handoff: {}",
+                value_of(&a, "task", "None"),
+                value_of(&a, "output", "None")
+            ),
+        );
+    })
 }
 
 /// An item laid out as a card's header and content (`QuestionnaireTitle
 /// as-child` on `CardTitle`, and so on).
-fn card_item(q: &Questionnaire, name: &str, title: &str, description: &str, entries: &[(&str, &str)]) -> Option<Div> {
-    questionnaire_item(q, name).map(|item| {
-        item.child(
+fn card_item(name: &str, title: &str, description: &str, entries: &[(&str, &str)]) -> Part<QuestionnaireItemProps> {
+    questionnaire_item(name)
+        .child(
             card_header()
                 // `as-child` merges the title's `text-base` into `CardTitle`'s
                 // `leading-none`, and `text-base`'s 24px line wins (Chrome).
                 .child(questionnaire_title(title.to_owned()).col_start(1))
                 .child(card_description(description.to_owned()))
-                .child(card_action().child(questionnaire_progress(q))),
+                .child(card_action().child(questionnaire_progress())),
         )
-        .child(
-            card_content()
-                .child(choices(q, name, entries))
-                .child(questionnaire_error(q, name)),
-        )
-    })
+        .child(card_content().child(choices(entries)).child(questionnaire_error()))
 }
 
-fn card_demo(q: &Questionnaire) -> Div {
-    questionnaire(q).mx_auto().max_w(112.0).child(
+fn card_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.mx_auto().max_w(112.0).child(
         card()
             .child(card_item(
-                q,
                 "task",
                 "What should the agent work on?",
                 "Choose the task that should be handled next.",
@@ -301,7 +279,6 @@ fn card_demo(q: &Questionnaire) -> Div {
                 ],
             ))
             .child(card_item(
-                q,
                 "output",
                 "What should the final handoff include?",
                 "Pick the level of detail needed for review.",
@@ -311,33 +288,28 @@ fn card_demo(q: &Questionnaire) -> Div {
                     ("review", "Full review handoff"),
                 ],
             ))
-            .child(card_footer().child(actions(q, "Create task").w_full())),
+            .child(card_footer().child(actions("Create task").w_full())),
     )
 }
 
-fn conditional(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("runtime", &["local", "cloud"]).checked(&["local"]),
-            item("environment", &["preview", "staging", "isolated"]).disabled(),
-            item("approval", &["writes", "commands", "sensitive"]),
-        ],
-        Some("runtime"),
-        None,
-        move |_, a| {
-            toast(
-                &toasts,
-                "Execution plan saved",
-                format!(
-                    "Runtime: {} · Environment: {} · Approval: {}",
-                    value_of(&a, "runtime", "None"),
-                    value_of(&a, "environment", "Not applicable"),
-                    value_of(&a, "approval", "None")
-                ),
-            );
-        },
-    )
+fn conditional() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("runtime", &["local", "cloud"]).checked(&["local"]),
+        item("environment", &["preview", "staging", "isolated"]).disabled(),
+        item("approval", &["writes", "commands", "sensitive"]),
+    ])
+    .default_item("runtime")
+    .on_submit(move |_, a| {
+        toast(
+            "Execution plan saved",
+            format!(
+                "Runtime: {} · Environment: {} · Approval: {}",
+                value_of(&a, "runtime", "None"),
+                value_of(&a, "environment", "Not applicable"),
+                value_of(&a, "approval", "None")
+            ),
+        );
+    })
     // `@change="runtime = …"` and `:disabled="runtime !== 'cloud'"`.
     .on_change(|q, name, value| {
         if name == "runtime" {
@@ -346,20 +318,17 @@ fn conditional(toasts: &Toaster) -> Questionnaire {
     })
 }
 
-fn conditional_demo(q: &Questionnaire) -> Div {
-    questionnaire(q)
-        .mx_auto()
+fn conditional_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.mx_auto()
         .max_w(112.0)
-        .child(questionnaire_progress(q))
+        .child(questionnaire_progress())
         .child(simple_item(
-            q,
             "runtime",
             "Where should the agent run?",
             Some("Cloud runs add an environment question to this flow."),
             &[("local", "Local workspace"), ("cloud", "Cloud workspace")],
         ))
         .child(simple_item(
-            q,
             "environment",
             "Which cloud environment should it use?",
             None,
@@ -370,7 +339,6 @@ fn conditional_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "approval",
             "When should the agent request approval?",
             None,
@@ -380,40 +348,35 @@ fn conditional_demo(q: &Questionnaire) -> Div {
                 ("sensitive", "Only for sensitive actions"),
             ],
         ))
-        .child(actions(q, "Save execution plan"))
+        .child(actions("Save execution plan"))
 }
 
-fn controlled(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("scope", &["component", "tests", "feature"]),
-            item("checks", &["targeted", "package", "full"]),
-            item("output", &["summary", "diff", "handoff"]),
-        ],
-        Some("scope"),
-        None,
-        move |_, a| {
-            toast(
-                &toasts,
-                "Agent workflow configured",
-                format!(
-                    "Scope: {} · Verification: {} · Output: {}",
-                    value_of(&a, "scope", "None"),
-                    value_of(&a, "checks", "None"),
-                    value_of(&a, "output", "None")
-                ),
-            );
-        },
-    )
+fn controlled() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("scope", &["component", "tests", "feature"]),
+        item("checks", &["targeted", "package", "full"]),
+        item("output", &["summary", "diff", "handoff"]),
+    ])
+    .default_item("scope")
+    .on_submit(move |_, a| {
+        toast(
+            "Agent workflow configured",
+            format!(
+                "Scope: {} · Verification: {} · Output: {}",
+                value_of(&a, "scope", "None"),
+                value_of(&a, "checks", "None"),
+                value_of(&a, "output", "None")
+            ),
+        );
+    })
 }
 
-fn controlled_demo(q: &Questionnaire) -> Div {
+fn controlled_demo(root: Part<QuestionnaireProps>, current: Signal<String>) -> Div {
     let t = theme();
-    let label = match q.item().as_deref() {
-        Some("scope") => "Change scope",
-        Some("checks") => "Verification",
-        Some("output") => "Final output",
+    let label = match current.get().as_str() {
+        "scope" => "Change scope",
+        "checks" => "Verification",
+        "output" => "Final output",
         _ => "",
     };
     div()
@@ -431,11 +394,9 @@ fn controlled_demo(q: &Questionnaire) -> Div {
                 .text_color(t.muted_foreground),
         )
         .child(
-            questionnaire(q)
-                .mt_auto()
-                .child(questionnaire_progress(q))
+            root.mt_auto()
+                .child(questionnaire_progress())
                 .child(simple_item(
-                    q,
                     "scope",
                     "What may the agent change?",
                     Some("The host stores the active checkpoint while Questionnaire navigates."),
@@ -446,7 +407,6 @@ fn controlled_demo(q: &Questionnaire) -> Div {
                     ],
                 ))
                 .child(simple_item(
-                    q,
                     "checks",
                     "Which verification level should it use?",
                     None,
@@ -457,7 +417,6 @@ fn controlled_demo(q: &Questionnaire) -> Div {
                     ],
                 ))
                 .child(simple_item(
-                    q,
                     "output",
                     "What should the agent return when finished?",
                     None,
@@ -467,150 +426,127 @@ fn controlled_demo(q: &Questionnaire) -> Div {
                         ("handoff", "Detailed implementation handoff"),
                     ],
                 ))
-                .child(actions(q, "Save workflow")),
+                .child(actions("Save workflow")),
         )
 }
 
-fn dialog_questionnaire(toasts: &Toaster, open: &DialogState) -> Questionnaire {
-    let (toasts, open) = (toasts.clone(), open.clone());
-    Questionnaire::new(
-        vec![
-            item("scope", &["component", "feature", "workspace"]),
-            item("tests", &["targeted", "package", "full"]),
-        ],
-        Some("scope"),
-        None,
-        move |_, a| {
-            open.close();
-            toast(
-                &toasts,
-                "Clarification sent",
-                format!(
-                    "Scope: {} · Verification: {}",
-                    value_of(&a, "scope", "None"),
-                    value_of(&a, "tests", "None")
-                ),
-            );
-        },
-    )
-}
-
-/// An item whose title and description are the dialog's.
-fn dialog_item(q: &Questionnaire, name: &str, title: &str, description: &str, entries: &[(&str, &str)]) -> Option<Div> {
-    questionnaire_item(q, name).map(|item| {
-        item.child(
-            dialog_header()
-                .child(questionnaire_progress(q))
-                .child(dialog_title(title.to_owned()))
-                .child(dialog_description(description.to_owned())),
-        )
-        .child(choices(q, name, entries))
-        .child(questionnaire_error(q, name))
+fn dialog_questionnaire(open: Signal<bool>) -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("scope", &["component", "feature", "workspace"]),
+        item("tests", &["targeted", "package", "full"]),
+    ])
+    .default_item("scope")
+    .on_submit(move |_, a| {
+        open.set(false);
+        toast(
+            "Clarification sent",
+            format!(
+                "Scope: {} · Verification: {}",
+                value_of(&a, "scope", "None"),
+                value_of(&a, "tests", "None")
+            ),
+        );
     })
 }
 
-fn dialog_demo(q: &Questionnaire, open: &DialogState) -> Div {
+/// An item whose title and description are the dialog's.
+fn dialog_item(name: &str, title: &str, description: &str, entries: &[(&str, &str)]) -> Part<QuestionnaireItemProps> {
+    questionnaire_item(name)
+        .child(
+            dialog_header()
+                .child(questionnaire_progress())
+                .child(dialog_title(title.to_owned()))
+                .child(dialog_description(description.to_owned())),
+        )
+        .child(choices(entries))
+        .child(questionnaire_error())
+}
+
+fn dialog_demo(root: Part<QuestionnaireProps>, open: Signal<bool>) -> Part<DialogProps> {
     let outline = |label: &str| button(ButtonVariant::Outline, ButtonSize::Default).child(label.to_owned());
-    div()
-        .child(dialog_trigger(open, outline("Open clarification")))
-        .child(dialog_content(open, |c| {
-            c.child(
-                questionnaire(q)
-                    .child(dialog_item(
-                        q,
-                        "scope",
-                        "Which files are in scope?",
-                        "Choose how broadly the agent can update the workspace.",
-                        &[
-                            ("component", "Component only"),
-                            ("feature", "Complete feature directory"),
-                            ("workspace", "Any related workspace file"),
-                        ],
-                    ))
-                    .child(dialog_item(
-                        q,
-                        "tests",
-                        "How much verification is needed?",
-                        "Choose the checks the agent should run before handoff.",
-                        &[
-                            ("targeted", "Targeted tests"),
-                            ("package", "Package tests"),
-                            ("full", "Full workspace verification"),
-                        ],
-                    ))
-                    .child(
-                        dialog_footer()
-                            .child(dialog_close(open, outline("Cancel")))
-                            .child(actions(q, "Send answer")),
-                    ),
-            )
-        }))
+    dialog()
+        .open(open)
+        .child(dialog_trigger(outline("Open clarification")))
+        .child(
+            dialog_content().child(
+                root.child(dialog_item(
+                    "scope",
+                    "Which files are in scope?",
+                    "Choose how broadly the agent can update the workspace.",
+                    &[
+                        ("component", "Component only"),
+                        ("feature", "Complete feature directory"),
+                        ("workspace", "Any related workspace file"),
+                    ],
+                ))
+                .child(dialog_item(
+                    "tests",
+                    "How much verification is needed?",
+                    "Choose the checks the agent should run before handoff.",
+                    &[
+                        ("targeted", "Targeted tests"),
+                        ("package", "Package tests"),
+                        ("full", "Full workspace verification"),
+                    ],
+                ))
+                .child(
+                    dialog_footer()
+                        .child(dialog_close(outline("Cancel")))
+                        .child(actions("Send answer")),
+                ),
+            ),
+        )
 }
 
-fn freeform(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![item("approach", &["incremental", "module", "rewrite"]).with_input()],
-        None,
-        Some(QuestionnaireShortcuts::Letters),
-        move |_, a| {
-            toast(
-                &toasts,
-                "Approach selected",
-                format!("Approach: {}", value_of(&a, "approach", "None")),
-            );
-        },
-    )
+fn freeform() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("approach", &["incremental", "module", "rewrite"]).with_input(),
+    ])
+    .shortcuts(Some(QuestionnaireShortcuts::Letters))
+    .on_submit(move |_, a| {
+        toast(
+            "Approach selected",
+            format!("Approach: {}", value_of(&a, "approach", "None")),
+        );
+    })
 }
 
-fn freeform_demo(q: &Questionnaire) -> Div {
-    questionnaire(q)
-        .mx_auto()
+fn freeform_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.mx_auto()
         .max_w(112.0)
-        .child(questionnaire_item(q, "approach").map(|item| {
-            item.child(questionnaire_title("How should the agent approach this refactor?"))
+        .child(
+            questionnaire_item("approach")
+                .child(questionnaire_title("How should the agent approach this refactor?"))
                 .child(questionnaire_description(
                     "Choose a strategy or write a more specific instruction.",
                 ))
                 .child(
-                    choices(
-                        q,
-                        "approach",
-                        &[
-                            ("incremental", "Make the smallest safe change"),
-                            ("module", "Refactor one module at a time"),
-                            ("rewrite", "Replace the implementation completely"),
-                        ],
-                    )
-                    .child(questionnaire_input(q, "approach").map(|i| i.placeholder("Describe another approach…"))),
+                    choices(&[
+                        ("incremental", "Make the smallest safe change"),
+                        ("module", "Refactor one module at a time"),
+                        ("rewrite", "Replace the implementation completely"),
+                    ])
+                    .child(questionnaire_input().placeholder("Describe another approach…")),
                 )
-                .child(questionnaire_error(q, "approach"))
-        }))
-        .child(questionnaire_actions().child(questionnaire_submit(q, "Use this approach")))
+                .child(questionnaire_error()),
+        )
+        .child(questionnaire_actions().child(questionnaire_submit("Use this approach")))
 }
 
-fn multiple(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![item("context", &["source", "tests", "docs", "history"]).multiple()],
-        None,
-        Some(QuestionnaireShortcuts::Letters),
-        move |_, a| {
-            toast(
-                &toasts,
-                "Context selected",
-                format!("Context: {}", values_of(&a, "context")),
-            );
-        },
-    )
+fn multiple() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("context", &["source", "tests", "docs", "history"]).multiple(),
+    ])
+    .shortcuts(Some(QuestionnaireShortcuts::Letters))
+    .on_submit(move |_, a| {
+        toast("Context selected", format!("Context: {}", values_of(&a, "context")));
+    })
 }
 
-fn multiple_demo(q: &Questionnaire) -> Div {
-    questionnaire(q)
-        .mx_auto()
+fn multiple_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.mx_auto()
         .max_w(112.0)
         .child(simple_item(
-            q,
             "context",
             "What context should the agent inspect?",
             Some("Select every source that may affect the implementation."),
@@ -621,40 +557,33 @@ fn multiple_demo(q: &Questionnaire) -> Div {
                 ("history", "Recent commit history"),
             ],
         ))
-        .child(questionnaire_actions().child(questionnaire_submit(q, "Share context")))
+        .child(questionnaire_actions().child(questionnaire_submit("Share context")))
 }
 
-fn navigation_state(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("permission", &["files", "tests", "config"]),
-            item("verification", &["tests", "types", "all"]),
-        ],
-        Some("permission"),
-        None,
-        move |_, a| {
-            toast(
-                &toasts,
-                "Permissions saved",
-                format!(
-                    "Permission: {} · Verification: {}",
-                    value_of(&a, "permission", "None"),
-                    value_of(&a, "verification", "None")
-                ),
-            );
-        },
-    )
+fn navigation_state() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("permission", &["files", "tests", "config"]),
+        item("verification", &["tests", "types", "all"]),
+    ])
+    .default_item("permission")
+    .on_submit(move |_, a| {
+        toast(
+            "Permissions saved",
+            format!(
+                "Permission: {} · Verification: {}",
+                value_of(&a, "permission", "None"),
+                value_of(&a, "verification", "None")
+            ),
+        );
+    })
 }
 
-fn navigation_state_demo(q: &Questionnaire) -> Div {
-    let unanswered = q.active_status() == Some(QuestionnaireStatus::Unanswered);
-    questionnaire(q)
-        .mx_auto()
+fn navigation_state_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    let unanswered = |s: Option<QuestionnaireStatus>| s == Some(QuestionnaireStatus::Unanswered);
+    root.mx_auto()
         .max_w(112.0)
-        .child(questionnaire_progress(q))
+        .child(questionnaire_progress())
         .child(simple_item(
-            q,
             "permission",
             "What may the agent modify?",
             Some("Next is intentionally disabled until an answer is selected."),
@@ -665,7 +594,6 @@ fn navigation_state_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "verification",
             "What must pass before completion?",
             None,
@@ -677,63 +605,57 @@ fn navigation_state_demo(q: &Questionnaire) -> Div {
         ))
         .child(
             questionnaire_actions()
-                .child(questionnaire_previous(q, "Previous"))
-                .child(questionnaire_next_with(q, "Next", ButtonVariant::Secondary, unanswered))
-                .child(questionnaire_submit_with(
-                    q,
-                    "Save permissions",
-                    ButtonVariant::Default,
-                    unanswered,
-                )),
+                .child(questionnaire_previous("Previous"))
+                .child(
+                    questionnaire_next("Next")
+                        .variant(ButtonVariant::Secondary)
+                        .disabled_when(unanswered),
+                )
+                .child(questionnaire_submit("Save permissions").disabled_when(unanswered)),
         )
 }
 
-fn progress(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("scope", &["small", "medium", "large"]),
-            item("strategy", &["single", "logical", "squash"]),
-            item("tests", &["targeted", "package", "workspace"]),
-            item("delivery", &["patch", "commit", "branch"]),
-        ],
-        Some("scope"),
-        None,
-        move |_, a| {
-            toast(
-                &toasts,
-                "Pull request plan ready",
-                format!(
-                    "Scope: {} · Commits: {} · Tests: {} · Delivery: {}",
-                    value_of(&a, "scope", "None"),
-                    value_of(&a, "strategy", "None"),
-                    value_of(&a, "tests", "None"),
-                    value_of(&a, "delivery", "None")
-                ),
-            );
-        },
-    )
+fn progress() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("scope", &["small", "medium", "large"]),
+        item("strategy", &["single", "logical", "squash"]),
+        item("tests", &["targeted", "package", "workspace"]),
+        item("delivery", &["patch", "commit", "branch"]),
+    ])
+    .default_item("scope")
+    .on_submit(move |_, a| {
+        toast(
+            "Pull request plan ready",
+            format!(
+                "Scope: {} · Commits: {} · Tests: {} · Delivery: {}",
+                value_of(&a, "scope", "None"),
+                value_of(&a, "strategy", "None"),
+                value_of(&a, "tests", "None"),
+                value_of(&a, "delivery", "None")
+            ),
+        );
+    })
 }
 
-fn progress_demo(q: &Questionnaire) -> Div {
-    let t = theme();
-    let (current, total) = (q.current(), q.total());
-    let bar = div().mb(2.0).flex().gap(1.5).children((1..=total).map(|step| {
+fn progress_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    let progress = |p: QuestionnaireProgressState| {
+        let t = theme();
+        let bar = div().mb(2.0).flex().gap(1.5).children((1..=p.total).map(|step| {
+            div()
+                .h(1.5)
+                .flex_1()
+                .rounded_full()
+                .bg(if step <= p.current { t.primary } else { t.muted })
+        }));
         div()
-            .h(1.5)
-            .flex_1()
-            .rounded_full()
-            .bg(if step <= current { t.primary } else { t.muted })
-    }));
-    questionnaire(q)
-        .mx_auto()
+            .child(bar)
+            .child(text(format!("Checkpoint {} of {}", p.current, p.total)))
+            .into_element()
+    };
+    root.mx_auto()
         .max_w(112.0)
-        .child(
-            questionnaire_progress_with(div().child(bar).child(text(format!("Checkpoint {current} of {total}"))))
-                .w_full(),
-        )
+        .child(questionnaire_progress_with(progress).w_full())
         .child(simple_item(
-            q,
             "scope",
             "How large is the change?",
             None,
@@ -744,7 +666,6 @@ fn progress_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "strategy",
             "How should commits be organized?",
             None,
@@ -755,7 +676,6 @@ fn progress_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "tests",
             "Which tests should run?",
             None,
@@ -766,7 +686,6 @@ fn progress_demo(q: &Questionnaire) -> Div {
             ],
         ))
         .child(simple_item(
-            q,
             "delivery",
             "How should the work be delivered?",
             None,
@@ -776,121 +695,102 @@ fn progress_demo(q: &Questionnaire) -> Div {
                 ("branch", "Push a review branch"),
             ],
         ))
-        .child(actions(q, "Finish plan"))
+        .child(actions("Finish plan"))
 }
 
-fn resume(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("change", &["incremental", "cutover"]).checked(&["incremental"]),
-            item("verification", &["tests", "typecheck", "manual"])
-                .multiple()
-                .checked(&["tests", "typecheck"]),
-            QuestionnaireItem::new("notes", &[]).default_value("Keep the existing public API stable."),
+fn resume() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("change", &["incremental", "cutover"]).checked(&["incremental"]),
+        item("verification", &["tests", "typecheck", "manual"])
+            .multiple()
+            .checked(&["tests", "typecheck"]),
+        QuestionnaireItem::new("notes", &[]).default_value("Keep the existing public API stable."),
+    ])
+    .default_item("verification")
+    .on_submit(move |_, a| {
+        toast(
+            "Draft updated",
+            format!(
+                "Migration: {} · Verification: {} · Notes: {}",
+                value_of(&a, "change", "None"),
+                values_of(&a, "verification"),
+                value_of(&a, "notes", "None")
+            ),
+        );
+    })
+}
+
+fn resume_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.on_reset(move |_| {
+        shadcn::toast("Saved answers restored");
+    })
+    .mx_auto()
+    .max_w(112.0)
+    .child(questionnaire_progress())
+    .child(simple_item(
+        "change",
+        "What kind of migration is this?",
+        Some("This answer was saved during the previous session."),
+        &[("incremental", "Incremental migration"), ("cutover", "Single cutover")],
+    ))
+    .child(simple_item(
+        "verification",
+        "How should the migration be verified?",
+        Some("These checks were selected during the previous session."),
+        &[
+            ("tests", "Run migration tests"),
+            ("typecheck", "Run the typecheck"),
+            ("manual", "Perform a manual smoke test"),
         ],
-        Some("verification"),
-        None,
-        move |_, a| {
-            toast(
-                &toasts,
-                "Draft updated",
-                format!(
-                    "Migration: {} · Verification: {} · Notes: {}",
-                    value_of(&a, "change", "None"),
-                    values_of(&a, "verification"),
-                    value_of(&a, "notes", "None")
-                ),
-            );
-        },
+    ))
+    .child(
+        questionnaire_item("notes")
+            .child(questionnaire_title("Anything else the agent should remember?"))
+            .child(questionnaire_description("This note was saved with the draft."))
+            .child(questionnaire_input()),
+    )
+    .child(
+        questionnaire_actions()
+            // `type="reset"`: no column of its own, so the grid puts it in the free middle one.
+            .child(questionnaire_reset(
+                button(ButtonVariant::Outline, ButtonSize::Default).child("Reset changes"),
+            ))
+            .child(questionnaire_previous("Previous"))
+            .child(questionnaire_next("Next"))
+            .child(questionnaire_submit("Update draft")),
     )
 }
 
-fn resume_demo(q: &Questionnaire, toasts: &Toaster) -> Div {
-    let (reset, toasts) = (q.clone(), toasts.clone());
-    questionnaire(q)
-        .mx_auto()
-        .max_w(112.0)
-        .child(questionnaire_progress(q))
-        .child(simple_item(
-            q,
-            "change",
-            "What kind of migration is this?",
-            Some("This answer was saved during the previous session."),
-            &[("incremental", "Incremental migration"), ("cutover", "Single cutover")],
-        ))
-        .child(simple_item(
-            q,
-            "verification",
-            "How should the migration be verified?",
-            Some("These checks were selected during the previous session."),
-            &[
-                ("tests", "Run migration tests"),
-                ("typecheck", "Run the typecheck"),
-                ("manual", "Perform a manual smoke test"),
-            ],
-        ))
-        .child(questionnaire_item(q, "notes").map(|item| {
-            item.child(questionnaire_title("Anything else the agent should remember?"))
-                .child(questionnaire_description("This note was saved with the draft."))
-                .child(questionnaire_input(q, "notes"))
-        }))
-        .child(
-            questionnaire_actions()
-                // `type="reset"`: no column of its own, so the grid puts it in the free middle one.
-                .child(
-                    button(ButtonVariant::Outline, ButtonSize::Default)
-                        .child("Reset changes")
-                        .on_click(move |_| {
-                            reset.reset();
-                            toasts.toast("Saved answers restored");
-                        }),
-                )
-                .child(questionnaire_previous(q, "Previous"))
-                .child(questionnaire_next(q, "Next"))
-                .child(questionnaire_submit(q, "Update draft")),
-        )
-}
-
-fn shortcuts(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![item("action", &["inspect", "tests", "patch"])],
-        None,
-        Some(QuestionnaireShortcuts::Letters),
-        move |_, a| {
+fn shortcuts() -> Part<QuestionnaireProps> {
+    questionnaire(vec![item("action", &["inspect", "tests", "patch"])])
+        .shortcuts(Some(QuestionnaireShortcuts::Letters))
+        .on_submit(move |_, a| {
             toast(
-                &toasts,
                 "Next action selected",
                 format!("Action: {}", value_of(&a, "action", "None")),
             );
-        },
-    )
+        })
 }
 
-fn shortcuts_demo(q: &Questionnaire, mode: &Signal<String>, focus: FocusHandle) -> Div {
-    let (q2, mode2) = (q.clone(), mode.clone());
-    let select = native_select_with(
-        focus,
-        &mode.get(),
-        move |v| {
-            q2.set_shortcuts(match v.as_str() {
-                "letters" => Some(QuestionnaireShortcuts::Letters),
-                "numbers" => Some(QuestionnaireShortcuts::Numbers),
-                _ => None,
-            });
-            mode2.set(v);
-        },
-        &[
-            native_select_option("none", "No shortcuts"),
-            native_select_option("letters", "Letters"),
-            native_select_option("numbers", "Numbers"),
-        ],
-        NativeSelectLook::default(),
-        // The demo's `class` lands on the `<select>`, not its wrapper: the
-        // wrapper keeps no width and the box hangs off its left edge, as in Vue.
-        |field, chevron| (field.absolute().right(0.0).top(0.0), chevron),
-    );
+fn shortcuts_demo(root: Part<QuestionnaireProps>, mode: &Signal<String>, focus: FocusHandle) -> Div {
+    let mode2 = *mode;
+    let shortcuts = match mode.get().as_str() {
+        "letters" => Some(QuestionnaireShortcuts::Letters),
+        "numbers" => Some(QuestionnaireShortcuts::Numbers),
+        _ => None,
+    };
+    let root = root.shortcuts(shortcuts);
+    let select = native_select([
+        native_select_option("none", "No shortcuts"),
+        native_select_option("letters", "Letters"),
+        native_select_option("numbers", "Numbers"),
+    ])
+    .value(mode.get())
+    .on_change(move |v| mode2.set(v))
+    .focus(focus)
+    // The demo's `class` lands on the `<select>`, not its wrapper: the
+    // wrapper keeps no width and the box hangs off its left edge, as in Vue.
+    .class(|field, chevron| (field.absolute().right(0.0).top(0.0), chevron));
     div()
         .relative()
         .mx_auto()
@@ -898,12 +798,10 @@ fn shortcuts_demo(q: &Questionnaire, mode: &Signal<String>, focus: FocusHandle) 
         .w_full()
         .max_w(112.0)
         // The wrapper's `w-fit`: with the select out of flow it has no width.
-        .child(select.self_start())
+        .child(div().self_start().child(select))
         .child(
-            questionnaire(q)
-                .mt_auto()
+            root.mt_auto()
                 .child(simple_item(
-                    q,
                     "action",
                     "What should the agent do next?",
                     Some("Use the displayed shortcut or navigate with the keyboard."),
@@ -913,73 +811,60 @@ fn shortcuts_demo(q: &Questionnaire, mode: &Signal<String>, focus: FocusHandle) 
                         ("patch", "Prepare the patch"),
                     ],
                 ))
-                .child(questionnaire_actions().child(questionnaire_submit(q, "Confirm action"))),
+                .child(questionnaire_actions().child(questionnaire_submit("Confirm action"))),
         )
 }
 
-fn skip(toasts: &Toaster) -> Questionnaire {
-    let toasts = toasts.clone();
-    Questionnaire::new(
-        vec![
-            item("task", &["feature", "fix", "refactor"]),
-            QuestionnaireItem::new("constraints", &["no-dependencies", "no-migrations", "preserve-api"]).with_input(),
-            item("review", &["tests", "diff", "both"]),
-        ],
-        Some("task"),
-        None,
-        move |q, a| {
-            let constraints = if q.status("constraints") == Some(QuestionnaireStatus::Skipped) {
-                "Skipped".to_owned()
-            } else {
-                value_of(&a, "constraints", "None")
-            };
-            toast(
-                &toasts,
-                "Agent brief submitted",
-                format!(
-                    "Task: {} · Constraints: {constraints} · Review: {}",
-                    value_of(&a, "task", "None"),
-                    value_of(&a, "review", "None")
-                ),
-            );
-        },
-    )
+fn skip() -> Part<QuestionnaireProps> {
+    questionnaire(vec![
+        item("task", &["feature", "fix", "refactor"]),
+        QuestionnaireItem::new("constraints", &["no-dependencies", "no-migrations", "preserve-api"]).with_input(),
+        item("review", &["tests", "diff", "both"]),
+    ])
+    .default_item("task")
+    .on_submit(move |q, a| {
+        let constraints = if q.status("constraints") == Some(QuestionnaireStatus::Skipped) {
+            "Skipped".to_owned()
+        } else {
+            value_of(&a, "constraints", "None")
+        };
+        toast(
+            "Agent brief submitted",
+            format!(
+                "Task: {} · Constraints: {constraints} · Review: {}",
+                value_of(&a, "task", "None"),
+                value_of(&a, "review", "None")
+            ),
+        );
+    })
 }
 
-fn skip_demo(q: &Questionnaire) -> Div {
-    questionnaire(q)
-        .mx_auto()
+fn skip_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
+    root.mx_auto()
         .max_w(112.0)
-        .child(questionnaire_progress(q))
+        .child(questionnaire_progress())
         .child(simple_item(
-            q,
             "task",
             "What kind of change is this?",
             Some("Choose the category that best describes the work."),
             &[("feature", "New feature"), ("fix", "Bug fix"), ("refactor", "Refactor")],
         ))
-        .child(questionnaire_item(q, "constraints").map(|item| {
-            item.child(questionnaire_title("Are there any implementation constraints?"))
+        .child(
+            questionnaire_item("constraints")
+                .child(questionnaire_title("Are there any implementation constraints?"))
                 .child(questionnaire_description(
                     "Answer if needed, or intentionally skip this question.",
                 ))
                 .child(
-                    choices(
-                        q,
-                        "constraints",
-                        &[
-                            ("no-dependencies", "Do not add dependencies"),
-                            ("no-migrations", "Do not change the database"),
-                            ("preserve-api", "Preserve the public API"),
-                        ],
-                    )
-                    .child(
-                        questionnaire_input(q, "constraints").map(|i| i.placeholder("Describe another constraint…")),
-                    ),
-                )
-        }))
+                    choices(&[
+                        ("no-dependencies", "Do not add dependencies"),
+                        ("no-migrations", "Do not change the database"),
+                        ("preserve-api", "Preserve the public API"),
+                    ])
+                    .child(questionnaire_input().placeholder("Describe another constraint…")),
+                ),
+        )
         .child(simple_item(
-            q,
             "review",
             "How should the work be reviewed?",
             Some("Choose the checks the agent should complete before handoff."),
@@ -991,40 +876,36 @@ fn skip_demo(q: &Questionnaire) -> Div {
         ))
         .child(
             questionnaire_actions()
-                .child(questionnaire_previous(q, "Previous"))
-                .child(questionnaire_skip(q, "Skip"))
-                .child(questionnaire_next(q, "Next"))
-                .child(questionnaire_submit(q, "Submit brief")),
+                .child(questionnaire_previous("Previous"))
+                .child(questionnaire_skip("Skip"))
+                .child(questionnaire_next("Next"))
+                .child(questionnaire_submit("Submit brief")),
         )
 }
 
 /// The message zod's `superRefine` adds to `detail`.
 const PUBLIC_NEEDS_DETAIL: &str = "Public answers need enough context. Choose a complete answer.";
 
-fn validation(toasts: &Toaster, error: &Signal<Option<String>>) -> Questionnaire {
-    let (toasts, error, cleared) = (toasts.clone(), error.clone(), error.clone());
-    Questionnaire::new(
-        vec![
-            item("detail", &["summary", "complete"]),
-            item("audience", &["team", "public"]),
-        ],
-        Some("detail"),
-        None,
-        move |q, a| {
-            let (detail, audience) = (value_of(&a, "detail", ""), value_of(&a, "audience", ""));
-            if audience == "public" && detail == "summary" {
-                error.set(Some(PUBLIC_NEEDS_DETAIL.to_owned()));
-                q.set_invalid("detail", true);
-                q.set_item("detail");
-                return;
-            }
-            toast(
-                &toasts,
-                "Agent response configured",
-                format!("Detail: {detail} · Audience: {audience}"),
-            );
-        },
-    )
+fn validation(error: &Signal<Option<String>>) -> Part<QuestionnaireProps> {
+    let (error, cleared) = (*error, *error);
+    questionnaire(vec![
+        item("detail", &["summary", "complete"]),
+        item("audience", &["team", "public"]),
+    ])
+    .default_item("detail")
+    .on_submit(move |q, a| {
+        let (detail, audience) = (value_of(&a, "detail", ""), value_of(&a, "audience", ""));
+        if audience == "public" && detail == "summary" {
+            error.set(Some(PUBLIC_NEEDS_DETAIL.to_owned()));
+            q.set_invalid("detail", true);
+            q.set_item("detail");
+            return;
+        }
+        toast(
+            "Agent response configured",
+            format!("Detail: {detail} · Audience: {audience}"),
+        );
+    })
     // `@change="clearError('detail')"`: only `detail` ever carries an error.
     .on_change(move |q, name, _| {
         if name == "detail" && cleared.get().is_some() {
@@ -1037,38 +918,37 @@ fn validation(toasts: &Toaster, error: &Signal<Option<String>>) -> Questionnaire
 /// An item as a card's header and content, its title and description the
 /// questionnaire's own (not `as-child`), its progress `{current} / {total}`.
 fn validation_item(
-    q: &Questionnaire,
     name: &str,
     title: &str,
     description: &str,
     entries: &[(&str, &str)],
     error: Option<String>,
-) -> Option<Div> {
-    questionnaire_item(q, name).map(|item| {
-        item.child(
+) -> Part<QuestionnaireItemProps> {
+    questionnaire_item(name)
+        .child(
             card_header()
                 .child(questionnaire_title(title.to_owned()).col_start(1))
                 // Not the item's legend here, so it keeps its place under the title.
                 .child(questionnaire_description(description.to_owned()).mt(0.0).col_start(1))
                 .child(
-                    card_action()
-                        .child(questionnaire_progress_with(format!("{} / {}", q.current(), q.total())).min_w(0.0)),
+                    card_action().child(
+                        questionnaire_progress_with(|p| text(format!("{} / {}", p.current, p.total)).into_element())
+                            .min_w(0.0),
+                    ),
                 ),
         )
         .child(
             card_content()
-                .child(choices(q, name, entries))
-                .child(questionnaire_error_with(q, name, error.unwrap_or_default())),
+                .child(choices(entries))
+                .child(questionnaire_error_with(error.unwrap_or_default())),
         )
-    })
 }
 
-fn validation_demo(q: &Questionnaire, error: &Signal<Option<String>>) -> Div {
-    questionnaire(q).mx_auto().max_w(112.0).child(
+fn validation_demo(root: Part<QuestionnaireProps>, error: &Signal<Option<String>>) -> Part<QuestionnaireProps> {
+    root.mx_auto().max_w(112.0).child(
         card()
             .w_full()
             .child(validation_item(
-                q,
                 "detail",
                 "How much detail should the answer include?",
                 "Choose the response depth.",
@@ -1076,69 +956,63 @@ fn validation_demo(q: &Questionnaire, error: &Signal<Option<String>>) -> Div {
                 error.get(),
             ))
             .child(validation_item(
-                q,
                 "audience",
                 "Who will read the answer?",
                 "Public answers require complete context.",
                 &[("team", "My team"), ("public", "Public audience")],
                 None,
             ))
-            .child(card_footer().child(actions(q, "Validate answers"))),
+            .child(card_footer().child(actions("Validate answers"))),
     )
 }
 
 pub fn render() -> Render {
     let saved = Signal::labeled("saved", String::new());
-    let toasts = Toaster::new();
-    let open = DialogState::new();
+    let open = Signal::labeled("clarification open", false);
     let mode = Signal::labeled("shortcut mode", "letters".to_owned());
     let mode_focus = FocusHandle::new();
     let validation_error = Signal::labeled("validation error", None);
-    let q = the_demo(&saved);
-    let animated = animated(&toasts);
-    let card = card_questionnaire(&toasts);
-    let conditional = conditional(&toasts);
-    let controlled = controlled(&toasts);
-    let dialog = dialog_questionnaire(&toasts, &open);
-    let freeform = freeform(&toasts);
-    let multiple = multiple(&toasts);
-    let navigation = navigation_state(&toasts);
-    let progress = progress(&toasts);
-    let resume = resume(&toasts);
-    let shortcuts = shortcuts(&toasts);
-    let skip = skip(&toasts);
-    let validation = validation(&toasts, &validation_error);
+    let current = Signal::labeled("controlled item", "scope".to_owned());
     Box::new(move || {
         page(
             "Questionnaire",
             div()
                 .flex_col()
                 .gap(8.0)
-                .child(demo("QuestionnaireDemo.vue", questionnaire_demo(&q)))
+                .child(demo("QuestionnaireDemo.vue", questionnaire_demo(the_demo(&saved))))
                 .child(text(saved.get()).text_sm())
-                .child(demo("QuestionnaireAnimatedDemo.vue", animated_demo(&animated)))
-                .child(demo("QuestionnaireCardDemo.vue", card_demo(&card)))
-                .child(demo("QuestionnaireConditionalDemo.vue", conditional_demo(&conditional)))
-                .child(demo("QuestionnaireControlledDemo.vue", controlled_demo(&controlled)))
-                .child(demo("QuestionnaireDialogDemo.vue", dialog_demo(&dialog, &open)))
-                .child(demo("QuestionnaireFreeformDemo.vue", freeform_demo(&freeform)))
-                .child(demo("QuestionnaireMultipleDemo.vue", multiple_demo(&multiple)))
+                .child(demo("QuestionnaireAnimatedDemo.vue", animated_demo(animated())))
+                .child(demo("QuestionnaireCardDemo.vue", card_demo(card_questionnaire())))
+                .child(demo(
+                    "QuestionnaireConditionalDemo.vue",
+                    conditional_demo(conditional()),
+                ))
+                .child(demo(
+                    "QuestionnaireControlledDemo.vue",
+                    controlled_demo(controlled().item(Model::bind(current)), current),
+                ))
+                .child(demo(
+                    "QuestionnaireDialogDemo.vue",
+                    dialog_demo(dialog_questionnaire(open), open),
+                ))
+                .child(demo("QuestionnaireFreeformDemo.vue", freeform_demo(freeform())))
+                .child(demo("QuestionnaireMultipleDemo.vue", multiple_demo(multiple())))
                 .child(demo(
                     "QuestionnaireNavigationStateDemo.vue",
-                    navigation_state_demo(&navigation),
+                    navigation_state_demo(navigation_state()),
                 ))
-                .child(demo("QuestionnaireProgressDemo.vue", progress_demo(&progress)))
-                .child(demo("QuestionnaireResumeDemo.vue", resume_demo(&resume, &toasts)))
+                .child(demo("QuestionnaireProgressDemo.vue", progress_demo(progress())))
+                .child(demo("QuestionnaireResumeDemo.vue", resume_demo(resume())))
                 .child(demo(
                     "QuestionnaireShortcutsDemo.vue",
-                    shortcuts_demo(&shortcuts, &mode, mode_focus),
+                    shortcuts_demo(shortcuts(), &mode, mode_focus),
                 ))
-                .child(demo("QuestionnaireSkipDemo.vue", skip_demo(&skip)))
+                .child(demo("QuestionnaireSkipDemo.vue", skip_demo(skip())))
                 .child(demo(
                     "QuestionnaireValidationDemo.vue",
-                    validation_demo(&validation, &validation_error),
+                    validation_demo(validation(&validation_error), &validation_error),
                 ))
-                .child(toaster(&toasts)),
+                .child(toaster()),
         )
     })
 }
