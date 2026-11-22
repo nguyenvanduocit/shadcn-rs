@@ -149,7 +149,9 @@ pub fn run() -> (Vec<String>, bool) {
         // click (it may be drawn in a frame whose vblank came before it: a
         // main frame is granted mid-frame).
         let mut found = None;
-        while found.is_none() && at.elapsed() < Duration::from_millis(500) {
+        // Whether it shows, not how soon (the goal below): a software GPU
+        // on a two-core runner may take far longer than a frame.
+        while found.is_none() && at.elapsed() < Duration::from_secs(3) {
             std::thread::sleep(Duration::from_millis(10));
             found = off
                 .take_frames()
@@ -249,7 +251,9 @@ pub fn run() -> (Vec<String>, bool) {
     // What must hold whatever the machine's load: the compositor drew
     // while the UI owed it a frame, the UI was really late, the wheel
     // scrolled. How close to every tick is the goal, reported.
-    let works = without_ui > 0 && longest_ui >= BUSY && scrolled > 0.0;
+    // Commits land on vblanks: a UI busy for `BUSY` leaves a gap of whole
+    // ticks, which may fall a hair short of it (6 × 8.333 ms = 49.998 ms).
+    let works = without_ui > 0 && longest_ui + INTERVAL > BUSY && scrolled > 0.0;
     failed |= !works;
     let goal = f64::from(u32::try_from(drawn).unwrap_or(0)) >= ticks * 0.95 && worst_gap <= GAP_GOAL;
     lines.push(format!(
