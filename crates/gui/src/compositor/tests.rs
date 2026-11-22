@@ -421,10 +421,13 @@ fn a_frame_the_ui_owes_still_moves_what_the_compositor_runs() {
     );
 }
 
-/// Wait until `done` holds, up to two seconds.
+/// Wait until `done` holds, up to ten seconds: whether it happens, not how
+/// fast. A render thread made afresh makes a device and builds every
+/// pipeline up front, which on lavapipe (software Vulkan, CI) amid the
+/// parallel tests takes seconds.
 fn wait_for(mut done: impl FnMut() -> bool) -> bool {
     let until = Instant::now()
-        .checked_add(Duration::from_secs(2))
+        .checked_add(Duration::from_secs(10))
         .unwrap_or_else(Instant::now);
     while Instant::now() < until {
         if done() {
