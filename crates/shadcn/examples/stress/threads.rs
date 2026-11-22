@@ -30,6 +30,8 @@ const SIZE: (u32, u32) = (800, 600);
 /// How many clicks input to present is measured over, and its goal: two
 /// intervals (a click lands somewhere in one) and a little.
 const CLICKS: usize = 20;
+/// Clicks made before those measured (see where they are made).
+const WARM_CLICKS: usize = 4;
 /// No two frames further apart than two intervals (one tick missed at most).
 const GAP_GOAL: Duration = Duration::from_micros(8_333 * 2 + 1_000);
 const LATENCY_GOAL: Duration = Duration::from_micros(8_333 * 2 + 1_000);
@@ -139,6 +141,19 @@ pub fn run() -> (Vec<String>, bool) {
     let mut latencies = Vec::new();
     off.input(Input::PointerMoved { x: 60.0, y: 20.0 });
     std::thread::sleep(Duration::from_millis(100));
+    // Warm up, unmeasured: a driver that compiles shader variants on first
+    // draw (lavapipe in CI, with an empty shader cache) stalls the first
+    // clicks for seconds; what is measured is the steady path.
+    for _ in 0..WARM_CLICKS {
+        let shown = off.presented().commit;
+        off.input(Input::MouseDown { x: 60.0, y: 20.0 });
+        off.input(Input::MouseUp { x: 60.0, y: 20.0 });
+        let at = Instant::now();
+        while off.presented().commit <= shown && at.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
     drop(off.take_frames());
     for _ in 0..CLICKS {
         let shown = off.presented().commit;
