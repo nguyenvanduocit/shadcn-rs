@@ -253,7 +253,7 @@ pub fn run() -> (Vec<String>, bool) {
     // scrolled. How close to every tick is the goal, reported.
     // Commits land on vblanks: a UI busy for `BUSY` leaves a gap of whole
     // ticks, which may fall a hair short of it (6 × 8.333 ms = 49.998 ms).
-    let works = without_ui > 0 && longest_ui + INTERVAL > BUSY && scrolled > 0.0;
+    let works = without_ui > 0 && longest_ui.saturating_add(INTERVAL) > BUSY && scrolled > 0.0;
     failed |= !works;
     let goal = f64::from(u32::try_from(drawn).unwrap_or(0)) >= ticks * 0.95 && worst_gap <= GAP_GOAL;
     lines.push(format!(
