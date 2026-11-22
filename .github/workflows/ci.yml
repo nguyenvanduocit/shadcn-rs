@@ -31,6 +31,9 @@ jobs:
       - run: "cargo test -p shadcn --lib --locked --features tabler,hugeicons,phosphor,remixicon icons::"
       # Allocation budgets per scene and frame on the UI thread (ADR-0023): a
       # scene over its budget fails the run. Release: the scenes are large.
+      # Diagnostic (to be removed): the threads scene's per-click and per-frame timings, three runs.
+      - run: for i in 1 2 3; do STRESS_THREADS_DEBUG=1 cargo run --release --locked -p shadcn --example stress -- --run threads --cycles=0 --monkey=0 2>&1 | grep -E "^click|input to present|FAIL|UI busy" || true; done
+        shell: bash
       - run: cargo run --release --locked -p shadcn --example stress -- --run --cycles=0 --monkey=0
       # Retired instructions beside time (ADR-0023): the same build benched
       # twice must agree, by instructions where the VM exposes the counters
