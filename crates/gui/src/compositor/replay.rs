@@ -208,15 +208,20 @@ fn replay(log: &InputLog, hz: f64, ui_every: u32) -> Run {
                     point,
                     delta,
                     precise,
+                    began,
                     ended,
                 } => {
                     let c = &mut s.parts().1.compositor;
-                    let t = f64_f32(at);
-                    let hit = if precise {
-                        c.gesture(point, delta, t, ended)
-                    } else {
-                        c.wheel(point, delta, t)
-                    };
+                    let seen = c.presented().frame;
+                    let hit = c.wheel_input(super::WheelInput {
+                        point,
+                        delta,
+                        at: f64_f32(at),
+                        precise,
+                        began,
+                        ended,
+                        seen,
+                    }) == super::Wheeled::Scrolled;
                     run.wheels.push(Wheel {
                         at,
                         dy: delta.1,
@@ -247,7 +252,7 @@ fn replay(log: &InputLog, hz: f64, ui_every: u32) -> Run {
                             down = Some((at, x, y, on_screen));
                             run.raw.push(Vec::new());
                         }
-                        Input::MouseUp { .. } => {
+                        Input::MouseUp { .. } | Input::Blur => {
                             pressed = false;
                             if let Some((x, y)) = resampler.flush() {
                                 s.pipeline_mut().input_shown(Input::PointerMoved { x, y }, &shown);
@@ -602,7 +607,7 @@ fn check(name: &str, log: &InputLog, run: &Run) -> String {
                     );
                 }
             }
-            DragPhase::End => {
+            DragPhase::End | DragPhase::Cancel => {
                 raw_moves = raw_moves.saturating_add(run.raw.get(drag).map_or(0, Vec::len));
                 drag = drag.saturating_add(1);
             }

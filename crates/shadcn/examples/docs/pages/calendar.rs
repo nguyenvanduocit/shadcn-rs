@@ -653,7 +653,7 @@ fn last_text(s: &Shot, label: &str) -> Result<(f32, f32), ScenarioError> {
         .nodes
         .iter()
         .rev()
-        .find(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if content == label))
+        .find(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == label))
         .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound(label.to_owned()))
 }

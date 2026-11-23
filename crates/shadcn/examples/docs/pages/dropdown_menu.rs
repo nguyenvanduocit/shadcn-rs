@@ -19,13 +19,13 @@ pub fn render() -> Render {
         let t = theme();
         let item = |name: &'static str| {
             dropdown_menu_item(name, MenuItem::default())
-                .on_select(move || last.set(name.to_owned()))
+                .on_select(move |_| last.set(name.to_owned()))
                 .child(name)
         };
         let with_shortcut = |name: &'static str, keys: &str| item(name).child(dropdown_menu_shortcut(keys));
         let with_icon = |glyph: Icon, name: &'static str| {
             dropdown_menu_item(name, MenuItem::default())
-                .on_select(move || last.set(name.to_owned()))
+                .on_select(move |_| last.set(name.to_owned()))
                 .child(icon(glyph).text_color(t.muted_foreground))
                 .child(name)
         };
@@ -162,6 +162,10 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.frame("arrow down twice")?;
     let (x, y) = s.locate("Invite users")?;
     s.hover(x, y);
+    // A submenu opens 100 ms after the mouse rests on its trigger (reka's),
+    // then plays its opening.
+    s.wait(std::time::Duration::from_millis(100));
+    s.rest(std::time::Duration::from_millis(500))?;
     s.frame("submenu open")?;
     key(s, NamedKey::ArrowRight);
     key(s, NamedKey::ArrowDown);

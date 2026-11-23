@@ -1,0 +1,16 @@
+---
+source: crates/primitives/tests/overlays.rs
+expression: a11y(&p.s)
+---
+Window "w"
+  GenericContainer hidden
+    Button haspopup=Dialog expanded=true controls=AlertDialog
+      Label "Delete"
+  GenericContainer
+    AlertDialog modal labelled-by=Are you sure? described-by=This cannot be undone.
+      Heading "Are you sure?" level=2
+      Label "This cannot be undone."
+      Button
+        Label "Continue"
+      Button
+        Label "Cancel"

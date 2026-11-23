@@ -62,16 +62,22 @@ in `apps/v4/components/demo/<Name>Demo.vue` and `apps/v4/components/_internal/si
   `.class(move |d| d.when(on.get(), |d| d.bg(blue)))`).
 - **Watches, timers and effects belong to the instance's scope**: they are
   made in setup and disposed with it. No `_effect` fields.
-- **Focus goes back on close**: an overlay remembers what held focus when it
-  opened and gives it back when it closes, from a watch on its open state
-  (`dialog::return_focus`). So a caller writing the model closes it as
-  correctly as Escape does.
+- **Floating layers are the engine's** (ADR-0024): an overlay's region is
+  `.layer(Layer::new().modal(…).dismiss(DismissPolicy::…).focus_scope(…)
+  .on_dismiss(…))`. The engine sends Escape to the top layer only (never
+  while an input method composes), asks with a typed `DismissReason`
+  (Escape, press outside, focus outside, scroll, `LayerHandle::dismiss`),
+  lets the owner veto, and keeps a modal's hit testing, wheel and reader
+  tree to the layer. Its `FocusScope` focuses into the content as it opens
+  and gives focus back as it closes unless focus moved since. So a caller
+  writing the model closes it as correctly as Escape does; no overlay
+  remembers focus or handles Escape itself.
 - **App-wide services are reached, not threaded**: a toast is raised with
   `toast(…)` / `toast::success(…)` from anywhere once a `toaster()` is
   placed, as vue-sonner's are.
 - **Behaviour comes from `gui`, not hand-rolled**: `.focusable()` (Tab order,
-  Enter/Space press a focused `on_click`), `.on_key_down` (arrows, Escape),
-  `.on_click_outside` (dismiss), `gui::deferred(Placement::…, …)` for anything
+  Enter/Space press a focused `on_click`), `.on_key_down` (arrows),
+  `.layer(…)` (dismiss, modal, focus scope), `.inert(…)`, `gui::deferred(Placement::…, …)` for anything
   that floats (popover, menu, dialog, toast), `.on_drag` (slider, resizable),
   `.overflow_y_scroll()` (scroll area), `gui::clock::{now, after}` (spinner,
   skeleton pulse, tooltip delay, toast timeout), `gui::shapes` (chart),
@@ -266,10 +272,15 @@ port scores ≥ 90 (`PASS`, no need to look); 75–90 is `WARN` (read its
 `side.png`); below 75 is `FAIL`, a port defect, and `run.sh` exits non-zero.
 A demo listed in `verdict/better.tsv` with why ours is better grades `BETTER`.
 The run ends with the mean score, the FAIL count and the tolerance it judged
-with, and writes `/tmp/shadcn-verdict[-dark]/<pages>/verdict.json` (page, demo,
+with, and writes `/tmp/shadcn-verdict/<style>/<pages>[-dark][@<theme>]/verdict.json` (page, demo,
 score, grade, sizes) for tools. `side.png`, per demo under
-`<pages>/<page>/<Demo>/`, holds theirs, ours, ours at half opacity over
+`<page>/<Demo>/` there, holds theirs, ours, ours at half opacity over
 theirs, and theirs faded with differing pixels magenta, top to bottom.
+`run.sh --style <name> --theme <spec>` judges a style (vega by default) in a theme
+(`baseColor=zinc,theme=blue,radius=large`: shadcn's picker choices); the reference
+renders the base components under `.style-<name>`, as shadcn-vue's previews do, and
+`/tmp/shadcn-verdict/index.html` sets every style's report side by side
+(`run.sh --help`).
 
 The tolerance forgives how the two rasterisers differ, never the port; each
 part is a flag of `run.sh`:

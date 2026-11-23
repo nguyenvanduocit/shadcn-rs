@@ -1,12 +1,17 @@
 //! Collapsible (`ui/collapsible`): content shown and hidden by a trigger.
 //!
-//! [`collapsible`] keeps whether it is open: its own, starting at
-//! `default_open`, the caller's through `.model(…)` (reka's
-//! `v-model:open`), or a value the caller keeps (`.open(…)` with
-//! `.on_change(…)`). Its trigger and content read it.
+//! The behaviour is `primitives::collapsible` (reka's `Collapsible`):
+//! [`collapsible`] keeps whether it is open, its own from `default_open`,
+//! the caller's through `.model(…)` (reka's `v-model:open`), or a value the
+//! caller keeps (`.open(…)` with `.on_change(…)`); its trigger toggles it
+//! unless disabled, and its content is gone while closed unless kept
+//! mounted. This file draws nothing of its own: the trigger and content are
+//! the caller's boxes.
 
 use gui::prelude::*;
-use gui::{Bind, Div, Element, Model, Signal, UseModel, component, div, provide, use_context, use_model};
+use gui::{Bind, Div, Model, component, div, provide, use_context, use_model};
+use primitives::Availability;
+use primitives::collapsible::Collapsible;
 
 use crate::part::{Part, PartProps};
 
@@ -15,26 +20,17 @@ use crate::part::{Part, PartProps};
 pub struct CollapsibleProps {
     open: Bind<bool>,
     disabled: bool,
+    keep_mounted: bool,
 }
 
-/// What the parts below a [`collapsible`] read.
-#[derive(Clone)]
-pub(crate) struct CollapsibleContext {
-    pub(crate) open: UseModel<PartProps<CollapsibleProps>, bool>,
-    props: Signal<PartProps<CollapsibleProps>>,
-}
+/// What the parts below a [`collapsible`] read: its primitive.
+#[derive(Clone, Copy)]
+pub(crate) struct CollapsibleContext(pub(crate) Collapsible<PartProps<CollapsibleProps>>);
 
 impl CollapsibleContext {
     /// Whether it is open (tracked).
     pub(crate) fn is_open(&self) -> bool {
-        self.open.get()
-    }
-
-    /// Open it when closed, close it when open, unless disabled.
-    pub(crate) fn toggle(&self) {
-        if !self.props.with_untracked(|p| p.props.disabled) {
-            self.open.update(|o| *o = !*o);
-        }
+        self.0.is_open()
     }
 
     /// The context of the collapsible this instance is in.
@@ -49,10 +45,11 @@ pub fn collapsible() -> Part<CollapsibleProps> {
     Part::new(CollapsibleProps::default(), div().named("collapsible"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            provide(CollapsibleContext {
-                open: use_model(props, |p| &p.props.open),
-                props,
-            });
+            provide(CollapsibleContext(Collapsible::new(
+                use_model(props, |p| &p.props.open),
+                move || Availability::from_disabled(props.with(|p| p.props.disabled)),
+                move || props.with(|p| p.props.keep_mounted),
+            )));
             move || props.with(|p| p.slot.0.clone()).into_element()
         })
     })
@@ -80,14 +77,22 @@ impl Part<CollapsibleProps> {
 
     /// Called with each new open state (`@update:open`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.open = std::mem::take(&mut p.open).on_change(f))
     }
 
-    /// The trigger does nothing.
+    /// The trigger takes no focus and no press; the caller can still open
+    /// and close it.
     #[must_use]
     pub fn disabled(self, disabled: bool) -> Self {
         self.with_props(|p| p.disabled = disabled)
+    }
+
+    /// The content stays mounted while closed, hidden and inert (reka's
+    /// `unmount-on-hide="false"`).
+    #[must_use]
+    pub fn keep_mounted(self, keep: bool) -> Self {
+        self.with_props(|p| p.keep_mounted = keep)
     }
 }
 
@@ -104,14 +109,11 @@ pub fn collapsible_trigger_as(control: impl Into<Div>) -> Part<()> {
     Part::new((), control.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = CollapsibleContext::find();
+            let ctx = primitives::context::use_root::<CollapsibleContext>("collapsible_trigger", "collapsible");
             move || {
                 let control = props.with(|p| p.slot.0.clone());
-                match ctx.clone() {
-                    Some(ctx) => control
-                        .aria_expanded(ctx.is_open())
-                        .on_click(move |_| ctx.toggle())
-                        .into_element(),
+                match ctx {
+                    Some(ctx) => ctx.0.trigger(control).into_element(),
                     None => control.into_element(),
                 }
             }
@@ -126,12 +128,12 @@ pub fn collapsible_content() -> Part<()> {
     Part::new((), div().named("collapsible-content"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = CollapsibleContext::find();
+            let ctx = primitives::context::use_root::<CollapsibleContext>("collapsible_content", "collapsible");
             move || {
-                if ctx.as_ref().is_none_or(CollapsibleContext::is_open) {
-                    props.with(|p| p.slot.0.clone()).into_element()
-                } else {
-                    Element::Empty
+                let content = props.with(|p| p.slot.0.clone());
+                match ctx {
+                    Some(ctx) => ctx.0.content(content),
+                    None => content.into_element(),
                 }
             }
         })

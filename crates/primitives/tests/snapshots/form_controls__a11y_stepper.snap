@@ -1,0 +1,21 @@
+---
+source: crates/primitives/tests/form_controls.rs
+expression: tree
+---
+Window "w"
+  Group "progress"
+    GenericContainer
+      Button labelled_by=["Address", "Where to"]
+        Label "Step 1"
+      Label "Address"
+      Label "Where to"
+    GenericContainer current=True
+      Button labelled_by=["Shipping"] current=Step
+        Label "Step 2"
+      Label "Shipping"
+    GenericContainer
+      Button "Finish" described_by=["How to pay"]
+        Label "Step 3"
+      Label "Payment"
+      Label "How to pay"
+    Status "Step 2 of 3" live=Polite

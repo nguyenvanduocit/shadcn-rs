@@ -124,11 +124,28 @@ impl fmt::Display for Bounds {
 }
 
 /// One step of a [`NodePath`]: a child's position among its siblings, or its
-/// key when it has one.
+/// key when it has one; the root of a keyed component's output is placed by
+/// the component's key, with its own key if it has one (a segment no
+/// element's key can make, so a component keyed 7 and a sibling node keyed
+/// 7 never share a path, and the root keeps its path as its keyed siblings
+/// are reordered).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PathSeg {
     Index(usize),
     Key(ElementKey),
+    Component(ElementKey, Option<ElementKey>),
+}
+
+impl PathSeg {
+    /// The node's own key (an element's, not its component's).
+    #[must_use]
+    pub fn element_key(self) -> Option<ElementKey> {
+        match self {
+            Self::Key(k) => Some(k),
+            Self::Component(_, own) => own,
+            Self::Index(_) => None,
+        }
+    }
 }
 
 /// Where a node sits in the tree: the same node across frames has the same
@@ -210,6 +227,8 @@ impl fmt::Display for NodePath {
             match seg {
                 PathSeg::Index(n) => write!(f, "{n}")?,
                 PathSeg::Key(k) => write!(f, "k{k}")?,
+                PathSeg::Component(c, None) => write!(f, "c{c}")?,
+                PathSeg::Component(c, Some(k)) => write!(f, "c{c}k{k}")?,
             }
         }
         Ok(())

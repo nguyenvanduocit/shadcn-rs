@@ -1,7 +1,7 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{
-    Part, PinInputProps, PinInputType, input_otp_group, label, pin_input, pin_input_separator, pin_input_slot, theme,
+    Part, PinInputProps, PinKind, input_otp_group, label, pin_input, pin_input_separator, pin_input_slot, theme,
 };
 
 use crate::{Render, Shot, demo, page};
@@ -11,7 +11,7 @@ fn group(range: std::ops::Range<usize>) -> gui::Div {
 }
 
 pub fn render() -> Render {
-    let simple = Signal::labeled("pin", Vec::<Option<char>>::new());
+    let simple = Signal::labeled("pin", Vec::<Option<String>>::new());
     Box::new(move || {
         let t = theme();
         let labelled = |name: &str, body: Part<PinInputProps>| {
@@ -21,7 +21,7 @@ pub fn render() -> Render {
                 .child(label(name.to_owned()))
                 .child(body)
         };
-        let code: String = simple.with(|v| v.iter().flatten().collect());
+        let code: String = simple.with(|v| v.iter().flatten().map(String::as_str).collect());
         page(
             "Pin Input",
             div()
@@ -38,7 +38,7 @@ pub fn render() -> Render {
                 ))
                 .child(labelled(
                     "Digits Only",
-                    pin_input().kind(PinInputType::Number).child(group(0..6)),
+                    pin_input().kind(PinKind::Number).child(group(0..6)),
                 ))
                 .child(labelled(
                     "With Separator",

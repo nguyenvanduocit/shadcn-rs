@@ -109,7 +109,7 @@ pub fn render() -> Render {
                                             .display(Display::Grid)
                                             .flex(Flex::grow(1.0))
                                             .gap(8.0)
-                                            .child(input().field(link).read_only()),
+                                            .child(input().field(link).read_only(true)),
                                     ),
                                 )
                                 .child(dialog_footer().justify_content(Justify::Start).child(dialog_close(
@@ -144,7 +144,7 @@ pub fn render() -> Render {
                                             .display(Display::Grid)
                                             .flex(Flex::grow(1.0))
                                             .gap(8.0)
-                                            .child(input().field(docs).read_only()),
+                                            .child(input().field(docs).read_only(true)),
                                     ),
                                 )
                                 .child(dialog_footer().padding_top(16.0).child(dialog_close(

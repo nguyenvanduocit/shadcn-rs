@@ -18,7 +18,7 @@ pub fn render() -> Render {
                 .align(SideAlign::Start)
                 .children(labels.iter().map(|&label| {
                     dropdown_menu_item(label, MenuItem::default())
-                        .on_select(move || visited.set(label.to_owned()))
+                        .on_select(move |_| visited.set(label.to_owned()))
                         .child(label)
                 }));
             dropdown_menu().child(dropdown_menu_trigger(trigger)).child(content)

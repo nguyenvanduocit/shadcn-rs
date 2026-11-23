@@ -1,0 +1,18 @@
+---
+source: crates/primitives/tests/dates.rs
+expression: dump(&tree)
+---
+Window "w"
+  Group
+    SpinButton "Month" value=3 in 1..=12 text="03"
+      Label "03"
+    SpinButton "Day" value=31 in 1..=31 text="31"
+      Label "31"
+    SpinButton "Year" value=3333 in 1..=9999 text="3333"
+      Label "3333"
+    SpinButton "Hours" value=3 in 1..=12 text="03"
+      Label "03"
+    SpinButton "Minutes" value=3 in 0..=59 text="03"
+      Label "03"
+    SpinButton "AM/PM" value=0 in 0..=1 text="AM"
+      Label "AM"

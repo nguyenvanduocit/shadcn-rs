@@ -1,0 +1,10 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      ComboBox "apple" expanded=false autocomplete=List
+        TextRun "apple"
+    GenericContainer

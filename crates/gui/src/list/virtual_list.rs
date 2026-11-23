@@ -98,6 +98,54 @@ struct Window {
     local: f32,
 }
 
+/// What a render built the rows from: worked out from the list's state and
+/// the data the render was given, and handed with the scroll container to
+/// the layout hook, which takes it in (a render writes nothing, ADR-0013;
+/// a render the frame does not lay out, as the cold check's, leaves the
+/// state as it was).
+/// A scroll asked for, held until the viewport shows it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Request {
+    /// Which request it is: a layout clears only the one it saw.
+    rev: u64,
+    /// It holds the anchored row's bottom this many pixels above the
+    /// viewport's, whatever height the row is measured at; `None`: the
+    /// anchor's own offset from its top.
+    bottom: Option<f32>,
+}
+
+#[derive(Debug)]
+struct Plan {
+    /// The rows the data holds.
+    rows: u64,
+    /// The anchor moved to its key's row, the data having moved under it;
+    /// `None`: it stays.
+    followed: Option<Anchor>,
+    window: Window,
+    /// The keys of the window's rows, in order.
+    keys: Vec<ElementKey>,
+    /// The rows built outside the window, in order, and how many come before it.
+    pins: Vec<(u64, ElementKey)>,
+    pins_before: usize,
+    /// The row holding focus, as the render found it by its key.
+    focus: Option<(u64, ElementKey)>,
+    /// The rows' extent and the end space, in units, over `rows` rows.
+    total: u64,
+    /// The scroll request revision it was built against: a request made
+    /// since (an effect that ran after the render) wins over its anchor.
+    rev: u64,
+}
+
+/// Heights `ext` matched to `rows` rows: rows added or removed at the end.
+fn resize(ext: &mut ExtentTree, rows: u64) {
+    let len = ext.len();
+    if rows > len {
+        ext.splice(len, 0, rows.saturating_sub(len));
+    } else if rows < len {
+        ext.splice(rows, len.saturating_sub(rows), 0);
+    }
+}
+
 /// One row built, as last laid out.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RowLayout {
@@ -126,18 +174,22 @@ pub struct ListLayout {
 }
 
 type Hook = Rc<dyn Fn(&ListLayout) -> bool>;
+/// What tells the row its owner treats as current ([`ListState::active_from`]).
+type ActiveFrom = Rc<dyn Fn() -> Option<u64>>;
+/// A row and its key.
+type KeyedRow = (u64, ElementKey);
 
 struct Inner {
     /// Bumped when the window moves: the list renders again.
     version: Signal<u64>,
     extents: RefCell<ExtentTree>,
     anchor: Cell<Anchor>,
-    /// The anchor was asked for and the viewport does not show it yet: it is
-    /// held through the layouts that measure the rows around it.
-    requested: Cell<bool>,
-    /// The anchor asked for holds the row's bottom this many pixels above
-    /// the viewport's, whatever height the row is measured at.
-    bottom: Cell<Option<f32>>,
+    /// The scroll asked for, the viewport not showing it yet: the anchor is
+    /// held through the layouts that measure the rows around it. One slot:
+    /// each request replaces the one before, whole, so none comes back.
+    request: Cell<Option<Request>>,
+    /// The revision the next request takes.
+    requests: Cell<u64>,
     window: Cell<Window>,
     /// The keys of the window's rows, in order.
     keys: RefCell<Vec<ElementKey>>,
@@ -158,10 +210,12 @@ struct Inner {
     end_space: Cell<f32>,
     /// As tall as its rows, up to this many pixels; `None`: sized by its parent.
     fit: Cell<Option<f32>>,
-    /// Its height when sized by its rows.
-    height: Signal<f32>,
-    /// The thumb is not drawn (`scrollbar-width: none`).
-    no_scrollbar: Cell<bool>,
+    /// Its height when sized by its rows, as last laid out; `None` before.
+    height: Signal<Option<f32>>,
+    /// The thumb is not drawn (`scrollbar-width: none`): read as the list
+    /// renders, so a scroller that hides it as it scrolls itself (an
+    /// effect on its own state) builds the list again.
+    no_scrollbar: Signal<bool>,
     /// Rows measured and their total height, for the estimate.
     measured: Cell<(u64, f64)>,
     /// Where on the thumb a drag took hold, from its top.
@@ -181,12 +235,23 @@ struct Inner {
     hook: RefCell<Option<Hook>>,
     /// The row holding focus, as last laid out, and its key.
     focus_row: Cell<Option<(u64, ElementKey)>>,
+    /// Where the scroll container sits, as last laid out: its rows are
+    /// its children.
+    viewport_path: RefCell<Option<crate::geometry::NodePath>>,
     /// The row its owner treats as current (an active option).
     active: Cell<Option<u64>>,
+    /// Or what tells it, read as the list renders ([`ListState::active_from`]).
+    /// Held by the owner's instance while it is mounted: a list state that
+    /// outlives it (reused by another list) never calls it once it left.
+    active_from: crate::Holder<ActiveFrom>,
+    /// Rows on each side of the focused one kept built with it.
+    around_focus: Cell<u64>,
     /// The rows built outside the window (pinned), in order, and how many
     /// of them come before it.
     pins: RefCell<Vec<(u64, ElementKey)>>,
     pins_before: Cell<usize>,
+    /// The last render's plan, taken in: taken once.
+    taken: RefCell<Weak<dyn std::any::Any>>,
 }
 
 impl Drop for Inner {
@@ -195,6 +260,8 @@ impl Drop for Inner {
         self.thumb.dispose_quietly();
         self.thumb_shown.dispose_quietly();
         self.height.dispose_quietly();
+        self.no_scrollbar.dispose_quietly();
+        self.active_from.dispose_quietly();
     }
 }
 
@@ -237,8 +304,8 @@ impl ListState {
             version: detached(|| Signal::labeled("virtual list", 0)),
             extents: RefCell::new(ExtentTree::new(0, units(estimate))),
             anchor: Cell::default(),
-            requested: Cell::new(false),
-            bottom: Cell::new(None),
+            request: Cell::new(None),
+            requests: Cell::new(0),
             window: Cell::default(),
             keys: RefCell::default(),
             viewport: Cell::default(),
@@ -250,8 +317,8 @@ impl ListState {
             to_end: Cell::new(false),
             end_space: Cell::new(0.0),
             fit: Cell::new(None),
-            height: detached(|| Signal::labeled("virtual list height", 0.0)),
-            no_scrollbar: Cell::new(false),
+            height: detached(|| Signal::labeled("virtual list height", None)),
+            no_scrollbar: detached(|| Signal::labeled("virtual list no scrollbar", false)),
             measured: Cell::new((0, 0.0)),
             grab: Cell::new(0.0),
             thumb: detached(|| Signal::labeled("virtual list thumb", None)),
@@ -262,13 +329,21 @@ impl ListState {
             hook: RefCell::new(None),
             focus_row: Cell::new(None),
             active: Cell::new(None),
+            active_from: detached(crate::Holder::new),
+            around_focus: Cell::new(0),
             pins: RefCell::default(),
+            viewport_path: RefCell::default(),
             pins_before: Cell::new(0),
+            taken: RefCell::new(Weak::<Plan>::new()),
         });
         let weak: Weak<Inner> = Rc::downgrade(&inner);
         inner
             .scroll
-            .on_layout(move |l| weak.upgrade().is_some_and(|i| Self(i).laid_out(l)));
+            .on_layout_built(move |l, built| weak.upgrade().is_some_and(|i| Self(i).laid_out(l, built)));
+        let weak: Weak<Inner> = Rc::downgrade(&inner);
+        inner
+            .scroll
+            .on_built(move |built| weak.upgrade().is_some_and(|i| Self(i).take(built)));
         let weak: Weak<Inner> = Rc::downgrade(&inner);
         inner
             .scroll
@@ -344,7 +419,7 @@ impl ListState {
         }
         let (n, sum) = self.0.measured.get();
         self.0.measured.set((n, sum + f64::from(delta)));
-        self.bump();
+        self.moved();
     }
 
     /// Whether `row`'s height was measured.
@@ -382,7 +457,7 @@ impl ListState {
         if follow {
             self.0.pinned.set(true);
         }
-        self.bump();
+        self.moved();
     }
 
     /// Whether it follows its tail.
@@ -403,7 +478,7 @@ impl ListState {
     pub fn set_end_space(&self, px: f32) {
         let px = px.max(0.0);
         if self.0.end_space.replace(px) != px {
-            self.bump();
+            self.moved();
         }
     }
 
@@ -441,6 +516,26 @@ impl ListState {
         self.0.active.set(row);
     }
 
+    /// The row its owner treats as current is what `f` gives, read (tracked)
+    /// as the list renders: an owner whose highlight lives in its own state
+    /// says so once, in its setup, rather than setting it as it renders
+    /// (where a list built before the call would read the last one).
+    /// It stands in for [`Self::set_active`] while the calling setup's
+    /// instance is mounted (from its mount, [`crate::while_mounted`]): its
+    /// unmounting lets go of `f` unless another owner gave one since.
+    #[track_caller]
+    pub fn active_from(&self, f: impl Fn() -> Option<u64> + 'static) {
+        let f: ActiveFrom = Rc::new(f);
+        self.0.active_from.hold(f);
+    }
+
+    /// Keep `rows` rows on each side of the focused one built with it (0 by
+    /// default), so Tab and Shift+Tab from a row scrolled away reach its
+    /// neighbours, not the rows in view. Read when the list renders.
+    pub fn keep_around_focus(&self, rows: u64) {
+        self.0.around_focus.set(rows);
+    }
+
     /// The row holding focus, as last laid out.
     #[must_use]
     pub fn focused_row(&self) -> Option<u64> {
@@ -475,10 +570,55 @@ impl ListState {
         }
     }
 
-    /// The pinned rows for this render: focus and the active row, outside
-    /// the window `w`, found again by key after the data moved.
-    fn pins_for(&self, w: Window, rows: u64, key: &dyn Fn(u64) -> ElementKey) -> Vec<(u64, ElementKey)> {
-        let focus = self.0.focus_row.get().and_then(|(row, k)| {
+    /// The row holding focus now, if built in the last frame or in window
+    /// `w` (its rows keyed `keys`): found as the list renders, not at the
+    /// next layout, so a window that jumps before then (a scroll asked in
+    /// the same turn) keeps it built.
+    fn noted_focus(&self, w: Window, keys: &[ElementKey]) -> Option<(u64, ElementKey)> {
+        let path = crate::untracked(crate::focus::focused).and_then(crate::focus::path_of)?;
+        // A row is a child of this list's scroll container: the segment
+        // past the container's in the focused node's path, and no other.
+        let seg = self.0.viewport_path.borrow().as_ref().and_then(|v| {
+            path.0
+                .starts_with(&v.0)
+                .then(|| path.0.get(v.0.len()).copied())
+                .flatten()
+        });
+        // A row the list keyed: as a node, or as a component's root.
+        let Some(crate::geometry::PathSeg::Key(k) | crate::geometry::PathSeg::Component(k, _)) = seg else {
+            return None;
+        };
+        // Built in the last frame: in its window or pinned.
+        let last = self.0.window.get();
+        let in_window = self
+            .0
+            .keys
+            .borrow()
+            .iter()
+            .position(|key| *key == k)
+            .map(|j| last.first.saturating_add(u64::try_from(j).unwrap_or(u64::MAX)));
+        let row = in_window
+            .or_else(|| self.0.pins.borrow().iter().find(|(_, key)| *key == k).map(|(r, _)| *r))
+            // Or in the window this render builds.
+            .or_else(|| {
+                keys.iter()
+                    .position(|key| *key == k)
+                    .map(|j| w.first.saturating_add(u64::try_from(j).unwrap_or(u64::MAX)))
+            });
+        row.map(|r| (r, k))
+    }
+
+    /// The pinned rows for this render: focus (and the rows kept around it)
+    /// and the active row, outside the window `w`, found again by key after
+    /// the data moved.
+    fn pins_for(
+        &self,
+        focus: Option<(u64, ElementKey)>,
+        w: Window,
+        rows: u64,
+        key: &dyn Fn(u64) -> ElementKey,
+    ) -> (Option<KeyedRow>, Vec<KeyedRow>) {
+        let focus = focus.and_then(|(row, k)| {
             if row < rows && key(row) == k {
                 return Some((row, k));
             }
@@ -486,16 +626,26 @@ impl ListState {
             let to = row.saturating_add(KEY_SEARCH).min(rows);
             (from..to).find(|&r| key(r) == k).map(|r| (r, k))
         });
-        self.0.focus_row.set(focus);
-        let active = self.0.active.get().filter(|&r| r < rows).map(|r| (r, key(r)));
+        let from = self.0.active_from.get();
+        let active = from
+            .map_or_else(|| self.0.active.get(), |f| f())
+            .filter(|&r| r < rows)
+            .map(|r| (r, key(r)));
+        let around = self.0.around_focus.get();
+        let neighbours = focus.into_iter().flat_map(|(row, _)| {
+            (row.saturating_sub(around)..row.saturating_add(around).saturating_add(1).min(rows))
+                .filter(move |&r| r != row)
+                .map(|r| (r, key(r)))
+        });
         let mut pins: Vec<(u64, ElementKey)> = focus
             .into_iter()
+            .chain(neighbours)
             .chain(active)
             .filter(|(r, _)| !(w.first..w.last).contains(r))
             .collect();
         pins.sort_unstable_by_key(|(r, _)| *r);
         pins.dedup_by_key(|(r, _)| *r);
-        pins
+        (focus, pins)
     }
 
     /// Scroll so `row`'s top is the viewport's.
@@ -513,13 +663,12 @@ impl ListState {
     pub fn scroll_to(&self, anchor: Anchor) {
         self.0.pinned.set(false);
         self.0.to_end.set(false);
-        self.0.requested.set(true);
-        self.0.bottom.set(None);
+        self.ask(None);
         self.0.anchor.set(Anchor {
             row: anchor.row.min(self.len().saturating_sub(1)),
             ..anchor
         });
-        self.bump();
+        self.moved();
     }
 
     /// Scroll so `row`'s bottom lies `above` pixels above the viewport's,
@@ -530,7 +679,15 @@ impl ListState {
             key: None,
             offset: 0.0,
         });
-        self.0.bottom.set(Some(above));
+        self.ask(Some(above));
+        self.moved();
+    }
+
+    /// Ask for a scroll, in place of any asked before.
+    fn ask(&self, bottom: Option<f32>) {
+        let rev = self.0.requests.get().wrapping_add(1);
+        self.0.requests.set(rev);
+        self.0.request.set(Some(Request { rev, bottom }));
     }
 
     /// Scroll as little as shows `row` whole (its top when it is taller than
@@ -560,10 +717,10 @@ impl ListState {
 
     /// Scroll to the end (and follow it if [`Self::follow_tail`] is on).
     pub fn scroll_to_end(&self) {
-        self.0.requested.set(false);
+        self.0.request.set(None);
         self.0.pinned.set(true);
         self.0.to_end.set(true);
-        self.bump();
+        self.moved();
     }
 
     /// Scroll so a `fraction` of the whole extent lies above the viewport.
@@ -574,7 +731,7 @@ impl ListState {
         let top = crate::convert::f64_to_u64(fraction.clamp(0.0, 1.0) * crate::convert::u64_to_f64(room));
         let (row, into) = ext.row_at(top);
         drop(ext);
-        self.0.requested.set(false);
+        self.0.request.set(None);
         self.0.pinned.set(fraction >= 1.0 && self.0.follow.get());
         self.0.to_end.set(fraction >= 1.0);
         self.0.anchor.set(Anchor {
@@ -582,7 +739,7 @@ impl ListState {
             key: None,
             offset: crate::convert::f64_to_f32(pixels(into)),
         });
-        self.bump();
+        self.moved();
     }
 
     /// Rows `at..at + removed` were replaced by `inserted` new ones (not
@@ -602,11 +759,27 @@ impl ListState {
             // The rows built moved: the window is decided anew.
             self.0.window.set(Window::default());
         }
-        self.bump();
+        self.moved();
     }
 
     fn bump(&self) {
         self.0.version.update(|v| *v = v.wrapping_add(1));
+    }
+
+    /// Where the view is to be changed (a scroll asked for, rows moved
+    /// under it): the scroll container is put where the window the next
+    /// render builds has it, and the list renders again.
+    fn moved(&self) {
+        self.place(self.compute());
+        self.bump();
+    }
+
+    /// Put the scroll container where window `w` shows the viewport (at
+    /// the end, as far as the rows reach once measured: the container
+    /// clamps it).
+    fn place(&self, w: Window) {
+        let local = if self.wants_end() { f32::MAX } else { w.local };
+        self.0.scroll.keep_at((0.0, local));
     }
 
     /// The rows' extent and the end space, in units.
@@ -616,6 +789,11 @@ impl ListState {
 
     /// The viewport's top in units as the anchor puts it, within the extent.
     fn top_units(&self, ext: &ExtentTree) -> u64 {
+        self.top_units_at(ext, self.0.anchor.get())
+    }
+
+    /// [`Self::top_units`] with the anchor at `a`.
+    fn top_units_at(&self, ext: &ExtentTree, a: Anchor) -> u64 {
         let len = ext.len();
         if len == 0 {
             return 0;
@@ -625,10 +803,9 @@ impl ListState {
         if self.wants_end() {
             return room;
         }
-        let a = self.0.anchor.get();
         let row = a.row.min(len.saturating_sub(1));
         let base = crate::convert::u64_to_f64(ext.offset_of(row));
-        let offset = match self.0.bottom.get().filter(|_| self.0.requested.get()) {
+        let offset = match self.0.request.get().and_then(|r| r.bottom) {
             Some(above) => {
                 let height = crate::convert::u64_to_f64(u64::from(ext.height(row).unwrap_or(0)));
                 height - crate::convert::u64_to_f64(vp) + signed_units(f64::from(above))
@@ -652,7 +829,11 @@ impl ListState {
     /// Chromium's interest rect and Flutter's `cacheExtent` are the same
     /// margin; this one is sized by the scroll's speed and the UI's latency.
     fn compute(&self) -> Window {
-        let ext = self.0.extents.borrow();
+        self.compute_at(&self.0.extents.borrow(), self.0.anchor.get())
+    }
+
+    /// [`Self::compute`] over heights `ext`, the anchor at `anchor`.
+    fn compute_at(&self, ext: &ExtentTree, anchor: Anchor) -> Window {
         let len = ext.len();
         if len == 0 {
             return Window::default();
@@ -660,7 +841,7 @@ impl ListState {
         let vp_px = self.viewport_height();
         let vp = u64::from(units(vp_px));
         let rows_end = ext.extent();
-        let top = self.top_units(&ext);
+        let top = self.top_units_at(ext, anchor);
         let over = u64::from(units(self.0.prefetch.get().unwrap_or(vp_px)));
         let reach = self.0.scroll.reach().1;
         let up = u64::from(units((-reach).max(0.0)));
@@ -692,12 +873,18 @@ impl ListState {
 
     /// After a layout: measure the rows built, move the anchor to where the
     /// viewport is, and whether the window must move (another pass).
-    fn laid_out(&self, l: &ScrollLayout) -> bool {
+    fn laid_out(&self, l: &ScrollLayout, built: Option<&crate::scroll::Built>) -> bool {
         let inner = &self.0;
+        if let Some(b) = built {
+            let _moved = self.take(b);
+        }
         let width = l.bounds.width;
         let height = (l.bounds.height - l.padding.top - l.padding.bottom).max(0.0);
         let (old_width, _) = inner.viewport.get();
         inner.viewport.set((width, height));
+        if inner.viewport_path.borrow().as_ref() != Some(&l.path) {
+            inner.viewport_path.replace(Some(l.path.clone()));
+        }
         inner.top.set(l.bounds.y);
         if old_width > 0.0 && old_width != width {
             // Heights measured at another width: estimates again.
@@ -727,11 +914,8 @@ impl ListState {
                     .or_else(|| inner.pins.borrow().iter().find(|(_, key)| *key == k).map(|(r, _)| *r))
                     .map(|r| (r, k))
             });
-        let unpinned = inner
-            .focus_row
-            .get()
-            .is_some_and(|(r, _)| !(w.first..w.last).contains(&r))
-            && focus.is_none();
+        let held = inner.focus_row.get();
+        let unpinned = held.is_some_and(|(r, _)| !(w.first..w.last).contains(&r)) && focus != held;
         inner.focus_row.set(focus);
         if unpinned {
             // Focus left the row kept built for it: it goes.
@@ -758,7 +942,8 @@ impl ListState {
         // The anchor: the row at the viewport's top, unless one asked for is
         // not shown yet.
         let y = l.offset.1 + l.padding.top;
-        if !inner.requested.get() {
+        let asked = inner.request.get();
+        if asked.is_none() {
             let at = children
                 .iter()
                 .enumerate()
@@ -792,12 +977,18 @@ impl ListState {
             (next.local - l.offset.1).abs() <= PLACED
         };
         if next.first != w.first || next.last != w.last || !placed {
+            // The next render builds this window, put where it shows the
+            // viewport.
+            inner.window.set(next);
+            self.place(next);
             self.bump();
             return true;
         }
         // The rows built still cover it: nothing to build.
         inner.window.set(next);
-        inner.requested.set(false);
+        if inner.request.get().map(|r| r.rev) == asked.map(|r| r.rev) {
+            inner.request.set(None);
+        }
         let hook = inner.hook.borrow().clone();
         let owner = hook.is_some_and(|f| {
             let origin = self.offset_of(w.first);
@@ -828,10 +1019,10 @@ impl ListState {
         };
         let rows = pixels(self.total(&self.0.extents.borrow()));
         let h = crate::convert::f64_to_f32(rows).min(max);
-        if self.0.height.get_untracked() == h {
+        if self.0.height.get_untracked() == Some(h) {
             return false;
         }
-        self.0.height.set(h);
+        self.0.height.set(Some(h));
         true
     }
 
@@ -869,33 +1060,93 @@ impl ListState {
         (self.0.follow.get() && self.0.pinned.get()) || self.0.to_end.get()
     }
 
-    /// Keep the anchor on its key after the data moved under it.
-    fn follow_key(&self, key: &dyn Fn(u64) -> ElementKey) {
-        let mut a = self.0.anchor.get();
-        let len = self.len();
-        let Some(k) = a.key else { return };
+    /// The anchor kept on its key after the data moved under it, over
+    /// `len` rows; `None` when it stays where it is.
+    fn followed(&self, len: u64, key: &dyn Fn(u64) -> ElementKey) -> Option<Anchor> {
+        let a = self.0.anchor.get();
+        let k = a.key?;
         if a.row < len && key(a.row) == k {
-            return;
+            return None;
         }
         let from = a.row.saturating_sub(KEY_SEARCH);
         let to = a.row.saturating_add(KEY_SEARCH).min(len);
-        if let Some(row) = (from..to).find(|&r| key(r) == k) {
-            a.row = row;
-            self.0.anchor.set(a);
-        }
+        (from..to).find(|&r| key(r) == k).map(|row| Anchor { row, ..a })
     }
 
     /// Match the heights to `rows` rows: rows added or removed at the end.
     fn sync_len(&self, rows: u64) {
-        let len = self.len();
-        if rows != len {
-            let mut ext = self.0.extents.borrow_mut();
-            if rows > len {
-                ext.splice(len, 0, rows.saturating_sub(len));
-            } else {
-                ext.splice(rows, len.saturating_sub(rows), 0);
-            }
+        resize(&mut self.0.extents.borrow_mut(), rows);
+    }
+
+    /// What a render builds from the state as it stands and the data it is
+    /// given, `rows` rows keyed `key`: worked out, nothing written (the
+    /// layout hook takes it in, [`Self::take`]).
+    fn plan(&self, rows: u64, key: &dyn Fn(u64) -> ElementKey) -> Plan {
+        let held = self.0.extents.borrow();
+        // The heights as the data has them: rows added or removed at the end.
+        let resized = (held.len() != rows).then(|| {
+            let mut ext = held.clone();
+            resize(&mut ext, rows);
+            ext
+        });
+        let ext = resized.as_ref().unwrap_or(&held);
+        let followed = self.followed(rows, key);
+        let window = self.compute_at(ext, followed.unwrap_or_else(|| self.0.anchor.get()));
+        let total = self.total(ext);
+        drop(held);
+        let keys: Vec<ElementKey> = (window.first..window.last).map(key).collect();
+        let focus = self.noted_focus(window, &keys).or_else(|| self.0.focus_row.get());
+        let (focus, pins) = self.pins_for(focus, window, rows, key);
+        let pins_before = pins.iter().take_while(|(r, _)| *r < window.first).count();
+        Plan {
+            rows,
+            followed,
+            window,
+            keys,
+            pins,
+            pins_before,
+            focus,
+            total,
+            rev: self.0.requests.get(),
         }
+    }
+
+    /// Take in what the render built from, once (the plan is known by its
+    /// own allocation, which the `Weak` held keeps from being reused, so a
+    /// plan taken again changes nothing): the heights matched to its data,
+    /// the anchor kept on its key, the rows it built. Taken after every
+    /// layout pass that laid them out, the frame's last too. Whether it put
+    /// the container elsewhere.
+    fn take(&self, built: &crate::scroll::Built) -> bool {
+        let inner = &self.0;
+        if Weak::ptr_eq(&inner.taken.borrow(), &Rc::downgrade(built)) {
+            return false;
+        }
+        *inner.taken.borrow_mut() = Rc::downgrade(built);
+        let Some(p) = built.downcast_ref::<Plan>() else {
+            return false;
+        };
+        let was = inner.scroll.offset();
+        self.sync_len(p.rows);
+        // A scroll asked for since the render (a later effect's) is newer
+        // than the anchor the plan followed: it wins, and the list renders
+        // again for it.
+        let current = inner.requests.get() == p.rev;
+        if let Some(a) = p.followed.filter(|_| current) {
+            // The reader's row moved to another index under them: the
+            // container goes where the plan put that row, and the anchor
+            // holds until the viewport shows it there (the hook reads no
+            // other row from a layout at the old offset).
+            inner.anchor.set(a);
+            self.ask(None);
+            self.place(p.window);
+        }
+        inner.window.set(p.window);
+        inner.keys.borrow_mut().clone_from(&p.keys);
+        inner.pins.borrow_mut().clone_from(&p.pins);
+        inner.pins_before.set(p.pins_before);
+        inner.focus_row.set(p.focus);
+        inner.scroll.offset() != was
     }
 
     /// Show the thumb, and hide it [`THUMB_SHOWN_MS`] after the last call.
@@ -919,10 +1170,12 @@ impl ListState {
 
     /// Move the thumb to put its top at `y` (window pixels).
     fn drag_thumb(&self, e: &DragEvent) {
-        self.0.dragging.set(e.phase != DragPhase::End);
+        self.0.dragging.set(!e.phase.is_last());
         self.show_thumb();
         match e.phase {
             DragPhase::Start => self.0.grab.set(e.y - e.bounds.y),
+            // Cancelled, the list stays where the moves put it.
+            DragPhase::Cancel => {}
             DragPhase::Move | DragPhase::End => {
                 let (_, vp) = self.0.viewport.get();
                 let total = pixels(self.total(&self.0.extents.borrow()));
@@ -1010,23 +1263,16 @@ pub fn virtual_list_in(
 ) -> Div {
     // Read so a moved window renders again.
     state.0.version.with(|_| ());
-    state.sync_len(rows);
-    state.follow_key(&key);
-    let w = state.compute();
-    state.0.window.set(w);
-    let keys: Vec<ElementKey> = (w.first..w.last).map(&key).collect();
-    // At the end, as far as the rows reach once measured (the container
-    // clamps it).
-    let local = if state.wants_end() { f32::MAX } else { w.local };
-    state.0.scroll.scroll_to((0.0, local));
+    let plan = state.plan(rows, &key);
+    let w = plan.window;
+    let total = plan.total;
     let row_at = |i: u64, k: ElementKey| {
         row_wrapper(i, k, row(i))
             .flex(Flex::NONE)
             .width(pct(100.0))
             .into_element()
     };
-    let pins = state.pins_for(w, rows, &key);
-    let before = pins.iter().take_while(|(r, _)| *r < w.first).count();
+    let before = plan.pins_before;
     // Kept built where nothing shows them: their bottom on the viewport's
     // top, out of the scroll range.
     let pinned = |&(i, k): &(u64, ElementKey)| {
@@ -1037,13 +1283,11 @@ pub fn virtual_list_in(
             .bottom(Length::Fraction(1.0))
             .into_element()
     };
-    let pins_before: Vec<Element> = pins.iter().take(before).map(pinned).collect();
-    let pins_after: Vec<Element> = pins.iter().skip(before).map(pinned).collect();
-    state.0.pins_before.set(before);
-    *state.0.pins.borrow_mut() = pins;
+    let pins_before: Vec<Element> = plan.pins.iter().take(before).map(pinned).collect();
+    let pins_after: Vec<Element> = plan.pins.iter().skip(before).map(pinned).collect();
     let built = pins_before
         .into_iter()
-        .chain((w.first..w.last).zip(&keys).map(|(i, &k)| row_at(i, k)))
+        .chain((w.first..w.last).zip(&plan.keys).map(|(i, &k)| row_at(i, k)))
         .chain(pins_after);
     let end_space = state.0.end_space.get();
     let room =
@@ -1057,12 +1301,11 @@ pub fn virtual_list_in(
             .flex_direction(FlexDirection::Column)
             .overflow_y(Overflow::Scroll)
             .overflow_x(Overflow::Hidden)
-            .scrollbar_hidden(true)
-            .track_scroll(&state.0.scroll),
+            .scrollbar_hidden(true),
     )
     .children(built.collect::<Vec<_>>())
     .child(room);
-    *state.0.keys.borrow_mut() = keys;
+    let scroller = scroller.track_scroll_built(&state.0.scroll, Rc::new(plan));
     // The thumb's place and size are bound to the layout (ADR-0013): set
     // after each layout from the anchor over the whole extent, they move the
     // thumb without building the list again.
@@ -1104,12 +1347,10 @@ pub fn virtual_list_in(
     match state.0.fit.get() {
         Some(max) => {
             // Its rows' height so far; measured after layout, bound there.
-            let rows_h = crate::convert::f64_to_f32(pixels(state.total(&state.0.extents.borrow()))).min(max);
-            if state.0.height.get_untracked() != rows_h {
-                state.0.height.set(rows_h);
-            }
+            // Before its first layout, from the heights it starts with.
+            let rows_h = crate::convert::f64_to_f32(pixels(total)).min(max);
             let height = state.0.height;
-            list.flex(Flex::NONE).height(move || height.get())
+            list.flex(Flex::NONE).height(move || height.get().unwrap_or(rows_h))
         }
         None => list,
     }
@@ -1171,6 +1412,78 @@ mod tests {
         let mut s = Scenario::measuring(move || list(&st), 300, 400, 1.0).unwrap();
         s.settle().unwrap();
         s
+    }
+
+    /// Focus moved to a row and a scroll far away asked in the same turn:
+    /// the row is kept built from when focus moved, so focus stays on it.
+    #[test]
+    fn a_row_focused_then_scrolled_away_at_once_keeps_focus() {
+        let state = ListState::new(30.0);
+        let h = crate::FocusHandle::new();
+        let st = state.clone();
+        let ui = move || {
+            div()
+                .width(300.0)
+                .child(
+                    virtual_list(
+                        &st,
+                        ROWS,
+                        |i| i,
+                        move |i| {
+                            let d = div().height(24.0).child(text(format!("row {i}")));
+                            let d = if i == 3 { d.track_focus(h) } else { d };
+                            d.into_element()
+                        },
+                    )
+                    .height(400.0),
+                )
+                .into_element()
+        };
+        let mut s = Scenario::measuring(ui, 300, 400, 1.0).unwrap();
+        s.settle().unwrap();
+        s.act("focus row 3 and jump away", || {
+            h.focus();
+            state.scroll_to_row(5_000);
+        });
+        s.settle().unwrap();
+        assert!(top(&s) > 4_000, "the window moved");
+        assert_eq!(crate::focus::focused(), Some(h.id()), "row 3 keeps focus");
+        assert_eq!(state.focused_row(), Some(3), "kept built, pinned");
+    }
+
+    /// Focus on a row of another list keyed as one of this list's rows
+    /// pins nothing here: only a node under this list's container is its.
+    #[test]
+    fn focus_in_a_sibling_list_pins_no_row_here() {
+        let b = ListState::new(30.0);
+        let h = crate::FocusHandle::new();
+        let (sa, sb) = (ListState::new(30.0), b.clone());
+        let ui = move || {
+            let rows = |focus: Option<crate::FocusHandle>| {
+                move |i: u64| {
+                    let d = div().height(24.0).child(text(format!("row {i}")));
+                    match focus {
+                        Some(h) if i == 3 => d.track_focus(h).into_element(),
+                        _ => d.into_element(),
+                    }
+                }
+            };
+            div()
+                .width(300.0)
+                .child(virtual_list(&sa, ROWS, |i| i, rows(Some(h))).height(200.0))
+                .child(virtual_list(&sb, ROWS, |i| i, rows(None)).height(200.0))
+                .into_element()
+        };
+        let mut s = Scenario::measuring(ui, 300, 400, 1.0).unwrap();
+        s.settle().unwrap();
+        s.act("focus the first list's row 3, and scroll the second", || {
+            h.focus();
+            b.scroll_to_row(5_000);
+        });
+        s.settle().unwrap();
+        assert_eq!(crate::focus::focused(), Some(h.id()));
+        assert_eq!(b.focused_row(), None, "the second list holds no focus");
+        assert!(b.pinned().is_empty(), "and pins none of its rows");
     }
 
     #[test]
@@ -1276,9 +1589,448 @@ mod tests {
         assert!(state.is_at_end());
     }
 
+    /// A million rows of 24 px in a 300 px viewport.
+    fn million(state: &ListState) -> Scenario {
+        let st = state.clone();
+        Scenario::measuring(
+            move || {
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            1_000_000,
+                            |i| i,
+                            |i| div().height(24.0).child(text(format!("row {i}"))).into_element(),
+                        )
+                        .height(300.0),
+                    )
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap()
+    }
+
+    /// A fling under way, its scroll and its reach in flight to the UI,
+    /// when the program jumps far: the delta, scrolled from where the list
+    /// was, is dropped, and its reach with it, so the rows built are those
+    /// around where the list lands, as a jump from rest builds them.
+    #[test]
+    fn a_jump_during_a_fling_builds_no_rows_for_the_flings_reach() {
+        let built = |s: &Scenario| rows(s).into_iter().map(|r| r.0).collect::<Vec<_>>();
+        let calm = ListState::new(30.0);
+        let mut r = million(&calm);
+        r.settle().unwrap();
+        r.act("far", || calm.scroll_to_row(5_000));
+        r.frame("jumped").unwrap();
+        let want = built(&r);
+        let state = ListState::new(30.0);
+        let mut s = million(&state);
+        s.settle().unwrap();
+        s.hover(150.0, 150.0);
+        s.frame("hovered").unwrap();
+        let dt = 1.0 / 60.0;
+        let mut t = crate::clock::current_seconds();
+        let mut wheel = |s: &mut Scenario| {
+            t += dt;
+            crate::clock::advance_to(std::time::Duration::from_secs_f32(t));
+            let (_, headless) = s.parts();
+            assert!(headless.wheel((150.0, 150.0), (0.0, 80.0), t), "the list scrolls");
+        };
+        for _ in 0..6 {
+            wheel(&mut s);
+            s.frame("flung").unwrap();
+        }
+        assert!(
+            built(&s).len() > want.len(),
+            "a fling's reach builds rows past the viewport's margin"
+        );
+        wheel(&mut s);
+        s.act("far", || state.scroll_to_row(5_000));
+        s.frame("jumped").unwrap();
+        assert_eq!(built(&s), want, "around where it landed, as from rest");
+    }
+
+    /// The list's render writes nothing: the window it builds is taken in
+    /// by its layout hook, so the cold check's render of every instance
+    /// (which asserts no live write) leaves it as it was, through a scroll
+    /// asked for, the wheel, rows added and a followed tail.
+    #[test]
+    fn a_list_renders_purely_under_the_cold_check() {
+        let state = ListState::new(30.0);
+        let n = Signal::new(1_000_000_u64);
+        let st = state.clone();
+        let mut s = Scenario::measuring(
+            move || {
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            n.get(),
+                            |i| i,
+                            |i| div().height(24.0).child(text(format!("row {i}"))).into_element(),
+                        )
+                        .height(300.0),
+                    )
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap();
+        s.check_cold(true);
+        s.settle().unwrap();
+        // A fling the compositor scrolls between the UI's frames: the
+        // window reaches as far as it may go before the next commit.
+        s.hover(150.0, 150.0);
+        s.frame("hovered").unwrap();
+        // A UI busy for six frames: the compositor scrolls on meanwhile.
+        let dt = 1.0 / 60.0;
+        s.parts().1.set_ui_late(std::time::Duration::from_secs_f32(dt * 6.0));
+        let mut t = crate::clock::current_seconds();
+        for _ in 0..12 {
+            for _ in 0..7 {
+                t += dt;
+                crate::clock::advance_to(std::time::Duration::from_secs_f32(t));
+                let (_, headless) = s.parts();
+                assert!(headless.wheel((150.0, 150.0), (0.0, 50.0), t), "the list scrolls");
+            }
+            s.frame("the UI's commit").unwrap();
+        }
+        s.settle().unwrap();
+        s.act("far", || state.scroll_to_row(30));
+        s.settle().unwrap();
+        assert_eq!(top(&s), 30, "where it was asked to go");
+        s.act("more", || n.set(2_000_000));
+        s.settle().unwrap();
+        s.act("tail", || {
+            state.follow_tail(true);
+            state.scroll_to_end();
+        });
+        s.settle().unwrap();
+        s.act("more again", || n.set(2_000_010));
+        s.settle().unwrap();
+        assert!(rows(&s).iter().any(|r| r.0 == 2_000_009), "the tail followed");
+    }
+
     /// The top of `row`'s box, if built.
     fn top_of(s: &Scenario, row: u64) -> Option<f32> {
         rows(s).into_iter().find(|r| r.0 == row).map(|r| r.1)
+    }
+
+    /// A list of 200 rows 24 px tall in a 300 px viewport, each showing
+    /// the id `ids` holds at its index, keyed by it.
+    fn swappable(state: &ListState, ids: Signal<Vec<u64>>) -> Scenario {
+        let st = state.clone();
+        Scenario::measuring(
+            move || {
+                let v = Rc::new(ids.get());
+                let (k, r) = (Rc::clone(&v), Rc::clone(&v));
+                let at = move |v: &[u64], i: u64| usize::try_from(i).ok().and_then(|i| v.get(i)).copied().unwrap_or(0);
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            u64::try_from(v.len()).unwrap_or(0),
+                            move |i| at(&k, i),
+                            move |i| {
+                                div()
+                                    .height(24.0)
+                                    .child(text(format!("row {}", at(&r, i))))
+                                    .into_element()
+                            },
+                        )
+                        .height(300.0),
+                    )
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap()
+    }
+
+    /// A bottom alignment asked for once, then the reader wheels to anchor
+    /// a row at the top, and the data swaps that row with the next: the
+    /// plan's anchor replaces every earlier request, so the old bottom
+    /// alignment does not come back and the reader's row stays at the top.
+    #[test]
+    fn a_reorder_after_the_wheel_brings_back_no_earlier_request() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..200).collect());
+        let mut s = swappable(&state, ids);
+        s.settle().unwrap();
+        s.act("row 40's bottom at the viewport's", || {
+            state.scroll_to_row_bottom(40, 0.0)
+        });
+        s.settle().unwrap();
+        s.hover(150.0, 150.0);
+        s.wheel(120.0);
+        s.settle().unwrap();
+        let reader = top(&s);
+        let shown = top_of(&s, reader);
+        let at = usize::try_from(state.anchor().row).unwrap();
+        s.act("swap it with the next", || ids.update(|v| v.swap(at, at + 1)));
+        s.settle().unwrap();
+        assert_eq!(top(&s), reader, "the reader's row stays at the top");
+        assert_eq!(top_of(&s, reader), shown, "where it was on screen");
+        assert_eq!(state.anchor().row, u64::try_from(at + 1).unwrap());
+    }
+
+    /// The data reorders under the reader: the row at the viewport's top
+    /// swaps places with the next one, of the same height. The reader's row
+    /// (by key) stays at the top, now at the next index: the plan moves the
+    /// container with it, and the hook does not take the row now at the old
+    /// offset for the anchor.
+    #[test]
+    fn a_row_moved_to_another_index_stays_where_the_reader_sees_it() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..200).collect());
+        let mut s = swappable(&state, ids);
+        s.settle().unwrap();
+        s.act("to row 30", || state.scroll_to_row(30));
+        s.settle().unwrap();
+        assert_eq!(top(&s), 30);
+        s.act("swap 30 and 31", || ids.update(|v| v.swap(30, 31)));
+        s.settle().unwrap();
+        assert_eq!(top(&s), 30, "the reader's row stays at the top");
+        assert_eq!(state.anchor().row, 31, "at its new index");
+        assert_eq!(state.len(), 200, "what the list holds is what it shows");
+    }
+
+    /// The data reorders under the reader, and in the same resolve a later
+    /// sibling, mounting, asks (from its setup's effect, which runs after
+    /// the list rendered) for row 100: the plan the list built follows the
+    /// reader's row against an older request, so the newer one wins and
+    /// row 100 is at the top.
+    #[test]
+    fn a_scroll_asked_after_the_render_wins_over_the_plans_anchor() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..200).collect());
+        let go = Signal::new(false);
+        let st = state.clone();
+        let mut s = Scenario::measuring(
+            move || {
+                let v = Rc::new(ids.get());
+                let (k, r) = (Rc::clone(&v), Rc::clone(&v));
+                let at = move |v: &[u64], i: u64| usize::try_from(i).ok().and_then(|i| v.get(i)).copied().unwrap_or(0);
+                let asker = go.get().then(|| {
+                    let st = st.clone();
+                    crate::component((), move |_| {
+                        let _ask = crate::Effect::new(move || st.scroll_to_row(100));
+                        || Element::Empty
+                    })
+                    .into_element()
+                });
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            u64::try_from(v.len()).unwrap_or(0),
+                            move |i| at(&k, i),
+                            move |i| {
+                                div()
+                                    .height(24.0)
+                                    .child(text(format!("row {}", at(&r, i))))
+                                    .into_element()
+                            },
+                        )
+                        .height(300.0),
+                    )
+                    .child(asker)
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        s.act("to row 30", || state.scroll_to_row(30));
+        s.settle().unwrap();
+        assert_eq!(top(&s), 30);
+        s.act("swap 30 and 31, and ask for row 100 after", || {
+            ids.update(|v| v.swap(30, 31));
+            go.set(true);
+        });
+        s.settle().unwrap();
+        assert_eq!(state.anchor().row, 100, "the newer request holds");
+        assert_eq!(top(&s), 100, "row 100 at the top");
+    }
+
+    /// A frame whose pass lays out again (a plan moved the container): what
+    /// the frame reports of its layout counts both layouts, the first of
+    /// which rebuilt the frame for the rows that moved among their
+    /// siblings, not only the repeat (which only moved the container).
+    #[test]
+    fn a_pass_laid_out_again_reports_both_layouts() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..200).collect());
+        let mut s = swappable(&state, ids);
+        s.settle().unwrap();
+        s.act("to row 30", || state.scroll_to_row(30));
+        s.settle().unwrap();
+        s.act("swap 30 and 31", || ids.update(|v| v.swap(30, 31)));
+        let report = s.frame("swapped").unwrap();
+        assert!(
+            report.visits.rebuilt >= 1,
+            "the first layout's rebuild is counted: {}",
+            report.visits
+        );
+    }
+
+    /// A binding read in a pass's repeat layout: what the renders built is
+    /// taken in between each pass's two layouts, and the taking moves
+    /// `gate` on, which the binding reads, so the repeat runs it again and
+    /// it reads the signal `gate` now picks. The frame ends with the
+    /// repeat's read, and that read is tracked: the signal it picked
+    /// changing lays the node out again.
+    #[test]
+    fn a_binding_read_in_the_repeat_layout_is_tracked() {
+        let gate = Signal::new(0_u32);
+        let picks = [Signal::new(30.0_f32), Signal::new(60.0_f32)];
+        let handle = ScrollHandle::new();
+        let armed = Rc::new(Cell::new(true));
+        let a = Rc::clone(&armed);
+        handle.on_built(move |_| {
+            if !a.get() {
+                return false;
+            }
+            gate.set(gate.get_untracked() + 1);
+            // The container moved: the pass lays out again.
+            true
+        });
+        let mut s = Scenario::measuring(
+            move || {
+                let built: Rc<dyn std::any::Any> = Rc::new(());
+                div()
+                    .width(300.0)
+                    .child(
+                        div()
+                            .height(100.0)
+                            .overflow_y(crate::Overflow::Scroll)
+                            .track_scroll_built(&handle, built)
+                            .child(div().height(400.0)),
+                    )
+                    .child(div().named("gauge").height(10.0).width(move || {
+                        let g = gate.get();
+                        if g == 0 {
+                            10.0
+                        } else {
+                            picks[usize::from(g % 2 == 1)].get()
+                        }
+                    }))
+                    .into_element()
+            },
+            300,
+            400,
+            1.0,
+        )
+        .unwrap();
+        let width = |s: &Scenario| {
+            s.last()
+                .nodes
+                .iter()
+                .find(|n| n.name == Some("gauge"))
+                .map(|n| n.bounds.width)
+        };
+        s.frame("armed").unwrap();
+        armed.set(false);
+        let g = gate.get_untracked();
+        assert!(g >= 1, "the frame took in what was built");
+        let picked = picks[usize::from(g % 2 == 1)];
+        assert_eq!(
+            width(&s),
+            Some(picked.get_untracked()),
+            "the frame ends with the repeat's layout of the gauge"
+        );
+        s.act("change the pick", || picked.set(90.0));
+        s.settle().unwrap();
+        assert_eq!(width(&s), Some(90.0), "what the repeat read lays the gauge out again");
+    }
+
+    /// A frame whose passes run out: a hook prepends a row after every
+    /// pass, so the reader's row moves down an index each time, the last
+    /// pass too. The plan the last pass built is taken in all the same, and
+    /// the container placed for it within that pass: what the list holds is
+    /// what it shows, and the reader's row is painted where it was.
+    #[test]
+    fn the_last_layout_pass_takes_in_its_plan() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((1000..1200).collect());
+        let armed = Rc::new(Cell::new(false));
+        let other = ScrollHandle::new();
+        let (a, next) = (Rc::clone(&armed), Rc::new(Cell::new(0_u64)));
+        other.on_layout(move |_| {
+            if !a.get() {
+                return false;
+            }
+            let id = next.get();
+            next.set(id + 1);
+            ids.update(|v| v.insert(0, id));
+            true
+        });
+        let st = state.clone();
+        let mut s = Scenario::measuring(
+            move || {
+                let v = Rc::new(ids.get());
+                let (k, r) = (Rc::clone(&v), Rc::clone(&v));
+                let at = move |v: &[u64], i: u64| usize::try_from(i).ok().and_then(|i| v.get(i)).copied().unwrap_or(0);
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            u64::try_from(v.len()).unwrap_or(0),
+                            move |i| at(&k, i),
+                            move |i| {
+                                div()
+                                    .height(24.0)
+                                    .child(text(format!("row {}", at(&r, i))))
+                                    .into_element()
+                            },
+                        )
+                        .height(288.0),
+                    )
+                    .child(
+                        div()
+                            .height(10.0)
+                            .overflow_y(Overflow::Scroll)
+                            .track_scroll(&other)
+                            .child(div().height(20.0)),
+                    )
+                    .into_element()
+            },
+            300,
+            298,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        s.act("to id 1050", || state.scroll_to_row(50));
+        s.settle().unwrap();
+        assert_eq!(top(&s), 1050);
+        let shown = top_of(&s, 1050);
+        armed.set(true);
+        s.frame("passes run out").unwrap();
+        armed.set(false);
+        let held = ids.with_untracked(Vec::len);
+        assert!(held > 200, "rows came in during the frame");
+        assert_eq!(
+            state.len(),
+            u64::try_from(held).unwrap(),
+            "the list holds the rows the frame built"
+        );
+        assert_eq!(top(&s), 1050, "the reader's row is painted at the top");
+        assert_eq!(top_of(&s, 1050), shown, "at the offset it was");
     }
 
     #[test]
@@ -1350,7 +2102,7 @@ mod tests {
             s.last()
                 .nodes
                 .iter()
-                .find(|n| matches!(&n.content, Content::Text { content, .. } if content.as_str() == "below"))
+                .find(|n| matches!(&n.content, Content::Text { content, .. } if &**content == "below"))
                 .map(|n| n.bounds.y)
         };
         assert_eq!(below(&s), Some(100.0));

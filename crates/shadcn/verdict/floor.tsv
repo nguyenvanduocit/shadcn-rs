@@ -1,0 +1,6 @@
+# Each style's score in its full run at its defaults (run.sh --style <name>, every page, light, no --theme):
+# the lowest it may be (ADR-0022: scores restart per style and are never lower afterwards). run.sh fails a full
+# run below it and says when a run is above it; raising the line is part of the change that raised the score.
+# A style that is not judged yet (its Design const is not built) has no line.
+# style	score
+vega	64

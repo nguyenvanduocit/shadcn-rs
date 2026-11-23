@@ -18,7 +18,7 @@ Window "window"
     ListItem 3/3  @0/0/4/2
       Label value="Privacy"  @0/0/4/2/0
   Button disabled  @0/0/5/0
-    Label value="Reset"  @0/0/5/0/0
+    Label value="Reset" disabled  @0/0/5/0/0
   Button [click]  @0/0/5/1
     Label value="Save"  @0/0/5/1/0
 19 nodes heard

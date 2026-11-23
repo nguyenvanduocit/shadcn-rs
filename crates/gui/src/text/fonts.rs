@@ -100,10 +100,98 @@ pub(crate) struct Fonts {
     face_ids: HashMap<(u64, u32), u32>,
     axes: Vec<Vec<i16>>,
     axes_ids: HashMap<Vec<i16>, u16>,
+    /// Scratch: the coordinates [`Fonts::axes`] looks up, and those an
+    /// intercept reads an outline at.
+    bits: Vec<i16>,
+    coords: Vec<NormalizedCoord>,
+    /// Whether each glyph has colour, by face and glyph. Shared with a cold
+    /// frame: append-only and result-neutral, an entry a pure function of
+    /// its key (the face's bytes), never changed or removed.
     color: HashMap<(u32, u32), bool>,
+    /// Each glyph's skip-ink intercept with an underline's band, by
+    /// [`InkKey`]: an outline is read once for a size and band.
+    ink: InkCache,
     /// How many faces and coordinate sets the renderer's [`Glyphs`] was
     /// given ([`Fonts::glyph_tables`]).
     sent: (usize, usize),
+}
+
+/// A glyph at a size, variation and slant against an underline's band
+/// (top and bottom below the baseline), each float by its bits: what a
+/// skip-ink intercept is cached by.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct InkKey {
+    pub(crate) font: u32,
+    pub(crate) glyph: u32,
+    pub(crate) axes: u16,
+    pub(crate) size: u32,
+    pub(crate) skew: u32,
+    pub(crate) band: (u32, u32),
+}
+
+/// Most intercepts kept ([`InkCache`]).
+const MAX_INK: usize = 4096;
+
+/// Skip-ink intercepts by [`InkKey`], at most [`MAX_INK`] of them: past
+/// that a new one takes the slot of one not used since the clock's hand
+/// last passed it (CLOCK, a second chance), so a view whose glyphs need
+/// more than it holds reads outlines again only for those it uses least,
+/// and a hit only marks its slot (no allocation).
+#[derive(Default)]
+pub(crate) struct InkCache {
+    /// Each key's intercept and its slot in `ring`.
+    map: HashMap<InkKey, (Option<(f32, f32)>, usize)>,
+    /// The key in each slot, and whether it was used since the hand passed.
+    ring: Vec<(InkKey, bool)>,
+    hand: usize,
+}
+
+impl InkCache {
+    /// The intercept kept for `key`, its slot marked used.
+    pub(crate) fn get(&mut self, key: &InkKey) -> Option<Option<(f32, f32)>> {
+        let (found, slot) = *self.map.get(key)?;
+        if let Some(s) = self.ring.get_mut(slot) {
+            s.1 = true;
+        }
+        Some(found)
+    }
+
+    /// Keep `found` for `key` (not kept yet), in a free slot or in the
+    /// first the hand reaches that was not used since it last passed.
+    pub(crate) fn insert(&mut self, key: InkKey, found: Option<(f32, f32)>) {
+        debug_assert!(!self.map.contains_key(&key), "an intercept is kept once");
+        let len = self.ring.len();
+        if len < MAX_INK {
+            self.ring.push((key, false));
+            self.map.insert(key, (found, len));
+            if self.ring.len() == MAX_INK {
+                // Full: keys are replaced from now on, and room for as
+                // many again lets the map clean out what they leave
+                // behind in place, never growing.
+                self.map.reserve(MAX_INK);
+            }
+            return;
+        }
+        // Each slot passed loses its mark: within two turns one is free.
+        for _ in 0..len.saturating_mul(2) {
+            let at = self.hand;
+            self.hand = at.saturating_add(1).checked_rem(len).unwrap_or(0);
+            let Some(slot) = self.ring.get_mut(at) else { continue };
+            if std::mem::take(&mut slot.1) {
+                continue;
+            }
+            let old = std::mem::replace(&mut slot.0, key);
+            self.map.remove(&old);
+            self.map.insert(key, (found, at));
+            return;
+        }
+    }
+
+    /// How many intercepts are kept.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 /// Hinting instances kept before the oldest are dropped.
@@ -149,7 +237,10 @@ impl Fonts {
             face_ids: HashMap::default(),
             axes: Vec::new(),
             axes_ids: HashMap::default(),
+            bits: Vec::new(),
+            coords: Vec::new(),
             color: HashMap::default(),
+            ink: InkCache::default(),
             sent: (0, 0),
         }
     }
@@ -173,13 +264,14 @@ impl Fonts {
 
     /// The id of a set of normalized variation coordinates.
     pub(crate) fn axes(&mut self, coords: impl Iterator<Item = i16>) -> u16 {
-        let bits: Vec<i16> = coords.collect();
-        if let Some(id) = self.axes_ids.get(&bits) {
+        self.bits.clear();
+        self.bits.extend(coords);
+        if let Some(id) = self.axes_ids.get(self.bits.as_slice()) {
             return *id;
         }
         let id = u16::try_from(self.axes.len()).unwrap_or(u16::MAX);
-        self.axes.push(bits.clone());
-        self.axes_ids.insert(bits, id);
+        self.axes.push(self.bits.clone());
+        self.axes_ids.insert(self.bits.clone(), id);
         id
     }
 
@@ -207,6 +299,40 @@ impl Fonts {
             .is_some_and(|f| color_glyph::has_color(&f, GlyphId::new(glyph)));
         self.color.insert((font, glyph), c);
         c
+    }
+
+    /// Where glyph `key.glyph`'s ink is inside the band `key.band` (CSS
+    /// pixels below the baseline), as its leftmost and rightmost x from
+    /// its pen at `key.size` pixels per em, unhinted (Skia's glyph
+    /// intercept, [`super::ink`]); None where its ink misses the band or it
+    /// has no outline.
+    pub(crate) fn intercept(&mut self, key: InkKey) -> Option<(f32, f32)> {
+        if let Some(found) = self.ink.get(&key) {
+            return found;
+        }
+        let mut coords = std::mem::take(&mut self.coords);
+        coords.clear();
+        if let Some(v) = self.axes.get(usize::from(key.axes)) {
+            coords.extend(v.iter().map(|b| NormalizedCoord::from_bits(*b)));
+        }
+        let found = self.font_ref(key.font).and_then(|font| {
+            let glyph = font.outline_glyphs().get(GlyphId::new(key.glyph))?;
+            let mut gap = super::ink::Gap::new(
+                f32::from_bits(key.band.0),
+                f32::from_bits(key.band.1),
+                f32::from_bits(key.skew),
+            );
+            glyph
+                .draw(
+                    DrawSettings::unhinted(Size::new(f32::from_bits(key.size)), LocationRef::new(&coords)),
+                    &mut gap,
+                )
+                .ok()?;
+            gap.span()
+        });
+        self.coords = coords;
+        self.ink.insert(key, found);
+        found
     }
 
     /// How far [`Self::glyph_tables`] has sent.
@@ -607,5 +733,56 @@ impl Glyphs {
                 })
             }
         }
+    }
+}
+
+impl Fonts {
+    /// Swap the ink cache for `ink` (a cold frame reads and warms no
+    /// cache; the faces and their ids stay, append-only).
+    #[cfg(debug_assertions)]
+    pub(crate) fn swap_ink(&mut self, ink: InkCache) -> InkCache {
+        std::mem::replace(&mut self.ink, ink)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(glyph: u32) -> InkKey {
+        InkKey {
+            font: u32::MAX,
+            glyph,
+            axes: 0,
+            size: 16.0_f32.to_bits(),
+            skew: 0,
+            band: (1.5_f32.to_bits(), 2.1_f32.to_bits()),
+        }
+    }
+
+    /// Past its bound the cache keeps what is used and lets go of what is
+    /// not: a key read between every new one stays, the cache never holds
+    /// more than its bound, and it never starts over.
+    #[test]
+    fn the_intercept_cache_keeps_what_is_used_past_its_bound() {
+        let mut ink = InkCache::default();
+        let hot = key(u32::MAX);
+        ink.insert(hot, Some((1.0, 2.0)));
+        let mut misses = 0_u32;
+        let count = u32::try_from(MAX_INK.saturating_mul(3)).unwrap_or(u32::MAX);
+        for g in 0..count {
+            if ink.get(&hot).is_none() {
+                misses = misses.saturating_add(1);
+                ink.insert(hot, Some((1.0, 2.0)));
+            }
+            ink.insert(key(g), None);
+            assert!(ink.len() <= MAX_INK, "{} kept", ink.len());
+        }
+        assert_eq!(misses, 0, "the key in use was let go");
+        assert_eq!(ink.get(&hot), Some(Some((1.0, 2.0))));
+        assert_eq!(ink.len(), MAX_INK, "full, not started over");
+        // The most recent keys are kept; the oldest unused ones went.
+        assert!(ink.get(&key(count.saturating_sub(1))).is_some());
+        assert!(ink.get(&key(0)).is_none());
     }
 }

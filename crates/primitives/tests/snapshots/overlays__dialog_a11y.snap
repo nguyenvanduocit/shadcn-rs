@@ -1,0 +1,14 @@
+---
+source: crates/primitives/tests/overlays.rs
+expression: a11y(&p.s)
+---
+Window "w"
+  GenericContainer hidden
+    Button haspopup=Dialog expanded=true controls=Dialog
+      Label "Open"
+  GenericContainer
+    Dialog modal labelled-by=Edit profile described-by=Make changes here.
+      Heading "Edit profile" level=2
+      Label "Make changes here."
+      GenericContainer
+        Label "Save"

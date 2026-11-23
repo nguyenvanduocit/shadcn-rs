@@ -30,7 +30,7 @@ pub fn render() -> Render {
                                 .child(
                                     avatar()
                                         .child(avatar_image(vercel.as_ref()))
-                                        .child(avatar_fallback(vercel.as_ref(), "VC")),
+                                        .child(avatar_fallback("VC")),
                                 )
                                 .child(
                                     div()

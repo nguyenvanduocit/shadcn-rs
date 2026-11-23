@@ -34,7 +34,7 @@ fn said(p: MessageProps, variant: BubbleVariant, words: &str) -> Div {
 /// The demos' avatars have no picture here (`/avatars/*.png` are the docs
 /// site's), so their initials show, as reka shows them until a picture loads.
 fn face(p: MessageProps, initials: &str) -> Div {
-    message_avatar(p).child(avatar().child(avatar_fallback(None, initials)))
+    message_avatar(p).child(avatar().child(avatar_fallback(initials)))
 }
 
 fn turn(align: BubbleAlign, footer: bool, initials: &str, body: impl IntoElement) -> Div {

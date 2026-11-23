@@ -697,7 +697,7 @@ impl<'a> Geometry<'a> {
             });
         }
         if chart.crosshair.is_some() {
-            p = p.on_hover(24.0, move |h| active.set(h.and_then(|h| usize::try_from(h.index).ok())));
+            p = p.on_hover(move |h| active.set(h.and_then(|h| usize::try_from(h.index).ok())));
         }
         p
     }

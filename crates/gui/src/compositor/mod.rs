@@ -22,12 +22,16 @@
 
 mod compose;
 pub mod input_log;
+mod latch;
 #[cfg(test)]
 mod replay;
 mod scroll;
 pub(crate) mod thread;
 
 use std::sync::Arc;
+
+pub(crate) use latch::WheelGesture;
+pub use latch::{LATCH_SLOP, MOMENTUM_GAP, WHEEL_LATCH, WheelStep};
 
 pub use self::scroll::{Fling, ScrollPredictor};
 use self::scroll::{Scrolls, WheelTarget};
@@ -58,6 +62,14 @@ impl NodeKey {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScrollNode {
     pub key: NodeKey,
+    /// The component instance whose output it is: with [`Self::key`], its
+    /// identity as the UI names it (`ScrollId`), which every piece of
+    /// scroll state and every message about it is keyed by.
+    pub(crate) owner: Option<crate::reactive::OwnerId>,
+    /// Which scroll container it is: given as it first shows, a new one
+    /// when its key leaves and comes back. A gesture, its latch and its
+    /// fling are the instance's.
+    pub instance: u64,
     /// The transform its children paint under: the scroll offset is its offset.
     pub content: u32,
     /// The offset as laid out, within `0..=max`.
@@ -74,6 +86,14 @@ pub struct ScrollNode {
     pub thumb: Option<ThumbNode>,
     /// The scroll container around it, by index in [`Compositing::scrollers`].
     pub parent: Option<u32>,
+    /// It has a wheel handler of its own: the UI is asked before it scrolls.
+    pub wheel: bool,
+    /// A node between it and [`Self::parent`] has one: the UI is asked
+    /// when it cannot scroll that way.
+    pub wheel_above: bool,
+    /// It is below the top modal layer: no wheel reaches it, a gesture
+    /// latched to it before that layer opened included (the UI's rule).
+    pub below_modal: bool,
 }
 
 /// A scrollbar thumb the compositor moves with its scroll offset.
@@ -92,13 +112,117 @@ pub struct ThumbNode {
 /// hit-tests a wheel event against, as the UI hit-tests (`interact::hit`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hit {
-    /// Its border box in its paint space.
+    /// Its border box in its paint space, its shape and its hit slop: it
+    /// takes the pointer as the UI's node does
+    /// ([`crate::shape::takes_pointer`]).
     pub rect: Bounds,
+    pub shape: crate::shape::Shape,
+    pub slop: crate::style::Edges<f32>,
     pub transform: u32,
     /// The clip it is hit inside, 0 for none.
     pub clip: u32,
     /// The scroll container it is in (itself, when it is one), by index.
     pub scroller: Option<u32>,
+    /// A wheel handler is on it or on an ancestor below [`Self::scroller`]:
+    /// the wheel over it goes to the UI, which may consume it.
+    pub wheel: bool,
+    /// Which node it is: what the UI hands a wheel over it to.
+    pub target: HitTarget,
+    /// It is below the top modal layer: a gesture latched to it before
+    /// that layer opened is routed afresh (the UI's rule).
+    pub below_modal: bool,
+}
+
+/// What a wheel gesture goes to: the UI (a handler may consume it) or the
+/// compositor, scrolling a container itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Latched {
+    /// The UI, with the node the gesture's first event was over.
+    Ui(Option<HitTarget>),
+    /// A scroll container, the instance it is ([`ScrollNode::instance`]).
+    Scroll(u64),
+}
+
+/// Where a gesture's first event goes, and the innermost scroll container
+/// under it.
+#[derive(Clone, Copy, Debug)]
+struct Routed {
+    to: Option<Latched>,
+    under: Option<u64>,
+}
+
+/// A wheel event from the platform, as the render thread takes it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WheelInput {
+    /// Where, logical window pixels.
+    pub point: (f32, f32),
+    /// How far: positive moves the content up and toward the inline start.
+    pub delta: (f32, f32),
+    /// When, seconds on the frame clock.
+    pub at: f32,
+    /// A trackpad's, resampled; else a notched wheel's, applied.
+    pub precise: bool,
+    /// A trackpad's fingers went down: a new gesture.
+    pub began: bool,
+    /// A trackpad's fingers lifted (its momentum, if any, follows).
+    pub ended: bool,
+    /// The frame shown as it came ([`Presented::frame`]).
+    pub seen: u64,
+}
+
+impl WheelInput {
+    /// Its place in its gesture.
+    #[must_use]
+    pub fn step(&self) -> WheelStep {
+        WheelStep {
+            point: self.point,
+            at: self.at,
+            precise: self.precise,
+            began: self.began,
+            ended: self.ended,
+        }
+    }
+}
+
+/// What a wheel event became.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wheeled {
+    /// Handed to the UI: it is over a wheel handler, the node it hands it
+    /// to with it.
+    Ui(Option<HitTarget>),
+    /// The compositor scrolls a container.
+    Scrolled,
+    Nothing,
+}
+
+/// A frame as shown, kept once the next is composed over it: what a wheel
+/// event that came while it was on screen is routed in. Kept as what the
+/// next compose overwrote of it, made again from the frames after it.
+#[derive(Default)]
+struct Before {
+    frame: u64,
+    scale: f32,
+    compositing: Compositing,
+    /// Each transform and clip the next compose changed, as it was.
+    transforms: Vec<(u32, crate::scene::TransformNode)>,
+    clips: Vec<(u32, crate::scene::ClipNode)>,
+    /// All of it, when the next compose made the tables whole.
+    whole: Option<crate::scene::Properties>,
+}
+
+/// How many frames a wheel is routed in as it came: the last composed and
+/// those shown before it (kept as what the composes after each
+/// overwrote, [`Before`]). A wheel stamped with one older is routed in the
+/// last composed, as Chrome routes a wheel in its current frame.
+const ROUTED: usize = 5;
+
+/// The node a wheel is routed to, as a frame showed it: its compositor key
+/// and the component instance that made it ([`crate::interact`]'s node
+/// identity). The UI delivers the wheel to that node while it is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HitTarget {
+    pub(crate) key: NodeKey,
+    pub(crate) owner: Option<crate::reactive::OwnerId>,
 }
 
 /// A node whose opacity and transform the compositor moves.
@@ -138,7 +262,7 @@ impl Default for Compositing {
 /// and paint place it (the same code, so a compositor frame at the UI
 /// frame's own time draws what the UI recorded).
 #[must_use]
-pub(crate) fn moving_at(m: &MovingNode, at: f32, scale: f32) -> (TransformNode, f32) {
+pub(crate) fn moving_at(m: &MovingNode, at: f32, scale: f32) -> (TransformNode, f32, crate::style::Painted) {
     let moment = m.moving.curves.at(at, m.moving.transform);
     let shift = moment
         .transform
@@ -163,7 +287,53 @@ pub(crate) fn moving_at(m: &MovingNode, at: f32, scale: f32) -> (TransformNode, 
             matrix,
         },
         opacity,
+        painted,
     )
+}
+
+/// `at` (logical window pixels) with every scale and turn from transform
+/// `id` up undone, outermost first (the matrices are in physical pixels,
+/// `k` per logical one); `None` when one does not invert (a scale of 0).
+fn unturned(props: &crate::scene::Properties, id: u32, at: (f32, f32), k: f32) -> Option<(f32, f32)> {
+    // `x' = a·x + c·y + e`, `y' = b·x + d·y + f`.
+    let then = |m: [f32; 6], n: [f32; 6]| {
+        let [a, b, c, d, e, f] = m;
+        let [na, nb, nc, nd, ne, nf] = n;
+        [
+            na * a + nc * b,
+            nb * a + nd * b,
+            na * c + nc * d,
+            nb * c + nd * d,
+            na * e + nc * f + ne,
+            nb * e + nd * f + nf,
+        ]
+    };
+    let mut undo = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
+    let mut any = false;
+    // Innermost first: each one's inverse goes before those found so far.
+    for m in props.matrices(id, 0) {
+        let [a, b, c, d, e, f] = m.matrix();
+        let det = a * d - b * c;
+        if !det.is_finite() || det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = [
+            d / det,
+            -b / det,
+            -c / det,
+            a / det,
+            (c * f - d * e) / det,
+            (b * e - a * f) / det,
+        ];
+        undo = then(inv, undo);
+        any = true;
+    }
+    if !any || k <= 0.0 {
+        return Some(at);
+    }
+    let [a, b, c, d, e, f] = undo;
+    let (x, y) = (at.0 * k, at.1 * k);
+    Some(((a * x + c * y + e) / k, (b * x + d * y + f) / k))
 }
 
 /// The transforms, clips and effects that changed between two frames, by id.
@@ -176,34 +346,60 @@ pub struct PropertiesDelta {
 }
 
 impl PropertiesDelta {
-    fn between(old: &Properties, new: &Properties) -> Self {
-        fn changed<T: Clone + PartialEq>(old: &[T], new: &[T]) -> Vec<(u32, T)> {
-            new.iter()
-                .enumerate()
-                .filter(|(i, t)| old.get(*i) != Some(*t))
-                .map(|(i, t)| (u32::try_from(i).unwrap_or(u32::MAX), t.clone()))
-                .collect()
+    /// Write what turns `old` into `new` over what it held, its buffers kept.
+    fn between(&mut self, old: &Properties, new: &Properties) {
+        fn changed<T: Clone + PartialEq>(into: &mut Vec<(u32, T)>, old: &[T], new: &[T]) {
+            into.clear();
+            into.extend(
+                new.iter()
+                    .enumerate()
+                    .filter(|(i, t)| old.get(*i) != Some(*t))
+                    .map(|(i, t)| (u32::try_from(i).unwrap_or(u32::MAX), t.clone())),
+            );
         }
-        Self {
-            lens: (new.transforms.len(), new.clips.len(), new.effects.len()),
-            transforms: changed(&old.transforms, &new.transforms),
-            clips: changed(&old.clips, &new.clips),
-            effects: changed(&old.effects, &new.effects),
-        }
+        self.lens = (new.transforms.len(), new.clips.len(), new.effects.len());
+        changed(&mut self.transforms, &old.transforms, &new.transforms);
+        changed(&mut self.clips, &old.clips, &new.clips);
+        changed(&mut self.effects, &old.effects, &new.effects);
     }
 
-    fn apply(self, to: &mut Properties) {
-        fn put<T: Clone + Default>(v: &mut Vec<T>, len: usize, changed: Vec<(u32, T)>) {
+    /// Write the entries of `props` whose ids are in each list (sorted,
+    /// unique) over what it held, its buffers kept: what in-place writes
+    /// changed.
+    pub(crate) fn written(&mut self, props: &Properties, ids: (&[u32], &[u32], &[u32])) {
+        fn of<T: Clone>(into: &mut Vec<(u32, T)>, v: &[T], ids: &[u32]) {
+            into.clear();
+            into.extend(
+                ids.iter()
+                    .filter_map(|&id| Some((id, v.get(usize::try_from(id).ok()?)?.clone()))),
+            );
+        }
+        self.lens = (props.transforms.len(), props.clips.len(), props.effects.len());
+        of(&mut self.transforms, &props.transforms, ids.0);
+        of(&mut self.clips, &props.clips, ids.1);
+        of(&mut self.effects, &props.effects, ids.2);
+    }
+
+    /// Write its entries into `to`, emptying it (its buffers kept).
+    fn apply(&mut self, to: &mut Properties) {
+        fn put<T: Clone + Default>(v: &mut Vec<T>, len: usize, changed: &mut Vec<(u32, T)>) {
             v.resize(len, T::default());
-            for (i, t) in changed {
+            for (i, t) in changed.drain(..) {
                 if let Some(slot) = usize::try_from(i).ok().and_then(|i| v.get_mut(i)) {
                     *slot = t;
                 }
             }
         }
-        put(&mut to.transforms, self.lens.0, self.transforms);
-        put(&mut to.clips, self.lens.1, self.clips);
-        put(&mut to.effects, self.lens.2, self.effects);
+        put(&mut to.transforms, self.lens.0, &mut self.transforms);
+        put(&mut to.clips, self.lens.1, &mut self.clips);
+        put(&mut to.effects, self.lens.2, &mut self.effects);
+    }
+
+    fn clear(&mut self) {
+        self.lens = (0, 0, 0);
+        self.transforms.clear();
+        self.clips.clear();
+        self.effects.clear();
     }
 
     fn is_empty(&self) -> bool {
@@ -227,10 +423,7 @@ impl PropertiesDelta {
             || self.effects.iter().any(|(i, e)| {
                 at(old.effects.len(), *i).is_none_or(|i| {
                     old.effects.get(i).is_none_or(|o| {
-                        o.parent != e.parent
-                            || o.transform != e.transform
-                            || o.transformed != e.transformed
-                            || o.clip != e.clip
+                        o.parent != e.parent || o.transform != e.transform || o.transformed != e.transformed
                     })
                 })
             })
@@ -238,7 +431,10 @@ impl PropertiesDelta {
 }
 
 /// One UI frame for the render thread: what changed since the last commit
-/// (ADR-0015). Applied whole, in sequence.
+/// (ADR-0015). Applied whole, in sequence. The render thread empties it as
+/// it applies it and sends it back ([`Compose::spare`]): the next frame
+/// writes into its buffers, so a frame that changes as much as one before
+/// allocates nothing to say so.
 #[derive(Clone, Debug, Default)]
 pub struct Commit {
     /// One more than the last commit's.
@@ -253,8 +449,9 @@ pub struct Commit {
     pub size: (u32, u32),
     pub scale: f32,
     pub background: Option<crate::color::Color>,
-    /// The chunks' ids in painting order, when that changed.
-    pub order: Option<Vec<ChunkId>>,
+    /// The chunks' order changed: `order` holds their ids in painting order.
+    pub reorder: bool,
+    pub order: Vec<ChunkId>,
     /// Chunks recorded again, new or under another state.
     pub chunks: Vec<Chunk>,
     pub properties: PropertiesDelta,
@@ -267,74 +464,62 @@ pub struct Commit {
 }
 
 impl Commit {
-    /// What turns the scene `old` (as last committed) into `new`.
-    #[must_use]
-    pub fn between(old: &Scene, new: &Scene) -> Self {
+    /// Empty, its buffers kept for the next frame's.
+    pub fn clear(&mut self) {
+        self.sequence = 0;
+        self.answers = 0;
+        self.at = 0.0;
+        self.full = false;
+        self.reorder = false;
+        self.order.clear();
+        self.chunks.clear();
+        self.properties.clear();
+        self.scrollers = None;
+        self.hits = None;
+        self.moving = None;
+        self.glyphs = GlyphUpdate::default();
+    }
+
+    /// What turns the scene `old` (as last committed) into `new`, written
+    /// over what it held.
+    pub fn between(&mut self, old: &Scene, new: &Scene) {
+        self.clear();
         let same_order =
             old.chunks.len() == new.chunks.len() && old.chunks.iter().zip(&new.chunks).all(|(a, b)| a.id == b.id);
         let kept: foldhash::HashMap<ChunkId, &Chunk> = old.chunks.iter().map(|c| (c.id, c)).collect();
-        let chunks = new
-            .chunks
-            .iter()
-            .filter(|c| {
-                kept.get(&c.id)
-                    .is_none_or(|k| k.state != c.state || !Arc::ptr_eq(&k.display, &c.display))
-            })
-            .cloned()
-            .collect();
-        let (oc, nc) = (&old.compositing, &new.compositing);
-        Self {
-            sequence: 0,
-            answers: 0,
-            at: 0.0,
-            full: false,
-            size: new.size,
-            scale: new.scale,
-            background: new.background,
-            order: (!same_order).then(|| new.chunks.iter().map(|c| c.id).collect()),
-            chunks,
-            properties: PropertiesDelta::between(&old.properties, &new.properties),
-            scrollers: replaced(&oc.scrollers, &nc.scrollers).then(|| Arc::clone(&nc.scrollers)),
-            hits: replaced(&oc.hits, &nc.hits).then(|| Arc::clone(&nc.hits)),
-            moving: replaced(&oc.moving, &nc.moving).then(|| Arc::clone(&nc.moving)),
-            glyphs: GlyphUpdate::default(),
+        self.chunks.extend(
+            new.chunks
+                .iter()
+                .filter(|c| {
+                    kept.get(&c.id)
+                        .is_none_or(|k| k.state != c.state || !Arc::ptr_eq(&k.display, &c.display))
+                })
+                .cloned(),
+        );
+        if !same_order {
+            self.reorder = true;
+            self.order.extend(new.chunks.iter().map(|c| c.id));
         }
+        self.properties.between(&old.properties, &new.properties);
+        self.tables(new, &old.compositing);
     }
 
-    /// What a record in place changed of `scene`: the chunks recorded
-    /// again or under another state, the property entries written, and the
-    /// compositor's tables where they differ from `before` (ADR-0013: what
-    /// a frame visited, never a comparison of the whole scene).
-    #[must_use]
-    pub(crate) fn changed(
-        scene: &Scene,
-        before: &Compositing,
-        chunks: Vec<Chunk>,
-        properties: PropertiesDelta,
-    ) -> Self {
+    /// The frame's size and background, and the compositor's tables of
+    /// `scene` where they differ from `before`.
+    pub(crate) fn tables(&mut self, scene: &Scene, before: &Compositing) {
         let nc = &scene.compositing;
-        Self {
-            sequence: 0,
-            answers: 0,
-            at: 0.0,
-            full: false,
-            size: scene.size,
-            scale: scene.scale,
-            background: scene.background,
-            order: None,
-            chunks,
-            properties,
-            scrollers: replaced(&before.scrollers, &nc.scrollers).then(|| Arc::clone(&nc.scrollers)),
-            hits: replaced(&before.hits, &nc.hits).then(|| Arc::clone(&nc.hits)),
-            moving: replaced(&before.moving, &nc.moving).then(|| Arc::clone(&nc.moving)),
-            glyphs: GlyphUpdate::default(),
-        }
+        self.size = scene.size;
+        self.scale = scene.scale;
+        self.background = scene.background;
+        self.scrollers = replaced(&before.scrollers, &nc.scrollers).then(|| Arc::clone(&nc.scrollers));
+        self.hits = replaced(&before.hits, &nc.hits).then(|| Arc::clone(&nc.hits));
+        self.moving = replaced(&before.moving, &nc.moving).then(|| Arc::clone(&nc.moving));
     }
 
     /// Whether it changes nothing the compositor draws or moves.
     #[must_use]
     pub fn is_empty(&self, last: &Scene) -> bool {
-        self.order.is_none()
+        !self.reorder
             && self.chunks.is_empty()
             && self.properties.is_empty()
             && self.scrollers.is_none()
@@ -358,7 +543,14 @@ impl Commit {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ScrollDelta {
     pub key: NodeKey,
+    /// With `key`, the container's identity (its [`ScrollNode`]'s owner): a
+    /// container another instance replaced at the same path is another.
+    pub(crate) owner: Option<crate::reactive::OwnerId>,
     pub delta: (f32, f32),
+    /// The scroll generation ([`ScrollNode::generation`]) `delta` was
+    /// scrolled from: the UI drops it if it set the offset since, as its
+    /// own scroll wins (Chrome's).
+    pub generation: u64,
     /// How far, at the speed it scrolls now, the compositor may scroll it
     /// before the commit after this frame's shows (signed as `delta`): the
     /// content a virtual list builds beyond its viewport that way, as
@@ -411,12 +603,18 @@ pub struct Presented {
     pub scroll: Vec<ShownScroll>,
     /// How far each moving node was shown from where its commit placed it.
     pub moved: Vec<(NodeKey, (f32, f32))>,
+    /// The scale and turn each moving node was shown at, as sampled then
+    /// (its origin from the corner of its border box): input lands in it
+    /// as it showed, whatever scale and turn its commit had.
+    pub turned: Vec<(NodeKey, crate::style::Painted)>,
 }
 
 /// A scroll container as a frame showed it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShownScroll {
     pub key: NodeKey,
+    /// With `key`, which container it is (its [`ScrollNode`]'s owner).
+    pub(crate) owner: Option<crate::reactive::OwnerId>,
     pub offset: (f32, f32),
     /// What the offset moved its children by, as paint applies it.
     pub applied: (f32, f32),
@@ -444,11 +642,24 @@ pub struct Compositor {
     changed: Changed,
     links: compose::Links,
     moved: compose::Moved,
+    /// The last frame's sources, kept for their memory.
+    spare: compose::Sources,
+    /// The frame presented before the last, kept to be the next once
+    /// nothing else holds it.
+    retired: Option<Arc<Presented>>,
     work: compose::Work,
     /// Each frame is compared with one composed whole (`GUI_COLD_CHECK`).
     cold_check: bool,
     frame: u64,
     presented: Arc<Presented>,
+    /// The frames shown before the last composed one, the latest first:
+    /// `ROUTED - 1` of them at most.
+    ring: std::collections::VecDeque<Box<Before>>,
+    /// The wheel gesture under way.
+    latch: WheelGesture<Latched, u64>,
+    /// Clip chains wheel routing has walked: only those of boxes under
+    /// the wheel.
+    chain_walks: std::cell::Cell<usize>,
 }
 
 impl Compositor {
@@ -467,11 +678,22 @@ impl Compositor {
             changed: Changed::default(),
             links: compose::Links::default(),
             moved: compose::Moved::default(),
+            spare: compose::Sources::default(),
+            retired: None,
             work: compose::Work::default(),
-            cold_check: std::env::var_os("GUI_COLD_CHECK").is_some(),
+            cold_check: cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some(),
             frame: 0,
             presented: Arc::new(Presented::default()),
+            ring: std::collections::VecDeque::new(),
+            latch: WheelGesture::default(),
+            chain_walks: std::cell::Cell::new(0),
         }
+    }
+
+    /// How many clip chains wheel routing has walked.
+    #[cfg(test)]
+    pub(crate) fn chain_walks(&self) -> usize {
+        self.chain_walks.get()
     }
 
     /// Compare each frame it composes with one composed whole, panicking
@@ -494,35 +716,34 @@ impl Compositor {
         &self.scene
     }
 
+    /// Take in the last commit's scroll containers again, as each commit
+    /// does: for the test that a commit's scroll bookkeeping allocates
+    /// nothing (its own binary counts the heap).
+    #[doc(hidden)]
+    pub fn recommit_scrollers(&mut self) {
+        self.scrolls.committed(&self.scene.compositing.scrollers, self.commit);
+    }
+
     /// The glyph tables it draws with.
     pub fn glyphs(&mut self) -> &mut Glyphs {
         &mut self.glyphs
     }
 
-    /// Take in `commit`, whole.
-    pub fn apply(&mut self, commit: Commit) {
-        let Commit {
-            sequence,
-            answers,
-            at,
-            full,
-            size,
-            scale,
-            background,
-            order,
-            chunks,
-            properties,
-            scrollers,
-            hits,
-            moving,
-            glyphs,
-        } = commit;
-        self.glyphs.apply(glyphs);
+    /// Take in `commit`, whole, emptying it: what it carried is the
+    /// scene's now, and its buffers go back to the UI for the next frame.
+    pub fn apply(&mut self, commit: &mut Commit) {
+        self.glyphs.apply(std::mem::take(&mut commit.glyphs));
         let scene = &mut self.scene;
         let pending = &mut self.pending;
-        if full || order.is_some() || size != scene.size || scale != scene.scale || background != scene.background {
+        if commit.full
+            || commit.reorder
+            || commit.size != scene.size
+            || commit.scale != scene.scale
+            || commit.background != scene.background
+        {
             pending.all = true;
         }
+        let properties = &mut commit.properties;
         if !pending.all && properties.reshapes(&scene.properties) {
             pending.all = true;
         }
@@ -531,21 +752,21 @@ impl Compositor {
             pending.clips.extend(properties.clips.iter().map(|(i, _)| *i));
             pending.effects.extend(properties.effects.iter().map(|(i, _)| *i));
         }
-        scene.size = size;
-        scene.scale = scale;
-        scene.background = background;
-        if let Some(order) = order {
+        scene.size = commit.size;
+        scene.scale = commit.scale;
+        scene.background = commit.background;
+        if commit.reorder {
             let mut by_id: foldhash::HashMap<ChunkId, Chunk> = std::mem::take(&mut scene.chunks)
                 .into_iter()
                 .map(|c| (c.id, c))
                 .collect();
-            for c in chunks {
+            for c in commit.chunks.drain(..) {
                 by_id.insert(c.id, c);
             }
-            scene.chunks = order.iter().filter_map(|id| by_id.remove(id)).collect();
+            scene.chunks = commit.order.iter().filter_map(|id| by_id.remove(id)).collect();
             self.index = scene.chunks.iter().enumerate().map(|(i, c)| (c.id, i)).collect();
         } else {
-            for c in chunks {
+            for c in commit.chunks.drain(..) {
                 if let Some(&i) = self.index.get(&c.id)
                     && let Some(slot) = scene.chunks.get_mut(i)
                 {
@@ -555,18 +776,19 @@ impl Compositor {
             }
         }
         properties.apply(&mut scene.properties);
-        if let Some(s) = scrollers {
+        if let Some(s) = commit.scrollers.take() {
             scene.compositing.scrollers = s;
         }
-        if let Some(h) = hits {
+        if let Some(h) = commit.hits.take() {
             scene.compositing.hits = h;
         }
-        if let Some(m) = moving {
+        if let Some(m) = commit.moving.take() {
             scene.compositing.moving = m;
         }
-        self.scrolls.committed(&scene.compositing.scrollers, answers);
-        self.commit = sequence;
-        self.committed_at = at;
+        self.scrolls.committed(&scene.compositing.scrollers, commit.answers);
+        self.commit = commit.sequence;
+        self.committed_at = commit.at;
+        commit.clear();
     }
 
     /// Replace what is drawn over every frame.
@@ -574,47 +796,201 @@ impl Compositor {
         self.overlay = overlay;
     }
 
-    /// Scroll by `delta` (pixels, positive moves the content up and left)
-    /// the scroll container under `at` (logical window pixels) that can
-    /// scroll that way, as the UI's wheel would pick it; whether one did.
-    /// `when` is the event's time, seconds on the frame clock.
-    pub fn wheel(&mut self, at: (f32, f32), delta: (f32, f32), when: f32) -> bool {
-        let Some(target) = self.wheel_target(at, delta) else {
-            return false;
+    /// Take the platform's wheel event `w`: hand it to the UI (it is over
+    /// a wheel handler), with the node it is over, or scroll a container,
+    /// as Chrome scrolls. A gesture stays latched to what took its first
+    /// event, even once that container cannot go on (no chaining within a
+    /// gesture): a trackpad's from its fingers going down to their lifting
+    /// and the momentum after, however long it rests; a notched wheel's
+    /// while it turns within [`WHEEL_LATCH`] of its last turn, the pointer
+    /// not moved past [`LATCH_SLOP`] nor onto another container. A new one
+    /// starts at the innermost container under it that can still scroll
+    /// that way, passing those at their end to the one around them. It is
+    /// routed in the frame shown as it came (`w.seen`), that frame's hit
+    /// table and transforms both, while that frame is kept ([`ROUTED`]).
+    pub fn wheel_input(&mut self, w: WheelInput) -> Wheeled {
+        let to = self.latched(w);
+        let scrollers = &self.scene.compositing.scrollers;
+        let target = match to {
+            Some(Latched::Ui(target)) => return Wheeled::Ui(target),
+            Some(Latched::Scroll(instance)) => scrollers
+                .iter()
+                .position(|s| s.instance == instance)
+                .and_then(|i| u32::try_from(i).ok())
+                .map(WheelTarget),
+            None => None,
         };
-        self.scrolls
-            .scroll(&self.scene.compositing.scrollers, target, delta, when)
+        let moved = if w.precise {
+            self.scrolls.gesture(scrollers, target, w.delta, w.at, w.ended)
+        } else {
+            target.is_some_and(|t| self.scrolls.scroll(scrollers, t, w.delta, w.at))
+        };
+        if moved { Wheeled::Scrolled } else { Wheeled::Nothing }
     }
 
-    /// A trackpad's wheel event at `point` moving `delta`, at `at` seconds
-    /// on the frame clock: resampled at each frame's present time, and
-    /// flung on once `ended` where the platform does not fling.
-    pub fn gesture(&mut self, point: (f32, f32), delta: (f32, f32), at: f32, ended: bool) -> bool {
-        let target = self.wheel_target(point, delta);
-        self.scrolls
-            .gesture(&self.scene.compositing.scrollers, target, delta, at, ended);
-        target.is_some()
+    /// What `w` goes to: what its gesture latched to while it goes on,
+    /// else what it is routed to, latched for the gesture.
+    fn latched(&mut self, w: WheelInput) -> Option<Latched> {
+        let compositing = &self.scene.compositing;
+        let routed = self.route(w.point, w.delta, w.seen);
+        let step = w.step();
+        // One rule for every latch, checked on each event against what is
+        // there now: its target by identity (a node by key and the
+        // instance that made it, a container by the instance it is).
+        // Gone, or below a modal layer opened since: the gesture's latch
+        // ends, and what it goes on over is routed afresh.
+        let held = self
+            .latch
+            .held(&step, routed.as_ref().map(|r| r.under))
+            .copied()
+            .filter(|to| match to {
+                Latched::Ui(None) => true,
+                Latched::Ui(Some(target)) => compositing.hits.iter().any(|h| h.target == *target && !h.below_modal),
+                Latched::Scroll(instance) => compositing
+                    .scrollers
+                    .iter()
+                    .any(|s| s.instance == *instance && !s.below_modal),
+            });
+        let (to, under) = match held {
+            Some(to) => (Some(to), None),
+            None => routed.map_or((None, None), |r| (r.to, r.under)),
+        };
+        self.latch.went(&step, under, to, held.is_some());
+        to
     }
 
-    /// The scroll container a wheel at `at` moving `delta` scrolls.
-    fn wheel_target(&self, at: (f32, f32), delta: (f32, f32)) -> Option<WheelTarget> {
-        let c = &self.scene.compositing;
-        let props = &self.shown.properties;
+    /// The hit table, scroll containers, transforms and scale of the frame
+    /// numbered `seen` as shown: the last composed, or one before it made
+    /// again from what the composes after it overwrote. One older than
+    /// those kept is routed in the last composed, as Chrome routes a wheel
+    /// in its current frame.
+    fn tables(&self, seen: u64) -> (&Compositing, std::borrow::Cow<'_, crate::scene::Properties>, f32) {
+        let current = (
+            &self.shown.compositing,
+            std::borrow::Cow::Borrowed(&self.shown.properties),
+            self.shown.scale,
+        );
+        if seen == 0 || seen >= self.presented.frame {
+            return current;
+        }
+        let Some(k) = self.ring.iter().position(|b| b.frame == seen) else {
+            return current;
+        };
+        let now = &self.shown.properties;
+        let mut p = crate::scene::Properties {
+            transforms: now.transforms.clone(),
+            clips: now.clips.clone(),
+            effects: Vec::new(),
+        };
+        for b in self.ring.iter().take(k.saturating_add(1)) {
+            if let Some(whole) = &b.whole {
+                p.transforms.clone_from(&whole.transforms);
+                p.clips.clone_from(&whole.clips);
+                continue;
+            }
+            for &(t, v) in b.transforms.iter().rev() {
+                if let Some(slot) = usize::try_from(t).ok().and_then(|i| p.transforms.get_mut(i)) {
+                    *slot = v;
+                }
+            }
+            for &(c, v) in b.clips.iter().rev() {
+                if let Some(slot) = usize::try_from(c).ok().and_then(|i| p.clips.get_mut(i)) {
+                    *slot = v;
+                }
+            }
+        }
+        let b = self.ring.get(k).map_or(&self.shown.compositing, |b| &b.compositing);
+        let scale = self.ring.get(k).map_or(self.shown.scale, |b| b.scale);
+        (b, std::borrow::Cow::Owned(p), scale)
+    }
+
+    /// Whether `node` (as some frame showed it) can scroll by `delta` from
+    /// where it is now.
+    fn can_scroll(&self, node: &ScrollNode, delta: (f32, f32)) -> bool {
+        let now = self
+            .scene
+            .compositing
+            .scrollers
+            .iter()
+            .find(|s| s.key == node.key)
+            .unwrap_or(node);
+        let o = self.scrolls.offset(now, 0);
+        let along = if now.rtl { -delta.0 } else { delta.0 };
+        (delta.1 > 0.0 && o.1 < now.max.1)
+            || (delta.1 < 0.0 && o.1 > 0.0)
+            || (along > 0.0 && o.0 < now.max.0)
+            || (along < 0.0 && o.0 > 0.0)
+    }
+
+    /// Where a wheel at `at` moving `delta` that starts a gesture goes, in
+    /// the frame numbered `seen`: walking up from the box under it as the
+    /// UI's routing does, a wheel handler (the UI's, with the box), or the
+    /// innermost container that can still scroll that way; with the
+    /// innermost container under it, whatever it does.
+    fn route(&self, at: (f32, f32), delta: (f32, f32), seen: u64) -> Option<Routed> {
+        let (c, props, k) = self.tables(seen);
+        let props = &*props;
         let hit = c.hits.iter().rev().find(|h| {
+            // Where the point lies under each scale and turn above the box
+            // as shown, as the UI's hit testing maps it: a box under a
+            // scale of 0 is hit by nothing.
+            let Some(p) = unturned(props, h.transform, at, k) else {
+                return false;
+            };
             let t = props.transform(h.transform);
-            let inside = h.rect.translated(t.offset.0, t.offset.1).contains(at.0, at.1);
-            let clipped = props.clip(h.clip).is_some_and(|c| !c.clip.bounds.contains(at.0, at.1));
-            inside && !clipped
+            let b = h.rect.translated(t.offset.0, t.offset.1);
+            if !crate::shape::takes_pointer(&h.shape, b, h.slop, p.0, p.1) {
+                return false;
+            }
+            if h.clip == 0 {
+                return true;
+            }
+            // Under it: its clip chain, rounded corners included, as paint
+            // and the UI's hit testing keep it ([`crate::clip::keeps`]).
+            self.chain_walks.set(self.chain_walks.get().saturating_add(1));
+            let clip_of = |id: u32| {
+                (id != 0)
+                    .then(|| usize::try_from(id).ok().and_then(|i| props.clips.get(i)))
+                    .flatten()
+            };
+            let link = |id: u32| {
+                let c = clip_of(id)?;
+                let b = c.clip.bounds;
+                Some(crate::clip::Link {
+                    rect: b,
+                    radius: crate::shape::Shape::Rounded(c.clip.radius).used(b.width, b.height),
+                    curve: c.clip.curve,
+                    next: (c.parent != 0).then_some(c.parent),
+                })
+            };
+            let to_local = |id: u32, q: (f32, f32)| unturned(props, clip_of(id)?.transform, q, k);
+            crate::clip::keeps(Some(h.clip), link, to_local, props.clips.len(), at.0, at.1) == Some(true)
         })?;
+        let under = hit
+            .scroller
+            .and_then(|i| c.scrollers.get(usize::try_from(i).ok()?))
+            .map(|n| n.instance);
+        let routed = |to: Option<Latched>| Some(Routed { to, under });
+        if hit.wheel {
+            return routed(Some(Latched::Ui(Some(hit.target))));
+        }
         let mut s = hit.scroller;
         while let Some(i) = s {
-            let node = c.scrollers.get(usize::try_from(i).ok()?)?;
-            if (delta.1 != 0.0 && node.max.1 > 0.0) || (delta.0 != 0.0 && node.max.0 > 0.0) {
-                return Some(WheelTarget(i));
+            let Some(node) = usize::try_from(i).ok().and_then(|i| c.scrollers.get(i)) else {
+                break;
+            };
+            if node.wheel {
+                return routed(Some(Latched::Ui(Some(hit.target))));
+            }
+            if self.can_scroll(node, delta) {
+                return routed(Some(Latched::Scroll(node.instance)));
+            }
+            if node.wheel_above {
+                return routed(Some(Latched::Ui(Some(hit.target))));
             }
             s = node.parent;
         }
-        None
+        routed(None)
     }
 
     /// The scroll done since the last [`MainFrame`], handed to one with
@@ -681,7 +1057,10 @@ impl Compositor {
 /// or the render thread's.
 pub trait Compose {
     /// Take in a frame's commit, and with it what is drawn over it.
-    fn commit(&mut self, commit: Commit, overlay: Option<Scene>);
+    fn commit(&mut self, commit: Box<Commit>, overlay: Option<Scene>);
+    /// A commit the renderer applied and gave back, emptied, for the next
+    /// frame to write into: commits go round, not one made per frame.
+    fn spare(&mut self) -> Option<Box<Commit>>;
     /// Replace what is drawn over the frames (the HUD, after its frame).
     fn overlay(&mut self, overlay: Option<Scene>);
     /// What the renderer holds across frames, as last known.
@@ -716,6 +1095,8 @@ pub struct Headless {
     /// How long the UI takes to answer a main frame, as a render thread
     /// would have measured it: here it answers at once, unless a test says.
     ui_late: std::time::Duration,
+    /// The last commit, applied and emptied, for the next frame.
+    spare: Option<Box<Commit>>,
 }
 
 impl Headless {
@@ -730,6 +1111,7 @@ impl Headless {
             pixels: None,
             sequence: 0,
             ui_late: std::time::Duration::ZERO,
+            spare: None,
         }
     }
 
@@ -742,7 +1124,16 @@ impl Headless {
     /// Scroll as the platform's wheel would, then draw the frame that shows
     /// it at `at`, as the render thread draws one without the UI.
     pub fn wheel(&mut self, at_point: (f32, f32), delta: (f32, f32), at: f32) -> bool {
-        let scrolled = self.compositor.wheel(at_point, delta, at);
+        let seen = self.compositor.presented.frame;
+        let scrolled = self.compositor.wheel_input(WheelInput {
+            point: at_point,
+            delta,
+            at,
+            precise: false,
+            began: false,
+            ended: false,
+            seen,
+        }) == Wheeled::Scrolled;
         if scrolled {
             self.draw(at);
         }
@@ -779,11 +1170,16 @@ impl Headless {
 }
 
 impl Compose for Headless {
-    fn commit(&mut self, commit: Commit, overlay: Option<Scene>) {
+    fn commit(&mut self, mut commit: Box<Commit>, overlay: Option<Scene>) {
         let at = commit.at;
-        self.compositor.apply(commit);
+        self.compositor.apply(&mut commit);
+        self.spare = Some(commit);
         self.compositor.set_overlay(overlay);
         self.draw(at);
+    }
+
+    fn spare(&mut self) -> Option<Box<Commit>> {
+        self.spare.take()
     }
 
     fn overlay(&mut self, overlay: Option<Scene>) {

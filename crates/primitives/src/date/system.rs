@@ -6,7 +6,7 @@
 
 use std::num::Saturating;
 
-use crate::calendar::{CalendarDate, quot, rem, s};
+use super::{CalendarDate, quot, rem, s};
 
 /// The systems `createCalendar` knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Hash)]

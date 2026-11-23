@@ -635,10 +635,10 @@ fn text_in_a_canvas_is_drawn_from_its_curves_and_as_bars_far_out() {
         camera: Camera::default(),
     };
     crate::chunk::Picture::shape(&picture, &mut text);
-    let s = w.snapshot();
+    let s = picture.labelled();
     let o = s.object(0).unwrap();
     let super::Body::Text(t) = &o.body else { panic!("text") };
-    let shaped = t.shaped.get().expect("shaped");
+    let shaped = s.labels.get(t).expect("shaped");
     assert_eq!(shaped.glyphs.len(), 12, "a glyph a character");
     assert!(
         shaped.width > 4.0 && shaped.width < 8.0,
@@ -658,7 +658,7 @@ fn text_in_a_canvas_is_drawn_from_its_curves_and_as_bars_far_out() {
         scene.push(vec![Item::World(Arc::new(WorldView {
             key: 9,
             bounds,
-            world: w.snapshot(),
+            world: Arc::clone(&s),
             camera,
             tiled: false,
         }))]);
@@ -970,12 +970,12 @@ fn text_in_a_canvas_wraps_to_its_width() {
         camera: Camera::default(),
     };
     crate::chunk::Picture::shape(&picture, &mut text);
-    let s = w.snapshot();
+    let s = picture.labelled();
     let shaped = |id: super::ObjectId| {
         let super::Body::Text(t) = &s.object(id.0).unwrap().body else {
             panic!("text")
         };
-        t.shaped.get().expect("shaped").clone()
+        s.labels.get(t).expect("shaped").clone()
     };
     let (p, l) = (shaped(para), shaped(line));
     assert_eq!(l.lines.len(), 1, "unwrapped, one line");
@@ -1102,4 +1102,119 @@ fn snapshots_find_what_a_scan_finds_through_edits() {
             assert_eq!(found, scan, "step {step}");
         }
     }
+}
+
+/// Text a cold frame's paint shapes is its own: the live paint after it
+/// still finds the text unshaped, and the labels it had are as they were.
+#[test]
+fn a_cold_paint_does_not_shape_text_for_the_live_one() {
+    let mut text = crate::text::TextSystem::new();
+    let w = world();
+    let seen = w.add_text(super::WorldText::new("Seen live", (0.0, 0.0), 10.0));
+    let picture = || super::CanvasPicture {
+        world: w.snapshot(),
+        camera: Camera::default(),
+    };
+    let body = |s: &super::WorldSnapshot, id: super::ObjectId| {
+        let super::Body::Text(t) = &s.object(id.0).unwrap().body else {
+            panic!("text")
+        };
+        Arc::clone(t)
+    };
+    crate::chunk::Picture::shape(&picture(), &mut text);
+    let live = picture().labelled();
+    assert!(
+        live.labels.get(&body(&live, seen)).is_some(),
+        "the live paint shaped it"
+    );
+    let later = w.add_text(super::WorldText::new("Added since", (0.0, 40.0), 10.0));
+    {
+        let _cold = crate::engine::ColdFrame::begin();
+        let p = picture();
+        crate::chunk::Picture::shape(&p, &mut text);
+        let cold = p.labelled();
+        assert!(
+            cold.labels.get(&body(&cold, later)).is_some(),
+            "the cold paint shaped it"
+        );
+    }
+    let after = picture().labelled();
+    assert!(
+        after.labels.get(&body(&after, later)).is_none(),
+        "the cold shaping is gone with the cold frame"
+    );
+    assert!(
+        after.labels.get(&body(&after, seen)).is_some(),
+        "the live labels are kept"
+    );
+    assert!(Arc::ptr_eq(&after.labels, &live.labels), "the live labels unchanged");
+}
+
+/// A cold paint shapes every text it draws, not only what the live
+/// snapshots left unshaped: text the live paint shaped before an edit is
+/// in the cold scene, drawn with the glyphs the live one has.
+#[test]
+fn a_cold_paint_draws_text_the_live_paint_shaped_before_an_edit() {
+    let mut text = crate::text::TextSystem::new();
+    let w = world();
+    let a = w.add_text(super::WorldText::new("Shaped live", (0.0, 0.0), 10.0));
+    let picture = || super::CanvasPicture {
+        world: w.snapshot(),
+        camera: Camera::default(),
+    };
+    let view = |p: &super::CanvasPicture| {
+        let mut out = Vec::new();
+        crate::chunk::Picture::draw(
+            p,
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 200.0,
+                height: 100.0,
+            },
+            1.0,
+            7,
+            &mut out,
+        );
+        let Some(Item::World(v)) = out.pop() else {
+            panic!("a world")
+        };
+        v
+    };
+    crate::chunk::Picture::shape(&picture(), &mut text);
+    // An edit, and the live paint again: A no longer waits to be shaped.
+    w.add_text(super::WorldText::new("Added since", (0.0, 40.0), 10.0));
+    let p = picture();
+    crate::chunk::Picture::shape(&p, &mut text);
+    let live = view(&p);
+    let cold = crate::engine::in_cold_frame(|| {
+        let p = picture();
+        crate::chunk::Picture::shape(&p, &mut text);
+        view(&p)
+    });
+    let super::Body::Text(t) = &cold.world.object(a.0).unwrap().body else {
+        panic!("text")
+    };
+    assert!(cold.world.labels.get(t).is_some(), "A is in the cold scene");
+    assert!(*cold == *live, "drawn with the same glyphs");
+    let bare = super::WorldView {
+        world: w.snapshot(),
+        ..(*live).clone()
+    };
+    assert!(bare != *live, "a view is told apart by its text's glyphs");
+}
+
+/// A world's snapshot made first in a cold frame is the frame's: the
+/// world's cache of it stays empty, its unshaped text as it was.
+#[test]
+fn a_cold_snapshot_leaves_the_worlds_caches_empty() {
+    let w = world();
+    w.add_text(super::WorldText::new("Never drawn live", (0.0, 0.0), 10.0));
+    let cold = crate::engine::in_cold_frame(|| w.snapshot());
+    assert!(cold.unshaped.is_empty(), "the cold paint shapes everything itself");
+    w.0.with_untracked(|s| {
+        assert!(s.snapshot.borrow().is_none(), "no snapshot cached");
+        assert!(s.base.borrow().is_none(), "no base cached");
+        assert_eq!(s.unshaped.borrow().len(), 1, "the text still waits for the live paint");
+    });
 }

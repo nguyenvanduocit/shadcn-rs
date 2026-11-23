@@ -12,16 +12,25 @@ export default defineConfig({
     tailwindcss(),
     // The demos are written for Nuxt, which imports Vue's and VueUse's
     // functions (`ref`, `computed`, `useMediaQuery`) without an import line.
-    AutoImport({ imports: ["vue", "@vueuse/core"], dts: false }),
+    // The base components read the picker's choices (IconPlaceholder's
+    // `iconLibrary`) from a Nuxt composable of apps/v4, which is not in the
+    // checkout: design-system.ts answers it from the page's query.
+    AutoImport({
+      imports: ["vue", "@vueuse/core", { [here("./design-system.ts")]: ["useDesignSystemSearchParams"] }],
+      dts: false,
+    }),
   ],
   resolve: {
     alias: [
-      // Some demos are written against another shadcn style (`bases/reka`,
-      // `styles/reka-nova`, ...); the port follows new-york-v4, so render
-      // every demo with new-york-v4's component of the same name.
+      // A style is the base components (`registry/bases/reka/ui`, written in
+      // `cn-*` classes) under `.style-<name>` (registry/styles/style-<name>.css),
+      // as shadcn's previews render it (design-system-provider.tsx). The demos
+      // import new-york-v4's components, a base's or a style's built copy
+      // (`styles/reka-nova`): every one renders the base component of the same
+      // name, so the page's style class alone decides the look.
       {
-        find: /^@\/(?:registry\/bases\/[^/]+|styles\/[^/]+)\/ui\//,
-        replacement: `${here("./.shadcn-vue/apps/v4/registry/new-york-v4/ui")}/`,
+        find: /^@\/(?:registry\/(?:new-york-v4|bases\/[^/]+)|styles\/[^/]+)\/ui\//,
+        replacement: `${here("./.shadcn-vue/apps/v4/registry/bases/reka/ui")}/`,
       },
       // Nuxt's component barrel, for the demos that import NuxtLink from it.
       { find: "#components", replacement: here("./nuxt-components.ts") },

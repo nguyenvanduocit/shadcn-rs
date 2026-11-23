@@ -3,14 +3,19 @@
 //!
 //! The parts nest as in Vue: [`dialog`] keeps whether it is open, its own
 //! (`default_open`) or the caller's (`open`, `v-model:open`); the
-//! [`dialog_trigger`], [`dialog_content`] and each [`dialog_close`] inside
-//! read it. Every other modal built on Reka's `DialogRoot` (alert dialog,
-//! sheet, drawer) is a [`dialog`] too, so Escape, the overlay and focus
-//! behave the same in all: opening takes focus off the page, and closing,
-//! however it happens (a part, Escape, or the caller writing the model),
-//! gives it back (Reka's `getReturnFocusElement`): to the trigger when its
-//! press opened the dialog, else to what held focus as it opened, else to
-//! the trigger; with none of them, nothing keeps focus.
+//! [`dialog_trigger`], [`dialog_content`], [`dialog_title`],
+//! [`dialog_description`] and each [`dialog_close`] inside read it. Every
+//! other modal on Reka's `DialogRoot` (sheet) is a [`dialog`] too; an alert
+//! dialog and a drawer have roots of their own, and the trigger, close,
+//! title and description parts work under each.
+//!
+//! The behaviour is `primitives::dialog`'s: modal by default (focus trapped
+//! and cycling, the page below inert and hidden from screen readers),
+//! Escape and a press on the overlay close it (a context menu's press does
+//! not), opening focuses its first Tab stop, closing gives focus back to
+//! what held it as it opened, else to the trigger. The content is read as a
+//! dialog named by its title and described by its description. This module
+//! draws it.
 //!
 //! ```ignore
 //! dialog()
@@ -18,42 +23,107 @@
 //!     .child(dialog_content().max_width(425.0).child(dialog_header().child(dialog_title("Edit profile"))))
 //! ```
 
-use gui::focus::{self, FocusId};
 use gui::prelude::*;
 use gui::{
-    Animation, Bind, Color, Div, Element, FocusHandle, Icon, Length, Model, NamedKey, Positioning, Signal, Text,
-    UseModel, component, deferred, div, icon, on_mounted, on_unmounted, provide, text, use_context, use_model, watch,
+    Animation, Bind, Color, Div, Element, Icon, Length, Model, Positioning, Slot, Text, component, deferred, div, icon,
+    provide, text, use_model,
 };
+use primitives::alert_dialog::AlertDialog;
+use primitives::context::use_root;
+use primitives::dialog::{Dialog, DialogOptions};
+use primitives::drawer::Drawer;
+use primitives::presence::Presence;
+
+pub use primitives::dialog::Veto;
 
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
-/// What [`dialog`] (and every modal on it) is given.
-#[derive(Clone, PartialEq, Default)]
+/// What [`dialog`] (and a sheet) is given.
+#[derive(Clone, PartialEq)]
 pub struct DialogProps {
     open: Bind<bool>,
+    modal: bool,
+    veto: Option<Veto>,
 }
 
-/// What the parts below a [`dialog`] read: whether it is open.
+impl Default for DialogProps {
+    fn default() -> Self {
+        Self {
+            open: Bind::default(),
+            modal: true,
+            veto: None,
+        }
+    }
+}
+
+/// The dialog of a [`dialog`] root.
+pub(crate) type DialogState = Dialog<PartProps<DialogProps>>;
+
+/// The modal a trigger, close, title or description part sits in: the
+/// state of a dialog (or sheet), an alert dialog, or a drawer root.
 #[derive(Clone, Copy)]
-pub(crate) struct DialogContext {
-    open: UseModel<PartProps<DialogProps>, bool>,
-    pub(crate) focus: FocusReturn,
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a Copy handle a part reads in its setup; boxing the drawer's would lose Copy for no gain"
+)]
+pub(crate) enum Modal {
+    Dialog(DialogState),
+    Alert(AlertDialog<PartProps<crate::alert_dialog::AlertDialogProps>>),
+    Drawer(Drawer<PartProps<crate::drawer::DrawerProps>>),
 }
 
-impl DialogContext {
-    /// The nearest dialog's, from a part's setup.
-    pub(crate) fn find() -> Option<Self> {
-        use_context::<Self>()
+impl Modal {
+    /// The nearest modal root's, from a part's setup; outside one it is a
+    /// reported error naming `part`.
+    #[track_caller]
+    pub(crate) fn find(part: &str) -> Option<Self> {
+        use_root::<Self>(part, "dialog")
     }
 
-    /// Whether the dialog shows (tracked).
-    pub(crate) fn is_open(self) -> bool {
-        self.open.get()
+    fn trigger(self, d: Div) -> Div {
+        match self {
+            Self::Dialog(m) => m.trigger(d),
+            Self::Alert(m) => m.trigger(d),
+            Self::Drawer(m) => m.trigger(d),
+        }
     }
 
-    pub(crate) fn set_open(self, open: bool) {
-        self.open.set(open);
+    fn close(self, d: Div) -> Div {
+        match self {
+            Self::Dialog(m) => m.close(d),
+            Self::Alert(m) => m.dialog().close(d),
+            Self::Drawer(m) => m.close(d),
+        }
+    }
+
+    fn title(self, t: Text) -> Text {
+        match self {
+            Self::Dialog(m) => m.title(t),
+            Self::Alert(m) => m.title(t),
+            Self::Drawer(m) => m.title(t),
+        }
+    }
+
+    fn description(self, t: Text) -> Text {
+        match self {
+            Self::Dialog(m) => m.description(t),
+            Self::Alert(m) => m.description(t),
+            Self::Drawer(m) => m.description(t),
+        }
+    }
+
+    /// From a title's or description's setup: the content has one while
+    /// it is mounted (what the primitive's missing-title check reads).
+    fn register(self, names: Names) {
+        match (self, names) {
+            (Self::Dialog(m), Names::Title) => m.register_title(),
+            (Self::Dialog(m), Names::Description) => m.register_description(),
+            (Self::Alert(m), Names::Title) => m.register_title(),
+            (Self::Alert(m), Names::Description) => m.register_description(),
+            (Self::Drawer(m), Names::Title) => m.register_title(),
+            (Self::Drawer(m), Names::Description) => m.register_description(),
+        }
     }
 }
 
@@ -66,15 +136,23 @@ pub fn dialog() -> Part<DialogProps> {
     modal_root(div().named("dialog"))
 }
 
-/// A modal root on `root` (dialog, alert dialog, sheet, drawer).
+/// A dialog root on `root` (dialog, sheet).
 pub(crate) fn modal_root(root: Div) -> Part<DialogProps> {
     Part::new(DialogProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            provide(DialogContext {
-                open: use_model(props, |p| &p.props.open),
-                focus: FocusReturn::new(),
-            });
+            let d = Dialog::new(
+                use_model(props, |p: &PartProps<DialogProps>| &p.props.open),
+                move || {
+                    props.with(|p| DialogOptions {
+                        modal: p.props.modal,
+                        veto: p.props.veto.clone(),
+                        ..DialogOptions::default()
+                    })
+                },
+            );
+            provide(d);
+            provide(Modal::Dialog(d));
             move || props.with(|p| p.slot.0.clone()).into_element()
         })
     })
@@ -95,8 +173,24 @@ impl Part<DialogProps> {
 
     /// Call `f` each time it opens or closes (`@update:open`).
     #[must_use]
-    pub fn on_open_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.open = p.open.clone().on_change(f))
+    }
+
+    /// Modal or not (`:modal`, on by default): not modal, focus is not
+    /// trapped and the page stays live, and focus going outside closes it.
+    #[must_use]
+    pub fn modal(self, modal: bool) -> Self {
+        self.with_props(|p| p.modal = modal)
+    }
+
+    /// Answer each close a user asks for (Escape, a press or focus
+    /// outside): reka's `escapeKeyDown`, `pointerDownOutside`,
+    /// `focusOutside` and `interactOutside` with `preventDefault`.
+    #[must_use]
+    pub fn on_dismiss(self, f: impl Into<gui::Callback<gui::DismissReason, gui::Dismiss>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.veto = Some(f))
     }
 }
 
@@ -108,27 +202,11 @@ pub fn dialog_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let dialog = DialogContext::find();
-            // Reka's `triggerElement`: where focus returns when nothing
-            // else is to have it.
-            let handle = FocusHandle::new();
-            if let Some(d) = dialog {
-                on_mounted(move || d.focus.trigger.set(Some(handle.id())));
-                on_unmounted(move || {
-                    if d.focus.trigger.get_untracked() == Some(handle.id()) {
-                        d.focus.trigger.set(None);
-                    }
-                });
-            }
+            let modal = Modal::find("dialog_trigger");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
-                match dialog {
-                    Some(d) => root.track_focus(handle).aria_expanded(d.is_open()).on_click(move |_| {
-                        if !d.open.get_untracked() {
-                            d.focus.pressed(handle.id());
-                        }
-                        d.set_open(true);
-                    }),
+                match modal {
+                    Some(m) => m.trigger(root),
                     None => root,
                 }
                 .into_element()
@@ -145,11 +223,11 @@ pub fn dialog_close(close: impl Into<Div>) -> Part<()> {
     Part::new((), close.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let dialog = DialogContext::find();
+            let modal = Modal::find("dialog_close");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
-                match dialog {
-                    Some(d) => root.on_click(move |_| d.set_open(false)),
+                match modal {
+                    Some(m) => m.close(root),
                     None => root,
                 }
                 .into_element()
@@ -179,8 +257,6 @@ pub(crate) struct ModalLook {
     pub(crate) centred: bool,
     /// How long the overlay fades.
     pub(crate) overlay_ms: Option<f32>,
-    /// A press on the overlay closes it (an alert dialog's does not).
-    pub(crate) dismiss_outside: bool,
     /// The X in its top-right corner.
     pub(crate) close_button: bool,
 }
@@ -191,24 +267,19 @@ pub struct ModalContentProps {
     pub(crate) look: ModalLook,
 }
 
-/// A modal's content on `root`: nothing while the dialog is closed; open, on
-/// its own window-sized layer over the overlay, where Escape closes it.
-/// While it is mounted it takes focus off the page when the dialog opens and
-/// gives it back when it closes (Reka's `FocusScope`), whoever opened or
-/// closed it.
+/// A dialog's content on `root`: nothing while the dialog is closed; open,
+/// on its own window-sized layer over the overlay (see [`modal_layer`]).
 pub(crate) fn modal_content(root: Div, look: ModalLook) -> Part<ModalContentProps> {
     Part::new(ModalContentProps { look }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let dialog = DialogContext::find();
-            if let Some(d) = dialog {
-                return_focus(move || d.is_open(), true, Some(d.focus));
-            }
+            let dialog = use_root::<DialogState>("dialog_content", "dialog");
             move || {
                 let Some(d) = dialog else {
                     return Element::Empty;
                 };
-                if !d.is_open() {
+                let presence = d.presence();
+                if presence == Presence::Gone {
                     return Element::Empty;
                 }
                 props.with(|p| {
@@ -217,84 +288,31 @@ pub(crate) fn modal_content(root: Div, look: ModalLook) -> Part<ModalContentProp
                         .0
                         .clone()
                         .when(p.props.look.close_button, |c| c.child(corner_close(d)));
-                    modal_layer(d, p.props.look, content)
+                    modal_layer(presence, d.has_overlay(), p.props.look, d.content(content))
                 })
             }
         })
     })
 }
 
-/// Where a layer gives focus back when it closes: its trigger, as it is
-/// mounted and as its press recorded it (Reka's `triggerElement` and
-/// `recordTriggerPress`). Made in the root's setup.
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) struct FocusReturn {
-    /// The mounted trigger's focus.
-    trigger: Signal<Option<FocusId>>,
-    /// The trigger whose press is opening the layer, until it opens.
-    pressed: Signal<Option<FocusId>>,
+/// A modal on its own window-sized layer: the overlay when it has one, then
+/// `content` (already its primitive's part), centred or placed by itself,
+/// as `presence` makes it.
+pub(crate) fn modal_layer(presence: Presence, overlay: bool, look: ModalLook, content: impl IntoElement) -> Element {
+    modal_layer_with(presence, overlay, look, content, |f| f, |o| o)
 }
 
-impl FocusReturn {
-    pub(crate) fn new() -> Self {
-        Self {
-            trigger: Signal::new(None),
-            pressed: Signal::new(None),
-        }
-    }
-
-    /// Trigger `id` was pressed to open the layer: focus returns to it, even
-    /// when the press did not focus it.
-    pub(crate) fn pressed(self, id: FocusId) {
-        self.pressed.set(Some(id));
-    }
-}
-
-/// Called in a part's setup: when `open` turns true, remember where focus is
-/// to return and (when `take` holds) take it off the page, so keys and Tab
-/// go to the opened layer; when it turns false, give it back. Focus returns
-/// as Reka's `getReturnFocusElement` has it: to the trigger whose press
-/// opened the layer, else to what held focus as it opened, else to the
-/// trigger still mounted; with none, nothing keeps focus (the page's body),
-/// so focus is not left on a node the closed layer took away.
-pub(crate) fn return_focus(open: impl Fn() -> bool + 'static, take: bool, trigger: Option<FocusReturn>) {
-    /// Where focus goes back to, as the layer opened.
-    struct Held {
-        to: Option<FocusId>,
-        /// `to` is the pressed trigger: skipped if it has gone since.
-        trigger: bool,
-        by_keyboard: bool,
-    }
-    let mut held: Option<Held> = None;
-    watch(open, move |open, _| {
-        if *open {
-            let pressed = trigger.and_then(|t| {
-                let id = t.pressed.get_untracked();
-                if id.is_some() {
-                    t.pressed.set(None);
-                }
-                id
-            });
-            if take {
-                held = Some(Held {
-                    to: pressed.or_else(focus::focused),
-                    trigger: pressed.is_some(),
-                    by_keyboard: focus::focus_visible(),
-                });
-                focus::set_focus(None, false);
-            }
-        } else if let Some(h) = held.take() {
-            let mounted = trigger.and_then(|t| t.trigger.get_untracked());
-            let to = h.to.filter(|id| !h.trigger || mounted == Some(*id)).or(mounted);
-            focus::set_focus(to, h.by_keyboard && to.is_some());
-        }
-    });
-}
-
-/// A modal on its own window-sized layer: the overlay, then `content`,
-/// centred or placed by itself. Escape closes it; so does a press on the
-/// overlay when the look allows it.
-pub(crate) fn modal_layer(dialog: DialogContext, look: ModalLook, content: Div) -> Element {
+/// [`modal_layer`], its window-sized `frame` and its `overlay` given to the
+/// caller first (a drawer measures the frame and fades the overlay with
+/// its swipe).
+pub(crate) fn modal_layer_with(
+    presence: Presence,
+    overlay: bool,
+    look: ModalLook,
+    content: impl IntoElement,
+    frame_part: impl FnOnce(Div) -> Div,
+    overlay_part: impl FnOnce(Div) -> Div,
+) -> Element {
     let t = theme();
     let frame = if look.centred {
         div()
@@ -304,45 +322,39 @@ pub(crate) fn modal_layer(dialog: DialogContext, look: ModalLook, content: Div) 
     } else {
         div()
     };
-    let overlay = dialog_overlay().when_some(look.overlay_ms, Div::duration_ms);
-    let root = frame
-        .named("dialog-portal")
+    let root = frame_part(frame.named("dialog-portal"))
         .size(pct(100.0))
         .text_color(t.foreground)
-        .on_key_down(move |e| {
-            let escape = e.is(NamedKey::Escape);
-            if escape {
-                dialog.set_open(false);
-            }
-            escape
+        .when(overlay, |f| {
+            f.child(overlay_part(
+                dialog_overlay().when_some(look.overlay_ms, Div::duration_ms),
+            ))
         })
-        .child(overlay.when(look.dismiss_outside, |o| {
-            o.on_mouse_down(move |_| dialog.set_open(false))
-        }))
         .child(content);
-    deferred(Positioning::Fill, root).into_element()
+    deferred(Positioning::Fill, presence.render(root)).into_element()
 }
 
 /// The close button in a modal's top-right corner: an X at 70% opacity.
-fn corner_close(dialog: DialogContext) -> Div {
+fn corner_close(dialog: DialogState) -> Div {
     let t = theme();
     let i = Interaction::new();
     let ring = Ring::new(2.0, t.ring);
-    div()
-        .named("dialog-close")
-        .interaction(i)
-        .position(Position::Absolute)
-        .top(16.0)
-        .right(16.0)
-        .radius(2.0)
-        .opacity(move || if i.hovered() || i.focused() { 1.0 } else { 0.7 })
-        .transition(Properties::OPACITY)
-        .cursor(Cursor::Pointer)
-        .focusable()
-        .ring(move || i.focused().then_some(ring))
-        .aria_label("Close")
-        .on_click(move |_| dialog.set_open(false))
-        .child(icon(Icon::X))
+    dialog.close(
+        div()
+            .named("dialog-close")
+            .interaction(i)
+            .position(Position::Absolute)
+            .top(16.0)
+            .right(16.0)
+            .radius(2.0)
+            .opacity(move || if i.hovered() || i.focused() { 1.0 } else { 0.7 })
+            .transition(Properties::OPACITY)
+            .cursor(Cursor::Pointer)
+            .focusable()
+            .ring(move || i.focused().then_some(ring))
+            .aria_label("Close")
+            .child(icon(Icon::X)),
+    )
 }
 
 /// The dialog itself, centred on a dimmed page with a close button in its
@@ -350,11 +362,10 @@ fn corner_close(dialog: DialogContext) -> Div {
 #[must_use]
 pub fn dialog_content() -> Part<ModalContentProps> {
     modal_content(
-        centred_surface().named("dialog-content").role(gui::Role::Dialog),
+        centred_surface().named("dialog-content"),
         ModalLook {
             centred: true,
             overlay_ms: None,
-            dismiss_outside: true,
             close_button: true,
         },
     )
@@ -414,29 +425,118 @@ pub fn dialog_footer() -> Div {
         .justify_content(Justify::End)
 }
 
-#[must_use]
-pub fn dialog_title(title: impl Into<String>) -> Text {
-    text(title)
-        .named("dialog-title")
-        .text_size(18.0)
-        .line_height(LineHeight::Relative(1.0))
-        .font_weight(600)
+/// Which of a modal's texts a [`ModalText`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Names {
+    Title,
+    Description,
 }
 
+/// A modal's title or description being built: a [`Text`] its caller
+/// styles, which becomes its part as it goes into a tree, naming or
+/// describing the modal it sits in (`DialogTitle`, `DialogDescription`).
 #[must_use]
-pub fn dialog_description(description: impl Into<String>) -> Text {
+pub struct ModalText {
+    text: Text,
+    names: Names,
+}
+
+impl ModalText {
+    fn new(text: Text, names: Names) -> Self {
+        Self { text, names }
+    }
+
+    /// The name the text shows in the debug tools and the verdict.
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.text = self.text.named(name);
+        self
+    }
+}
+
+impl Fluent for ModalText {}
+
+impl Styled for ModalText {
+    fn style_and_bindings(&mut self) -> (&mut gui::Style, Option<&mut gui::value::Bindings>) {
+        self.text.style_and_bindings()
+    }
+
+    fn node_interaction(&self) -> Option<gui::Interaction> {
+        self.text.node_interaction()
+    }
+}
+
+/// What a [`ModalText`]'s instance is given.
+#[derive(Clone, PartialEq)]
+struct ModalTextProps {
+    names: Names,
+    text: Slot<Text>,
+}
+
+impl IntoElement for ModalText {
+    fn into_element(self) -> Element {
+        let props = ModalTextProps {
+            names: self.names,
+            text: Slot(self.text),
+        };
+        component(props, |cx| {
+            let props = cx.props();
+            let part = match props.with_untracked(|p| p.names) {
+                Names::Title => "dialog_title",
+                Names::Description => "dialog_description",
+            };
+            let modal = Modal::find(part);
+            if let Some(m) = modal {
+                m.register(props.with_untracked(|p| p.names));
+            }
+            move || {
+                let (names, t) = props.with(|p| (p.names, p.text.0.clone()));
+                match (modal, names) {
+                    (Some(m), Names::Title) => m.title(t),
+                    (Some(m), Names::Description) => m.description(t),
+                    (None, _) => t,
+                }
+                .into_element()
+            }
+        })
+        .into_element()
+    }
+}
+
+/// The modal's title, which names it to a screen reader (`DialogTitle`).
+pub fn dialog_title(title: impl Into<String>) -> ModalText {
+    ModalText::new(
+        text(title)
+            .named("dialog-title")
+            .text_size(18.0)
+            .line_height(LineHeight::Relative(1.0))
+            .font_weight(600),
+        Names::Title,
+    )
+}
+
+/// The modal's description, which describes it to a screen reader
+/// (`DialogDescription`).
+pub fn dialog_description(description: impl Into<String>) -> ModalText {
     let t = theme();
-    text(description)
-        .named("dialog-description")
-        .text_color(t.muted_foreground)
-        .text_size(14.0)
-        .line_height(20.0)
+    ModalText::new(
+        text(description)
+            .named("dialog-description")
+            .text_color(t.muted_foreground)
+            .text_size(14.0)
+            .line_height(20.0),
+        Names::Description,
+    )
+}
+
+/// A title for a modal of another kind, from its `text`.
+pub(crate) fn modal_title(text: Text) -> ModalText {
+    ModalText::new(text, Names::Title)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gui::{Modifiers, Scenario};
+    use gui::{FocusHandle, Modifiers, NamedKey, Scenario, Signal, focus};
 
     /// A page with a focusable box, `before`, and a dialog opened by `open`,
     /// with a trigger when `trigger` holds; its content focuses `inner`.

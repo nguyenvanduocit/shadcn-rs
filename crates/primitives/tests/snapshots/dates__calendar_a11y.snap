@@ -1,0 +1,121 @@
+---
+source: crates/primitives/tests/dates.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer
+    Group "Event Date, February 2024"
+      Application
+        Row
+          GridCell
+            Button "Sunday, January 28, 2024"
+              Label "28"
+          GridCell
+            Button "Monday, January 29, 2024"
+              Label "29"
+          GridCell
+            Button "Tuesday, January 30, 2024"
+              Label "30"
+          GridCell
+            Button "Wednesday, January 31, 2024"
+              Label "31"
+          GridCell
+            Button "Thursday, February 1, 2024"
+              Label "1"
+          GridCell
+            Button "Friday, February 2, 2024"
+              Label "2"
+          GridCell
+            Button "Saturday, February 3, 2024"
+              Label "3"
+        Row
+          GridCell
+            Button "Sunday, February 4, 2024"
+              Label "4"
+          GridCell
+            Button "Monday, February 5, 2024"
+              Label "5"
+          GridCell
+            Button "Tuesday, February 6, 2024"
+              Label "6"
+          GridCell
+            Button "Wednesday, February 7, 2024"
+              Label "7"
+          GridCell
+            Button "Thursday, February 8, 2024"
+              Label "8"
+          GridCell selected
+            Button "Friday, February 9, 2024"
+              Label "9"
+          GridCell
+            Button "Saturday, February 10, 2024"
+              Label "10"
+        Row
+          GridCell
+            Button "Sunday, February 11, 2024"
+              Label "11"
+          GridCell
+            Button "Monday, February 12, 2024"
+              Label "12"
+          GridCell
+            Button "Tuesday, February 13, 2024"
+              Label "13"
+          GridCell disabled
+            Button "Wednesday, February 14, 2024" disabled
+              Label "14" disabled
+          GridCell disabled
+            Button "Thursday, February 15, 2024" disabled
+              Label "15" disabled
+          GridCell
+            Button "Friday, February 16, 2024"
+              Label "16"
+          GridCell
+            Button "Saturday, February 17, 2024"
+              Label "17"
+        Row
+          GridCell
+            Button "Sunday, February 18, 2024"
+              Label "18"
+          GridCell
+            Button "Monday, February 19, 2024"
+              Label "19"
+          GridCell
+            Button "Tuesday, February 20, 2024"
+              Label "20"
+          GridCell
+            Button "Wednesday, February 21, 2024"
+              Label "21"
+          GridCell
+            Button "Thursday, February 22, 2024"
+              Label "22"
+          GridCell
+            Button "Friday, February 23, 2024"
+              Label "23"
+          GridCell
+            Button "Saturday, February 24, 2024"
+              Label "24"
+        Row
+          GridCell
+            Button "Sunday, February 25, 2024"
+              Label "25"
+          GridCell
+            Button "Monday, February 26, 2024"
+              Label "26"
+          GridCell
+            Button "Tuesday, February 27, 2024"
+              Label "27"
+          GridCell
+            Button "Wednesday, February 28, 2024"
+              Label "28"
+          GridCell
+            Button "Thursday, February 29, 2024"
+              Label "29"
+          GridCell
+            Button "Friday, March 1, 2024"
+              Label "1"
+          GridCell
+            Button "Saturday, March 2, 2024"
+              Label "2"
+      Heading level=2
+        Label "Event Date, February 2024"
+    GenericContainer "after"

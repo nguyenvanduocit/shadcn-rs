@@ -1,0 +1,13 @@
+---
+source: crates/primitives/tests/form_controls.rs
+expression: tree
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      TextInput "pin input 1 of 2" value="1"
+      TextInput "pin input 2 of 2" value=""
+    TextInput "One-time code" value="42"
+    Label
+      Label "Code sent"
+    TextInput "" labelled_by=["Code sent"]

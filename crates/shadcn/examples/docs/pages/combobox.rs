@@ -1,4 +1,5 @@
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gui::prelude::*;
 use gui::{Icon, ImageSource, Modifiers, NamedKey, ScenarioError, SideAlign, Signal, div, icon, text};
@@ -70,26 +71,26 @@ pub fn render() -> Render {
     let listbox = Signal::labeled("listbox open", false);
     let listbox_value = Signal::labeled("listbox framework", None::<String>);
     // The lists' data, once: the items are their values.
-    let frameworks_list = Rc::new(vec![
+    let frameworks_list = Arc::new(vec![
         CommandSection::empty("No framework found."),
         CommandSection::group(None, FRAMEWORKS.map(CommandItem::new)),
     ]);
-    let timezones_list: Rc<Vec<CommandSection>> = Rc::new(
+    let timezones_list: Arc<Vec<CommandSection>> = Arc::new(
         std::iter::once(CommandSection::empty("No timezone found."))
             .chain(TIMEZONES.map(|(region, zones)| CommandSection::group(Some(region), zones.map(CommandItem::new))))
             .collect(),
     );
-    let create_timezone = Rc::new(vec![
+    let create_timezone = Arc::new(vec![
         CommandSection::Separator,
         CommandSection::group(None, [CommandItem::null("Create timezone")]),
     ]);
-    let users_list = Rc::new(vec![
+    let users_list = Arc::new(vec![
         CommandSection::empty("No user found."),
         CommandSection::group(None, USERS.map(CommandItem::new)),
         CommandSection::Separator,
         CommandSection::group(None, [CommandItem::null("Create user")]),
     ]);
-    let listbox_list = Rc::new(vec![
+    let listbox_list = Arc::new(vec![
         CommandSection::empty("No framework found."),
         CommandSection::group(None, FRAMEWORK_VALUES.map(|(value, _)| CommandItem::new(value))),
     ]);
@@ -103,7 +104,7 @@ pub fn render() -> Render {
                 avatar()
                     .size(20.0)
                     .child(avatar_image(source))
-                    .child(avatar_fallback(source, login.chars().take(1).collect::<String>()))
+                    .child(avatar_fallback(login.chars().take(1).collect::<String>()))
             }
         };
         let outline = || button(ButtonVariant::Outline, ButtonSize::Default);
@@ -121,7 +122,7 @@ pub fn render() -> Render {
             .child(
                 combobox_list()
                     .child(combobox_input("Search framework..."))
-                    .child(combobox_items(Rc::clone(&frameworks_list), |item, row| {
+                    .child(combobox_items(Arc::clone(&frameworks_list), |item, row| {
                         row.child(item.value.clone())
                             .child(combobox_item_indicator(&item.value))
                     })),
@@ -166,7 +167,7 @@ pub fn render() -> Render {
                     .align(SideAlign::Start)
                     .width(280.0)
                     .child(combobox_input("Search framework..."))
-                    .child(combobox_items(Rc::clone(&frameworks_list), move |item, row| {
+                    .child(combobox_items(Arc::clone(&frameworks_list), move |item, row| {
                         row.child(tick(frameworks.with(|p| p.contains(&item.value))))
                             .child(item.value.clone())
                     })),
@@ -207,7 +208,7 @@ pub fn render() -> Render {
                 .width(288.0)
                 .child(combobox_input("Search timezone..."))
                 .child(
-                    combobox_items(Rc::clone(&timezones_list), move |item, row| {
+                    combobox_items(Arc::clone(&timezones_list), move |item, row| {
                         if item.null {
                             return row
                                 .child(icon(Icon::PlusCircle).text_color(t.muted_foreground))
@@ -217,7 +218,7 @@ pub fn render() -> Render {
                             .child(combobox_item_indicator(&item.value))
                     })
                     .max_h_px(260.0)
-                    .footer(Rc::clone(&create_timezone)),
+                    .footer(Arc::clone(&create_timezone)),
                 ),
         );
 
@@ -240,7 +241,7 @@ pub fn render() -> Render {
         let user_combobox = combobox().model(user).child(combobox_trigger(user_trigger)).child(
             combobox_list()
                 .child(combobox_input("Search user..."))
-                .child(combobox_items(Rc::clone(&users_list), move |item, row| {
+                .child(combobox_items(Arc::clone(&users_list), move |item, row| {
                     if item.null {
                         return row
                             .child(icon(Icon::PlusCircle).text_color(t.muted_foreground))
@@ -257,7 +258,7 @@ pub fn render() -> Render {
             .iter()
             .find(|(v, _)| current.as_deref() == Some(*v))
             .map_or("Select framework...", |(_, l)| *l);
-        let listbox_items = command_list(Rc::clone(&listbox_list), move |item, row| {
+        let listbox_items = command_list(Arc::clone(&listbox_list), move |item, row| {
             let label = FRAMEWORK_VALUES
                 .iter()
                 .find(|(v, _)| *v == item.value)
@@ -269,8 +270,8 @@ pub fn render() -> Render {
                     .opacity(if on { 1.0 } else { 0.0 }),
             )
         })
-        .on_select(move |item| {
-            let value = item.value.clone();
+        .on_select(move |item: CommandItem| {
+            let value = item.value;
             listbox_value.update(|v| *v = (v.as_deref() != Some(value.as_str())).then(|| value.clone()));
             listbox.set(false);
         });

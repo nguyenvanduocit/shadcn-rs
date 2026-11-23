@@ -1,0 +1,10 @@
+---
+source: crates/primitives/tests/form_controls.rs
+expression: tree
+---
+Window "w"
+  Group
+    Button False
+      Label "a"
+    Button True
+      Label "b"

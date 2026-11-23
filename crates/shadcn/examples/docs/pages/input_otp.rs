@@ -1,7 +1,7 @@
 use gui::prelude::*;
 use gui::{Modifiers, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, FieldOrientation, InputOtpPattern, button, field, field_description, field_error,
+    ButtonSize, ButtonVariant, FieldOrientation, OtpPattern, button, field, field_description, field_error,
     field_group, field_label, input_otp, input_otp_group, input_otp_separator, input_otp_slot,
 };
 
@@ -62,7 +62,7 @@ pub fn render() -> Render {
                 ))
                 .child(demo(
                     "InputOTPPatternDemo.vue",
-                    input_otp().pattern(InputOtpPattern::DigitsAndChars).child(slots(0..6)),
+                    input_otp().pattern(OtpPattern::DigitsAndChars).child(slots(0..6)),
                 ))
                 .child(demo(
                     "InputOTPFormDemo.vue",

@@ -39,8 +39,8 @@ static HEAP: gui::heap::Counting = gui::heap::COUNTING;
 #[global_allocator]
 static HEAP: dhat::Alloc = dhat::Alloc;
 
-/// A scene's render function; it holds the scene's state.
-pub type Render = Box<dyn FnMut() -> Element>;
+/// A scene's render function: its state is in the signals it made.
+pub type Render = Box<dyn Fn() -> Element>;
 
 /// What `--run` judges by.
 struct Options {

@@ -2,14 +2,15 @@
 //!
 //! [`radio_group`] keeps the checked value: its own, from `default_value`,
 //! or the caller's through `.model(…)` (reka's `v-model`); `on_change`
-//! hears each check. Its items read it. Arrow keys move to the next or
-//! previous item and check it, wrapping, as WAI-ARIA radio groups do.
+//! hears each check. Its items read it. The group is one Tab stop, and the
+//! arrow keys move to the next or previous item and check it, wrapping;
+//! Home and End only move focus, as reka's (`primitives::radio_group`).
 
 use gui::Properties;
 use gui::prelude::*;
-use gui::{
-    Bind, Color, FocusHandle, Key, Members, Model, NamedKey, UseModel, component, div, provide, use_context, use_model,
-};
+use gui::{Bind, Color, FocusHandle, Model, component, div, provide, use_model};
+use primitives::radio_group::RadioGroup;
+use primitives::{Availability, use_direction};
 
 use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
@@ -20,39 +21,19 @@ use crate::theme::theme;
 pub struct RadioGroupProps {
     value: Bind<Option<String>>,
     disabled: bool,
+    required: bool,
 }
 
 /// What the items below a [`radio_group`] read.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct RadioGroupContext {
-    value: UseModel<PartProps<RadioGroupProps>, Option<String>>,
+    group: RadioGroup<PartProps<RadioGroupProps>, String>,
     props: gui::Signal<PartProps<RadioGroupProps>>,
-    /// The items in tree order, as last laid out, each with its focus.
-    items: Members<(String, FocusHandle)>,
 }
 
 impl RadioGroupContext {
     fn disabled(&self) -> bool {
         self.props.with(|p| p.props.disabled)
-    }
-
-    /// Focus and check the item `by` places from the focused one, wrapping.
-    fn step(&self, by: isize) -> bool {
-        let target = self.items.with(|items| {
-            let len = items.len();
-            let at = items.iter().position(|(_, f)| f.is_focused())?;
-            let next = isize::try_from(at)
-                .ok()
-                .and_then(|a| a.checked_add(by))
-                .and_then(|n| n.checked_rem_euclid(isize::try_from(len).ok()?))
-                .and_then(|n| usize::try_from(n).ok())?;
-            items.get(next).cloned()
-        });
-        target.is_some_and(|(v, f)| {
-            gui::focus::set_focus(Some(f.id()), true);
-            self.value.set(Some(v));
-            true
-        })
     }
 }
 
@@ -66,23 +47,14 @@ pub fn radio_group() -> Part<RadioGroupProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let ctx = RadioGroupContext {
-                    value: use_model(props, |p| &p.props.value),
-                    props,
-                    items: Members::new(),
-                };
-                provide(ctx.clone());
+                let group = RadioGroup::new(
+                    use_model(props, |p: &PartProps<RadioGroupProps>| &p.props.value),
+                    use_direction(None),
+                );
+                provide(RadioGroupContext { group, props });
                 move || {
-                    let keys = ctx.clone();
-                    props
-                        .with(|p| p.slot.0.clone())
-                        .role(gui::Role::RadioGroup)
-                        .on_key_down(move |ev| match &ev.key {
-                            Key::Named(NamedKey::ArrowDown | NamedKey::ArrowRight) => keys.step(1),
-                            Key::Named(NamedKey::ArrowUp | NamedKey::ArrowLeft) => keys.step(-1),
-                            _ => false,
-                        })
-                        .into_element()
+                    let (slot, required) = props.with(|p| (p.slot.0.clone(), p.props.required));
+                    group.root(slot, None, required).into_element()
                 }
             })
         },
@@ -105,7 +77,7 @@ impl Part<RadioGroupProps> {
 
     /// Call `f` with the value each check makes (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(Option<String>) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<Option<String>>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 
@@ -113,6 +85,13 @@ impl Part<RadioGroupProps> {
     #[must_use]
     pub fn disabled(self, disabled: bool) -> Self {
         self.with_props(|p| p.disabled = disabled)
+    }
+
+    /// A form needs one checked (`required`): told to assistive
+    /// technology; the check itself is the form field's rule.
+    #[must_use]
+    pub fn required(self, required: bool) -> Self {
+        self.with_props(|p| p.required = required)
     }
 }
 
@@ -130,7 +109,6 @@ pub fn radio_group_item(value: impl Into<String>) -> Part<RadioGroupItemProps> {
     let root = div()
         .named("radio-group-item")
         .interaction(i)
-        .role(gui::Role::RadioButton)
         .transition(Properties::COLOR | Properties::SHADOW)
         .position(Position::Relative)
         .display(Display::Flex)
@@ -157,27 +135,22 @@ pub fn radio_group_item(value: impl Into<String>) -> Part<RadioGroupItemProps> {
         })
         .focus_ring_on(i, &t)
         .dim_disabled(i, 0.5)
-        .cursor_disabled(i)
-        // WAI-ARIA: Enter does not check a radio, only Space does.
-        .on_key_down(|ev| ev.is(NamedKey::Enter));
+        .cursor_disabled(i);
     Part::new(RadioGroupItemProps { value: value.into() }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let group = use_context::<RadioGroupContext>();
+            let group = primitives::context::use_root::<RadioGroupContext>("radio_group_item", "radio_group");
             let focus = FocusHandle::new();
             move || {
                 let (value, root) = props.with(|p| (p.props.value.clone(), p.slot.0.clone()));
-                let Some(g) = group.clone() else {
+                let Some(g) = group else {
                     return root.into_element();
                 };
                 let t = theme();
-                let checked = g.value.with(|v| v.as_deref() == Some(value.as_str()));
-                let pick = g.value;
-                root.aria_checked(checked)
-                    .track_focus(focus)
-                    .member(&g.items, (value.clone(), focus))
-                    .disabled(g.disabled())
-                    .on_click(move |_| pick.set(Some(value.clone())))
+                let checked = g.group.checked(&value);
+                let availability = Availability::from_disabled(g.disabled());
+                g.group
+                    .item(root, value, focus, availability)
                     .when(checked, |d| {
                         // lucide's circle (r=10 in 24) filled and stroked at `size-2`: a 22/3px disc.
                         d.child(

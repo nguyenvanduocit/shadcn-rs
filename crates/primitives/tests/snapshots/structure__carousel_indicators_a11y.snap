@@ -1,0 +1,26 @@
+---
+source: crates/primitives/tests/structure.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Region described="carousel"
+        GenericContainer live=Polite
+          GenericContainer
+            TabPanel labelled-by=Slide 4
+              Button
+                Label "Open 4"
+        Button "Previous slide" controls=GenericContainer
+          Label "Prev"
+        Button "Next slide" disabled controls=GenericContainer
+          Label "Next" disabled
+        TabList "Choose slide to display"
+          Tab "Slide 1" unselected
+            Label "Dot 1"
+          Tab "Slide 2" unselected
+            Label "Dot 2"
+          Tab "Slide 3" unselected
+            Label "Dot 3"
+          Tab "Slide 4" selected controls=TabPanel
+            Label "Dot 4"

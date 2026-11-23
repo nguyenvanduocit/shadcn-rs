@@ -1,0 +1,40 @@
+[package]
+name = "primitives"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Behaviour without look: the state, keyboard tables, parts and context of reka-ui's primitives, on gui's engine"
+
+[lints]
+workspace = true
+
+[dependencies]
+gui = { path = "../gui" }
+# A filter matches as reka's `useFilter` does with `Intl.Collator(…, { usage: 'search', sensitivity: 'base' })`:
+# by the collation of a locale, case and accents aside; NFC on both sides (ADR-0025).
+icu_collator = "2"
+icu_normalizer = "2"
+icu_locale_core = "2"
+# A number field formats and parses by the locale's CLDR data, as reka's `@internationalized/number` does by
+# `Intl`: separators, digits, grouping and signs (`icu_decimal`), percent, currency and unit patterns
+# (`icu_experimental`'s `dimension`), plural forms of a unit's name (`icu_plurals`).
+icu_decimal = "2.3"
+icu_experimental = "0.6"
+icu_plurals = "2.3"
+fixed_decimal = { version = "0.7", features = ["ryu"] }
+icu_provider = "2"
+writeable = "0.6"
+# Today is the day it is in a time zone (the system's, or an IANA one), as reka's `today(getLocalTimeZone())`.
+jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
+# A pasted code is spread over a pin input's slots by grapheme, not by UTF-16 unit as reka's (research §10).
+unicode-segmentation = "1"
+# A tags input's delimiter may be a pattern, as reka's `delimiter` may be a `RegExp`.
+regex = "1"
+
+[dev-dependencies]
+# The tree a screen reader is given, to snapshot (ADR-0021).
+accesskit = "0.25"
+insta = "1"

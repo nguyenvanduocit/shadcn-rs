@@ -13,10 +13,16 @@
 // slot, which names a transform (the offset its space is moved by: a
 // scroll, a moving translation), a clip and an effect (the opacity folded
 // into it) in the property tables, so a scroll or a fade writes one table
-// entry and no record. The vertex shader moves the quad by its offset,
-// clamps it to its clip's rectangle, and drops the clip when the quad lies
-// wholly inside the clip's inner rectangle; only a quad across a clip's
-// edge or corner tests it per fragment.
+// entry and no record. A clip's entry is its own rounded rectangle in its
+// own space, the map from the canvas into it, and the next clip of its
+// effective chain (`gpu::clips`): the shaders walk the chain to its end,
+// so moving an outer clip writes its entry alone, and one chain crosses
+// scales and turns. A pass's target maps to the canvas by `to_canvas`.
+// The vertex shader moves the quad by its offset, clamps it to the
+// rectangles of the chain's clips that lie in its target's space moved,
+// and drops the clip when the quad lies wholly inside each one's inner
+// rectangle; only a quad across a clip's edge or corner tests the chain
+// per fragment, each clip's coverage multiplied.
 //
 // Positions are physical pixels. Colours in are straight alpha; colours
 // out are premultiplied, blended `One, OneMinusSrcAlpha` in the target's
@@ -36,6 +42,9 @@ struct Globals {
     // Where each property table starts in `props` (vec4s): state slots,
     // transforms, clips, effects.
     bases: vec4<u32>,
+    // The map from the target's space to the canvas's: (a, b, c, d), (e, f).
+    to_canvas: vec4<f32>,
+    to_canvas_t: vec2<f32>,
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -44,8 +53,8 @@ struct Globals {
 // One word per instance: where its record starts.
 @group(0) @binding(2) var<storage, read> index: array<u32>;
 // The property tables: a slot is (transform, clip, effect) ids; a
-// transform its offset; a clip its rectangle, radii and corners' curve (three
-// vec4s); an effect its alpha.
+// transform its offset; a clip its entry (`PCLIP` vec4s, `common.wgsl`);
+// an effect its alpha.
 @group(0) @binding(3) var<storage, read> props: array<vec4<f32>>;
 // Atlas pages (ADR-0016): coverage (glyphs, icons), and colour or subpixel.
 @group(0) @binding(4) var mono_atlas: texture_2d_array<f32>;
@@ -145,20 +154,38 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
     quad = vec4<f32>(quad.xy + offset, quad.zw);
     var clip = 0u;
     if (slot.y != 0u) {
-        let rect = props[globals.bases.z + slot.y * 3u];
-        let radii = props[globals.bases.z + slot.y * 3u + 1u];
-        // Wholly inside the clip's inner rectangle (its corners and half a
-        // pixel of its edges left out): the clip changes nothing.
-        let r = max(max(radii.x, radii.y), max(radii.z, radii.w)) + 0.5;
-        let inner_lo = rect.xy + r;
-        let inner_hi = rect.xy + rect.zw - r;
-        let inside = all(quad.xy >= inner_lo) && all(quad.xy + quad.zw <= inner_hi);
+        var lo = quad.xy;
+        var hi = quad.xy + quad.zw;
+        var inside = true;
+        let tl = mat2x2<f32>(globals.to_canvas.xy, globals.to_canvas.zw);
+        let tt = globals.to_canvas_t;
+        let a = tl * lo + tt;
+        let b = tl * vec2<f32>(hi.x, lo.y) + tt;
+        let c = tl * vec2<f32>(lo.x, hi.y) + tt;
+        let d = tl * hi + tt;
+        var id = slot.y;
+        let n = (globals.bases.w - globals.bases.z) / PCLIP;
+        for (var k = 0u; k < n && id != 0u; k = k + 1u) {
+            let at = globals.bases.z + id * PCLIP;
+            let rect = props[at];
+            let m = props[at + 2u];
+            let t = props[at + 3u];
+            inside = inside && entry_holds(rect, props[at + 1u], m, t, a, b, c, d);
+            // Nothing outside it is drawn: neither is it shaded. From the
+            // target into the clip's space: its map after the target's.
+            let el = mat2x2<f32>(m.xy, m.zw);
+            let lin = el * tl;
+            let off = el * tt + t.xy;
+            if (lin[0].y == 0.0 && lin[1].x == 0.0 && lin[0].x > 0.0 && lin[1].y > 0.0) {
+                let scale = vec2<f32>(lin[0].x, lin[1].y);
+                lo = max(lo, floor((rect.xy - off) / scale));
+                hi = min(hi, ceil((rect.xy + rect.zw - off) / scale));
+            }
+            id = bitcast<u32>(props[at + 4u].x);
+        }
         if (!inside) {
             clip = slot.y;
         }
-        // Nothing outside the clip is drawn: neither is it shaded.
-        let lo = max(quad.xy, floor(rect.xy));
-        let hi = min(quad.xy + quad.zw, ceil(rect.xy + rect.zw));
         quad = vec4<f32>(lo, max(hi - lo, vec2<f32>(0.0)));
     }
     if (alpha <= 0.0) {
@@ -178,14 +205,19 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 
 // ---- clips ----
 
+// The coverage of clip `clip` and the rest of its chain, multiplied, at
+// point `p` of the target.
 fn clip_cov(clip: u32, p: vec2<f32>) -> f32 {
-    if (clip == 0u) {
-        return 1.0;
+    var cov = 1.0;
+    var id = clip;
+    let q = mat2x2<f32>(globals.to_canvas.xy, globals.to_canvas.zw) * p + globals.to_canvas_t;
+    let n = (globals.bases.w - globals.bases.z) / PCLIP;
+    for (var k = 0u; k < n && id != 0u; k = k + 1u) {
+        let at = globals.bases.z + id * PCLIP;
+        cov = cov * clip_entry_cov(props[at], props[at + 1u], props[at + 2u], props[at + 3u], q);
+        id = bitcast<u32>(props[at + 4u].x);
     }
-    let rect = props[globals.bases.z + clip * 3u];
-    let radii = props[globals.bases.z + clip * 3u + 1u];
-    let curve = props[globals.bases.z + clip * 3u + 2u].x;
-    return shape_cov(p, rect, radii, curve);
+    return cov;
 }
 
 // ---- shadows: Raph Levien's blurred rounded rectangle, as GPUI draws them ----

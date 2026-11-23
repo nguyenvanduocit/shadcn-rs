@@ -2,13 +2,16 @@
 //!
 //! As reka's `SwitchRoot` it keeps its own value (`default_checked`), is
 //! bound to the caller's (`model`, `v-model`), or shows one the caller keeps
-//! (`checked`, `:model-value`); `on_change` hears each flip.
+//! (`checked`, `:model-value`); `on_change` hears each flip. Its behaviour
+//! (role, Space and Enter flip it) is `primitives::switch`'s; this module
+//! draws it.
 
 use std::rc::Rc;
 
 use gui::prelude::*;
 use gui::style::Calc;
 use gui::{Bind, Color, Div, Element, Model, Slot, component, div, use_model};
+use primitives::{Availability, switch as part};
 
 use crate::checkbox::Class;
 use crate::focus::StateLook;
@@ -21,6 +24,7 @@ pub fn switch() -> Switch {
     Switch {
         checked: Bind::default(),
         disabled: false,
+        required: false,
         class: None,
     }
 }
@@ -30,6 +34,7 @@ pub fn switch() -> Switch {
 pub struct Switch {
     checked: Bind<bool>,
     disabled: bool,
+    required: bool,
     class: Option<Class>,
 }
 
@@ -58,7 +63,7 @@ impl Switch {
 
     /// Call `f` with the value each flip turns it to (`@update:model-value`).
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_change(mut self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.checked = self.checked.on_change(f);
         self
     }
@@ -66,6 +71,14 @@ impl Switch {
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// A form needs it on (`required`): told to assistive technology; the
+    /// check itself is the form field's rule (`primitives::switch::required`).
+    #[must_use]
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
         self
     }
 
@@ -77,7 +90,13 @@ impl Switch {
     }
 
     fn render(&self, on: bool, set: impl Fn(bool) + 'static) -> Element {
-        let d = look(on).disabled(self.disabled).on_click(move |_| set(!on));
+        let d = part::root(
+            look(on),
+            on,
+            Availability::from_disabled(self.disabled),
+            self.required,
+            set,
+        );
         match &self.class {
             Some(f) => f(d),
             None => d,
@@ -123,8 +142,6 @@ fn look(on: bool) -> Div {
     div()
         .named("switch")
         .interaction(i)
-        .role(gui::Role::Switch)
-        .aria_checked(on)
         .display(Display::Flex)
         .inline(true)
         .height(18.4)
@@ -143,14 +160,12 @@ fn look(on: bool) -> Div {
         })
         .background(track)
         .transition(Properties::ALL)
-        .focusable()
         .focus_ring_on(i, &t)
         .dim_disabled(i, 0.5)
         .cursor_disabled(i)
         .child(
-            div()
+            part::thumb(div())
                 .named("switch-thumb")
-                .pass_through()
                 .display(Display::Block)
                 .size(16.0)
                 .radius(9999.0)

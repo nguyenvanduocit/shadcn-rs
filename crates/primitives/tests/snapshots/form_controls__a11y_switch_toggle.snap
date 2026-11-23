@@ -1,0 +1,10 @@
+---
+source: crates/primitives/tests/form_controls.rs
+assertion_line: 1485
+expression: tree
+---
+Window "w"
+  GenericContainer
+    Switch "Wi-Fi" required True
+    Button "Bold" True disabled
+    Button "Italic" False

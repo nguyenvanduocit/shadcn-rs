@@ -16,6 +16,7 @@ use gui::Pixels;
 use gui::layout::Frame;
 use gui::text::{logical, physical, physical_pos};
 use shadcn::CalendarDate;
+use shadcn::theme::ThemeSpec;
 
 use crate::{Page, Shot};
 
@@ -220,16 +221,79 @@ impl Verdict {
     }
 }
 
-/// `verdict/better.tsv`: demo file → why our port is better than shadcn-vue's.
-pub fn better_list() -> Vec<(String, String)> {
+/// What a verdict judges in: the style, the theme's choices and the scheme
+/// (the docs' `--style`, `--theme` and `--dark`; `run.sh` hands the browser
+/// the same).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Choices {
+    pub style: &'static str,
+    pub spec: ThemeSpec,
+    pub dark: bool,
+}
+
+impl Choices {
+    /// The value of a scope key of `better.tsv`: `style`, `scheme`, or a [`ThemeSpec`] key.
+    fn get(&self, key: &str) -> Option<&'static str> {
+        match key {
+            "style" => Some(self.style),
+            "scheme" => Some(if self.dark { "dark" } else { "light" }),
+            _ => self.spec.get(key),
+        }
+    }
+
+    /// Whether `scope` (`key=value,…`, or `*`) holds for these choices; an unknown key is an error.
+    pub fn within(&self, scope: &str) -> Result<bool, String> {
+        let mut holds = true;
+        for pair in scope.split(',').map(str::trim).filter(|p| !p.is_empty() && *p != "*") {
+            let (key, value) = pair
+                .split_once('=')
+                .ok_or_else(|| format!("scope {pair:?} is not key=value"))?;
+            let have = self.get(key.trim()).ok_or_else(|| {
+                format!(
+                    "scope key {key:?} is none of style, scheme, {}",
+                    ThemeSpec::KEYS.join(", ")
+                )
+            })?;
+            holds &= have == value.trim();
+        }
+        Ok(holds)
+    }
+}
+
+impl fmt::Display for Choices {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scheme = if self.dark { "dark" } else { "light" };
+        write!(f, "style {} scheme {scheme} theme {}", self.style, self.spec)
+    }
+}
+
+/// `verdict/better.tsv`'s entries that hold for `choices`: demo file → why our
+/// port is better than shadcn-vue's. A line is `<Demo>.vue<TAB>why` (every
+/// style and theme) or `<Demo>.vue<TAB><scope><TAB>why`, the scope as
+/// [`Choices::within`] reads it (`iconLibrary=tabler`, `style=nova,scheme=dark`).
+pub fn better_list(choices: &Choices) -> Result<Vec<(String, String)>, String> {
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/verdict/better.tsv");
-    std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|l| !l.trim_start().starts_with('#'))
-        .filter_map(|l| l.split_once('\t'))
-        .map(|(demo, why)| (demo.trim().to_owned(), why.trim().to_owned()))
-        .collect()
+    better_entries(&std::fs::read_to_string(path).unwrap_or_default(), choices)
+}
+
+fn better_entries(tsv: &str, choices: &Choices) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    for (n, line) in (1_usize..).zip(tsv.lines()) {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let (demo, scope, why) = match cols.as_slice() {
+            [demo, why] => (*demo, "*", *why),
+            [demo, scope, why] => (*demo, *scope, *why),
+            [""] => continue,
+            _ => return Err(format!("better.tsv:{n}: not <Demo>.vue<TAB>[scope<TAB>]why")),
+        };
+        if choices.within(scope).map_err(|e| format!("better.tsv:{n}: {e}"))? {
+            entries.push((demo.to_owned(), why.to_owned()));
+        }
+    }
+    Ok(entries)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -599,4 +663,57 @@ fn stacked(panels: &[&Pixels], bg: Rgba) -> Option<Pixels> {
         y = y.checked_add(i32::try_from(p.height().checked_add(GAP)?).ok()?)?;
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choices(style: &'static str, spec: &str, dark: bool) -> Choices {
+        Choices {
+            style,
+            spec: ThemeSpec::parse(spec).unwrap(),
+            dark,
+        }
+    }
+
+    #[test]
+    fn better_entries_hold_in_their_scope_only() {
+        let tsv = "# comment\nA.vue\tevery run\nB.vue\ticonLibrary=lucide\tlucide only\n\
+                   C.vue\tstyle=nova,scheme=dark\tnova dark\nD.vue\t*\tstar\n";
+        let names =
+            |c: &Choices| -> Vec<String> { better_entries(tsv, c).unwrap().into_iter().map(|(d, _)| d).collect() };
+        assert_eq!(names(&choices("vega", "", false)), ["A.vue", "B.vue", "D.vue"]);
+        assert_eq!(names(&choices("nova", "", true)), ["A.vue", "B.vue", "C.vue", "D.vue"]);
+        assert_eq!(names(&choices("nova", "", false)), ["A.vue", "B.vue", "D.vue"]);
+    }
+
+    #[test]
+    fn better_entries_refuse_what_they_cannot_read() {
+        let c = choices("vega", "", false);
+        assert!(
+            better_entries("A.vue\tcolour=red\twhy", &c)
+                .unwrap_err()
+                .contains("better.tsv:1: scope key")
+        );
+        assert!(
+            better_entries("A.vue\ta\tb\tc", &c)
+                .unwrap_err()
+                .contains("better.tsv:1")
+        );
+        assert!(
+            better_entries("A.vue\tradius\twhy", &c)
+                .unwrap_err()
+                .contains("not key=value")
+        );
+    }
+
+    #[test]
+    fn the_repository_better_list_reads() {
+        for style in ["vega", "nova"] {
+            for dark in [false, true] {
+                better_list(&choices(style, "", dark)).unwrap();
+            }
+        }
+    }
 }

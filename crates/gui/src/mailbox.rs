@@ -59,12 +59,12 @@ impl<T: Send> Sender<T> {
 /// A mailbox's drain: whether anything arrived, or `None` once it closed.
 type Drain = Box<dyn FnMut() -> Option<bool>>;
 
-thread_local! {
+crate::engine::engine_local! {
     /// Each mailbox's drain: runs its handler on what arrived, says whether anything did.
-    static BOXES: RefCell<Vec<Drain>> = const { RefCell::new(Vec::new()) };
-    static BELLS: RefCell<Vec<Arc<Bell>>> = const { RefCell::new(Vec::new()) };
+    [Fresh] static BOXES: RefCell<Vec<Drain>> = const { RefCell::new(Vec::new()) };
+    [Fresh] static BELLS: RefCell<Vec<Arc<Bell>>> = const { RefCell::new(Vec::new()) };
     /// The running window's wake, for the mailboxes made after it started.
-    static WAKE: RefCell<Option<Wake>> = const { RefCell::new(None) };
+    [Fork] static WAKE: RefCell<Option<Wake>> = const { RefCell::new(None) };
 }
 
 /// A mailbox on this (the UI) thread whose `handler` takes each value sent
@@ -197,5 +197,31 @@ mod tests {
         scope.dispose();
         assert!(sender.send(2));
         assert!(!deliver(), "closed: its handler would write a disposed signal");
+    }
+
+    /// A mailbox only a cold frame made goes with it: nothing drains it
+    /// after, however often the check runs, and what is sent to it is
+    /// never handled.
+    #[test]
+    fn a_mailbox_a_cold_frame_made_leaves_no_drain() {
+        let live = mailbox(|_: u32| {});
+        let boxes = || BOXES.with(|b| b.borrow().len());
+        let bells = || BELLS.with(|b| b.borrow().len());
+        let (held, rung) = (boxes(), bells());
+        let got = Rc::new(std::cell::Cell::new(0_u32));
+        let mut senders = Vec::new();
+        for _ in 0..3 {
+            let _cold = crate::engine::ColdFrame::begin();
+            let into = Rc::clone(&got);
+            senders.push(mailbox(move |n: u32| into.set(into.get() + n)));
+        }
+        assert_eq!((boxes(), bells()), (held, rung), "no drain kept, none piled up");
+        assert!(
+            senders.iter().all(|s| !s.send(1)),
+            "sent to nothing: the cold mailboxes are gone"
+        );
+        assert!(live.send(1));
+        assert!(deliver(), "the live mailbox delivers");
+        assert_eq!(got.get(), 0, "the cold mailboxes' handlers never run");
     }
 }

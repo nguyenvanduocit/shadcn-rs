@@ -1,0 +1,16 @@
+---
+source: crates/primitives/tests/overlays.rs
+assertion_line: 461
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Button haspopup=Dialog expanded=true controls=Dialog
+        Label "Settings"
+    GenericContainer
+    GenericContainer
+      Label "Other"
+  Dialog labelled-by=Button
+    GenericContainer
+      Label "Width"

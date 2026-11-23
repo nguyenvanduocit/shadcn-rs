@@ -22,13 +22,13 @@ fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32, f32), ScenarioErr
 }
 
 pub fn render() -> Render {
-    let temperature = Signal::labeled("temperature", vec![0.3_f32, 0.7]);
+    let temperature = Signal::labeled("temperature", vec![0.3_f64, 0.7]);
     Box::new(move || {
         let t = theme();
         let shown = temperature
             .get()
             .iter()
-            .map(f32::to_string)
+            .map(f64::to_string)
             .collect::<Vec<_>>()
             .join(", ");
         page(

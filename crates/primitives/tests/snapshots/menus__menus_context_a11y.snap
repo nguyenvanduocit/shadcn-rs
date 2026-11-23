@@ -1,0 +1,21 @@
+---
+source: crates/primitives/tests/menus.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer hidden
+    GenericContainer
+      Label "Area"
+      GenericContainer
+        Label "Field"
+  Menu Vertical
+    MenuItem
+      Label "Apple"
+    MenuItem
+      Label "Banana"
+    MenuItem disabled
+      Label "Cherry" disabled
+    MenuItem
+      Label "Date"
+    MenuItem
+      Label "Elder"

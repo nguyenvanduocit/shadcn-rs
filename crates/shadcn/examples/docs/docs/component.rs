@@ -40,6 +40,17 @@ impl DemoState {
 /// Demo states by page and demo file.
 pub type DemoStates = HashMap<(&'static str, &'static str), DemoState>;
 
+/// The states of the demos `lifted` holds, each cut from the page's source
+/// once: what a page's setup keeps for its render, which keeps nothing of
+/// its own (a render is `Fn`).
+pub fn demo_states(entry: &Entry, lifted: &Lifted) -> DemoStates {
+    lifted
+        .demos
+        .iter()
+        .map(|&(file, _)| ((entry.page.name, file), DemoState::new(entry, file)))
+        .collect()
+}
+
 /// The doc's first paragraph split as the module docs open, `Badge
 /// (`ui/badge`): a small label…`: the registry item, and the sentence after
 /// it, capitalised; the other paragraphs follow as notes.
@@ -241,13 +252,19 @@ fn demo_block(entry: &Entry, file: &'static str, demo: Element, state: &DemoStat
 }
 
 /// The page of `entry`, from its lifted gallery page.
-pub fn parts(entry: &Entry, lifted: Lifted, states: &mut DemoStates, verdicts: &Verdicts) -> Vec<Part> {
+pub fn parts(entry: &Entry, lifted: Lifted, states: &DemoStates, verdicts: &Verdicts) -> Vec<Part> {
     let t = theme();
     let mut parts = vec![Part::new("top", None, header(entry))];
     for (file, demo) in lifted.demos {
-        let state = states
-            .entry((entry.page.name, file))
-            .or_insert_with(|| DemoState::new(entry, file));
+        // A demo the setup did not see (shown only later) is cut now.
+        let cut;
+        let state = match states.get(&(entry.page.name, file)) {
+            Some(state) => state,
+            None => {
+                cut = DemoState::new(entry, file);
+                &cut
+            }
+        };
         parts.push(Part::keyed(
             gui::key_of(file),
             Some(demo_title(&entry.title, file)),

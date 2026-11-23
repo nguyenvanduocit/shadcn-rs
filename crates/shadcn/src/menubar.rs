@@ -1,6 +1,8 @@
 //! Menubar (`ui/menubar`): a row of menus, at most one open; once one is
 //! open, pointing at another trigger opens that one, and ArrowLeft or
-//! ArrowRight in a menu moves to its neighbour.
+//! ArrowRight in a menu moves to its neighbour. Its behaviour is
+//! `primitives`' ([`primitives::menubar::Menubar`] on the menu engine); the
+//! parts draw it (see [`crate::dropdown_menu`]).
 //!
 //! The parts nest as in Vue: [`menubar`] keeps which menu is open (reka's
 //! `modelValue`, the open menu's value or `""`), its own or the caller's
@@ -8,29 +10,44 @@
 //! open while the bar's value is its own.
 
 use std::cell::Cell;
-use std::rc::Rc;
 
 use gui::prelude::*;
-use gui::{Bind, Div, Icon, Members, Model, Text, UseModel, component, div, icon, provide, use_context, use_model};
+use gui::{Bind, Div, Icon, Model, Text, component, div, icon, provide, use_context, use_model};
+
+use primitives::Availability;
+use primitives::Wrap;
+use primitives::menu::MenuOptions;
+use primitives::menubar::{Menubar, MenubarMenu};
 
 use crate::dropdown_menu::{
-    MenuCheckboxItemProps, MenuContentProps, MenuItem, MenuItemProps, MenuNav, MenuPlace, MenuRadioGroupProps,
-    MenuRadioItemProps, MenuRootProps, MenuState, MenuSubTriggerProps, OpenModel, menu_box, menu_checkbox_item,
-    menu_content, menu_item, menu_level, menu_radio_group, menu_radio_item, menu_row_base, menu_separator,
-    menu_shortcut, menu_sub, menu_sub_trigger,
+    MenuCheckboxItemProps, MenuContentProps, MenuItem, MenuItemProps, MenuPlace, MenuRadioGroupProps,
+    MenuRadioItemProps, MenuRootProps, MenuSubTriggerProps, menu_box, menu_checkbox_item, menu_content, menu_group,
+    menu_item, menu_item_separator, menu_radio_group, menu_radio_item, menu_row_base, menu_shortcut, menu_sub,
+    menu_sub_trigger,
 };
 use gui::style::Origin;
 use gui::{Side, SideAlign};
 
 use crate::focus::StateLook;
 use crate::motion::{popper, popper_in};
-use crate::part::{Part, PartProps};
+use crate::part::Part;
 use crate::theme::theme;
 
-/// What [`menubar`] is given: which menu is open (`""`: none).
-#[derive(Clone, PartialEq, Default)]
+/// What [`menubar`] is given: which menu is open (`""`: none), and what
+/// the keys do past the first or last trigger.
+#[derive(Clone, PartialEq)]
 pub struct MenubarProps {
     value: Bind<String>,
+    wrap: Wrap,
+}
+
+impl Default for MenubarProps {
+    fn default() -> Self {
+        Self {
+            value: Bind::default(),
+            wrap: Wrap::Stop,
+        }
+    }
 }
 
 impl Part<MenubarProps> {
@@ -40,39 +57,26 @@ impl Part<MenubarProps> {
         self.with_props(|p| p.value = p.value.clone().with_model(model))
     }
 
+    /// The menu open first, when no model is given (`default-value`).
+    #[must_use]
+    pub fn default_value(self, value: impl Into<String>) -> Self {
+        let value = value.into();
+        self.with_props(|p| p.value = p.value.clone().with_default(value))
+    }
+
+    /// What the arrows do past the first or last trigger, past a content's
+    /// first or last item, and from the last menu to the first (reka's
+    /// `loop`: off, [`Wrap::Stop`]).
+    /// Read once, as the bar is made.
+    #[must_use]
+    pub fn wrap(self, wrap: Wrap) -> Self {
+        self.with_props(|p| p.wrap = wrap)
+    }
+
     /// Call `f` with the open menu's value each time it changes.
     #[must_use]
-    pub fn on_change(self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<String>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
-    }
-}
-
-type BarValue = UseModel<PartProps<MenubarProps>, String>;
-
-/// What a bar's menus read: which is open, and the menus in tree order.
-#[derive(Clone)]
-struct MenubarContext {
-    value: BarValue,
-    menus: Members<(String, MenuState)>,
-}
-
-/// A menu of a bar is open while the bar's value is its own.
-struct BarOpen {
-    bar: BarValue,
-    me: String,
-}
-
-impl OpenModel for BarOpen {
-    fn get(&self) -> bool {
-        self.bar.with(|v| *v == self.me)
-    }
-
-    fn set(&self, open: bool) {
-        if open {
-            self.bar.set(self.me.clone());
-        } else if self.bar.get_untracked() == self.me {
-            self.bar.set(String::new());
-        }
     }
 }
 
@@ -83,7 +87,6 @@ pub fn menubar() -> Part<MenubarProps> {
     let t = theme();
     let root = div()
         .named("menubar")
-        .role(gui::Role::MenuBar)
         .background(t.background)
         .display(Display::Flex)
         .height(36.0)
@@ -103,11 +106,10 @@ pub fn menubar() -> Part<MenubarProps> {
     Part::new(MenubarProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            provide(MenubarContext {
-                value: use_model(props, |p| &p.props.value),
-                menus: Members::new(),
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
+            let wrap = props.with_untracked(|p| p.props.wrap);
+            let bar = Menubar::new(use_model(props, |p| &p.props.value), wrap);
+            provide(bar);
+            move || bar.root(props.with(|p| p.slot.0.clone())).into_element()
         })
     })
 }
@@ -127,9 +129,9 @@ impl Part<MenubarMenuProps> {
     }
 }
 
-thread_local! {
+gui::engine_local! {
     /// Values for menus not given one (reka's `useId`).
-    static NEXT_MENU: Cell<u64> = const { Cell::new(0) };
+    [Fork] static NEXT_MENU: Cell<u64> = Cell::new(0);
 }
 
 /// One menu of the bar (`MenubarMenu`): the anchor its content opens
@@ -142,62 +144,29 @@ pub fn menubar_menu() -> Part<MenubarMenuProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let bar = use_context::<MenubarContext>();
                 let me = props.with_untracked(|p| p.props.value.clone()).unwrap_or_else(|| {
                     let n = NEXT_MENU.get();
                     NEXT_MENU.set(n.wrapping_add(1));
                     format!("menubar-menu-{n}")
                 });
-                let level = match &bar {
-                    Some(b) => {
-                        let open = Rc::new(BarOpen {
-                            bar: b.value,
-                            me: me.clone(),
-                        });
-                        let (menus, from) = (b.menus.clone(), me.clone());
-                        MenuState::with_open(
-                            open,
-                            Some(Rc::new(move |forward| move_sideways(&menus, &from, forward))),
-                        )
-                    }
-                    None => MenuState::new(),
-                };
-                level.return_focus_on_close();
-                provide(level.clone());
-                move || {
-                    let root = props.with(|p| p.slot.0.clone());
-                    match &bar {
-                        Some(b) => root.member(&b.menus, (me.clone(), level.clone())),
-                        None => root,
-                    }
-                    .into_element()
+                if let Some(bar) = use_context::<Menubar>() {
+                    let menu = MenubarMenu::new(bar, me, MenuOptions::DEFAULT);
+                    provide(menu);
+                    provide(menu.menu());
                 }
+                move || props.with(|p| p.slot.0.clone()).into_element()
             })
         },
     )
 }
 
-/// ArrowLeft or ArrowRight past a menu's items: the neighbouring menu opens
-/// on its first item (reka's `loop` is off, so the ends stay).
-fn move_sideways(menus: &Members<(String, MenuState)>, from: &str, forward: bool) {
-    let target = menus.with(|all| {
-        let i = all.iter().position(|(v, _)| v == from)?;
-        let next = if forward { i.checked_add(1) } else { i.checked_sub(1) }?;
-        all.get(next).map(|(_, m)| m.clone())
-    });
-    if let Some(target) = target {
-        target.open_at(MenuNav::First);
-    }
-}
-
-/// A menu's trigger, `label` (`align start, side-offset 8` for its content).
-/// Pointing at it while another menu is open switches to it.
+/// A menu's trigger, `label` (`align start, side-offset 8` for its content),
+/// lit while focused or open. Pressing it opens its menu; pointing at it
+/// while another menu is open switches to it.
 #[must_use]
-pub fn menubar_trigger(label: &str) -> Part<()> {
-    let t = theme();
+pub fn menubar_trigger(label: &str) -> Part<MenubarTriggerProps> {
     let root = div()
         .named("menubar-trigger")
-        .role(gui::Role::MenuItem)
         .display(Display::Flex)
         .align_items(Align::Center)
         .radius(6.0)
@@ -206,38 +175,35 @@ pub fn menubar_trigger(label: &str) -> Part<()> {
         .text_size(14.0)
         .line_height(20.0)
         .font_weight(500)
-        .with_interaction(|d, i| {
-            d.background_while(move || i.focused(), t.accent)
-                .text_color_while(move || i.focused(), t.accent_foreground)
-        })
         .child(label.to_owned());
-    Part::new((), root, |p| {
+    let props = MenubarTriggerProps {
+        label: label.to_owned(),
+    };
+    Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let level = menu_level();
-            let bar = use_context::<MenubarContext>();
+            let menu = use_context::<MenubarMenu>();
             move || {
-                let root = props.with(|p| p.slot.0.clone());
-                let Some(level) = level.clone() else {
+                let (label, root) = props.with(|p| (p.props.label.clone(), p.slot.0.clone()));
+                let Some(menu) = menu else {
                     return root.into_element();
                 };
                 let t = theme();
-                let (hover, bar) = (level.clone(), bar.clone());
-                level
-                    .trigger(root)
-                    .when(level.is_open(), |d| {
-                        d.background(t.accent).text_color(t.accent_foreground)
-                    })
-                    .on_hover(move |inside| {
-                        let any_open = bar.as_ref().is_some_and(|b| !b.value.get_untracked().is_empty());
-                        if inside && !gui::untracked(|| hover.is_open()) && any_open {
-                            hover.open();
-                        }
-                    })
-                    .into_element()
+                let d = root.with_interaction(|d, i| {
+                    let lit = move || i.focused() || menu.is_open();
+                    d.background_while(lit, t.accent)
+                        .text_color_while(lit, t.accent_foreground)
+                });
+                menu.trigger(d, label, Availability::Enabled).into_element()
             }
         })
     })
+}
+
+/// What [`menubar_trigger`] is given: its label, what the bar's order reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MenubarTriggerProps {
+    label: String,
 }
 
 /// The floating panel below its trigger (`align start, side-offset 8`):
@@ -251,7 +217,6 @@ pub fn menubar_content() -> Part<MenuContentProps> {
         popper_in(
             menu_box(&t)
                 .named("menubar-content")
-                .role(gui::Role::Menu)
                 .min_width(192.0)
                 .overflow(Overflow::Hidden)
                 .shadow(crate::popover::POPUP_SHADOW),
@@ -268,7 +233,7 @@ pub fn menubar_content() -> Part<MenuContentProps> {
 
 #[must_use]
 pub fn menubar_group() -> Div {
-    div().named("menubar-group")
+    menu_group(div().named("menubar-group"))
 }
 
 /// A group of radio items, their chosen value its own (`default_value`) or
@@ -283,11 +248,7 @@ pub fn menubar_radio_group() -> Part<MenuRadioGroupProps> {
 #[must_use]
 pub fn menubar_item(id: &str, item: MenuItem) -> Part<MenuItemProps> {
     let t = theme();
-    menu_item(
-        menu_row_base(&t, item).named("menubar-item").role(gui::Role::MenuItem),
-        id,
-        item,
-    )
+    menu_item(menu_row_base(&t, item).named("menubar-item"), id, item)
 }
 
 /// A checkbox item labelled `label` (`rounded-xs`); picking it toggles.
@@ -347,7 +308,7 @@ pub fn menubar_label(label: &str, inset: bool) -> Div {
 
 #[must_use]
 pub fn menubar_separator() -> Div {
-    menu_separator(&theme()).named("menubar-separator")
+    menu_item_separator(&theme()).named("menubar-separator")
 }
 
 #[must_use]
@@ -363,7 +324,7 @@ pub fn menubar_sub() -> Part<MenuRootProps> {
 }
 
 /// The row opening its submenu (`data-[state=open]:bg-accent`, no gap); the
-/// content opens to its right.
+/// content opens on the inline end.
 #[must_use]
 pub fn menubar_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
     let t = theme();
@@ -375,7 +336,6 @@ pub fn menubar_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerPr
             .child(icon(Icon::ChevronRight).margin_left(Length::Auto)),
         label,
         item,
-        true,
     )
 }
 

@@ -1,0 +1,21 @@
+---
+source: crates/primitives/tests/menus.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer
+    MenuBar
+      GenericContainer
+        MenuItem expanded=true haspopup=Menu controls=Menu
+          Label "File"
+      GenericContainer
+        MenuItem expanded=false haspopup=Menu disabled
+          Label "Edit" disabled
+      GenericContainer
+        MenuItem expanded=false haspopup=Menu
+          Label "View"
+  Menu Vertical labelled-by=MenuItem
+    MenuItem
+      Label "File 0"
+    MenuItem
+      Label "File 1"

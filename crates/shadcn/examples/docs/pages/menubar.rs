@@ -15,7 +15,7 @@ pub fn render() -> Render {
     let profile = Signal::labeled("profile", String::from("benoit"));
     Box::new(move || {
         let t = theme();
-        let act = |name: &'static str| move || last.set(name.to_owned());
+        let act = |name: &'static str| move |_| last.set(name.to_owned());
         let item = |name: &'static str, opts: MenuItem| menubar_item(name, opts).on_select(act(name)).child(name);
         let short = |name: &'static str, opts: MenuItem, keys: &str| item(name, opts).child(menubar_shortcut(keys));
         let plain = MenuItem::default();
@@ -132,6 +132,10 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.frame("file open")?;
     let (x, y) = s.locate("Share")?;
     s.hover(x, y);
+    // A submenu opens 100 ms after the mouse rests on its trigger (reka's),
+    // then plays its opening.
+    s.wait(std::time::Duration::from_millis(100));
+    s.rest(std::time::Duration::from_millis(500))?;
     s.frame("share submenu")?;
     let (x, y) = s.locate("Edit")?;
     s.hover(x, y);
@@ -141,6 +145,8 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.frame("arrow down in edit")?;
     key(s, NamedKey::ArrowRight);
     s.frame("arrow right opens view")?;
+    // The arrows open the next menu with no item highlighted (reka's).
+    key(s, NamedKey::ArrowDown);
     key(s, NamedKey::Enter);
     s.settle()?;
     s.click_text("View")?;

@@ -68,8 +68,14 @@ pub trait Props: 'static { fn changed(&self, old: &Self) -> bool; } // from Part
 - A parent's re-render skips a child whose `changed` is false.
 - `cx.props()` is reactive, so a changed prop reruns only what read it.
 - `Shared<T>` compares by `Rc::ptr_eq`, so a large collection costs nothing to compare.
-- `Callback<A>` is a latest-value cell. It always compares equal and is never stale. It is never called during
-  render (debug assert).
+- `Callback<A, R>` is for events. It is immutable: a clone is the same closure, and nothing writes into it. It
+  always compares equal, so passing a new closure does not re-render the child. It runs untracked, as the instance
+  that made it. A child that keeps one beyond the render that read it (in setup, a timer, a handler on an output
+  that is not rendered again) keeps `cx.event(|p| &p.field)` (or `cx.event_opt` for an optional field), a handle
+  owned by the instance that reads the current props on each call and calls what that field holds then (React's
+  `useEffectEvent`). The cold check never changes what a handle calls.
+- `Derive<A, R>` is for functions a child calls while it renders (a predicate, a formatter). It runs inline,
+  tracked as the render that calls it, and compares by pointer.
 - Slots are closures that run inside the child's own tracked render.
 
 **Two-way binding and context.**
@@ -253,6 +259,25 @@ list open and closed (hidden while closed, on a layer while open), so its items 
 (`opening_and_closing_keeps_the_items_instances`: open, close, open: 0 setups, 0 unmounts after the first); a
 `popover_content(..).force_mount()` (reka's `forceMount`) stays mounted while closed and keeps its state
 (`content_kept_mounted_keeps_its_state_across_open_and_close`).
+
+### A panic poisons its root (2026-11-23)
+
+A panic that leaves user code while a root resolves (a setup, a render, an effect run by it, a cleanup of an instance
+leaving, props compared as they are passed) poisons the root, as an uncaught render error unmounts a React root. No
+frame is retried from what a half-done one left: `Root::resolve` catches the panic, tears the whole instance tree
+down in one pass that runs every teardown though one panics (`each_to_completion`; those later panics are dropped),
+and raises the first panic again, once. Its next resolve mounts the tree again, fresh, from the root's render: the
+app goes on, its instances' state starts over. Nothing makes a half-done frame reusable, so there are no per-step
+rollback guards; a child is its parent's from before its setup runs, so the teardown reaches it through its parent.
+
+Teardown in a destructor never raises while a panic unwinds (`std::thread::panicking()`): `Leaving` and `Root` drop
+what they dispose under `catch_unwind` then, as a second panic would abort the process. Instances are known by
+generation-checked ids (slot and generation), so an id kept past its instance finds nothing, never the instance
+made in its slot.
+
+Tests (`component/tests.rs`): `a_setup_that_panics_after_a_panicking_cleanup_poisons_its_root_once`,
+`a_child_whose_cleanup_panics_leaves_another_roots_instances_alone`,
+`a_poisoned_root_mounts_its_new_child_again_not_the_stale_output`.
 
 ## Consequences
 

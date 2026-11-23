@@ -1,0 +1,19 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      GenericContainer
+      ListBox
+        ListBoxOption selected=false
+          Label "Apple"
+        ListBoxOption selected=true
+          Label "Banana"
+        ListBoxOption selected=false disabled
+          Label "Blueberry" disabled
+        ListBoxOption selected=false
+          Label "Cherry"
+        ListBoxOption selected=false
+          Label "Grapes"

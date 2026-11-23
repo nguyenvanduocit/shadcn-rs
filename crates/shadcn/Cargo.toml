@@ -12,6 +12,8 @@ workspace = true
 
 [dependencies]
 gui = { path = "../gui" }
+# Behaviour without look (ADR-0022, ADR-0025): each component draws itself and hands its parts to the primitive.
+primitives = { path = "../primitives" }
 # The calendars' today: the day it is in the local time zone, as reka's
 # `today(getLocalTimeZone())`. The IANA database is bundled, so a zone names
 # the same days on every machine, as the browser's own ICU copy does.
@@ -32,6 +34,11 @@ tabler = []
 hugeicons = []
 phosphor = []
 remixicon = []
+
+# The docs app's own tests (its startup flags, the verdict's better.tsv) run with the workspace's.
+[[example]]
+name = "docs"
+test = true
 
 [dev-dependencies]
 # The stress example's `--a11y` feeds each update to the tree a platform

@@ -135,12 +135,51 @@ pub struct MotionStyle {
     /// What plays when the node leaves the tree; it stays painted, inert,
     /// until that ends (`data-[state=closed]:animate-out` under reka's `Presence`).
     pub exit: Option<Rc<Animation>>,
+    /// Told each [`Stage`] the node reaches, as it reaches it
+    /// ([`crate::Div::on_stage`]).
+    pub report: Option<StageReport>,
+}
+
+/// A point in a node's life its look's animations mark (reka's `Presence`
+/// events `enter`, `after-enter`, `leave`, `after-leave`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Stage {
+    /// It is laid out for the first time (or again, back before its exit
+    /// ended): its entry animation, if any, starts.
+    Entering,
+    /// Its entry animation ended, or it has none (an endless one never
+    /// ends).
+    Entered,
+    /// It left the tree: its exit animation, if any, starts.
+    Exiting,
+    /// Its exit ended (or it had none, or its parent left first): it is
+    /// gone from the screen.
+    Exited,
+}
+
+/// What a node is told of its [`Stage`]s: run after the layout pass that
+/// reached each, in order, every one of them, as the work of the owner
+/// that built the node (none once it is disposed).
+#[derive(Clone)]
+pub struct StageReport(pub Rc<dyn Fn(Stage)>, pub Option<crate::component::Owner>);
+
+/// The same closure is the same report.
+impl PartialEq for StageReport {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for StageReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("StageReport")
+    }
 }
 
 impl MotionStyle {
     /// Whether it sets anything moving.
     fn moves(&self) -> bool {
-        self.transition != Properties::NONE || self.animation.is_some() || self.exit.is_some()
+        self.transition != Properties::NONE || self.animation.is_some() || self.exit.is_some() || self.report.is_some()
     }
 }
 
@@ -774,6 +813,9 @@ struct NodeState {
     /// It moves (a transition, an animation, an exit, the compositor's
     /// curves, a height it waits for): it is sampled again next pass.
     busy: bool,
+    /// Where it reports its stages, and the last it reported.
+    report: Option<StageReport>,
+    told: Option<Stage>,
 }
 
 impl NodeState {
@@ -864,6 +906,8 @@ pub struct Motion {
     mounting: Vec<NodePath>,
     /// Nodes with an exit that left the tree this pass.
     gone: Vec<NodePath>,
+    /// Stages reached this pass, told once it is laid out.
+    stages: Vec<(StageReport, Stage)>,
     /// A node waited for its natural height and has it now: lay out again.
     again: bool,
     /// Bumped when what runs changes for every node at once (reduced
@@ -955,7 +999,10 @@ impl Motion {
             match self.nodes.get(path) {
                 Some(s) if s.exit.is_some() && !leaving => self.gone.push(path.clone()),
                 Some(_) if !leaving => {
-                    self.nodes.remove(path);
+                    if let Some(r) = self.nodes.remove(path).and_then(|s| s.report) {
+                        self.stages.push((r.clone(), Stage::Exiting));
+                        self.stages.push((r, Stage::Exited));
+                    }
                 }
                 _ => {}
             }
@@ -1052,6 +1099,19 @@ impl Motion {
         };
         let still = |a: &Animation| reduced || (finite_still && a.iterations.is_some());
         let playing = playing.filter(|p| !still(&p.animation));
+        state.report.clone_from(&m.report);
+        if leaving.is_none()
+            && let Some(r) = &m.report
+        {
+            if state.told.is_none() {
+                self.stages.push((r.clone(), Stage::Entering));
+                state.told = Some(Stage::Entering);
+            }
+            if state.told == Some(Stage::Entering) && playing.as_ref().is_none_or(|p| p.ended(&m, now)) {
+                self.stages.push((r.clone(), Stage::Entered));
+                state.told = Some(Stage::Entered);
+            }
+        }
         // Where the transitions go: what keyframes fill open ends with once
         // they end, and what shows when nothing runs.
         let mut own = Own::of(style);
@@ -1185,6 +1245,11 @@ impl Motion {
                     .filter_map(|(a, duration)| a.end(now, *duration))
                     .fold(now, f32::max);
                 if let Some((mut slot, index)) = previous.and_then(|p| slot_at(p, &root)) {
+                    for p in gone.iter().filter(|p| p.0.starts_with(&root.0)) {
+                        if let Some(r) = self.nodes.get(p).and_then(|s| s.report.clone()) {
+                            self.stages.push((r, Stage::Exiting));
+                        }
+                    }
                     inert(&mut slot);
                     self.leaving.push(Leaving {
                         path: root,
@@ -1199,8 +1264,19 @@ impl Motion {
         }
         // What left and does not leave with an exit is forgotten.
         for path in &gone {
-            if self.leaving_since(path).is_none() {
-                self.nodes.remove(path);
+            if self.leaving_since(path).is_none()
+                && let Some(r) = self.nodes.remove(path).and_then(|s| s.report)
+            {
+                self.stages.push((r.clone(), Stage::Exiting));
+                self.stages.push((r, Stage::Exited));
+            }
+        }
+        // Each told as the work of its node's owner, in order.
+        for (StageReport(f, owner), stage) in self.stages.drain(..) {
+            let tell = move || f(stage);
+            match owner {
+                Some(owner) => owner.after_layout(tell),
+                None => crate::component::after_layout(tell),
             }
         }
         again
@@ -1213,13 +1289,32 @@ impl Motion {
         let now = clock::frame_time();
         let mut ended = Vec::new();
         for l in std::mem::take(&mut self.leaving) {
+            // Its slot holds a node again: it came back before its exit
+            // ended, and enters anew rather than ending.
+            let mut back = false;
             let kept = now < l.until
                 && l.path.0.split_last().is_some_and(|(last, parent)| {
-                    siblings_at(&mut root, parent).is_some_and(|kids| put_back(kids, *last, l.index, &l.slot))
+                    siblings_at(&mut root, parent).is_some_and(|kids| {
+                        let put = put_back(kids, *last, l.index, &l.slot);
+                        back = !put;
+                        put
+                    })
                 });
             if kept {
                 self.leaving.push(l);
             } else {
+                if !back {
+                    // In tree order, outer first, whatever the map's order.
+                    let mut told: Vec<(&NodePath, &StageReport)> = self
+                        .nodes
+                        .iter()
+                        .filter(|(path, _)| path.0.starts_with(&l.path.0))
+                        .filter_map(|(path, s)| Some((path, s.report.as_ref()?)))
+                        .collect();
+                    told.sort_by_cached_key(|(path, _)| (path.0.len(), format!("{:?}", path.0)));
+                    self.stages
+                        .extend(told.into_iter().map(|(_, r)| (r.clone(), Stage::Exited)));
+                }
                 ended.push(l.path);
             }
         }
@@ -1598,6 +1693,7 @@ fn child_mut(kids: &mut [Element], seg: PathSeg) -> Option<&mut Element> {
     match seg {
         PathSeg::Index(i) => kids.get_mut(i),
         PathSeg::Key(k) => kids.iter_mut().find(|c| c.key() == Some(k)),
+        PathSeg::Component(..) => kids.iter_mut().find(|c| c.seg(0) == seg),
     }
 }
 
@@ -1641,6 +1737,7 @@ fn index_of(kids: &[Element], seg: PathSeg) -> Option<usize> {
     match seg {
         PathSeg::Index(i) => (i < kids.len()).then_some(i),
         PathSeg::Key(k) => kids.iter().position(|c| c.key() == Some(k)),
+        PathSeg::Component(..) => kids.iter().position(|c| c.seg(0) == seg),
     }
 }
 
@@ -1648,15 +1745,20 @@ fn index_of(kids: &[Element], seg: PathSeg) -> Option<usize> {
 /// place now (the node came back).
 fn put_back(kids: &mut Vec<Element>, seg: PathSeg, index: usize, slot: &Element) -> bool {
     match seg {
-        PathSeg::Key(k) => {
-            if kids.iter().any(|c| c.key() == Some(k)) {
+        PathSeg::Key(_) | PathSeg::Component(..) => {
+            if kids.iter().enumerate().any(|(i, c)| c.seg(i) == seg) {
                 return false;
             }
             kids.insert(index.min(kids.len()), slot.clone());
             true
         }
         PathSeg::Index(i) => match kids.get_mut(i) {
-            Some(at @ Element::Empty) => {
+            // A layer shares its content's place: one that holds nothing
+            // now is the place its leaving content goes back to.
+            Some(at)
+                if matches!(&*at, Element::Empty)
+                    || matches!(&*at, Element::Deferred(d) if matches!(d.child, Element::Empty)) =>
+            {
                 *at = slot.clone();
                 true
             }
@@ -1671,7 +1773,9 @@ fn put_back(kids: &mut Vec<Element>, seg: PathSeg, index: usize, slot: &Element)
 }
 
 /// Make a leaving subtree inert: no handlers, no focus, and the pointer
-/// passes through it (`pointer-events: none` while it animates out).
+/// passes through it (`pointer-events: none` while it animates out); it is
+/// [`crate::Div::inert`] too, so it leaves the layer stack and the reader's
+/// tree as it starts to leave.
 fn inert(el: &mut Element) {
     if let Element::Deferred(d) = el {
         inert(&mut Rc::make_mut(d).child);
@@ -1682,6 +1786,7 @@ fn inert(el: &mut Element) {
         c.focus = None;
         c.focusable = false;
         c.pass_through = true;
+        c.inert = true;
     }
     if let Some(kids) = el.kids_mut() {
         kids.iter_mut().for_each(inert);

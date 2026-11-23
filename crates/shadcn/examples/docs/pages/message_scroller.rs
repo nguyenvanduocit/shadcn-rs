@@ -313,7 +313,7 @@ struct Context {
     chat: DemoChat,
     /// The provider's key, bumped by the demo's reset.
     key: Signal<u32>,
-    peek: Signal<Vec<f32>>,
+    peek: Signal<Vec<f64>>,
 }
 
 impl Context {
@@ -321,20 +321,21 @@ impl Context {
         Self {
             chat: DemoChat::new(CONTEXT, 2, 35),
             key: Signal::new(0),
-            peek: Signal::new(vec![DEFAULT_PEEK]),
+            peek: Signal::new(vec![f64::from(DEFAULT_PEEK)]),
         }
     }
 
     fn reset(&self) {
         self.chat.reset();
-        self.peek.set(vec![DEFAULT_PEEK]);
+        self.peek.set(vec![f64::from(DEFAULT_PEEK)]);
         bump(self.key);
     }
 
     fn view(&self) -> Div {
         let messages = self.chat.messages.get();
         let busy = self.chat.streaming.get();
-        let peek = self.peek.get().first().copied().unwrap_or(DEFAULT_PEEK);
+        #[expect(clippy::as_conversions, reason = "a peek of 64 to 128 px; `as` rounds to nearest")]
+        let peek = self.peek.get().first().map_or(DEFAULT_PEEK, |p| *p as f32);
         let props = MessageScrollerProps {
             scroll_margin: 24.0,
             scroll_previous_item_peek: peek,
@@ -432,7 +433,7 @@ impl Anchoring {
     /// resets the turns; releasing this one changes nothing.
     fn toggle(&self, value: &str, label: &str, role: Role) -> ToggleGroupItem {
         let me = self.clone();
-        toggle_group_item(value).child(label.to_owned()).on_click(move || {
+        toggle_group_item(value).child(label.to_owned()).on_click(move |()| {
             if me.role.get() != role {
                 me.reset();
             }
@@ -605,7 +606,7 @@ impl Commands {
                     .children(user_turns(COMMANDS).map(|(index, id, words)| {
                         let s = scroller.clone();
                         dropdown_menu_item(id, MenuItem::default())
-                            .on_select(move || {
+                            .on_select(move |_| {
                                 s.scroll_to_message(index, MessageScrollerScrollOptions::default());
                             })
                             .child(text(trimmed(words)).line_clamp(1).min_width(0.0))
@@ -777,7 +778,7 @@ fn opening_tabs(position: Signal<String>) -> Element {
         }
         move || {
             let s = scroller.clone();
-            let model = Model::bind(position).on_change(move |p| {
+            let model = Model::bind(position).on_change(move |p: String| {
                 if let Some(s) = &s {
                     apply(s, &p);
                 }

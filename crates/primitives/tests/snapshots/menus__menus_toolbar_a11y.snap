@@ -1,0 +1,16 @@
+---
+source: crates/primitives/tests/menus.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer
+    Toolbar Horizontal
+      GenericContainer
+        Label "Bold"
+      GenericContainer disabled
+        Label "Italic" disabled
+      Splitter Vertical
+      GenericContainer
+        Label "Left"
+      Link
+        Label "Help"

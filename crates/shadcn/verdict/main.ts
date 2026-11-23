@@ -1,9 +1,12 @@
-// Mounts one shadcn-vue demo, `?demo=ButtonDemo[&dark=1]`, inside #specimen at
-// the width the gallery lays its copy out in, and marks it ready to shoot.
+// Mounts one shadcn-vue demo, `?demo=ButtonDemo[&dark=1][&style=<name>&theme=<spec>]`,
+// inside #specimen at the width the gallery lays its copy out in, in a style
+// and theme as apps/v4's previews apply them (design-system.ts reads the
+// choices), and marks it ready to shoot.
 import type { Component } from "vue"
 import { TooltipProvider } from "reka-ui"
 import { Suspense, createApp, h, nextTick } from "vue"
 import { THEMES } from "@/registry/themes"
+import { choices } from "./design-system"
 import { NuxtLink } from "./nuxt-components"
 import "./style.css"
 
@@ -16,13 +19,113 @@ const params = new URLSearchParams(location.search)
 const name = params.get("demo") ?? ""
 const dark = params.get("dark") === "1"
 
-function applyTheme() {
-  const neutral = THEMES.find(t => t.name === "neutral")
-  const vars = neutral?.cssVars
-  const root = document.documentElement
-  root.classList.toggle("dark", dark)
-  for (const [k, v] of Object.entries({ ...vars?.light, ...(dark ? vars?.dark : {}) }))
-    root.style.setProperty(`--${k}`, String(v))
+/** `radius`'s values (apps/v4/registry/config.ts RADII); "" keeps the base colour's own. */
+const RADII: Record<string, string> = { default: "", none: "0", small: "0.45rem", medium: "0.625rem", large: "0.875rem" }
+/**
+ * The fonts the verdict has files for: the faces `gui` bundles (style.css),
+ * so text is set in the same faces on both sides. Another font of the picker
+ * would fall back to a different face on each side, which judges nothing.
+ */
+const FONTS: Record<string, string> = { "inter": "\"Inter\", sans-serif", "geist-mono": "\"Geist Mono\", monospace" }
+const icons = import.meta.glob("@/registry/icons/*.ts")
+
+type Vars = Record<string, string>
+const varsOf = (name: string, scheme: "light" | "dark") => {
+  const theme = THEMES.find(t => t.name === name)
+  if (!theme)
+    throw new Error(`theme: no base colour or accent ${name}`)
+  return { ...(theme.cssVars?.[scheme] as Vars | undefined) }
+}
+const rule = (selector: string, vars: Vars) =>
+  `${selector} {\n${Object.entries(vars).filter(([, v]) => v).map(([k, v]) => `  --${k}: ${v};`).join("\n")}\n}\n`
+
+/**
+ * The page in the chosen style and theme, as shadcn's DesignSystemProvider
+ * applies them (apps/v4 design-system-provider.tsx; shadcn-vue's checkout has
+ * no copy): `style-<name>` and `base-color-<name>` on the body, the base
+ * colour's variables with the accent's over them (buildRegistryTheme, menu
+ * accent and radius included) as `:root` and `.dark` rules, the fonts, and
+ * menu content inverted or translucent by `menuColor`.
+ */
+async function applyTheme() {
+  const { style, theme } = choices()
+  document.body.classList.add(`style-${style}`, `base-color-${theme.baseColor}`)
+  document.documentElement.classList.toggle("dark", dark)
+
+  const light = { ...varsOf(theme.baseColor, "light"), ...varsOf(theme.theme, "light") }
+  const darkVars = { ...varsOf(theme.baseColor, "dark"), ...varsOf(theme.theme, "dark") }
+  if (theme.menuAccent === "bold") {
+    for (const vars of [light, darkVars]) {
+      vars.accent = vars.primary!
+      vars["accent-foreground"] = vars["primary-foreground"]!
+      vars["sidebar-accent"] = vars.primary!
+      vars["sidebar-accent-foreground"] = vars["primary-foreground"]!
+    }
+  }
+  else if (theme.menuAccent !== "subtle") {
+    throw new Error(`theme: no menuAccent ${theme.menuAccent}`)
+  }
+  // Taken as given: run.sh passes the spec as the style keeps it (`docs --style
+  // <name> --spec`, ThemeSpec::in_style: lyra and sera square, rhea without
+  // large), the one place that rule lives, so both sides judge one radius.
+  const radius = theme.radius
+  if (!(radius in RADII))
+    throw new Error(`theme: no radius ${radius}`)
+  if (RADII[radius])
+    light.radius = RADII[radius]
+  const sheet = document.createElement("style")
+  sheet.textContent = rule(":root", light) + rule(".dark", darkVars)
+  document.head.append(sheet)
+
+  const root = document.documentElement.style
+  for (const [variable, font] of [["--verdict-sans", theme.font], ["--verdict-heading", theme.fontHeading]] as const) {
+    if (font === "inherit")
+      continue
+    if (!FONTS[font])
+      throw new Error(`theme: font ${font} has no file here; the verdict sets ${Object.keys(FONTS).join(", ")}, the faces gui bundles`)
+    root.setProperty(variable, FONTS[font])
+  }
+
+  const menu = ["default", "default-translucent", "inverted", "inverted-translucent"]
+  if (!menu.includes(theme.menuColor))
+    throw new Error(`theme: no menuColor ${theme.menuColor}`)
+  const inverted = theme.menuColor.startsWith("inverted")
+  const translucent = theme.menuColor.endsWith("translucent")
+  const menus = () => {
+    for (const el of document.querySelectorAll<HTMLElement>(".cn-menu-target, [data-menu-translucent]")) {
+      if (el.classList.contains("cn-menu-target"))
+        el.classList.toggle("dark", inverted)
+      if (translucent && el.hasAttribute("data-menu-translucent")) {
+        el.classList.add("cn-menu-translucent")
+        el.removeAttribute("data-menu-translucent")
+      }
+    }
+  }
+  // Each time a menu mounts, before it paints (upstream waits a frame).
+  new MutationObserver(menus).observe(document.body, { childList: true, subtree: true })
+
+  // The library's module loaded before the demo mounts, so its icons draw
+  // with it instead of after the shot (IconPlaceholder loads it lazily).
+  const library = [`/__${theme.iconLibrary}__.ts`, `/icon-${theme.iconLibrary}.ts`]
+    .map(file => Object.entries(icons).find(([path]) => path.endsWith(file)))
+  if (library.some(l => !l))
+    throw new Error(`theme: no iconLibrary ${theme.iconLibrary}`)
+  await Promise.all(library.map(l => l![1]()))
+}
+
+/**
+ * Resolves once no module or file has been fetched for 200ms (at most 5s):
+ * what a demo loads lazily (IconPlaceholder's icon, a Suspense's async
+ * component) draws before the shot, not its fallback.
+ */
+async function fetchesQuiet() {
+  let last = performance.now()
+  const seen = new PerformanceObserver(() => (last = performance.now()))
+  seen.observe({ type: "resource" })
+  for (let waited = 0; performance.now() - last < 200 && waited < 5000; waited += 20)
+    await new Promise(r => setTimer(r, 20))
+  seen.disconnect()
+  await nextTick()
 }
 
 /**
@@ -71,7 +174,7 @@ async function styleQuiet(root: HTMLElement) {
 }
 
 async function mount() {
-  applyTheme()
+  await applyTheme()
   const entry = Object.entries(demos).find(([path]) => path.endsWith(`/${name}.vue`))
   const specimen = document.createElement("div")
   specimen.id = "specimen"
@@ -112,6 +215,7 @@ async function mount() {
   // Let entrance animations (tw-animate) finish before the shot.
   await new Promise(r => setTimeout(r, 400))
   await mountTimersDone()
+  await fetchesQuiet()
   // And any other one-shot animation on the clock (`shimmer-once`), so the shot
   // does not land mid-way at a random moment; scroll-driven ones never finish.
   const once = document.getAnimations().filter(a =>

@@ -4,9 +4,12 @@
 //! The parts nest as in Vue: [`popover`] is the anchor the panel is placed
 //! against and keeps whether it is open, its own (`default_open`) or the
 //! caller's (`open`, `v-model:open`); it holds the [`popover_trigger`] and
-//! the [`popover_content`]. Like a dialog the content takes focus when it
-//! opens and gives it back when it closes, unless told
-//! [`open_auto_focus(false)`](Part::open_auto_focus).
+//! the [`popover_content`]. The behaviour is `primitives::popover`'s: the
+//! content takes focus when it opens (unless told
+//! [`open_auto_focus(false)`](Part::open_auto_focus)) and gives it to the
+//! trigger when it closes; Escape, a press outside it or focus going
+//! outside it close it, and its trigger is not outside it. This module
+//! draws it.
 //!
 //! ```ignore
 //! popover()
@@ -15,18 +18,18 @@
 //! ```
 
 use gui::prelude::*;
-use gui::{
-    Bind, Div, Element, Model, NamedKey, Positioning, Side, SideAlign, UseModel, component, deferred, div, provide,
-    use_context, use_model,
-};
+use gui::{Bind, Div, Element, Model, Side, SideAlign, component, div, provide, use_model};
+use primitives::context::use_root;
+use primitives::popover::{Popover, PopoverOptions};
+use primitives::popper::Popper;
+use primitives::presence::Presence;
 
 use gui::style::Origin;
 
-use crate::dialog::return_focus;
+use crate::dialog::Veto;
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
-
 /// A popup's shadow (shadcn's `shadow-md`): menu, popover and hover card
 /// content.
 pub(crate) const POPUP_SHADOW: [Shadow; 2] = [
@@ -75,27 +78,19 @@ const SHADE: gui::Color = gui::Color {
 #[derive(Clone, PartialEq, Default)]
 pub struct PopoverProps {
     open: Bind<bool>,
+    modal: bool,
+    veto: Option<Veto>,
 }
 
-/// What the parts below a [`popover`] read: whether it is open.
+/// The popover of a [`popover`] root.
+type PopoverState = Popover<PartProps<PopoverProps>>;
+
+/// What the content's options come from: the root's props and the
+/// content's own, which the content writes as it renders.
 #[derive(Clone, Copy)]
-pub(crate) struct PopoverContext {
-    open: UseModel<PartProps<PopoverProps>, bool>,
-}
-
-impl PopoverContext {
-    pub(crate) fn find() -> Option<Self> {
-        use_context::<Self>()
-    }
-
-    /// Whether the popover shows (tracked).
-    pub(crate) fn is_open(self) -> bool {
-        self.open.get()
-    }
-
-    pub(crate) fn set_open(self, open: bool) {
-        self.open.set(open);
-    }
+struct PopoverContext {
+    popover: PopoverState,
+    content: gui::Signal<PopoverContentProps>,
 }
 
 /// The anchor the content is placed against: wrap the trigger (and the
@@ -108,9 +103,21 @@ pub fn popover() -> Part<PopoverProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                provide(PopoverContext {
-                    open: use_model(props, |p| &p.props.open),
-                });
+                let content = gui::Signal::labeled("popover content", PopoverContentProps::DEFAULT);
+                let popover = Popover::new(
+                    use_model(props, |p: &PartProps<PopoverProps>| &p.props.open),
+                    move || {
+                        let c = content.get();
+                        props.with(|p| PopoverOptions {
+                            modal: p.props.modal,
+                            keep_mounted: c.force_mount,
+                            open_auto_focus: c.auto_focus,
+                            veto: p.props.veto.clone(),
+                            ..PopoverOptions::default()
+                        })
+                    },
+                );
+                provide(PopoverContext { popover, content });
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })
         },
@@ -132,8 +139,22 @@ impl Part<PopoverProps> {
 
     /// Call `f` each time it opens or closes (`@update:open`).
     #[must_use]
-    pub fn on_open_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.open = p.open.clone().on_change(f))
+    }
+
+    /// Modal (`:modal`, off by default): focus trapped, the page inert and
+    /// hidden from screen readers.
+    #[must_use]
+    pub fn modal(self, modal: bool) -> Self {
+        self.with_props(|p| p.modal = modal)
+    }
+
+    /// Answer each close a user asks for (Escape, a press or focus outside).
+    #[must_use]
+    pub fn on_dismiss(self, f: impl Into<gui::Callback<gui::DismissReason, gui::Dismiss>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.veto = Some(f))
     }
 }
 
@@ -145,13 +166,54 @@ pub fn popover_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let popover = PopoverContext::find();
+            let popover = use_root::<PopoverContext>("popover_trigger", "popover");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match popover {
-                    Some(o) => root
-                        .aria_expanded(o.is_open())
-                        .on_click(move |_| o.set_open(!o.open.get_untracked())),
+                    Some(o) => o.popover.trigger(root),
+                    None => root,
+                }
+                .into_element()
+            }
+        })
+    })
+}
+
+/// Place the content against `anchor` instead of the whole [`popover`]
+/// (`PopoverAnchor as-child`): render it inside the popover; the trigger
+/// still opens and closes it.
+#[must_use]
+pub fn popover_anchor(anchor: impl Into<Div>) -> Part<()> {
+    Part::new((), anchor.into(), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let popover = use_root::<PopoverContext>("popover_anchor", "popover");
+            if let Some(o) = popover {
+                o.popover.register_anchor();
+            }
+            move || {
+                let root = props.with(|p| p.slot.0.clone());
+                match popover {
+                    Some(o) => o.popover.anchor(root),
+                    None => root,
+                }
+                .into_element()
+            }
+        })
+    })
+}
+
+/// Make `close` close the popover when pressed (`PopoverClose as-child`).
+#[must_use]
+pub fn popover_close(close: impl Into<Div>) -> Part<()> {
+    Part::new((), close.into(), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let popover = use_root::<PopoverContext>("popover_close", "popover");
+            move || {
+                let root = props.with(|p| p.slot.0.clone());
+                match popover {
+                    Some(o) => o.popover.close(root),
                     None => root,
                 }
                 .into_element()
@@ -167,6 +229,15 @@ pub struct PopoverContentProps {
     align: SideAlign,
     auto_focus: bool,
     force_mount: bool,
+}
+
+impl PopoverContentProps {
+    const DEFAULT: Self = Self {
+        side: Side::Bottom,
+        align: SideAlign::Center,
+        auto_focus: true,
+        force_mount: false,
+    };
 }
 
 impl Part<PopoverContentProps> {
@@ -200,8 +271,7 @@ impl Part<PopoverContentProps> {
 
 /// The panel, below its anchor and centred on it, 4px away
 /// (`PopoverContent`); style and fill it as a `Div`. Nothing renders while
-/// the popover is closed, unless it is kept mounted (`.force_mount()`);
-/// Escape or a press outside closes it.
+/// the popover is closed, unless it is kept mounted (`.force_mount()`).
 #[must_use]
 pub fn popover_content() -> Part<PopoverContentProps> {
     let t = theme();
@@ -215,54 +285,31 @@ pub fn popover_content() -> Part<PopoverContentProps> {
         .border_color(t.border)
         .padding(16.0)
         .shadow(POPUP_SHADOW);
-    let props = PopoverContentProps {
-        side: Side::Bottom,
-        align: SideAlign::Center,
-        auto_focus: true,
-        force_mount: false,
-    };
-    Part::new(props, root, |p| {
+    Part::new(PopoverContentProps::DEFAULT, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let popover = PopoverContext::find();
-            let auto_focus = props.with_untracked(|p| p.props.auto_focus);
+            let popover = use_root::<PopoverContext>("popover_content", "popover");
             if let Some(o) = popover {
-                return_focus(move || o.is_open(), auto_focus, None);
+                // The content's own props are options of the popover: an
+                // effect hands them up, now and as they change (setup, as a
+                // render, writes nothing it did not make).
+                gui::Effect::new(move || o.content.set(props.with(|p| p.props)));
             }
             move || {
                 let Some(o) = popover else {
                     return Element::Empty;
                 };
                 let (p, root) = props.with(|p| (p.props, p.slot.0.clone()));
-                if !o.is_open() {
+                match o.popover.presence() {
+                    Presence::Gone => Element::Empty,
                     // Kept, hidden where it would float from: a layer is no
                     // step of its instances' identity, so they stay.
-                    return if p.force_mount {
-                        root.display(Display::None).into_element()
-                    } else {
-                        Element::Empty
-                    };
+                    Presence::Kept => root.display(Display::None).into_element(),
+                    Presence::Open => {
+                        let at = Popper::DEFAULT.side(p.side).align(p.align).side_offset(4.0);
+                        o.popover.floating(root, &at).into_element()
+                    }
                 }
-                let content = root
-                    .on_key_down(move |e| {
-                        let escape = e.is(NamedKey::Escape);
-                        if escape {
-                            o.set_open(false);
-                        }
-                        escape
-                    })
-                    .on_click_outside(move || o.set_open(false));
-                deferred(
-                    Positioning::Anchored {
-                        side: p.side,
-                        align: p.align,
-                        offset: 4.0,
-                        match_width: false,
-                        fit_height: false,
-                    },
-                    content,
-                )
-                .into_element()
             }
         })
     })
@@ -288,7 +335,7 @@ mod tests {
             .nodes
             .iter()
             .filter_map(|n| match &n.content {
-                gui::layout::Content::Text { content, .. } if content.starts_with("n ") => Some(content.clone()),
+                gui::layout::Content::Text { content, .. } if content.starts_with("n ") => Some(content.to_string()),
                 _ => None,
             })
             .collect()
@@ -323,5 +370,87 @@ mod tests {
         s.settle().expect("settled");
         assert_eq!(shown(&s), ["n 1"], "the same counter, its count kept");
         assert_eq!(gui::component::stats().setups, setups, "nothing set up again");
+    }
+
+    fn bounds_of(s: &Scenario, name: &str) -> gui::Bounds {
+        s.last()
+            .nodes
+            .iter()
+            .find(|n| n.name == Some(name))
+            .map(|n| n.bounds)
+            .expect("the node on screen")
+    }
+
+    /// An explicit anchor tells the popover from its setup that it is there
+    /// (through an effect: a setup writes nothing it did not make), and the
+    /// content opens against it, in the first frame.
+    #[test]
+    fn an_explicit_anchor_mounts_and_places_the_content_below_it() {
+        let open = Signal::new(true);
+        let mut s = Scenario::measuring(
+            move || {
+                popover()
+                    .open(open)
+                    .child(popover_trigger(div().child("Open")))
+                    .child(popover_anchor(
+                        div().named("the-anchor").margin_top(200.0).width(40.0).height(20.0),
+                    ))
+                    .child(popover_content().child("Inside"))
+                    .into_element()
+            },
+            400,
+            400,
+            1.0,
+        )
+        .expect("a scenario");
+        s.frame("first").expect("a frame");
+        let anchor = bounds_of(&s, "the-anchor");
+        let content = bounds_of(&s, "popover-content");
+        assert!(
+            content.y >= anchor.y + anchor.height,
+            "the content below the anchor: {content:?} against {anchor:?}"
+        );
+    }
+
+    /// An anchor replaced in one update (keyed anew): the new one joins
+    /// before the old one leaves, and the old one's leaving does not take
+    /// the anchor away from the new one, so the content stays below it.
+    #[test]
+    fn an_anchor_replaced_in_one_update_keeps_the_content_below_it() {
+        let open = Signal::new(true);
+        let which = Signal::new(false);
+        let mut s = Scenario::measuring(
+            move || {
+                popover()
+                    .open(open)
+                    .child(popover_trigger(div().child("Open")))
+                    .child(
+                        div()
+                            .key(gui::key_of(if which.get() { "second" } else { "first" }))
+                            .child(popover_anchor(
+                                div().named("the-anchor").margin_top(200.0).width(40.0).height(20.0),
+                            )),
+                    )
+                    // Below the anchor: content placed against the whole
+                    // popover would sit under this, far from the anchor.
+                    .child(div().height(100.0))
+                    .child(popover_content().child("Inside"))
+                    .into_element()
+            },
+            400,
+            400,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("settled");
+        s.act("replace the anchor", || which.set(true));
+        s.settle().expect("settled");
+        let anchor = bounds_of(&s, "the-anchor");
+        let content = bounds_of(&s, "popover-content");
+        let gap = content.y - (anchor.y + anchor.height);
+        assert!(
+            (0.0..50.0).contains(&gap),
+            "the content just below the new anchor: {content:?} against {anchor:?}"
+        );
     }
 }

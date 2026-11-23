@@ -146,7 +146,7 @@ impl Composer {
                 .padding(12.0)
                 .on_submit({
                     let send = send.clone();
-                    move || send.submit()
+                    move |()| send.submit()
                 }),
         );
         let group = match self.attachments().filter(|_| files) {

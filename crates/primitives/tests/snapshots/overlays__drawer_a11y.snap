@@ -1,0 +1,13 @@
+---
+source: crates/primitives/tests/overlays.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer hidden
+    Button haspopup=Dialog expanded=true controls=Dialog
+      Label "Open"
+  GenericContainer
+    Dialog modal labelled-by=Move goal
+      Heading "Move goal" level=2
+      GenericContainer
+        Label "Submit"

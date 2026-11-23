@@ -206,7 +206,7 @@ impl Part<SidebarProps> {
 
     /// Called with each new open state (`@update:open`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.open = std::mem::take(&mut p.open).on_change(f))
     }
 

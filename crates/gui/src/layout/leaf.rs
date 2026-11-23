@@ -3,7 +3,6 @@
 //! that lays it out.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use taffy::{AvailableSpace, Baselines, Size};
 
@@ -19,9 +18,12 @@ use crate::text::{InlineSlot, Paragraph, Run, TextMetrics, TextSystem};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Leaf {
     Text {
-        content: String,
+        /// Shared with the frame node that shows it.
+        content: std::sync::Arc<str>,
         text: ResolvedText,
-        runs: Vec<Run>,
+        /// Paint taken out ([`Leaf::measuring_run`]); shared with the
+        /// last leaf while they compare equal.
+        runs: std::sync::Arc<[Run]>,
         /// The [`crate::text::OBJECT`]s its atomic inlines stand on, in
         /// order: one to each of the layout node's children, and one to
         /// each inline that took no space, which stays empty.
@@ -29,7 +31,10 @@ pub enum Leaf {
     },
     Image(ImageMeasure),
     Input {
-        content: String,
+        /// What it shows, shared with its frame node
+        /// ([`crate::edit::Shown`]): it measures again only when that
+        /// changes, not as its caret moves.
+        content: std::sync::Arc<str>,
         text: ResolvedText,
         multiline: bool,
     },
@@ -50,15 +55,12 @@ impl Leaf {
                 content,
                 objects,
                 text: shape(text),
-                runs: runs
-                    .into_iter()
-                    .map(|r| Run {
-                        text: shape(r.text),
-                        background: None,
-                        radius: 0.0,
-                        ..r
-                    })
-                    .collect(),
+                // Most come with paint already out, and stay shared.
+                runs: if runs.iter().all(|r| *r == Self::measuring_run(r)) {
+                    runs
+                } else {
+                    runs.iter().map(Self::measuring_run).collect()
+                },
             },
             Self::Input {
                 content,
@@ -70,6 +72,61 @@ impl Leaf {
                 multiline,
             },
             image @ Self::Image(_) => image,
+        }
+    }
+}
+
+impl Leaf {
+    /// `a` and `b` measure alike but for their inline objects, which
+    /// `lay_objects` sets once the paragraph's children are patched.
+    #[must_use]
+    pub fn same_but_objects(a: Option<&Self>, b: Option<&Self>) -> bool {
+        match (a, b) {
+            (
+                Some(Self::Text {
+                    content: c0,
+                    text: t0,
+                    runs: r0,
+                    ..
+                }),
+                Some(Self::Text {
+                    content: c1,
+                    text: t1,
+                    runs: r1,
+                    ..
+                }),
+            ) => c0 == c1 && t0 == t1 && r0 == r1,
+            (
+                Some(Self::Input {
+                    content: c0,
+                    text: t0,
+                    multiline: m0,
+                }),
+                Some(Self::Input {
+                    content: c1,
+                    text: t1,
+                    multiline: m1,
+                }),
+            ) => crate::edit::same_text(c0, c1) && t0 == t1 && m0 == m1,
+            (a, b) => a == b,
+        }
+    }
+
+    /// `run` with what only paints taken out: its top and bottom padding
+    /// too, which grow its background and not its line (CSS pads a
+    /// non-replaced inline box so, CSS 2.1 §10.8.1).
+    #[must_use]
+    pub fn measuring_run(run: &Run) -> Run {
+        Run {
+            text: ResolvedText::shape(run.text.clone()),
+            background: None,
+            radius: 0.0,
+            padding: crate::style::Edges {
+                top: 0.0,
+                bottom: 0.0,
+                ..run.padding
+            },
+            range: run.range.clone(),
         }
     }
 }
@@ -89,35 +146,30 @@ const EMPTY_OBJECT: u64 = 1 << 62;
 
 /// The boxes of `objects` in their paragraph, `boxes` (one to a child) the
 /// children's, each named by its child's index.
-#[must_use]
-pub fn slots(objects: &[Object], boxes: &[InlineBox]) -> Vec<InlineSlot> {
+pub fn slots<'a>(objects: &'a [Object], boxes: &'a [InlineBox]) -> impl Iterator<Item = InlineSlot> + 'a {
     let mut child = 0_usize;
-    objects
-        .iter()
-        .enumerate()
-        .map(|(j, o)| {
-            if o.laid {
-                let b = boxes.get(child).copied().unwrap_or_default();
-                let id = u64::try_from(child).unwrap_or(0);
-                child = child.saturating_add(1);
-                InlineSlot {
-                    at: o.at,
-                    width: b.width,
-                    height: b.height,
-                    baseline: b.baseline,
-                    id,
-                }
-            } else {
-                InlineSlot {
-                    at: o.at,
-                    width: 0.0,
-                    height: 0.0,
-                    baseline: None,
-                    id: EMPTY_OBJECT | u64::try_from(j).unwrap_or(0),
-                }
+    objects.iter().enumerate().map(move |(j, o)| {
+        if o.laid {
+            let b = boxes.get(child).copied().unwrap_or_default();
+            let id = u64::try_from(child).unwrap_or(0);
+            child = child.saturating_add(1);
+            InlineSlot {
+                at: o.at,
+                width: b.width,
+                height: b.height,
+                baseline: b.baseline,
+                id,
             }
-        })
-        .collect()
+        } else {
+            InlineSlot {
+                at: o.at,
+                width: 0.0,
+                height: 0.0,
+                baseline: None,
+                id: EMPTY_OBJECT | u64::try_from(j).unwrap_or(0),
+            }
+        }
+    })
 }
 
 /// What an image's box is sized from: its natural size, and which of its
@@ -203,7 +255,7 @@ impl Measure for Leaf {
         matches!(self, Self::Image(_))
     }
 
-    fn place_inline(&self, text: &mut TextSystem, width: f32, boxes: &[InlineBox]) -> Vec<taffy::Point<f32>> {
+    fn place_inline(&self, text: &mut TextSystem, width: f32, boxes: &[InlineBox]) -> Vec<(taffy::Point<f32>, bool)> {
         self.placed(text, width, boxes)
     }
 
@@ -225,7 +277,7 @@ impl Measure for Leaf {
                 runs,
                 objects,
             } => {
-                let boxes = slots(objects, boxes);
+                let boxes: Vec<InlineSlot> = slots(objects, boxes).collect();
                 let p = Paragraph {
                     content,
                     runs,
@@ -259,7 +311,8 @@ impl Measure for Leaf {
                 multiline,
             } => {
                 if *multiline {
-                    let m = text.metrics(content.as_str(), t, width_constraint(known.width, available.width));
+                    let content: &str = content;
+                    let m = text.metrics(content, t, width_constraint(known.width, available.width));
                     // An empty field still has a line, and its baseline.
                     let lines = if content.is_empty() {
                         text.metrics(" ", t, None)
@@ -285,9 +338,10 @@ impl Measure for Leaf {
 }
 
 impl Leaf {
-    /// Where a paragraph's children sit in a content box `width` wide.
-    fn placed(&self, text: &mut TextSystem, width: f32, boxes: &[InlineBox]) -> Vec<taffy::Point<f32>> {
-        let mut at = vec![taffy::Point::ZERO; boxes.len()];
+    /// Where a paragraph's children sit in a content box `width` wide, and
+    /// whether each shows (a clamp or a cut hides it).
+    fn placed(&self, text: &mut TextSystem, width: f32, boxes: &[InlineBox]) -> Vec<(taffy::Point<f32>, bool)> {
+        let mut at = vec![(taffy::Point::ZERO, true); boxes.len()];
         let Self::Text {
             content,
             text: t,
@@ -297,15 +351,21 @@ impl Leaf {
         else {
             return at;
         };
-        let slots = slots(objects, boxes);
+        let slots: Vec<InlineSlot> = slots(objects, boxes).collect();
         let p = Paragraph {
             content,
             runs,
             boxes: &slots,
         };
-        for (id, b) in text.inline_boxes(p, t, wrap_width(t, width)) {
-            if let Some(place) = usize::try_from(id).ok().and_then(|i| at.get_mut(i)) {
-                *place = taffy::Point { x: b.x, y: b.y };
+        for b in text.placed_inline_boxes(p, t, wrap_width(t, width)) {
+            if let Some(place) = usize::try_from(b.id).ok().and_then(|i| at.get_mut(i)) {
+                *place = (
+                    taffy::Point {
+                        x: b.bounds.x,
+                        y: b.bounds.y,
+                    },
+                    b.shown,
+                );
             }
         }
         at
@@ -323,14 +383,14 @@ fn measured(width: f32, height: f32, lines: TextMetrics) -> Measured {
     }
 }
 
-/// A pool thread measured text this pass.
-static USED: AtomicBool = AtomicBool::new(false);
-
 /// End a layout pass: the pool threads forget what they shaped (the
 /// layout tree keeps the answers it gave), so it is not held twice, nor
-/// past the pass while the pool idles.
+/// past the pass while the pool idles. Each pass that handed the pool jobs
+/// clears after them itself, whatever another thread's pass (the pool is
+/// shared) did meanwhile: no flag passes share decides it. A pass that
+/// handed it none (one that changed only what paints) touches nothing.
 pub(crate) fn end_pass() {
-    if USED.swap(false, Ordering::Relaxed) {
+    if super::engine::take_dispatched() {
         super::engine::pool().broadcast(|_| {
             IDLE.with(|idle| {
                 for text in idle.borrow_mut().iter_mut() {
@@ -341,11 +401,20 @@ pub(crate) fn end_pass() {
     }
 }
 
-thread_local! {
+/// Pieces of text the pool threads' idle text systems hold shaped.
+#[cfg(test)]
+pub(crate) fn idle_footprint() -> usize {
+    super::engine::pool()
+        .broadcast(|_| IDLE.with(|idle| idle.borrow().iter().map(TextSystem::footprint).sum::<usize>()))
+        .into_iter()
+        .sum()
+}
+
+crate::engine::engine_local! {
     /// This pool thread's text system. A job that waits on nested
     /// parallel work may run another job on the same thread meanwhile,
     /// which takes a second one for as long as it runs.
-    static IDLE: RefCell<Vec<TextSystem>> = const { RefCell::new(Vec::new()) };
+    [Fresh] static IDLE: RefCell<Vec<TextSystem>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Give each pool thread its text system up front, so the pool's memory is
@@ -363,7 +432,6 @@ impl Worker for TextSystem {
     }
 
     fn with_worker<R>(f: impl FnOnce(&mut Self) -> R) -> R {
-        USED.store(true, Ordering::Relaxed);
         let mut text = IDLE.with(|idle| idle.borrow_mut().pop()).unwrap_or_default();
         let out = f(&mut text);
         IDLE.with(|idle| {

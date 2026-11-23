@@ -23,7 +23,7 @@ use gui::{Color, Element, Scenario, Signal, TextField, div, text, text_input};
 
 /// A settings card: a heading, a labelled field, a checkbox, a list of
 /// three, and two buttons, one disabled. Clicking "Remember me" toggles it.
-fn settings() -> impl FnMut() -> Element + 'static {
+fn settings() -> impl Fn() -> Element + 'static {
     let remember = Signal::labeled("remember", false);
     let name = TextField::new("");
     move || {

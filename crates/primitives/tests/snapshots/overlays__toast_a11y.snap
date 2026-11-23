@@ -1,0 +1,13 @@
+---
+source: crates/primitives/tests/overlays.rs
+expression: a11y(&s)
+---
+Window "w"
+  Region "Notifications"
+    GenericContainer
+      Status "Notification. Failed." live=Assertive
+      Status "Notification. Saved." live=Polite
+    Group
+      Label "Saved"
+    Group
+      Label "Failed"

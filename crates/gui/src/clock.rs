@@ -46,14 +46,72 @@ pub fn instant(seconds: f32) -> Instant {
     start().checked_add(d).unwrap_or_else(start)
 }
 
-thread_local! {
+crate::engine::engine_local! {
     /// The time frames read, fixed per frame so one frame is consistent.
-    static FRAME_TIME: Cell<Option<f32>> = const { Cell::new(None) };
+    [Fork] static FRAME_TIME: Cell<Option<f32>> = const { Cell::new(None) };
     /// Where a script has set the clock, once one drives it.
-    static SCRIPTED: Cell<Option<Duration>> = const { Cell::new(None) };
-    static WANTS_FRAME: Cell<bool> = const { Cell::new(false) };
-    static TIMERS: RefCell<Vec<Timer>> = const { RefCell::new(Vec::new()) };
-    static NEXT_TIMER: Cell<u64> = const { Cell::new(1) };
+    [Fork] static SCRIPTED: Cell<Option<Duration>> = const { Cell::new(None) };
+    [Fork] static WANTS_FRAME: Cell<bool> = const { Cell::new(false) };
+    /// A cold frame's timers are its own; the live ones it can only see
+    /// ([`Queue`]).
+    [Fork(cold_enter, cold_drain, cold_exit)] static TIMERS: RefCell<Queue> = RefCell::new(Queue::default());
+    [Fork] static NEXT_TIMER: Cell<u64> = const { Cell::new(1) };
+}
+
+/// The timers pending. In a cold frame, `timers` are the frame's (none at
+/// first, never run live), and the live ones are set aside where the
+/// frame reads, never runs or changes them: whether one is pending
+/// ([`is_pending`]) answers as it does live.
+#[derive(Default)]
+struct Queue {
+    timers: Vec<Timer>,
+    /// While a cold frame runs: the live timers, and those of them the
+    /// frame cancelled (for its own reads only).
+    live: Option<(Vec<Timer>, Vec<u64>)>,
+}
+
+impl Queue {
+    fn is_pending(&self, id: u64) -> bool {
+        self.timers.iter().any(|x| x.id == id)
+            || self
+                .live
+                .as_ref()
+                .is_some_and(|(live, gone)| !gone.contains(&id) && live.iter().any(|x| x.id == id))
+    }
+
+    fn cancel(&mut self, id: u64) {
+        self.timers.retain(|x| x.id != id);
+        if let Some((live, gone)) = self.live.as_mut()
+            && live.iter().any(|x| x.id == id)
+        {
+            gone.push(id);
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn cold_enter() -> Box<dyn std::any::Any> {
+    crate::engine::fork_work(1);
+    TIMERS.with(|t| {
+        let mut q = t.borrow_mut();
+        let live = std::mem::take(&mut q.timers);
+        q.live = Some((live, Vec::new()));
+    });
+    Box::new(())
+}
+
+#[cfg(debug_assertions)]
+fn cold_drain(_: &dyn std::any::Any) -> Box<dyn std::any::Any> {
+    Box::new(TIMERS.with(|t| std::mem::take(&mut t.borrow_mut().timers)))
+}
+
+#[cfg(debug_assertions)]
+fn cold_exit(_: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
+    TIMERS.with(|t| {
+        let mut q = t.borrow_mut();
+        let live = q.live.take().map(|(live, _)| live).unwrap_or_default();
+        Box::new(std::mem::replace(&mut q.timers, live))
+    })
 }
 
 /// The time on the clock: since the app started, or where a script set it.
@@ -65,6 +123,14 @@ fn current() -> Duration {
 #[must_use]
 pub fn scripted() -> bool {
     SCRIPTED.with(Cell::get).is_some()
+}
+
+/// The time on the clock now, exact: real time, or where a script set it.
+/// For what measures spans (a swipe's speed, a countdown's time left),
+/// which `f32` seconds quantize after days of uptime.
+#[must_use]
+pub fn current_time() -> Duration {
+    current()
 }
 
 /// The time on the clock now, in seconds: real time, or where a script set it.
@@ -102,7 +168,7 @@ pub fn take_frame_request() -> bool {
 pub fn script(at: Duration) {
     let was = current();
     TIMERS.with(|t| {
-        for timer in t.borrow_mut().iter_mut() {
+        for timer in t.borrow_mut().timers.iter_mut() {
             timer.due = at.saturating_add(timer.due.saturating_sub(was));
         }
     });
@@ -132,7 +198,7 @@ fn set_scripted(at: Duration) {
 /// Remove and return the earliest timer due by `by`.
 fn take_due(by: Duration) -> Option<Timer> {
     TIMERS.with(|t| {
-        let mut timers = t.borrow_mut();
+        let timers = &mut t.borrow_mut().timers;
         let first = timers
             .iter()
             .enumerate()
@@ -157,7 +223,7 @@ pub fn after(delay: Duration, f: impl Fn() + 'static) -> TimerId {
         id
     });
     TIMERS.with(|t| {
-        t.borrow_mut().push(Timer {
+        t.borrow_mut().timers.push(Timer {
             due: current().saturating_add(delay),
             id,
             run: Rc::new(f),
@@ -173,12 +239,18 @@ pub fn after(delay: Duration, f: impl Fn() + 'static) -> TimerId {
 /// Drop every scheduled call, for a run that starts afresh (a scenario of
 /// another page on the same thread).
 pub fn cancel_all() {
-    TIMERS.with(|t| t.borrow_mut().clear());
+    TIMERS.with(|t| t.borrow_mut().timers.clear());
+}
+
+/// Whether a scheduled call has not run yet (nor been dropped).
+#[must_use]
+pub fn is_pending(timer: TimerId) -> bool {
+    TIMERS.with(|t| t.borrow().is_pending(timer.0))
 }
 
 /// Drop a scheduled call that has not run yet.
 pub fn cancel(timer: TimerId) {
-    TIMERS.with(|t| t.borrow_mut().retain(|x| x.id != timer.0));
+    TIMERS.with(|t| t.borrow_mut().cancel(timer.0));
 }
 
 /// Run every timer that is due, earliest first; returns whether any ran.
@@ -195,13 +267,13 @@ pub fn run_due_timers() -> bool {
 /// When the last timer due by `by` on the clock is due, if one is pending.
 #[must_use]
 pub fn last_due_by(by: Duration) -> Option<Duration> {
-    TIMERS.with(|t| t.borrow().iter().map(|x| x.due).filter(|&due| due <= by).max())
+    TIMERS.with(|t| t.borrow().timers.iter().map(|x| x.due).filter(|&due| due <= by).max())
 }
 
 /// When the next timer is due, in real time.
 #[must_use]
 pub fn next_deadline() -> Option<Instant> {
-    let due = TIMERS.with(|t| t.borrow().iter().map(|x| x.due).min())?;
+    let due = TIMERS.with(|t| t.borrow().timers.iter().map(|x| x.due).min())?;
     start().checked_add(due)
 }
 

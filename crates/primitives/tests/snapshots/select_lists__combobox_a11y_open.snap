@@ -1,0 +1,21 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      ComboBox "apple" expanded=true autocomplete=List active=ListBoxOption controls=ListBox
+        TextRun "apple"
+    GenericContainer
+  ListBox
+    ListBoxOption selected=true
+      Label "Apple"
+    ListBoxOption selected=false
+      Label "Banana"
+    ListBoxOption selected=false disabled
+      Label "Blueberry" disabled
+    ListBoxOption selected=false
+      Label "Cherry"
+    ListBoxOption selected=false
+      Label "Grapes"

@@ -79,6 +79,14 @@ pub fn graph() -> Graph {
     })
 }
 
+/// How many cleanups ([`crate::reactive::on_cleanup`]) the live owners on
+/// this thread hold: what disposing them would run. A long-lived owner
+/// whose count keeps growing keeps what each cleanup holds.
+#[must_use]
+pub fn cleanups() -> usize {
+    runtime::with(|rt| rt.cleanup_count())
+}
+
 /// The bytes this thread's reactive arena holds (nodes, links, queues; the
 /// values signals hold aside): the reactive owner in the memory report.
 #[must_use]
@@ -92,17 +100,20 @@ pub fn held_bytes() -> u64 {
 /// functions made for its type, no allocation per signal.
 type Snapshot = fn(NodeId) -> Option<SignalValue>;
 
+#[derive(Clone)]
 struct Probe {
     id: NodeId,
     snapshot: Snapshot,
     write: fn(NodeId, &str) -> Option<Result<(), String>>,
 }
 
-thread_local! {
-    static PROBES: RefCell<Vec<Probe>> = const { RefCell::new(Vec::new()) };
+crate::engine::engine_local! {
+    /// The labelled signals the devtools read. A cold frame's labels are
+    /// its own, thrown away with it.
+    [Fresh] static PROBES: RefCell<Vec<Probe>> = const { RefCell::new(Vec::new()) };
     /// The length at which the list is next swept of disposed signals:
     /// twice what lived at the last sweep, so labelling stays linear.
-    static SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
+    [Fresh] static SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
 }
 
 pub(crate) fn register_probe<T: fmt::Debug + 'static>(id: NodeId) {

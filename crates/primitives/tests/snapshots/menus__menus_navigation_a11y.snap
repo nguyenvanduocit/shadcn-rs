@@ -1,0 +1,23 @@
+---
+source: crates/primitives/tests/menus.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer
+    Navigation
+      List
+        ListItem
+          Button expanded=true controls=GenericContainer owns=GenericContainer
+            Label "One"
+        ListItem
+          Button expanded=false
+            Label "Two"
+        Link
+          Label "Docs"
+    GenericContainer
+      Label "Page"
+  GenericContainer labelled-by=Button
+    Link current=Page
+      Label "One link 0"
+    Link
+      Label "One link 1"

@@ -1,7 +1,7 @@
 use gui::layout::Content;
 use gui::prelude::*;
 use gui::{ScenarioError, Signal, div, text_bound};
-use shadcn::{CalendarDate, RangeCalendarValue, range_calendar, theme};
+use shadcn::{CalendarDate, DateRange, range_calendar, theme};
 
 use crate::{Render, Shot, demo, page, section};
 
@@ -11,20 +11,17 @@ fn today() -> CalendarDate {
     crate::verdict::today()
 }
 
-fn describe(value: RangeCalendarValue) -> String {
+fn describe(value: DateRange) -> String {
     let day = |d: CalendarDate| format!("{} {}", d.month_name(), d.day());
-    match value {
-        RangeCalendarValue::Empty => "No range picked".to_owned(),
-        RangeCalendarValue::Started(start) => format!("From {}, pick the end", day(start)),
-        RangeCalendarValue::Range { start, end } => format!("{} to {}", day(start), day(end)),
+    match (value.start, value.end) {
+        (None, None) => "No range picked".to_owned(),
+        (Some(start), None) | (None, Some(start)) => format!("From {}, pick the end", day(start)),
+        (Some(start), Some(end)) => format!("{} to {}", day(start), day(end)),
     }
 }
 
 pub fn render() -> Render {
-    let value = Signal::labeled(
-        "range calendar value",
-        RangeCalendarValue::between(today(), today().add_days(7)),
-    );
+    let value = Signal::labeled("range calendar value", DateRange::between(today(), today().add_days(7)));
     Box::new(move || {
         let t = theme();
         page(
@@ -79,7 +76,7 @@ fn nth_text(s: &Shot, label: &str, n: usize) -> Result<(f32, f32), ScenarioError
     s.last()
         .nodes
         .iter()
-        .filter(|node| matches!(&node.content, Content::Text { content, .. } if content == label))
+        .filter(|node| matches!(&node.content, Content::Text { content, .. } if &**content == label))
         .nth(n)
         .map(|node| {
             (

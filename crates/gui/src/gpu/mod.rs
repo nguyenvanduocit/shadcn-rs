@@ -36,6 +36,7 @@
 mod arena;
 mod atlas;
 mod chunks;
+mod clips;
 mod cold;
 mod damage;
 mod frame;
@@ -82,7 +83,7 @@ const MAX_LCD_PPEM: f32 = 48.0;
 /// curves (glifo's cap, ADR-0016).
 const MAX_ATLAS_PPEM: f32 = 128.0;
 /// Bytes of globals a pass reads (`Globals` in `shaders.wgsl`).
-const GLOBALS: u64 = 32;
+const GLOBALS: u64 = 64;
 
 /// Why the GPU renderer could not start.
 #[derive(Debug)]
@@ -307,6 +308,10 @@ impl Ids {
     }
 }
 
+/// What a device's lost callback runs: whoever must hear of the loss
+/// at once, as it comes (on a thread of the driver's).
+type LostWaker = Arc<std::sync::Mutex<Option<Box<dyn Fn() + Send>>>>;
+
 /// The GPU renderer, for a window or headless.
 pub struct GpuRenderer {
     /// What it was made from, to make it again when its device is lost
@@ -315,6 +320,9 @@ pub struct GpuRenderer {
     options: GpuOptions,
     /// Set by the device's lost callback (a driver reset, a GPU removed).
     lost: Arc<std::sync::atomic::AtomicBool>,
+    /// What the lost callback runs after setting `lost` ([`Self::wake_on_lost`]),
+    /// kept across [`Self::rebuild`].
+    wake: LostWaker,
     device: wgpu::Device,
     queue: wgpu::Queue,
     format: wgpu::TextureFormat,
@@ -394,6 +402,10 @@ pub struct GpuRenderer {
     reads: read::Reads,
     /// Kept chunks that blur a backdrop: canvas damage then grows around them.
     blurring: usize,
+    /// The scene's clips as the shaders walk them, kept across frames.
+    clip_tree: clips::ClipTree,
+    /// The canvas's clip tree while a capture draws with its own.
+    parked_tree: Option<clips::ClipTree>,
     pclips: Scratch,
     stops: Scratch,
     slug_instances: Scratch,
@@ -465,7 +477,8 @@ impl GpuRenderer {
             .copied()
             .find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .ok_or_else(|| GpuError("no 8-bit unorm surface format".to_owned()))?;
-        let mut renderer = Self::with_adapter(&instance, &adapter, format, GpuOptions::default())?;
+        let mut renderer =
+            Self::with_adapter(&instance, &adapter, format, GpuOptions::default(), LostWaker::default())?;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -513,7 +526,13 @@ impl GpuRenderer {
         let instance = instance();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
             .map_err(|e| GpuError(format!("adapter: {e}")))?;
-        Self::with_adapter(&instance, &adapter, wgpu::TextureFormat::Rgba8Unorm, options)
+        Self::with_adapter(
+            &instance,
+            &adapter,
+            wgpu::TextureFormat::Rgba8Unorm,
+            options,
+            LostWaker::default(),
+        )
     }
 
     /// Whether its device was lost: nothing it holds draws any more, and
@@ -521,6 +540,20 @@ impl GpuRenderer {
     #[must_use]
     pub fn lost(&self) -> bool {
         self.lost.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Run `wake` each time a device of its is lost, as the loss is
+    /// reported (on a thread of the driver's), after [`Self::lost`] turns
+    /// true: a render thread asleep on its channel is woken to make the
+    /// device again (ADR-0015's invariant 7). Kept across [`Self::rebuild`].
+    pub fn wake_on_lost(&self, wake: impl Fn() + Send + 'static) {
+        *self.wake.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(wake));
+    }
+
+    /// Its device, to lose it from another thread (tests).
+    #[cfg(test)]
+    pub(crate) fn device(&self) -> wgpu::Device {
+        self.device.clone()
     }
 
     /// Lose the device, as a driver reset would (tests, the devtools).
@@ -546,7 +579,13 @@ impl GpuRenderer {
             ..Default::default()
         }))
         .map_err(|e| GpuError(format!("adapter: {e}")))?;
-        let mut fresh = Self::with_adapter(&self.instance, &adapter, self.format, self.options)?;
+        let mut fresh = Self::with_adapter(
+            &self.instance,
+            &adapter,
+            self.format,
+            self.options,
+            Arc::clone(&self.wake),
+        )?;
         if let Some(mut w) = self.window.take() {
             // A texture of the lost device is never presented.
             w.frame = None;
@@ -565,6 +604,7 @@ impl GpuRenderer {
         adapter: &wgpu::Adapter,
         format: wgpu::TextureFormat,
         options: GpuOptions,
+        wake: LostWaker,
     ) -> Result<Self, GpuError> {
         let needed = wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::INDIRECT_EXECUTION;
         if !adapter.get_downlevel_capabilities().flags.contains(needed) {
@@ -586,7 +626,15 @@ impl GpuRenderer {
         .map_err(|e| GpuError(format!("device: {e}")))?;
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let on_lost = Arc::clone(&lost);
-        device.set_device_lost_callback(move |_, _| on_lost.store(true, std::sync::atomic::Ordering::Release));
+        let waker = Arc::clone(&wake);
+        device.set_device_lost_callback(move |_, _| {
+            on_lost.store(true, std::sync::atomic::Ordering::Release);
+            // A thread asleep waiting for work hears of it now, not at
+            // its next message.
+            if let Some(wake) = waker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref() {
+                wake();
+            }
+        });
         let texture_entry = |binding: u32, dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -950,6 +998,7 @@ impl GpuRenderer {
             instance: instance.clone(),
             options,
             lost,
+            wake,
             dual_source,
             foreground: foldhash::HashMap::default(),
             gamma_texture,
@@ -979,7 +1028,7 @@ impl GpuRenderer {
             props: Table::new(&device, "gui properties"),
             tables: frame::Tables::default(),
             planned: None,
-            cold_plan: std::env::var_os("GUI_COLD_CHECK").is_some(),
+            cold_plan: cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some(),
             image_refs: foldhash::HashMap::default(),
             transient_ids: Vec::new(),
             swept: false,
@@ -997,6 +1046,8 @@ impl GpuRenderer {
             fr: FrameData::default(),
             reads: read::Reads::new(&device),
             blurring: 0,
+            clip_tree: clips::ClipTree::default(),
+            parked_tree: None,
             pclips: Scratch::new(&device, "gui clips", storage_usage, 1 << 12),
             stops: Scratch::new(&device, "gui stops", storage_usage, 1 << 12),
             slug_instances: Scratch::new(&device, "gui curve glyphs", storage_usage, 1 << 12),

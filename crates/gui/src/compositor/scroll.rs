@@ -6,7 +6,7 @@
 
 use foldhash::HashMap;
 
-use super::{NodeKey, ScrollDelta, ScrollNode};
+use super::{ScrollDelta, ScrollNode};
 
 /// A scroll container a wheel scrolls, by index in the scene's scrollers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +174,8 @@ impl Fling {
 /// A precise wheel gesture (a trackpad's) the compositor resamples.
 #[derive(Clone, Debug)]
 struct Gesture {
-    target: NodeKey,
+    /// The scroll container's instance ([`ScrollNode::instance`]).
+    target: u64,
     predictor: ScrollPredictor,
     /// Its events of the last [`FLING_WINDOW`]: (when, delta).
     recent: Vec<(f32, (f32, f32))>,
@@ -204,18 +205,34 @@ impl Gesture {
     }
 }
 
-/// Every scroll container's synced offset, and the gesture under way.
+/// A scroll container's identity on this side: the instance paint gave it
+/// ([`ScrollNode::instance`]), new for another component instance at its
+/// path and for one that left the tables and came back. Every piece of
+/// per-container state (what is owed, its moves, its scrollbar, its
+/// gesture) is the instance's, so none outlives it.
+pub(super) type ScrollerId = u64;
+
+/// `node`'s identity.
+pub(super) fn id_of(node: &ScrollNode) -> ScrollerId {
+    node.instance
+}
+
+/// Every scroll container's synced offset, and the gesture under way, each
+/// by the container's identity ([`ScrollerId`]).
 pub(super) struct Scrolls {
-    by_key: HashMap<NodeKey, Synced>,
+    by_key: HashMap<ScrollerId, Synced>,
     gesture: Option<Gesture>,
     /// What the compositor moved each container by lately, when: its speed.
-    moves: HashMap<NodeKey, Vec<Moved>>,
+    moves: HashMap<ScrollerId, Vec<Moved>>,
     /// Whether a trackpad gesture is flung on after the fingers lift: the
     /// platform sends no momentum of its own.
     flings: bool,
     /// When the user last scrolled each container: its overlay scrollbar
     /// shows from then, and fades. A program's scroll shows none.
-    touched: HashMap<NodeKey, f32>,
+    touched: HashMap<ScrollerId, f32>,
+    /// The instances the last commit showed ([`Self::committed`]'s, kept
+    /// so a commit allocates nothing).
+    shown: foldhash::HashSet<ScrollerId>,
 }
 
 impl Default for Scrolls {
@@ -226,6 +243,7 @@ impl Default for Scrolls {
             moves: HashMap::default(),
             flings: PLATFORM_FLINGS_NOT,
             touched: HashMap::default(),
+            shown: foldhash::HashSet::default(),
         }
     }
 }
@@ -241,7 +259,7 @@ impl Scrolls {
     /// The offset shown for `node` (at `index` among the scrollers).
     pub(super) fn offset(&self, node: &ScrollNode, _index: u32) -> (f32, f32) {
         let mut o = node.offset;
-        if let Some(s) = self.by_key.get(&node.key) {
+        if let Some(s) = self.by_key.get(&id_of(node)) {
             for (_, d) in &s.sent {
                 o = (o.0 + d.0, o.1 + d.1);
             }
@@ -260,8 +278,13 @@ impl Scrolls {
         self.scroll_node(node, delta, at) != (0.0, 0.0)
     }
 
-    /// Scroll `node` by the wheel's `delta` at `at`; how far it moved, in offsets.
+    /// Scroll `node` by the wheel's `delta` at `at`; how far it moved, in
+    /// offsets. Every move the compositor makes comes here, so here it
+    /// keeps its one rule: a container below a modal layer is not moved.
     fn scroll_node(&mut self, node: &ScrollNode, delta: (f32, f32), at: f32) -> (f32, f32) {
+        if !movable(node) {
+            return (0.0, 0.0);
+        }
         let along = if node.rtl { -delta.0 } else { delta.0 };
         let was = self.offset(node, 0);
         let next = (
@@ -270,24 +293,24 @@ impl Scrolls {
         );
         let moved = (next.0 - was.0, next.1 - was.1);
         if moved != (0.0, 0.0) {
-            let s = self.by_key.entry(node.key).or_insert_with(|| Synced {
+            let s = self.by_key.entry(id_of(node)).or_insert_with(|| Synced {
                 generation: node.generation,
                 ..Synced::default()
             });
             s.pending = (s.pending.0 + moved.0, s.pending.1 + moved.1);
-            let m = self.moves.entry(node.key).or_default();
+            let m = self.moves.entry(id_of(node)).or_default();
             m.retain(|(t, _)| at - *t < SPEED_WINDOW);
             m.push((at, moved));
-            self.touched.insert(node.key, at);
+            self.touched.insert(id_of(node), at);
         }
         moved
     }
 
-    /// The opacity of `key`'s overlay scrollbar at `at`: 1 while the user
+    /// The opacity of `node`'s overlay scrollbar at `at`: 1 while the user
     /// scrolls it and for [`THUMB_SHOWN`] after, then down to 0 over
     /// [`THUMB_FADE`]; 0 at rest.
-    pub(super) fn thumb_opacity(&self, key: NodeKey, at: f32) -> f32 {
-        self.touched.get(&key).map_or(0.0, |&t| {
+    pub(super) fn thumb_opacity(&self, node: &ScrollNode, at: f32) -> f32 {
+        self.touched.get(&id_of(node)).map_or(0.0, |&t| {
             let idle = at - t - THUMB_SHOWN;
             if idle <= 0.0 {
                 1.0
@@ -305,9 +328,10 @@ impl Scrolls {
     /// How fast the compositor scrolls `key` at `at`, offset pixels a
     /// second: a fling's own speed, else what it moved over the last
     /// [`SPEED_WINDOW`], from its first event there to its last.
-    fn speed(&self, key: NodeKey, at: f32) -> (f32, f32) {
+    fn speed(&self, node: &ScrollNode, at: f32) -> (f32, f32) {
+        let key = id_of(node);
         if let Some(g) = &self.gesture
-            && g.target == key
+            && g.target == node.instance
             && let Some((f, _)) = &g.fling
             && f.moving(at)
         {
@@ -334,7 +358,8 @@ impl Scrolls {
 
     /// A precise wheel event of a gesture on `target` at `at`: resampled at
     /// each frame ([`Self::tick`]). `ended`: the fingers lifted, and a fling
-    /// carries it on where the platform has none of its own.
+    /// carries it on where the platform has none of its own. Whether it
+    /// went to a container: none is below a modal layer.
     pub(super) fn gesture(
         &mut self,
         scrollers: &[ScrollNode],
@@ -342,33 +367,37 @@ impl Scrolls {
         delta: (f32, f32),
         at: f32,
         ended: bool,
-    ) {
+    ) -> bool {
         let node = target
             .and_then(|t| usize::try_from(t.0).ok())
-            .and_then(|i| scrollers.get(i));
-        if let Some(node) = node {
-            let fresh = self.gesture.as_ref().is_none_or(|g| {
-                g.target != node.key || g.fling.is_some() || g.predictor.last().is_none_or(|l| at - l > 0.25)
-            });
-            if fresh {
-                self.gesture = Some(Gesture {
-                    target: node.key,
-                    predictor: ScrollPredictor::default(),
-                    recent: Vec::new(),
-                    applied: (0.0, 0.0),
-                    fling: None,
-                });
-            }
-        }
-        let Some(g) = &mut self.gesture else { return };
-        if delta != (0.0, 0.0) && node.is_some() {
+            .and_then(|i| scrollers.get(i))
+            .filter(|n| movable(n));
+        // An event no container takes moves nothing: its end flings
+        // nothing either, whatever gesture ran before it.
+        let Some(node) = node else { return false };
+        let fresh = self.gesture.as_ref().is_none_or(|g| {
+            g.target != node.instance || g.fling.is_some() || g.predictor.last().is_none_or(|l| at - l > 0.25)
+        });
+        let g = match &mut self.gesture {
+            Some(g) if !fresh => g,
+            slot => slot.insert(Gesture {
+                target: node.instance,
+                predictor: ScrollPredictor::default(),
+                recent: Vec::new(),
+                applied: (0.0, 0.0),
+                fling: None,
+            }),
+        };
+        if delta != (0.0, 0.0) {
             g.predictor.push(at, delta);
             g.recent.retain(|(t, _)| at - *t <= FLING_WINDOW);
             g.recent.push((at, delta));
         }
+        // Flung from this gesture's own samples: its container took the end.
         if ended && self.flings && g.fling.is_none() {
             g.fling = Fling::new(at, g.lift_velocity(at)).map(|f| (f, g.predictor.at(at + PREDICT_FOR)));
         }
+        true
     }
 
     /// Move the gesture's scroll container to where its events, resampled
@@ -376,7 +405,8 @@ impl Scrolls {
     pub(super) fn tick(&mut self, scrollers: &[ScrollNode], at: f32) {
         self.touched.retain(|_, t| at < *t + THUMB_SHOWN + THUMB_FADE);
         let Some(mut g) = self.gesture.take() else { return };
-        let Some(node) = scrollers.iter().find(|s| s.key == g.target) else {
+        // Gone, or below a modal layer opened since: its fling stops.
+        let Some(node) = scrollers.iter().find(|s| s.instance == g.target).filter(|n| movable(n)) else {
             return;
         };
         let want = match &g.fling {
@@ -430,18 +460,21 @@ impl Scrolls {
         });
         let mut out = Vec::new();
         for node in scrollers {
-            let speed = self.speed(node.key, at);
+            let speed = self.speed(node, at);
             let reach = (speed.0 * horizon, speed.1 * horizon);
-            let pending = self.by_key.get(&node.key).map_or((0.0, 0.0), |s| s.pending);
+            let synced = self.by_key.get(&id_of(node));
+            let pending = synced.map_or((0.0, 0.0), |s| s.pending);
             if pending == (0.0, 0.0) && reach == (0.0, 0.0) {
                 continue;
             }
             out.push(ScrollDelta {
                 key: node.key,
+                owner: node.owner,
                 delta: pending,
+                generation: synced.map_or(node.generation, |s| s.generation),
                 reach,
             });
-            if let Some(s) = self.by_key.get_mut(&node.key)
+            if let Some(s) = self.by_key.get_mut(&id_of(node))
                 && pending != (0.0, 0.0)
             {
                 s.sent.push((sequence, pending));
@@ -455,23 +488,49 @@ impl Scrolls {
     /// took in is dropped from what is owed, and a container the program
     /// scrolled since forgets what the compositor did before.
     pub(super) fn committed(&mut self, scrollers: &[ScrollNode], answers: u64) {
-        let mut keep: HashMap<NodeKey, Synced> = HashMap::default();
+        // A gesture is its container's, the one shown: gone from the
+        // commit (even if a later one brings back its key), or covered by
+        // a modal layer, it stops at once, its fling too.
+        if self
+            .gesture
+            .as_ref()
+            .is_some_and(|g| !scrollers.iter().any(|s| s.instance == g.target && movable(s)))
+        {
+            self.gesture = None;
+        }
+        // Nothing held for any container (scrollers at rest): nothing to do.
+        if self.by_key.is_empty() && self.moves.is_empty() && self.touched.is_empty() {
+            return;
+        }
+        // An instance gone from the commit is gone for good (one coming
+        // back is another): what is owed it, its moves and its scrollbar go
+        // with it. The set of those shown is one kept, refilled.
+        self.shown.clear();
+        self.shown.extend(scrollers.iter().map(id_of));
+        let shown = &self.shown;
+        self.moves.retain(|id, _| shown.contains(id));
+        self.touched.retain(|id, _| shown.contains(id));
+        self.by_key.retain(|id, _| shown.contains(id));
         for node in scrollers {
-            if let Some(mut s) = self.by_key.remove(&node.key) {
+            if let Some(s) = self.by_key.get_mut(&id_of(node)) {
                 s.sent.retain(|(seq, _)| *seq > answers);
                 if s.generation != node.generation {
-                    s = Synced {
+                    *s = Synced {
                         generation: node.generation,
                         ..Synced::default()
                     };
                 }
-                if s.pending != (0.0, 0.0) || !s.sent.is_empty() {
-                    keep.insert(node.key, s);
-                }
             }
         }
-        self.by_key = keep;
+        self.by_key.retain(|_, s| s.pending != (0.0, 0.0) || !s.sent.is_empty());
     }
+}
+
+/// Whether the compositor may move `node`: never while a modal layer is
+/// over it, whatever path the move comes by (a wheel, a gesture's
+/// resampling, a fling).
+fn movable(node: &ScrollNode) -> bool {
+    !node.below_modal
 }
 
 /// Whether the platform does not fling a trackpad gesture itself (macOS

@@ -40,7 +40,7 @@ use crate::compositor::input_log::{self, Recorder, Routed, Router};
 use crate::compositor::thread::{Feedback, FrameStat, FromRender, Pace, RenderThread, ToRender};
 use crate::compositor::{Commit, Compose, Compositor, MainFrame, Presented};
 use crate::convert::{f64_to_f32, u32_to_f32};
-use crate::events::{ImeEvent, KeyEvent, Modifiers};
+use crate::events::{ImeEvent, KeyEvent, Modifiers, TouchEvent};
 use crate::gpu::GpuRenderer;
 use crate::image::Pixels;
 use crate::interact::ImeTarget;
@@ -57,6 +57,9 @@ pub enum Input {
         y: f32,
     },
     PointerLeft,
+    /// The window lost the keyboard focus: every pointer down is cancelled,
+    /// as Chrome sends `pointercancel` and `lostpointercapture` then.
+    Blur,
     MouseDown {
         x: f32,
         y: f32,
@@ -65,10 +68,13 @@ pub enum Input {
         x: f32,
         y: f32,
     },
-    /// The secondary (right) button went down.
-    SecondaryDown {
+    /// A button other than the primary went down: the secondary (right)
+    /// one, the middle one, or another (back, forward). Only a press counts;
+    /// their releases do nothing in `gui`.
+    ButtonDown {
         x: f32,
         y: f32,
+        button: crate::layer::PointerButton,
     },
     /// Scroll by this many pixels (positive moves the content up / left)
     /// on the UI thread: the devtools' wheel. The platform's wheel scrolls
@@ -77,7 +83,26 @@ pub enum Input {
         dx: f32,
         dy: f32,
     },
+    /// The platform's wheel at `(x, y)`, which the render thread hands on
+    /// (it is over a wheel handler): routed from where it was, under the
+    /// frame it came under, whatever the mouse did since.
+    WheelAt {
+        /// Where and when, and its place in its gesture: the UI latches
+        /// a gesture as the compositor does.
+        step: crate::compositor::WheelStep,
+        dx: f32,
+        dy: f32,
+        /// The node it was over in that frame, which it goes to while it
+        /// is there.
+        target: Option<crate::compositor::HitTarget>,
+    },
     Key(KeyEvent),
+    /// A key held down, sent again by the platform: a key press, but Space
+    /// presses the focused control once per press (a browser activates a
+    /// button on Space's release), so holding it toggles nothing again.
+    KeyRepeat(KeyEvent),
+    /// A finger or a pen touched, moved, lifted or was taken away.
+    Touch(TouchEvent),
     /// An input method composed or committed text.
     Ime(ImeEvent),
     /// Assistive technology asked a node to act (press, focus, set its value).
@@ -101,7 +126,7 @@ pub trait WindowHandler {
     fn frame(&mut self, target: &mut dyn Compose, begin: MainFrame, size: (u32, u32), scale: f32);
     /// React to `input`, which arrived while `presented` was on screen;
     /// return `true` when a frame must follow.
-    fn input(&mut self, input: Input, presented: &Presented) -> bool;
+    fn input(&mut self, input: Input, presented: &Arc<Presented>) -> bool;
     /// The cursor to show where the pointer is.
     fn cursor(&self) -> Cursor;
     /// Where an input method may type, after the last frame; `None` turns
@@ -137,6 +162,8 @@ pub(crate) enum ToUi {
     Render(FromRender),
     Access(AccessEvent),
     Focused,
+    /// The window can (or cannot) be seen.
+    Visible(bool),
     /// The window is this many physical pixels at this scale.
     Resized((u32, u32), f32),
     /// The window's decorations changed.
@@ -186,11 +213,17 @@ pub(crate) struct RenderLink {
     tx: Sender<ToRender>,
     feedback: Feedback,
     presented: Arc<Mutex<Arc<Presented>>>,
+    /// The last commit the render thread applied and sent back.
+    spare: Option<Box<Commit>>,
 }
 
 impl Compose for RenderLink {
-    fn commit(&mut self, commit: Commit, overlay: Option<Scene>) {
-        self.tx.send(ToRender::Commit(Box::new(commit), overlay)).ok();
+    fn commit(&mut self, commit: Box<Commit>, overlay: Option<Scene>) {
+        self.tx.send(ToRender::Commit(commit, overlay)).ok();
+    }
+
+    fn spare(&mut self) -> Option<Box<Commit>> {
+        self.spare.take()
     }
 
     fn overlay(&mut self, overlay: Option<Scene>) {
@@ -302,6 +335,47 @@ impl PointerResampler {
     }
 }
 
+/// The moves of a held button waiting for a frame ([`PointerResampler`]),
+/// with what the screen showed as they came: a move lands where that
+/// frame showed each node. Moves are merged only under one frame shown:
+/// one that comes under another sends those waiting first, each under its
+/// own; and any input that is not such a move sends them before it
+/// ([`Self::flush`]), so nothing overtakes them (a leave is never followed
+/// by a move from before it).
+#[derive(Default)]
+struct HeldMoves {
+    resampler: PointerResampler,
+    /// What was on screen as the moves waiting came.
+    shown: Option<Arc<Presented>>,
+}
+
+/// A move to send, and what was on screen as it came.
+type HeldMove = ((f32, f32), Arc<Presented>);
+
+impl HeldMoves {
+    /// The pointer was at `(x, y)` at `at` seconds, with `shown` on
+    /// screen; the move waiting under another frame shown, to send first.
+    fn push(&mut self, at: f32, x: f32, y: f32, shown: &Arc<Presented>) -> Option<HeldMove> {
+        let other = self.shown.as_ref().is_some_and(|s| !Arc::ptr_eq(s, shown));
+        let first = if other { self.flush() } else { None };
+        self.resampler.push(at, x, y);
+        self.shown = Some(Arc::clone(shown));
+        first
+    }
+
+    /// The move for a frame presented at `present_at`, when one waits.
+    fn sample(&mut self, present_at: f32) -> Option<HeldMove> {
+        let at = self.resampler.sample(present_at)?;
+        Some((at, Arc::clone(self.shown.as_ref()?)))
+    }
+
+    /// The last move waiting, now, and nothing waits after.
+    fn flush(&mut self) -> Option<HeldMove> {
+        let at = self.resampler.flush()?;
+        Some((at, Arc::clone(self.shown.as_ref()?)))
+    }
+}
+
 /// The UI thread's loop: run frames when granted, input as it arrives,
 /// timers and mail when due, and say what the platform must show.
 pub(crate) fn ui_loop(
@@ -317,7 +391,7 @@ pub(crate) fn ui_loop(
     let mut asked = false;
     let mut access = false;
     let mut pressed = false;
-    let mut resampler = PointerResampler::default();
+    let mut held = HeldMoves::default();
     let mut shown: Arc<Presented> = link.presented();
     let mut cursor = None;
     let mut chrome = Chrome::default();
@@ -356,15 +430,25 @@ pub(crate) fn ui_loop(
         let Some(msg) = msg else { continue };
         match msg {
             ToUi::Input(input, at, presented) => {
+                if let Input::PointerMoved { x, y } = input
+                    && pressed
+                {
+                    // A drag: one move a frame, resampled, under the frame
+                    // it came under.
+                    if let Some(first) = held.push(clock::seconds(at), x, y, &presented) {
+                        send_move(handler, first);
+                    }
+                    shown = presented;
+                    wants = true;
+                    continue;
+                }
+                // Anything else goes after the moves held before it.
+                if let Some(last) = held.flush() {
+                    wants |= send_move(handler, last);
+                }
                 shown = presented;
                 let logical = (u32_to_f32(size.0) / scale, u32_to_f32(size.1) / scale);
                 match input {
-                    Input::PointerMoved { x, y } if pressed => {
-                        // A drag: one move a frame, resampled.
-                        resampler.push(clock::seconds(at), x, y);
-                        wants = true;
-                        continue;
-                    }
                     Input::PointerMoved { x, y } => edge = decoration::edge_at(&chrome, logical, x, y),
                     Input::PointerLeft => edge = None,
                     Input::MouseDown { x, y } => {
@@ -376,12 +460,9 @@ pub(crate) fn ui_loop(
                         }
                         pressed = true;
                     }
-                    Input::MouseUp { .. } => {
-                        pressed = false;
-                        if let Some((x, y)) = resampler.flush() {
-                            handler.input(Input::PointerMoved { x, y }, &shown);
-                        }
-                    }
+                    // The press ends, released or cancelled (the moves it
+                    // resampled went first).
+                    Input::MouseUp { .. } | Input::Blur => pressed = false,
                     _ => {}
                 }
                 wants |= handler.input(input, &shown);
@@ -390,8 +471,8 @@ pub(crate) fn ui_loop(
             ToUi::Render(FromRender::Begin(token)) => {
                 asked = false;
                 wants = false;
-                if let Some((x, y)) = resampler.sample(token.present_at) {
-                    handler.input(Input::PointerMoved { x, y }, &shown);
+                if let Some(due) = held.sample(token.present_at) {
+                    send_move(handler, due);
                 }
                 handler.frame(link, token, size, scale);
                 platform(ToPlatform::Ime(handler.ime_target()));
@@ -400,7 +481,21 @@ pub(crate) fn ui_loop(
                     platform(ToPlatform::Access(Box::new(handler.access_update(scale, title))));
                 }
             }
+            ToUi::Render(FromRender::Wheel {
+                step,
+                delta,
+                shown: under,
+                target,
+            }) => {
+                if let Some(last) = held.flush() {
+                    wants |= send_move(handler, last);
+                }
+                let (dx, dy) = delta;
+                wants |= handler.input(Input::WheelAt { step, dx, dy, target }, &under);
+                follow(handler, edge, &mut cursor);
+            }
             ToUi::Render(FromRender::Drawn(f)) => link.feedback = *f,
+            ToUi::Render(FromRender::Spare(c)) => link.spare = Some(c),
             ToUi::Render(FromRender::Lost) => {
                 handler.renderer_lost();
                 wants = true;
@@ -415,6 +510,9 @@ pub(crate) fn ui_loop(
                 platform(ToPlatform::Access(Box::new(handler.access_update(scale, title))));
             }
             ToUi::Access(AccessEvent::Action(request)) => {
+                if let Some(last) = held.flush() {
+                    wants |= send_move(handler, last);
+                }
                 wants |= handler.input(Input::Act(request), &shown);
                 follow(handler, edge, &mut cursor);
             }
@@ -423,9 +521,17 @@ pub(crate) fn ui_loop(
                 handler.access_reset();
             }
             ToUi::Focused => wants |= handler.focused(),
+            ToUi::Visible(visible) => {
+                crate::environment::set_window_visible(visible);
+                wants = true;
+            }
             ToUi::Resized(s, k) => {
                 size = s;
                 scale = k;
+                if k > 0.0 {
+                    let logical = |p: u32| f32::from(u16::try_from(p).unwrap_or(u16::MAX)) / k;
+                    crate::environment::set_window_size((logical(s.0), logical(s.1)));
+                }
                 wants = true;
             }
             ToUi::Chrome(c) => {
@@ -438,10 +544,18 @@ pub(crate) fn ui_loop(
     }
 }
 
+/// Send a held move to `handler`, under the frame it came under.
+fn send_move(handler: &mut dyn WindowHandler, ((x, y), shown): HeldMove) -> bool {
+    handler.input(Input::PointerMoved { x, y }, &shown)
+}
+
 /// The threads of an app, and what links them.
 struct Threads {
     to_ui: Sender<ToUi>,
     to_render: Sender<ToRender>,
+    /// What the device's lost callback wakes the render thread through.
+    #[expect(dead_code, reason = "held: the lost callback holds it weakly")]
+    waker: Arc<Sender<ToRender>>,
     presented: Arc<Mutex<Arc<Presented>>>,
     /// How the OS schedules each thread, as each set it when it started.
     priorities: Arc<Mutex<Vec<(&'static str, Applied)>>>,
@@ -464,6 +578,16 @@ fn spawn(
     let presented = Arc::new(Mutex::new(Arc::new(Presented::default())));
     let priorities = Arc::new(Mutex::new(Vec::new()));
     let ui = to_ui.clone();
+    // A device lost while the render thread sleeps on its channel wakes
+    // it, to be made again at once. Held weakly: the device does not keep
+    // the channel open once the app has let go of it.
+    let waker = Arc::new(to_render.clone());
+    let wake = Arc::downgrade(&waker);
+    gpu.wake_on_lost(move || {
+        if let Some(tx) = wake.upgrade() {
+            tx.send(ToRender::Wake).ok();
+        }
+    });
     let render = RenderThread::new(
         Compositor::new(Glyphs::for_os()),
         gpu,
@@ -487,6 +611,7 @@ fn spawn(
         tx: to_render.clone(),
         feedback: Feedback::default(),
         presented: Arc::clone(&presented),
+        spare: None,
     };
     let mail = to_ui.clone();
     let render_quit = to_render.clone();
@@ -506,6 +631,7 @@ fn spawn(
     Ok(Threads {
         to_ui,
         to_render,
+        waker,
         presented,
         priorities,
     })
@@ -616,6 +742,17 @@ fn cursor_icon(c: Cursor) -> CursorIcon {
         Cursor::Grab => CursorIcon::Grab,
         Cursor::ResizeColumn => CursorIcon::ColResize,
         Cursor::ResizeRow => CursorIcon::RowResize,
+        Cursor::ResizeEastWest => CursorIcon::EwResize,
+        Cursor::ResizeNorthSouth => CursorIcon::NsResize,
+        Cursor::ResizeEast => CursorIcon::EResize,
+        Cursor::ResizeWest => CursorIcon::WResize,
+        Cursor::ResizeNorth => CursorIcon::NResize,
+        Cursor::ResizeSouth => CursorIcon::SResize,
+        Cursor::ResizeNorthEast => CursorIcon::NeResize,
+        Cursor::ResizeNorthWest => CursorIcon::NwResize,
+        Cursor::ResizeSouthEast => CursorIcon::SeResize,
+        Cursor::ResizeSouthWest => CursorIcon::SwResize,
+        Cursor::Move => CursorIcon::Move,
     }
 }
 
@@ -691,9 +828,13 @@ impl Platform {
                 point,
                 delta,
                 precise,
+                began,
                 ended,
             } => {
                 if let Some(s) = &self.state {
+                    // Stamped with the frame on screen as it came: the
+                    // render thread routes it in that frame.
+                    let shown = Arc::clone(&s.threads.presented.lock().unwrap_or_else(PoisonError::into_inner));
                     s.threads
                         .to_render
                         .send(ToRender::Wheel {
@@ -701,7 +842,9 @@ impl Platform {
                             delta,
                             at,
                             precise,
+                            began,
                             ended,
+                            shown,
                         })
                         .ok();
                 }
@@ -901,12 +1044,18 @@ impl ApplicationHandler<UserEvent> for Platform {
                 if focused && let Some(s) = &self.state {
                     s.threads.to_ui.send(ToUi::Focused).ok();
                 }
+                // Losing focus loses the pointers' capture: what they held
+                // is cancelled, in order with the input before it.
+                if !focused {
+                    self.forward(input_log::Event::Blur);
+                }
                 self.follow_chrome();
             }
             WindowEvent::ThemeChanged(_) => self.follow_chrome(),
             WindowEvent::Occluded(hidden) => {
                 if let Some(s) = &self.state {
                     s.threads.to_render.send(ToRender::Visible(!hidden)).ok();
+                    s.threads.to_ui.send(ToUi::Visible(!hidden)).ok();
                 }
             }
             WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. } => {
@@ -1032,7 +1181,9 @@ impl Offscreen {
                 delta,
                 at: Instant::now(),
                 precise,
+                began: false,
                 ended: false,
+                shown: self.presented(),
             })
             .ok();
     }
@@ -1075,9 +1226,16 @@ impl Offscreen {
     /// The last frame, read back.
     #[must_use]
     pub fn capture(&self) -> Option<Pixels> {
+        self.capture_within(Duration::from_secs(5))
+    }
+
+    /// The last frame, read back if the render thread answers within
+    /// `timeout`.
+    #[must_use]
+    pub fn capture_within(&self, timeout: Duration) -> Option<Pixels> {
         let (tx, rx) = mpsc::channel();
         self.threads.to_render.send(ToRender::Capture(None, tx)).ok()?;
-        rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+        rx.recv_timeout(timeout).ok().flatten()
     }
 }
 
@@ -1091,6 +1249,144 @@ impl Drop for Offscreen {
 #[cfg(test)]
 mod tests {
     use super::PointerResampler;
+
+    /// A handler that writes down each input and the frame shown as it came.
+    struct Seen(Vec<String>);
+
+    impl super::WindowHandler for Seen {
+        fn frame(&mut self, _: &mut dyn super::Compose, _: super::MainFrame, _: (u32, u32), _: f32) {}
+        fn input(&mut self, input: super::Input, presented: &std::sync::Arc<super::Presented>) -> bool {
+            self.0.push(format!("{input:?} @{}", presented.frame));
+            false
+        }
+        fn cursor(&self) -> super::Cursor {
+            super::Cursor::Default
+        }
+        fn ime_target(&mut self) -> Option<super::ImeTarget> {
+            None
+        }
+        #[expect(clippy::unreachable, reason = "no screen reader connects in the test")]
+        fn access_update(&mut self, _: f32, _: &str) -> accesskit::TreeUpdate {
+            unreachable!("no screen reader connects")
+        }
+        fn access_reset(&mut self) {}
+        fn idle(&mut self, _: &mut dyn super::Compose) -> super::Wake {
+            super::Wake {
+                redraw: false,
+                animating: false,
+                next_timer: None,
+            }
+        }
+        fn focused(&mut self) -> bool {
+            false
+        }
+        fn renderer_lost(&mut self) {}
+        fn chrome(&mut self, _: super::Chrome) -> bool {
+            false
+        }
+        fn window_actions(&mut self) -> Vec<super::WindowAction> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn held_moves_keep_the_frame_they_came_under_and_go_before_what_follows() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        use super::{FromRender, Input, MainFrame, Presented, ToUi};
+        let (to_ui, rx) = mpsc::channel();
+        let (to_render, _render) = mpsc::channel();
+        let mut link = super::RenderLink {
+            tx: to_render,
+            feedback: super::Feedback::default(),
+            presented: Arc::new(Mutex::new(Arc::new(Presented::default()))),
+            spare: None,
+        };
+        let shown = |frame| {
+            Arc::new(Presented {
+                frame,
+                ..Presented::default()
+            })
+        };
+        let (a, b) = (shown(1), shown(2));
+        let now = std::time::Instant::now();
+        let input = |i, p: &Arc<Presented>| ToUi::Input(i, now, Arc::clone(p));
+        // A drag's moves under two frames shown, then the pointer leaves
+        // before the next frame: each move goes under its own frame, both
+        // before the leave, and none after it.
+        for msg in [
+            input(Input::MouseDown { x: 10.0, y: 10.0 }, &a),
+            input(Input::PointerMoved { x: 20.0, y: 10.0 }, &a),
+            input(Input::PointerMoved { x: 30.0, y: 10.0 }, &b),
+            input(Input::PointerLeft, &b),
+            ToUi::Render(FromRender::Begin(MainFrame::at(1.0))),
+            ToUi::Quit,
+        ] {
+            to_ui.send(msg).ok();
+        }
+        let mut seen = Seen(Vec::new());
+        super::ui_loop(&mut seen, &rx, &mut link, &|_| {}, "test");
+        assert_eq!(
+            seen.0,
+            [
+                "MouseDown { x: 10.0, y: 10.0 } @1",
+                "PointerMoved { x: 20.0, y: 10.0 } @1",
+                "PointerMoved { x: 30.0, y: 10.0 } @2",
+                "PointerLeft @2"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wheel_the_compositor_forwards_keeps_its_own_point_and_frame() {
+        use std::sync::{Arc, Mutex, mpsc};
+
+        use super::{FromRender, Input, Presented, ToUi};
+        let (to_ui, rx) = mpsc::channel();
+        let (to_render, _render) = mpsc::channel();
+        let mut link = super::RenderLink {
+            tx: to_render,
+            feedback: super::Feedback::default(),
+            presented: Arc::new(Mutex::new(Arc::new(Presented::default()))),
+            spare: None,
+        };
+        let shown = |frame| {
+            Arc::new(Presented {
+                frame,
+                ..Presented::default()
+            })
+        };
+        let now = std::time::Instant::now();
+        // The pointer last moved under frame 1 at (10, 10); the compositor
+        // then forwards a wheel it found at (50, 60) under frame 2: the
+        // wheel lands there, under that frame, after the held move.
+        for msg in [
+            ToUi::Input(Input::MouseDown { x: 10.0, y: 10.0 }, now, shown(1)),
+            ToUi::Input(Input::PointerMoved { x: 10.0, y: 10.0 }, now, shown(1)),
+            ToUi::Render(FromRender::Wheel {
+                step: crate::compositor::WheelStep {
+                    point: (50.0, 60.0),
+                    ..crate::compositor::WheelStep::default()
+                },
+                delta: (0.0, 40.0),
+                shown: shown(2),
+                target: None,
+            }),
+            ToUi::Quit,
+        ] {
+            to_ui.send(msg).ok();
+        }
+        let mut seen = Seen(Vec::new());
+        super::ui_loop(&mut seen, &rx, &mut link, &|_| {}, "test");
+        assert_eq!(
+            seen.0,
+            [
+                "MouseDown { x: 10.0, y: 10.0 } @1",
+                "PointerMoved { x: 10.0, y: 10.0 } @1",
+                "WheelAt { step: WheelStep { point: (50.0, 60.0), at: 0.0, precise: false, began: false, ended: false }, dx: 0.0, dy: 40.0, target: None } @2"
+            ]
+        );
+    }
 
     fn close(a: Option<(f32, f32)>, b: (f32, f32)) -> bool {
         a.is_some_and(|a| (a.0 - b.0).abs() < 1e-3 && (a.1 - b.1).abs() < 1e-3)

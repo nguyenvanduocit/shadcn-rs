@@ -1,0 +1,20 @@
+---
+source: crates/primitives/tests/dates.rs
+expression: dump(&tree)
+---
+Window "w"
+  Group
+    SpinButton "Month" value=1 in 1..=12 text="01"
+      Label "01"
+    SpinButton "Day" value=5 in 1..=31 text="05"
+      Label "05"
+    SpinButton "Year" value=2024 in 1..=9999 text="2024"
+      Label "2024"
+    SpinButton "Hours" value=9 in 1..=12 text="09"
+      Label "09"
+    SpinButton "Minutes" value=30 in 0..=59 text="30"
+      Label "30"
+    SpinButton "AM/PM" value=0 in 0..=1 text="AM"
+      Label "AM"
+    Button "Show date picker"
+    GenericContainer

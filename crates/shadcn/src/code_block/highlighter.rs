@@ -3,6 +3,10 @@
 //! `github-dark` colours, from irosashi, a Rust port of Shiki's TextMate
 //! engine whose tokens are byte-identical to it (ADR-0002).
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "a cache of highlighted lines the code block keeps for itself"
+)]
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
@@ -90,11 +94,19 @@ type Lines = Rc<Vec<Vec<HighlightedToken>>>;
 #[derive(Clone)]
 struct Highlighting(Rc<State>);
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "a cache of highlighted lines the code block keeps for itself"
+)]
 struct State {
     highlighter: Option<Highlighter>,
     kept: RefCell<HashMap<(String, &'static str), Lines>>,
 }
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "a cache of highlighted lines the code block keeps for itself"
+)]
 fn highlighting() -> Highlighting {
     use_context::<Highlighting>().unwrap_or_else(|| {
         let h = Highlighting(Rc::new(State {

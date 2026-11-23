@@ -266,8 +266,8 @@ impl Palette {
 pub fn decorate(
     chrome: Signal<Chrome>,
     actions: Actions,
-    mut app: impl FnMut() -> Element + 'static,
-) -> impl FnMut() -> Element + 'static {
+    app: impl Fn() -> Element + 'static,
+) -> impl Fn() -> Element + 'static {
     let caption = Rc::new(RefCell::new(Caption::default()));
     move || {
         let c = chrome.get();
@@ -377,7 +377,7 @@ fn bar(c: &Chrome, p: &Palette, caption: &Rc<RefCell<Caption>>, actions: &Action
                     push(&a_drag, a);
                 }
             }
-            DragPhase::End => drag.borrow_mut().released(),
+            DragPhase::End | DragPhase::Cancel => drag.borrow_mut().released(),
         })
         .on_secondary_click(move |e| {
             let a = menu.borrow_mut().secondary(e.x, e.y);

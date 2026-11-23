@@ -40,12 +40,15 @@ pub(crate) enum ToRender {
     NeedsFrame,
     /// The wheel at `point` (logical window pixels) moved `delta` at `at`:
     /// a trackpad's (`precise`) is resampled, a notched wheel's applied.
+    /// `shown` is the frame on screen as it came: it is routed in that.
     Wheel {
         point: (f32, f32),
         delta: (f32, f32),
         at: Instant,
         precise: bool,
+        began: bool,
         ended: bool,
+        shown: Arc<Presented>,
     },
     /// The window's surface is this many physical pixels now.
     Resize((u32, u32)),
@@ -61,6 +64,10 @@ pub(crate) enum ToRender {
     /// driver reset would, or panic as a bug in the render thread would.
     LoseDevice,
     Panic,
+    /// Nothing but a wake: the device was lost while the thread slept
+    /// ([`crate::gpu::GpuRenderer::wake_on_lost`]), and it is to be made
+    /// again and drawn.
+    Wake,
     Quit,
 }
 
@@ -75,6 +82,19 @@ pub(crate) enum FromRender {
     Lost,
     /// The render thread cannot go on, and why.
     Failed(String),
+    /// A commit applied, emptied: the UI's next frame writes into it.
+    Spare(Box<Commit>),
+    /// A wheel event over a wheel handler, its place in its gesture
+    /// (`step`), `delta` as the UI's `Input::WheelAt` takes it, and the
+    /// frame shown as it came: the UI routes it from there, and may
+    /// consume it.
+    Wheel {
+        step: super::WheelStep,
+        delta: (f32, f32),
+        shown: Arc<Presented>,
+        /// The node it was over in that frame.
+        target: Option<super::HitTarget>,
+    },
 }
 
 /// What the renderer did with a commit, for the UI's reports.
@@ -104,6 +124,9 @@ pub struct FrameStat {
     pub granted: Option<Instant>,
     /// Its compositor-only part: drawn while the UI owed a commit.
     pub without_ui: bool,
+    /// It made a lost device again before drawing (idle recovery, not a
+    /// capture's).
+    pub renewed: bool,
 }
 
 /// How the render thread waits for a vblank.
@@ -336,16 +359,25 @@ impl RenderThread {
         }
     }
 
-    /// Whether there is a frame to draw.
+    /// Whether there is a frame to draw. A lost device is a reason of its
+    /// own, read off the device rather than a flag a frame clears: lost
+    /// while a frame drains the channel or waits for its commit (after the
+    /// frame made sure of its device), the frame draws nothing and clears
+    /// `dirty`, and the device is still to be made again and drawn whole
+    /// before the thread sleeps.
     fn busy(&self) -> bool {
         let now = clock::seconds(Instant::now());
-        self.dirty || (self.wants && self.owed.is_none()) || self.compositor.animating(now) || self.gpu.raster_pending()
+        self.dirty
+            || self.gpu.lost()
+            || (self.wants && self.owed.is_none())
+            || self.compositor.animating(now)
+            || self.gpu.raster_pending()
     }
 
     /// Take in one message; `false` to quit.
-    fn handle(&mut self, msg: ToRender) -> bool {
+    pub(super) fn handle(&mut self, msg: ToRender) -> bool {
         match msg {
-            ToRender::Commit(commit, overlay) => {
+            ToRender::Commit(mut commit, overlay) => {
                 if self.owed.is_some_and(|(seq, _)| seq <= commit.answers) {
                     self.owed = None;
                     self.answered = self.granted.take();
@@ -359,11 +391,14 @@ impl RenderThread {
                 }
                 if self.awaiting_full && !commit.full {
                     // A delta against what a panic dropped.
+                    commit.clear();
+                    (self.to_ui)(FromRender::Spare(commit));
                     return true;
                 }
                 self.awaiting_full = false;
                 self.applied = Some(commit.sequence);
-                self.compositor.apply(*commit);
+                self.compositor.apply(&mut commit);
+                (self.to_ui)(FromRender::Spare(commit));
                 self.compositor.set_overlay(overlay);
                 self.dirty = true;
             }
@@ -377,14 +412,30 @@ impl RenderThread {
                 delta,
                 at,
                 precise,
+                began,
                 ended,
+                shown,
             } => {
-                let moved = if precise {
-                    self.compositor.gesture(point, delta, clock::seconds(at), ended)
-                } else {
-                    self.compositor.wheel(point, delta, clock::seconds(at))
+                let w = super::WheelInput {
+                    point,
+                    delta,
+                    at: clock::seconds(at),
+                    precise,
+                    began,
+                    ended,
+                    seen: shown.frame,
                 };
-                if moved {
+                let wheeled = self.compositor.wheel_input(w);
+                if let super::Wheeled::Ui(target) = wheeled {
+                    (self.to_ui)(FromRender::Wheel {
+                        step: w.step(),
+                        delta,
+                        shown,
+                        target,
+                    });
+                    return true;
+                }
+                if wheeled == super::Wheeled::Scrolled {
                     self.dirty = true;
                     // The UI takes the scroll in with its next frame.
                     self.wants = true;
@@ -407,10 +458,10 @@ impl RenderThread {
                     .flatten();
                 reply.send(pixels).ok();
             }
-            ToRender::LoseDevice => {
-                self.gpu.lose();
-                self.dirty = true;
-            }
+            // Made again by the next frame, which `busy` asks for.
+            ToRender::LoseDevice => self.gpu.lose(),
+            // Woken: `busy` reads the loss off the device.
+            ToRender::Wake => {}
             ToRender::Panic => {
                 #[expect(
                     clippy::panic,
@@ -505,9 +556,11 @@ impl RenderThread {
 
     /// Draw one frame; `false` when the UI thread is gone.
     fn frame(&mut self) -> bool {
+        let was_lost = self.gpu.lost();
         if !self.ensure_device() {
             return true;
         }
+        let renewed = was_lost && !self.gpu.lost();
         let (vblank, waited) = self.wait_vsync();
         let woke = Instant::now();
         self.vsync.acquired(vblank, waited);
@@ -555,6 +608,12 @@ impl RenderThread {
                 Err(RecvTimeoutError::Disconnected) => return false,
             }
         }
+        // The device was lost meanwhile (a message drained above, a driver
+        // reset): nothing it holds draws. The frame is drawn whole on a
+        // device made again, at once, as `busy` keeps the thread awake.
+        if self.gpu.lost() {
+            return true;
+        }
         // Drawn without the commit the UI owes: a compositor-only frame.
         let without_ui = self.owed.is_some();
         let drawing = Instant::now();
@@ -600,6 +659,7 @@ impl RenderThread {
                 ui_took: drew.and(self.ui_took),
                 granted: drew.and(self.answered),
                 without_ui,
+                renewed,
             });
         }
         if drew.is_some() {
@@ -610,5 +670,95 @@ impl RenderThread {
         }
         self.dirty = false;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A render thread on a headless device, ticking every millisecond,
+    /// and the sender of its channel; `None` without a GPU.
+    fn ticking() -> Option<(RenderThread, Sender<ToRender>)> {
+        let gpu = GpuRenderer::headless().ok()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(|_| {}),
+            Arc::new(Mutex::new(Arc::new(Presented::default()))),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        );
+        Some((thread, tx))
+    }
+
+    #[test]
+    fn a_device_lost_while_the_thread_sleeps_wakes_it_to_make_it_again() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        // As the app wires it: the lost callback sends a wake.
+        let wake = tx.clone();
+        gpu.wake_on_lost(move || {
+            wake.send(ToRender::Wake).ok();
+        });
+        let device = gpu.device();
+        let presented = Arc::new(Mutex::new(Arc::new(Presented::default())));
+        let thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(|_| {}),
+            Arc::clone(&presented),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        );
+        let frames = || presented.lock().unwrap_or_else(PoisonError::into_inner).frame;
+        let running = std::thread::spawn(move || thread.run());
+        // Idle: nothing to draw, it sleeps on its channel.
+        std::thread::sleep(Duration::from_millis(100));
+        let before = frames();
+        // The driver reports the loss through the device's own callback,
+        // on this thread; no message is sent for it.
+        device.destroy();
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        let until = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .unwrap_or_else(Instant::now);
+        while frames() == before && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let after = frames();
+        tx.send(ToRender::Quit).ok();
+        running.join().ok();
+        assert!(
+            after > before,
+            "the loss woke the thread, which made its device again and drew"
+        );
+    }
+
+    #[test]
+    fn a_device_lost_while_a_frame_drains_its_channel_keeps_the_thread_awake_until_made_again() {
+        let Some((mut thread, tx)) = ticking() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        assert!(!thread.busy(), "idle: it would sleep");
+        // The loss arrives after the frame made sure of its device, while
+        // it takes in what came during its vsync wait.
+        tx.send(ToRender::LoseDevice).ok();
+        assert!(thread.frame(), "the frame runs");
+        assert!(thread.gpu.lost(), "the device the frame drew on is lost");
+        assert!(thread.busy(), "a lost device keeps it from sleeping");
+        // The next frame makes it again, and then it may sleep.
+        assert!(thread.frame());
+        assert!(!thread.gpu.lost(), "made again");
+        assert!(!thread.busy(), "made again and drawn: it may sleep");
     }
 }

@@ -1,7 +1,7 @@
 use gui::prelude::*;
 use gui::{Icon, Modifiers, NamedKey, ScenarioError, div, icon};
 use shadcn::{
-    Part, SelectModel, ToggleGroupProps, ToggleSize, ToggleVariant, toggle_group, toggle_group_item,
+    Part, ToggleGroupModel, ToggleGroupProps, ToggleSize, ToggleVariant, toggle_group, toggle_group_item,
     toggle_group_multiple,
 };
 
@@ -25,7 +25,7 @@ const BIU: [(&str, Icon); 3] = [
 ];
 
 /// The bold, italic and underline items with their icons.
-fn icons<M: SelectModel>(group: Part<ToggleGroupProps<M>>) -> Part<ToggleGroupProps<M>> {
+fn icons<M: ToggleGroupModel>(group: Part<ToggleGroupProps<M>>) -> Part<ToggleGroupProps<M>> {
     group.children(BIU.map(|(v, i)| toggle_group_item(v).child(icon(i))))
 }
 

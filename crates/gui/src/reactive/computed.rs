@@ -47,28 +47,43 @@ impl<T: PartialEq + 'static> Computed<T> {
     pub fn new(f: impl Fn() -> T + 'static) -> Self {
         let created_at = Location::caller();
         let cell: Rc<Cell<T>> = Rc::new(RefCell::new(None));
-        let store = Rc::clone(&cell);
+        let id = runtime::with(|rt| {
+            let id = rt.alloc(Kind::Computed, flag::NONE, created_at);
+            if let Some(n) = rt.live_mut(id) {
+                n.value = Some(cell);
+            }
+            rt.adopt(id);
+            id
+        });
+        // The value is the node's, found as it computes: a cold frame's copy
+        // of the node keeps its own ([`runtime::cold_owns`]).
         let update: Update = Rc::new(move || {
             let new = f();
+            let Some(Ok(store)) =
+                runtime::with(|rt| rt.live(id).and_then(|n| n.value.clone())).map(Rc::downcast::<Cell<T>>)
+            else {
+                runtime::disposed("computed", created_at);
+            };
             let Ok(mut slot) = store.try_borrow_mut() else {
                 runtime::misuse(&format!("the computed made at {created_at} read itself"));
             };
             if slot.as_ref() == Some(&new) {
                 return false;
             }
+            if runtime::cold_owns(id) {
+                drop(slot);
+                runtime::replace_value(id, Rc::new(RefCell::new(Some(new))));
+                return true;
+            }
             let old = slot.replace(new);
             drop(slot);
             drop(old);
             true
         });
-        let id = runtime::with(|rt| {
-            let id = rt.alloc(Kind::Computed, flag::NONE, created_at);
+        runtime::with(|rt| {
             if let Some(n) = rt.live_mut(id) {
-                n.value = Some(cell);
                 n.update = Some(update);
             }
-            rt.adopt(id);
-            id
         });
         Self {
             id,
@@ -82,11 +97,16 @@ impl<T: 'static> Computed<T> {
     /// Up to date, and subscribed by the running reader.
     fn fresh(&self) -> Rc<Cell<T>> {
         let i = self.id.index;
+        if runtime::with(|rt| rt.live(self.id).is_none()) {
+            runtime::disposed("computed", self.created_at);
+        }
+        runtime::refresh_computed(i);
+        // Fetched once computed: computing may give the node a value of
+        // its own (a cold frame's).
         let value = runtime::with(|rt| rt.live(self.id).and_then(|n| n.value.clone()));
         let Some(Ok(cell)) = value.map(Rc::downcast::<Cell<T>>) else {
             runtime::disposed("computed", self.created_at);
         };
-        runtime::refresh_computed(i);
         runtime::with(|rt| rt.track(i));
         cell
     }

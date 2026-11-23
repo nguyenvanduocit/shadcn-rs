@@ -1,133 +1,88 @@
 //! Resizable (`ui/resizable`): panels in a row or column whose sizes the
 //! user drags the handles between them to change.
 //!
-//! reka's group measures itself on each drag; here the group takes the drag,
-//! since its box is what a move in pixels is a share of, and the handle
-//! pressed names itself on mouse down, which comes first.
+//! The behaviour is `primitives::splitter` (reka's `Splitter`): the layout
+//! in percent, each panel's min, max and collapsed size (in percent, or in
+//! pixels a panel keeps as the group resizes), the drag measured against
+//! the group's box less its handles and taken within 5 px of a handle (15
+//! for a finger), the keys (arrows, Home, End, Enter to collapse or expand,
+//! F6 between handles), the cursors, the panels' callbacks, the layout
+//! saved between runs and the semantics. This file draws the line, its
+//! grab area and its grip.
+
+use std::rc::Rc;
 
 use gui::prelude::*;
 use gui::{
-    Bind, ComponentElement, Cursor, Div, DragEvent, DragPhase, Icon, KeyEvent, Model, NamedKey, Shadow, Signal,
-    UseModel, component, div, icon, provide, px, use_context, use_model,
+    Bind, Callback, FocusHandle, Icon, Model, Shadow, component, div, icon, provide, px, use_context, use_model,
 };
+use primitives::Availability;
+use primitives::direction::use_direction;
+use primitives::splitter::{Constraints, Panel, Splitter, SplitterOptions, Storage, Unit};
 
 use crate::part::{Part, PartProps};
 use crate::separator::Orientation;
 use crate::theme::theme;
 
-/// How far a key press moves a handle, in percent (reka's `keyboardResizeBy`).
-const KEYBOARD_STEP: f32 = 10.0;
 /// Half the width of a handle's grab area (`after:w-1`) around its 1px line.
 const GRAB: f32 = 2.0;
+
+/// Where a group saves its layout: an id and a storage (reka's
+/// `auto-save-id` and `storage`), compared by the id and the storage's
+/// identity.
+#[derive(Clone)]
+pub struct SaveLayout {
+    id: String,
+    storage: Rc<dyn Storage>,
+}
+
+impl PartialEq for SaveLayout {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && Rc::ptr_eq(&self.storage, &other.storage)
+    }
+}
+
+impl std::fmt::Debug for SaveLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SaveLayout")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
 
 /// What [`resizable_panel_group`] is given (reka's `SplitterGroup`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResizableProps {
     direction: Orientation,
-    layout: Bind<Vec<f32>>,
+    layout: Bind<Vec<f64>>,
+    step: f64,
+    save: Option<SaveLayout>,
+    on_layout: Option<Callback<Vec<f64>>>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HandleDrag {
-    handle: usize,
-    from: f32,
-    before: f32,
-    after: f32,
-}
+/// What the panels and handles of a group read: its primitive.
+#[derive(Clone, Copy)]
+struct ResizableContext(Splitter<PartProps<ResizableProps>>);
 
-/// What the panels and handles of a group read: the sizes, in percent of
-/// the group, and the drag under way.
-#[derive(Clone)]
-struct ResizableContext {
-    props: Signal<PartProps<ResizableProps>>,
-    sizes: UseModel<PartProps<ResizableProps>, Vec<f32>>,
-    pressed: Signal<Option<usize>>,
-    drag: Signal<Option<HandleDrag>>,
-}
-
-impl ResizableContext {
-    fn find() -> Option<Self> {
-        use_context::<Self>()
-    }
-
-    fn direction(&self) -> Orientation {
-        self.props.with(|p| p.props.direction)
-    }
-
-    fn size(&self, panel: usize) -> f32 {
-        self.sizes.with(|s| s.get(panel).copied().unwrap_or_default())
-    }
-
-    fn size_untracked(&self, panel: usize) -> f32 {
-        self.sizes.get_untracked().get(panel).copied().unwrap_or_default()
-    }
-
-    /// Give panel `handle` the size `before`, its next sibling the rest of
-    /// `total`, neither below 0.
-    fn split(&self, handle: usize, before: f32, total: f32) {
-        let before = before.clamp(0.0, total);
-        self.sizes.update(|sizes| {
-            if let Some(a) = sizes.get_mut(handle) {
-                *a = before;
-            }
-            if let Some(b) = sizes.get_mut(handle.saturating_add(1)) {
-                *b = total - before;
-            }
-        });
-    }
-
-    fn nudge(&self, handle: usize, by: f32) {
-        let before = self.size_untracked(handle);
-        let total = before + self.size_untracked(handle.saturating_add(1));
-        self.split(handle, before + by, total);
-    }
-
-    fn along(&self, x: f32, y: f32) -> f32 {
-        match self.props.with_untracked(|p| p.props.direction) {
-            Orientation::Horizontal => x,
-            Orientation::Vertical => y,
-        }
-    }
-
-    fn on_drag(&self, e: &DragEvent) {
-        let pointer = self.along(e.x, e.y);
-        match e.phase {
-            DragPhase::Start => {
-                let drag = self.pressed.get_untracked().map(|handle| HandleDrag {
-                    handle,
-                    from: pointer,
-                    before: self.size_untracked(handle),
-                    after: self.size_untracked(handle.saturating_add(1)),
-                });
-                self.drag.set(drag);
-            }
-            DragPhase::Move => {
-                if let Some(d) = self.drag.get_untracked() {
-                    // The group's box less its handles' lines is what the sizes share.
-                    let count = self.sizes.get_untracked().len();
-                    let lines = u16::try_from(count.saturating_sub(1)).map_or(0.0, f32::from);
-                    let room = (self.along(e.bounds.width, e.bounds.height) - lines).max(1.0);
-                    let moved = (pointer - d.from) / room * 100.0;
-                    self.split(d.handle, d.before + moved, d.before + d.after);
-                }
-            }
-            DragPhase::End => {
-                self.drag.set(None);
-                self.pressed.set(None);
-            }
-        }
+fn axis(direction: Orientation) -> Axis {
+    match direction {
+        Orientation::Horizontal => Axis::Horizontal,
+        Orientation::Vertical => Axis::Vertical,
     }
 }
 
 /// The group: lays its panels and handles along `direction`. It keeps the
-/// panels' sizes: its own, from `default_layout`, the caller's through
-/// `.model(…)`, or ones the caller shows (`.value(…)` with `.on_change(…)`,
-/// reka's `@layout`).
+/// panels' sizes, in percent: its own, from `default_layout` or the panels'
+/// default sizes, the caller's through `.model(…)`, or ones the caller shows
+/// (`.value(…)` with `.on_change(…)`, reka's `@layout`).
 #[must_use]
 pub fn resizable_panel_group(direction: Orientation) -> Part<ResizableProps> {
     let props = ResizableProps {
         direction,
         layout: Bind::default(),
+        step: primitives::splitter::KEY_STEP,
+        save: None,
+        on_layout: None,
     };
     let root = div()
         .named("resizable-panel-group")
@@ -137,23 +92,33 @@ pub fn resizable_panel_group(direction: Orientation) -> Part<ResizableProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = ResizableContext {
-                props,
-                sizes: use_model(props, |p| &p.props.layout),
-                pressed: Signal::labeled("resizable pressed", None),
-                drag: Signal::labeled("resizable drag", None),
-            };
-            provide(ctx.clone());
-            move || {
-                let drag = ctx.clone();
-                props
-                    .with(|p| {
-                        p.slot.0.clone().when(p.props.direction == Orientation::Vertical, |e| {
-                            e.display(Display::Flex).flex_direction(FlexDirection::Column)
-                        })
+            let splitter = Splitter::new(
+                use_model(props, |p: &PartProps<ResizableProps>| &p.props.layout),
+                move || {
+                    props.with(|p| SplitterOptions {
+                        orientation: axis(p.props.direction),
+                        step: p.props.step,
                     })
-                    .on_drag(move |e| drag.on_drag(e))
-                    .into_element()
+                },
+                use_direction(None),
+            )
+            .on_layout(move |sizes: Vec<f64>| {
+                if let Some(f) = props.with_untracked(|p| p.props.on_layout.clone()) {
+                    f.call(sizes);
+                }
+            });
+            let splitter = match props.with_untracked(|p| p.props.save.clone()) {
+                Some(save) => splitter.persist(save.id, save.storage),
+                None => splitter,
+            };
+            provide(ResizableContext(splitter));
+            move || {
+                let group = props.with(|p| {
+                    p.slot.0.clone().when(p.props.direction == Orientation::Vertical, |e| {
+                        e.display(Display::Flex).flex_direction(FlexDirection::Column)
+                    })
+                });
+                splitter.group(group).into_element()
             }
         })
     })
@@ -162,41 +127,69 @@ pub fn resizable_panel_group(direction: Orientation) -> Part<ResizableProps> {
 impl Part<ResizableProps> {
     /// The panels' sizes at first, in percent, when no model is given.
     #[must_use]
-    pub fn default_layout(self, sizes: &[f32]) -> Self {
+    pub fn default_layout(self, sizes: &[f64]) -> Self {
         let sizes = sizes.to_vec();
         self.with_props(|p| p.layout = std::mem::take(&mut p.layout).with_default(sizes))
     }
 
     /// The panels' sizes, kept by the caller.
     #[must_use]
-    pub fn model(self, sizes: impl Into<Model<Vec<f32>>>) -> Self {
+    pub fn model(self, sizes: impl Into<Model<Vec<f64>>>) -> Self {
         self.with_props(|p| p.layout = std::mem::take(&mut p.layout).with_model(sizes))
     }
 
     /// The panels' sizes as the caller shows them; a drag only calls
     /// `on_change`.
     #[must_use]
-    pub fn value(self, sizes: &[f32]) -> Self {
+    pub fn value(self, sizes: &[f64]) -> Self {
         let sizes = sizes.to_vec();
         self.with_props(|p| p.layout = std::mem::take(&mut p.layout).with_value(sizes))
     }
 
     /// Called with the sizes after each change (reka's `@layout`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(Vec<f32>) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<Vec<f64>>>) -> Self {
         self.with_props(|p| p.layout = std::mem::take(&mut p.layout).on_change(f))
+    }
+
+    /// How far an arrow key moves a handle, in percent (reka's
+    /// `keyboardResizeBy`; 10 by default).
+    #[must_use]
+    pub fn keyboard_step(self, percent: f64) -> Self {
+        self.with_props(|p| p.step = percent)
+    }
+
+    /// Save the layout under `id` in `storage` and start from what it saved
+    /// (reka's `auto-save-id` and `storage`).
+    #[must_use]
+    pub fn save_layout(self, id: impl Into<String>, storage: Rc<dyn Storage>) -> Self {
+        let save = SaveLayout { id: id.into(), storage };
+        self.with_props(|p| p.save = Some(save))
+    }
+
+    /// Called with each layout in each panel's own unit (reka's `@layout`).
+    #[must_use]
+    pub fn on_layout(self, f: impl Into<Callback<Vec<f64>>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_layout = Some(f))
     }
 }
 
-/// Which panel or handle of its group a part is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ResizableIndex {
+/// What a panel is given: its place in the group, what it allows of its
+/// size, its id and what it is told (reka's `SplitterPanel`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResizablePanelProps {
     index: usize,
+    constraints: Constraints,
+    id: Option<String>,
+    on_resize: Option<Callback<(f64, Option<f64>)>>,
+    on_collapse: Option<Callback<()>>,
+    on_expand: Option<Callback<()>>,
 }
 
 /// Panel `index`: its share of the group is its size.
 #[must_use]
-pub fn resizable_panel(index: usize) -> Part<ResizableIndex> {
+pub fn resizable_panel(index: usize) -> Part<ResizablePanelProps> {
     // `overflow: hidden` lets a flex item shrink below its content in CSS;
     // gui's `overflow_hidden` clips without that, so the zero minimum is stated.
     let root = div()
@@ -205,69 +198,190 @@ pub fn resizable_panel(index: usize) -> Part<ResizableIndex> {
         .min_width(0.0)
         .min_height(0.0)
         .flex(Flex::grow(1.0));
-    Part::new(ResizableIndex { index }, root, |p| {
+    let props = ResizablePanelProps {
+        index,
+        constraints: Constraints::default(),
+        id: None,
+        on_resize: None,
+        on_collapse: None,
+        on_expand: None,
+    };
+    Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = ResizableContext::find();
+            let ctx = use_context::<ResizableContext>();
+            if let Some(ResizableContext(splitter)) = ctx {
+                let (index, constraints, id) =
+                    props.with_untracked(|p| (p.props.index, p.props.constraints, p.props.id.clone()));
+                // The callbacks read the props' latest.
+                let on_resize = Callback::new(move |(now, was): (f64, Option<f64>)| {
+                    if let Some(f) = props.with_untracked(|p| p.props.on_resize.clone()) {
+                        f.call((now, was));
+                    }
+                });
+                let on_collapse = Callback::new(move |()| {
+                    if let Some(f) = props.with_untracked(|p| p.props.on_collapse.clone()) {
+                        f.call(());
+                    }
+                });
+                let on_expand = Callback::new(move |()| {
+                    if let Some(f) = props.with_untracked(|p| p.props.on_expand.clone()) {
+                        f.call(());
+                    }
+                });
+                splitter.register(
+                    index,
+                    Panel {
+                        constraints,
+                        id: id.map(Rc::from),
+                        on_resize: Some(on_resize),
+                        on_collapse: Some(on_collapse),
+                        on_expand: Some(on_expand),
+                    },
+                );
+                gui::watch(
+                    move || props.with(|p| p.props.constraints),
+                    move |_, c| splitter.set_constraints(index, *c),
+                );
+            }
             move || {
-                let (index, mut panel) = props.with(|p| (p.props.index, p.slot.0.clone()));
-                if let Some(ctx) = &ctx {
-                    panel.style_mut().flex_grow = ctx.size(index);
+                let (index, panel) = props.with(|p| (p.props.index, p.slot.0.clone()));
+                match ctx {
+                    Some(ResizableContext(splitter)) => splitter.panel(panel, index).into_element(),
+                    None => panel.into_element(),
                 }
-                panel.into_element()
             }
         })
     })
 }
 
-/// What a handle is given: the panel it follows, and whether it shows a grip.
+impl Part<ResizablePanelProps> {
+    /// Its smallest size, in its unit (reka's `min-size`).
+    #[must_use]
+    pub fn min_size(self, size: f64) -> Self {
+        self.with_props(|p| p.constraints.min = size)
+    }
+
+    /// Its largest size, in its unit (reka's `max-size`).
+    #[must_use]
+    pub fn max_size(self, size: f64) -> Self {
+        self.with_props(|p| p.constraints.max = Some(size))
+    }
+
+    /// Its size in the default layout, in its unit (reka's `default-size`).
+    #[must_use]
+    pub fn default_size(self, size: f64) -> Self {
+        self.with_props(|p| p.constraints.default = Some(size))
+    }
+
+    /// It collapses to `size` (in its unit) when dragged below half its
+    /// min, and by Enter on its handle (reka's `collapsible` and
+    /// `collapsed-size`).
+    #[must_use]
+    pub fn collapsible(self, size: f64) -> Self {
+        self.with_props(|p| {
+            p.constraints.collapsible = true;
+            p.constraints.collapsed = size;
+        })
+    }
+
+    /// Its sizes are pixels, kept as the group resizes (reka's
+    /// `size-unit="px"`); percent unless set.
+    #[must_use]
+    pub fn pixels(self) -> Self {
+        self.with_props(|p| p.constraints.unit = Unit::Pixels)
+    }
+
+    /// Its id: a saved layout is keyed by it (reka's `id`).
+    #[must_use]
+    pub fn id(self, id: impl Into<String>) -> Self {
+        self.with_props(|p| p.id = Some(id.into()))
+    }
+
+    /// Called with its new size and the one it was last told, in its unit
+    /// (reka's `@resize`), the first time too.
+    #[must_use]
+    pub fn on_resize(self, f: impl Into<Callback<(f64, Option<f64>)>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_resize = Some(f))
+    }
+
+    /// Called as it collapses (reka's `@collapse`).
+    #[must_use]
+    pub fn on_collapse(self, f: impl Into<Callback<()>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_collapse = Some(f))
+    }
+
+    /// Called as it expands (reka's `@expand`).
+    #[must_use]
+    pub fn on_expand(self, f: impl Into<Callback<()>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_expand = Some(f))
+    }
+}
+
+/// What a handle is given: the panel it follows, whether it shows a grip,
+/// and whether it is disabled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ResizableHandleProps {
     index: usize,
     with_handle: bool,
+    disabled: bool,
 }
 
 /// The handle after panel `index`; `with_handle` shows a grip on it.
 #[must_use]
-pub fn resizable_handle(index: usize, with_handle: bool) -> ComponentElement {
-    component(ResizableHandleProps { index, with_handle }, |cx| {
-        let props = cx.props();
-        let ctx = ResizableContext::find();
-        move || {
-            let ResizableHandleProps { index, with_handle } = props.get();
-            let Some(ctx) = ctx.clone() else {
-                return gui::Element::Empty;
-            };
-            handle(&ctx, index, with_handle).into_element()
-        }
+pub fn resizable_handle(index: usize, with_handle: bool) -> Part<ResizableHandleProps> {
+    let props = ResizableHandleProps {
+        index,
+        with_handle,
+        disabled: false,
+    };
+    Part::new(props, div().named("resizable-handle"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = use_context::<ResizableContext>();
+            let focus = FocusHandle::new();
+            move || {
+                let Some(ResizableContext(splitter)) = ctx else {
+                    return gui::Element::Empty;
+                };
+                let (
+                    d,
+                    ResizableHandleProps {
+                        index,
+                        with_handle,
+                        disabled,
+                    },
+                ) = props.with(|p| (p.slot.0.clone(), p.props));
+                let vertical = splitter.options().orientation == Axis::Vertical;
+                let availability = Availability::from_disabled(disabled);
+                let cursor = move || availability.actionable().then(|| splitter.cursor(index));
+                splitter
+                    .handle(look(d, vertical, with_handle, cursor), index, availability, focus)
+                    .into_element()
+            }
+        })
     })
 }
 
-fn handle(ctx: &ResizableContext, index: usize, with_handle: bool) -> Div {
+impl Part<ResizableHandleProps> {
+    /// The handle takes no drag and no key (reka's `disabled`); it stays a
+    /// Tab stop, announced disabled.
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.disabled = disabled)
+    }
+}
+
+fn look(
+    d: gui::Div,
+    vertical: bool,
+    with_handle: bool,
+    cursor: impl Fn() -> Option<gui::Cursor> + Clone + 'static,
+) -> gui::Div {
     let t = theme();
-    let vertical = ctx.direction() == Orientation::Vertical;
-    let keys = ctx.clone();
-    let pressed = ctx.pressed;
-    let (back, forward) = if vertical {
-        (NamedKey::ArrowUp, NamedKey::ArrowDown)
-    } else {
-        (NamedKey::ArrowLeft, NamedKey::ArrowRight)
-    };
-    let on_key = move |e: &KeyEvent| {
-        let by = if e.is(back) {
-            -KEYBOARD_STEP
-        } else if e.is(forward) {
-            KEYBOARD_STEP
-        } else if e.is(NamedKey::Home) {
-            -100.0
-        } else if e.is(NamedKey::End) {
-            100.0
-        } else {
-            return false;
-        };
-        keys.nudge(index, by);
-        true
-    };
     // `focus-visible:ring-1 ring-offset-1`: a 1px gap in the background, then the ring.
     let ring = Shadows::from([
         Shadow {
@@ -285,20 +399,15 @@ fn handle(ctx: &ResizableContext, index: usize, with_handle: bool) -> Div {
             color: t.background,
         },
     ]);
-    let cursor = if vertical {
-        Cursor::ResizeRow
-    } else {
-        Cursor::ResizeColumn
-    };
-    // `after:`: the grab area, 4px across the line.
-    let grab = div().position(Position::Absolute).cursor(cursor);
+    // `after:`: the grab area, 4px across the line; its cursor the
+    // primitive's (one way at a limit).
+    let grab = div().position(Position::Absolute).cursor(cursor.clone());
     let grab = if vertical {
         grab.left(0.0).width(pct(100.0)).top(px(-GRAB)).height(4.0)
     } else {
         grab.top(0.0).bottom(0.0).left(px(0.5 - GRAB)).width(4.0)
     };
-    let d = div()
-        .named("resizable-handle")
+    let d = d
         .background(t.border)
         .position(Position::Relative)
         .display(Display::Flex)
@@ -307,8 +416,6 @@ fn handle(ctx: &ResizableContext, index: usize, with_handle: bool) -> Div {
         .flex_shrink(0.0)
         .cursor(cursor)
         .focusable()
-        .on_key_down(on_key)
-        .on_mouse_down(move |_| pressed.set(Some(index)))
         .with_interaction(|mut d, i| {
             let base = d.style_mut().shadows.clone();
             d.shadow(move || if i.focus_visible() { ring.clone() } else { base.clone() })

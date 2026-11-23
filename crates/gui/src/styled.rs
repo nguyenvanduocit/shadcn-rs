@@ -291,9 +291,19 @@ pub trait Styled: Sized {
         /// How wrapped lines are chosen (`text-wrap`).
         text_wrap: WrapStyle [TextWrap] => |s, v| s.content.text.wrap_style = Some(v);
         italic: bool [Italic] => |s, v| s.content.text.italic = Some(v);
+        /// Underline the text it holds (`text-decoration-line:
+        /// underline`): a paragraph's line by its font and colour under
+        /// all its runs, a span's by the span's own. `false` declares no
+        /// underline of its own; it cannot take off one an enclosing node
+        /// or paragraph declares, which CSS draws over everything inside
+        /// it whatever its descendants say.
         underline: bool [Underline] => |s, v| s.content.text.underline = Some(v);
-        /// The underline this many pixels below the baseline.
+        /// The underline's top this many pixels below the baseline
+        /// (`text-underline-offset`), with no gap added.
         underline_offset: f32 [UnderlineOffset] => |s, v| s.content.text.underline_offset = Some(v);
+        /// Strike its text through (`text-decoration-line: line-through`);
+        /// as with `underline`, `false` cannot take off an enclosing
+        /// node's.
         line_through: bool [LineThrough] => |s, v| s.content.text.line_through = Some(v);
         /// Letter spacing in em.
         tracking: f32 [Tracking] => |s, v| s.content.text.tracking = Some(v);

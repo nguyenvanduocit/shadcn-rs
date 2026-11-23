@@ -1,0 +1,23 @@
+---
+source: crates/primitives/tests/structure.rs
+assertion_line: 369
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      GenericContainer
+        GenericContainer
+          Heading aria-level=3
+            Button expanded controls=Region
+              Label "A"
+          Region labelled-by=Button
+            Label "A body"
+        GenericContainer
+          Heading aria-level=3
+            Button collapsed disabled
+              Label "B" disabled
+        GenericContainer
+          Heading aria-level=3
+            Button collapsed
+              Label "C"

@@ -1,4 +1,5 @@
-/target/
+# No trailing slash: target may be a symlink to a build volume.
+/target
 node_modules/
 .DS_Store
 # The verdict's fetched references and the photos it shoots (crates/shadcn/verdict/fetch.sh).

@@ -9,9 +9,11 @@
 
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{Animation, Div, Text, div, text};
+use gui::{Animation, Div, div, text};
 
-use crate::dialog::{DialogProps, ModalContentProps, ModalLook, dialog_description, modal_content, modal_root};
+use crate::dialog::{
+    DialogProps, ModalContentProps, ModalLook, ModalText, dialog_description, modal_content, modal_root, modal_title,
+};
 use crate::part::Part;
 use crate::theme::theme;
 
@@ -47,7 +49,6 @@ pub fn sheet_content(side: SheetSide) -> Part<ModalContentProps> {
     };
     let base = div()
         .named("sheet-content")
-        .role(gui::Role::Dialog)
         .animation(slide(Animation::enter(), off).duration(0.5))
         .exit_animation(slide(Animation::exit(), off).duration(0.3))
         .transition(Properties::DEFAULT)
@@ -94,7 +95,6 @@ pub fn sheet_content(side: SheetSide) -> Part<ModalContentProps> {
         ModalLook {
             centred: false,
             overlay_ms: None,
-            dismiss_outside: true,
             close_button: true,
         },
     )
@@ -126,16 +126,18 @@ pub fn sheet_footer() -> Div {
         .padding(16.0)
 }
 
-#[must_use]
-pub fn sheet_title(title: impl Into<String>) -> Text {
+/// The sheet's title, which names it to a screen reader.
+pub fn sheet_title(title: impl Into<String>) -> ModalText {
     let t = theme();
-    text(title)
-        .named("sheet-title")
-        .text_color(t.foreground)
-        .font_weight(600)
+    modal_title(
+        text(title)
+            .named("sheet-title")
+            .text_color(t.foreground)
+            .font_weight(600),
+    )
 }
 
-#[must_use]
-pub fn sheet_description(description: impl Into<String>) -> Text {
+/// The sheet's description, which describes it to a screen reader.
+pub fn sheet_description(description: impl Into<String>) -> ModalText {
     dialog_description(description).named("sheet-description")
 }

@@ -25,8 +25,8 @@ struct Globals {
 @group(0) @binding(4) var<storage, read> entries: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read> instances: array<vec4<u32>>;
 @group(0) @binding(6) var<storage, read> stops: array<vec4<f32>>;
-// Four vec4s per clip: rect, radii, the map from the window into the
-// clip's space (a, b, c, d), (e, f, its scale, its corners' curve). Clip 0 is none.
+// Clip entries (`PCLIP` in `common.wgsl`), read in the target's space.
+// Clip 0 is none.
 @group(0) @binding(7) var<storage, read> clips: array<vec4<f32>>;
 
 const TILE: f32 = 16.0;
@@ -59,6 +59,8 @@ struct PathVarying {
     @location(0) @interpolate(flat) job: u32,
     @location(1) @interpolate(flat) tile: u32,
     @location(2) @interpolate(flat) solid: u32,
+    // Its two clips, each 0 when the tile lies wholly inside its chain.
+    @location(3) @interpolate(flat) clips_of: vec2<u32>,
 }
 
 @vertex
@@ -81,6 +83,13 @@ fn vs_path(@builtin(vertex_index) vertex: u32, @builtin(instance_index) id: u32)
     let unit = vec2<f32>(f32(vertex & 1u), f32((vertex >> 1u) & 1u));
     let offset = vec2<f32>(df(job, 0u), df(job, 1u));
     let at = quad.xy + unit * quad.zw + offset - globals.origin;
+    let lo = quad.xy + offset;
+    let hi = lo + quad.zw;
+    out.clips_of = vec2<u32>(clip_needed(du(job, 20u), lo, hi), clip_needed(du(job, 21u), lo, hi));
+    // Never skipped (`path::ClipSkip`, tests).
+    if (du(job, 22u) == 2u) {
+        out.clips_of = vec2<u32>(du(job, 20u), du(job, 21u));
+    }
     out.position = vec4<f32>(at / globals.size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
     return out;
 }
@@ -164,12 +173,32 @@ fn coverage(job: u32, tile: u32, p: vec2<f32>) -> f32 {
     return min(abs(acc), 1.0);
 }
 
+// Clip entry `id` and the rest of its chain, their coverages multiplied.
 fn clip_coverage(id: u32, p: vec2<f32>) -> f32 {
-    if (id == 0u) {
-        return 1.0;
+    var cov = 1.0;
+    var e = id;
+    let n = arrayLength(&clips) / PCLIP;
+    for (var d = 0u; d < n && e != 0u; d = d + 1u) {
+        let at = e * PCLIP;
+        cov = cov * clip_entry_cov(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], p);
+        e = bitcast<u32>(clips[at + 4u].x);
     }
-    let at = id * 4u;
-    return clip_entry_cov(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], p);
+    return cov;
+}
+
+// `id`, or 0 when the box from `lo` to `hi` lies wholly inside each clip
+// of its chain (as a quad's is dropped, `shaders.wgsl`).
+fn clip_needed(id: u32, lo: vec2<f32>, hi: vec2<f32>) -> u32 {
+    var e = id;
+    let n = arrayLength(&clips) / PCLIP;
+    for (var d = 0u; d < n && e != 0u; d = d + 1u) {
+        let at = e * PCLIP;
+        if (!entry_holds(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], lo, vec2<f32>(hi.x, lo.y), vec2<f32>(lo.x, hi.y), hi)) {
+            return id;
+        }
+        e = bitcast<u32>(clips[at + 4u].x);
+    }
+    return 0u;
 }
 
 struct PathShaded {
@@ -185,7 +214,7 @@ fn shade_path(input: PathVarying) -> PathShaded {
     if (input.solid == 0u) {
         cov = coverage(job, input.tile, p);
     }
-    cov *= df(job, 15u) * clip_coverage(du(job, 20u), window) * clip_coverage(du(job, 21u), window);
+    cov *= df(job, 15u) * clip_coverage(input.clips_of.x, window) * clip_coverage(input.clips_of.y, window);
     var color = vec4<f32>(df(job, 8u), df(job, 9u), df(job, 10u), df(job, 11u));
     if (du(job, 12u) == 1u) {
         // A linear gradient, placed in the path's own space.
@@ -195,6 +224,11 @@ fn shade_path(input: PathVarying) -> PathShaded {
         );
         let line = vec4<f32>(df(job, 16u), df(job, 17u), df(job, 18u), df(job, 19u));
         color = gradient_stops(du(job, 13u), du(job, 14u), q, line);
+    }
+    // Marked where a clip's test was skipped (`path::ClipSkip`, tests).
+    let skipped = (du(job, 20u) != 0u && input.clips_of.x == 0u) || (du(job, 21u) != 0u && input.clips_of.y == 0u);
+    if (du(job, 22u) == 1u && skipped) {
+        color = vec4<f32>(0.0, 1.0, 0.0, 1.0);
     }
     let out = premul(color) * cov;
     return PathShaded(out, vec4<f32>(out.a));

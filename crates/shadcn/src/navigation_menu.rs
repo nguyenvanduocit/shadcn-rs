@@ -1,33 +1,30 @@
-//! Navigation menu (`ui/navigation-menu`), as shadcn's demo uses it
-//! (`:viewport="false"`): a row of triggers, each opening its own panel
-//! below it. Pointing at a trigger opens its panel after 200ms (at once
-//! when another is open), leaving trigger and panel closes it after 150ms;
-//! a click toggles, Escape and a click outside close.
+//! Navigation menu (`ui/navigation-menu`): a row of triggers, each showing
+//! its panel in the shared viewport below the menu (shadcn's default,
+//! `viewport`), or below itself with [`NavigationMenuProps`]'s
+//! `.viewport(false)` (shadcn's demo). Its behaviour is `primitives`'
+//! ([`primitives::navigation_menu::NavigationMenu`]): pointing at a trigger
+//! opens its panel after 200 ms (150 ms while one is open, or just after
+//! one closed), leaving trigger and panel closes it after 150 ms; a click
+//! toggles; the arrows move between triggers and links; Escape, a press
+//! outside and focus leaving close.
 //!
 //! The parts nest as in Vue: [`navigation_menu`] keeps which item is open,
 //! its own or the caller's (`model`, `v-model`); each
-//! [`navigation_menu_item`] holds its trigger and its content.
+//! [`navigation_menu_item`] holds its trigger and its content, or a link.
 
-use std::cell::Cell;
-use std::rc::Rc;
-use std::time::Duration;
-
-use gui::clock::{TimerId, after, cancel};
 use gui::prelude::*;
 use gui::style::Calc;
 use gui::{
-    Animation, Bind, Div, Element, Icon, Members, Model, NamedKey, Positioning, Properties, Side, SideAlign, Signal,
-    UseModel, component, div, icon, provide, text, use_context, use_model,
+    Animation, Bind, Dismiss, Div, Element, FocusHandle, Icon, Model, Positioning, Properties, Role, Side, SideAlign,
+    component, div, icon, provide, text, use_context, use_model,
 };
 
-use crate::focus::StateLook;
-use crate::part::{Part, PartProps};
-use crate::theme::{Colors, theme};
+use primitives::Availability;
+use primitives::navigation_menu::{Motion, NavOptions, NavigationMenu, NavigationMenuItem};
 
-/// reka's `delayDuration`: how long the pointer rests on a trigger before its panel opens.
-const OPEN_DELAY: Duration = Duration::from_millis(200);
-/// How long after the pointer leaves a trigger and its panel the panel closes.
-const CLOSE_DELAY: Duration = Duration::from_millis(150);
+use crate::focus::StateLook;
+use crate::part::Part;
+use crate::theme::{Colors, theme};
 
 /// How far a panel slides in when the pointer moves to it from another
 /// trigger (`slide-in-from-right-52`), in pixels.
@@ -35,12 +32,29 @@ const SWITCH_SLIDE: f32 = 208.0;
 
 /// What [`navigation_menu`] is given: the open item's value (reka's
 /// `modelValue`; `None`: every panel closed).
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq)]
 pub struct NavigationMenuProps {
     value: Bind<Option<String>>,
+    viewport: bool,
+}
+
+impl Default for NavigationMenuProps {
+    fn default() -> Self {
+        Self {
+            value: Bind::default(),
+            viewport: true,
+        }
+    }
 }
 
 impl Part<NavigationMenuProps> {
+    /// Show the panels in one viewport below the menu (`true`, shadcn's
+    /// default) or each below its trigger (`:viewport="false"`).
+    #[must_use]
+    pub fn viewport(self, viewport: bool) -> Self {
+        self.with_props(|p| p.viewport = viewport)
+    }
+
     /// The open item, kept by the caller (`v-model`).
     #[must_use]
     pub fn model(self, model: impl Into<Model<Option<String>>>) -> Self {
@@ -56,102 +70,14 @@ impl Part<NavigationMenuProps> {
 
     /// Call `f` with the open item each time it changes.
     #[must_use]
-    pub fn on_change(self, f: impl Fn(Option<String>) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<Option<String>>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 }
 
-/// What the parts below a [`navigation_menu`] read: which panel is open, the
-/// one open before it, its items in tree order, and the timers that open
-/// and close one.
-#[derive(Clone)]
-struct NavigationContext {
-    open: UseModel<PartProps<NavigationMenuProps>, Option<String>>,
-    /// The panel open just before this one, when one was (reka's `previousValue`).
-    previous: Signal<Option<String>>,
-    /// The items' values, in tree order as last laid out.
-    items: Members<String>,
-    open_timer: Rc<Cell<Option<TimerId>>>,
-    close_timer: Rc<Cell<Option<TimerId>>>,
-}
-
-impl NavigationContext {
-    fn is_open(&self, value: &str) -> bool {
-        self.open.with(|v| v.as_deref() == Some(value))
-    }
-
-    fn any_open(&self) -> bool {
-        self.open.get_untracked().is_some()
-    }
-
-    fn stop(timer: &Cell<Option<TimerId>>) {
-        if let Some(t) = timer.take() {
-            cancel(t);
-        }
-    }
-
-    fn show(&self, value: &str) {
-        Self::stop(&self.open_timer);
-        Self::stop(&self.close_timer);
-        if !gui::untracked(|| self.is_open(value)) {
-            self.previous.set(self.open.get_untracked());
-            self.open.set(Some(value.to_owned()));
-        }
-    }
-
-    fn close(&self) {
-        Self::stop(&self.open_timer);
-        Self::stop(&self.close_timer);
-        if self.any_open() {
-            self.previous.set(None);
-            self.open.set(None);
-        }
-    }
-
-    /// Where `value`'s item is among the items.
-    fn index(&self, value: &str) -> usize {
-        self.items
-            .with(|items| items.iter().position(|v| v == value).unwrap_or(0))
-    }
-
-    /// How `value`'s panel opens (`data-[motion=from-end]:slide-in-from-right-52`,
-    /// `from-start` from the left), on top of `fade-in-0 zoom-in-95
-    /// duration-200`: sliding only when the pointer came from another trigger.
-    fn opening(&self, value: &str) -> Animation {
-        let enter = Animation::enter().fade(0.0).zoom(0.95);
-        let Some(from) = self.previous.get().filter(|p| p != value) else {
-            return enter;
-        };
-        let (from, to) = (self.index(&from), self.index(value));
-        enter.slide(Slide::X(Calc::px(if to > from { SWITCH_SLIDE } else { -SWITCH_SLIDE })))
-    }
-
-    fn pointer_enters(&self, value: &str) {
-        Self::stop(&self.close_timer);
-        if gui::untracked(|| self.is_open(value)) {
-            return;
-        }
-        if self.any_open() {
-            self.show(value);
-            return;
-        }
-        Self::stop(&self.open_timer);
-        let (me, value) = (self.clone(), value.to_owned());
-        self.open_timer.set(Some(after(OPEN_DELAY, move || me.show(&value))));
-    }
-
-    fn pointer_leaves(&self) {
-        Self::stop(&self.open_timer);
-        Self::stop(&self.close_timer);
-        if self.any_open() {
-            let me = self.clone();
-            self.close_timer.set(Some(after(CLOSE_DELAY, move || me.close())));
-        }
-    }
-}
-
-/// The root: `relative flex max-w-max flex-1 items-center justify-center`;
-/// give it a [`navigation_menu_list`] of [`navigation_menu_item`]s.
+/// The root: `relative flex max-w-max flex-1 items-center justify-center`,
+/// the `navigation` landmark; give it a [`navigation_menu_list`] of
+/// [`navigation_menu_item`]s.
 #[must_use]
 pub fn navigation_menu() -> Part<NavigationMenuProps> {
     let root = div()
@@ -164,29 +90,29 @@ pub fn navigation_menu() -> Part<NavigationMenuProps> {
     Part::new(NavigationMenuProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let nav = NavigationContext {
-                open: use_model(props, |p| &p.props.value),
-                previous: Signal::labeled("navigation menu previous", None),
-                items: Members::new(),
-                open_timer: Rc::new(Cell::new(None)),
-                close_timer: Rc::new(Cell::new(None)),
-            };
-            let (open_timer, close_timer) = (Rc::clone(&nav.open_timer), Rc::clone(&nav.close_timer));
-            gui::on_cleanup(move || {
-                NavigationContext::stop(&open_timer);
-                NavigationContext::stop(&close_timer);
-            });
+            let nav = NavigationMenu::new(use_model(props, |p| &p.props.value), NavOptions::DEFAULT);
             provide(nav);
-            move || props.with(|p| p.slot.0.clone()).into_element()
+            let panels = Panels(gui::Signal::new(Vec::new()));
+            provide(panels);
+            move || {
+                let (root, viewport) = props.with(|p| (p.slot.0.clone(), p.props.viewport));
+                let root = nav.root(root);
+                if viewport {
+                    root.child(viewport_part(nav, panels)).into_element()
+                } else {
+                    root.into_element()
+                }
+            }
         })
     })
 }
 
-/// `flex flex-1 items-center justify-center gap-1`.
+/// `flex flex-1 items-center justify-center gap-1`, a list.
 #[must_use]
 pub fn navigation_menu_list() -> Div {
     div()
         .named("navigation-menu-list")
+        .role(Role::List)
         .display(Display::Flex)
         .flex(Flex::grow(1.0))
         .align_items(Align::Center)
@@ -199,9 +125,6 @@ pub fn navigation_menu_list() -> Div {
 pub struct NavigationMenuItemProps {
     value: String,
 }
-
-#[derive(Clone)]
-struct NavigationItem(String);
 
 /// An item (`relative`), known by `value`: the anchor its content opens
 /// against. Give it a [`navigation_menu_trigger`] and a
@@ -217,13 +140,15 @@ pub fn navigation_menu_item(value: &str) -> Part<NavigationMenuItemProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let nav = use_context::<NavigationContext>();
-                let value = props.with_untracked(|p| p.props.value.clone());
-                provide(NavigationItem(value.clone()));
+                let item = use_context::<NavigationMenu>().map(|nav| {
+                    let item = NavigationMenuItem::new(nav, props.with_untracked(|p| p.props.value.clone()));
+                    provide(item);
+                    item
+                });
                 move || {
                     let root = props.with(|p| p.slot.0.clone());
-                    match &nav {
-                        Some(n) => root.member(&n.items, value.clone()),
+                    match item {
+                        Some(i) => i.root(root),
                         None => root,
                     }
                     .into_element()
@@ -274,8 +199,7 @@ fn lit(mut d: Div, i: Interaction, t: &Colors, ring: Ring) -> Div {
 }
 
 /// The item's trigger, labelled `label`, with a chevron turning over while
-/// its panel is open. Pointing at it opens the panel after 200ms (at once
-/// when another is open); a click toggles; Escape closes.
+/// its panel is open.
 #[must_use]
 pub fn navigation_menu_trigger(label: &str) -> Part<()> {
     let root = div()
@@ -285,39 +209,14 @@ pub fn navigation_menu_trigger(label: &str) -> Part<()> {
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let nav = use_context::<NavigationContext>();
-            let item = use_context::<NavigationItem>();
+            let item = use_context::<NavigationMenuItem>();
             move || {
                 let root = props.with(|p| p.slot.0.clone());
-                let (Some(nav), Some(NavigationItem(value))) = (nav.clone(), item.clone()) else {
+                let Some(item) = item else {
                     return root.into_element();
                 };
-                let open = nav.is_open(&value);
-                let (hover, click, keys) = (nav.clone(), nav.clone(), nav);
-                let (hover_value, click_value) = (value.clone(), value);
-                trigger_look(root, open)
-                    .aria_expanded(open)
-                    .on_hover(move |inside| {
-                        if inside {
-                            hover.pointer_enters(&hover_value);
-                        } else {
-                            hover.pointer_leaves();
-                        }
-                    })
-                    .on_click(move |_| {
-                        if gui::untracked(|| click.is_open(&click_value)) {
-                            click.close();
-                        } else {
-                            click.show(&click_value);
-                        }
-                    })
-                    .on_key_down(move |ev| {
-                        if ev.is(NamedKey::Escape) && keys.any_open() {
-                            keys.close();
-                            return true;
-                        }
-                        false
-                    })
+                let open = item.is_open();
+                item.trigger(trigger_look(root, open), Availability::Enabled)
                     .child(
                         icon(Icon::ChevronDown)
                             .position(Position::Relative)
@@ -334,51 +233,152 @@ pub fn navigation_menu_trigger(label: &str) -> Part<()> {
     })
 }
 
+/// `shadow`: the panel's (and the viewport's) two shadows.
+fn popup_shadow() -> [Shadow; 2] {
+    [
+        Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 3.0,
+            spread: 0.0,
+            color: gui::Color::BLACK.opacity(0.1),
+        },
+        Shadow {
+            x: 0.0,
+            y: 1.0,
+            blur: 2.0,
+            spread: -1.0,
+            color: gui::Color::BLACK.opacity(0.1),
+        },
+    ]
+}
+
+/// The panels a viewport draws: each item's content, by value, as its
+/// part last gave it.
+type PanelSlot = std::rc::Rc<dyn Fn() -> Div>;
+
+#[derive(Clone, Copy)]
+struct Panels(gui::Signal<Vec<(NavigationMenuItem, gui::Registration, PanelSlot)>>);
+
+/// The viewport (`NavigationMenuViewport`): below the menu at its start
+/// (`absolute top-full left-0`, `mt-1.5`), `bg-popover
+/// text-popover-foreground rounded-lg border shadow overflow-hidden`,
+/// opening with `zoom-in-90` and closing with `zoom-out-90` in 100 ms; it
+/// draws the open item's panel, and its Tab stops follow that item's
+/// trigger.
+fn viewport_part(nav: NavigationMenu, panels: Panels) -> Element {
+    component((), move |_| {
+        nav.use_viewport();
+        let t = theme();
+        move || {
+            let Some(item) = nav.open_item() else {
+                return Element::Empty;
+            };
+            let slot_of = move || {
+                panels.0.with(|list| {
+                    list.iter()
+                        .find(|(i, _, _)| *i == item)
+                        .map(|(_, _, slot)| std::rc::Rc::clone(slot))
+                })
+            };
+            if slot_of().is_none() {
+                return Element::Empty;
+            }
+            let key = item.trigger_key();
+            let panel = component(key, move |_| {
+                provide(Panel(item));
+                move || {
+                    // Read as it renders, not kept from its setup: a content
+                    // replaced in one update gives a new slot to the same
+                    // panel.
+                    let Some(slot) = slot_of() else {
+                        return Element::Empty;
+                    };
+                    let panel = slot()
+                        .animation(opening(item.motion()))
+                        .exit_animation(Animation::exit().fade(0.0))
+                        .duration_ms(300.0);
+                    item.content(panel).into_element()
+                }
+            })
+            .key(key);
+            let surface = nav
+                .viewport(div().named("navigation-menu-viewport"))
+                .position(Position::Relative)
+                .overflow(Overflow::Hidden)
+                .background(t.popover)
+                .text_color(t.popover_foreground)
+                .radius(10.0)
+                .border(1.0)
+                .border_color(t.border)
+                .shadow(popup_shadow())
+                .animation(Animation::enter().zoom(0.9))
+                .exit_animation(Animation::exit().zoom(0.9))
+                .duration_ms(100.0)
+                .child(panel);
+            let placement = Positioning::Anchored {
+                side: Side::Bottom,
+                align: SideAlign::Start,
+                offset: 6.0,
+                match_width: false,
+                fit_height: false,
+            };
+            gui::deferred(placement, surface)
+                .tab_after(item.trigger_key())
+                .into_element()
+        }
+    })
+    .into_element()
+}
+
 /// The item's panel (`p-2 pr-2.5`, and with no viewport `bg-popover
 /// text-popover-foreground rounded-md border shadow overflow-hidden`),
-/// below the item while it is open; add its links with `.child`.
+/// below the item while it is open, or in the menu's viewport; add its
+/// links with `.child`.
 #[must_use]
 pub fn navigation_menu_content() -> Part<()> {
-    let t = theme();
-    let root = div()
-        .named("navigation-menu-content")
-        .padding(8.0)
-        .padding_right(10.0)
-        .background(t.popover)
-        .text_color(t.popover_foreground)
-        .overflow(Overflow::Hidden)
-        .radius(8.0)
-        .border(1.0)
-        .border_color(t.border)
-        .shadow([
-            Shadow {
-                x: 0.0,
-                y: 1.0,
-                blur: 3.0,
-                spread: 0.0,
-                color: gui::Color::BLACK.opacity(0.1),
-            },
-            Shadow {
-                x: 0.0,
-                y: 1.0,
-                blur: 2.0,
-                spread: -1.0,
-                color: gui::Color::BLACK.opacity(0.1),
-            },
-        ]);
+    let root = div().named("navigation-menu-content").padding(8.0).padding_right(10.0);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let nav = use_context::<NavigationContext>();
-            let item = use_context::<NavigationItem>();
+            let item = use_context::<NavigationMenuItem>();
+            if let Some(i) = item {
+                provide(Panel(i));
+                // A viewport draws it from its slot.
+                if let Some(panels) = use_context::<Panels>() {
+                    let slot: PanelSlot = std::rc::Rc::new(move || props.with(|p| p.slot.0.clone()));
+                    // From its mount to its unmount (a setup, as a render,
+                    // writes only what it made); its unmounting takes back
+                    // only its own registration: a content that replaced it
+                    // registered first.
+                    gui::while_mounted(move || {
+                        let mine = gui::Registration::new();
+                        panels.0.update(|list| list.push((i, mine, slot)));
+                        move || {
+                            if panels.0.is_alive() {
+                                panels.0.update(|list| list.retain(|(_, r, _)| *r != mine));
+                            }
+                        }
+                    });
+                }
+            }
+            let t = theme();
             move || {
-                let (Some(nav), Some(NavigationItem(value))) = (nav.clone(), item.clone()) else {
+                let Some(item) = item else {
                     return Element::Empty;
                 };
-                if !nav.is_open(&value) {
+                if !item.is_open() || item.menu().has_viewport() {
                     return Element::Empty;
                 }
-                let root = props.with(|p| p.slot.0.clone());
+                let root = props
+                    .with(|p| p.slot.0.clone())
+                    .background(t.popover)
+                    .text_color(t.popover_foreground)
+                    .overflow(Overflow::Hidden)
+                    .radius(8.0)
+                    .border(1.0)
+                    .border_color(t.border)
+                    .shadow(popup_shadow());
                 let placement = Positioning::Anchored {
                     side: Side::Bottom,
                     align: SideAlign::Start,
@@ -386,45 +386,96 @@ pub fn navigation_menu_content() -> Part<()> {
                     match_width: false,
                     fit_height: false,
                 };
-                let (hover, outside, keys) = (nav.clone(), nav.clone(), nav.clone());
                 // A panel leaving for another fades and zooms out where it is; reka
                 // also slides it toward the side the pointer went (`to-start`, `to-end`),
                 // which is known only after it has left.
                 let panel = root
-                    .animation(nav.opening(&value))
+                    .animation(opening(item.motion()))
                     .exit_animation(Animation::exit().fade(0.0).zoom(0.95))
-                    .duration_ms(200.0)
-                    .on_hover(move |inside| {
-                        if inside {
-                            hover.pointer_enters(&value);
-                        } else {
-                            hover.pointer_leaves();
-                        }
-                    })
-                    .on_click_outside(move || outside.close())
-                    .on_key_down(move |ev| {
-                        if !ev.is(NamedKey::Escape) {
-                            return false;
-                        }
-                        keys.close();
-                        true
-                    });
-                gui::deferred(placement, panel).into_element()
+                    .duration_ms(200.0);
+                gui::deferred(placement, item.content(panel)).into_element()
             }
         })
     })
 }
 
-/// A link in a panel: `flex flex-col gap-1 rounded-sm p-2 text-sm
-/// hover:bg-accent focus:bg-accent`; `active` marks the current page
-/// (`data-active:bg-accent/50`). Add its title and description with `.child`.
+/// How a panel opens (`data-[motion=from-end]:slide-in-from-right-52`,
+/// `from-start` from the left), on top of `fade-in-0 zoom-in-95
+/// duration-200`: sliding only when the pointer came from another trigger.
+fn opening(motion: Option<Motion>) -> Animation {
+    let enter = Animation::enter().fade(0.0).zoom(0.95);
+    match motion {
+        Some(Motion::FromEnd) => enter.slide(Slide::X(Calc::px(SWITCH_SLIDE))),
+        Some(Motion::FromStart) => enter.slide(Slide::X(Calc::px(-SWITCH_SLIDE))),
+        _ => enter,
+    }
+}
+
+/// What a link in a panel reads: the item whose panel it is in.
+#[derive(Clone, Copy)]
+struct Panel(NavigationMenuItem);
+
+/// What a link is given: whether it is the current page, and what
+/// following it does.
+#[derive(Clone)]
+pub struct NavigationMenuLinkProps {
+    active: bool,
+    on_select: gui::Callback<()>,
+}
+
+/// A link in a panel or in the list: `flex flex-col gap-1 rounded-sm p-2
+/// text-sm hover:bg-accent focus:bg-accent`; `active` marks the current
+/// page (`data-active:bg-accent/50`, `aria-current="page"`). Following it
+/// runs `on_click` and closes the menu (a Command-click does not). Add its
+/// title and description with `.child`.
 #[must_use]
-pub fn navigation_menu_link(active: bool, on_click: impl Fn() + 'static) -> Div {
+pub fn navigation_menu_link(active: bool, on_click: impl Into<gui::Callback<()>>) -> Part<NavigationMenuLinkProps> {
     let t = theme();
-    link_look(div(), &t, active)
-        .named("navigation-menu-link")
-        .transition(Properties::COLOR | Properties::SHADOW)
-        .on_click(move |_| on_click())
+    navigation_menu_link_as(
+        link_look(div(), &t, active).transition(Properties::COLOR | Properties::SHADOW),
+        active,
+        on_click,
+    )
+}
+
+/// A link drawn as `look` (`NavigationMenuLink as-child`), such as
+/// [`navigation_menu_trigger_style`] for a link in the list.
+#[must_use]
+pub fn navigation_menu_link_as(
+    look: impl Into<Div>,
+    active: bool,
+    on_click: impl Into<gui::Callback<()>>,
+) -> Part<NavigationMenuLinkProps> {
+    let props = NavigationMenuLinkProps {
+        active,
+        on_select: on_click.into(),
+    };
+    Part::new(props, look.into().named("navigation-menu-link"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let panel = use_context::<Panel>();
+            let nav = use_context::<NavigationMenu>();
+            let focus = FocusHandle::new();
+            // The `on_select` passed last, when it is picked.
+            let on_select = cx.event(|p| &p.props.on_select);
+            move || {
+                let (active, root) = props.with(|p| (p.props.active, p.slot.0.clone()));
+                let on_select = on_select.clone();
+                let select = move |()| {
+                    on_select.call(());
+                    Dismiss::Close
+                };
+                match (panel, nav) {
+                    (Some(Panel(item)), _) => item.link(root, focus, active, select),
+                    (None, Some(nav)) => nav.link(root, focus, active, select),
+                    (None, None) => root.on_click(move |_| {
+                        select(());
+                    }),
+                }
+                .into_element()
+            }
+        })
+    })
 }
 
 fn link_look(d: Div, t: &Colors, active: bool) -> Div {
@@ -441,4 +492,54 @@ fn link_look(d: Div, t: &Colors, active: bool) -> Div {
             d.background(t.accent.opacity(0.5)).text_color(t.accent_foreground)
         })
         .with_interaction(|d, i| lit(d, i, &t, Ring::new(4.0, t.ring.opacity(if t.dark { 0.2 } else { 0.1 }))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gui::{Scenario, Signal, text};
+
+    fn shows(s: &Scenario, what: &str) -> bool {
+        s.last().nodes.iter().any(|n| match &n.content {
+            gui::layout::Content::Text { content, .. } => &**content == what,
+            _ => false,
+        })
+    }
+
+    /// An item's content replaced in one update (keyed anew): the new one
+    /// gives the viewport its panel before the old one leaves, and the old
+    /// one's leaving takes back only its own, so the viewport draws the new
+    /// panel.
+    #[test]
+    fn a_content_replaced_in_one_update_is_the_panel_the_viewport_draws() {
+        let which = Signal::new(false);
+        let mut s = Scenario::measuring(
+            move || {
+                let second = which.get();
+                navigation_menu()
+                    .default_value("one")
+                    .child(navigation_menu_list().child(
+                        navigation_menu_item("one").child(navigation_menu_trigger("One")).child(
+                            div().key(gui::key_of(if second { "second" } else { "first" })).child(
+                                navigation_menu_content().child(text(if second {
+                                    "second panel"
+                                } else {
+                                    "first panel"
+                                })),
+                            ),
+                        ),
+                    ))
+                    .into_element()
+            },
+            600,
+            400,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("settled");
+        assert!(shows(&s, "first panel"));
+        s.act("replace the content", || which.set(true));
+        s.settle().expect("settled");
+        assert!(shows(&s, "second panel"), "the viewport draws the new content's panel");
+    }
 }

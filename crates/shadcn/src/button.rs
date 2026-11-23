@@ -165,9 +165,7 @@ forward! {
     /// As on [`Div`].
     fn on_pointer_move(f: impl Fn(&gui::PointerEvent) + 'static);
     /// As on [`Div`].
-    fn on_wheel(f: impl Fn(&gui::WheelEvent) + 'static);
-    /// As on [`Div`].
-    fn on_click_outside(f: impl Fn() + 'static);
+    fn on_wheel(f: impl Fn(&gui::WheelEvent) -> bool + 'static);
 }
 
 impl Button {
@@ -251,7 +249,7 @@ fn styled(d: Div, i: Interaction, variant: ButtonVariant, t: &Colors) -> Div {
         ButtonVariant::Ghost => d
             .background(move || on().then(|| if t.dark { t.accent.opacity(0.5) } else { t.accent }))
             .text_color(move || on().then_some(t.accent_foreground)),
-        ButtonVariant::Link => d.text_color(t.primary).underline(on),
+        ButtonVariant::Link => d.text_color(t.primary).underline_offset(4.0).underline(on),
     };
     let ring = if variant == ButtonVariant::Destructive {
         destructive_ring(gui::Style::default(), &t)

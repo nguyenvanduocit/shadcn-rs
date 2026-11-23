@@ -1,0 +1,15 @@
+---
+source: crates/primitives/tests/overlays.rs
+expression: a11y(&p.s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Button haspopup=Dialog expanded=false
+        Label "Settings"
+  GenericContainer
+    Region "Notifications (F8)"
+      GenericContainer
+        Status "Notification. New." live=Polite
+      Group
+        Label "New"

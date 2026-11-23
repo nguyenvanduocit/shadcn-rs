@@ -693,7 +693,9 @@ pub struct Placed {
 #[derive(Debug)]
 pub enum Body {
     Path(PathBody),
-    Text(TextBody),
+    /// Shared by the object and its moved copies, so what is shaped for
+    /// it (a [`Labels`] entry, by this allocation) is found for them too.
+    Text(Arc<TextBody>),
 }
 
 /// A path: its `f64` source, its path about the anchor, how it is painted,
@@ -776,7 +778,7 @@ pub fn level_of(k: f64) -> i32 {
 }
 
 /// Text: its content, how it is set, its size, the width it wraps to, and
-/// its glyphs once shaped.
+/// its glyphs, once shaped, in [`Labels`].
 #[derive(Debug)]
 pub struct TextBody {
     pub content: String,
@@ -785,25 +787,62 @@ pub struct TextBody {
     pub size: f64,
     /// World units its lines wrap to (`None`: one line).
     pub width: Option<f64>,
-    /// Its glyphs, shaped once by the first paint that has the text system
-    /// ([`crate::chunk::Picture::shape`]).
-    pub shaped: std::sync::OnceLock<Shaped>,
 }
 
-impl TextBody {
-    fn moved(&self) -> Self {
-        let shaped = std::sync::OnceLock::new();
-        if let Some(s) = self.shaped.get() {
-            shaped.set(s.clone()).ok();
+/// Canvas text shaped by the paints so far, by the [`TextBody`] it shapes
+/// (its allocation: the entry's `Weak` keeps the address from being
+/// reused while the entry lives). The paint that first meets a text
+/// shapes it ([`crate::chunk::Picture::shape`]) into the labels of the
+/// thread's engine (a cold frame starts from none, so its shaping warms
+/// nothing live); a frame's [`WorldSnapshot`] carries them to the render
+/// thread. Newest first, a layer a batch shaped together, merged into the
+/// one below once it is at least half that one's size (dropping the text
+/// gone meanwhile): adding is amortised O(1) and a frame shares the rest
+/// unchanged; a lookup walks O(log n) layers.
+#[derive(Debug, Default)]
+pub struct Labels {
+    layer: std::collections::HashMap<usize, (std::sync::Weak<TextBody>, Arc<Shaped>)>,
+    below: Option<Arc<Labels>>,
+}
+
+impl Labels {
+    /// What `t` was shaped to, if it has been.
+    #[must_use]
+    pub fn get(&self, t: &Arc<TextBody>) -> Option<&Shaped> {
+        let key = Arc::as_ptr(t).addr();
+        let mut at = Some(self);
+        while let Some(l) = at {
+            if let Some((_, s)) = l.layer.get(&key) {
+                return Some(s);
+            }
+            at = l.below.as_deref();
         }
-        Self {
-            content: self.content.clone(),
-            style: self.style,
-            size: self.size,
-            width: self.width,
-            shaped,
-        }
+        None
     }
+
+    /// `batch` on top of `head`, merging down while a layer below is no
+    /// more than twice the one above.
+    fn with(head: Option<Arc<Self>>, batch: Vec<(Arc<TextBody>, Shaped)>) -> Arc<Self> {
+        let mut layer: std::collections::HashMap<_, _> = batch
+            .into_iter()
+            .map(|(t, s)| (Arc::as_ptr(&t).addr(), (Arc::downgrade(&t), Arc::new(s))))
+            .collect();
+        let mut below = head;
+        while let Some(b) = below.take_if(|b| b.layer.len() <= layer.len().saturating_mul(2)) {
+            for (k, (t, s)) in &b.layer {
+                if t.strong_count() > 0 {
+                    layer.entry(*k).or_insert_with(|| (t.clone(), Arc::clone(s)));
+                }
+            }
+            below.clone_from(&b.below);
+        }
+        Arc::new(Self { layer, below })
+    }
+}
+
+crate::engine::engine_local! {
+    /// The text shaped for every canvas this thread paints ([`Labels`]).
+    [Fresh] static LABELS: std::cell::RefCell<Option<Arc<Labels>>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Text shaped: each glyph's key and pen (ems from the text's top left,
@@ -903,7 +942,7 @@ impl Placed {
         Self {
             body: match &self.body {
                 Body::Path(p) => Body::Path(p.moved(d)),
-                Body::Text(t) => Body::Text(t.moved()),
+                Body::Text(t) => Body::Text(Arc::clone(t)),
             },
             anchor: (self.anchor.0 + d.0, self.anchor.1 + d.1),
             bbox: [b[0] + d.0, b[1] + d.1, b[2] + d.0, b[3] + d.1],
@@ -979,6 +1018,11 @@ impl Base {
         }
     }
 
+    /// Every object, by id.
+    fn objects(&self) -> impl Iterator<Item = &Arc<Placed>> {
+        self.pages.iter().flat_map(|p| p.iter().flatten())
+    }
+
     /// About how many objects meet `area`, at most `limit`.
     #[must_use]
     pub fn count(&self, area: &Aabb, limit: usize) -> usize {
@@ -994,7 +1038,7 @@ pub const DAMAGE_KEPT: usize = 1024;
 pub type DamageList = Arc<[(u64, Aabb)]>;
 
 /// A world as one frame drew it.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct WorldSnapshot {
     pub id: u64,
     /// What tiles show: moves with every change but one to a lifted object.
@@ -1012,6 +1056,9 @@ pub struct WorldSnapshot {
     pub damage_from: u64,
     /// Text not yet shaped when it was made.
     pub unshaped: Vec<u32>,
+    /// Its text shaped: the labels as the frame's paint left them (none
+    /// in a snapshot no paint has drawn).
+    pub labels: Arc<Labels>,
 }
 
 impl WorldSnapshot {
@@ -1245,13 +1292,12 @@ fn place_text(t: WorldText, z: ZKey) -> Placed {
         color: t.style.color.opacity(0.5),
         anchor: t.at,
         bbox: [t.at.0, t.at.1 - 0.25 * t.size, t.at.0 + wide, t.at.1 + tall],
-        body: Body::Text(TextBody {
+        body: Body::Text(Arc::new(TextBody {
             content: t.content,
             style: t.style,
             size: t.size,
             width: t.width,
-            shaped: std::sync::OnceLock::new(),
-        }),
+        })),
         z,
     }
 }
@@ -1474,6 +1520,12 @@ impl World {
 
     fn snapshot_untracked(&self) -> Arc<WorldSnapshot> {
         self.0.with_untracked(|w| {
+            // A cold frame reads none of the world's caches and fills none:
+            // its snapshot is its own, made from the world itself.
+            #[cfg(debug_assertions)]
+            if crate::engine::is_cold() {
+                return w.build_cold();
+            }
             let mut cache = w.snapshot.borrow_mut();
             Arc::clone(cache.get_or_insert_with(|| w.build()))
         })
@@ -1639,6 +1691,24 @@ impl WorldState {
         })
     }
 
+    /// A cold frame's snapshot: made from the world, not its caches, and
+    /// with no text left for the paint's shaping to find (a cold paint
+    /// shapes all the world's text).
+    #[cfg(debug_assertions)]
+    fn build_cold(&self) -> Arc<WorldSnapshot> {
+        Arc::new(WorldSnapshot {
+            id: self.id,
+            version: self.version,
+            live_version: self.live_version,
+            base: self.build_base(),
+            live: self.lifted.iter().map(|(i, p)| (*i, Arc::clone(p))).collect(),
+            damage: self.damage.iter().copied().collect(),
+            damage_from: self.damage_from,
+            unshaped: Vec::new(),
+            labels: Arc::default(),
+        })
+    }
+
     fn build(&self) -> Arc<WorldSnapshot> {
         let base = Arc::clone(self.base.borrow_mut().get_or_insert_with(|| self.build_base()));
         let damage = Arc::clone(
@@ -1656,14 +1726,19 @@ impl WorldState {
             damage_from: self.damage_from,
             unshaped: {
                 let mut u = self.unshaped.borrow_mut();
-                u.retain(|i| {
-                    self.objects
-                        .get(usize::try_from(*i).unwrap_or(usize::MAX))
-                        .and_then(Option::as_ref)
-                        .is_some_and(|(p, _)| matches!(&p.body, Body::Text(t) if t.shaped.get().is_none()))
+                LABELS.with_borrow_mut(|labels| {
+                    u.retain(|i| {
+                        self.objects
+                            .get(usize::try_from(*i).unwrap_or(usize::MAX))
+                            .and_then(Option::as_ref)
+                            .is_some_and(|(p, _)| {
+                                matches!(&p.body, Body::Text(t) if labels.as_ref().is_none_or(|l| l.get(t).is_none()))
+                            })
+                    });
                 });
                 u.clone()
             },
+            labels: Arc::default(),
         })
     }
 }
@@ -1687,7 +1762,23 @@ impl PartialEq for WorldView {
             && self.camera == other.camera
             && self.tiled == other.tiled
             && same_world(&self.world, &other.world)
+            && same_labels(&self.world, &other.world)
     }
+}
+
+/// Two snapshots of one world version draw their text with the same
+/// glyphs: the same labels, or each text shaped alike in both.
+fn same_labels(a: &WorldSnapshot, b: &WorldSnapshot) -> bool {
+    if Arc::ptr_eq(&a.labels, &b.labels) {
+        return true;
+    }
+    a.base
+        .objects()
+        .chain(a.live.iter().map(|(_, o)| o))
+        .all(|o| match &o.body {
+            Body::Text(t) => a.labels.get(t).map(|s| &s.glyphs) == b.labels.get(t).map(|s| &s.glyphs),
+            _ => true,
+        })
 }
 
 fn same_world(a: &WorldSnapshot, b: &WorldSnapshot) -> bool {
@@ -1706,16 +1797,48 @@ impl PartialEq for CanvasPicture {
     }
 }
 
+impl CanvasPicture {
+    /// The world with the text shaped so far ([`Labels`]): the snapshot
+    /// itself while this thread has shaped none.
+    fn labelled(&self) -> Arc<WorldSnapshot> {
+        let Some(labels) = LABELS.with_borrow_mut(|l| l.clone()) else {
+            return Arc::clone(&self.world);
+        };
+        Arc::new(WorldSnapshot {
+            labels,
+            ..WorldSnapshot::clone(&self.world)
+        })
+    }
+}
+
 impl Picture for CanvasPicture {
     fn shape(&self, text: &mut crate::text::TextSystem) {
-        let base = self.world.unshaped.iter().filter_map(|i| self.world.object(*i));
-        for o in base.chain(self.world.live.iter().map(|(_, o)| o)) {
-            if let Body::Text(t) = &o.body
-                && t.shaped.get().is_none()
-            {
-                t.shaped.set(shape_text(t, text)).ok();
+        LABELS.with_borrow_mut(|labels| {
+            // What the snapshot left unshaped; a cold frame, whose labels
+            // start from none, every text in the world.
+            #[cfg(debug_assertions)]
+            let cold = crate::engine::is_cold();
+            #[cfg(not(debug_assertions))]
+            let cold = false;
+            let base: Box<dyn Iterator<Item = &Arc<Placed>>> = if cold {
+                Box::new(self.world.base.objects())
+            } else {
+                Box::new(self.world.unshaped.iter().filter_map(|i| self.world.object(*i)))
+            };
+            let mut batch: Vec<(Arc<TextBody>, Shaped)> = Vec::new();
+            let mut in_batch = std::collections::HashSet::new();
+            for o in base.chain(self.world.live.iter().map(|(_, o)| o)) {
+                if let Body::Text(t) = &o.body
+                    && labels.as_ref().is_none_or(|l| l.get(t).is_none())
+                    && in_batch.insert(Arc::as_ptr(t).addr())
+                {
+                    batch.push((Arc::clone(t), shape_text(t, text)));
+                }
             }
-        }
+            if !batch.is_empty() {
+                *labels = Some(Labels::with(labels.take(), batch));
+            }
+        });
     }
 
     fn draw(&self, area: Bounds, _scale: f32, key: u64, out: &mut Vec<Item>) {
@@ -1724,7 +1847,7 @@ impl Picture for CanvasPicture {
         out.push(Item::World(Arc::new(WorldView {
             key,
             bounds: area,
-            world: Arc::clone(&self.world),
+            world: self.labelled(),
             camera: self.camera,
             tiled: visible > TILE_ABOVE,
         })));
@@ -1736,7 +1859,7 @@ impl Picture for CanvasPicture {
 /// broken to its width as UI text breaks to its box), their pens and its
 /// lines in ems from the top left.
 fn shape_text(t: &TextBody, text: &mut crate::text::TextSystem) -> Shaped {
-    let mut style = t.style;
+    let mut style = t.style.clone();
     // Shaped at 16 px and scale 64: an em of 1024 device pixels.
     style.size = 16.0;
     style.line_height = style.line_height.max(1.0) / t.style.size.max(1.0) * 16.0;
@@ -1871,6 +1994,15 @@ fn canvas_with(world: World, camera: Signal<Camera>, movable: Option<Movable>) -
             }));
             return;
         }
+        // Cancelled, the camera and an object moved stay where the moves
+        // put them.
+        if e.phase == DragPhase::Cancel {
+            if let Some(Gesture::Move(id, _)) = gesture.get() {
+                world.land(id);
+            }
+            gesture.set(None);
+            return;
+        }
         match gesture.get() {
             Some(Gesture::Pan((x, y))) => {
                 let (dx, dy) = (f64::from(e.x - x), f64::from(e.y - y));
@@ -1905,6 +2037,7 @@ fn canvas_with(world: World, camera: Signal<Camera>, movable: Option<Movable>) -
             c.settled = false;
         });
         moved();
+        true
     })
 }
 

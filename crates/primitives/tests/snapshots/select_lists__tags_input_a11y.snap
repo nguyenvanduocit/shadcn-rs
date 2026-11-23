@@ -1,0 +1,14 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Label "apple"
+      Button "Remove apple"
+    GenericContainer current=True
+      Label "banana"
+      Button "Remove banana"
+    TextInput ""
+      TextRun ""

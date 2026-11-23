@@ -1,0 +1,16 @@
+---
+source: crates/primitives/tests/menus.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer
+    Toolbar Horizontal
+      GenericContainer
+        Label "Cut"
+      Group
+        Button checked=True
+          Label "Bold"
+        Button checked=True
+          Label "Italic"
+    GenericContainer
+      Label "After"

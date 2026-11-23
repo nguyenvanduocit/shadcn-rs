@@ -30,9 +30,10 @@ use gui::{
 use shadcn::{
     ButtonSize, ButtonVariant, CommandItem, CommandSection, Orientation, SidebarCollapsible, SidebarMenuButtonProps,
     SidebarMenuButtonSize, breadcrumb, breadcrumb_item, breadcrumb_link, breadcrumb_list, breadcrumb_page,
-    breadcrumb_separator, button, command, command_input, command_list, dialog, dialog_content, kbd, kbd_group,
-    separator, sidebar, sidebar_content, sidebar_group, sidebar_group_content, sidebar_group_label, sidebar_header,
-    sidebar_inset, sidebar_menu, sidebar_menu_button, sidebar_menu_item, sidebar_provider, sidebar_trigger, theme,
+    breadcrumb_separator, button, command, command_input, command_list, dialog, dialog_content, dialog_description,
+    dialog_header, dialog_title, kbd, kbd_group, separator, sidebar, sidebar_content, sidebar_group,
+    sidebar_group_content, sidebar_group_label, sidebar_header, sidebar_inset, sidebar_menu, sidebar_menu_button,
+    sidebar_menu_item, sidebar_provider, sidebar_trigger, theme,
 };
 
 use self::catalog::{Catalog, Route};
@@ -164,7 +165,7 @@ impl Docs {
         }
     }
 
-    fn render(&mut self) -> Element {
+    fn render(&self) -> Element {
         let route = self.nav.route.get();
         let body = match route {
             Route::Page(i) => page_view(Rc::clone(&self.catalog), self.nav.clone(), self.verdicts, i),
@@ -198,7 +199,7 @@ impl Docs {
     }
 
     /// The page's parts, then the links to the pages either side of it.
-    fn parts(&mut self, route: Route) -> Vec<Part> {
+    fn parts(&self, route: Route) -> Vec<Part> {
         let verdicts = self.verdicts.get();
         let mut parts = match route {
             Route::Introduction => intro::parts(&self.catalog, &verdicts, &self.nav),
@@ -365,7 +366,7 @@ impl Docs {
                 .map(|&r| CommandItem::new(self.catalog.title(r)))
                 .collect()
         };
-        let sections = Rc::new(vec![
+        let sections = std::sync::Arc::new(vec![
             CommandSection::group(Some("Getting Started"), titled(&self.catalog.getting_started)),
             CommandSection::Separator,
             CommandSection::group(Some("Components"), titled(&self.catalog.components)),
@@ -389,7 +390,7 @@ impl Docs {
             })
             .collect();
         let (nav, open) = (self.nav.clone(), self.search.dialog);
-        let on_select = move |item: &CommandItem| {
+        let on_select = move |item: CommandItem| {
             if let Some(&(_, route)) = routes.iter().find(|(t, _)| *t == item.value) {
                 nav.go(route);
                 open.set(false);
@@ -412,6 +413,15 @@ impl Docs {
                     .gap(0.0)
                     .max_width(560.0)
                     .overflow(Overflow::Hidden)
+                    // `CommandDialog`'s `DialogHeader class="sr-only"`: read, not shown.
+                    .child(
+                        primitives::visually_hidden::visually_hidden(
+                            dialog_header(),
+                            primitives::visually_hidden::Hidden::Visually,
+                        )
+                        .child(dialog_title("Search documentation"))
+                        .child(dialog_description("Search for a page to open.")),
+                    )
                     .child(
                         command()
                             .child(command_input("Search documentation..."))
@@ -435,7 +445,7 @@ pub fn run(debug: gui::DebugTools, setup: impl FnOnce() + Send + 'static) -> ! {
         move || {
             setup();
             gui::provide(Host::Docs);
-            let mut docs = Docs::new(Route::Introduction);
+            let docs = Docs::new(Route::Introduction);
             move || docs.render()
         },
         options,
@@ -446,7 +456,7 @@ pub fn run(debug: gui::DebugTools, setup: impl FnOnce() + Send + 'static) -> ! {
 /// `--inspect docs` drives headless.
 pub fn app() -> Render {
     gui::provide(Host::Docs);
-    let mut docs = Docs::new(Route::Introduction);
+    let docs = Docs::new(Route::Introduction);
     Box::new(move || docs.render())
 }
 
@@ -481,7 +491,7 @@ fn within(nodes: &[FrameNode], i: usize, name: &str) -> bool {
 fn shows(nodes: &[FrameNode], i: usize, label: &str) -> bool {
     nodes
         .get(i)
-        .is_some_and(|n| matches!(&n.content, Content::Text { content, .. } if content == label))
+        .is_some_and(|n| matches!(&n.content, Content::Text { content, .. } if &**content == label))
 }
 
 /// Walk the docs headless at 1440×900, 2x, a frame per step into `dir`: the
@@ -491,7 +501,7 @@ fn shows(nodes: &[FrameNode], i: usize, label: &str) -> bool {
 pub fn trace(dir: &Path) -> Result<(), ScenarioError> {
     gui::provide(Host::Docs);
     coverage();
-    let mut docs = Docs::new(Route::Introduction);
+    let docs = Docs::new(Route::Introduction);
     let (nav, catalog) = (docs.nav.clone(), Rc::clone(&docs.catalog));
     let mut s = Scenario::new(move || docs.render(), dir, 1440, 900, 2.0)?;
     s.frame("introduction")?;
@@ -633,14 +643,18 @@ fn coverage() {
 /// leaves the page. Only it renders when what it shows changes.
 fn page_view(catalog: Rc<Catalog>, nav: Nav, verdicts: Signal<Rc<Verdicts>>, i: usize) -> Element {
     gui::component(i, move |_| {
-        let mut render = catalog.entries.get(i).map(|e| (e.page.render)());
-        let mut demos = DemoStates::new();
+        let render = catalog.entries.get(i).map(|e| (e.page.render)());
+        // Each demo's code, cut once here from the demos the page shows.
+        let demos = match (catalog.entries.get(i), render.as_ref()) {
+            (Some(entry), Some(render)) => component::demo_states(entry, &gui::untracked(|| lift::lift(render()))),
+            _ => DemoStates::new(),
+        };
         move || {
-            let (Some(entry), Some(render)) = (catalog.entries.get(i), render.as_mut()) else {
+            let (Some(entry), Some(render)) = (catalog.entries.get(i), render.as_ref()) else {
                 return gui::Element::Empty;
             };
             let lifted = lift::lift(render());
-            let mut parts = component::parts(entry, lifted, &mut demos, &verdicts.get());
+            let mut parts = component::parts(entry, lifted, &demos, &verdicts.get());
             parts.push(Part::new("pager", None, pager(&catalog, &nav, Route::Page(i))));
             body(&nav, parts).into_element()
         }

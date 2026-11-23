@@ -1,256 +1,50 @@
-//! Calendar (`ui/calendar`): a month of days to pick one date from, paged with
-//! the header's arrows and walked with the keyboard as reka-ui's
-//! `CalendarRoot` does. The date type, the view (which months show, in which
-//! calendar system and locale, which day holds the grid's tab stop) and the
-//! day trigger are shared with `range_calendar`.
+//! Calendar (`ui/calendar`): a month of days to pick one date from, paged
+//! with the header's arrows. Its behaviour (the view, the anchor and the
+//! grid's one Tab stop, the keys, picking, what assistive technology is
+//! told) is `primitives::calendar`'s; this file draws it: the header, the
+//! day cells and triggers, the arrows and the month and year selects. The
+//! look and the dates are shared with `range_calendar`.
 //!
 //! [`calendar`] is an instance keeping its view and, unless the caller
 //! passes `.model(…)` (reka's `v-model`), the picked day, starting at
 //! `default_value`. Each day is an instance of its own, so a pick renders
 //! the two days it changes.
 
-use std::num::Saturating;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use gui::prelude::*;
 use gui::{
-    Bind, Computed, Div, Element, FocusHandle, Icon, KeyEvent, Length, Model, NamedKey, Signal, UseModel, component,
-    div, icon, on_mounted, provide, text, use_context, use_model, watch,
+    Bind, Computed, Derive, Direction, Div, Element, FocusHandle, Icon, Length, Model, Signal, component, div, icon,
+    on_mounted, provide, text,
 };
+use primitives::Availability;
+use primitives::calendar::{Calendar, CalendarGrid};
+pub use primitives::calendar::{CalendarOptions, Day};
+use primitives::context::use_root;
+pub use primitives::date::{
+    CalendarDate, CalendarLocale, CalendarSystem, DatePart, DateStrings, Era, MonthWidth, SystemDate, WeekdayFormat,
+};
+use primitives::direction::use_direction;
 
 use crate::button::{ButtonSize, ButtonVariant, button};
-use crate::calendar_locale::{CalendarLocale, MonthWidth, WeekdayFormat};
-use crate::calendar_system::CalendarSystem;
 use crate::focus::StateLook;
 use crate::native_select::{NativeSelectEntry, native_select, native_select_option};
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
-const FIRST_YEAR: i32 = 1;
-const LAST_YEAR: i32 = 9999;
-
-/// A day of the proleptic Gregorian calendar, in years 1 to 9999.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CalendarDate {
-    year: i32,
-    month: u8,
-    day: u8,
-}
-
-impl CalendarDate {
-    /// `None` when that day does not exist or its year is outside 1..=9999.
-    #[must_use]
-    pub fn new(year: i32, month: u8, day: u8) -> Option<Self> {
-        let valid = (FIRST_YEAR..=LAST_YEAR).contains(&year)
-            && (1..=12).contains(&month)
-            && (1..=CalendarSystem::Gregorian.days_in_month(year, month)).contains(&day);
-        valid.then_some(Self { year, month, day })
-    }
-
-    /// Today where the machine is: the day it is now in the system's time
-    /// zone (`TZ` when set, else the OS's), as reka's
-    /// `today(getLocalTimeZone())` is the day in the browser's.
-    #[must_use]
-    pub fn today() -> Self {
-        Self::in_zone(SystemTime::now(), &jiff::tz::TimeZone::system())
-    }
-
-    /// The day `instant` falls on in the IANA time zone `zone` ("UTC",
-    /// "Asia/Tehran"); `None` when the time zone database has no such zone.
-    #[must_use]
-    pub fn at(instant: SystemTime, zone: &str) -> Option<Self> {
-        jiff::tz::TimeZone::get(zone).ok().map(|tz| Self::in_zone(instant, &tz))
-    }
-
-    /// The day `instant` falls on in `tz`, clamped into years 1..=9999.
-    fn in_zone(instant: SystemTime, tz: &jiff::tz::TimeZone) -> Self {
-        let Ok(at) = jiff::Timestamp::try_from(instant) else {
-            let after = instant.duration_since(UNIX_EPOCH).is_ok();
-            return Self::from_days(if after { i64::MAX } else { i64::MIN });
-        };
-        let date = tz.to_datetime(at).date();
-        Self::new(
-            i32::from(date.year()),
-            date.month().unsigned_abs(),
-            date.day().unsigned_abs(),
-        )
-        .unwrap_or_else(|| Self::from_days(if date.year() < 1 { i64::MIN } else { i64::MAX }))
-    }
-
-    #[must_use]
-    pub fn year(self) -> i32 {
-        self.year
-    }
-
-    /// 1 for January.
-    #[must_use]
-    pub fn month(self) -> u8 {
-        self.month
-    }
-
-    #[must_use]
-    pub fn day(self) -> u8 {
-        self.day
-    }
-
-    /// The month's English name.
-    #[must_use]
-    pub fn month_name(self) -> &'static str {
-        CalendarLocale::EnUs.month(CalendarSystem::Gregorian, self, MonthWidth::Long)
-    }
-
-    /// "Nov": the name `Intl`'s `{ month: 'short' }` gives in English.
-    #[must_use]
-    pub fn month_short_name(self) -> &'static str {
-        CalendarLocale::EnUs.month(CalendarSystem::Gregorian, self, MonthWidth::Short)
-    }
-
-    /// 0 for Sunday.
-    #[must_use]
-    pub fn weekday(self) -> u8 {
-        u8::try_from(self.days().saturating_add(4).rem_euclid(7)).unwrap_or(0)
-    }
-
-    /// `n` days later (earlier when negative), held inside years 1..=9999.
-    #[must_use]
-    pub fn add_days(self, n: i64) -> Self {
-        Self::from_days(self.days().saturating_add(n))
-    }
-
-    /// `n` months later, its day cut to the length of that month.
-    #[must_use]
-    pub fn add_months(self, n: i64) -> Self {
-        CalendarSystem::Gregorian.add_months(self, n)
-    }
-
-    #[must_use]
-    pub fn start_of_month(self) -> Self {
-        CalendarSystem::Gregorian.start_of_month(self)
-    }
-
-    #[must_use]
-    pub fn end_of_month(self) -> Self {
-        CalendarSystem::Gregorian.end_of_month(self)
-    }
-
-    /// Whether `other` falls in the same month of the same year.
-    #[must_use]
-    pub fn same_month(self, other: Self) -> bool {
-        CalendarSystem::Gregorian.same_month(self, other)
-    }
-
-    /// Days since 1970-01-01 (Howard Hinnant's `days_from_civil`). Every
-    /// intermediate is non-negative because years start at 1.
-    pub(crate) fn days(self) -> i64 {
-        let y = s(i64::from(self.year)) - s(i64::from(self.month <= 2));
-        let era = quot(y, 400);
-        let yoe = y - era * s(400);
-        let mp = rem(s(i64::from(self.month)) + s(9), 12);
-        let doy = quot(s(153) * mp + s(2), 5) + s(i64::from(self.day)) - s(1);
-        let doe = yoe * s(365) + quot(yoe, 4) - quot(yoe, 100) + doy;
-        (era * s(146_097) + doe - s(719_468)).0
-    }
-
-    /// The day `days` after 1970-01-01 (`civil_from_days`), clamped into years 1..=9999.
-    pub(crate) fn from_days(days: i64) -> Self {
-        let first = Self {
-            year: FIRST_YEAR,
-            month: 1,
-            day: 1,
-        }
-        .days();
-        let last = Self {
-            year: LAST_YEAR,
-            month: 12,
-            day: 31,
-        }
-        .days();
-        let z = s(days.clamp(first, last)) + s(719_468);
-        let era = quot(z, 146_097);
-        let doe = z - era * s(146_097);
-        let yoe = quot(doe - quot(doe, 1460) + quot(doe, 36_524) - quot(doe, 146_096), 365);
-        let doy = doe - (s(365) * yoe + quot(yoe, 4) - quot(yoe, 100));
-        let mp = quot(s(5) * doy + s(2), 153);
-        let day = doy - quot(s(153) * mp + s(2), 5) + s(1);
-        let month = if mp < s(10) { mp + s(3) } else { mp - s(9) };
-        let year = yoe + era * s(400) + s(i64::from(month <= s(2)));
-        Self {
-            year: i32::try_from(year.0).unwrap_or(LAST_YEAR),
-            month: u8::try_from(month.0).unwrap_or(1),
-            day: u8::try_from(day.0).unwrap_or(1),
-        }
-    }
-}
-
-/// The civil-date arithmetic runs on non-negative day counts far from `i64`'s
-/// ends: it saturates rather than overflow, and divides only by the positive
-/// constants of the algorithm.
-pub(crate) fn s(v: i64) -> Saturating<i64> {
-    Saturating(v)
-}
-
-pub(crate) fn quot(a: Saturating<i64>, by: i64) -> Saturating<i64> {
-    Saturating(a.0.checked_div_euclid(by).unwrap_or_default())
-}
-
-pub(crate) fn rem(a: Saturating<i64>, by: i64) -> Saturating<i64> {
-    Saturating(a.0.checked_rem_euclid(by).unwrap_or_default())
-}
-
-/// The weeks a month's grid shows, starting on `first_weekday` (0 for
-/// Sunday), padded with the days of the months around it (reka-ui's grid
-/// without `fixedWeeks`). `month` is any day of the month, in `system`.
-#[must_use]
-pub fn calendar_weeks(system: CalendarSystem, first_weekday: u8, month: CalendarDate) -> Vec<Vec<CalendarDate>> {
-    let first = system.start_of_month(month);
-    let last = system.end_of_month(month);
-    let lead = i64::from(first.weekday())
-        .saturating_sub(i64::from(first_weekday))
-        .rem_euclid(7);
-    let mut start = first.add_days(lead.saturating_neg());
-    let mut weeks = Vec::new();
-    while start <= last {
-        weeks.push((0..7).map(|d| start.add_days(d)).collect());
-        start = start.add_days(7);
-    }
-    weeks
-}
-
-/// What both calendars are told about their view: reka-ui's `numberOfMonths`,
-/// `minValue`, `maxValue`, `weekdayFormat`, `disableDaysOutsideCurrentView`,
-/// `dir`, `locale` and the placeholder's calendar, with the day counted as
-/// today and the day triggers' size.
+/// What only the look of both calendars reads: the day triggers' size and
+/// the direction the rows run.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CalendarOptions {
-    pub today: CalendarDate,
-    pub months: u8,
-    pub min: Option<CalendarDate>,
-    pub max: Option<CalendarDate>,
-    pub weekday_format: WeekdayFormat,
+pub struct CalendarLook {
     /// A day trigger's side, in pixels (`size-8`).
     pub cell_size: f32,
-    pub disable_outside_view: bool,
     /// `dir="rtl"`: rows run right to left, the arrows and arrow keys mirrored.
     pub rtl: bool,
-    /// The calendar the months are counted in (the placeholder's calendar).
-    pub system: CalendarSystem,
-    /// What the names, digits, week and direction are read in (`locale`).
-    pub locale: CalendarLocale,
 }
 
-impl Default for CalendarOptions {
+impl Default for CalendarLook {
     fn default() -> Self {
         Self {
-            today: CalendarDate::today(),
-            months: 1,
-            min: None,
-            max: None,
-            weekday_format: WeekdayFormat::Narrow,
             cell_size: 32.0,
-            disable_outside_view: false,
             rtl: false,
-            system: CalendarSystem::Gregorian,
-            locale: CalendarLocale::EnUs,
         }
     }
 }
@@ -259,217 +53,7 @@ impl Default for CalendarOptions {
 /// their shared builder methods set.
 pub trait HasOptions {
     fn options_mut(&mut self) -> &mut CalendarOptions;
-}
-
-/// Which months show and which day holds the grid's one tab stop: the state
-/// a calendar's instance keeps, shared with its days.
-#[derive(Clone, Copy)]
-pub(crate) struct CalendarView {
-    /// The first month shown (reka-ui's `placeholder`), as its first day in the system.
-    month: Signal<CalendarDate>,
-    /// The day the arrow keys move and the grid's tab stop sits on.
-    focused: Signal<CalendarDate>,
-    focus: FocusHandle,
-    options: Computed<CalendarOptions>,
-}
-
-impl CalendarView {
-    /// In a calendar's setup: the view of `options`, on the month of
-    /// `focused`. A new calendar system or locale goes back to today.
-    #[track_caller]
-    pub(crate) fn new(options: impl Fn() -> CalendarOptions + 'static, focused: CalendarDate) -> Self {
-        let options = Computed::new(options);
-        let system = options.get_untracked().system;
-        let view = Self {
-            month: Signal::labeled("calendar month", system.start_of_month(focused)),
-            focused: Signal::labeled("calendar focused", focused),
-            focus: FocusHandle::new(),
-            options,
-        };
-        let _calendar = watch(
-            move || options.with(|o| (o.system, o.locale)),
-            move |(system, _), _| {
-                let today = options.get_untracked().today;
-                view.month.set(system.start_of_month(today));
-                view.focused.set(today);
-            },
-        );
-        view
-    }
-
-    fn opt(&self) -> CalendarOptions {
-        self.options.get()
-    }
-
-    pub(crate) fn rtl(&self) -> bool {
-        self.opt().rtl
-    }
-
-    /// The first day of each month shown.
-    pub(crate) fn shown(&self) -> Vec<CalendarDate> {
-        let o = self.opt();
-        let first = self.month.get();
-        (0..i64::from(o.months))
-            .map(|i| o.system.add_months(first, i))
-            .collect()
-    }
-
-    /// Whether `day` is a day of the month `month` starts.
-    pub(crate) fn in_month(&self, day: CalendarDate, month: CalendarDate) -> bool {
-        self.opt().system.same_month(day, month)
-    }
-
-    /// `day`'s number as the grid shows it.
-    fn day_label(&self, day: CalendarDate) -> String {
-        let o = self.opt();
-        o.locale.number(i64::from(o.system.fields(day).day))
-    }
-
-    /// "November 2026", or "November - December 2026" over several months.
-    pub(crate) fn heading(&self) -> String {
-        let o = self.opt();
-        let (system, locale) = (o.system, o.locale);
-        let first = self.month.get();
-        let last = system.add_months(first, i64::from(o.months.saturating_sub(1)));
-        if first == last {
-            return locale.month_and_year(system, first);
-        }
-        let month = |d| locale.month(system, d, MonthWidth::Long);
-        let (first_year, last_year) = (locale.year(system, first), locale.year(system, last));
-        if first_year == last_year {
-            format!("{} - {} {last_year}", month(first), month(last))
-        } else {
-            format!("{} {first_year} - {} {last_year}", month(first), month(last))
-        }
-    }
-
-    /// Outside `minValue..=maxValue`, or outside `month` when those are disabled.
-    fn is_disabled(&self, date: CalendarDate, month: CalendarDate) -> bool {
-        let o = self.opt();
-        o.min.is_some_and(|m| date < m)
-            || o.max.is_some_and(|m| date > m)
-            || (o.disable_outside_view && !self.in_month(date, month))
-    }
-
-    /// The last day shown when the first month shown starts on `first`.
-    fn last_shown(&self, first: CalendarDate) -> CalendarDate {
-        let o = self.opt();
-        o.system
-            .end_of_month(o.system.add_months(first, i64::from(o.months.saturating_sub(1))))
-    }
-
-    /// Whether paging `step` pages (of `numberOfMonths`) still shows a day in bounds.
-    fn can_page(&self, step: i64) -> bool {
-        let o = self.opt();
-        let first = o
-            .system
-            .add_months(self.month.get(), step.saturating_mul(i64::from(o.months)));
-        let last = self.last_shown(first);
-        !(o.max.is_some_and(|m| first > m) || o.min.is_some_and(|m| last < m))
-    }
-
-    /// Show the months `step` pages away; the focused day moves with them.
-    fn page(&self, step: i64) {
-        self.shift(step.saturating_mul(i64::from(self.opt().months)));
-    }
-
-    /// Show the months `months` later (earlier when negative); the focused
-    /// day moves with them, as reka-ui's `placeholder` does.
-    fn shift(&self, months: i64) {
-        let system = self.opt().system;
-        self.month.update(|m| *m = system.add_months(*m, months));
-        self.focused.update(|d| *d = system.add_months(*d, months));
-    }
-
-    /// Show `year`'s month of the same name (the year select); the focused day moves with it.
-    fn set_year(&self, year: i32) {
-        let system = self.opt().system;
-        self.month.update(|m| *m = system.with_year(*m, year));
-        self.focused.update(|d| *d = system.with_year(*d, year));
-    }
-
-    /// Show `month` of the shown year (the month select); the focused day moves with it.
-    fn set_month(&self, month: u8) {
-        let system = self.opt().system;
-        let by = i64::from(month).saturating_sub(i64::from(system.fields(self.month.get_untracked()).month));
-        self.shift(by);
-    }
-
-    /// Move the tab stop to `date` and bring its month into view.
-    pub(crate) fn reveal(&self, date: CalendarDate) {
-        let o = self.opt();
-        let date = o.min.map_or(date, |m| date.max(m));
-        let date = o.max.map_or(date, |m| date.min(m));
-        let first = self.month.get_untracked();
-        if date < first {
-            self.month.set(o.system.start_of_month(date));
-        } else if date > self.last_shown(first) {
-            self.month.set(o.system.add_months(
-                o.system.start_of_month(date),
-                i64::from(o.months.saturating_sub(1)).saturating_neg(),
-            ));
-        }
-        self.focused.set(date);
-    }
-
-    /// Move the tab stop to `date`, bring its month into view and focus it.
-    fn focus_day(&self, date: CalendarDate, by_keyboard: bool) {
-        self.reveal(date);
-        gui::focus::set_focus(Some(self.focus.id()), by_keyboard);
-    }
-
-    /// The grid's keys: arrows by day and week (mirrored right to left),
-    /// Home and End to the week's ends, Page Up and Down by month (by year
-    /// with Shift).
-    fn on_key(&self, e: &KeyEvent) -> bool {
-        let o = self.opt();
-        let d = self.focused.get_untracked();
-        let page: i64 = if e.modifiers.shift { 12 } else { 1 };
-        let forward: i64 = if o.rtl { -1 } else { 1 };
-        let into_week = i64::from(d.weekday())
-            .saturating_sub(i64::from(o.locale.first_weekday()))
-            .rem_euclid(7);
-        let to = if e.is(NamedKey::ArrowLeft) {
-            d.add_days(forward.saturating_neg())
-        } else if e.is(NamedKey::ArrowRight) {
-            d.add_days(forward)
-        } else if e.is(NamedKey::ArrowUp) {
-            d.add_days(-7)
-        } else if e.is(NamedKey::ArrowDown) {
-            d.add_days(7)
-        } else if e.is(NamedKey::Home) {
-            d.add_days(into_week.saturating_neg())
-        } else if e.is(NamedKey::End) {
-            d.add_days(6_i64.saturating_sub(into_week))
-        } else if e.is(NamedKey::PageUp) {
-            o.system.add_months(d, page.saturating_neg())
-        } else if e.is(NamedKey::PageDown) {
-            o.system.add_months(d, page)
-        } else {
-            return false;
-        };
-        self.focus_day(to, true);
-        true
-    }
-
-    /// A row laid out in the locale's direction.
-    pub(crate) fn row(&self) -> Div {
-        if self.rtl() {
-            div().display(Display::Flex).flex_direction(FlexDirection::RowReverse)
-        } else {
-            div().display(Display::Flex).flex_direction(FlexDirection::Row)
-        }
-    }
-
-    /// The months' grids side by side, walked with [`Self::on_key`].
-    pub(crate) fn months_row(&self, grid: impl Fn(CalendarDate) -> Div) -> Div {
-        let view = *self;
-        self.row()
-            .margin_top(16.0)
-            .column_gap(16.0)
-            .on_key_down(move |e| view.on_key(e))
-            .children(self.shown().into_iter().map(grid))
-    }
+    fn look_mut(&mut self) -> &mut CalendarLook;
 }
 
 /// How a day stands in the selection; both calendars draw it the same way.
@@ -482,30 +66,39 @@ pub(crate) enum DaySelection {
     Picked,
 }
 
-/// The day button both calendars put in a cell (`CalendarCellTrigger`).
-pub(crate) fn day_trigger(
-    view: CalendarView,
-    day: CalendarDate,
-    month: CalendarDate,
-    selection: DaySelection,
-    on_pick: impl Fn(CalendarDate) + 'static,
-) -> Div {
+/// A row laid out in the calendar's direction.
+pub(crate) fn row(rtl: bool) -> Div {
+    if rtl {
+        div().display(Display::Flex).flex_direction(FlexDirection::RowReverse)
+    } else {
+        div().display(Display::Flex).flex_direction(FlexDirection::Row)
+    }
+}
+
+/// The months' grids side by side.
+pub(crate) fn months_row(grid: CalendarGrid, rtl: bool, month: impl Fn(CalendarDate) -> Div) -> Div {
+    row(rtl)
+        .margin_top(16.0)
+        .column_gap(16.0)
+        .children(grid.months().into_iter().map(month))
+}
+
+/// The look of the day button both calendars put in a cell
+/// (`CalendarCellTrigger`); the primitive's trigger part adds what it does.
+pub(crate) fn day_trigger(grid: CalendarGrid, look: CalendarLook, day: Day, selection: DaySelection) -> Div {
     let t = theme();
-    let outside = !view.in_month(day, month);
-    let disabled = view.is_disabled(day, month);
-    let today = view.opt().today;
     let cell = button(ButtonVariant::Ghost, ButtonSize::IconSm);
     let i = cell.interaction();
     let lit = if t.dark { t.accent.opacity(0.5) } else { t.accent };
     cell.named("calendar-cell-trigger")
-        .size(view.opt().cell_size)
+        .size(look.cell_size)
         .padding(0.0)
         .font_weight(400)
         .cursor(Cursor::Default)
-        .when(day == today && selection == DaySelection::Unselected, |b| {
+        .when(day.today && selection == DaySelection::Unselected, |b| {
             b.background(t.accent).text_color(t.accent_foreground)
         })
-        .when(outside, |b| b.text_color(t.muted_foreground))
+        .when(day.outside_month, |b| b.text_color(t.muted_foreground))
         // A picked day keeps its fill under the pointer; any other takes
         // the ghost button's hover over what it shows.
         .when(selection == DaySelection::Picked, |b| {
@@ -515,24 +108,20 @@ pub(crate) fn day_trigger(
             b.background_while(move || i.hovered(), lit)
                 .text_color_while(move || i.hovered(), t.accent_foreground)
         })
-        .when(disabled, |b| b.text_color(t.muted_foreground).disabled(true))
-        .when(!outside && day == view.focused.get(), |b| b.track_focus(view.focus))
-        .on_click(move |_| {
-            on_pick(day);
-            view.focus_day(day, false);
-        })
-        .child(view.day_label(day))
+        .when(day.blocked, |b| b.text_color(t.muted_foreground))
+        .child(grid.number(day.date))
         .into_div()
 }
 
-/// The prev and next arrows both calendars use: an outline icon button,
-/// see-through until hovered, its chevron pointing the way it pages.
-pub(crate) fn page_button(view: CalendarView, step: i64) -> Div {
+/// The look of the prev and next arrows both calendars use: an outline
+/// icon button, see-through until hovered, its chevron pointing the way it
+/// pages; the primitive's part adds what it does.
+pub(crate) fn page_button(grid: CalendarGrid, rtl: bool, step: i64) -> Div {
     let t = theme();
-    let back = (step < 0) != view.rtl();
+    let back = (step < 0) != rtl;
     let arrow = button(ButtonVariant::Outline, ButtonSize::Default);
     let i = arrow.interaction();
-    arrow
+    let d = arrow
         .named(if step < 0 {
             "calendar-prev-button"
         } else {
@@ -546,39 +135,33 @@ pub(crate) fn page_button(view: CalendarView, step: i64) -> Div {
                 .background_while(move || i.hovered(), t.accent)
         })
         .opacity(move || if i.hovered() { 1.0 } else { 0.5 })
-        .disabled(!view.can_page(step))
-        .on_click(move |_| view.page(step))
         .child(icon(if back { Icon::ChevronLeft } else { Icon::ChevronRight }))
-        .into_div()
+        .into_div();
+    grid.page_button(step, d)
 }
 
 /// One month's grid: weekday names over its weeks; `cell` gives each day's
 /// cell given its column.
 pub(crate) fn month_grid(
-    view: CalendarView,
+    grid: CalendarGrid,
+    rtl: bool,
     month: CalendarDate,
     head_cell: impl Fn(&'static str) -> Div,
     cell: impl Fn(CalendarDate, usize) -> Element,
 ) -> Div {
-    let o = view.opt();
-    let first = o.locale.first_weekday();
-    let names = (0..7_u8).map(|i| {
-        o.locale
-            .weekday(first.saturating_add(i).checked_rem(7).unwrap_or(0), o.weekday_format)
-    });
-    div()
-        .named("calendar-grid")
-        .display(Display::Flex)
-        .flex_direction(FlexDirection::Column)
-        .width(pct(100.0))
-        .child(view.row().named("calendar-grid-row").children(names.map(&head_cell)))
-        .children(calendar_weeks(o.system, first, month).into_iter().map(|week| {
-            view.row()
-                .named("calendar-grid-row")
-                .margin_top(8.0)
-                .width(pct(100.0))
-                .children(week.into_iter().enumerate().map(|(col, day)| cell(day, col)))
-        }))
+    let names = grid.weekdays();
+    grid.grid(
+        div()
+            .named("calendar-grid")
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .width(pct(100.0)),
+    )
+    .child(grid.head(row(rtl).named("calendar-grid-row").children(names.map(&head_cell))))
+    .children(grid.weeks(month).into_iter().map(|week| {
+        grid.row(row(rtl).named("calendar-grid-row").margin_top(8.0).width(pct(100.0)))
+            .children(week.into_iter().enumerate().map(|(col, day)| cell(day, col)))
+    }))
 }
 
 /// What the header shows between the arrows (the Vue calendar's `layout`).
@@ -600,8 +183,9 @@ pub enum CalendarLayout {
 pub struct CalendarProps {
     value: Bind<Option<CalendarDate>>,
     options: CalendarOptions,
+    look: CalendarLook,
     layout: CalendarLayout,
-    /// `initialFocus`: the tab-stop day takes focus as the calendar mounts.
+    /// `initialFocus`: the picked day (else today) takes focus as the calendar mounts.
     initial_focus: bool,
     /// The `#calendar-heading` slot, in place of the layout's.
     heading: Option<Element>,
@@ -611,13 +195,20 @@ impl HasOptions for CalendarProps {
     fn options_mut(&mut self) -> &mut CalendarOptions {
         &mut self.options
     }
+
+    fn look_mut(&mut self) -> &mut CalendarLook {
+        &mut self.look
+    }
 }
+
+type Picker = Calendar<PartProps<CalendarProps>, Option<CalendarDate>>;
 
 /// What a calendar's parts read.
 #[derive(Clone)]
 struct CalendarContext {
-    view: CalendarView,
-    value: UseModel<PartProps<CalendarProps>, Option<CalendarDate>>,
+    calendar: Picker,
+    rtl: bool,
+    look: Computed<CalendarLook>,
 }
 
 /// A calendar: its `layout`'s heading between paging arrows, then the month
@@ -627,6 +218,7 @@ pub fn calendar() -> Part<CalendarProps> {
     let props = CalendarProps {
         value: Bind::default(),
         options: CalendarOptions::default(),
+        look: CalendarLook::default(),
         layout: CalendarLayout::Heading,
         heading: None,
         initial_focus: false,
@@ -634,43 +226,28 @@ pub fn calendar() -> Part<CalendarProps> {
     Part::new(props, div().named("calendar").padding(12.0), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let value = use_model(props, |p| &p.props.value);
-            let start = value.get_untracked();
-            let today = props.with_untracked(|p| p.props.options.today);
-            let view = CalendarView::new(move || props.with(|p| p.props.options), start.unwrap_or(today));
-            // A day picked from outside comes into view (reka-ui's placeholder
-            // follows the model); with `initialFocus` it takes focus too.
-            let focuses = props.with_untracked(|p| p.props.initial_focus);
-            if focuses {
-                // As reka-ui's `initialFocus`: once laid out, focus the tab
-                // stop (the picked day, else today), with no ring.
-                on_mounted(move || view.focus_day(view.focused.get_untracked(), false));
+            let value = gui::use_model(props, |p| &p.props.value);
+            let rtl = props.with_untracked(|p| p.props.look.rtl);
+            let direction = use_direction(Some(if rtl { Direction::Rtl } else { Direction::Ltr }));
+            let calendar = Calendar::new(value, move || props.with(|p| p.props.options.clone()), None, direction);
+            if props.with_untracked(|p| p.props.initial_focus) {
+                // As reka-ui's `initialFocus`: once laid out, the picked day
+                // (else today) takes focus, with no ring.
+                on_mounted(move || calendar.focus_initial());
             }
-            let picked = value;
-            let _follow = watch(
-                move || picked.get(),
-                move |new, _| {
-                    if let Some(day) = *new {
-                        if focuses {
-                            view.focus_day(day, false);
-                        } else {
-                            view.reveal(day);
-                        }
-                    }
-                },
-            );
-            provide(CalendarContext { view, value });
-            move || calendar_render(props, view)
+            let look = Computed::new(move || props.with(|p| p.props.look));
+            provide(CalendarContext { calendar, rtl, look });
+            move || calendar_render(props, calendar, rtl)
         })
     })
 }
 
-fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) -> Element {
+fn calendar_render(props: Signal<PartProps<CalendarProps>>, calendar: Picker, rtl: bool) -> Element {
+    let grid = calendar.grid;
     let (root, layout, heading) = props.with(|p| (p.slot.0.clone(), p.props.layout, p.props.heading.clone()));
     let heading = heading.unwrap_or_else(|| match layout {
-        CalendarLayout::Heading => calendar_heading(view.heading()).into_element(),
-        CalendarLayout::MonthAndYear => view
-            .row()
+        CalendarLayout::Heading => calendar_heading(grid.heading()).into_element(),
+        CalendarLayout::MonthAndYear => row(rtl)
             .align_items(Align::Center)
             .justify_content(Justify::Center)
             .gap(4.0)
@@ -678,9 +255,9 @@ fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) 
             .child(calendar_year_select())
             .into_element(),
         CalendarLayout::MonthOnly => {
-            let o = view.opt();
-            let year = o.locale.year(o.system, view.month.get());
-            view.row()
+            let o = grid.options();
+            let year = o.locale.year(o.system, grid.first_month());
+            row(rtl)
                 .align_items(Align::Center)
                 .justify_content(Justify::Center)
                 .gap(4.0)
@@ -689,9 +266,9 @@ fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) 
                 .into_element()
         }
         CalendarLayout::YearOnly => {
-            let o = view.opt();
-            let month = o.locale.month(o.system, view.month.get(), MonthWidth::Short);
-            view.row()
+            let o = grid.options();
+            let month = o.locale.month(o.system, grid.first_month(), MonthWidth::Short);
+            row(rtl)
                 .align_items(Align::Center)
                 .justify_content(Justify::Center)
                 .gap(4.0)
@@ -700,22 +277,26 @@ fn calendar_render(props: Signal<PartProps<CalendarProps>>, view: CalendarView) 
                 .into_element()
         }
     });
-    root.child(
-        calendar_header().padding_top(0.0).child(heading).child(
-            view.row()
-                .align_items(Align::Center)
-                .gap(4.0)
-                .position(Position::Absolute)
-                .top(0.0)
-                .left(0.0)
-                .right(0.0)
-                .justify_content(Justify::Between)
-                .pass_through()
-                .child(page_button(view, -1))
-                .child(page_button(view, 1)),
-        ),
+    grid.root(
+        root.child(
+            calendar_header().padding_top(0.0).child(heading).child(
+                row(rtl)
+                    .align_items(Align::Center)
+                    .gap(4.0)
+                    .position(Position::Absolute)
+                    .top(0.0)
+                    .left(0.0)
+                    .right(0.0)
+                    .justify_content(Justify::Between)
+                    .pass_through()
+                    .child(page_button(grid, rtl, -1))
+                    .child(page_button(grid, rtl, 1)),
+            ),
+        )
+        .child(months_row(grid, rtl, |month| {
+            month_grid(grid, rtl, month, calendar_head_cell, |day, _| calendar_day(day, month))
+        })),
     )
-    .child(view.months_row(|month| month_grid(view, month, calendar_head_cell, |day, _| calendar_day(day, month))))
     .into_element()
 }
 
@@ -734,6 +315,24 @@ impl<P: HasOptions> Part<P> {
         self.with_props(|p| p.options_mut().months = months.max(1))
     }
 
+    /// `pagedNavigation`: the arrows turn every month shown.
+    #[must_use]
+    pub fn paged_navigation(self) -> Self {
+        self.with_props(|p| p.options_mut().paged = true)
+    }
+
+    /// `fixedWeeks`: always six weeks.
+    #[must_use]
+    pub fn fixed_weeks(self) -> Self {
+        self.with_props(|p| p.options_mut().fixed_weeks = true)
+    }
+
+    /// `weekStartsOn`: the weekday a week starts on, 0 for Sunday.
+    #[must_use]
+    pub fn week_starts_on(self, weekday: u8) -> Self {
+        self.with_props(|p| p.options_mut().first_weekday = Some(weekday))
+    }
+
     /// `minValue`: days before it are disabled.
     #[must_use]
     pub fn min(self, date: CalendarDate) -> Self {
@@ -746,6 +345,38 @@ impl<P: HasOptions> Part<P> {
         self.with_props(|p| p.options_mut().max = Some(date))
     }
 
+    /// `isDateDisabled`: days that cannot be focused or picked.
+    #[must_use]
+    pub fn is_date_disabled(self, f: impl Into<Derive<CalendarDate, bool>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.options_mut().is_blocked = Some(f))
+    }
+
+    /// `isDateUnavailable`: days that take focus but cannot be picked.
+    #[must_use]
+    pub fn is_date_unavailable(self, f: impl Into<Derive<CalendarDate, bool>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.options_mut().is_unavailable = Some(f))
+    }
+
+    /// `disabled`: no day takes focus or a pick, the arrows are disabled.
+    #[must_use]
+    pub fn disabled(self) -> Self {
+        self.with_props(|p| p.options_mut().availability = Availability::Disabled)
+    }
+
+    /// `readonly`: focus and keys as usual, nothing picked.
+    #[must_use]
+    pub fn readonly(self) -> Self {
+        self.with_props(|p| p.options_mut().readonly = true)
+    }
+
+    /// `preventDeselect`: picking the picked day keeps it.
+    #[must_use]
+    pub fn prevent_deselect(self) -> Self {
+        self.with_props(|p| p.options_mut().prevent_deselect = true)
+    }
+
     /// `weekdayFormat`: how the weekdays over the columns are named.
     #[must_use]
     pub fn weekday_format(self, format: WeekdayFormat) -> Self {
@@ -755,7 +386,7 @@ impl<P: HasOptions> Part<P> {
     /// A day trigger's side in pixels (`**:data-[slot=calendar-cell-trigger]:size-12!`).
     #[must_use]
     pub fn cell_size(self, size: f32) -> Self {
-        self.with_props(|p| p.options_mut().cell_size = size)
+        self.with_props(|p| p.look_mut().cell_size = size)
     }
 
     /// `disableDaysOutsideCurrentView`: the padding days of other months are disabled.
@@ -764,10 +395,10 @@ impl<P: HasOptions> Part<P> {
         self.with_props(|p| p.options_mut().disable_outside_view = true)
     }
 
-    /// `dir="rtl"`: laid out right to left.
+    /// `dir="rtl"`: laid out right to left, ArrowLeft and ArrowRight swapped.
     #[must_use]
     pub fn rtl(self) -> Self {
-        self.with_props(|p| p.options_mut().rtl = true)
+        self.with_props(|p| p.look_mut().rtl = true)
     }
 
     /// Counted in `system` and read out in `locale` (`placeholder` in that
@@ -779,6 +410,13 @@ impl<P: HasOptions> Part<P> {
             o.system = system;
             o.locale = locale;
         })
+    }
+
+    /// What assistive technology is told, in place of the locale's strings
+    /// (`calendarLabel` among them).
+    #[must_use]
+    pub fn strings(self, strings: DateStrings) -> Self {
+        self.with_props(|p| p.options_mut().strings = Some(strings))
     }
 }
 
@@ -804,13 +442,12 @@ impl Part<CalendarProps> {
 
     /// Called with each value picked (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(Option<CalendarDate>) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<Option<CalendarDate>>>) -> Self {
         self.with_props(|p| p.value = std::mem::take(&mut p.value).on_change(f))
     }
 
     /// `initialFocus`: as it mounts, the picked day (else today) takes
-    /// focus, without a ring; a day the model moves to later takes it too.
-    /// For a calendar in a popover.
+    /// focus, without a ring. For a calendar in a popover.
     #[must_use]
     pub fn initial_focus(self) -> Self {
         self.with_props(|p| p.initial_focus = true)
@@ -837,23 +474,24 @@ impl Part<CalendarProps> {
 fn calendar_day(day: CalendarDate, month: CalendarDate) -> Element {
     component((day, month), |cx| {
         let props = cx.props();
-        let ctx = use_context::<CalendarContext>();
+        let ctx = use_root::<CalendarContext>("calendar day", "calendar");
         move || {
-            let (day, month) = props.get();
+            let (date, month) = props.get();
             let Some(ctx) = &ctx else {
                 return Element::Empty;
             };
-            let selected = ctx.value.with(|v| *v == Some(day));
+            let calendar = ctx.calendar;
+            let look = ctx.look.get();
+            let day = calendar.grid.day(date, month);
+            let selected = calendar.has(date);
             let selection = if selected {
                 DaySelection::Picked
             } else {
                 DaySelection::Unselected
             };
-            let value = ctx.value;
-            calendar_cell(selected)
-                .child(day_trigger(ctx.view, day, month, selection, move |d| {
-                    value.set(Some(d))
-                }))
+            calendar
+                .cell(day, calendar_cell(selected))
+                .child(calendar.trigger(day, day_trigger(calendar.grid, look, day, selection)))
                 .into_element()
         }
     })
@@ -887,16 +525,16 @@ pub fn calendar_heading(heading: impl Into<String>) -> impl IntoElement {
 #[must_use]
 pub fn calendar_month_select() -> Element {
     component((), |_| {
-        let ctx = use_context::<CalendarContext>();
+        let ctx = use_root::<CalendarContext>("calendar select", "calendar");
         let focus = FocusHandle::new();
         move || {
             let Some(ctx) = &ctx else {
                 return Element::Empty;
             };
-            let view = ctx.view;
-            let o = view.opt();
+            let grid = ctx.calendar.grid;
+            let o = grid.options();
             let (system, locale) = (o.system, o.locale);
-            let shown = view.month.get();
+            let shown = grid.first_month();
             let year = system.fields(shown).year;
             let months: Vec<NativeSelectEntry> = (1..=system.months_in_year(year))
                 .map(|m| {
@@ -905,14 +543,14 @@ pub fn calendar_month_select() -> Element {
                 })
                 .collect();
             heading_select(
-                view,
+                ctx.rtl,
                 locale.month(system, shown, MonthWidth::Short),
                 focus,
                 &system.fields(shown).month.to_string(),
                 &months,
                 move |v| {
                     if let Ok(m) = v.parse::<u8>() {
-                        view.set_month(m);
+                        grid.set_month(m);
                     }
                 },
             )
@@ -927,16 +565,16 @@ pub fn calendar_month_select() -> Element {
 #[must_use]
 pub fn calendar_year_select() -> Element {
     component((), |_| {
-        let ctx = use_context::<CalendarContext>();
+        let ctx = use_root::<CalendarContext>("calendar select", "calendar");
         let focus = FocusHandle::new();
         move || {
             let Some(ctx) = &ctx else {
                 return Element::Empty;
             };
-            let view = ctx.view;
-            let o = view.opt();
+            let grid = ctx.calendar.grid;
+            let o = grid.options();
             let (system, locale) = (o.system, o.locale);
-            let shown = view.month.get();
+            let shown = grid.first_month();
             let year_of = |d: CalendarDate| system.fields(d).year;
             let first = o.min.map_or(year_of(o.today).saturating_sub(100), year_of);
             let last = o.max.map_or(year_of(o.today).saturating_add(10), year_of);
@@ -944,14 +582,14 @@ pub fn calendar_year_select() -> Element {
                 .map(|y| native_select_option(&y.to_string(), &locale.year(system, system.with_year(shown, y))))
                 .collect();
             heading_select(
-                view,
+                ctx.rtl,
                 &locale.year(system, shown),
                 focus,
                 &year_of(shown).to_string(),
                 &years,
                 move |v| {
                     if let Ok(y) = v.parse::<i32>() {
-                        view.set_year(y);
+                        grid.set_year(y);
                     }
                 },
             )
@@ -966,14 +604,13 @@ pub fn calendar_year_select() -> Element {
 /// the right and the chevron at the left (the Persian demo's
 /// `**:data-[slot=native-select-icon]:left-3.5`).
 fn heading_select(
-    view: CalendarView,
+    rtl: bool,
     shown: &str,
     focus: FocusHandle,
     value: &str,
     entries: &[NativeSelectEntry],
     on_change: impl Fn(String) + 'static,
 ) -> Div {
-    let rtl = view.rtl();
     div()
         .position(Position::Relative)
         .child(
@@ -1043,79 +680,4 @@ pub fn calendar_cell(selected: bool) -> Div {
         .line_height(20.0)
         .flex(Flex::grow(1.0))
         .when(selected, |d| d.radius(8.0).background(t.accent))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-    use super::CalendarDate;
-
-    /// Set in the child process `today_follows_the_local_time_zone` runs.
-    const PROBE: &str = "SHADCN_CALENDAR_TODAY_PROBE";
-
-    fn utc(secs: u64) -> SystemTime {
-        UNIX_EPOCH.checked_add(Duration::from_secs(secs)).unwrap()
-    }
-
-    fn day(year: i32, month: u8, day: u8) -> Option<CalendarDate> {
-        CalendarDate::new(year, month, day)
-    }
-
-    #[test]
-    fn an_instant_falls_on_its_zones_day() {
-        // 2026-11-20T20:00:00Z: still the 20th in London, already the 21st in Saigon.
-        let evening = utc(1_795_204_800);
-        assert_eq!(CalendarDate::at(evening, "UTC"), day(2026, 11, 20));
-        assert_eq!(CalendarDate::at(evening, "Europe/London"), day(2026, 11, 20));
-        assert_eq!(CalendarDate::at(evening, "Asia/Ho_Chi_Minh"), day(2026, 11, 21));
-        // 2026-11-21T05:00:00Z: the 21st in UTC, the 20th in Los Angeles.
-        let dawn = utc(1_795_230_000);
-        assert_eq!(CalendarDate::at(dawn, "UTC"), day(2026, 11, 21));
-        assert_eq!(CalendarDate::at(dawn, "America/Los_Angeles"), day(2026, 11, 20));
-        assert_eq!(CalendarDate::at(dawn, "Nowhere/Atlantis"), None);
-    }
-
-    /// `today()` is the day in the process's time zone, not in UTC: run in
-    /// zones 25 hours apart (`TZ`), it names two different days, each the
-    /// one it is now there.
-    #[test]
-    fn today_follows_the_local_time_zone() {
-        if std::env::var_os(PROBE).is_some() {
-            let d = CalendarDate::today();
-            println!("today={}-{}-{}", d.year(), d.month(), d.day());
-            return;
-        }
-        let today_in = |zone: &str| {
-            let before = CalendarDate::at(SystemTime::now(), zone);
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "calendar::tests::today_follows_the_local_time_zone",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(PROBE, "1")
-                .env("TZ", zone)
-                .output()
-                .unwrap();
-            let after = CalendarDate::at(SystemTime::now(), zone);
-            let out = String::from_utf8_lossy(&out.stdout).into_owned();
-            // The harness prints the test's name on the same line.
-            let line = out
-                .split("today=")
-                .nth(1)
-                .and_then(|t| t.split_whitespace().next())
-                .unwrap_or_else(|| panic!("no today in {out}"));
-            let mut parts = line.split('-').map(|p| p.parse::<i32>().unwrap());
-            let (y, m, d) = (parts.next().unwrap(), parts.next().unwrap(), parts.next().unwrap());
-            let got = day(y, u8::try_from(m).unwrap(), u8::try_from(d).unwrap());
-            assert!(
-                got == before || got == after,
-                "TZ={zone}: today {got:?}, the day there {before:?}"
-            );
-            got
-        };
-        assert_ne!(today_in("Pacific/Kiritimati"), today_in("Pacific/Pago_Pago"));
-    }
 }

@@ -1,0 +1,72 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    ComboBox "number 12" expanded=true autocomplete=List active=ListBoxOption controls=ListBox
+      TextRun "number 12"
+    ListBox
+      GenericContainer
+        GenericContainer
+          Splitter
+        GenericContainer
+          GenericContainer
+        GenericContainer
+          ListBoxOption description="Numbers" 1/111 selected=false
+            Label "number 12"
+        GenericContainer
+          ListBoxOption description="Numbers" 2/111 selected=false
+            Label "number 120"
+        GenericContainer
+          ListBoxOption description="Numbers" 3/111 selected=false
+            Label "number 121"
+        GenericContainer
+          ListBoxOption description="Numbers" 4/111 selected=false
+            Label "number 122"
+        GenericContainer
+          ListBoxOption description="Numbers" 5/111 selected=false
+            Label "number 123"
+        GenericContainer
+          ListBoxOption description="Numbers" 6/111 selected=false
+            Label "number 124"
+        GenericContainer
+          ListBoxOption description="Numbers" 7/111 selected=false
+            Label "number 125"
+        GenericContainer
+          ListBoxOption description="Numbers" 8/111 selected=false
+            Label "number 126"
+        GenericContainer
+          ListBoxOption description="Numbers" 9/111 selected=false
+            Label "number 127"
+        GenericContainer
+          ListBoxOption description="Numbers" 10/111 selected=false
+            Label "number 128"
+        GenericContainer
+          ListBoxOption description="Numbers" 11/111 selected=false
+            Label "number 129"
+        GenericContainer
+          ListBoxOption description="Numbers" 12/111 selected=false
+            Label "number 1200"
+        GenericContainer
+          ListBoxOption description="Numbers" 13/111 selected=false
+            Label "number 1201"
+        GenericContainer
+          ListBoxOption description="Numbers" 14/111 selected=false
+            Label "number 1202"
+        GenericContainer
+          ListBoxOption description="Numbers" 15/111 selected=false
+            Label "number 1203"
+        GenericContainer
+          ListBoxOption description="Numbers" 16/111 selected=false
+            Label "number 1204"
+        GenericContainer
+          ListBoxOption description="Numbers" 17/111 selected=false
+            Label "number 1205"
+        GenericContainer
+          ListBoxOption description="Numbers" 18/111 selected=false
+            Label "number 1206"
+        GenericContainer
+          ListBoxOption description="Numbers" 19/111 selected=false
+            Label "number 1207"
+      GenericContainer

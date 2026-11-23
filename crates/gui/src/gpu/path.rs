@@ -444,6 +444,32 @@ pub(crate) struct Paths {
     pub(crate) binned: u64,
     /// Jobs drawn while it is set are this frame's only ([`Job::once`]).
     pub(crate) once: bool,
+    /// How draws treat the contained-quad clip skip ([`ClipSkip`]).
+    pub(crate) clip_skip: ClipSkip,
+}
+
+/// How paths and curve glyphs skip a clip chain their quad lies wholly
+/// inside (`clip_needed` in `path_render.wgsl`, `slug.wgsl`): as they draw,
+/// or, for tests, marking each pixel drawn with the test skipped (pure
+/// green), or never skipping.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "tests mark or turn off the skip"))]
+pub(crate) enum ClipSkip {
+    #[default]
+    Skip,
+    Mark,
+    Never,
+}
+
+impl ClipSkip {
+    /// The word the shaders read.
+    pub(crate) fn word(self) -> u32 {
+        match self {
+            Self::Skip => 0,
+            Self::Mark => 1,
+            Self::Never => 2,
+        }
+    }
 }
 
 /// The sizes of this frame's dispatches.
@@ -492,6 +518,7 @@ impl Paths {
             pending: None,
             binned: 0,
             once: false,
+            clip_skip: ClipSkip::Skip,
         }
     }
 
@@ -709,6 +736,7 @@ impl Paths {
             w[15] = (paint.alpha * hairline).to_bits();
             w[20] = paint.device_clip;
             w[21] = paint.local_clip;
+            w[22] = self.clip_skip.word();
         }
         if let Some(d) = words_at::<DRAW>(&mut self.draw_words, slot)
             && *d != w

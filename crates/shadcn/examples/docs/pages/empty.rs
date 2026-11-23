@@ -9,10 +9,8 @@ use shadcn::{
 use crate::{Render, Shot, demo, page, photo};
 
 /// An avatar with its picture, or its initials until there is one.
-fn person(image: Option<&ImageSource>, initials: &str) -> gui::Div {
-    avatar()
-        .child(avatar_image(image))
-        .child(avatar_fallback(image, initials))
+fn person(image: Option<&ImageSource>, initials: &str) -> shadcn::Part<()> {
+    avatar().child(avatar_image(image)).child(avatar_fallback(initials))
 }
 
 pub fn render() -> Render {
@@ -80,8 +78,8 @@ pub fn render() -> Render {
                                     empty_media(EmptyMediaVariant::Default).child(
                                         avatar()
                                             .size(48.0)
-                                            .child(avatar_image(zernonia.as_ref()).map(|e| e.filters(Filter::Grayscale(1.0))))
-                                            .child(avatar_fallback(zernonia.as_ref(), "ZN")),
+                                            .child(avatar_image(zernonia.as_ref()).filters(Filter::Grayscale(1.0)))
+                                            .child(avatar_fallback("ZN")),
                                     ),
                                 )
                                 .child(empty_title("User Offline"))

@@ -38,18 +38,39 @@ pub(crate) fn begin_frame() {
     runtime::begin_frame();
 }
 
+/// The phase of the frame running now.
+pub(crate) fn phase() -> Phase {
+    runtime::with(|rt| rt.phase)
+}
+
 /// Run `f` as `phase` of the running frame (the late-write check); `settles`
 /// for a layout pass that another follows when it dirties what was read.
+/// Run `f` as the render (or setup) of component `name`: it may write no
+/// live signal but those it made (checked in a debug build).
+pub(crate) fn rendering<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
+    runtime::rendering(name, f)
+}
+
 pub(crate) fn in_phase<R>(phase: Phase, settles: bool, f: impl FnOnce() -> R) -> R {
     runtime::in_phase(phase, settles, f)
 }
 pub use computed::Computed;
 pub use effect::{Effect, on_cleanup, watch};
+#[cfg(test)]
+pub(crate) use runtime::arena;
+#[cfg(all(debug_assertions, test))]
+pub(crate) use runtime::cold_steps;
+#[cfg(debug_assertions)]
+pub(crate) use runtime::cold_wrote;
+pub(crate) use runtime::is_cold;
+pub(crate) use runtime::making_shared;
+#[cfg(debug_assertions)]
+pub(crate) use runtime::outside_cold;
 pub use scope::Scope;
 pub use signal::Signal;
 pub use trace::{
-    Graph, ReactiveTrace, SignalRef, SignalValue, graph, held_bytes, probes, start_trace, stop_trace, take_trace,
-    write_probe,
+    Graph, ReactiveTrace, SignalRef, SignalValue, cleanups, graph, held_bytes, probes, start_trace, stop_trace,
+    take_trace, write_probe,
 };
 
 /// Run `f` as one update: writes inside it mark what depends on them, and
@@ -96,10 +117,9 @@ pub(crate) fn run_owned<R>(owner: Option<runtime::NodeId>, f: impl FnOnce() -> R
     f()
 }
 
-/// Make room in the active owner's list for `n` more signals or computeds
-/// about to be made together (an `Interaction`'s flags), so it grows once.
-pub(crate) fn reserve_owned(n: usize) {
-    runtime::with(|rt| rt.reserve_owned(n));
+/// Whether `owner` (as [`owner`] gave it) was not disposed.
+pub(crate) fn is_live(owner: runtime::NodeId) -> bool {
+    runtime::try_with(|rt| rt.live(owner).is_some()).unwrap_or(false)
 }
 
 pub(crate) fn has_owner() -> bool {
@@ -170,8 +190,11 @@ impl RenderNode {
     }
 
     /// Take it out of the graph now (one made detached, owned by no scope).
+    /// Safe from a `Drop` while the thread unwinds: the runtime is left as
+    /// it is when it cannot be reached, and what leaving runs (cleanups,
+    /// drops) waits for the next settle, so a panic in it cannot abort.
     pub(crate) fn dispose(self) {
-        if runtime::try_with(|rt| rt.dispose(self.0)).is_some() {
+        if runtime::try_with(|rt| rt.dispose(self.0)).is_some() && !std::thread::panicking() {
             runtime::settle();
         }
     }

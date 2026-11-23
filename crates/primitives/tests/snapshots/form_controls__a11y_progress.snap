@@ -1,0 +1,8 @@
+---
+source: crates/primitives/tests/form_controls.rs
+expression: tree
+---
+Window "w"
+  GenericContainer
+    ProgressIndicator "30%" value=30 in 0..=100
+    ProgressIndicator value=none in 0..=100

@@ -1,0 +1,11 @@
+---
+source: crates/primitives/tests/structure.rs
+assertion_line: 1886
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      GenericContainer
+        GenericContainer
+          GenericContainer

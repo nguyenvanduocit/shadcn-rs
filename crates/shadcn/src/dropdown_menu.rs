@@ -1,526 +1,48 @@
-//! Dropdown menu (`ui/dropdown-menu`), and the menu primitive under it.
+//! Dropdown menu (`ui/dropdown-menu`), and the menu parts every menu shares.
 //!
-//! The parts nest as in Vue: [`dropdown_menu`] keeps whether it is open, its
-//! own (`default_open`) or the caller's (`open`, `v-model:open`), and is the
-//! anchor its [`dropdown_menu_content`] opens against; the
-//! [`dropdown_menu_trigger`] and the items below read it. A
-//! [`dropdown_menu_sub`] is a level of its own, holding its sub trigger and
-//! sub content. Closing gives focus back to the trigger, however it closes.
+//! The behaviour is `primitives`' (ADR-0025, group 4): the menu engine
+//! ([`primitives::menu::Menu`]) and the dropdown's trigger
+//! ([`primitives::dropdown_menu::DropdownMenu`]). This file draws them:
+//! each part makes its look once and hands it to the primitive's part
+//! function, which adds the behaviour. The parts nest as in Vue:
+//! [`dropdown_menu`] keeps whether it is open, its own (`default_open`) or
+//! the caller's (`open`, `v-model:open`), and is the anchor its
+//! [`dropdown_menu_content`] opens against; the [`dropdown_menu_trigger`]
+//! and the items below read it. A [`dropdown_menu_sub`] is a level of its
+//! own, holding its sub trigger and sub content.
 //!
 //! ```ignore
 //! dropdown_menu()
 //!     .child(dropdown_menu_trigger(button(ButtonVariant::Outline, ButtonSize::Default).child("Open")))
 //!     .child(dropdown_menu_content().align(SideAlign::Start).width(224.0)
-//!         .child(dropdown_menu_item("Profile", MenuItem::default()).on_select(|| …).child("Profile")))
+//!         .child(dropdown_menu_item("Profile", MenuItem::default()).on_select(|_| …).child("Profile")))
 //! ```
 //!
-//! Under it is reka's `Menu` ([`MenuState`], crate-private): one level of a
-//! menu (the root or a submenu) with its open state, its highlighted item,
-//! keyboard navigation and dismissal. Dropdown menu, context menu, menubar
-//! and select build their parts on it, as their reka roots share `Menu`; a
-//! root makes its level in its setup and provides it to the parts below.
-//! Items join their level's list as they are laid out, in tree order, as
-//! reka's collection does when items mount; the keys read that list.
+//! The highlight is focus: a row is lit while its node holds focus
+//! ([`gui::Interaction::focused`]), so moving it renders no row. A sub
+//! trigger is lit while focused or while its submenu is open (`focus:bg-accent
+//! data-open:bg-accent`, in all three menus).
 
-use std::cell::RefCell;
-use std::rc::{Rc, Weak};
+use std::cell::Cell;
+use std::rc::Rc;
 
 use gui::prelude::*;
 use gui::{
-    Bind, Callback, Div, Element, FocusHandle, Icon, KeyEvent, Model, NamedKey, Positioning, Side, SideAlign, Signal,
-    Text, UseModel, component, deferred, div, icon, provide, text, use_context, use_model, watch,
+    Bind, Callback, Dismiss, Div, Element, FocusHandle, Icon, Interaction, Model, Positioning, Side, SideAlign, Text,
+    Toggled, UseModel, component, deferred, div, icon, provide, text, use_context, use_model,
 };
 
 use gui::style::Origin;
 
+use primitives::context_menu::ContextMenu;
+use primitives::dropdown_menu::DropdownMenu;
+use primitives::menu::{Menu, MenuOptions};
+use primitives::{Availability, Item};
+
+use crate::focus::StateLook;
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
 use crate::theme::{Colors, theme};
-
-/// A step of the highlight through a list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MenuNav {
-    Next,
-    Prev,
-    First,
-    Last,
-}
-
-/// The step a navigation key asks for.
-pub(crate) fn menu_nav_key(ev: &KeyEvent) -> Option<MenuNav> {
-    [
-        (NamedKey::ArrowDown, MenuNav::Next),
-        (NamedKey::ArrowUp, MenuNav::Prev),
-        (NamedKey::Home, MenuNav::First),
-        (NamedKey::End, MenuNav::Last),
-    ]
-    .into_iter()
-    .find_map(|(key, nav)| ev.is(key).then_some(nav))
-}
-
-/// Where the highlight goes in a list of `len` items from `current`; it stops
-/// at either end (reka's `loop` is off by default).
-pub(crate) fn menu_step(len: usize, current: Option<usize>, nav: MenuNav) -> Option<usize> {
-    let last = len.checked_sub(1)?;
-    Some(match (nav, current) {
-        (MenuNav::First, _) | (MenuNav::Next, None) => 0,
-        (MenuNav::Last, _) | (MenuNav::Prev, None) => last,
-        (MenuNav::Next, Some(i)) => i.saturating_add(1).min(last),
-        (MenuNav::Prev, Some(i)) => i.saturating_sub(1).min(last),
-    })
-}
-
-/// The next item after `current` (wrapping) whose text starts with `typed`.
-pub(crate) fn menu_typeahead(texts: &[&str], current: Option<usize>, typed: &str) -> Option<usize> {
-    let len = texts.len();
-    let typed = typed.to_lowercase();
-    let start = current.map_or(0, |i| i.saturating_add(1));
-    (0..len)
-        .filter_map(|k| start.checked_add(k).and_then(|i| i.checked_rem(len)))
-        .find(|&i| texts.get(i).is_some_and(|t| t.to_lowercase().starts_with(&typed)))
-}
-
-/// A printable character typed without a shortcut modifier, for typeahead.
-pub(crate) fn menu_typed_char(ev: &KeyEvent) -> Option<&str> {
-    ev.text
-        .as_deref()
-        .filter(|s| s.chars().count() == 1 && s.chars().all(|c| !c.is_control() && !c.is_whitespace()))
-        .filter(|_| !ev.modifiers.primary() && !ev.modifiers.control)
-}
-
-/// Enter or Space: pick the highlighted item.
-pub(crate) fn menu_picks(ev: &KeyEvent) -> bool {
-    ev.is(NamedKey::Enter) || ev.is(NamedKey::Space) || ev.text.as_deref() == Some(" ")
-}
-
-/// Whether a level is open, wherever it is kept: its own signal (a submenu,
-/// a select's list), a root's `v-model:open`, or a menubar's value.
-pub(crate) trait OpenModel {
-    /// Tracked.
-    fn get(&self) -> bool;
-    fn set(&self, open: bool);
-}
-
-impl OpenModel for Signal<bool> {
-    fn get(&self) -> bool {
-        Signal::get(self)
-    }
-
-    fn set(&self, open: bool) {
-        if self.get_untracked() != open {
-            Signal::set(self, open);
-        }
-    }
-}
-
-impl<P: 'static> OpenModel for UseModel<P, bool> {
-    fn get(&self) -> bool {
-        UseModel::get(self)
-    }
-
-    fn set(&self, open: bool) {
-        UseModel::set(self, open);
-    }
-}
-
-#[derive(Clone)]
-enum Action {
-    /// Run, then close the menu.
-    Select(Rc<dyn Fn()>),
-    /// Run, and stay open for the next pick (a select with `multiple`).
-    Toggle(Rc<dyn Fn()>),
-    OpenSub(MenuState),
-}
-
-#[derive(Clone)]
-struct Entry {
-    id: String,
-    disabled: bool,
-    action: Action,
-}
-
-/// What ArrowLeft (`false`) or ArrowRight (`true`) does past a menu's items.
-type Sideways = Rc<dyn Fn(bool)>;
-
-struct Level {
-    open: Rc<dyn OpenModel>,
-    highlighted: Signal<Option<String>>,
-    /// This level's items on screen, in tree order (laid out last frame).
-    entries: gui::Members<Entry>,
-    /// The content's focus while open, so its keys reach it.
-    content: FocusHandle,
-    /// The trigger's focus, which closing hands back (the root's).
-    trigger: FocusHandle,
-    parent: Option<Weak<Level>>,
-    subs: RefCell<Vec<MenuState>>,
-    /// ArrowLeft and ArrowRight past the items (a menubar moves between menus).
-    sideways: Option<Sideways>,
-}
-
-/// One level of a menu: the root or a submenu (reka's `Menu`). A root part
-/// makes it in its setup ([`MenuState::with_open`]) and provides it; a sub
-/// part makes its own with [`MenuState::sub`].
-#[derive(Clone)]
-pub(crate) struct MenuState(Rc<Level>);
-
-impl Default for MenuState {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl MenuState {
-    /// A closed level keeping its own open state.
-    #[must_use]
-    #[track_caller]
-    pub(crate) fn new() -> Self {
-        Self::with_open(Rc::new(Signal::labeled("menu open", false)), None)
-    }
-
-    /// A root level open as `open` says; `sideways` runs for ArrowLeft and
-    /// ArrowRight past its items.
-    #[must_use]
-    #[track_caller]
-    pub(crate) fn with_open(open: Rc<dyn OpenModel>, sideways: Option<Sideways>) -> Self {
-        Self::level(open, None, sideways)
-    }
-
-    #[track_caller]
-    fn level(open: Rc<dyn OpenModel>, parent: Option<Weak<Level>>, sideways: Option<Sideways>) -> Self {
-        Self(Rc::new(Level {
-            open,
-            highlighted: Signal::labeled("menu highlighted", None),
-            entries: gui::Members::new(),
-            content: FocusHandle::new(),
-            trigger: FocusHandle::new(),
-            parent,
-            subs: RefCell::new(Vec::new()),
-            sideways,
-        }))
-    }
-
-    /// A submenu of this level, made in its part's setup: it leaves the
-    /// level when the part unmounts.
-    #[must_use]
-    #[track_caller]
-    pub(crate) fn sub(&self, open: Rc<dyn OpenModel>) -> Self {
-        let sub = Self::level(open, Some(Rc::downgrade(&self.0)), None);
-        self.0.subs.borrow_mut().push(sub.clone());
-        let (parent, me) = (Rc::downgrade(&self.0), Rc::downgrade(&sub.0));
-        gui::on_cleanup(move || {
-            if let Some(p) = parent.upgrade() {
-                p.subs
-                    .borrow_mut()
-                    .retain(|s| !std::ptr::eq(Rc::as_ptr(&s.0), me.as_ptr()));
-            }
-        });
-        sub
-    }
-
-    /// Whether this level is open (reactive).
-    #[must_use]
-    pub(crate) fn is_open(&self) -> bool {
-        self.0.open.get()
-    }
-
-    #[must_use]
-    pub(crate) fn is_highlighted(&self, id: &str) -> bool {
-        self.0.highlighted.with(|h| h.as_deref() == Some(id))
-    }
-
-    /// Open this level with nothing highlighted, as a pointer opens it.
-    pub(crate) fn open(&self) {
-        self.0.open.set(true);
-        self.0.content.focus();
-    }
-
-    /// Open this level from the keyboard, highlighting its first (or last) item.
-    pub(crate) fn open_at(&self, nav: MenuNav) {
-        self.0.open.set(true);
-        gui::focus::set_focus(Some(self.0.content.id()), true);
-        // Its items join its list as they are laid out: step once they are.
-        let me = self.clone();
-        gui::after_layout(move || me.highlight_step(nav));
-    }
-
-    /// Close this level and every submenu under it.
-    pub(crate) fn close(&self) {
-        self.close_subs();
-        self.0.open.set(false);
-        if self.0.highlighted.get_untracked().is_some() {
-            self.0.highlighted.set(None);
-        }
-    }
-
-    /// Close the whole menu and give focus back to its trigger, with a
-    /// visible ring when the keyboard closed it.
-    pub(crate) fn dismiss(&self, by_keyboard: bool) {
-        let root = self.root();
-        root.close();
-        gui::focus::set_focus(Some(root.0.trigger.id()), by_keyboard);
-    }
-
-    /// The focus handle the trigger carries.
-    #[must_use]
-    pub(crate) fn trigger_focus(&self) -> FocusHandle {
-        self.0.trigger
-    }
-
-    /// Whether this level's content, or a submenu's, holds focus.
-    fn holds_focus(&self) -> bool {
-        self.0.content.is_focused() || self.0.subs.borrow().iter().any(Self::holds_focus)
-    }
-
-    /// Called in a root's setup: when the menu closes with focus inside it
-    /// (the caller wrote its model), focus goes back to the trigger, as
-    /// reka's `FocusScope` returns it on unmount.
-    pub(crate) fn return_focus_on_close(&self) {
-        let me = self.clone();
-        watch(move || me.is_open(), {
-            let me = self.clone();
-            move |open: &bool, _: &bool| {
-                if !*open && me.holds_focus() {
-                    gui::focus::set_focus(Some(me.0.trigger.id()), gui::focus::focus_visible());
-                }
-            }
-        });
-    }
-
-    /// Whether this submenu's row, `id`, is highlighted in its parent (reactive).
-    pub(crate) fn parent_highlighted(&self, id: &str) -> bool {
-        self.parent().is_some_and(|p| p.is_highlighted(id))
-    }
-
-    fn root(&self) -> Self {
-        self.parent().map_or_else(|| self.clone(), |p| p.root())
-    }
-
-    fn parent(&self) -> Option<Self> {
-        self.0.parent.as_ref().and_then(Weak::upgrade).map(Self)
-    }
-
-    fn close_subs(&self) {
-        let subs = self.0.subs.borrow().clone();
-        for sub in &subs {
-            sub.close();
-        }
-    }
-
-    /// Highlight `id` (pointer or keyboard); submenus of this level close and
-    /// focus comes back to this level's content.
-    fn highlight(&self, id: &str) {
-        self.close_subs();
-        if !gui::untracked(|| self.is_highlighted(id)) {
-            self.0.highlighted.set(Some(id.to_owned()));
-        }
-        if !self.0.content.is_focused() {
-            self.0.content.focus();
-        }
-    }
-
-    fn enabled(&self) -> Vec<Entry> {
-        self.0
-            .entries
-            .with(|all| all.iter().filter(|e| !e.disabled).cloned().collect())
-    }
-
-    fn highlight_step(&self, nav: MenuNav) {
-        let enabled = self.enabled();
-        let current = self.0.highlighted.get_untracked();
-        let at = current.and_then(|h| enabled.iter().position(|e| e.id == h));
-        if let Some(e) = menu_step(enabled.len(), at, nav).and_then(|i| enabled.get(i)) {
-            self.close_subs();
-            self.0.highlighted.set(Some(e.id.clone()));
-        }
-    }
-
-    fn activate(&self, entry: &Entry, by_keyboard: bool) {
-        match &entry.action {
-            Action::Select(f) => {
-                f();
-                self.dismiss(by_keyboard);
-            }
-            Action::Toggle(f) => f(),
-            Action::OpenSub(sub) => sub.open_at(MenuNav::First),
-        }
-    }
-
-    fn key(&self, ev: &KeyEvent) -> bool {
-        if let Some(nav) = menu_nav_key(ev) {
-            self.highlight_step(nav);
-            return true;
-        }
-        let enabled = self.enabled();
-        let current = self
-            .0
-            .highlighted
-            .get_untracked()
-            .and_then(|h| enabled.iter().position(|e| e.id == h));
-        let entry = current.and_then(|i| enabled.get(i));
-        if menu_picks(ev) {
-            if let Some(e) = entry {
-                self.activate(e, true);
-            }
-            return true;
-        }
-        if ev.is(NamedKey::ArrowRight) {
-            if let Some(Entry {
-                action: Action::OpenSub(sub),
-                ..
-            }) = entry
-            {
-                sub.open_at(MenuNav::First);
-                return true;
-            }
-            return self.go_sideways(true);
-        }
-        if ev.is(NamedKey::ArrowLeft) {
-            if let Some(parent) = self.parent() {
-                self.close();
-                gui::focus::set_focus(Some(parent.0.content.id()), true);
-                return true;
-            }
-            return self.go_sideways(false);
-        }
-        if ev.is(NamedKey::Escape) {
-            self.dismiss(true);
-            return true;
-        }
-        if let Some(typed) = menu_typed_char(ev) {
-            let texts: Vec<&str> = enabled.iter().map(|e| e.id.as_str()).collect();
-            if let Some(e) = menu_typeahead(&texts, current, typed).and_then(|i| enabled.get(i)) {
-                self.highlight(&e.id);
-            }
-            return true;
-        }
-        false
-    }
-
-    fn go_sideways(&self, forward: bool) -> bool {
-        self.0.sideways.as_ref().is_some_and(|f| {
-            f(forward);
-            true
-        })
-    }
-
-    /// `d` as this level's content (its items join its list as they are laid out);
-    /// it takes the menu's keys, and a click outside the root closes it.
-    pub(crate) fn content(&self, d: Div) -> Div {
-        let keys = self.clone();
-        let d = d.track_focus(self.0.content).on_key_down(move |ev| keys.key(ev));
-        if self.0.parent.is_some() {
-            return d;
-        }
-        let outside = self.clone();
-        d.on_click_outside(move || outside.dismiss(false))
-    }
-
-    /// `d` as an item of this level: the pointer highlights it, a click or
-    /// Enter runs `on_select` and closes the menu.
-    pub(crate) fn item(&self, d: Div, id: &str, disabled: bool, on_select: impl Fn() + 'static) -> Div {
-        self.entry(d, id, disabled, Rc::new(on_select), true)
-    }
-
-    /// An item that leaves the menu open once `on_select` has run.
-    pub(crate) fn toggle_item(&self, d: Div, id: &str, disabled: bool, on_select: impl Fn() + 'static) -> Div {
-        self.entry(d, id, disabled, Rc::new(on_select), false)
-    }
-
-    fn entry(&self, d: Div, id: &str, disabled: bool, on_select: Rc<dyn Fn()>, closes: bool) -> Div {
-        let action = if closes {
-            Action::Select(on_select.clone())
-        } else {
-            Action::Toggle(on_select.clone())
-        };
-        let d = d.member(
-            &self.0.entries,
-            Entry {
-                id: id.to_owned(),
-                disabled,
-                action,
-            },
-        );
-        if disabled {
-            return d.disabled(true);
-        }
-        let (hover, click, hover_id) = (self.clone(), self.clone(), id.to_owned());
-        d.on_hover(move |inside| {
-            if inside {
-                hover.highlight(&hover_id);
-            } else if gui::untracked(|| hover.is_highlighted(&hover_id)) {
-                hover.0.highlighted.set(None);
-            }
-        })
-        .on_click(move |_| {
-            on_select();
-            if closes {
-                click.dismiss(false);
-            }
-        })
-    }
-
-    /// `d` as the trigger of this submenu, inside its parent level: the
-    /// pointer opens it, ArrowRight or Enter enters it.
-    pub(crate) fn sub_trigger(&self, d: Div, id: &str, disabled: bool) -> Div {
-        let Some(parent) = self.parent() else {
-            return d;
-        };
-        let d = d.member(
-            &parent.0.entries,
-            Entry {
-                id: id.to_owned(),
-                disabled,
-                action: Action::OpenSub(self.clone()),
-            },
-        );
-        if disabled {
-            return d.disabled(true);
-        }
-        let (hover, click, hover_id) = (self.clone(), self.clone(), id.to_owned());
-        let hover_parent = parent;
-        d.on_hover(move |inside| {
-            if inside {
-                hover_parent.highlight(&hover_id);
-                hover.0.open.set(true);
-            }
-        })
-        .on_click(move |_| click.0.open.set(true))
-    }
-
-    /// `d` as the root's trigger: a click toggles the menu, Enter, Space or
-    /// ArrowDown open it on its first item.
-    pub(crate) fn trigger(&self, d: Div) -> Div {
-        let (click, keys) = (self.clone(), self.clone());
-        d.track_focus(self.0.trigger)
-            .aria_expanded(self.is_open())
-            .on_click(move |_| {
-                if gui::untracked(|| click.is_open()) {
-                    click.close();
-                } else {
-                    click.open();
-                }
-            })
-            .on_key_down(move |ev| {
-                if gui::untracked(|| keys.is_open()) || !(menu_picks(ev) || ev.is(NamedKey::ArrowDown)) {
-                    return false;
-                }
-                keys.open_at(MenuNav::First);
-                true
-            })
-    }
-
-    /// Highlight the first enabled item without moving focus (a select
-    /// opens on it when nothing is chosen, as reka focuses it).
-    pub(crate) fn highlight_first(&self) {
-        let me = self.clone();
-        gui::after_layout(move || me.highlight_step(MenuNav::First));
-    }
-
-    /// Highlight `id` without moving focus (a select opens on its value).
-    pub(crate) fn set_highlighted(&self, id: Option<String>) {
-        self.0.highlighted.set(id);
-    }
-}
 
 /// What an item looks like and whether it takes input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -554,6 +76,10 @@ impl MenuItem {
         disabled: false,
         variant: MenuItemVariant::Destructive,
     };
+
+    fn availability(self) -> Availability {
+        Availability::from_disabled(self.disabled)
+    }
 }
 
 /// The look every menu row shares: `relative flex cursor-default items-center
@@ -564,7 +90,7 @@ pub(crate) fn menu_row(t: &Colors, item: MenuItem, highlighted: bool) -> Div {
     menu_highlight(menu_row_base(t, item), t, item, highlighted)
 }
 
-/// [`menu_row`] not highlighted, for a part to highlight in its render.
+/// [`menu_row`] not highlighted, for a part to highlight.
 pub(crate) fn menu_row_base(t: &Colors, item: MenuItem) -> Div {
     let destructive = item.variant == MenuItemVariant::Destructive;
     div()
@@ -583,7 +109,7 @@ pub(crate) fn menu_row_base(t: &Colors, item: MenuItem) -> Div {
         .when(destructive, |d| d.text_color(t.destructive))
 }
 
-/// A row's highlight, on top of [`menu_row_base`].
+/// A row's highlight, on top of [`menu_row_base`], decided in render.
 pub(crate) fn menu_highlight(d: Div, t: &Colors, item: MenuItem, highlighted: bool) -> Div {
     let destructive = item.variant == MenuItemVariant::Destructive;
     d.when(highlighted && !destructive, |d| {
@@ -592,6 +118,17 @@ pub(crate) fn menu_highlight(d: Div, t: &Colors, item: MenuItem, highlighted: bo
     .when(highlighted && destructive, |d| {
         d.background(t.destructive.opacity(if t.dark { 0.2 } else { 0.1 }))
     })
+}
+
+/// A row's highlight bound to `lit` (read where the node resolves, so a
+/// highlight moving renders nothing), on top of [`menu_row_base`].
+fn menu_lit(d: Div, t: &Colors, item: MenuItem, lit: impl Fn() -> bool + Clone + 'static) -> Div {
+    if item.variant == MenuItemVariant::Destructive {
+        d.background_while(lit, t.destructive.opacity(if t.dark { 0.2 } else { 0.1 }))
+    } else {
+        d.background_while(lit.clone(), t.accent)
+            .text_color_while(lit, t.accent_foreground)
+    }
 }
 
 /// The box a checkbox or radio item's mark sits in:
@@ -614,9 +151,14 @@ pub(crate) fn menu_check() -> gui::Element {
 }
 
 /// The dot of a chosen radio item (`Circle class="size-2 fill-current"`): a
-/// filled circle in the text colour.
-pub(crate) fn menu_dot(color: gui::Color) -> gui::Element {
-    div().size(8.0).radius(9999.0).background(color).into_element()
+/// filled circle in the row's text colour, which its highlight turns.
+fn menu_dot(t: &Colors, row: Interaction) -> gui::Element {
+    let (lit, rest) = (t.accent_foreground, t.popover_foreground);
+    div()
+        .size(8.0)
+        .radius(9999.0)
+        .background(move || Some(if row.focused() { lit } else { rest }))
+        .into_element()
 }
 
 /// The content's box: `bg-popover text-popover-foreground min-w-[8rem]
@@ -637,6 +179,17 @@ pub(crate) fn menu_separator(t: &Colors) -> Div {
     div().background(t.border).margin_x(-4.0).margin_y(4.0).height(1.0)
 }
 
+/// A separator between a menu's items: [`menu_separator`], read as one.
+pub(crate) fn menu_item_separator(t: &Colors) -> Div {
+    primitives::menu::separator(menu_separator(t))
+}
+
+/// A group of items: `role=group`, unnamed (it has no label part to point
+/// at; reka points at one that may not exist).
+pub(crate) fn menu_group(d: Div) -> Div {
+    primitives::menu::group(d, None)
+}
+
 /// `text-muted-foreground ml-auto text-xs tracking-widest`.
 pub(crate) fn menu_shortcut(t: &Colors, keys: &str) -> Text {
     text(keys)
@@ -649,15 +202,24 @@ pub(crate) fn menu_shortcut(t: &Colors, keys: &str) -> Text {
 
 // ── The parts every menu builds on (dropdown, context menu, menubar) ──
 
-/// The nearest menu level, from a part's setup.
-pub(crate) fn menu_level() -> Option<MenuState> {
-    use_context::<MenuState>()
-}
-
-/// What a menu root is given: whether it is open.
-#[derive(Clone, PartialEq, Default)]
+/// What a menu root is given: whether it is open, and whether it is modal.
+#[derive(Clone, PartialEq)]
 pub struct MenuRootProps {
     open: Bind<bool>,
+    modal: bool,
+    /// A context menu's long press (reka's `pressOpenDelay`); none: the
+    /// engine's 700 ms.
+    press_open_delay: Option<std::time::Duration>,
+}
+
+impl Default for MenuRootProps {
+    fn default() -> Self {
+        Self {
+            open: Bind::default(),
+            modal: MenuOptions::DEFAULT.modal,
+            press_open_delay: None,
+        }
+    }
 }
 
 impl<P: 'static> Part<P>
@@ -678,8 +240,25 @@ where
 
     /// Call `f` each time it opens or closes (`@update:open`).
     #[must_use]
-    pub fn on_open_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.bind(|b| b.on_change(f)))
+    }
+}
+
+impl Part<MenuRootProps> {
+    /// Modal or not (`:modal`, reka: modal): a modal menu keeps focus in,
+    /// and the page below takes no pointer. Read as the root is made.
+    #[must_use]
+    pub fn modal(self, modal: bool) -> Self {
+        self.with_props(|p| p.modal = modal)
+    }
+
+    /// How long a touch or pen is held to open a context menu
+    /// (`:press-open-delay`, reka: 700 ms). Read as the root is made; a
+    /// dropdown menu has no long press.
+    #[must_use]
+    pub fn press_open_delay(self, delay: std::time::Duration) -> Self {
+        self.with_props(|p| p.press_open_delay = Some(delay))
     }
 }
 
@@ -694,6 +273,16 @@ impl MenuRootProps {
     pub(crate) fn open_bind(&self) -> &Bind<bool> {
         &self.open
     }
+
+    /// The menu's options, as the root is made.
+    pub(crate) fn options(&self) -> MenuOptions {
+        MenuOptions::DEFAULT.modal(self.modal)
+    }
+
+    /// A context menu's long press delay, if the caller set one.
+    pub(crate) fn press_open_delay(&self) -> Option<std::time::Duration> {
+        self.press_open_delay
+    }
 }
 
 impl OpenProps for MenuRootProps {
@@ -702,37 +291,9 @@ impl OpenProps for MenuRootProps {
     }
 }
 
-/// A menu's root on `root`, the anchor its content opens against: it makes
-/// the menu's level in its setup and provides it to the parts below.
-pub(crate) fn menu_root(root: Div) -> Part<MenuRootProps> {
-    Part::new(MenuRootProps::default(), root, |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let level = MenuState::with_open(Rc::new(use_model(props, |p| p.props.open_bind())), None);
-            level.return_focus_on_close();
-            provide(level);
-            move || props.with(|p| p.slot.0.clone()).into_element()
-        })
-    })
-}
-
-/// A root's trigger on `root`: a click toggles the menu, Enter, Space or
-/// ArrowDown open it on its first item.
-pub(crate) fn menu_trigger(root: Div) -> Part<()> {
-    Part::new((), root, |p| {
-        component(p, |cx| {
-            let props = cx.props();
-            let level = menu_level();
-            move || {
-                let root = props.with(|p| p.slot.0.clone());
-                match &level {
-                    Some(l) => l.trigger(root),
-                    None => root,
-                }
-                .into_element()
-            }
-        })
-    })
+/// The nearest menu level, from a part's setup.
+pub(crate) fn menu_level() -> Option<Menu> {
+    use_context::<Menu>()
 }
 
 /// Where a menu's content opens.
@@ -745,15 +306,11 @@ pub(crate) enum MenuPlace {
         offset: f32,
         fit_height: bool,
     },
-    /// At the pointer that opened it (a context menu).
+    /// Where its context menu says: at the pointer that opened it.
     Pointer,
-    /// Beside its sub trigger, to its right (a submenu).
+    /// Beside its sub trigger, on the inline end (a submenu).
     Beside,
 }
-
-/// Where a context menu was opened, provided by its root.
-#[derive(Clone, Copy)]
-pub(crate) struct MenuPointer(pub(crate) Signal<(f32, f32)>);
 
 /// What a menu's content is given.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -784,22 +341,22 @@ impl Part<MenuContentProps> {
 }
 
 /// A level's content on `root`: nothing while the level is closed; open,
-/// floating at `place`, taking the level's keys.
+/// floating at `place`, the engine's content (keys, pointer, layer).
 pub(crate) fn menu_content(root: Div, place: MenuPlace) -> Part<MenuContentProps> {
     Part::new(MenuContentProps { place }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
             let level = menu_level();
-            let pointer = use_context::<MenuPointer>();
+            let context = use_context::<ContextMenu>();
             move || {
-                let Some(level) = &level else {
+                let Some(menu) = level else {
                     return Element::Empty;
                 };
-                if !level.is_open() {
+                if !menu.is_open() {
                     return Element::Empty;
                 }
                 let (place, root) = props.with(|p| (p.props.place, p.slot.0.clone()));
-                let placement = match place {
+                let positioning = match place {
                     MenuPlace::Anchored {
                         side,
                         align,
@@ -812,22 +369,53 @@ pub(crate) fn menu_content(root: Div, place: MenuPlace) -> Part<MenuContentProps
                         match_width: false,
                         fit_height,
                     },
-                    MenuPlace::Pointer => {
-                        let (x, y) = pointer.map_or((0.0, 0.0), |p| p.0.get());
-                        Positioning::At { x, y }
-                    }
+                    MenuPlace::Pointer => context.map_or(Positioning::At { x: 0.0, y: 0.0 }, ContextMenu::positioning),
                     MenuPlace::Beside => Positioning::Anchored {
-                        side: Side::Right,
+                        side: menu.sub_side(),
                         align: SideAlign::Start,
                         offset: 0.0,
                         match_width: false,
                         fit_height: false,
                     },
                 };
-                deferred(placement, level.content(root)).into_element()
+                deferred(positioning, menu.content(root))
+                    .placement(menu.placed())
+                    .into_element()
             }
         })
     })
+}
+
+/// A pick of a menu item (reka's `select` event), handed to its
+/// `on_select`: the menu closes after it unless the handler keeps it open
+/// ([`Self::keep_open`], reka's `event.preventDefault()`).
+#[derive(Clone, Debug, Default)]
+pub struct SelectEvent {
+    keep: Rc<Cell<bool>>,
+}
+
+impl SelectEvent {
+    /// Leave the menu open after this pick.
+    pub fn keep_open(&self) {
+        self.keep.set(true);
+    }
+
+    /// Whether a handler kept the menu open.
+    #[must_use]
+    pub fn kept_open(&self) -> bool {
+        self.keep.get()
+    }
+
+    /// Hand a pick to `on_select`; what the menu does then.
+    fn pick(on_select: &Callback<Self>) -> Dismiss {
+        let event = Self::default();
+        on_select.call(event.clone());
+        if event.kept_open() {
+            Dismiss::Veto
+        } else {
+            Dismiss::Close
+        }
+    }
 }
 
 /// What an item is given: its id (what typeahead matches), its look, and
@@ -836,14 +424,16 @@ pub(crate) fn menu_content(root: Div, place: MenuPlace) -> Part<MenuContentProps
 pub struct MenuItemProps {
     id: String,
     item: MenuItem,
-    on_select: Option<Callback<()>>,
+    on_select: Option<Callback<SelectEvent>>,
 }
 
 impl Part<MenuItemProps> {
-    /// Run `f` when the item is picked (`@select`); the menu then closes.
+    /// Run `f` when the item is picked (`@select`); the menu then closes,
+    /// unless `f` keeps it open ([`SelectEvent::keep_open`]).
     #[must_use]
-    pub fn on_select(self, f: impl Fn() + 'static) -> Self {
-        self.with_props(|p| p.on_select = Some(Callback::new(move |()| f())))
+    pub fn on_select(self, f: impl Into<Callback<SelectEvent>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_select = Some(f))
     }
 }
 
@@ -858,26 +448,19 @@ pub(crate) fn menu_item(root: Div, id: &str, item: MenuItem) -> Part<MenuItemPro
         component(p, |cx| {
             let props = cx.props();
             let level = menu_level();
+            let focus = FocusHandle::new();
+            // The `on_select` passed last, when it is picked.
+            let on_select = cx.event_opt(|p| p.props.on_select.as_ref());
             move || {
-                let (id, item, on_select, root) = props.with(|p| {
-                    (
-                        p.props.id.clone(),
-                        p.props.item,
-                        p.props.on_select.clone(),
-                        p.slot.0.clone(),
-                    )
-                });
-                let Some(level) = &level else {
+                let (id, item, root) = props.with(|p| (p.props.id.clone(), p.props.item, p.slot.0.clone()));
+                let on_select = on_select.clone();
+                let Some(menu) = level else {
                     return root.into_element();
                 };
                 let t = theme();
-                let d = menu_highlight(root, &t, item, level.is_highlighted(&id));
-                level
-                    .item(d, &id, item.disabled, move || {
-                        if let Some(f) = &on_select {
-                            f.call(());
-                        }
-                    })
+                let d = root.with_interaction(|d, i| menu_lit(d, &t, item, move || i.focused()));
+                let entry = Item::new((), focus).label(id).availability(item.availability());
+                menu.item(d, entry, move |()| SelectEvent::pick(&on_select))
                     .into_element()
             }
         })
@@ -890,6 +473,7 @@ pub struct MenuCheckboxItemProps {
     label: String,
     disabled: bool,
     checked: Bind<bool>,
+    on_select: Option<Callback<SelectEvent>>,
 }
 
 impl Part<MenuCheckboxItemProps> {
@@ -913,42 +497,59 @@ impl Part<MenuCheckboxItemProps> {
 
     /// Call `f` with the value each pick turns it to (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.checked = p.checked.clone().on_change(f))
+    }
+
+    /// Run `f` when the item is picked (`@select`), after it turns; the
+    /// menu then closes, unless `f` keeps it open ([`SelectEvent::keep_open`]).
+    #[must_use]
+    pub fn on_select(self, f: impl Into<Callback<SelectEvent>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_select = Some(f))
     }
 }
 
-/// A checkbox item on `root` (its label already in it); picking it toggles.
+/// A checkbox item on `root` (its label already in it); picking it asks for
+/// the other value and closes the menu, unless its `on_select` keeps it open.
 pub(crate) fn menu_checkbox_item(root: Div, label: &str, disabled: bool) -> Part<MenuCheckboxItemProps> {
     let props = MenuCheckboxItemProps {
         label: label.to_owned(),
         disabled,
         checked: Bind::default(),
+        on_select: None,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
             let level = menu_level();
             let checked = use_model(props, |p| &p.props.checked);
+            let focus = FocusHandle::new();
+            let on_select = cx.event_opt(|p| p.props.on_select.as_ref());
             move || {
+                let on_select = on_select.clone();
                 let (label, disabled, root) =
                     props.with(|p| (p.props.label.clone(), p.props.disabled, p.slot.0.clone()));
-                let Some(level) = &level else {
+                let Some(menu) = level else {
                     return root.into_element();
                 };
-                let t = theme();
                 let item = MenuItem {
                     disabled,
                     ..MenuItem::default()
                 };
-                let on = checked.get();
-                let d = menu_highlight(root, &t, item, level.is_highlighted(&label))
-                    .role(gui::Role::MenuItemCheckBox)
-                    .aria_checked(on)
-                    .child(menu_indicator(on.then(menu_check)));
-                level
-                    .item(d, &label, disabled, move || checked.set(!checked.get_untracked()))
-                    .into_element()
+                let state = if checked.get() { Toggled::True } else { Toggled::False };
+                let t = theme();
+                let d = root
+                    .with_interaction(|d, i| menu_lit(d, &t, item, move || i.focused()))
+                    .child(menu_indicator(
+                        primitives::menu::indicator_shown(state, false).then(menu_check),
+                    ));
+                let entry = Item::new((), focus).label(label).availability(item.availability());
+                menu.checkbox_item(d, entry, state, move |next| {
+                    checked.set(next);
+                    SelectEvent::pick(&on_select)
+                })
+                .into_element()
             }
         })
     })
@@ -976,7 +577,7 @@ impl Part<MenuRadioGroupProps> {
 
     /// Call `f` with each value picked (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<String>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 }
@@ -985,9 +586,9 @@ impl Part<MenuRadioGroupProps> {
 #[derive(Clone, Copy)]
 struct MenuRadio(UseModel<PartProps<MenuRadioGroupProps>, String>);
 
-/// A radio group on `root`; its radio items set its value.
+/// A radio group on `root` (`role=group`); its radio items set its value.
 pub(crate) fn menu_radio_group(root: Div) -> Part<MenuRadioGroupProps> {
-    Part::new(MenuRadioGroupProps::default(), root, |p| {
+    Part::new(MenuRadioGroupProps::default(), menu_group(root), |p| {
         component(p, |cx| {
             let props = cx.props();
             provide(MenuRadio(use_model(props, |p| &p.props.value)));
@@ -1002,6 +603,18 @@ pub struct MenuRadioItemProps {
     label: String,
     value: String,
     disabled: bool,
+    on_select: Option<Callback<SelectEvent>>,
+}
+
+impl Part<MenuRadioItemProps> {
+    /// Run `f` when the item is picked (`@select`), after its group takes
+    /// its value; the menu then closes, unless `f` keeps it open
+    /// ([`SelectEvent::keep_open`]).
+    #[must_use]
+    pub fn on_select(self, f: impl Into<Callback<SelectEvent>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.on_select = Some(f))
+    }
 }
 
 /// A radio item on `root` (its label already in it), setting its group to `value`.
@@ -1010,13 +623,17 @@ pub(crate) fn menu_radio_item(root: Div, label: &str, value: &str, disabled: boo
         label: label.to_owned(),
         value: value.to_owned(),
         disabled,
+        on_select: None,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
             let level = menu_level();
             let group = use_context::<MenuRadio>();
+            let focus = FocusHandle::new();
+            let on_select = cx.event_opt(|p| p.props.on_select.as_ref());
             move || {
+                let on_select = on_select.clone();
                 let (label, value, disabled, root) = props.with(|p| {
                     (
                         p.props.label.clone(),
@@ -1025,7 +642,7 @@ pub(crate) fn menu_radio_item(root: Div, label: &str, value: &str, disabled: boo
                         p.slot.0.clone(),
                     )
                 });
-                let (Some(level), Some(group)) = (&level, group) else {
+                let (Some(menu), Some(group)) = (level, group) else {
                     return root.into_element();
                 };
                 let t = theme();
@@ -1033,20 +650,18 @@ pub(crate) fn menu_radio_item(root: Div, label: &str, value: &str, disabled: boo
                     disabled,
                     ..MenuItem::default()
                 };
-                let highlighted = level.is_highlighted(&label);
-                let dot = if highlighted {
-                    t.accent_foreground
-                } else {
-                    t.popover_foreground
-                };
                 let chosen = group.0.with(|v| *v == value);
-                let d = menu_highlight(root, &t, item, highlighted)
-                    .role(gui::Role::MenuItemRadio)
-                    .aria_checked(chosen)
-                    .child(menu_indicator(chosen.then(|| menu_dot(dot))));
-                level
-                    .item(d, &label, disabled, move || group.0.set(value.clone()))
-                    .into_element()
+                let shown =
+                    primitives::menu::indicator_shown(if chosen { Toggled::True } else { Toggled::False }, false);
+                let d = root.with_interaction(|d, i| {
+                    menu_lit(d, &t, item, move || i.focused()).child(menu_indicator(shown.then(|| menu_dot(&t, i))))
+                });
+                let entry = Item::new((), focus).label(label).availability(item.availability());
+                menu.radio_item(d, entry, chosen, move |()| {
+                    group.0.set(value.clone());
+                    SelectEvent::pick(&on_select)
+                })
+                .into_element()
             }
         })
     })
@@ -1059,7 +674,7 @@ pub(crate) fn menu_sub(root: Div) -> Part<MenuRootProps> {
         component(p, |cx| {
             let props = cx.props();
             if let Some(parent) = menu_level() {
-                provide(parent.sub(Rc::new(use_model(props, |p| p.props.open_bind()))));
+                provide(parent.submenu(use_model(props, |p| p.props.open_bind())));
             }
             move || props.with(|p| p.slot.0.clone()).into_element()
         })
@@ -1071,43 +686,28 @@ pub(crate) fn menu_sub(root: Div) -> Part<MenuRootProps> {
 pub struct MenuSubTriggerProps {
     label: String,
     item: MenuItem,
-    /// Highlighted while its submenu is open (`data-[state=open]:bg-accent`).
-    open_highlights: bool,
 }
 
 /// A submenu's row on `root` (label and chevron already in it), in its
-/// parent level: the pointer opens it, ArrowRight or Enter enters it.
-pub(crate) fn menu_sub_trigger(
-    root: Div,
-    label: &str,
-    item: MenuItem,
-    open_highlights: bool,
-) -> Part<MenuSubTriggerProps> {
+/// parent level: lit while focused or open (`focus:bg-accent
+/// data-open:bg-accent`).
+pub(crate) fn menu_sub_trigger(root: Div, label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
     let props = MenuSubTriggerProps {
         label: label.to_owned(),
         item,
-        open_highlights,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
             let sub = menu_level();
             move || {
-                let (label, item, open_highlights, root) = props.with(|p| {
-                    (
-                        p.props.label.clone(),
-                        p.props.item,
-                        p.props.open_highlights,
-                        p.slot.0.clone(),
-                    )
-                });
-                let Some(sub) = &sub else {
+                let (label, item, root) = props.with(|p| (p.props.label.clone(), p.props.item, p.slot.0.clone()));
+                let Some(sub) = sub else {
                     return root.into_element();
                 };
                 let t = theme();
-                let highlighted = (open_highlights && sub.is_open()) || sub.parent_highlighted(&label);
-                sub.sub_trigger(menu_highlight(root, &t, item, highlighted), &label, item.disabled)
-                    .into_element()
+                let d = root.with_interaction(|d, i| menu_lit(d, &t, item, move || i.focused() || sub.is_open()));
+                sub.sub_trigger(d, label, item.availability()).into_element()
             }
         })
     })
@@ -1119,7 +719,20 @@ pub(crate) fn menu_sub_trigger(
 /// against. Give it a [`dropdown_menu_trigger`] and a [`dropdown_menu_content`].
 #[must_use]
 pub fn dropdown_menu() -> Part<MenuRootProps> {
-    menu_root(div().named("dropdown-menu").display(Display::Flex).inline(true))
+    Part::new(
+        MenuRootProps::default(),
+        div().named("dropdown-menu").display(Display::Flex).inline(true),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let options = props.with_untracked(|p| p.props.options());
+                let menu = DropdownMenu::new(use_model(props, |p| p.props.open_bind()), options);
+                provide(menu);
+                provide(menu.menu());
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
 }
 
 /// Make `trigger` (usually a button) toggle the menu (`DropdownMenuTrigger as-child`).
@@ -1127,7 +740,20 @@ pub fn dropdown_menu() -> Part<MenuRootProps> {
 /// its padding from them as it becomes the box.
 #[must_use]
 pub fn dropdown_menu_trigger(trigger: impl Into<Div>) -> Part<()> {
-    menu_trigger(trigger.into().named("dropdown-menu-trigger"))
+    Part::new((), trigger.into().named("dropdown-menu-trigger"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let menu = use_context::<DropdownMenu>();
+            move || {
+                let root = props.with(|p| p.slot.0.clone());
+                match menu {
+                    Some(m) => m.trigger(root, Availability::Enabled),
+                    None => root,
+                }
+                .into_element()
+            }
+        })
+    })
 }
 
 /// The floating panel (`DropdownMenuContent`, `side-offset 4`): below the
@@ -1141,7 +767,6 @@ pub fn dropdown_menu_content() -> Part<MenuContentProps> {
         popper(
             menu_box(&t)
                 .named("dropdown-menu-content")
-                .role(gui::Role::Menu)
                 .overflow_y(Overflow::Scroll)
                 .overflow_x(Overflow::Hidden)
                 .shadow(crate::popover::POPUP_SHADOW),
@@ -1156,9 +781,10 @@ pub fn dropdown_menu_content() -> Part<MenuContentProps> {
     )
 }
 
+/// A group of items (`DropdownMenuGroup`, `role=group`).
 #[must_use]
 pub fn dropdown_menu_group() -> Div {
-    div().named("dropdown-menu-group")
+    menu_group(div().named("dropdown-menu-group"))
 }
 
 /// A group of radio items, their chosen value its own (`default_value`) or
@@ -1175,13 +801,7 @@ pub fn dropdown_menu_radio_group() -> Part<MenuRadioGroupProps> {
 #[must_use]
 pub fn dropdown_menu_item(id: &str, item: MenuItem) -> Part<MenuItemProps> {
     let t = theme();
-    menu_item(
-        menu_row_base(&t, item)
-            .named("dropdown-menu-item")
-            .role(gui::Role::MenuItem),
-        id,
-        item,
-    )
+    menu_item(menu_row_base(&t, item).named("dropdown-menu-item"), id, item)
 }
 
 /// A checkbox item labelled `label`, its own (`default_checked`) or bound to
@@ -1240,7 +860,7 @@ pub fn dropdown_menu_label(label: &str, inset: bool) -> Div {
 
 #[must_use]
 pub fn dropdown_menu_separator() -> Div {
-    menu_separator(&theme()).named("dropdown-menu-separator")
+    menu_item_separator(&theme()).named("dropdown-menu-separator")
 }
 
 #[must_use]
@@ -1255,7 +875,7 @@ pub fn dropdown_menu_sub() -> Part<MenuRootProps> {
     menu_sub(div().named("dropdown-menu-sub"))
 }
 
-/// The row opening its submenu, whose content opens to its right. Its
+/// The row opening its submenu, whose content opens on the inline end. Its
 /// chevron is muted, as the item's `[&_svg]` rule makes it.
 #[must_use]
 pub fn dropdown_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
@@ -1271,7 +891,6 @@ pub fn dropdown_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTri
             ),
         label,
         item,
-        false,
     )
 }
 

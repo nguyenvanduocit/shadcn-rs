@@ -1,0 +1,7 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  ComboBox "Fruit" value="Banana" expanded=false required
+    Label "Banana"

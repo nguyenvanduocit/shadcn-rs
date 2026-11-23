@@ -1,0 +1,11 @@
+---
+source: crates/primitives/tests/form_controls.rs
+expression: tree
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Slider "Minimum" Horizontal value=20 in 0..=100
+      Slider "Maximum" Horizontal value=60 in 0..=100
+    GenericContainer disabled
+      Slider Horizontal value=40 in 0..=100 disabled

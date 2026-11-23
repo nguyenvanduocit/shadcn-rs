@@ -1,0 +1,17 @@
+---
+source: crates/primitives/tests/structure.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Region described="carousel"
+        GenericContainer live=Polite
+          GenericContainer
+            Group "1 of 4" described="slide"
+              Button
+                Label "Open 1"
+        Button "Previous slide" disabled controls=GenericContainer
+          Label "Prev" disabled
+        Button "Next slide" controls=GenericContainer
+          Label "Next"

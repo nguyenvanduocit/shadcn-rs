@@ -15,6 +15,7 @@ pub(crate) mod handle;
 mod ink;
 mod palette;
 mod scale;
+mod spec;
 
 use crate::icons::IconSet;
 pub use handle::{Colors, TextStyle, ThemeHandle, install, use_theme, with_theme};
@@ -25,6 +26,7 @@ pub use scale::{
     Font, Fonts, Heading, LeadingScale, Menu, MenuAccent, REM, Radius, RadiusStep, Scheme, ShadowScale, ShadowStep,
     TextStep, TrackingScale, TypeScale, TypeStep,
 };
+pub use spec::{SpecError, ThemeSpec};
 
 /// A theme: every token a component reads.
 #[derive(Clone, Debug, PartialEq)]

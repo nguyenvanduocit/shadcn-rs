@@ -100,8 +100,9 @@ pub fn marker_content(variant: MarkerVariant) -> Div {
     }
 }
 
-/// A marker that is a link (Vue's `<a>` marker): a [`marker_button`], underlined.
+/// A marker that is a link (Vue's `<a>` marker, `[a]:underline
+/// [a]:underline-offset-3`): a [`marker_button`], underlined.
 #[must_use]
 pub fn marker_link(marker: Div) -> Div {
-    marker_button(marker).underline(true)
+    marker_button(marker).underline(true).underline_offset(3.0)
 }

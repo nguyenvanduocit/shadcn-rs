@@ -4,10 +4,8 @@ use shadcn::{avatar, avatar_fallback, avatar_image, theme};
 
 use crate::{Render, Shot, demo, page, photo, section};
 
-fn person(image: Option<&ImageSource>, initials: &str) -> gui::Div {
-    avatar()
-        .child(avatar_image(image))
-        .child(avatar_fallback(image, initials))
+fn person(image: Option<&ImageSource>, initials: &str) -> shadcn::Part<()> {
+    avatar().child(avatar_image(image)).child(avatar_fallback(initials))
 }
 
 pub fn render() -> Render {

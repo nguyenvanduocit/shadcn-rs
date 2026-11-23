@@ -235,7 +235,7 @@ fn tile(label: impl IntoElement) -> Div {
 }
 
 /// Two lines (name over detail) beside a tile, then the up-down chevrons.
-fn identity(tile: Div, name: &str, detail: &str) -> Div {
+fn identity(tile: impl IntoElement, name: &str, detail: &str) -> Div {
     sidebar_menu().child(
         sidebar_menu_item().child(
             sidebar_menu_button(SidebarMenuButtonProps {
@@ -285,7 +285,7 @@ fn team_switcher() -> Div {
 }
 
 fn nav_user() -> Div {
-    let initials = avatar_fallback(None, "CN").map(|f| f.radius(10.0));
+    let initials = avatar_fallback("CN").radius(10.0);
     identity(avatar().radius(10.0).child(initials), "shadcn", "m@example.com")
 }
 

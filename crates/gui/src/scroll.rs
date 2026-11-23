@@ -16,6 +16,8 @@ use crate::style::Edges;
 /// A scroll container as last laid out.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScrollLayout {
+    /// Where the container sits in the tree.
+    pub path: crate::geometry::NodePath,
     /// The border box in window pixels.
     pub bounds: Bounds,
     pub padding: Edges<f32>,
@@ -37,8 +39,12 @@ pub struct ScrollChild {
     pub focus_within: bool,
 }
 
-type Hook = Rc<dyn Fn(&ScrollLayout) -> bool>;
+/// What the render built the container's children from, as it handed it
+/// ([`crate::Div::track_scroll_built`]).
+pub(crate) type Built = Rc<dyn std::any::Any>;
+type Hook = Rc<dyn Fn(&ScrollLayout, Option<&Built>) -> bool>;
 type Reveal = Rc<dyn Fn(ElementKey) -> bool>;
+type Take = Rc<dyn Fn(&Built) -> bool>;
 
 struct Inner {
     /// Bumped when a layout differs from the last: what a render read
@@ -60,6 +66,9 @@ struct Inner {
     /// compositor drops what it scrolled before (ADR-0015).
     generation: Cell<u64>,
     hook: RefCell<Option<Hook>>,
+    /// Takes in what the render built the children from, after each layout
+    /// pass that laid them out ([`Self::on_built`]).
+    take: RefCell<Option<Take>>,
     /// Brings the child keyed so into view (a virtual list's row, built or not).
     reveal: RefCell<Option<Reveal>>,
     /// How far the compositor may scroll it, at its speed, before the
@@ -79,6 +88,7 @@ impl Default for Inner {
             wheels: Cell::default(),
             generation: Cell::default(),
             hook: RefCell::default(),
+            take: RefCell::default(),
             reveal: RefCell::default(),
             reach: Cell::default(),
         }
@@ -117,9 +127,44 @@ impl ScrollHandle {
         self.0.offset.get()
     }
 
-    /// Scroll to `offset`; the next layout clamps it to what the content allows.
+    /// Scroll to `offset`; the next layout clamps it to what the content
+    /// allows. Where it already is, nothing is written.
     pub fn scroll_to(&self, offset: (f32, f32)) {
+        self.write(offset, false);
+    }
+
+    /// Hold it at `offset` (`f32::MAX` on an axis: its end), from a hook
+    /// run after a layout (a virtual list's), whose layout is the current
+    /// one: at its end already, asking for the end writes nothing either.
+    /// (Not [`Self::scroll_to`]'s rule: a program asking for the end after
+    /// it added content asks past the last layout's end.)
+    pub fn keep_at(&self, offset: (f32, f32)) {
+        let at = self.0.offset.get();
+        let max = self.0.laid.borrow().as_ref().map(|l| l.max);
+        let at_end = |want: f32, at: f32, max: Option<f32>| want == f32::MAX && max.is_some_and(|m| at >= m);
+        let held = |want: f32, at: f32, max: Option<f32>| want == at || at_end(want, at, max);
+        if held(offset.0, at.0, max.map(|m| m.0)) && held(offset.1, at.1, max.map(|m| m.1)) {
+            return;
+        }
+        self.write(offset, false);
+    }
+
+    /// The one way the UI side sets the offset (a program's scroll, the
+    /// UI's own wheel): a write to where it is changes nothing, so it
+    /// writes nothing, and above all starts no new generation (the
+    /// compositor's scroll in flight from here still lands).
+    fn write(&self, offset: (f32, f32), wheel: bool) {
+        if self.0.offset.get() == offset {
+            return;
+        }
         self.0.offset.set(offset);
+        // How far the compositor may scroll it was measured from where it
+        // was: the compositor drops that scroll, and its reach goes too.
+        self.0.reach.set((0.0, 0.0));
+        if wheel {
+            self.0.wheeled.set(true);
+            self.0.wheels.set(self.0.wheels.get().wrapping_add(1));
+        }
         self.0.generation.set(self.0.generation.get().wrapping_add(1));
         self.moved();
     }
@@ -164,7 +209,29 @@ impl ScrollHandle {
     /// changed what the frame is built from (a signal the view reads, the
     /// offset), and then the frame is laid out again before it is painted.
     pub fn on_layout(&self, f: impl Fn(&ScrollLayout) -> bool + 'static) {
+        *self.0.hook.borrow_mut() = Some(Rc::new(move |l: &ScrollLayout, _: Option<&Built>| f(l)));
+    }
+
+    /// [`Self::on_layout`], handed also what the render built the
+    /// children from ([`crate::Div::track_scroll_built`]): the frame's
+    /// container's, whether or not this pass laid it out again.
+    pub(crate) fn on_layout_built(&self, f: impl Fn(&ScrollLayout, Option<&Built>) -> bool + 'static) {
         *self.0.hook.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Run `f` on what the render built the children from
+    /// ([`crate::Div::track_scroll_built`]) after every layout pass that laid
+    /// them out, the frame's last one too, before the hooks: what the frame
+    /// shows is what its owner holds. The same `built` may come again. It
+    /// returns whether it put the container elsewhere (the pass lays it out
+    /// again at once, so the frame paints its rows where they are).
+    pub(crate) fn on_built(&self, f: impl Fn(&Built) -> bool + 'static) {
+        *self.0.take.borrow_mut() = Some(Rc::new(f));
+    }
+
+    pub(crate) fn take_built(&self, built: &Built) -> bool {
+        let take = self.0.take.borrow().clone();
+        take.is_some_and(|f| f(built))
     }
 
     /// Let `f` bring the child keyed `key` into view when assistive
@@ -193,11 +260,7 @@ impl ScrollHandle {
 
     /// The UI's own wheel moved it to `offset`.
     pub(crate) fn wheel(&self, offset: (f32, f32)) {
-        self.0.offset.set(offset);
-        self.0.wheeled.set(true);
-        self.0.wheels.set(self.0.wheels.get().wrapping_add(1));
-        self.0.generation.set(self.0.generation.get().wrapping_add(1));
-        self.moved();
+        self.write(offset, true);
     }
 
     /// The compositor's wheel moved it to `offset` (a main frame brought the
@@ -221,12 +284,12 @@ impl ScrollHandle {
     }
 
     /// Run the hook on the last layout; whether the frame must be laid out again.
-    pub(crate) fn after_layout(&self) -> bool {
+    pub(crate) fn after_layout(&self, built: Option<&Built>) -> bool {
         // Cloned out, so the hook may set a new one.
         let hook = self.0.hook.borrow().clone();
         let laid = self.0.laid.borrow().clone();
         match (hook, laid) {
-            (Some(f), Some(l)) => f(&l),
+            (Some(f), Some(l)) => f(&l, built),
             _ => false,
         }
     }

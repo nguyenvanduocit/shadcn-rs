@@ -1,0 +1,12 @@
+[package]
+name = "gui-tls"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The per-thread slots gui's engine state is stored in (gui bans raw thread_local!)."
+
+[lints]
+workspace = true

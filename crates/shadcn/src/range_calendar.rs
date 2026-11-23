@@ -1,94 +1,49 @@
 //! Range Calendar (`ui/range-calendar`): one or more months to pick a start
-//! and an end day from. The first click starts a range, the second closes it
-//! (in either order), a third starts a new one, as reka-ui's
-//! `RangeCalendarRoot` does. Dates, paging and keys come from `calendar`.
+//! and an end day from. How presses build the range, the preview, the
+//! keys, Escape and what assistive technology is told are
+//! `primitives::range_calendar`'s; this file draws it, with the day look,
+//! arrows and dates of `calendar`.
 
 use gui::prelude::*;
-use gui::{Bind, Div, Element, IntoElement, Model, UseModel, component, div, provide, text, use_context, use_model};
+use gui::{Bind, Computed, Direction, Div, Element, IntoElement, Model, component, div, provide, text};
+use primitives::context::use_root;
+use primitives::direction::use_direction;
+use primitives::range_calendar::RangeCalendar;
+pub use primitives::range_calendar::{DateRange, RangeDay, RangeEnd, RangeOptions};
 
 use crate::calendar::{
-    CalendarDate, CalendarOptions, CalendarView, DaySelection, HasOptions, day_trigger, month_grid, page_button,
+    CalendarDate, CalendarLook, CalendarOptions, DaySelection, HasOptions, day_trigger, month_grid, months_row,
+    page_button,
 };
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
-/// The picked range (`v-model`): nothing, a start waiting for its end, or both
-/// ends with `start <= end`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum RangeCalendarValue {
-    #[default]
-    Empty,
-    Started(CalendarDate),
-    Range {
-        start: CalendarDate,
-        end: CalendarDate,
-    },
-}
-
-impl RangeCalendarValue {
-    /// The range from `a` to `b`, in whichever order they come.
-    #[must_use]
-    pub fn between(a: CalendarDate, b: CalendarDate) -> Self {
-        Self::Range {
-            start: a.min(b),
-            end: a.max(b),
-        }
-    }
-
-    /// The value after a click on `day`.
-    #[must_use]
-    pub fn pick(self, day: CalendarDate) -> Self {
-        match self {
-            Self::Started(start) => Self::between(start, day),
-            Self::Empty | Self::Range { .. } => Self::Started(day),
-        }
-    }
-
-    #[must_use]
-    pub fn start(self) -> Option<CalendarDate> {
-        match self {
-            Self::Empty => None,
-            Self::Started(start) | Self::Range { start, .. } => Some(start),
-        }
-    }
-
-    #[must_use]
-    pub fn end(self) -> Option<CalendarDate> {
-        match self {
-            Self::Range { end, .. } => Some(end),
-            Self::Empty | Self::Started(_) => None,
-        }
-    }
-
-    /// Whether `day` is inside the range, its ends included.
-    #[must_use]
-    pub fn contains(self, day: CalendarDate) -> bool {
-        match self {
-            Self::Empty => false,
-            Self::Started(start) => day == start,
-            Self::Range { start, end } => (start..=end).contains(&day),
-        }
-    }
-}
-
 /// What [`range_calendar`] is given.
 #[derive(Clone)]
 pub struct RangeCalendarProps {
-    value: Bind<RangeCalendarValue>,
+    value: Bind<DateRange>,
     options: CalendarOptions,
+    range: RangeOptions,
+    look: CalendarLook,
 }
 
 impl HasOptions for RangeCalendarProps {
     fn options_mut(&mut self) -> &mut CalendarOptions {
         &mut self.options
     }
+
+    fn look_mut(&mut self) -> &mut CalendarLook {
+        &mut self.look
+    }
 }
+
+type Ranger = RangeCalendar<PartProps<RangeCalendarProps>>;
 
 /// What a range calendar's days read.
 #[derive(Clone)]
 struct RangeCalendarContext {
-    view: CalendarView,
-    value: UseModel<PartProps<RangeCalendarProps>, RangeCalendarValue>,
+    calendar: Ranger,
+    look: Computed<CalendarLook>,
 }
 
 /// A range calendar: its heading between the paging arrows, then one grid
@@ -99,29 +54,42 @@ pub fn range_calendar() -> Part<RangeCalendarProps> {
     let props = RangeCalendarProps {
         value: Bind::default(),
         options: CalendarOptions::default(),
+        range: RangeOptions::default(),
+        look: CalendarLook::default(),
     };
     Part::new(props, div().named("range-calendar").padding(12.0), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let value = use_model(props, |p| &p.props.value);
-            let today = props.with_untracked(|p| p.props.options.today);
-            let start = value.get_untracked().start().unwrap_or(today);
-            let view = CalendarView::new(move || props.with(|p| p.props.options), start);
-            provide(RangeCalendarContext { view, value });
+            let value = gui::use_model(props, |p| &p.props.value);
+            let rtl = props.with_untracked(|p| p.props.look.rtl);
+            let direction = use_direction(Some(if rtl { Direction::Rtl } else { Direction::Ltr }));
+            let calendar = RangeCalendar::new(
+                value,
+                move || props.with(|p| p.props.options.clone()),
+                move || props.with(|p| p.props.range.clone()),
+                None,
+                direction,
+            );
+            let look = Computed::new(move || props.with(|p| p.props.look));
+            provide(RangeCalendarContext { calendar, look });
             move || {
-                props
-                    .with(|p| p.slot.0.clone())
-                    .child(
-                        range_calendar_header()
-                            .child(range_calendar_heading(view.heading()))
-                            .child(page_button(view, -1).position(Position::Absolute).left(4.0))
-                            .child(page_button(view, 1).position(Position::Absolute).right(4.0)),
+                let grid = calendar.grid;
+                calendar
+                    .root(
+                        props
+                            .with(|p| p.slot.0.clone())
+                            .child(
+                                range_calendar_header()
+                                    .child(range_calendar_heading(grid.heading()))
+                                    .child(page_button(grid, rtl, -1).position(Position::Absolute).left(4.0))
+                                    .child(page_button(grid, rtl, 1).position(Position::Absolute).right(4.0)),
+                            )
+                            .child(months_row(grid, rtl, |month| {
+                                calendar.grid(month_grid(grid, rtl, month, range_calendar_head_cell, |day, col| {
+                                    range_day(day, month, col)
+                                }))
+                            })),
                     )
-                    .child(view.months_row(|month| {
-                        month_grid(view, month, range_calendar_head_cell, |day, col| {
-                            range_day(day, month, col)
-                        })
-                    }))
                     .into_element()
             }
         })
@@ -131,63 +99,80 @@ pub fn range_calendar() -> Part<RangeCalendarProps> {
 impl Part<RangeCalendarProps> {
     /// The range, kept by the caller (`v-model`).
     #[must_use]
-    pub fn model(self, model: impl Into<Model<RangeCalendarValue>>) -> Self {
+    pub fn model(self, model: impl Into<Model<DateRange>>) -> Self {
         self.with_props(|p| p.value = std::mem::take(&mut p.value).with_model(model))
     }
 
     /// The range shown, kept by the caller as a plain value (`:model-value`):
     /// a pick only calls `on_change`.
     #[must_use]
-    pub fn value(self, value: RangeCalendarValue) -> Self {
+    pub fn value(self, value: DateRange) -> Self {
         self.with_props(|p| p.value = std::mem::take(&mut p.value).with_value(value))
     }
 
     /// The range first, kept by the calendar (`default-value`).
     #[must_use]
-    pub fn default_value(self, value: RangeCalendarValue) -> Self {
+    pub fn default_value(self, value: DateRange) -> Self {
         self.with_props(|p| p.value = std::mem::take(&mut p.value).with_default(value))
     }
 
     /// Called with each value picked (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(RangeCalendarValue) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<DateRange>>) -> Self {
         self.with_props(|p| p.value = std::mem::take(&mut p.value).on_change(f))
+    }
+
+    /// `allowNonContiguousRanges`: a range may run over unavailable days.
+    #[must_use]
+    pub fn allow_non_contiguous_ranges(self) -> Self {
+        self.with_props(|p| p.range.non_contiguous = true)
+    }
+
+    /// `maximumDays`: the longest range, its ends included.
+    #[must_use]
+    pub fn maximum_days(self, days: u32) -> Self {
+        self.with_props(|p| p.range.maximum_days = Some(days))
+    }
+
+    /// `fixedDate`: which end a press does not move by default.
+    #[must_use]
+    pub fn fixed_date(self, end: RangeEnd) -> Self {
+        self.with_props(|p| p.range.fixed = Some(end))
     }
 }
 
 /// One day of the grid at column `col`: its cell and trigger, an instance
-/// of its own. The first click starts a range, the next closes it.
+/// of its own.
 fn range_day(day: CalendarDate, month: CalendarDate, col: usize) -> Element {
     component((day, month, col), |cx| {
         let props = cx.props();
-        let ctx = use_context::<RangeCalendarContext>();
+        let ctx = use_root::<RangeCalendarContext>("range calendar day", "range_calendar");
         move || {
-            let (day, month, col) = props.get();
+            let (date, month, col) = props.get();
             let Some(ctx) = &ctx else {
                 return Element::Empty;
             };
-            let range = ctx.value.get();
-            let inside = ctx.view.in_month(day, month);
-            let selection = if !inside || !range.contains(day) {
+            let calendar = ctx.calendar;
+            let day = calendar.grid.day(date, month);
+            let range = calendar.day(date);
+            let shown = !day.outside_month && range.selected;
+            let selection = if !shown {
                 DaySelection::Unselected
-            } else if range.start() == Some(day) || range.end() == Some(day) {
+            } else if range.start || range.end {
                 DaySelection::Picked
             } else {
                 DaySelection::Between
             };
-            let value = ctx.value;
-            range_calendar_cell(
-                inside && range.contains(day),
-                col == 0 || range.start() == Some(day),
-                col == 6 || range.end() == Some(day),
-            )
-            .child(
-                day_trigger(ctx.view, day, month, selection, move |d| {
-                    value.update(|v| *v = v.pick(d))
-                })
-                .named("range-calendar-trigger"),
-            )
-            .into_element()
+            calendar
+                .cell(
+                    day,
+                    range_calendar_cell(shown, col == 0 || range.start, col == 6 || range.end),
+                )
+                .child(calendar.trigger(
+                    day,
+                    day_trigger(calendar.grid, ctx.look.get(), day, selection).named("range-calendar-trigger"),
+                ))
+                .into_element()
         }
     })
     .into_element()

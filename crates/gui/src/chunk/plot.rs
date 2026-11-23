@@ -612,14 +612,28 @@ impl Plot {
         self
     }
 
+    /// How near the pointer a dot is hovered, pixels (24 by default): of
+    /// a plot, whatever handlers hear it ([`Self::on_hover`]).
+    #[must_use]
+    pub fn hover_radius(mut self, radius: f32) -> Self {
+        self.hover_radius = radius;
+        self
+    }
+
     /// Told the point under the pointer (`None` when there is none or it
     /// leaves), in the frame it moved: of each line, area and bars the
-    /// point nearest by x, of dots the nearest within `radius` pixels, and
-    /// of those the nearest to the pointer.
+    /// point nearest by x, of dots the nearest within the
+    /// [`Self::hover_radius`], and of those the nearest to the pointer.
+    /// Each given is told, in the order given.
     #[must_use]
-    pub fn on_hover(mut self, radius: f32, f: impl Fn(Option<Hover>) + 'static) -> Self {
-        self.hover = Some(Rc::new(f));
-        self.hover_radius = radius;
+    pub fn on_hover(mut self, f: impl Fn(Option<Hover>) + 'static) -> Self {
+        self.hover = Some(match self.hover.take() {
+            Some(before) => Rc::new(move |h| {
+                before(h);
+                f(h);
+            }),
+            None => Rc::new(f),
+        });
         self
     }
 
@@ -878,4 +892,26 @@ pub fn item<K: ChunkKind>(key: u64, bounds: Bounds, region: Bounds, params: &K::
 )]
 fn f64_to_i64(v: f64) -> i64 {
     v as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A plot's hover handlers add up, as a node's do; its radius is its own.
+    #[test]
+    fn a_plots_hover_handlers_add_up() {
+        let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+        let (a, b) = (Rc::clone(&log), Rc::clone(&log));
+        let p = super::plot()
+            .on_hover(move |_| a.borrow_mut().push("first"))
+            .hover_radius(8.0)
+            .on_hover(move |_| b.borrow_mut().push("second"));
+        if let Some(f) = &p.hover {
+            f(None);
+        }
+        assert_eq!(*log.borrow(), ["first", "second"]);
+        assert!((p.hover_radius - 8.0).abs() < f32::EPSILON);
+    }
 }

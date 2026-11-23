@@ -1,0 +1,12 @@
+---
+source: crates/primitives/tests/form_controls.rs
+assertion_line: 1456
+expression: tree
+---
+Window "w"
+  GenericContainer
+    CheckBox "Terms" required Mixed
+    CheckBox "All" controls=["a", "b", "c"] Mixed
+    CheckBox "a" True
+    CheckBox "b" True
+    CheckBox "c" False disabled focusable

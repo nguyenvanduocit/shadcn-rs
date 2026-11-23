@@ -16,9 +16,9 @@ fn label(s: &str) -> gui::Div {
 
 pub fn render() -> Render {
     // The page shows three groups' sizes, so it keeps them; the inner group keeps its own.
-    let outer = Signal::labeled("resizable sizes", vec![50.0_f32, 50.0]);
-    let grip = Signal::labeled("resizable sizes", vec![25.0_f32, 75.0]);
-    let grip_v = Signal::labeled("resizable sizes", vec![25.0_f32, 75.0]);
+    let outer = Signal::labeled("resizable sizes", vec![50.0_f64, 50.0]);
+    let grip = Signal::labeled("resizable sizes", vec![25.0_f64, 75.0]);
+    let grip_v = Signal::labeled("resizable sizes", vec![25.0_f64, 75.0]);
     Box::new(move || {
         let t = theme();
         let demo = resizable_panel_group(Orientation::Horizontal)
@@ -70,7 +70,7 @@ pub fn render() -> Render {
             .child(resizable_panel(0).child(label("Header")))
             .child(resizable_handle(0, true))
             .child(resizable_panel(1).child(label("Content")));
-        let sizes = |s: &Signal<Vec<f32>>| {
+        let sizes = |s: &Signal<Vec<f64>>| {
             s.get()
                 .iter()
                 .map(|v| format!("{v:.0}"))

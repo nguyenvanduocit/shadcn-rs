@@ -2,31 +2,20 @@
 //!
 //! As reka's `CheckboxRoot` it keeps its own value (`default_checked`), is
 //! bound to the caller's (`model`, `v-model`), or shows one the caller
-//! keeps (`checked`, `:model-value`); `on_change` hears each click.
+//! keeps (`checked`, `:model-value`); `on_change` hears each click. Its
+//! behaviour (role, Space toggles and Enter does not, an indeterminate box
+//! turns checked) is `primitives::checkbox`'s; this module draws it.
 
 use std::rc::Rc;
 
 use gui::Color;
 use gui::prelude::*;
 use gui::{Bind, Div, Element, Icon, Model, Slot, component, div, icon, use_model};
+pub use primitives::checkbox::CheckedState;
+use primitives::{Availability, checkbox};
 
 use crate::focus::StateLook;
 use crate::theme::theme;
-
-/// What a checkbox shows: reka's `boolean | 'indeterminate'`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckedState {
-    Unchecked,
-    Checked,
-    /// Some of what it stands for is checked (a "select all" over a part).
-    Indeterminate,
-}
-
-impl From<bool> for CheckedState {
-    fn from(checked: bool) -> Self {
-        if checked { Self::Checked } else { Self::Unchecked }
-    }
-}
 
 /// Classes a caller adds after a control's own (Vue's `class` prop), run in
 /// the control's render: what it reads there renders the control again.
@@ -41,6 +30,7 @@ pub fn checkbox() -> Checkbox {
         checked: Bind::default(),
         indeterminate: false,
         disabled: false,
+        required: false,
         class: None,
     }
 }
@@ -51,6 +41,7 @@ pub struct Checkbox {
     checked: Bind<bool>,
     indeterminate: bool,
     disabled: bool,
+    required: bool,
     class: Option<Class>,
 }
 
@@ -88,7 +79,7 @@ impl Checkbox {
 
     /// Call `f` with the value each click turns it to (`@update:model-value`).
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_change(mut self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.checked = self.checked.on_change(f);
         self
     }
@@ -96,6 +87,15 @@ impl Checkbox {
     #[must_use]
     pub fn disabled(mut self, disabled: bool) -> Self {
         self.disabled = disabled;
+        self
+    }
+
+    /// A form needs it checked (`required`): told to assistive technology;
+    /// the check itself is the form field's rule
+    /// (`primitives::checkbox::required`).
+    #[must_use]
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
         self
     }
 
@@ -114,9 +114,13 @@ impl Checkbox {
             (false, true) => CheckedState::Indeterminate,
             (false, false) => CheckedState::Unchecked,
         };
-        let d = look(state)
-            .disabled(self.disabled)
-            .on_click(move |_| set(state != CheckedState::Checked));
+        let d = checkbox::root(
+            look(state),
+            state,
+            Availability::from_disabled(self.disabled),
+            self.required,
+            move |next| set(next.is_checked()),
+        );
         match &self.class {
             Some(f) => f(d),
             None => d,
@@ -152,12 +156,6 @@ fn look(state: CheckedState) -> Div {
     let base = div()
         .named("checkbox")
         .interaction(i)
-        .role(gui::Role::CheckBox)
-        .aria_checked(match state {
-            CheckedState::Checked => gui::Toggled::True,
-            CheckedState::Indeterminate => gui::Toggled::Mixed,
-            CheckedState::Unchecked => gui::Toggled::False,
-        })
         .transition(Properties::SHADOW)
         .display(Display::Flex)
         .align_items(Align::Center)
@@ -174,7 +172,6 @@ fn look(state: CheckedState) -> Div {
             spread: 0.0,
             color: Color::BLACK.opacity(0.05),
         })
-        .focusable()
         .dim_disabled(i, 0.5)
         .cursor_disabled(i);
     let indicator = || icon(Icon::Check).named("checkbox-indicator").size(14.0);

@@ -1,0 +1,16 @@
+---
+source: crates/gui/tests/layers.rs
+expression: dump(&first)
+---
+Window "w"
+  GenericContainer hidden
+    Button "Edit" controls=Dialog
+  GenericContainer
+    Dialog modal labelled-by=Edit profile described-by=Make changes here.
+      Label "Edit profile"
+      Label "Make changes here."
+      ListBox active=ListBoxOption
+        ListBoxOption
+          Label "Vega"
+        ListBoxOption
+          Label "Nova"

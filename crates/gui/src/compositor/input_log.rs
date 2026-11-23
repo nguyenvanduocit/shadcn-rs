@@ -57,8 +57,9 @@ use std::time::Instant;
 use winit::keyboard::{Key, NamedKey, NativeKey};
 
 use crate::edit::Preedit;
-use crate::events::{ImeEvent, KeyEvent, Modifiers};
+use crate::events::{ImeEvent, KeyEvent, Modifiers, TouchEvent, TouchPhase};
 use crate::interact::LINE_SCROLL;
+use crate::layer::{PointerButton, PointerKind};
 use crate::window::Input;
 
 /// The log format's version, the header's first line.
@@ -70,10 +71,13 @@ pub enum Event {
     /// The pointer moved to `(x, y)`, logical window pixels.
     Moved(f32, f32),
     Left,
+    /// The window lost the keyboard focus: the pointers down are cancelled.
+    Blur,
     /// The primary button went down (`true`) or up, where the pointer is.
     Primary(bool),
-    /// The secondary button went down, where the pointer is.
-    SecondaryDown,
+    /// A button other than the primary went down, where the pointer is
+    /// (`ButtonDown(Primary)` is `Primary(true)`).
+    ButtonDown(PointerButton),
     /// The wheel or a trackpad scrolled.
     Wheel {
         delta: WheelDelta,
@@ -84,11 +88,22 @@ pub enum Event {
     Key {
         key: Key,
         text: Option<String>,
+        /// The platform sent it again for a key held down.
+        repeat: bool,
     },
     /// The input method composes.
     Preedit(Preedit),
     /// The input method commits text.
     Commit(String),
+    /// A finger (or a pen, when `pen`) touched, moved, lifted or was
+    /// cancelled at `(x, y)`, logical window pixels.
+    Touch {
+        id: u64,
+        pen: bool,
+        phase: Phase,
+        x: f32,
+        y: f32,
+    },
 }
 
 /// A wheel's delta as winit gives it, positive moving the content down and
@@ -282,9 +297,14 @@ fn event_line(at: f64, event: &Event) -> String {
             s.push_str(&format!("move {x} {y}"));
         }
         Event::Left => s.push_str("leave"),
+        Event::Blur => s.push_str("blur"),
         Event::Primary(true) => s.push_str("down"),
         Event::Primary(false) => s.push_str("up"),
-        Event::SecondaryDown => s.push_str("secondary"),
+        Event::ButtonDown(PointerButton::Secondary) => s.push_str("secondary"),
+        Event::ButtonDown(PointerButton::Middle) => s.push_str("middle"),
+        Event::ButtonDown(PointerButton::Other(n)) => s.push_str(&format!("button {n}")),
+        // Not logged as a button: the primary is `down`.
+        Event::ButtonDown(PointerButton::Primary) => s.push_str("down"),
         Event::Wheel { delta, phase } => {
             let (kind, x, y) = match delta {
                 WheelDelta::Lines(x, y) => ("lines", x, y),
@@ -317,21 +337,22 @@ fn event_line(at: f64, event: &Event) -> String {
                 }
             ));
         }
-        Event::Key { key, text } => {
+        Event::Key { key, text, repeat } => {
+            let verb = if *repeat { "repeat" } else { "key" };
             match key {
                 Key::Named(n) => match NAMED.iter().find(|(k, _)| k == n) {
                     Some((_, name)) => {
-                        s.push_str(&format!("key named {name}"));
+                        s.push_str(&format!("{verb} named {name}"));
                     }
                     None => {
-                        s.push_str(&format!("key other {}", quote(&format!("{n:?}"))));
+                        s.push_str(&format!("{verb} other {}", quote(&format!("{n:?}"))));
                     }
                 },
                 Key::Character(c) => {
-                    s.push_str(&format!("key char {}", quote(c)));
+                    s.push_str(&format!("{verb} char {}", quote(c)));
                 }
                 other => {
-                    s.push_str(&format!("key other {}", quote(&format!("{other:?}"))));
+                    s.push_str(&format!("{verb} other {}", quote(&format!("{other:?}"))));
                 }
             }
             if let Some(t) = text {
@@ -351,6 +372,16 @@ fn event_line(at: f64, event: &Event) -> String {
         Event::Commit(t) => {
             s.push_str(&format!("commit {}", quote(t)));
         }
+        Event::Touch { id, pen, phase, x, y } => {
+            let what = if *pen { "pen" } else { "finger" };
+            let phase = match phase {
+                Phase::Started => "started",
+                Phase::Moved => "moved",
+                Phase::Ended => "ended",
+                Phase::Cancelled => "cancelled",
+            };
+            s.push_str(&format!("touch {id} {what} {phase} {x} {y}"));
+        }
     }
     s
 }
@@ -362,9 +393,31 @@ fn parse_event(rest: &str) -> Result<Event, String> {
     Ok(match w.as_slice() {
         ["move", x, y] => Event::Moved(num(x)?, num(y)?),
         ["leave"] => Event::Left,
+        ["blur"] => Event::Blur,
         ["down"] => Event::Primary(true),
         ["up"] => Event::Primary(false),
-        ["secondary"] => Event::SecondaryDown,
+        ["secondary"] => Event::ButtonDown(PointerButton::Secondary),
+        ["middle"] => Event::ButtonDown(PointerButton::Middle),
+        ["button", n] => Event::ButtonDown(PointerButton::Other(
+            n.parse().map_err(|_| format!("not a button number: {n}"))?,
+        )),
+        ["touch", id, what, phase, x, y] => Event::Touch {
+            id: id.parse().map_err(|_| format!("not a touch id: {id}"))?,
+            pen: match *what {
+                "pen" => true,
+                "finger" => false,
+                w => return Err(format!("a touch is a finger or a pen, not {w}")),
+            },
+            phase: match *phase {
+                "started" => Phase::Started,
+                "moved" => Phase::Moved,
+                "ended" => Phase::Ended,
+                "cancelled" => Phase::Cancelled,
+                p => return Err(format!("unknown phase {p}")),
+            },
+            x: num(x)?,
+            y: num(y)?,
+        },
         ["wheel", kind, x, y, phase] => {
             let (x, y) = (num(x)?, num(y)?);
             let delta = match *kind {
@@ -394,7 +447,7 @@ fn parse_event(rest: &str) -> Result<Event, String> {
             }
             Event::Modifiers(m)
         }
-        ["key", kind, what, text @ ..] => {
+        [verb @ ("key" | "repeat"), kind, what, text @ ..] => {
             let key = match *kind {
                 "named" => NAMED
                     .iter()
@@ -410,7 +463,11 @@ fn parse_event(rest: &str) -> Result<Event, String> {
                 [t] => Some((*t).to_owned()),
                 _ => return Err("a key types one text".to_owned()),
             };
-            Event::Key { key, text }
+            Event::Key {
+                key,
+                text,
+                repeat: *verb == "repeat",
+            }
         }
         ["preedit", text, "-"] => Event::Preedit(Preedit {
             text: (*text).to_owned(),
@@ -546,8 +603,8 @@ fn tokens(line: &str) -> Result<Vec<String>, String> {
 
 /// The input in a winit window event at `scale` (physical pixels per
 /// logical pixel), as the platform thread logs and routes it; `None` for
-/// what is not input (or input `gui` takes no notice of: other buttons, a
-/// secondary release, key releases).
+/// what is not input (or input `gui` takes no notice of: the release of a
+/// button other than the primary, key releases).
 #[must_use]
 pub fn from_winit(event: winit::event::WindowEvent, scale: f32) -> Option<Event> {
     use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
@@ -564,11 +621,21 @@ pub fn from_winit(event: winit::event::WindowEvent, scale: f32) -> Option<Event>
             button: MouseButton::Left,
             ..
         } => Event::Primary(state == ElementState::Pressed),
+        // Every other button counts as it goes down (a press outside a layer
+        // dismisses it whichever button it is: ADR-0024).
         WindowEvent::MouseInput {
             state: ElementState::Pressed,
-            button: MouseButton::Right,
+            button,
             ..
-        } => Event::SecondaryDown,
+        } => Event::ButtonDown(match button {
+            MouseButton::Left => PointerButton::Primary,
+            MouseButton::Right => PointerButton::Secondary,
+            MouseButton::Middle => PointerButton::Middle,
+            // Back and forward are buttons 3 and 4, as the DOM numbers them.
+            MouseButton::Back => PointerButton::Other(3),
+            MouseButton::Forward => PointerButton::Other(4),
+            MouseButton::Other(n) => PointerButton::Other(n),
+        }),
         WindowEvent::MouseWheel { delta, phase, .. } => Event::Wheel {
             delta: match delta {
                 MouseScrollDelta::LineDelta(x, y) => WheelDelta::Lines(x, y),
@@ -588,9 +655,24 @@ pub fn from_winit(event: winit::event::WindowEvent, scale: f32) -> Option<Event>
         WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => Event::Key {
             key: event.logical_key,
             text: event.text.map(|t| t.to_string()),
+            repeat: event.repeat,
         },
         WindowEvent::Ime(Ime::Preedit(text, cursor)) => Event::Preedit(Preedit { text, cursor }),
         WindowEvent::Ime(Ime::Commit(text)) => Event::Commit(text),
+        // An Apple Pencil reports its altitude; a finger does not.
+        WindowEvent::Touch(t) => Event::Touch {
+            id: t.id,
+            pen: matches!(
+                t.force,
+                Some(winit::event::Force::Calibrated {
+                    altitude_angle: Some(_),
+                    ..
+                })
+            ),
+            phase: t.phase.into(),
+            x: f64_to_f32(t.location.x) / scale,
+            y: f64_to_f32(t.location.y) / scale,
+        },
         // Another input source was chosen mid-composition: what it held is gone.
         WindowEvent::Ime(Ime::Disabled) => Event::Preedit(Preedit::default()),
         _ => return None,
@@ -604,11 +686,13 @@ pub(crate) enum Routed {
     Ui(Input),
     /// The wheel at `point` (logical window pixels) moved `delta` (positive
     /// moves the content up and left): a trackpad's (`precise`) is
-    /// resampled, a notched wheel's applied; `ended`: the fingers lifted.
+    /// resampled, a notched wheel's applied; `began`: the fingers went
+    /// down (a new gesture); `ended`: they lifted.
     Wheel {
         point: (f32, f32),
         delta: (f32, f32),
         precise: bool,
+        began: bool,
         ended: bool,
     },
 }
@@ -631,9 +715,11 @@ impl Router {
                 Input::PointerMoved { x, y }
             }
             Event::Left => Input::PointerLeft,
+            Event::Blur => Input::Blur,
             Event::Primary(true) => Input::MouseDown { x, y },
             Event::Primary(false) => Input::MouseUp { x, y },
-            Event::SecondaryDown => Input::SecondaryDown { x, y },
+            Event::ButtonDown(PointerButton::Primary) => Input::MouseDown { x, y },
+            Event::ButtonDown(button) => Input::ButtonDown { x, y, button },
             Event::Wheel { delta, phase } => {
                 let (delta, precise) = match delta {
                     WheelDelta::Lines(x, y) => ((-x * LINE_SCROLL, -y * LINE_SCROLL), false),
@@ -643,6 +729,7 @@ impl Router {
                     point: self.cursor,
                     delta,
                     precise,
+                    began: matches!(phase, Phase::Started),
                     ended: matches!(phase, Phase::Ended | Phase::Cancelled),
                 };
             }
@@ -650,13 +737,28 @@ impl Router {
                 self.modifiers = m;
                 Input::Modifiers(m)
             }
-            Event::Key { key, text } => Input::Key(KeyEvent {
-                key,
-                text,
-                modifiers: self.modifiers,
-            }),
+            Event::Key { key, text, repeat } => {
+                let ev = KeyEvent {
+                    key,
+                    text,
+                    modifiers: self.modifiers,
+                };
+                if repeat { Input::KeyRepeat(ev) } else { Input::Key(ev) }
+            }
             Event::Preedit(p) => Input::Ime(ImeEvent::Preedit(p)),
             Event::Commit(t) => Input::Ime(ImeEvent::Commit(t)),
+            Event::Touch { id, pen, phase, x, y } => Input::Touch(TouchEvent {
+                id,
+                kind: if pen { PointerKind::Pen } else { PointerKind::Touch },
+                phase: match phase {
+                    Phase::Started => TouchPhase::Started,
+                    Phase::Moved => TouchPhase::Moved,
+                    Phase::Ended => TouchPhase::Ended,
+                    Phase::Cancelled => TouchPhase::Cancelled,
+                },
+                x,
+                y,
+            }),
         })
     }
 }
@@ -746,6 +848,7 @@ mod tests {
                     event: Event::Key {
                         key: Key::Named(NamedKey::Enter),
                         text: Some("\r".to_owned()),
+                        repeat: false,
                     },
                 },
                 Stamped {
@@ -753,6 +856,7 @@ mod tests {
                     event: Event::Key {
                         key: Key::Character("\"é\"".into()),
                         text: Some("\"é\"\\".to_owned()),
+                        repeat: true,
                     },
                 },
                 Stamped {
@@ -776,11 +880,23 @@ mod tests {
                 },
                 Stamped {
                     at: 0.037,
-                    event: Event::SecondaryDown,
+                    event: Event::ButtonDown(PointerButton::Secondary),
                 },
                 Stamped {
                     at: 0.038,
+                    event: Event::ButtonDown(PointerButton::Middle),
+                },
+                Stamped {
+                    at: 0.039,
+                    event: Event::ButtonDown(PointerButton::Other(3)),
+                },
+                Stamped {
+                    at: 0.040,
                     event: Event::Left,
+                },
+                Stamped {
+                    at: 0.041,
+                    event: Event::Blur,
                 },
             ],
         };
@@ -801,6 +917,7 @@ mod tests {
                 point: (5.0, 6.0),
                 delta: (0.0, LINE_SCROLL),
                 precise: false,
+                began: false,
                 ended: false,
             }
         );
@@ -813,6 +930,7 @@ mod tests {
                 point: (5.0, 6.0),
                 delta: (-2.0, 8.0),
                 precise: true,
+                began: false,
                 ended: true,
             }
         );

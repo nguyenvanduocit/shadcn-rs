@@ -1,0 +1,12 @@
+---
+source: crates/primitives/tests/blocks.rs
+expression: dump(&tree)
+---
+Window "w"
+  Group
+    SpinButton "Hours" value=9 in 0..=23 text="09"
+      Label "09"
+    SpinButton "Minutes" value=none in 0..=59 text="Blank"
+      Label "--"
+    SpinButton "Seconds" value=none in 0..=59 text="Blank"
+      Label "--"

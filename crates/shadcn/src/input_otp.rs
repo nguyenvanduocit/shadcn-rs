@@ -4,98 +4,30 @@
 //! each slot shows one character of the value. The slot the next character
 //! goes to is active, and shows a blinking caret while empty. The root keeps
 //! the code, its own (`default_value`) or the caller's (`model`, `v-model`).
+//! The behaviour (fill order, a paste spread over the slots, the pattern)
+//! is `primitives::input_otp`'s; this module draws it.
 
 use gui::Color;
 use gui::prelude::*;
-use gui::{
-    Bind, Div, FocusHandle, Icon, Key, KeyEvent, Model, NamedKey, Signal, Style, UseModel, component, div, icon,
-    provide, use_context, use_model,
-};
+use gui::{Bind, Div, Icon, Model, Style, component, div, icon, provide, use_model, watch};
+pub use primitives::input_otp::OtpPattern;
+use primitives::input_otp::{Otp, OtpConfig};
 
 use crate::focus::{StateLook, destructive_ring, focus_ring};
 use crate::part::{Part, PartProps};
 use crate::theme::{Colors, theme};
 
-/// Which characters a code takes (`vue-input-otp`'s `REGEXP_ONLY_*`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum InputOtpPattern {
-    /// Any printable character.
-    #[default]
-    Any,
-    Digits,
-    Chars,
-    DigitsAndChars,
-}
-
-impl InputOtpPattern {
-    fn accepts(self, c: char) -> bool {
-        match self {
-            Self::Any => !c.is_control(),
-            Self::Digits => c.is_ascii_digit(),
-            Self::Chars => c.is_ascii_alphabetic(),
-            Self::DigitsAndChars => c.is_ascii_alphanumeric(),
-        }
-    }
-}
-
 /// What [`input_otp`] is given.
 #[derive(Clone, PartialEq)]
 pub struct InputOtpProps {
     value: Bind<String>,
-    max_length: usize,
-    pattern: InputOtpPattern,
+    config: OtpConfig,
 }
 
 /// What the slots below an [`input_otp`] read.
 #[derive(Clone, Copy)]
 struct InputOtpContext {
-    value: UseModel<PartProps<InputOtpProps>, String>,
-    focus: FocusHandle,
-    props: Signal<PartProps<InputOtpProps>>,
-}
-
-impl InputOtpContext {
-    fn rules(self) -> (usize, InputOtpPattern) {
-        self.props.with_untracked(|p| (p.props.max_length, p.props.pattern))
-    }
-
-    /// Type, erase or paste; returns whether the key was the input's.
-    fn key(self, ev: &KeyEvent) -> bool {
-        match &ev.key {
-            Key::Named(NamedKey::Backspace) => {
-                self.value.update(|v| {
-                    v.pop();
-                });
-                true
-            }
-            Key::Character(c) if ev.modifiers.primary() && c.eq_ignore_ascii_case("v") => {
-                let pasted = gui::clipboard::paste().unwrap_or_default();
-                self.value.set(self.fit(&pasted, String::new()));
-                true
-            }
-            _ if ev.modifiers.primary() || ev.modifiers.control => false,
-            _ => match ev.text.as_deref() {
-                Some(typed) if typed.chars().all(|c| self.rules().1.accepts(c)) => {
-                    let v = self.value.get_untracked();
-                    self.value.set(self.fit(typed, v));
-                    true
-                }
-                _ => false,
-            },
-        }
-    }
-
-    /// `onto` with the characters of `typed` the pattern takes, up to the length.
-    fn fit(self, typed: &str, mut onto: String) -> String {
-        let (max_length, pattern) = self.rules();
-        for c in typed.chars().filter(|c| pattern.accepts(*c)) {
-            if onto.chars().count() >= max_length {
-                break;
-            }
-            onto.push(c);
-        }
-        onto
-    }
+    otp: Otp<PartProps<InputOtpProps>>,
 }
 
 /// The root (`<InputOTP>`): holds focus and takes the keys; its groups and
@@ -105,8 +37,7 @@ impl InputOtpContext {
 pub fn input_otp() -> Part<InputOtpProps> {
     let props = InputOtpProps {
         value: Bind::default(),
-        max_length: 6,
-        pattern: InputOtpPattern::Any,
+        config: OtpConfig::default(),
     };
     let root = div()
         .named("input-otp")
@@ -118,19 +49,13 @@ pub fn input_otp() -> Part<InputOtpProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = InputOtpContext {
-                value: use_model(props, |p| &p.props.value),
-                focus: FocusHandle::new(),
-                props,
-            };
-            provide(ctx);
-            move || {
-                props
-                    .with(|p| p.slot.0.clone())
-                    .track_focus(ctx.focus)
-                    .on_key_down(move |ev| ctx.key(ev))
-                    .into_element()
-            }
+            let otp = Otp::new(
+                use_model(props, |p: &PartProps<InputOtpProps>| &p.props.value),
+                props.with_untracked(|p| p.props.config),
+            );
+            watch(move || props.with(|p| p.props.config), move |c, _| otp.set_config(*c));
+            provide(InputOtpContext { otp });
+            move || otp.root(props.with(|p| p.slot.0.clone())).into_element()
         })
     })
 }
@@ -151,20 +76,32 @@ impl Part<InputOtpProps> {
 
     /// Call `f` with the code after each change (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<String>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 
     /// How many characters the code has (`maxlength`).
     #[must_use]
     pub fn max_length(self, max_length: usize) -> Self {
-        self.with_props(|p| p.max_length = max_length)
+        self.with_props(|p| p.config.max_length = max_length)
     }
 
     /// Which characters it takes (`pattern`).
     #[must_use]
-    pub fn pattern(self, pattern: InputOtpPattern) -> Self {
-        self.with_props(|p| p.pattern = pattern)
+    pub fn pattern(self, pattern: OtpPattern) -> Self {
+        self.with_props(|p| p.config.pattern = pattern)
+    }
+
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.config.availability = primitives::Availability::from_disabled(disabled))
+    }
+
+    /// The label naming it (`<Label for>`); without one it is named
+    /// "One-time code".
+    #[must_use]
+    pub fn label(self, label: primitives::label::Label) -> Self {
+        self.with_props(|p| p.config.label = Some(label))
     }
 }
 
@@ -209,23 +146,26 @@ pub fn input_otp_slot(index: usize) -> Part<OtpSlotProps> {
     Part::new(OtpSlotProps { index, invalid: false }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = use_context::<InputOtpContext>();
+            let ctx = primitives::context::use_root::<InputOtpContext>("input_otp_slot", "input_otp");
             move || {
                 let (slot, root) = props.with(|p| (p.props, p.slot.0.clone()));
                 let Some(ctx) = ctx else {
                     return root.into_element();
                 };
                 let t = theme();
-                let max_length = ctx.props.with(|p| p.props.max_length);
-                let (len, char) = ctx.value.with(|v| (v.chars().count(), v.chars().nth(slot.index)));
                 // The slot the next character goes to is active while the
-                // root has focus: bound, so focus renders nothing.
-                let next = slot.index == len.min(max_length.saturating_sub(1));
-                let focus = ctx.focus;
-                let active = move || next && focus.is_focused();
-                otp_slot_state(root, &t, active, slot.invalid)
-                    .when_some(char, |d, c| d.child(c.to_string()))
-                    .when(next && char.is_none(), |d| d.child(fake_caret(&t, active)))
+                // root has focus: bound, so focus renders nothing. An input
+                // method's composition shows there.
+                let next = ctx.otp.is_next(slot.index);
+                let char = ctx
+                    .otp
+                    .char_at(slot.index)
+                    .or_else(|| next.then(|| ctx.otp.composing()).flatten());
+                let empty = char.is_none();
+                let active = ctx.otp.active(slot.index);
+                otp_slot_state(root, &t, active.clone(), slot.invalid)
+                    .when_some(char, |d, c| d.child(c))
+                    .when(next && empty, |d| d.child(fake_caret(&t, active)))
                     .into_element()
             }
         })

@@ -1,5 +1,5 @@
 use gui::prelude::*;
-use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon};
+use gui::{Icon, KeyEvent, Modifiers, NamedKey, ScenarioError, Signal, div, icon};
 use shadcn::{
     ButtonSize, ButtonVariant, CommandItem, CommandSection, Part, TagsInputProps, button, command, command_list,
     popover, popover_content, popover_trigger, tags_input, tags_input_input, tags_input_item, tags_input_item_delete,
@@ -20,8 +20,8 @@ fn tags(model: Signal<Vec<String>>, placeholder: &str, invalid: bool) -> Part<Ta
         .child(tags_input_input().placeholder(placeholder))
 }
 
-fn tag_item(tag: &str) -> gui::Div {
-    tags_input_item()
+fn tag_item(tag: &str) -> Part<String> {
+    tags_input_item(tag)
         .key(gui::key_of(tag))
         .child(tags_input_item_text(tag.to_owned()))
         .child(tags_input_item_delete(tag))
@@ -46,12 +46,12 @@ pub fn render() -> Render {
         },
     );
     // `ListboxContent max-h-[300px] overflow-y-auto`: the options straight in the list.
-    let options = std::rc::Rc::new(vec![CommandSection::Items(
+    let options = std::sync::Arc::new(vec![CommandSection::Items(
         FRAMEWORKS.iter().map(|l| CommandItem::new(*l)).collect(),
     )]);
     Box::new(move || {
         let t = theme();
-        let list = command_list(std::rc::Rc::clone(&options), move |item, row| {
+        let list = command_list(std::sync::Arc::clone(&options), move |item, row| {
             let label = item.value.clone();
             let on = frameworks.with(|f| f.contains(&label));
             row.child(label).child(on.then(|| {
@@ -64,8 +64,8 @@ pub fn render() -> Render {
                     .child(icon(Icon::Check).text_color(t.muted_foreground))
             }))
         })
-        .on_select(move |item| {
-            let label = item.value.clone();
+        .on_select(move |item: CommandItem| {
+            let label = item.value;
             frameworks.update(|tags| {
                 if tags.contains(&label) {
                     tags.retain(|t| *t != label);
@@ -76,13 +76,15 @@ pub fn render() -> Render {
         })
         .max_h_px(300.0);
         // `@keydown.down="open = true"`; the other keys go on to the listbox.
-        let filter = tags_input_input().placeholder("Frameworks...").on_key_down(move |ev| {
-            let opens = !open.get_untracked() && ev.is(NamedKey::ArrowDown);
-            if opens {
-                open.set(true);
-            }
-            opens
-        });
+        let filter = tags_input_input()
+            .placeholder("Frameworks...")
+            .on_key_down(move |ev: KeyEvent| {
+                let opens = !open.get_untracked() && ev.is(NamedKey::ArrowDown);
+                if opens {
+                    open.set(true);
+                }
+                opens
+            });
         let with_listbox = popover().open(open).width(300.0).child(
             command()
                 .search(search)

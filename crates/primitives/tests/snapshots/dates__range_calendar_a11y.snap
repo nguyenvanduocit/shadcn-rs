@@ -1,0 +1,31 @@
+---
+source: crates/primitives/tests/dates.rs
+expression: dump(&tree)
+---
+Window "w"
+  Group "Event Date, February 2024"
+    Application
+      Row
+        GridCell
+          Button "Sunday, February 4, 2024" toggled=Some(False)
+            Label "4"
+        GridCell selected
+          Button "Monday, February 5, 2024" toggled=Some(True)
+            Label "5"
+        GridCell selected
+          Button "Tuesday, February 6, 2024" toggled=Some(True)
+            Label "6"
+        GridCell selected
+          Button "Wednesday, February 7, 2024" toggled=Some(True)
+            Label "7"
+        GridCell
+          Button "Thursday, February 8, 2024" toggled=Some(False)
+            Label "8"
+        GridCell
+          Button "Friday, February 9, 2024" toggled=Some(False)
+            Label "9"
+        GridCell
+          Button "Saturday, February 10, 2024" toggled=Some(False)
+            Label "10"
+    Heading level=2
+      Label "Event Date, February 2024"

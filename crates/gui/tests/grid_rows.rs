@@ -81,23 +81,19 @@ struct Desc {
     children: Vec<Desc>,
 }
 
-thread_local! {
-    /// What grids generate besides the pass's case: 1 out-of-flow cells,
-    /// 2 baseline alignment as well.
-    static WILD: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
-fn wild() -> bool {
-    WILD.with(std::cell::Cell::get) >= 1
-}
-
-fn baseline() -> bool {
-    WILD.with(std::cell::Cell::get) >= 2
-}
-
-struct Rng(u64);
+/// A generator, with what grids generate besides the pass's case: 1
+/// out-of-flow cells, 2 baseline alignment as well.
+struct Rng(u64, u8);
 
 impl Rng {
+    fn wild(&self) -> bool {
+        self.1 >= 1
+    }
+
+    fn baseline(&self) -> bool {
+        self.1 >= 2
+    }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -289,8 +285,8 @@ fn cell_style(r: &mut Rng) -> Style {
                 end: GridPlacement::Span(2),
             }
         }
-        1 if wild() => s.position = Position::Absolute,
-        2 if baseline() => s.align_self = Some(AlignItems::BASELINE),
+        1 if r.wild() => s.position = Position::Absolute,
+        2 if r.baseline() => s.align_self = Some(AlignItems::BASELINE),
         3 => s.size.width = Dimension::fit_content(),
         4 | 5 => s.display = Display::None,
         6 => {
@@ -379,7 +375,7 @@ fn grid_style(r: &mut Rng, cells: usize) -> Style {
         0 => s.gap.width = LengthPercentage::percent(0.02),
         1 => s.grid_template_rows = vec![single(fr0(1.0))],
         2 => s.direction = taffy::Direction::Rtl,
-        3 if baseline() => s.align_items = AlignItems::BASELINE,
+        3 if r.baseline() => s.align_items = AlignItems::BASELINE,
         4 => s.grid_auto_flow = GridAutoFlow::RowDense,
         5 => s.grid_auto_rows = vec![TrackSizingFunction::from_length(30.0)],
         6 => s.position = Position::Relative,
@@ -413,7 +409,7 @@ fn cell(r: &mut Rng, depth: u32) -> Desc {
                     children: Vec::new(),
                 })
                 .collect();
-            if r.below(10) == 0 && wild() {
+            if r.below(10) == 0 && r.wild() {
                 children.push(Desc {
                     style: Style {
                         position: Position::Absolute,
@@ -606,8 +602,8 @@ fn space(r: &mut Rng) -> Size<AvailableSpace> {
     }
 }
 
-fn run(seed: u64, schedule: Schedule, steps: usize) -> Option<String> {
-    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+fn run(seed: u64, schedule: Schedule, steps: usize, wild: u8) -> Option<String> {
+    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1, wild);
     let mut desc = table(&mut r);
     let mut space = space(&mut r);
     let mut ours = build_ours(&desc);
@@ -695,15 +691,10 @@ const SCHEDULES: [Schedule; 3] = [
 ];
 
 /// Every seed under every schedule, `steps` changes each, with or without
-/// [`wild`] cells; the runs that differ, reported.
+/// wild cells ([`Rng::wild`]); the runs that differ, reported.
 fn all(seeds: u64, steps: usize, wild: u8) {
     let failed: Vec<String> = (0..seeds)
-        .flat_map(|seed| {
-            SCHEDULES.iter().filter_map(move |&s| {
-                WILD.with(|w| w.set(wild));
-                run(seed, s, steps)
-            })
-        })
+        .flat_map(|seed| SCHEDULES.iter().filter_map(move |&s| run(seed, s, steps, wild)))
         .collect();
     assert!(
         failed.is_empty(),

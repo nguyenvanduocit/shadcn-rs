@@ -131,16 +131,54 @@ fn curved_sdf(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, k: f32) -> f32 {
     return shape_sdf(p, rect, radii, k);
 }
 
-// How much of the pixel at window point `p` a path-and-curve clip entry
-// keeps: four vec4s, its rectangle, radii, the map from the window into
-// its space (a, b, c, d) and (e, f, its scale, its corners' curve).
+// Vec4s a clip entry takes (`gpu::clips::ENTRY`): its rectangle, its
+// radii, the map from the space it is read in (the canvas, or a path's or
+// curve glyph's target) into its own (a, b, c, d), (e, f, its scale, its
+// corners' curve), then (the next clip of its effective chain, 0, 0, 0).
+// Each shader walks an entry's chain to its end (0); a chain is an
+// ancestor list, so the walk ends, and the table's length bounds it.
+const PCLIP: u32 = 5u;
+
+// Point `p` through an entry's map (a, b, c, d) and (e, f).
+fn entry_point(m: vec4<f32>, t: vec4<f32>, p: vec2<f32>) -> vec2<f32> {
+    return mat2x2<f32>(m.xy, m.zw) * p + t.xy;
+}
+
+// How much of the pixel at point `p` (the space the entry is read in) a
+// clip entry keeps.
 fn clip_entry_cov(rect: vec4<f32>, radii: vec4<f32>, m: vec4<f32>, t: vec4<f32>, p: vec2<f32>) -> f32 {
-    let q = vec2<f32>(m.x * p.x + m.z * p.y + t.x, m.y * p.x + m.w * p.y + t.y);
+    let q = entry_point(m, t, p);
     if (t.z == 1.0 && m.y == 0.0 && m.z == 0.0) {
         return shape_cov(q, rect, radii, t.w);
     }
     // In a scaled or turned space: by distance, one device pixel wide.
     return saturate(0.5 - curved_sdf(q, rect, radii, t.w) * t.z);
+}
+
+// Whether the quad of corners `a`, `b`, `c`, `d` (the space the entry is
+// read in) lies wholly where the entry keeps every pixel: inside its
+// rectangle less its corners and half a device pixel of its edges. A
+// draw wholly so inside each clip of its chain tests none per fragment.
+fn entry_holds(
+    rect: vec4<f32>,
+    radii: vec4<f32>,
+    m: vec4<f32>,
+    t: vec4<f32>,
+    a: vec2<f32>,
+    b: vec2<f32>,
+    c: vec2<f32>,
+    d: vec2<f32>,
+) -> bool {
+    let r = max(max(radii.x, radii.y), max(radii.z, radii.w)) + 0.5 / max(t.z, 1e-6);
+    let lo = rect.xy + vec2<f32>(r);
+    let hi = rect.xy + rect.zw - vec2<f32>(r);
+    let qa = entry_point(m, t, a);
+    let qb = entry_point(m, t, b);
+    let qc = entry_point(m, t, c);
+    let qd = entry_point(m, t, d);
+    let least = min(min(qa, qb), min(qc, qd));
+    let most = max(max(qa, qb), max(qc, qd));
+    return all(least >= lo) && all(most <= hi);
 }
 
 fn premul(c: vec4<f32>) -> vec4<f32> {

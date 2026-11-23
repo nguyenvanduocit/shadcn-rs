@@ -85,23 +85,19 @@ struct Desc {
     children: Vec<Desc>,
 }
 
-thread_local! {
-    /// What rows generate besides the pass's case: 1 absolute items, 2
-    /// baseline alignment as well.
-    static WILD: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
-}
-
-fn wild() -> bool {
-    WILD.with(std::cell::Cell::get) >= 1
-}
-
-fn baseline() -> bool {
-    WILD.with(std::cell::Cell::get) >= 2
-}
-
-struct Rng(u64);
+/// A generator, with what rows generate besides the pass's case: 1
+/// absolute items, 2 baseline alignment as well.
+struct Rng(u64, u8);
 
 impl Rng {
+    fn wild(&self) -> bool {
+        self.1 >= 1
+    }
+
+    fn baseline(&self) -> bool {
+        self.1 >= 2
+    }
+
     fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
@@ -261,8 +257,8 @@ fn item_style(r: &mut Rng) -> Style {
     match r.below(40) {
         0 => s.size.height = Dimension::max_content(),
         1 => s.size.width = Dimension::min_content(),
-        2 if wild() => s.position = Position::Absolute,
-        3 if baseline() => s.align_self = Some(AlignItems::BASELINE),
+        2 if r.wild() => s.position = Position::Absolute,
+        3 if r.baseline() => s.align_self = Some(AlignItems::BASELINE),
         4 | 5 => s.display = Display::None,
         _ => {}
     }
@@ -379,7 +375,7 @@ fn row_style(r: &mut Rng) -> Style {
         0 => s.flex_wrap = FlexWrap::Wrap,
         1 => s.flex_direction = FlexDirection::Column,
         2 => s.flex_wrap = FlexWrap::WrapReverse,
-        3 if baseline() => s.align_items = AlignItems::BASELINE,
+        3 if r.baseline() => s.align_items = AlignItems::BASELINE,
         4 => s.position = Position::Relative,
         _ => {}
     }
@@ -458,7 +454,7 @@ fn row(r: &mut Rng, depth: u32) -> Desc {
         _ => 1 + r.below(6),
     };
     let mut children: Vec<Desc> = (0..n).map(|_| item(r, depth)).collect();
-    if r.below(10) == 0 && wild() {
+    if r.below(10) == 0 && r.wild() {
         children.push(Desc {
             style: Style {
                 position: Position::Absolute,
@@ -641,8 +637,8 @@ fn space(r: &mut Rng) -> Size<AvailableSpace> {
     }
 }
 
-fn run(seed: u64, schedule: Schedule, steps: usize) -> Option<String> {
-    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+fn run(seed: u64, schedule: Schedule, steps: usize, wild: u8) -> Option<String> {
+    let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1, wild);
     let mut desc = table(&mut r);
     let mut space = space(&mut r);
     let mut ours = build_ours(&desc);
@@ -715,15 +711,10 @@ const SCHEDULES: [Schedule; 3] = [
 ];
 
 /// Every seed under every schedule, `steps` changes each, with or without
-/// [`wild`] cells; the runs that differ, reported.
+/// wild cells ([`Rng::wild`]); the runs that differ, reported.
 fn all(seeds: u64, steps: usize, wild: u8) {
     let failed: Vec<String> = (0..seeds)
-        .flat_map(|seed| {
-            SCHEDULES.iter().filter_map(move |&s| {
-                WILD.with(|w| w.set(wild));
-                run(seed, s, steps)
-            })
-        })
+        .flat_map(|seed| SCHEDULES.iter().filter_map(move |&s| run(seed, s, steps, wild)))
         .collect();
     assert!(
         failed.is_empty(),

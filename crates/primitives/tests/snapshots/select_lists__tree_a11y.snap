@@ -1,0 +1,10 @@
+---
+source: crates/primitives/tests/select_lists.rs
+expression: a11y(&s)
+---
+Window "w"
+  Tree multiselectable
+    TreeItem level=1 1/2 expanded=false selected=true
+      Label "docs"
+    TreeItem level=1 2/2 selected=false
+      Label "readme"

@@ -595,7 +595,8 @@ mod plots {
                             .y(-1.0, 1.0)
                             .mark(line(s))
                             .mark(scatter(dots).radius(4.0))
-                            .on_hover(12.0, move |h| hovered.set(h))
+                            .hover_radius(12.0)
+                            .on_hover(move |h| hovered.set(h))
                             .build()
                             .width(400.0)
                             .height(200.0),
@@ -854,4 +855,92 @@ fn a_user_chunk_reads_back_what_its_compute_wrote() {
     // Unchanged, the chunk computes nothing and reads nothing again.
     shoot(&mut gpu, &item(9, true));
     assert!(!gpu.raster_pending(), "no new read");
+}
+
+/// A picture whose data source is made afresh at every draw, from the
+/// same values: a series, a grid, or bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Afresh {
+    Grid,
+    Bytes,
+    Series,
+}
+
+impl super::Picture for Afresh {
+    fn draw(&self, area: Bounds, _scale: f32, key: u64, out: &mut Vec<Item>) {
+        let item = match self {
+            Self::Series => {
+                let mut s = SeriesState::new(None, false);
+                s.append(&[0, 1, 2, 3], &[0.0, 0.5, 0.25, 1.0]);
+                DataItem::new::<Scatter>(
+                    key,
+                    area,
+                    area,
+                    &ScatterParams {
+                        view: GOLDEN_VIEW,
+                        color: Color::BLACK,
+                        radius: 2.0,
+                    }
+                    .words(),
+                    vec![Source::Series(s.snapshot())],
+                )
+            }
+            Self::Grid => DataItem::new::<super::Heatmap>(
+                key,
+                area,
+                area,
+                &super::HeatmapParams {
+                    low: Color::WHITE,
+                    high: Color::BLACK,
+                    min: 0.0,
+                    max: 1.0,
+                }
+                .words(),
+                vec![Source::Grid(super::GridSnapshot::new(2, 2, vec![0.0, 0.25, 0.5, 1.0]))],
+            ),
+            Self::Bytes => {
+                let boxes: [f32; crate::canvas::boxes::BOX] = [0.0, 0.0, 10.0, 10.0, 0.0, 0.0, 0.0, 1.0];
+                DataItem::new::<crate::canvas::boxes::Boxes>(
+                    key,
+                    area,
+                    area,
+                    &crate::canvas::boxes::words(1),
+                    vec![Source::Bytes(super::Bytes::new(
+                        bytemuck::cast_slice::<f32, u8>(&boxes).to_vec(),
+                    ))],
+                )
+            }
+        };
+        out.push(Item::Data(Arc::new(item)));
+    }
+}
+
+/// The cold check compares data sources by what they hold: a picture
+/// that makes its series, grid or bytes afresh each draw paints the same
+/// cold.
+#[test]
+fn data_made_afresh_each_draw_passes_the_cold_check() {
+    use crate::app::Scenario;
+    use crate::element::{IntoElement, div, drawing};
+    use crate::prelude::*;
+    for what in [Afresh::Series, Afresh::Grid, Afresh::Bytes] {
+        let tick = crate::reactive::Signal::new(0_u32);
+        let mut sc = Scenario::measuring(
+            move || {
+                div()
+                    .size(pct(100.0))
+                    .child(format!("frame {}", tick.get()))
+                    .child(drawing(move || super::Drawing::new(what)).width(40.0).height(40.0))
+                    .into_element()
+            },
+            100,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        sc.check_cold(true);
+        sc.settle().expect("settled");
+        sc.act("tick", move || tick.set(1));
+        sc.frame("again").expect("the cold frame paints the same data");
+    }
 }

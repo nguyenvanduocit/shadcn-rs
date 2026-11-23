@@ -5,7 +5,7 @@
 //   - the docs app's own data, `docs --export` (crates/shadcn/examples/docs/docs/export.rs): every page in the sidebar's
 //     order, its title, lead and notes, each demo's code as the app's Code tab cuts it, and the last verdicts;
 //   - each demo's interaction, an animated WebP motion.py cuts from its page's script (`docs --shots`);
-//   - each other demo's preview, the frame the verdict rendered (`<page>/<Demo>/ours.png` under /tmp/shadcn-verdict[-dark]/all,
+//   - each other demo's preview, the frame the verdict rendered (`<page>/<Demo>/ours.png` under /tmp/shadcn-verdict/vega/all[-dark],
 //     from `crates/shadcn/verdict/run.sh` and `run.sh --dark`);
 //   - README.md, crates/shadcn/README.md and docs/adr/*.md, as Markdown.
 //
@@ -27,7 +27,7 @@ const cache = join(here, ".cache");
 const REPO = "https://github.com/nguyenvanduocit/shadcn-rs";
 const BLOB = `${REPO}/blob/master`;
 const VUE_REGISTRY = "https://github.com/unovue/shadcn-vue/tree/dev/apps/v4/registry/new-york-v4";
-const VERDICT = { light: "/tmp/shadcn-verdict/all", dark: "/tmp/shadcn-verdict-dark/all" };
+const VERDICT = { light: "/tmp/shadcn-verdict/vega/all", dark: "/tmp/shadcn-verdict/vega/all-dark" };
 
 // --- Data -------------------------------------------------------------------------------------------------------
 

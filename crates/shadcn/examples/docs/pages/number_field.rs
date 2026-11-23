@@ -55,7 +55,7 @@ pub fn render() -> Render {
                         number_field().default_value(5.0).format(NumberFormat {
                             sign: SignDisplay::ExceptZero,
                             min_fraction: 1,
-                            ..plain
+                            ..plain.clone()
                         }),
                     ),
                 ))
@@ -66,7 +66,7 @@ pub fn render() -> Render {
                         number_field()
                             .default_value(0.05)
                             .step(0.01)
-                            .format(NumberFormat::PERCENT),
+                            .format(NumberFormat::percent()),
                     ),
                 ))
                 .child(section(

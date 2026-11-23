@@ -301,7 +301,7 @@ impl Suggestions {
             input_group_textarea(&self.draft)
                 .placeholder("Ask the agent to change your code...")
                 .padding(12.0)
-                .on_submit(move || {
+                .on_submit(move |()| {
                     if !enter.1.is_empty() {
                         enter.0.send(&enter.1);
                     }
@@ -1008,7 +1008,7 @@ impl Agent {
                 .min_height(56.0)
                 .on_submit({
                     let send = send.clone();
-                    move || send.submit()
+                    move |()| send.submit()
                 }),
         )
         .addon(

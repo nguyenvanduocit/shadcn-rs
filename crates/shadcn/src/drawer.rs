@@ -2,44 +2,157 @@
 //! dismissed by swiping it back toward that edge, by Escape, or by a press on
 //! the dimmed page. From the bottom edge it carries a grab handle.
 //!
-//! As vaul builds it on Reka's `DialogRoot`, [`drawer`] is a
-//! [`dialog`](crate::dialog) root: it opens and closes through
-//! [`drawer_trigger`] and [`drawer_close`] (or the dialog's), and keeps its
-//! open state the same way. Its content keeps the swipe in progress.
-
-use std::cell::Cell;
+//! The behaviour is `primitives::drawer`'s (reka's `Drawer`): every change
+//! asks the caller first, a swipe follows the pointer and closes past 40 px
+//! or faster than 0.3 px/ms, closing gives focus back to the trigger. It
+//! opens and closes through [`drawer_trigger`] and [`drawer_close`] (or the
+//! dialog's), and keeps its open state as a dialog does. Snap points
+//! (`snap_points`, a two-way `snap_point`), `sequential_snap` and
+//! `on_open_complete` are vaul's. The content follows the swipe and its
+//! snap point, and the overlay fades as the swipe goes. This module draws
+//! it.
 
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{Animation, Div, DragEvent, DragPhase, Easing, Element, Signal, Text, component, div, text};
+use gui::{
+    Animation, Bind, Div, Easing, Element, IntoElement, Model, Signal, component, div, provide, text, use_model,
+};
+use primitives::context::use_root;
+use primitives::drawer::{ChangeReason, Drawer, DrawerOptions};
+use primitives::presence::Presence;
+
+pub use primitives::drawer::{DrawerModal, SnapPoint, SwipeDirection as DrawerDirection};
 
 use crate::dialog::{
-    DialogContext, DialogProps, ModalLook, dialog_close, dialog_description, dialog_trigger, modal_layer, modal_root,
-    return_focus,
+    Modal, ModalLook, ModalText, dialog_close, dialog_description, dialog_trigger, modal_layer_with, modal_title,
 };
-use crate::part::Part;
+use crate::part::{Part, PartProps};
 use crate::sheet::slide;
 use crate::theme::theme;
 
-/// How far a swipe must carry the drawer toward its edge to dismiss it
-/// (Reka's `DEFAULT_SWIPE_THRESHOLD`).
-const SWIPE_THRESHOLD: f32 = 40.0;
+/// `duration-500`: how long the drawer and its overlay move.
+const DURATION_MS: f32 = 500.0;
 
-/// The direction a drawer is swiped to dismiss it, which is also the edge it
-/// sits on (`swipe-direction`; `down` by default, at the bottom edge).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum DrawerDirection {
-    Up,
-    #[default]
-    Down,
-    Left,
-    Right,
+/// What [`drawer`] is given.
+#[derive(Clone, PartialEq, Default)]
+pub struct DrawerProps {
+    open: Bind<bool>,
+    snap: Bind<Option<SnapPoint>>,
+    snap_points: Vec<SnapPoint>,
+    sequential_snap: bool,
+    modal: DrawerModal,
+    veto: Option<gui::Callback<(bool, ChangeReason), gui::Dismiss>>,
+    settled: Option<gui::Callback<bool>>,
+}
+
+/// The drawer of a [`drawer`] root.
+type DrawerState = Drawer<PartProps<DrawerProps>>;
+
+/// What the content part reads from its root: the drawer, and the edge the
+/// content tells it it sits on.
+#[derive(Clone, Copy)]
+struct DrawerContext {
+    drawer: DrawerState,
+    direction: Signal<DrawerDirection>,
 }
 
 /// The drawer's root: give it a [`drawer_trigger`] and a [`drawer_content`].
 #[must_use]
-pub fn drawer() -> Part<DialogProps> {
-    modal_root(div().named("drawer"))
+pub fn drawer() -> Part<DrawerProps> {
+    Part::new(DrawerProps::default(), div().named("drawer"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let direction = Signal::labeled("drawer direction", DrawerDirection::Down);
+            let d = Drawer::new(
+                use_model(props, |p: &PartProps<DrawerProps>| &p.props.open),
+                Some(use_model(props, |p: &PartProps<DrawerProps>| &p.props.snap)),
+                move || {
+                    let direction = direction.get();
+                    props.with(|p| DrawerOptions {
+                        modal: p.props.modal,
+                        direction,
+                        snap_points: p.props.snap_points.clone(),
+                        sequential_snap: p.props.sequential_snap,
+                        veto: p.props.veto.clone(),
+                        on_settled: p.props.settled.clone(),
+                        ..DrawerOptions::default()
+                    })
+                },
+            );
+            provide(DrawerContext { drawer: d, direction });
+            provide(Modal::Drawer(d));
+            move || props.with(|p| p.slot.0.clone()).into_element()
+        })
+    })
+}
+
+impl Part<DrawerProps> {
+    /// Open or not, kept by the caller (`v-model:open`).
+    #[must_use]
+    pub fn open(self, open: impl Into<Model<bool>>) -> Self {
+        self.with_props(|p| p.open = p.open.clone().with_model(open))
+    }
+
+    /// Open from the start, when no model is given (`default-open`).
+    #[must_use]
+    pub fn default_open(self, open: bool) -> Self {
+        self.with_props(|p| p.open = p.open.clone().with_default(open))
+    }
+
+    /// Call `f` each time it opens or closes (`@update:open`).
+    #[must_use]
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
+        self.with_props(|p| p.open = p.open.clone().on_change(f))
+    }
+
+    /// Call `f` once it has finished opening (`true`) or closing, its
+    /// animation run (`@update:open-complete`).
+    #[must_use]
+    pub fn on_open_complete(self, f: impl Into<gui::Callback<bool>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.settled = Some(f))
+    }
+
+    /// How modal it is (`:modal`; [`DrawerModal::On`] by default).
+    #[must_use]
+    pub fn modal(self, modal: DrawerModal) -> Self {
+        self.with_props(|p| p.modal = modal)
+    }
+
+    /// The heights it rests at (`:snap-points`): fractions of the window's
+    /// height, pixels, or rems.
+    #[must_use]
+    pub fn snap_points(self, points: impl IntoIterator<Item = SnapPoint>) -> Self {
+        self.with_props(|p| p.snap_points = points.into_iter().collect())
+    }
+
+    /// The snap point it rests at, kept by the caller (`v-model:snap-point`;
+    /// `None`: fully open).
+    #[must_use]
+    pub fn snap_point(self, point: impl Into<Model<Option<SnapPoint>>>) -> Self {
+        self.with_props(|p| p.snap = p.snap.clone().with_model(point))
+    }
+
+    /// The snap point it rests at first, when no model is given
+    /// (`default-snap-point`).
+    #[must_use]
+    pub fn default_snap_point(self, point: Option<SnapPoint>) -> Self {
+        self.with_props(|p| p.snap = p.snap.clone().with_default(point))
+    }
+
+    /// Let go, it moves one snap point at most (`snap-to-sequential-points`).
+    #[must_use]
+    pub fn sequential_snap(self, sequential: bool) -> Self {
+        self.with_props(|p| p.sequential_snap = sequential)
+    }
+
+    /// Answer each request to open or close, with its reason
+    /// (`@update:open` with `details.cancel()`).
+    #[must_use]
+    pub fn on_request(self, f: impl Into<gui::Callback<(bool, ChangeReason), gui::Dismiss>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.veto = Some(f))
+    }
 }
 
 /// Make `trigger` open the drawer when pressed (`DrawerTrigger as-child`).
@@ -59,22 +172,21 @@ pub fn drawer_close(close: impl Into<Div>) -> Part<()> {
 }
 
 /// What [`drawer_content`] is given: the edge it sits on and is swiped
-/// toward (vaul's `direction`, given to the content, the one part that reads it).
+/// toward, which it tells its root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct DrawerContentProps {
     direction: DrawerDirection,
 }
 
 /// The drawer on the edge of `direction` (`DrawerContent`; `Down`, at the
-/// bottom edge with a grab handle, is vaul's default); style and fill it as
-/// a `Div`. Dragged toward its edge it follows the pointer, and let go past
-/// [`SWIPE_THRESHOLD`] it closes.
+/// bottom edge with a grab handle, is the default); style and fill it as a
+/// `Div`. Dragged toward its edge it follows the pointer, and with snap
+/// points it rests at the active one.
 #[must_use]
 pub fn drawer_content(direction: DrawerDirection) -> Part<DrawerContentProps> {
     let t = theme();
     let root = div()
         .named("drawer-content")
-        .role(gui::Role::Dialog)
         .background(t.background)
         .position(Position::Absolute)
         .display(Display::Flex)
@@ -82,92 +194,84 @@ pub fn drawer_content(direction: DrawerDirection) -> Part<DrawerContentProps> {
         .height(Length::Auto)
         // `duration-500 ease-[cubic-bezier(0.32,0.72,0,1)]`.
         .transition(Properties::TRANSFORM)
-        .ease(Easing::CubicBezier(0.32, 0.72, 0.0, 1.0))
-        .when(direction == DrawerDirection::Down, |d| d.child(drawer_handle()));
+        .ease(Easing::CubicBezier(0.32, 0.72, 0.0, 1.0));
     Part::new(DrawerContentProps { direction }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let dialog = DialogContext::find();
-            // Pixels the drawer has been dragged toward its edge, and where the drag started.
-            let swipe = Signal::labeled("drawer-swipe", 0.0_f32);
-            let origin = std::rc::Rc::new(Cell::new((0.0_f32, 0.0_f32)));
-            if let Some(d) = dialog {
-                return_focus(move || d.is_open(), true, Some(d.focus));
-                // Each opening starts unswiped.
-                gui::watch(
-                    move || d.is_open(),
-                    move |open, _| {
-                        if *open {
-                            swipe.set(0.0);
-                        }
-                    },
-                );
+            let root = use_root::<DrawerContext>("drawer_content", "drawer");
+            if let Some(r) = root {
+                // The edge is the root's: the content tells it, now and as
+                // it changes, from an effect (setup, as a render, writes
+                // nothing it did not make).
+                gui::Effect::new(move || r.direction.set(props.with(|p| p.props.direction)));
             }
             move || {
-                let Some(d) = dialog else {
+                let Some(DrawerContext { drawer: d, .. }) = root else {
                     return Element::Empty;
                 };
-                if !d.is_open() {
+                let presence = d.presence();
+                if presence == Presence::Gone {
                     return Element::Empty;
                 }
                 let (direction, root) = props.with(|p| (p.props.direction, p.slot.0.clone()));
-                let origin = std::rc::Rc::clone(&origin);
-                let dragged = move |e: &DragEvent| match e.phase {
-                    DragPhase::Start => {
-                        origin.set((e.x, e.y));
-                        swipe.set(0.0);
-                    }
-                    DragPhase::Move => {
-                        let (x, y) = origin.get();
-                        let toward_edge = match direction {
-                            DrawerDirection::Up => y - e.y,
-                            DrawerDirection::Down => e.y - y,
-                            DrawerDirection::Left => x - e.x,
-                            DrawerDirection::Right => e.x - x,
-                        };
-                        swipe.set(toward_edge.max(0.0));
-                    }
-                    DragPhase::End => {
-                        if swipe.get_untracked() >= SWIPE_THRESHOLD {
-                            d.set_open(false);
-                        }
-                        swipe.set(0.0);
-                    }
+                let content = d.content(placed(root, direction, d));
+                let mut content = content.into_element();
+                if direction == DrawerDirection::Down
+                    && let Some(children) = content.children_mut()
+                {
+                    children.insert(0, d.handle(drawer_handle()).into_element());
+                }
+                // `DrawerOverlay`: the dialog's scrim, fading over 500ms,
+                // and with the swipe (`1 - --drawer-swipe-progress`).
+                let look = ModalLook {
+                    centred: false,
+                    overlay_ms: Some(DURATION_MS),
+                    close_button: false,
                 };
-                let content = placed(root, direction, swipe.get()).on_drag(dragged);
-                // `DrawerOverlay`: the dialog's scrim, fading over 500ms.
-                modal_layer(
-                    d,
-                    ModalLook {
-                        centred: false,
-                        overlay_ms: Some(500.0),
-                        dismiss_outside: true,
-                        close_button: false,
-                    },
+                modal_layer_with(
+                    presence,
+                    d.has_overlay(),
+                    look,
                     content,
+                    |frame| d.viewport(frame),
+                    move |o| o.opacity(move || 1.0 - d.progress()).duration_ms(move || duration(d)),
                 )
             }
         })
     })
 }
 
-/// `root` on the edge of `direction`, `swipe` pixels toward it.
-fn placed(root: Div, direction: DrawerDirection, swipe: f32) -> Div {
-    // Dragged toward its edge it moves with the pointer
-    // (`--drawer-swipe-movement-*`); let go short of dismissing, it eases back.
-    let (along, off) = match direction {
-        DrawerDirection::Up => ((0.0, -swipe), (Calc::default(), Calc::fraction(-1.0))),
-        DrawerDirection::Down => ((0.0, swipe), (Calc::default(), Calc::fraction(1.0))),
-        DrawerDirection::Right => ((swipe, 0.0), (Calc::fraction(1.0), Calc::default())),
-        DrawerDirection::Left => ((-swipe, 0.0), (Calc::fraction(-1.0), Calc::default())),
+/// How long the drawer and its overlay move: nothing while dragged (the
+/// pointer leads, `data-swiping:duration-0`), the release scalar's share of
+/// 500 ms as a flung drawer finishes (`--drawer-swipe-strength`).
+fn duration<P>(d: Drawer<P>) -> f32 {
+    if d.dragging() {
+        0.0
+    } else if d.swiped() {
+        DURATION_MS * d.release_scalar().unwrap_or(1.0)
+    } else {
+        DURATION_MS
+    }
+}
+
+/// `root` on the edge of `direction`, moved by `d`'s snap point and swipe.
+fn placed<P>(root: Div, direction: DrawerDirection, d: Drawer<P>) -> Div {
+    let off = match direction {
+        DrawerDirection::Up => (Calc::default(), Calc::fraction(-1.0)),
+        DrawerDirection::Down => (Calc::default(), Calc::fraction(1.0)),
+        DrawerDirection::Right => (Calc::fraction(1.0), Calc::default()),
+        DrawerDirection::Left => (Calc::fraction(-1.0), Calc::default()),
     };
-    // `slide-in-from-bottom` and its siblings; `data-swiping:duration-0`.
+    let vertical = direction.vertical();
+    // Dragged it moves with the pointer (`--drawer-swipe-movement-*`) from
+    // its snap point (`--drawer-snap-point-offset`); let go short of
+    // dismissing, it eases back. Bound to the node: a move renders nothing.
     let base = root
         .animation(slide(Animation::enter(), off))
         .exit_animation(slide(Animation::exit(), off))
-        .duration_ms(if swipe > 0.0 { 0.0 } else { 500.0 })
-        .translate_x(Calc::px(along.0))
-        .translate_y(Calc::px(along.1));
+        .duration_ms(move || duration(d))
+        .translate_x(move || Calc::px(d.offset().0 + if vertical { 0.0 } else { d.snap_offset() }))
+        .translate_y(move || Calc::px(d.offset().1 + if vertical { d.snap_offset() } else { 0.0 }));
     let mut placed = match direction {
         DrawerDirection::Up => base
             .left(0.0)
@@ -221,16 +325,18 @@ pub fn drawer_footer() -> Div {
         .padding(16.0)
 }
 
-#[must_use]
-pub fn drawer_title(title: impl Into<String>) -> Text {
+/// The drawer's title, which names it to a screen reader.
+pub fn drawer_title(title: impl Into<String>) -> ModalText {
     let t = theme();
-    text(title)
-        .named("drawer-title")
-        .text_color(t.foreground)
-        .font_weight(600)
+    modal_title(
+        text(title)
+            .named("drawer-title")
+            .text_color(t.foreground)
+            .font_weight(600),
+    )
 }
 
-#[must_use]
-pub fn drawer_description(description: impl Into<String>) -> Text {
+/// The drawer's description, which describes it to a screen reader.
+pub fn drawer_description(description: impl Into<String>) -> ModalText {
     dialog_description(description).named("drawer-description")
 }

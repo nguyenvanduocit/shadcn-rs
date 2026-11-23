@@ -29,6 +29,10 @@ pub struct Placement {
     /// the middle of the edge nearest the anchor for a centred layer, the
     /// edge's start or end for one aligned there.
     pub origin: (f32, f32),
+    /// The layer's own box in the window, where it went after flipping and
+    /// being kept on screen: what an arrow is placed on (floating-ui's
+    /// `rects.floating` and its coordinates).
+    pub bounds: Bounds,
 }
 
 /// Space kept between a placed layer and the window edge.
@@ -173,12 +177,19 @@ pub(crate) fn placed(
         Side::Top | Side::Bottom => (across_x, here),
         Side::Left | Side::Right => (here, across_y),
     };
+    let (x, y) = position(placement, Some(anchor), size, viewport);
     let mut placed = Placement {
         side,
         align,
         available,
         anchor,
         origin: (0.0, 0.0),
+        bounds: Bounds {
+            x,
+            y,
+            width: size.0,
+            height: size.1,
+        },
     };
     placed.origin = placed.facing(size.0, size.1);
     Some(placed)
@@ -221,17 +232,42 @@ pub(crate) struct Over {
 /// Place a layer of `size` over `anchor` so `part` (its box from the
 /// layer's top-left corner) lies on `anchor_part`, as reka's
 /// `SelectItemAlignedPosition` does.
-pub(crate) fn over(anchor: Bounds, anchor_part: Bounds, part: Bounds, size: (f32, f32), viewport: Bounds) -> Over {
-    let left = anchor_part.x - part.x;
-    let min_width = anchor.right() - left;
+pub(crate) fn over(
+    anchor: Bounds,
+    anchor_part: Bounds,
+    part: Bounds,
+    size: (f32, f32),
+    viewport: Bounds,
+    direction: crate::Direction,
+    min_height: f32,
+) -> Over {
+    // Left to right the left edges line up and the layer reaches the
+    // anchor's right edge; right to left, mirrored (`SelectItemAlignedPosition.vue:68-95`).
+    let (left, min_width) = if direction == crate::Direction::Rtl {
+        let right = anchor_part.right() + (size.0 - part.right());
+        let min_width = right - anchor.x;
+        (right - size.0.max(min_width), min_width)
+    } else {
+        let left = anchor_part.x - part.x;
+        (left, anchor.right() - left)
+    };
     let width = size.0.max(min_width);
     let x = left
         .min(viewport.right() - OVER_MARGIN - width)
         .max(viewport.x + OVER_MARGIN);
     let top = anchor.y + anchor.height / 2.0 - (part.y + part.height / 2.0);
-    let y = top.max(viewport.y + OVER_MARGIN);
+    let limit = viewport.bottom() - OVER_MARGIN;
+    let mut y = top.max(viewport.y + OVER_MARGIN);
     let scroll = y - top;
-    let height = (size.1 - scroll).min(viewport.bottom() - OVER_MARGIN - y);
+    if scroll <= 0.0 {
+        // Pinned to the bottom edge (`:144-164`): the least height and the
+        // part shown whole are made up above.
+        let short = (min_height.min(size.1) - (limit - y)).max(y + part.bottom() - limit);
+        if short > 0.0 {
+            y = (y - short).max(viewport.y + OVER_MARGIN);
+        }
+    }
+    let height = (size.1 - scroll).min(limit - y);
     Over {
         origin: (x, y),
         min_width,

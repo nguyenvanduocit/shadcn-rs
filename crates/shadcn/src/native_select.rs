@@ -136,7 +136,7 @@ impl NativeSelect {
 
     /// Call `f` with each value chosen (`@change`).
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_change(mut self, f: impl Into<gui::Callback<String>>) -> Self {
         self.value = self.value.on_change(f);
         self
     }

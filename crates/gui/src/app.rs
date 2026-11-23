@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::image::Pixels;
@@ -23,7 +24,7 @@ use crate::gpu::GpuRenderer;
 use crate::heap;
 use crate::inspect::{self, Footprint, FrameReport, LayoutDiff, Spread, Timings, ms};
 use crate::interact::{self, ImeTarget, InputState, Outcome};
-use crate::layout::{Frame, LayoutTree, layout};
+use crate::layout::{Frame, LayoutTree};
 use crate::mailbox;
 use crate::motion::Motion;
 use crate::overlay::{Overlay, record_hud, record_overlay};
@@ -57,6 +58,8 @@ pub struct DebugTools {
 
 /// Turns a component into frames and routes input back into it.
 pub struct Pipeline {
+    /// The window's focus: made current as the window's code runs.
+    focus: std::rc::Rc<crate::focus::FocusRoot>,
     /// The app's instance tree (ADR-0013).
     root: Root,
     /// What layout and paint read outside any render: a change marks the
@@ -87,8 +90,10 @@ pub struct Pipeline {
     animating: bool,
     /// A signal was written since the frame was laid out.
     stale: bool,
-    /// Where the devtools' diff read the frame's changes up to.
-    diffed: crate::layout::ReadAt,
+    /// What the frame report's diff read of the frame's changes, and room
+    /// to sort it.
+    unread: Vec<crate::layout::Changed>,
+    logged: Vec<(u32, usize, inspect::Bounds, bool)>,
     /// What layout visited since the last frame report (ADR-0013).
     visits: crate::layout::Visits,
     /// What moves across frames.
@@ -98,6 +103,8 @@ pub struct Pipeline {
     last_root: Option<Element>,
     /// Check each frame against one built cold (`GUI_COLD_CHECK`).
     cold_check: bool,
+    /// The scene the cold frame painted, what the live paint must equal.
+    cold_scene: Option<crate::scene::Scene>,
     /// The layout tree kept across frames (ADR-0014).
     tree: LayoutTree,
     /// The tree a screen reader holds (ADR-0021).
@@ -149,11 +156,12 @@ impl Drop for Trackers {
 impl Pipeline {
     /// A pipeline for `component`, the app's root render. With `trace`, the
     /// reactive runtime records what each frame wrote and read.
-    pub fn new(component: impl FnMut() -> Element + 'static, trace: bool) -> Self {
+    pub fn new(component: impl Fn() -> Element + 'static, trace: bool) -> Self {
         if trace {
             reactive::start_trace();
         }
         Self {
+            focus: crate::focus::FocusRoot::new(),
             root: Root::new(component),
             trackers: Trackers::new(),
             text: TextSystem::new(),
@@ -172,11 +180,14 @@ impl Pipeline {
             dirty: false,
             animating: false,
             stale: false,
-            diffed: crate::layout::ReadAt::default(),
+            unread: Vec::new(),
+            logged: Vec::new(),
             visits: crate::layout::Visits::default(),
             motion: Motion::default(),
             last_root: None,
-            cold_check: std::env::var_os("GUI_COLD_CHECK").is_some(),
+            // A debug build's check: a release build has none to run.
+            cold_check: cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some(),
+            cold_scene: None,
             tree: LayoutTree::new(),
             access: access::Accessibility::default(),
             probe: access::Accessibility::default(),
@@ -194,8 +205,15 @@ impl Pipeline {
         self.tree.frame()
     }
 
+    /// The last frame, for a test to make stale.
+    #[cfg(test)]
+    pub(crate) fn frame_mut(&mut self) -> &mut Frame {
+        self.tree.frame_mut()
+    }
+
     /// Run `f` (typically signal writes) and name it as the cause of the next frame.
     pub fn act(&mut self, cause: impl Into<String>, f: impl FnOnce()) {
+        self.focus.enter();
         self.causes.push(cause.into());
         f();
     }
@@ -213,6 +231,7 @@ impl Pipeline {
     /// `scale`: what changed since the last update, or the whole tree after
     /// [`Self::access_reset`] (ADR-0021).
     pub fn access_update(&mut self, scale: f32, title: &str) -> accesskit::TreeUpdate {
+        self.focus.enter();
         let frame = self.tree.frame();
         let update = reactive::in_phase(reactive::Phase::Access, false, || {
             self.access
@@ -237,6 +256,33 @@ impl Pipeline {
         self.access.reset();
     }
 
+    /// The input state between frames, for tests to look into.
+    #[cfg(test)]
+    pub(crate) fn input_state(&self) -> &InputState {
+        &self.input_state
+    }
+
+    /// The text field handles layout holds claimed.
+    #[cfg(test)]
+    pub(crate) fn field_claims(&self) -> usize {
+        self.tree.field_claims()
+    }
+
+    /// The focus handles layout finds nodes by.
+    #[cfg(test)]
+    pub(crate) fn focus_entries(&self) -> usize {
+        self.tree.focus_entries()
+    }
+
+    /// What layout and input keep for text fields, for tests to see it
+    /// stays bounded.
+    #[cfg(test)]
+    pub(crate) fn field_bookkeeping(&self) -> usize {
+        self.tree
+            .field_bookkeeping()
+            .saturating_add(self.input_state.field_bookkeeping())
+    }
+
     /// What the last accessibility update cost.
     #[must_use]
     pub fn access_stats(&self) -> access::AccessStats {
@@ -246,6 +292,7 @@ impl Pipeline {
     /// Bring the devtools' probe tree (never the window's) up to the last
     /// frame, from nothing when `full`; what it cost.
     pub(crate) fn access_probe(&mut self, full: bool) -> (accesskit::TreeUpdate, access::AccessStats) {
+        self.focus.enter();
         if full {
             self.probe.reset();
         }
@@ -261,38 +308,48 @@ impl Pipeline {
 
     /// The whole tree a screen reader would be given for the last frame.
     pub fn access_tree(&mut self, scale: f32, title: &str) -> accesskit::TreeUpdate {
+        self.focus.enter();
         access::tree(self.tree.frame(), crate::focus::focused(), scale, title, &mut self.text)
     }
 
     /// Where an input method may type in the last frame, if anywhere.
     pub fn ime_target(&mut self) -> Option<ImeTarget> {
+        self.focus.enter();
         self.input_state.ime_target(self.tree.frame(), &mut self.text)
     }
 
     /// Route `input`, which arrived while `presented` was on screen, to
     /// what it shows (ADR-0015): a node the compositor has scrolled or moved
-    /// since its commit is hit where the screen showed it.
-    pub fn input_shown(&mut self, input: Input, presented: &Presented) -> Outcome {
-        self.refresh();
-        self.input_state
-            .set_shift(interact::shift_of(self.tree.frame(), presented));
-        let out = self.input(input);
-        self.input_state.set_shift(Vec::new());
-        out
+    /// since its commit is hit where the screen showed it. The screen is
+    /// known to show `presented` from now on, until a frame or an input
+    /// says otherwise, so the frames after compare against what the input
+    /// saw.
+    pub fn input_shown(&mut self, input: Input, presented: &Arc<Presented>) -> Outcome {
+        self.input_state.show(Some(Arc::clone(presented)));
+        self.route(input)
     }
 
     /// Route `input` to the last frame's nodes as laid out (the devtools,
     /// which read positions off the frame), laid out again first when a
     /// signal was written or the wheel scrolled since.
     pub fn input(&mut self, input: Input) -> Outcome {
+        self.input_state.show(None);
+        self.route(input)
+    }
+
+    /// Route `input` to the last frame's nodes where the screen is known
+    /// to show them.
+    fn route(&mut self, input: Input) -> Outcome {
+        self.focus.enter();
         self.refresh();
         let (f, t) = (self.tree.frame(), &mut self.text);
         let mut out = match input {
             Input::PointerMoved { x, y } => self.input_state.pointer_moved(f, t, x, y),
             Input::PointerLeft => self.input_state.pointer_left(f),
+            Input::Blur => self.input_state.blur(f),
             Input::MouseDown { x, y } => self.input_state.mouse_down(f, t, x, y),
             Input::MouseUp { x, y } => self.input_state.mouse_up(f, x, y),
-            Input::SecondaryDown { x, y } => self.input_state.secondary_down(f, x, y),
+            Input::ButtonDown { x, y, button } => self.input_state.button_down(f, x, y, button),
             Input::Wheel { dx, dy } => {
                 // A scroll moves every box under it: the next input (the
                 // next wheel step included) reaches them where they are now.
@@ -300,7 +357,14 @@ impl Pipeline {
                 self.stale |= out.redraw;
                 out
             }
+            Input::WheelAt { step, dx, dy, target } => {
+                let out = self.input_state.wheel_at(f, step, (dx, dy), target);
+                self.stale |= out.redraw;
+                out
+            }
             Input::Key(ev) => self.input_state.key(f, t, &ev),
+            Input::KeyRepeat(ev) => self.input_state.key_repeated(f, t, &ev),
+            Input::Touch(ev) => self.input_state.touch(f, t, &ev),
             Input::Ime(ev) => self.input_state.ime(f, &ev),
             Input::Act(request) => self.input_state.act(f, t, &request),
             Input::Modifiers(m) => {
@@ -338,6 +402,7 @@ impl Pipeline {
     /// scroll handles' hooks or what moves change it; the frame and the time
     /// spent building and laying out.
     fn lay_out(&mut self) -> Timings {
+        self.focus.enter();
         let mut timings = Timings::default();
         let mut again = self.pass(&mut timings, 0);
         // What a scroll handle's hook changes after layout (an offset, a spacer
@@ -345,11 +410,22 @@ impl Pipeline {
         // was measured show in this frame, not the next.
         for pass in 1..LAYOUT_PASSES {
             // Post-flush: scroll handles' hooks, `on_mounted`, `on_updated`.
-            let hooks = after_layout(self.tree.frame()) | crate::component::run_post();
+            // And the layers' focus rules, on the frame just laid out (ADR-0024).
+            let hooks =
+                after_layout(self.tree.frame()) | crate::component::run_post() | self.input_state.settle(&self.tree);
             if !(hooks | again | crate::component::take_due()) {
-                break;
+                // The frame's last pass: focus left on a node it does not
+                // show goes, and what shows focus is laid out once more.
+                if !crate::focus::drop_lost(self.tree.frame()) {
+                    return timings;
+                }
+                self.input_state.sync_focus(&self.tree);
             }
             again = self.pass(&mut timings, pass);
+        }
+        // Out of passes: the last one's lost focus goes all the same.
+        if crate::focus::drop_lost(self.tree.frame()) {
+            self.input_state.sync_focus(&self.tree);
         }
         timings
     }
@@ -358,7 +434,14 @@ impl Pipeline {
     /// it took to `timings`; whether what moves needs another pass.
     fn pass(&mut self, timings: &mut Timings, pass: usize) -> bool {
         let t0 = Instant::now();
-        let built = reactive::in_phase(reactive::Phase::Render, false, || self.root.resolve());
+        let (built, leaving) = reactive::in_phase(reactive::Phase::Render, false, || self.root.resolve_leaving());
+        // What the instances that left hold captured gets its cancel while
+        // they are alive, in the frame that last held their nodes; then
+        // they are disposed, as the resolve would have.
+        if !leaving.is_empty() {
+            self.input_state.release_owned(self.tree.frame(), &|o| leaving.holds(o));
+        }
+        reactive::in_phase(reactive::Phase::Render, false, || drop(leaving));
         let root = self.motion.splice(built);
         let t1 = Instant::now();
         self.motion.begin();
@@ -376,14 +459,36 @@ impl Pipeline {
         // (a scroll handle's layout, a measured box) as Chrome's
         // ResizeObserver loop does; the last one may not.
         let settles = pass.saturating_add(1) < LAYOUT_PASSES;
-        reactive::in_phase(reactive::Phase::Layout, settles, || {
-            self.trackers
-                .layout
-                .track(|| tree.layout(&root, size.0, size.1, state, motion, text));
+        let layout = self.trackers.layout;
+        let repeated = reactive::in_phase(reactive::Phase::Layout, settles, || {
+            // Both layouts read under the frame's layout tracker, the repeat
+            // too: what either reads outside a node's own phases lays the
+            // next frame out when it changes.
+            layout.track(|| {
+                tree.layout(&root, size.0, size.1, state, motion, text);
+                // What the renders built the scroll containers' children
+                // from is taken in by their owners now (untracked: their
+                // writes, not their reads), this pass the last or not; one
+                // that puts its container elsewhere (an anchor whose row
+                // moved) is placed so within this pass: what is painted has
+                // the offset its rows are built for.
+                // The layout's counts are per layout: the first's are kept
+                // before the repeat starts its own, and the frame reports
+                // both.
+                if reactive::untracked(|| take_built(tree.frame())) {
+                    let first = (tree.stats(), tree.visits());
+                    tree.layout(&root, size.0, size.1, state, motion, text);
+                    Some(first)
+                } else {
+                    None
+                }
+            })
         });
-        text.add_shaped(tree.stats().work);
-        self.layout_stats.add(tree.stats());
-        self.visits.add(tree.visits());
+        for (stats, visits) in repeated.into_iter().chain([(tree.stats(), tree.visits())]) {
+            text.add_shaped(stats.work);
+            self.layout_stats.add(stats);
+            self.visits.add(visits);
+        }
         let again = {
             let tree = &self.tree;
             self.motion.finish(self.last_root.as_ref(), &|p| tree.holds(p))
@@ -398,13 +503,19 @@ impl Pipeline {
     /// compositor did, build, lay out and record one frame `size` physical
     /// pixels at `scale` for the time it is presented, and commit what
     /// changed since the last commit to `target`, the overlays with it.
+    ///
+    /// What the frame did is written into `report`, over the last frame's,
+    /// its buffers kept: with the commit the renderer gave back and the
+    /// displays it let go of, a frame that changes what one before changed
+    /// (a hover) allocates nothing on this thread, report included.
     pub fn draw_with(
         &mut self,
         target: &mut dyn Compose,
         begin: MainFrame,
         size: (u32, u32),
         scale: f32,
-    ) -> FrameReport {
+        report: &mut FrameReport,
+    ) {
         let logical = (u32_to_f32(size.0) / scale, u32_to_f32(size.1) / scale);
         if logical != self.size {
             if self.frames > 0 {
@@ -412,12 +523,17 @@ impl Pipeline {
             }
             self.size = logical;
         }
+        self.focus.enter();
         let heap_before = heap::now();
         let thread_before = heap::thread();
         clock::begin_frame(begin.present_at);
         reactive::begin_frame();
         if self.input_state.apply_scroll(self.tree.frame(), &begin.scroll) {
             self.causes.push("compositor scroll".to_owned());
+        }
+        // A drag held past a text field's edge scrolls it on.
+        if self.input_state.autoscroll(self.tree.frame(), &mut self.text) {
+            self.causes.push("autoscroll".to_owned());
         }
         self.input_state.sync_focus(&self.tree);
         self.input_state.set_scale(scale);
@@ -428,42 +544,51 @@ impl Pipeline {
         let built = heap::thread();
 
         if self.cold_check {
-            self.check_cold();
+            self.check_cold(size, scale);
         }
         let t2 = Instant::now();
         // Commit what changed since the last commit, with the glyph tables
-        // it needs (all of them to a renderer that has none yet).
+        // it needs (all of them to a renderer that has none yet), into the
+        // commit the renderer last gave back.
         let full = self.commits == 0 || std::mem::take(&mut self.resend);
+        let mut commit = target.spare().unwrap_or_default();
         let (painter, text, frame, paint) = (
             &mut self.painter,
             &mut self.text,
             self.tree.frame(),
             self.trackers.paint,
         );
-        let (mut commit, recorded) = heap::measure(|| {
+        let ((), recorded) = heap::measure(|| {
             reactive::in_phase(reactive::Phase::Paint, false, || {
-                paint.track(|| painter.record(frame, text, size, scale, Color::WHITE, full))
-            })
+                paint.track(|| painter.record(frame, text, size, scale, Color::WHITE, full, &mut commit));
+            });
         });
         let shaped = self.text.take_shaped();
-        if self.cold_check {
-            let cold = crate::paint::Painter::cold(self.tree.frame(), &mut self.text, size, scale, Color::WHITE);
-            let d = crate::paint::scene_differs(self.tree.frame(), self.painter.scene(), &cold);
+        // The live paint against what the cold frame painted from its own
+        // layout: a stale box or misplaced text in the live frame shows.
+        if let Some(cold) = self.cold_scene.take() {
+            // By content: the cold frame's data sources are allocations of
+            // its own (a `Bytes` made afresh holds the same bytes).
+            let d = crate::chunk::comparing_content(|| {
+                crate::paint::scene_differs(self.tree.frame(), self.painter.scene(), &cold)
+            });
             assert!(
                 d.is_none(),
                 "incremental paint of frame {} differs from a cold one: {}",
                 self.frames.saturating_add(1),
                 d.unwrap_or_default()
             );
-            let _ = self.text.take_shaped();
         }
         self.animating = clock::take_frame_request();
 
-        let diff = self.layout_diff();
-        let causes = std::mem::take(&mut self.causes);
-        if !diff.is_empty() || !causes.is_empty() {
-            self.diff = diff.clone();
+        self.layout_diff(&mut report.diff);
+        if !report.diff.is_empty() || !self.causes.is_empty() {
+            self.diff.clone_from(&report.diff);
         }
+        // The causes gathered go to the report; its last ones' buffer
+        // gathers the next frame's.
+        std::mem::swap(&mut report.causes, &mut self.causes);
+        self.causes.clear();
         self.frames = self.frames.saturating_add(1);
 
         self.commits = self.commits.saturating_add(1);
@@ -477,65 +602,66 @@ impl Pipeline {
         let t3 = Instant::now();
         let vsync = target.waited();
         self.text.end_frame();
-        // The boxes under a resting pointer may have changed.
+        // The boxes under a resting pointer may have changed: compared as
+        // the screen shows them now, as every input was.
         if self.visits.placed > 0 {
+            self.input_state.show(Some(target.presented()));
             self.dirty = self.input_state.rehover(self.tree.frame(), &mut self.text).redraw;
         }
         let drawn = target.drawn();
         self.held = target.held();
+        report.number = self.frames;
+        report.reactive = reactive::take_trace();
+        report.rendered = crate::component::take_rendered();
+        report.bindings = crate::component::take_bindings();
+        report.shaped = shaped;
+        report.timings = Timings {
+            paint: t3.duration_since(t2).saturating_sub(vsync),
+            vsync,
+            ..timings
+        };
+        report.layout = std::mem::take(&mut self.layout_stats);
+        report.visits = std::mem::take(&mut self.visits);
+        report.paint = self.painter.stats();
+        report.painted.clear();
+        report.painted.extend_from_slice(self.painter.painted());
+        report.late = reactive::take_late_writes();
+        report.drawn = drawn;
         let mut footprint = self.footprint();
-        footprint.heap = heap::now().zip(heap_before).map(|(after, before)| after.since(before));
-        footprint.thread = heap::thread()
-            .zip(thread_before)
-            .map(|(after, before)| after.since(before));
         footprint.built = built.zip(thread_before).map(|(after, before)| after.since(before));
         footprint.recorded = recorded;
         footprint.committed = committed;
-        FrameReport {
-            number: self.frames,
-            causes,
-            reactive: reactive::take_trace(),
-            rendered: crate::component::take_rendered(),
-            bindings: crate::component::take_bindings(),
-            shaped,
-            timings: Timings {
-                paint: t3.duration_since(t2).saturating_sub(vsync),
-                vsync,
-                ..timings
-            },
-            diff,
-            footprint,
-            layout: std::mem::take(&mut self.layout_stats),
-            visits: std::mem::take(&mut self.visits),
-            paint: self.painter.stats(),
-            painted: self.painter.painted().to_vec(),
-            late: reactive::take_late_writes(),
-            drawn,
-        }
+        // The whole frame, its report written.
+        footprint.thread = heap::thread()
+            .zip(thread_before)
+            .map(|(after, before)| after.since(before));
+        footprint.heap = heap::now().zip(heap_before).map(|(after, before)| after.since(before));
+        report.footprint = footprint;
     }
 
-    /// What changed in the frame since it was last painted, for the
-    /// devtools: the nodes written in place and, where a pass rebuilt the
-    /// frame, the rebuilt nodes against what they were.
-    fn layout_diff(&mut self) -> LayoutDiff {
+    /// What changed in the frame since it was last painted, for the frame
+    /// report (every frame), written into `diff`: the nodes written in place
+    /// and, where a pass rebuilt the frame, the rebuilt nodes against what
+    /// they were when it was last painted.
+    fn layout_diff(&mut self, diff: &mut LayoutDiff) {
+        diff.clear();
         let before = self.tree.take_before();
+        // Never behind: what a trim dropped before it was read is kept for it.
+        let read = self.tree.unread_changes(&mut self.unread);
         let frame = self.tree.frame();
-        let mut changes: Vec<inspect::NodeChange> = Vec::new();
-        if let Some(log) = frame.changes.since(&mut self.diffed) {
-            changes.extend(inspect::logged(
+        if read {
+            inspect::logged(
                 frame,
-                log,
-                before.as_ref().map_or(usize::MAX, |(at, _)| *at),
-            ));
+                &self.unread,
+                before.as_ref().map_or(usize::MAX, |b| b.at),
+                &mut self.logged,
+                &mut diff.changes,
+            );
         }
-        if let Some((at, was)) = &before {
-            let d = inspect::diff(was, frame.nodes.get(*at..).unwrap_or_default());
-            changes.extend(d.changes.iter().cloned());
+        if let Some(before) = &before {
+            diff.changes.extend(before.diff(frame).changes);
         }
-        LayoutDiff {
-            changes: changes.into(),
-            nodes: frame.nodes.len(),
-        }
+        diff.nodes = frame.nodes.len();
     }
 
     /// The report of a frame the compositor drew alone (canvas raster going
@@ -568,26 +694,54 @@ impl Pipeline {
 
     /// Panic unless `frame` equals the frame every instance rendered again
     /// gives (ADR-0013: incremental equals cold). Motion runs on a copy.
-    fn check_cold(&mut self) {
-        let mut motion = self.motion.clone();
-        let root = motion.splice(self.root.resolve_cold());
-        motion.begin();
-        let cold = layout(
-            &root,
-            self.size.0,
-            self.size.1,
-            self.input_state.state(),
-            &mut motion,
-            &mut self.text,
-        );
-        let frame = self.tree.frame();
-        let d = inspect::diff(&frame.nodes, &cold.nodes);
+    /// The cold frame lays its text out from fresh caches and paints its
+    /// own scene, kept as what the live paint must equal.
+    #[cfg(debug_assertions)]
+    fn check_cold(&mut self, size: (u32, u32), scale: f32) {
+        // One transaction from tree to paint: what the cold frame does is
+        // its own, thrown away once it is compared.
+        let frame = self.root.cold();
+        let live_text = self.text.enter_cold();
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut motion = self.motion.clone();
+            let root = motion.splice(frame.resolve());
+            motion.begin();
+            let cold = crate::layout::layout_carrying(
+                &root,
+                self.size.0,
+                self.size.1,
+                self.input_state.state(),
+                &mut motion,
+                &mut self.text,
+                Some(&self.tree),
+            );
+            let scene = crate::paint::Painter::cold(&cold, &mut self.text, size, scale, Color::WHITE);
+            let live = self.tree.frame();
+            (
+                inspect::diff(&live.nodes, &cold.nodes),
+                live.nodes.len() == cold.nodes.len(),
+                frame.wrote(),
+                scene,
+            )
+        }));
+        self.text.exit_cold(live_text);
+        drop(frame);
+        let (d, same, wrote, scene) = built.unwrap_or_else(|p| std::panic::resume_unwind(p));
         assert!(
-            d.is_empty() && frame.nodes.len() == cold.nodes.len(),
+            wrote.is_empty(),
+            "a cold frame wrote live state, which a render, a getter or a binding must not: {}",
+            wrote.join(", ")
+        );
+        assert!(
+            d.is_empty() && same,
             "incremental frame {} differs from a cold one:\n{d}",
             self.frames.saturating_add(1)
         );
+        self.cold_scene = Some(scene);
     }
+
+    #[cfg(not(debug_assertions))]
+    fn check_cold(&mut self, _: (u32, u32), _: f32) {}
 
     /// Read the user's text settings again; whether they changed (the
     /// renderer then rasterizes its glyphs anew).
@@ -761,19 +915,32 @@ const REST_RASTER_FRAMES: usize = 2400;
 
 /// Run the scroll handles' hooks on `frame`, each once; whether any changed
 /// what the frame is built from.
+/// What each scroll container's render built its children from, taken in
+/// by its owner after a layout pass laid them out (each pass, the last too).
+/// Whether one put its container elsewhere.
+fn take_built(frame: &Frame) -> bool {
+    let mut moved = false;
+    for (handle, built) in frame.handles.iter().filter_map(|&i| {
+        let b = frame.behaviour.get(i)?;
+        Some((b.scroll.as_ref()?, b.scroll_built.as_ref()?))
+    }) {
+        moved |= handle.take_built(built);
+    }
+    moved
+}
+
 fn after_layout(frame: &Frame) -> bool {
     let mut ran: Vec<&ScrollHandle> = Vec::new();
     let mut changed = false;
-    for handle in frame
-        .handles
-        .iter()
-        .filter_map(|&i| frame.behaviour.get(i).and_then(|b| b.scroll.as_ref()))
-    {
+    for (handle, built) in frame.handles.iter().filter_map(|&i| {
+        let b = frame.behaviour.get(i)?;
+        Some((b.scroll.as_ref()?, b.scroll_built.as_ref()))
+    }) {
         if ran.iter().any(|h| h.same(handle)) {
             continue;
         }
         ran.push(handle);
-        changed |= handle.after_layout();
+        changed |= handle.after_layout(built);
     }
     changed
 }
@@ -811,6 +978,8 @@ struct Live {
     chrome: reactive::Signal<Chrome>,
     /// What they asked of the platform.
     actions: Actions,
+    /// The last frame's report, written over by the next.
+    report: FrameReport,
 }
 
 /// How many frames the HUD's percentile looks back over.
@@ -939,18 +1108,19 @@ fn short_causes(causes: &[String]) -> String {
 
 impl WindowHandler for Live {
     fn frame(&mut self, target: &mut dyn Compose, begin: MainFrame, size: (u32, u32), scale: f32) {
-        let report = self.pipeline.draw_with(target, begin, size, scale);
-        self.history.push(&report);
+        self.pipeline.draw_with(target, begin, size, scale, &mut self.report);
+        let report = &self.report;
+        self.history.push(report);
         if self.log && report.changed() {
             eprintln!("{report}\n");
         }
         if let Some(attached) = &mut self.attached {
             let pipeline = &mut self.pipeline;
-            attached.drawn(&report, &mut |overlay| pipeline.capture(target, overlay));
+            attached.drawn(report, &mut |overlay| pipeline.capture(target, overlay));
         }
         if self.hud {
             let components = self.pipeline.frame().nodes.iter().filter(|n| n.name.is_some()).count();
-            let lines = self.history.lines(&report, components);
+            let lines = self.history.lines(report, components);
             let times = self.history.times();
             self.pipeline.render_hud(target, &lines, &times);
         } else if self.pipeline.hud.take().is_some() {
@@ -959,7 +1129,7 @@ impl WindowHandler for Live {
         }
     }
 
-    fn input(&mut self, input: Input, presented: &Presented) -> bool {
+    fn input(&mut self, input: Input, presented: &Arc<Presented>) -> bool {
         if let Input::Key(ev) = &input
             && ev.is(NamedKey::F12)
         {
@@ -1007,6 +1177,7 @@ impl WindowHandler for Live {
     }
 
     fn chrome(&mut self, chrome: Chrome) -> bool {
+        crate::interact::set_window_active(chrome.active);
         self.chrome.set(chrome);
         true
     }
@@ -1049,7 +1220,7 @@ impl WindowHandler for Live {
 /// what the debug tools do from the start.
 pub fn run<C>(title: &str, setup: impl FnOnce() -> C + Send + 'static, options: RunOptions) -> !
 where
-    C: FnMut() -> Element + 'static,
+    C: Fn() -> Element + 'static,
 {
     window::run(title, move || live(setup, options))
 }
@@ -1070,7 +1241,7 @@ pub fn offscreen<C>(
     interval: Duration,
 ) -> Result<window::Offscreen, String>
 where
-    C: FnMut() -> Element + 'static,
+    C: Fn() -> Element + 'static,
 {
     window::Offscreen::start(move || live(setup, options), size, scale, interval)
 }
@@ -1078,8 +1249,10 @@ where
 /// The window's handler, made on the UI thread: `setup` runs there first.
 fn live<C>(setup: impl FnOnce() -> C, options: RunOptions) -> Box<dyn WindowHandler>
 where
-    C: FnMut() -> Element + 'static,
+    C: Fn() -> Element + 'static,
 {
+    // Before the app's setup, so what it builds reads it from the start.
+    crate::environment::set_reduced_motion(options.reduced_motion);
     let debug = options.debug;
     let attached = (debug.attach || std::env::var_os("GUI_DEVTOOLS").is_some())
         .then(attach)
@@ -1102,6 +1275,7 @@ where
         attached,
         chrome,
         actions,
+        report: FrameReport::default(),
     })
 }
 
@@ -1191,6 +1365,8 @@ pub struct Scenario {
     step: u32,
     trace: String,
     reports: Vec<FrameReport>,
+    /// The last frame's report, written over by the next.
+    report: FrameReport,
     /// The compositor and the GPU, on this thread (ADR-0015): each commit is
     /// applied and drawn as it is made, at its own time, so runs repeat.
     headless: Headless,
@@ -1200,7 +1376,7 @@ impl Scenario {
     /// A scenario rendering `component` in a `width`×`height` logical window
     /// at `scale` into `dir`.
     pub fn new(
-        component: impl FnMut() -> Element + 'static,
+        component: impl Fn() -> Element + 'static,
         dir: &Path,
         width: u32,
         height: u32,
@@ -1213,7 +1389,7 @@ impl Scenario {
     /// A scenario as [`Self::new`] makes, that writes no files: its frames
     /// are only measured.
     pub fn measuring(
-        component: impl FnMut() -> Element + 'static,
+        component: impl Fn() -> Element + 'static,
         width: u32,
         height: u32,
         scale: f32,
@@ -1222,7 +1398,7 @@ impl Scenario {
     }
 
     fn create(
-        component: impl FnMut() -> Element + 'static,
+        component: impl Fn() -> Element + 'static,
         dir: Option<PathBuf>,
         width: u32,
         height: u32,
@@ -1247,16 +1423,20 @@ impl Scenario {
             step: 0,
             trace: String::new(),
             reports: Vec::new(),
+            report: FrameReport::default(),
             headless: Headless::new(gpu, Glyphs::for_os(), read),
         })
     }
 
     /// Check every frame from now on against one built cold, panicking where
     /// they differ (ADR-0013: incremental equals cold), as `GUI_COLD_CHECK` does:
-    /// its layout, and the data chunks it draws.
+    /// its layout, the data chunks it draws and the frames its compositor composes.
+    /// A release build has no cold check: this does nothing there.
     pub fn check_cold(&mut self, on: bool) {
+        let on = on && cfg!(debug_assertions);
         self.pipeline.cold_check = on;
         self.headless.gpu.check_cold(on);
+        self.headless.compositor.check_cold(on);
     }
 
     /// From now on, transitions and animations take their time on the
@@ -1276,6 +1456,8 @@ impl Scenario {
     /// timers that fall due on the way (an autoplay's advances, a tooltip's
     /// delay) at their own times.
     pub fn at(&mut self, seconds: f32) {
+        // Its timers are this window's code.
+        self.pipeline.focus.enter();
         // While a canvas rasters, the render thread draws on its own at the
         // display's rate: its frames, each with its raster budget, until
         // the time comes or a timer wants the UI.
@@ -1360,11 +1542,10 @@ impl Scenario {
         // What other threads sent before this frame is in it, as in a window.
         mailbox::deliver();
         let begin = self.headless.begin(clock::current_seconds());
-        let report = self
-            .pipeline
-            .draw_with(&mut self.headless, begin, self.size, self.scale);
-        self.reports.push(report.clone());
-        Ok(report)
+        self.pipeline
+            .draw_with(&mut self.headless, begin, self.size, self.scale, &mut self.report);
+        self.reports.push(self.report.clone());
+        Ok(self.report.clone())
     }
 
     /// Render a frame and write its files under `name`.
@@ -1393,6 +1574,12 @@ impl Scenario {
         self.pipeline
             .capture(&mut self.headless, overlay)
             .ok_or_else(|| ScenarioError::Gpu("the frame could not be read back".to_owned()))
+    }
+
+    /// The render thread's side, run headless: frames composed at its own
+    /// times without the UI, as a window's are between main frames.
+    pub fn compositor(&mut self) -> &mut crate::compositor::Compositor {
+        &mut self.headless.compositor
     }
 
     /// The scene last committed by the UI, and the compositor under it (tests).
@@ -1435,6 +1622,13 @@ impl Scenario {
         self.pipeline.footprint()
     }
 
+    /// What each part of the scenario's pipeline holds now (the memory
+    /// report by owner).
+    #[must_use]
+    pub fn owners(&self) -> Vec<inspect::Owner> {
+        self.pipeline.owners()
+    }
+
     /// Render without writing files (to settle hover after an input).
     pub fn settle(&mut self) -> Result<(), ScenarioError> {
         self.render().map(|_| ())
@@ -1451,6 +1645,16 @@ impl Scenario {
         self.pipeline.frame()
     }
 
+    /// Scroll on the render thread alone, as the platform's wheel at
+    /// `point` would at `at`, and draw the frame a second later, the
+    /// scroll's motion done (the UI not asked).
+    #[cfg(test)]
+    pub(crate) fn compositor_wheel(&mut self, point: (f32, f32), delta: (f32, f32), at: f32) -> bool {
+        let scrolled = self.headless.wheel(point, delta, at);
+        self.headless.draw(at + 1.0);
+        scrolled
+    }
+
     /// The last frame's pixels, at the scenario's scale.
     #[must_use]
     pub fn pixmap(&self) -> &Pixels {
@@ -1464,8 +1668,9 @@ impl Scenario {
         self.headless.presented()
     }
 
-    /// Route `input` as the window does: hit-tested through what is on screen.
-    fn send(&mut self, input: Input) -> Outcome {
+    /// Route `input` as the window does: hit-tested through what is on
+    /// screen (a touch, a key, any input a helper below does not send).
+    pub fn send(&mut self, input: Input) -> Outcome {
         let shown = self.headless.presented();
         self.pipeline.input_shown(input, &shown)
     }
@@ -1474,6 +1679,12 @@ impl Scenario {
     #[must_use]
     pub fn scale(&self) -> f32 {
         self.scale
+    }
+
+    /// The window gains (`true`) or loses the keyboard focus, as the
+    /// platform's focus event says ([`crate::interact::window_active`]).
+    pub fn set_window_active(&mut self, active: bool) {
+        crate::interact::set_window_active(active);
     }
 
     /// Move the pointer to `(x, y)`.
@@ -1503,8 +1714,13 @@ impl Scenario {
 
     /// Press the secondary (right) button at `(x, y)`.
     pub fn secondary_click(&mut self, x: f32, y: f32) -> Outcome {
+        self.press_button(x, y, crate::layer::PointerButton::Secondary)
+    }
+
+    /// Press `button` (not the primary: see [`Self::click`]) at `(x, y)`.
+    pub fn press_button(&mut self, x: f32, y: f32, button: crate::layer::PointerButton) -> Outcome {
         self.send(Input::PointerMoved { x, y });
-        self.send(Input::SecondaryDown { x, y })
+        self.send(Input::ButtonDown { x, y, button })
     }
 
     /// Turn the wheel at the pointer by `dy` pixels, as the platform's
@@ -1513,7 +1729,35 @@ impl Scenario {
     /// Whether anything scrolled.
     pub fn wheel(&mut self, dy: f32) -> bool {
         let at = self.pipeline.input_state.pointer().unwrap_or_default();
-        self.headless.wheel(at, (0.0, dy), clock::current_seconds())
+        let now = clock::current_seconds();
+        // As the render thread takes it, in the frame shown: over a wheel
+        // handler it hands it to the UI.
+        let seen = self.headless.presented().frame;
+        let w = crate::compositor::WheelInput {
+            point: at,
+            delta: (0.0, dy),
+            at: now,
+            precise: false,
+            began: false,
+            ended: false,
+            seen,
+        };
+        match self.headless.compositor.wheel_input(w) {
+            crate::compositor::Wheeled::Ui(target) => {
+                self.send(Input::WheelAt {
+                    step: w.step(),
+                    dx: 0.0,
+                    dy,
+                    target,
+                })
+                .redraw
+            }
+            crate::compositor::Wheeled::Scrolled => {
+                self.headless.draw(now);
+                true
+            }
+            crate::compositor::Wheeled::Nothing => false,
+        }
     }
 
     /// The centre of the first node showing exactly `text`, or of the first
@@ -1528,11 +1772,14 @@ impl Scenario {
     }
 
     /// Click the centre of the first node (or link span) showing exactly `text`; fails when it
-    /// is not on screen or no handler takes the click.
+    /// is not on screen or no handler takes the press or the click (a select opens on the
+    /// press, so its click lands on the list it opened).
     pub fn click_text(&mut self, text: &str) -> Result<(), ScenarioError> {
         let (x, y) = self.locate(text)?;
-        let out = self.click(x, y);
-        if out.handled_by.is_some() {
+        self.send(Input::PointerMoved { x, y });
+        let down = self.send(Input::MouseDown { x, y });
+        let up = self.send(Input::MouseUp { x, y });
+        if down.handled_by.is_some() || up.handled_by.is_some() {
             Ok(())
         } else {
             Err(ScenarioError::Unhandled(format!(
@@ -1615,7 +1862,7 @@ pub fn snapshot(view: impl IntoElement, path: &Path, width: u32, height: u32, sc
     let gpu = GpuRenderer::headless().map_err(|e| ScenarioError::Gpu(e.to_string()))?;
     let mut headless = Headless::new(gpu, Glyphs::for_os(), true);
     let begin = headless.begin(0.0);
-    pipeline.draw_with(&mut headless, begin, (pw, ph), scale);
+    pipeline.draw_with(&mut headless, begin, (pw, ph), scale, &mut FrameReport::default());
     let pixels = headless
         .pixels()
         .ok_or_else(|| ScenarioError::Gpu("the frame could not be read back".to_owned()))?;
@@ -1630,6 +1877,127 @@ mod tests {
     use crate::prelude::*;
     use crate::scene::Item;
     use crate::styled::Styled;
+
+    /// What a cold check forks is what it writes, over every Fork piece of
+    /// engine state together (copies and undo entries, one counter): the
+    /// same beside another window of a hundred interactive nodes or ten
+    /// thousand.
+    #[test]
+    fn the_first_cold_check_on_a_thread_takes_no_signal_id_from_the_live_frames() {
+        use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+        let next_id = |check: bool| {
+            std::thread::spawn(move || {
+                let n = crate::reactive::Signal::new(0_u32);
+                let mut s = Scenario::measuring(
+                    move || {
+                        div()
+                            .interaction(crate::interact::Interaction::new())
+                            .child(text(n.get().to_string()))
+                            .into_element()
+                    },
+                    100,
+                    50,
+                    1.0,
+                )
+                .expect("a scenario");
+                s.check_cold(check);
+                s.frame("first").expect("a frame");
+                s.act("tick", || n.set(1));
+                s.frame("second").expect("a frame");
+                let next = crate::reactive::Signal::new(0_u8);
+                BuildHasherDefault::<DefaultHasher>::default().hash_one(next)
+            })
+            .join()
+            .expect("the thread ends")
+        };
+        assert_eq!(next_id(true), next_id(false), "the same id with the check as without");
+    }
+
+    #[test]
+    fn a_cold_check_forks_what_it_writes_beside_any_other_window() {
+        let work = |other: usize| {
+            let mut big = Scenario::measuring(
+                move || {
+                    div()
+                        .children((0..other).map(|i| {
+                            div()
+                                .size(1.0)
+                                .interaction(crate::interact::Interaction::new())
+                                .key(u64::try_from(i).unwrap())
+                                .into_element()
+                        }))
+                        .into_element()
+                },
+                200,
+                100,
+                1.0,
+            )
+            .expect("a scenario");
+            big.frame("big").expect("a frame");
+            let n = crate::reactive::Signal::new(0_u32);
+            let mut small = Scenario::measuring(
+                move || {
+                    div()
+                        .interaction(crate::interact::Interaction::new())
+                        .child(text(n.get().to_string()))
+                        .into_element()
+                },
+                100,
+                50,
+                1.0,
+            )
+            .expect("a scenario");
+            small.frame("first").expect("a frame");
+            small.check_cold(true);
+            small.act("tick", || n.set(1));
+            let before = crate::engine::fork_work_done();
+            small.frame("checked").expect("a frame");
+            let done = crate::engine::fork_work_done() - before;
+            drop((small, big));
+            done
+        };
+        let (few, many) = (work(100), work(10_000));
+        assert!(few > 0, "the check forks what it writes");
+        assert_eq!(few, many, "the same work however large the other window");
+    }
+
+    /// A stale content box the layout check cannot see (the border box is
+    /// the same) moves the text the live paint draws; the paint check finds
+    /// it, as it compares with what the cold frame painted from its own
+    /// layout, not the live layout painted again.
+    #[test]
+    fn a_stale_content_box_fails_the_paint_check() {
+        let mut s = Scenario::measuring(
+            || div().size(pct(100.0)).padding(8.0).child(text("moved")).into_element(),
+            200,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        s.check_cold(true);
+        s.frame("first").expect("a frame");
+        let frame = s.pipeline_mut().frame_mut();
+        let node = frame
+            .nodes
+            .iter_mut()
+            .find(|n| matches!(n.content, crate::layout::Content::Text { .. }))
+            .expect("the text node");
+        node.content_box.x += 5.0;
+        node.space_content.x += 5.0;
+        // Paint records the whole frame again, the stale box with it.
+        frame.changes.rebuilt(0);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.frame("stale").map(|_| ())));
+        let said = caught.expect_err("the paint check fails");
+        let said = said
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| said.downcast_ref::<&str>().map(ToString::to_string))
+            .unwrap_or_default();
+        assert!(
+            said.contains("incremental paint"),
+            "the paint check, not the layout one: {said}"
+        );
+    }
 
     #[test]
     fn group_layers_are_given_back_once_no_group_paints() {
@@ -1748,5 +2116,129 @@ mod tests {
             let pixmap = s.headless.capture(Some(hud)).expect("read back");
             pixmap.save_png(path).expect("written");
         }
+    }
+
+    /// A pass writes boxes in place, then a later pass of the same frame
+    /// (a post-layout hook's) rebuilds the frame over them: the frame
+    /// report's diff still compares them with what was painted, the box they
+    /// had then and that one was repainted.
+    #[test]
+    fn the_frame_report_diff_sees_writes_in_place_a_later_rebuild_covers() {
+        use crate::inspect::Change;
+        let (run, more) = (crate::reactive::Signal::new(false), crate::reactive::Signal::new(false));
+        let mut s = Scenario::measuring(
+            move || {
+                let on = run.get();
+                if on && !more.get_untracked() {
+                    crate::component::after_layout(move || more.set(true));
+                }
+                div()
+                    .child(div().named("grown").width(if on { 30.0 } else { 20.0 }).height(5.0))
+                    .child(
+                        div()
+                            .named("painted")
+                            .size(5.0)
+                            .background(if on { Color::BLACK } else { Color::WHITE }),
+                    )
+                    .children(more.get().then(|| div().named("added").size(5.0)))
+                    .into_element()
+            },
+            200,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        s.frame("still").expect("a frame");
+        let was = |name: &str| {
+            s.pipeline
+                .frame()
+                .nodes
+                .iter()
+                .find(|n| n.name == Some(name))
+                .map(|n| n.bounds)
+                .expect("a node")
+        };
+        let (grown, painted) = (was("grown"), was("painted"));
+        let epoch = s.pipeline.frame().epoch();
+        s.act("run", || run.set(true));
+        s.frame("run").expect("a frame");
+        assert_ne!(s.pipeline.frame().epoch(), epoch, "a later pass rebuilt the frame");
+        let diff = s.pipeline.last_diff();
+        let of = |name: &str| {
+            let mut found = diff.changes.iter().filter(|c| c.what.to_string().starts_with(name));
+            let c = found.next().map(|c| c.change.clone());
+            assert!(found.next().is_none(), "{name} once");
+            c
+        };
+        assert!(
+            matches!(of("grown"), Some(Change::Updated { before, after, .. })
+                if before == grown && after.width == 30.0),
+            "{diff}"
+        );
+        assert!(
+            matches!(of("painted"), Some(Change::Updated { before, after, repainted: true })
+                if before == painted && after == painted),
+            "{diff}"
+        );
+        assert!(matches!(of("added"), Some(Change::Added { .. })), "{diff}");
+        assert_eq!(diff.changes.len(), 3, "{diff}");
+    }
+
+    /// One frame's passes may log more than the change log keeps, a trim
+    /// dropping what the frame report had not read: its diff still holds
+    /// every node that changed, as a comparison of the frames does.
+    #[test]
+    fn the_frame_report_diff_is_whole_when_a_frame_logs_more_than_the_log_keeps() {
+        let (run, step) = (crate::reactive::Signal::new(false), crate::reactive::Signal::new(0_u16));
+        let mut s = Scenario::measuring(
+            move || {
+                let n = step.get();
+                // Each pass moves every box again (a post hook writes the
+                // step), up to the passes a frame takes.
+                if run.get() {
+                    crate::component::after_layout(move || step.set(step.get_untracked() + 1));
+                }
+                div()
+                    .children((0..100).map(|_| {
+                        div()
+                            .width(10.0 + f32::from(n))
+                            .height(2.0)
+                            .child(div().width(pct(100.0)).height(1.0))
+                    }))
+                    .into_element()
+            },
+            400,
+            300,
+            1.0,
+        )
+        .expect("a scenario");
+        s.frame("still").expect("a frame");
+        let was = s.pipeline.frame().nodes.clone();
+        let epoch = s.pipeline.frame().epoch();
+        let end = s.pipeline.frame().changes.end();
+        s.act("run", || run.set(true));
+        s.frame("run").expect("a frame");
+        let frame = s.pipeline.frame();
+        assert_eq!(frame.epoch(), epoch, "written in place");
+        assert!(
+            frame.changes.end().saturating_sub(frame.changes.log.len()) > end,
+            "a trim dropped entries the frame report had not read"
+        );
+        let whole = crate::inspect::diff(&was, &frame.nodes);
+        assert!(whole.changes.len() >= 200, "every box and its child moved");
+        let key = |d: &LayoutDiff| {
+            let mut k: Vec<String> = d.changes.iter().map(|c| format!("{} {:?}", c.path, c.change)).collect();
+            k.sort();
+            k
+        };
+        // What was written in place shows as repainted; the boxes alone
+        // are compared.
+        let boxes = |d: &LayoutDiff| -> Vec<String> {
+            key(d)
+                .into_iter()
+                .map(|k| k.replace("repainted: true", "repainted: false"))
+                .collect()
+        };
+        assert_eq!(boxes(s.pipeline.last_diff()), boxes(&whole));
     }
 }

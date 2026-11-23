@@ -5,24 +5,24 @@
 //! caller's through `.model(…)` (reka's `v-model`). Each [`stepper_item`]
 //! knows where its step stands and gives that to what fills it
 //! ([`StepperItem`], reka's `v-slot="{ state }"`), since reka styles a part
-//! by the state of the item it sits in (`group-data-[state=…]`).
+//! by the state of the item it sits in (`group-data-[state=…]`). Its
+//! behaviour (reach, the keys, a press choosing at once, the status line)
+//! is `primitives::stepper`'s; this module draws it.
 
 use std::rc::Rc;
 
 use gui::prelude::*;
-use gui::{Bind, Div, Model, Signal, UseModel, component, div, provide, text, use_context, use_model};
+use gui::{Axis, Bind, Div, FocusHandle, Model, Signal, component, div, provide, text, use_model, watch};
+use primitives::context::use_root;
+use primitives::separator::Separator;
+pub use primitives::stepper::StepState;
+use primitives::stepper::{StepLabels, Stepper};
+use primitives::visually_hidden::{Hidden, visually_hidden};
+use primitives::{Availability, use_direction};
 
 use crate::part::{Part, PartProps};
 use crate::separator::Orientation;
 use crate::theme::theme;
-
-/// Where a step stands against the current one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepState {
-    Completed,
-    Active,
-    Inactive,
-}
 
 /// What [`stepper`] is given (reka's `StepperRoot`); steps are 1-based.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,31 +43,18 @@ impl Default for StepperProps {
 }
 
 /// What the parts below [`stepper`] read.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 struct StepperContext {
-    props: Signal<PartProps<StepperProps>>,
-    step: UseModel<PartProps<StepperProps>, usize>,
+    stepper: Stepper<PartProps<StepperProps>>,
 }
 
-impl StepperContext {
-    fn state_of(&self, step: usize) -> StepState {
-        match step.cmp(&self.step.get()) {
-            std::cmp::Ordering::Less => StepState::Completed,
-            std::cmp::Ordering::Equal => StepState::Active,
-            std::cmp::Ordering::Greater => StepState::Inactive,
-        }
-    }
-
-    /// Whether `step` can be moved to now (reka's `isFocusable`).
-    fn reachable(&self, step: usize) -> bool {
-        !self.props.with(|p| p.props.linear) || step <= self.step.get().saturating_add(1)
-    }
-
-    /// Move to `step` when it can be reached.
-    fn go(&self, step: usize) {
-        if self.reachable(step) {
-            self.step.set(step);
-        }
+impl StepperProps {
+    fn layout(&self) -> (bool, Axis) {
+        let axis = match self.orientation {
+            Orientation::Horizontal => Axis::Horizontal,
+            Orientation::Vertical => Axis::Vertical,
+        };
+        (self.linear, axis)
     }
 }
 
@@ -80,21 +67,29 @@ pub fn stepper() -> Part<StepperProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                provide(StepperContext {
-                    props,
-                    step: use_model(props, |p| &p.props.step),
-                });
+                let stepper = Stepper::new(
+                    use_model(props, |p: &PartProps<StepperProps>| &p.props.step),
+                    use_direction(None),
+                );
+                let (linear, axis) = props.with_untracked(|p| p.props.layout());
+                stepper.set_layout(linear, axis);
+                watch(
+                    move || props.with(|p| p.props.layout()),
+                    move |(linear, axis), _| stepper.set_layout(*linear, *axis),
+                );
+                provide(StepperContext { stepper });
                 move || {
-                    props
-                        .with(|p| {
-                            p.slot
-                                .0
-                                .clone()
-                                .when(p.props.orientation == Orientation::Vertical, |e| {
-                                    e.display(Display::Flex).flex_direction(FlexDirection::Column)
-                                })
-                        })
-                        .into_element()
+                    let root = props.with(|p| {
+                        p.slot
+                            .0
+                            .clone()
+                            .when(p.props.orientation == Orientation::Vertical, |e| {
+                                e.display(Display::Flex).flex_direction(FlexDirection::Column)
+                            })
+                    });
+                    // The status line a screen reader hears as the step moves; not on screen.
+                    let status = visually_hidden(stepper.status(div()), Hidden::Visually);
+                    stepper.root(root).child(status).into_element()
                 }
             })
         },
@@ -123,7 +118,7 @@ impl Part<StepperProps> {
 
     /// Called with each step moved to (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(usize) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<usize>>) -> Self {
         self.with_props(|p| p.step = std::mem::take(&mut p.step).on_change(f))
     }
 
@@ -147,14 +142,19 @@ pub struct StepperItem {
     pub state: StepState,
     /// Whether it can be moved to now.
     pub reachable: bool,
+    /// Its title's and description's nodes, which name its trigger.
+    pub labels: StepLabels,
 }
 
 type Fill = Rc<dyn Fn(StepperItem, Div) -> Div>;
 
-/// What a [`stepper_item`] is given: its step, and what fills it.
+/// What a [`stepper_item`] is given: its step, whether it is done or
+/// disabled of its own, and what fills it.
 #[derive(Clone)]
 pub struct StepperItemProps {
     step: usize,
+    completed: bool,
+    disabled: bool,
     fill: Option<Fill>,
 }
 
@@ -173,25 +173,40 @@ pub fn stepper_item(step: usize) -> Part<StepperItemProps> {
         .display(Display::Flex)
         .align_items(Align::Center)
         .gap(8.0);
-    Part::new(StepperItemProps { step, fill: None }, root, |p| {
+    let props = StepperItemProps {
+        step,
+        completed: false,
+        disabled: false,
+        fill: None,
+    };
+    Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let stepper = use_context::<StepperContext>();
+            let stepper = use_root::<StepperContext>("stepper_item", "stepper");
             provide(ItemContext { props });
             move || {
-                let (step, fill, root) = props.with(|p| (p.props.step, p.props.fill.clone(), p.slot.0.clone()));
-                let item = stepper.as_ref().map_or(
-                    StepperItem {
-                        step,
-                        state: StepState::Inactive,
-                        reachable: true,
-                    },
-                    |s| StepperItem {
-                        step,
-                        state: s.state_of(step),
-                        reachable: s.reachable(step),
-                    },
-                );
+                let (item, fill, root) = props.with(|p| (p.props.clone(), p.props.fill.clone(), p.slot.0.clone()));
+                let step = item.step;
+                let (item, root) = match stepper {
+                    None => (
+                        StepperItem {
+                            step,
+                            state: StepState::Inactive,
+                            reachable: true,
+                            labels: StepLabels::new(),
+                        },
+                        root,
+                    ),
+                    Some(s) => (
+                        StepperItem {
+                            step,
+                            state: s.stepper.state(step, item.completed),
+                            reachable: s.stepper.reachable(step, Availability::from_disabled(item.disabled)),
+                            labels: s.stepper.labels(step),
+                        },
+                        s.stepper.item(root, step),
+                    ),
+                };
                 match fill {
                     Some(fill) => fill(item, root).into_element(),
                     None => root.into_element(),
@@ -208,6 +223,18 @@ impl Part<StepperItemProps> {
     pub fn fill(self, f: impl Fn(StepperItem, Div) -> Div + 'static) -> Self {
         let f: Fill = Rc::new(f);
         self.with_props(|p| p.fill = Some(f))
+    }
+
+    /// Done whatever the current step (reka's `completed`).
+    #[must_use]
+    pub fn completed(self, completed: bool) -> Self {
+        self.with_props(|p| p.completed = completed)
+    }
+
+    /// Never reached, by a press, a key or the caller (reka's `disabled`).
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.disabled = disabled)
     }
 }
 
@@ -233,16 +260,17 @@ pub fn stepper_trigger_as(child: impl Into<Div>) -> Part<()> {
     Part::new((), child.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let stepper = use_context::<StepperContext>();
-            let item = use_context::<ItemContext>();
+            let stepper = use_root::<StepperContext>("stepper_trigger", "stepper");
+            let item = use_root::<ItemContext>("stepper_trigger", "stepper_item");
+            let focus = FocusHandle::new();
             move || {
-                let root = props.with(|p| p.slot.0.clone()).focusable();
-                let (Some(stepper), Some(item)) = (stepper.clone(), item) else {
-                    return root.into_element();
+                let root = props.with(|p| p.slot.0.clone());
+                let (Some(s), Some(item)) = (stepper, item) else {
+                    return root.focusable().into_element();
                 };
-                let step = item.props.with(|p| p.props.step);
-                root.when(!stepper.reachable(step), |d| d.disabled(true))
-                    .on_click(move |_| stepper.go(step))
+                let (step, disabled) = item.props.with(|p| (p.props.step, p.props.disabled));
+                s.stepper
+                    .trigger(root, step, focus, Availability::from_disabled(disabled))
                     .into_element()
             }
         })
@@ -271,11 +299,13 @@ pub fn stepper_indicator(item: StepperItem) -> Div {
     d.when(!item.reachable, |d| d.text_color(t.muted_foreground).opacity(0.5))
 }
 
-/// The line from `item`'s step to the next.
+/// The line from `item`'s step to the next: decorative, nothing to a
+/// screen reader (reka's `StepperSeparator`).
 #[must_use]
 pub fn stepper_separator(item: StepperItem) -> Div {
     let t = theme();
-    div()
+    Separator::DEFAULT
+        .apply(div())
         .named("stepper-separator")
         .background(if item.state == StepState::Completed {
             t.accent
@@ -285,16 +315,23 @@ pub fn stepper_separator(item: StepperItem) -> Div {
         .when(!item.reachable, |d| d.opacity(0.5))
 }
 
+/// `item`'s title, which names its trigger.
 #[must_use]
-pub fn stepper_title(title: impl Into<String>) -> gui::Text {
+pub fn stepper_title(item: StepperItem, title: impl Into<String>) -> gui::Text {
     // `text-md` is no Tailwind size, so the inherited size stands.
-    text(title).named("stepper-title").font_weight(600).nowrap(true)
+    item.labels
+        .title(text(title))
+        .named("stepper-title")
+        .font_weight(600)
+        .nowrap(true)
 }
 
+/// `item`'s description, which names its trigger after the title.
 #[must_use]
-pub fn stepper_description(description: impl Into<String>) -> gui::Text {
+pub fn stepper_description(item: StepperItem, description: impl Into<String>) -> gui::Text {
     let t = theme();
-    text(description)
+    item.labels
+        .description(text(description))
         .named("stepper-description")
         .text_size(12.0)
         .line_height(16.0)

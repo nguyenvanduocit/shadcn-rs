@@ -15,8 +15,13 @@
   "dependencies": {
     "@comark/vue": "^0.7.0",
     "@formisch/vue": "^1.2.0",
+    "@hugeicons/core-free-icons": "^4.4.0",
+    "@hugeicons/vue": "^1.0.8",
     "@internationalized/date": "^3.12.4",
     "@lucide/vue": "^1.77.0",
+    "@phosphor-icons/vue": "^2.2.1",
+    "@remixicon/vue": "^4.9.0",
+    "@tabler/icons-vue": "^3.52.0",
     "@tailwindcss/vite": "^4.3.5",
     "@tanstack/vue-form": "^1.33.5",
     "@tanstack/vue-table": "^9.3.1",

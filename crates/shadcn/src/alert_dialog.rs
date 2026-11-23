@@ -2,40 +2,113 @@
 //! a dialog it has no close button and a press outside does not dismiss it:
 //! the user answers through its action or cancel button (or Escape).
 //!
-//! As Reka builds `AlertDialogRoot` on `DialogRoot`, [`alert_dialog`] is a
-//! [`dialog`](crate::dialog) root: it opens through
-//! [`dialog_trigger`](crate::dialog_trigger) and keeps its open state the
-//! same way (`open`, `default_open`, `on_open_change`).
+//! The behaviour is `primitives::alert_dialog`'s: always modal, read as an
+//! alert dialog, focusing its cancel button as it opens. It opens through
+//! [`dialog_trigger`](crate::dialog_trigger), and its title and
+//! description are [`alert_dialog_title`] and [`alert_dialog_description`]
+//! (or the dialog's); it keeps its open state as a dialog does (`open`,
+//! `default_open`, `on_open_change`).
 
 use gui::prelude::*;
-use gui::{Div, Element, ElementKey, Text, component, text};
+use gui::{Bind, Div, Element, ElementKey, FocusHandle, Model, component, provide, text, use_model};
+use primitives::alert_dialog::{AlertDialog, AlertDialogOptions};
+use primitives::context::use_root;
+use primitives::presence::Presence;
 
 use crate::button::{Button, ButtonSize, ButtonVariant, button};
 use crate::dialog::{
-    DialogContext, DialogProps, ModalContentProps, ModalLook, centred_surface, dialog_close, dialog_description,
-    dialog_footer, dialog_header, modal_content, modal_root,
+    Modal, ModalContentProps, ModalLook, ModalText, Veto, centred_surface, dialog_description, dialog_footer,
+    dialog_header, modal_layer, modal_title,
 };
-use crate::part::Part;
+use crate::part::{Part, PartProps};
+
+/// What [`alert_dialog`] is given.
+#[derive(Clone, PartialEq, Default)]
+pub struct AlertDialogProps {
+    open: Bind<bool>,
+    veto: Option<Veto>,
+}
+
+/// The alert dialog of an [`alert_dialog`] root.
+type AlertState = AlertDialog<PartProps<AlertDialogProps>>;
 
 /// The alert dialog's root: give it a trigger and an [`alert_dialog_content`].
 #[must_use]
-pub fn alert_dialog() -> Part<DialogProps> {
-    modal_root(gui::div().named("alert-dialog"))
+pub fn alert_dialog() -> Part<AlertDialogProps> {
+    Part::new(AlertDialogProps::default(), gui::div().named("alert-dialog"), |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let d = AlertDialog::new(
+                use_model(props, |p: &PartProps<AlertDialogProps>| &p.props.open),
+                move || {
+                    props.with(|p| AlertDialogOptions {
+                        veto: p.props.veto.clone(),
+                        ..AlertDialogOptions::default()
+                    })
+                },
+            );
+            provide(d);
+            provide(Modal::Alert(d));
+            move || props.with(|p| p.slot.0.clone()).into_element()
+        })
+    })
+}
+
+impl Part<AlertDialogProps> {
+    /// Open or not, kept by the caller (`v-model:open`).
+    #[must_use]
+    pub fn open(self, open: impl Into<Model<bool>>) -> Self {
+        self.with_props(|p| p.open = p.open.clone().with_model(open))
+    }
+
+    /// Open from the start, when no model is given (`default-open`).
+    #[must_use]
+    pub fn default_open(self, open: bool) -> Self {
+        self.with_props(|p| p.open = p.open.clone().with_default(open))
+    }
+
+    /// Call `f` each time it opens or closes (`@update:open`).
+    #[must_use]
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
+        self.with_props(|p| p.open = p.open.clone().on_change(f))
+    }
+
+    /// Answer Escape, its one dismissal (`escapeKeyDown` with
+    /// `preventDefault`).
+    #[must_use]
+    pub fn on_dismiss(self, f: impl Into<gui::Callback<gui::DismissReason, gui::Dismiss>>) -> Self {
+        let f = f.into();
+        self.with_props(|p| p.veto = Some(f))
+    }
 }
 
 /// The alert dialog, centred on a dimmed page (`AlertDialogContent`); style
 /// and fill it as a `Div`.
 #[must_use]
 pub fn alert_dialog_content() -> Part<ModalContentProps> {
-    modal_content(
-        centred_surface()
-            .named("alert-dialog-content")
-            .role(gui::Role::AlertDialog),
-        ModalLook {
-            centred: true,
-            overlay_ms: None,
-            dismiss_outside: false,
-            close_button: false,
+    let look = ModalLook {
+        centred: true,
+        overlay_ms: None,
+        close_button: false,
+    };
+    Part::new(
+        ModalContentProps { look },
+        centred_surface().named("alert-dialog-content"),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                let dialog = use_root::<AlertState>("alert_dialog_content", "alert_dialog");
+                move || {
+                    let Some(d) = dialog else {
+                        return Element::Empty;
+                    };
+                    let presence = d.presence();
+                    if presence == Presence::Gone {
+                        return Element::Empty;
+                    }
+                    props.with(|p| modal_layer(presence, true, p.props.look, d.content(p.slot.0.clone())))
+                }
+            })
         },
     )
 }
@@ -50,24 +123,26 @@ pub fn alert_dialog_footer() -> Div {
     dialog_footer().named("alert-dialog-footer")
 }
 
-#[must_use]
-pub fn alert_dialog_title(title: impl Into<String>) -> Text {
-    text(title)
-        .named("alert-dialog-title")
-        .text_size(18.0)
-        .line_height(28.0)
-        .font_weight(600)
+/// The alert dialog's title, which names it to a screen reader.
+pub fn alert_dialog_title(title: impl Into<String>) -> ModalText {
+    modal_title(
+        text(title)
+            .named("alert-dialog-title")
+            .text_size(18.0)
+            .line_height(28.0)
+            .font_weight(600),
+    )
 }
 
-#[must_use]
-pub fn alert_dialog_description(description: impl Into<String>) -> Text {
+/// The alert dialog's description, which describes it to a screen reader.
+pub fn alert_dialog_description(description: impl Into<String>) -> ModalText {
     dialog_description(description).named("alert-dialog-description")
 }
 
 /// The confirming button: a default button that runs `on_action` and closes
 /// the dialog; give it its label with `.child`.
-pub fn alert_dialog_action(on_action: impl Fn() + 'static) -> AlertDialogButton {
-    let on_action = gui::Callback::new(move |()| on_action());
+pub fn alert_dialog_action(on_action: impl Into<gui::Callback<()>>) -> AlertDialogButton {
+    let on_action: gui::Callback<()> = on_action.into();
     AlertDialogButton {
         button: button(ButtonVariant::Default, ButtonSize::Default).named("alert-dialog-action"),
         key: None,
@@ -76,17 +151,15 @@ pub fn alert_dialog_action(on_action: impl Fn() + 'static) -> AlertDialogButton 
                 Part::new(on_action, root, |p| {
                     component(p, |cx| {
                         let props = cx.props();
-                        let dialog = DialogContext::find();
+                        let dialog = use_root::<AlertState>("alert_dialog_action", "alert_dialog");
                         move || {
                             props
                                 .with(|p| {
                                     let action = p.props.clone();
-                                    p.slot.0.clone().on_click(move |_| {
-                                        action.call(());
-                                        if let Some(d) = dialog {
-                                            d.set_open(false);
-                                        }
-                                    })
+                                    match dialog {
+                                        Some(d) => d.action(p.slot.0.clone(), action),
+                                        None => p.slot.0.clone(),
+                                    }
                                 })
                                 .into_element()
                         }
@@ -98,13 +171,35 @@ pub fn alert_dialog_action(on_action: impl Fn() + 'static) -> AlertDialogButton 
     }
 }
 
-/// The declining button: an outline button that closes the dialog; give it
-/// its label with `.child`.
+/// The declining button: an outline button that closes the dialog, and
+/// takes focus as it opens; give it its label with `.child`.
 pub fn alert_dialog_cancel() -> AlertDialogButton {
     AlertDialogButton {
         button: button(ButtonVariant::Outline, ButtonSize::Default).named("alert-dialog-cancel"),
         key: None,
-        part: Box::new(|root, key| keyed(dialog_close(root), key)),
+        part: Box::new(|root, key| {
+            keyed(
+                Part::new((), root, |p| {
+                    component(p, |cx| {
+                        let props = cx.props();
+                        let dialog = use_root::<AlertState>("alert_dialog_cancel", "alert_dialog");
+                        let focus = FocusHandle::new();
+                        if let Some(d) = dialog {
+                            d.register_cancel(focus);
+                        }
+                        move || {
+                            let root = props.with(|p| p.slot.0.clone());
+                            match dialog {
+                                Some(d) => d.cancel(root, focus),
+                                None => root,
+                            }
+                            .into_element()
+                        }
+                    })
+                }),
+                key,
+            )
+        }),
     }
 }
 
@@ -194,7 +289,7 @@ mod tests {
     fn an_icon_given_after_the_part_narrows_its_padding() {
         let action = |with_icon: bool| {
             inset("alert-dialog-action", move || {
-                alert_dialog_action(|| {})
+                alert_dialog_action(|()| {})
                     .when(with_icon, |b| b.child(icon(Icon::Trash)))
                     .child("Delete")
                     .into_element()

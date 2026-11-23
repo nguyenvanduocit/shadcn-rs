@@ -76,21 +76,38 @@ pub(super) struct Sources {
     /// A moving effect's opacity (the last moving node naming it wins).
     opacity: foldhash::HashMap<u32, f32>,
     pub(super) moved: Vec<(NodeKey, (f32, f32))>,
+    pub(super) turned: Vec<(NodeKey, crate::style::Painted)>,
     pub(super) scroll: Vec<ShownScroll>,
 }
 
+impl Sources {
+    /// Empty, its memory kept.
+    fn clear(&mut self) {
+        self.own.clear();
+        self.set.clear();
+        self.thumbs.clear();
+        self.opacity.clear();
+        self.moved.clear();
+        self.turned.clear();
+        self.scroll.clear();
+    }
+}
+
 impl Compositor {
-    /// What it moves at `at`.
-    pub(super) fn sources(&self, at: f32) -> Sources {
+    /// What it moves at `at`, written into the sources the last frame
+    /// left (their memory kept).
+    pub(super) fn sources(&mut self, at: f32) -> Sources {
+        let mut src = std::mem::take(&mut self.spare);
+        src.clear();
         let scene = &self.scene;
         let props = &scene.properties;
         let n = props.transforms.len();
-        let mut src = Sources::default();
         for m in scene.compositing.moving.iter() {
-            let (entry, opacity) = moving_at(m, at, scene.scale);
+            let (entry, opacity, painted) = moving_at(m, at, scene.scale);
             if let Some(t) = m.transform
                 && usize::try_from(t).is_ok_and(|i| i < n)
             {
+                src.turned.push((m.key, painted));
                 let was = props.transform(t);
                 let d = (entry.offset.0 - was.offset.0, entry.offset.1 - was.offset.1);
                 src.own.insert(t, d);
@@ -118,6 +135,7 @@ impl Compositor {
             }
             src.scroll.push(ShownScroll {
                 key: s.key,
+                owner: s.owner,
                 offset,
                 applied,
             });
@@ -127,7 +145,7 @@ impl Compositor {
                 let along = t.travel * (offset.1 / s.max.1);
                 src.thumbs.push((t.transform, (t.top.0, t.top.1 + along)));
                 // Shown only while it is: at rest it stays as committed (hidden).
-                let shown = self.scrolls.thumb_opacity(s.key, at);
+                let shown = self.scrolls.thumb_opacity(s, at);
                 if shown > 0.0 && usize::try_from(t.effect).is_ok_and(|e| e < props.effects.len()) {
                     src.opacity.insert(t.effect, shown);
                 }
@@ -273,6 +291,11 @@ pub(super) struct Work {
     list: Vec<u32>,
     stack: Vec<u32>,
     totals: foldhash::HashMap<u32, (f32, f32)>,
+    /// A transform's ancestors whose totals are not known yet.
+    chain: Vec<u32>,
+    /// The clips and effects to compose again.
+    clip_list: Vec<u32>,
+    effect_list: Vec<u32>,
 }
 
 impl Compositor {
@@ -280,7 +303,21 @@ impl Compositor {
     /// motion and commits since the last frame reach, and noting in
     /// `changed` what of it differs from what was shown.
     pub(super) fn compose_into_shown(&mut self, at: f32) {
-        let src = self.sources(at);
+        // The frame on screen until this one is, kept as what this compose
+        // overwrites of it (a wheel that came while it was is routed in
+        // it): the work is what changed, not the whole tables.
+        let mut was = if self.ring.len() >= super::ROUTED - 1 {
+            self.ring.pop_back().unwrap_or_default()
+        } else {
+            Box::default()
+        };
+        was.frame = self.presented.frame;
+        was.scale = self.shown.scale;
+        was.compositing.clone_from(&self.shown.compositing);
+        was.transforms.clear();
+        was.clips.clear();
+        was.whole = None;
+        let mut src = self.sources(at);
         let (a, b) = (&self.shown.properties, &self.scene.properties);
         let reshaped = a.transforms.len() != b.transforms.len()
             || a.clips.len() != b.clips.len()
@@ -289,27 +326,31 @@ impl Compositor {
         if std::mem::take(&mut self.pending.all) || reshaped {
             self.pending.clear();
             self.links = Links::of(&self.scene.properties);
-            self.shown.properties = whole(&self.scene, &src);
+            was.whole = Some(std::mem::replace(&mut self.shown.properties, whole(&self.scene, &src)));
             self.shown.chunks.clone_from(&self.scene.chunks);
             self.changed.all = true;
         } else {
-            self.compose_changed(&src);
+            self.compose_changed(&src, &mut was);
+        }
+        if self.presented.frame != 0 {
+            self.ring.push_front(was);
         }
         let scene = &self.scene;
         self.shown.scale = scene.scale;
         self.shown.size = scene.size;
         self.shown.background = scene.background;
         self.shown.compositing.clone_from(&scene.compositing);
-        self.moved = Moved {
-            transforms: src
-                .own
+        let moved = &mut self.moved;
+        moved.transforms.clear();
+        moved.transforms.extend(
+            src.own
                 .keys()
                 .chain(src.set.keys())
                 .copied()
-                .chain(src.thumbs.iter().map(|t| t.0))
-                .collect(),
-            effects: src.opacity.keys().copied().collect(),
-        };
+                .chain(src.thumbs.iter().map(|t| t.0)),
+        );
+        moved.effects.clear();
+        moved.effects.extend(src.opacity.keys().copied());
         if self.cold_check {
             let cold = whole(&self.scene, &src);
             assert!(
@@ -318,18 +359,38 @@ impl Compositor {
                 self.frame
             );
         }
-        self.presented = std::sync::Arc::new(super::Presented {
-            frame: self.frame.saturating_add(1),
-            commit: self.commit,
-            present_at: at,
-            scroll: src.scroll,
-            moved: src.moved,
-        });
+        let (frame, commit) = (self.frame.saturating_add(1), self.commit);
+        // The frame shown two before, if nothing holds it any more (the
+        // render thread hands the UI the one before until this one is
+        // drawn; no wheel under it is under way), becomes this one; its
+        // lists are the next frame's sources.
+        let next = if let Some(mut old) = self.retired.take()
+            && let Some(p) = std::sync::Arc::get_mut(&mut old)
+        {
+            p.frame = frame;
+            p.commit = commit;
+            p.present_at = at;
+            std::mem::swap(&mut p.scroll, &mut src.scroll);
+            std::mem::swap(&mut p.moved, &mut src.moved);
+            std::mem::swap(&mut p.turned, &mut src.turned);
+            old
+        } else {
+            std::sync::Arc::new(super::Presented {
+                frame,
+                commit,
+                present_at: at,
+                scroll: std::mem::take(&mut src.scroll),
+                moved: std::mem::take(&mut src.moved),
+                turned: std::mem::take(&mut src.turned),
+            })
+        };
+        self.retired = Some(std::mem::replace(&mut self.presented, next));
+        self.spare = src;
     }
 
     /// Write what `src`, the last frame's motion and the commits since reach.
     #[expect(clippy::too_many_lines, reason = "transforms, clips, effects, chunks, in order")]
-    fn compose_changed(&mut self, src: &Sources) {
+    fn compose_changed(&mut self, src: &Sources, was: &mut super::Before) {
         let k = self.scene.scale;
         let committed = &self.scene.properties;
         let shown = &mut self.shown.properties;
@@ -358,7 +419,8 @@ impl Compositor {
         // Their totals: only what lies under a displacement has one.
         w.totals.clear();
         let total = |t: u32, w: &mut Work| -> (f32, f32) {
-            let mut chain = Vec::new();
+            let mut chain = std::mem::take(&mut w.chain);
+            chain.clear();
             let mut at = t;
             let mut acc = (0.0, 0.0);
             while w.reached.has(at) && chain.len() <= nt {
@@ -377,6 +439,7 @@ impl Compositor {
                 acc = (acc.0 + o.0, acc.1 + o.1);
                 w.totals.insert(i, acc);
             }
+            w.chain = chain;
             acc
         };
         let thumb = |t: u32| src.thumbs.iter().rev().find(|(id, _)| *id == t).map(|(_, top)| *top);
@@ -401,6 +464,7 @@ impl Compositor {
             };
             if *slot != next {
                 let turned = slot.matrix != next.matrix;
+                was.transforms.push((t, *slot));
                 *slot = next;
                 if w.changed_t.mark(t) {
                     changed.transforms.push(t);
@@ -419,8 +483,10 @@ impl Compositor {
             }
         }
         // Clips and effects under what moved, and those committed.
-        let mut clips: Vec<u32> = Vec::new();
-        let mut effects: Vec<u32> = Vec::new();
+        let mut clips = std::mem::take(&mut w.clip_list);
+        let mut effects = std::mem::take(&mut w.effect_list);
+        clips.clear();
+        effects.clear();
         for &t in &todo {
             for &c in get(&links.clips, t) {
                 if w.clips.mark(c) {
@@ -443,7 +509,7 @@ impl Compositor {
                 effects.push(e);
             }
         }
-        for c in clips {
+        for &c in &clips {
             if c == 0 {
                 continue;
             }
@@ -455,11 +521,12 @@ impl Compositor {
             if let Some(slot) = usize::try_from(c).ok().and_then(|i| shown.clips.get_mut(i))
                 && *slot != next
             {
+                was.clips.push((c, *slot));
                 *slot = next;
                 changed.clips.push(c);
             }
         }
-        for e in effects {
+        for &e in &effects {
             let Some(base) = usize::try_from(e).ok().and_then(|i| committed.effects.get(i)) else {
                 continue;
             };
@@ -488,6 +555,8 @@ impl Compositor {
         }
         todo.clear();
         w.list = todo;
+        w.clip_list = clips;
+        w.effect_list = effects;
         for &i in &pending.chunks {
             if let (Some(slot), Some(c)) = (self.shown.chunks.get_mut(i), self.scene.chunks.get(i)) {
                 slot.clone_from(c);

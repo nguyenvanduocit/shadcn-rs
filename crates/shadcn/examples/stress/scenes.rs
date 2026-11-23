@@ -3,6 +3,11 @@
 //! flooding the UI, huge text, keyed churn), and one composite app that uses
 //! many shadcn components together.
 
+#![expect(
+    clippy::disallowed_types,
+    reason = "test and example state the test reads back, not a component's"
+)]
+
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
@@ -1847,8 +1852,8 @@ fn edit_dialog(d: &Dashboard) -> Element {
         .into_element()
 }
 
-thread_local! {
-    static EMAIL: TextField = gui::detached(|| TextField::new(""));
+gui::engine_local! {
+    [Shared("the dashboard's email field, one per thread: a handle made outside any cold frame")] static EMAIL: TextField = gui::detached(|| TextField::new(""));
 }
 
 /// The dialog's email field (one per thread, as the dashboard is).
@@ -2013,7 +2018,9 @@ fn chart_100m() -> Render {
     let last = Rc::new(Cell::new(None::<f32>));
     let drag_to = Rc::new({
         move |x: f32, width: f32, phase: gui::DragPhase| {
-            if let Some(from) = last.get() {
+            if phase != gui::DragPhase::Cancel
+                && let Some(from) = last.get()
+            {
                 let px = f64::from(from - x);
                 view.update(|(a, b)| {
                     let span = b.saturating_sub(*a);
@@ -2023,7 +2030,7 @@ fn chart_100m() -> Render {
                     *b = a.saturating_add(span);
                 });
             }
-            last.set((phase != gui::DragPhase::End).then_some(x));
+            last.set((!phase.is_last()).then_some(x));
         }
     });
     let wheel = move |dy: f32, at: f32, w: f32| {
@@ -2080,7 +2087,10 @@ fn chart_100m() -> Render {
                         let drag_to = Rc::clone(&drag_to);
                         move |e| drag_to(e.x, e.bounds.width, e.phase)
                     })
-                    .on_wheel(move |e| wheel(e.dy, e.x - e.bounds.x, e.bounds.width))
+                    .on_wheel(move |e| {
+                        wheel(e.dy, e.x - e.bounds.x, e.bounds.width);
+                        true
+                    })
                     .named("chart-plot")
                     .flex(Flex::grow(1.0))
                     .min_height(0.0),

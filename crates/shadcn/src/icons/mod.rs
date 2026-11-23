@@ -67,6 +67,24 @@ compile_error!(
     "shadcn needs an icon library: enable one of the features lucide, tabler, hugeicons, phosphor, remixicon"
 );
 
+/// The library [`IconSet::DEFAULT`] names: the first of [`IconSet::ALL`].
+#[cfg(feature = "lucide")]
+const FIRST: IconSet = IconSet::Lucide;
+#[cfg(all(not(feature = "lucide"), feature = "tabler"))]
+const FIRST: IconSet = IconSet::Tabler;
+#[cfg(all(not(any(feature = "lucide", feature = "tabler")), feature = "hugeicons"))]
+const FIRST: IconSet = IconSet::Hugeicons;
+#[cfg(all(
+    not(any(feature = "lucide", feature = "tabler", feature = "hugeicons")),
+    feature = "phosphor"
+))]
+const FIRST: IconSet = IconSet::Phosphor;
+#[cfg(all(
+    not(any(feature = "lucide", feature = "tabler", feature = "hugeicons", feature = "phosphor")),
+    feature = "remixicon"
+))]
+const FIRST: IconSet = IconSet::Remixicon;
+
 /// What an icon is for. Each [`IconSet`] has a glyph for every role.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IconRole {
@@ -198,30 +216,7 @@ impl IconSet {
 
     /// Lucide when this build carries it, as upstream's default; otherwise the first library it carries. A `const`, so
     /// a `const` theme can name it.
-    #[cfg(feature = "lucide")]
-    pub const DEFAULT: IconSet = IconSet::Lucide;
-    /// Lucide when this build carries it, as upstream's default; otherwise the first library it carries. A `const`, so
-    /// a `const` theme can name it.
-    #[cfg(all(not(feature = "lucide"), feature = "tabler"))]
-    pub const DEFAULT: IconSet = IconSet::Tabler;
-    /// Lucide when this build carries it, as upstream's default; otherwise the first library it carries. A `const`, so
-    /// a `const` theme can name it.
-    #[cfg(all(not(any(feature = "lucide", feature = "tabler")), feature = "hugeicons"))]
-    pub const DEFAULT: IconSet = IconSet::Hugeicons;
-    /// Lucide when this build carries it, as upstream's default; otherwise the first library it carries. A `const`, so
-    /// a `const` theme can name it.
-    #[cfg(all(
-        not(any(feature = "lucide", feature = "tabler", feature = "hugeicons")),
-        feature = "phosphor"
-    ))]
-    pub const DEFAULT: IconSet = IconSet::Phosphor;
-    /// Lucide when this build carries it, as upstream's default; otherwise the first library it carries. A `const`, so
-    /// a `const` theme can name it.
-    #[cfg(all(
-        not(any(feature = "lucide", feature = "tabler", feature = "hugeicons", feature = "phosphor")),
-        feature = "remixicon"
-    ))]
-    pub const DEFAULT: IconSet = IconSet::Remixicon;
+    pub const DEFAULT: IconSet = FIRST;
 
     /// Upstream's name for it (`iconLibrary` in shadcn's config), which is also its cargo feature.
     #[must_use]

@@ -270,6 +270,96 @@ impl PartialEq for SeriesSnapshot {
     }
 }
 
+impl SeriesSnapshot {
+    /// Whether it holds the same points as `other` (each x, and y to the
+    /// bit), whichever series and pages hold them: the cold check's
+    /// compare ([`super::Source`]'s).
+    pub(crate) fn same_points(&self, other: &Self) -> bool {
+        self.same_points_counted(other, &mut 0)
+    }
+
+    /// [`Self::same_points`], counting the page locks it takes in `locks`:
+    /// both sides walked page by page, contiguous runs compared as slices,
+    /// one lock a page and no search.
+    fn same_points_counted(&self, other: &Self, locks: &mut usize) -> bool {
+        if (self.0.start, self.0.len, self.0.precise) != (other.0.start, other.0.len, other.0.precise) {
+            return false;
+        }
+        let (mut a, mut b) = (Run::new(&self.0.pages), Run::new(&other.0.pages));
+        loop {
+            let (left_a, left_b) = (a.left(locks), b.left(locks));
+            if left_a == 0 || left_b == 0 {
+                return left_a == left_b;
+            }
+            let k = left_a.min(left_b);
+            let (Some(ra), Some(rb)) = (a.take(k), b.take(k)) else {
+                return false;
+            };
+            let same_bits = |p: &[f32], q: &[f32]| p.iter().zip(q).all(|(p, q)| p.to_bits() == q.to_bits());
+            let same_lo = match (ra.2, rb.2) {
+                (Some(la), Some(lb)) => same_bits(la, lb),
+                (la, lb) => la.is_none() && lb.is_none(),
+            };
+            if ra.0 != rb.0 || !same_bits(ra.1, rb.1) || !same_lo {
+                return false;
+            }
+        }
+    }
+}
+
+/// A snapshot's points walked page by page: the page it is on, locked
+/// once, and how far along it.
+struct Run<'a> {
+    pages: std::slice::Iter<'a, (Arc<Page>, usize)>,
+    held: Option<RwLockReadGuard<'a, PageData>>,
+    /// The page's points the snapshot holds, and how many are walked.
+    n: usize,
+    at: usize,
+}
+
+/// A run of points: x's, y's and y's low parts.
+type Slices<'a> = (&'a [i64], &'a [f32], Option<&'a [f32]>);
+
+impl<'a> Run<'a> {
+    fn new(pages: &'a [(Arc<Page>, usize)]) -> Self {
+        Self {
+            pages: pages.iter(),
+            held: None,
+            n: 0,
+            at: 0,
+        }
+    }
+
+    /// How many points are left on the page held, the next one locked
+    /// (and counted in `locks`) when it is spent; 0 past the last.
+    fn left(&mut self, locks: &mut usize) -> usize {
+        while self.at >= self.n {
+            let Some((page, n)) = self.pages.next() else {
+                self.held = None;
+                return 0;
+            };
+            *locks = locks.saturating_add(1);
+            let data = page.read();
+            self.n = (*n).min(data.len());
+            self.held = Some(data);
+            self.at = 0;
+        }
+        self.n.saturating_sub(self.at)
+    }
+
+    /// The next `k` points of the page held.
+    fn take(&mut self, k: usize) -> Option<Slices<'_>> {
+        let range = self.at..self.at.checked_add(k)?;
+        self.at = range.end;
+        let data = self.held.as_ref()?;
+        let lo = match &data.lo {
+            Some(lo) => Some(lo.get(range.clone())?),
+            None => None,
+        };
+        Some((data.x.get(range.clone())?, data.y.get(range)?, lo))
+    }
+}
+
 /// What a range of a snapshot holds (indices the snapshot's).
 pub type Summary = Node;
 
@@ -759,6 +849,31 @@ impl SeriesState {
 #[expect(clippy::as_conversions, reason = "test values are small and known")]
 mod tests {
     use super::*;
+
+    /// The cold check's compare of two series of a million points, paged
+    /// differently: it locks each page once, whatever the points.
+    #[test]
+    fn comparing_series_by_content_locks_each_page_once() {
+        let n = 1_000_000_usize;
+        let xs: Vec<i64> = (0..n).map(|i| i64::try_from(i).unwrap()).collect();
+        let ys: Vec<f64> = (0..n).map(|i| f64::from(u32::try_from(i % 977).unwrap())).collect();
+        let made = |retain: u64| {
+            let mut s = SeriesState::new(Some(retain), false);
+            s.append(&xs, &ys);
+            s.snapshot()
+        };
+        let (a, b) = (made(1_000_000), made(2_000_000));
+        let pages = a.pages().count() + b.pages().count();
+        assert!(a.pages().count() != b.pages().count(), "paged differently");
+        let mut locks = 0;
+        assert!(a.same_points_counted(&b, &mut locks), "the same points");
+        assert_eq!(locks, pages, "one lock a page");
+        let mut other = ys.clone();
+        other[n - 1] = 0.5;
+        let mut s = SeriesState::new(Some(1_000_000), false);
+        s.append(&xs, &other);
+        assert!(!a.same_points(&s.snapshot()), "a point apart");
+    }
 
     fn series(ys: &[f64]) -> SeriesState {
         let xs: Vec<i64> = (0..ys.len()).map(|i| i64::try_from(i).unwrap()).collect();

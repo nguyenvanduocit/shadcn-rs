@@ -1,0 +1,13 @@
+---
+source: crates/primitives/tests/structure.rs
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      GenericContainer
+        GenericContainer
+        Splitter "Resize panel 1" Vertical value=40 in 20..=90 controls=GenericContainer
+        GenericContainer
+        Splitter "Resize panel 2" Vertical value=30 in 0..=70 disabled controls=GenericContainer
+        GenericContainer

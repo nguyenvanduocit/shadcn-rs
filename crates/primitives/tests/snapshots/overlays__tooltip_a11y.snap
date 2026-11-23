@@ -1,0 +1,15 @@
+---
+source: crates/primitives/tests/overlays.rs
+assertion_line: 589
+expression: t.s_a11y()
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Button described-by=Tooltip
+        Label "Bold"
+    GenericContainer
+      Button
+        Label "Italic"
+  Tooltip
+    Label "Bold"

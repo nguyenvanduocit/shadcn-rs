@@ -1,0 +1,19 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+# Membership across components goes through `gui::Registry` and
+# `gui::Holder` (registered as a part mounts), and a part's identities
+# are derived from its owner's (`NodeRef::derived`, `FocusHandle::derived`):
+# no interior-mutable collection is handed from one component to another.
+# Each cell left is its owner's alone, and says so where it is declared.
+disallowed-types = [
+    { path = "std::cell::RefCell", reason = "an owner-only cell says so with `#[expect]`; membership across components is `gui::Registry` or `gui::Holder`" },
+]
+
+# Per-thread state is declared with `gui::engine_local!`, which gives each
+# piece the policy a cold frame applies to it (`gui::engine`); a raw
+# `thread_local!` would be shared with the cold frame unseen.
+disallowed-macros = [
+    { path = "std::thread_local", reason = "declare per-thread state with gui::engine_local!, which gives it a cold policy" },
+]

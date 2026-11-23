@@ -143,7 +143,7 @@ fn vertical() -> Part<StepperProps> {
                             .gap(4.0)
                             .child(
                                 // `text-sm lg:text-base`: the reference renders at desktop width.
-                                stepper_title(title)
+                                stepper_title(item, title)
                                     .text_size(16.0)
                                     .line_height(24.0)
                                     .font_weight(600)
@@ -151,7 +151,7 @@ fn vertical() -> Part<StepperProps> {
                             )
                             // `text-xs lg:text-sm`; its `text-primary` loses to
                             // `text-muted-foreground` in the stylesheet's order.
-                            .child(stepper_description(description).text_size(14.0).line_height(20.0)),
+                            .child(stepper_description(item, description).text_size(14.0).line_height(20.0)),
                     )
                 })
         }))
@@ -189,7 +189,7 @@ pub fn render() -> Render {
                                     .text_align(TextAlign::Center)
                                     .child(
                                         // `text-sm lg:text-base`: the reference renders at desktop width.
-                                        stepper_title(title)
+                                        stepper_title(item, title)
                                             .text_size(16.0)
                                             .line_height(24.0)
                                             .font_weight(600)
@@ -198,7 +198,7 @@ pub fn render() -> Render {
                                     .child(
                                         // `text-xs lg:text-sm`; its `text-primary` loses to
                                         // `text-muted-foreground` in the stylesheet's order.
-                                        stepper_description(description).text_size(14.0).line_height(20.0),
+                                        stepper_description(item, description).text_size(14.0).line_height(20.0),
                                     ),
                             )
                     })
@@ -238,8 +238,8 @@ pub fn render() -> Render {
                                 .display(Display::Flex)
                                 .flex_direction(FlexDirection::Column)
                                 .align_items(Align::Center)
-                                .child(stepper_title(title))
-                                .child(stepper_description(description)),
+                                .child(stepper_title(item, title))
+                                .child(stepper_description(item, description)),
                         )
                     })
             }));

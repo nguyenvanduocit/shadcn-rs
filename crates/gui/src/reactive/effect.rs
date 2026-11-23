@@ -31,7 +31,7 @@ impl Effect {
             rt.adopt(id);
             id
         });
-        runtime::first_run(id.index);
+        runtime::first_run_or_defer(id);
         Self { id, created_at }
     }
 

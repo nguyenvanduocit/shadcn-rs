@@ -159,7 +159,7 @@ pub(crate) fn record_text_through(
     // Glyph coverage only: the text's colour shows nowhere.
     let shape = ResolvedText {
         color: Color::WHITE,
-        ..*t
+        ..t.clone()
     };
     let mut mask = Vec::new();
     text.draw(

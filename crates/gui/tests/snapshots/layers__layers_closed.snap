@@ -1,0 +1,7 @@
+---
+source: crates/gui/tests/layers.rs
+expression: dump(&whole)
+---
+Window "w"
+  GenericContainer
+    Button "Edit"

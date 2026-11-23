@@ -48,7 +48,7 @@ fn busy(on: Arc<AtomicBool>) {
 }
 
 /// A button, a spinning box and a list of 300 rows under them.
-fn app(on: Arc<AtomicBool>) -> impl FnMut() -> gui::Element {
+fn app(on: Arc<AtomicBool>) -> impl Fn() -> gui::Element {
     busy(on);
     let pressed = Signal::new(false);
     move || {

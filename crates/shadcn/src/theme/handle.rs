@@ -3,7 +3,6 @@
 //! group it changed (Flutter's `InheritedModel` aspects). A subtree's override is a computed of the enclosing theme,
 //! so an app-wide change still reaches it.
 
-use std::cell::OnceCell;
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -351,16 +350,16 @@ impl Deref for Colors {
     }
 }
 
-thread_local! {
+gui::engine_local! {
     /// The theme read where none is installed: neutral, light. Made once per thread, owned by nothing.
-    static DEFAULT: OnceCell<ThemeHandle> = const { OnceCell::new() };
+    [Shared("a handle to signals made outside any cold frame, in the live arena")]
+    static DEFAULT: ThemeHandle = detached(|| ThemeHandle::root(Theme::default()));
 }
 
 /// The theme in scope: the nearest [`with_theme`] above, else the one [`install`]ed, else neutral and light.
 #[must_use]
 pub fn use_theme() -> ThemeHandle {
-    use_context::<ThemeHandle>()
-        .unwrap_or_else(|| DEFAULT.with(|d| *d.get_or_init(|| detached(|| ThemeHandle::root(Theme::default())))))
+    use_context::<ThemeHandle>().unwrap_or_else(|| DEFAULT.with(|d| *d))
 }
 
 /// Make `theme` and `design` the app's (or, in an instance, its subtree's): each a writable value split into
@@ -396,4 +395,27 @@ pub fn with_theme(edit: impl Fn(&mut Theme) + 'static, child: impl IntoElement) 
             move || props.with(|p| p.child.0.clone())
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Scheme, use_theme};
+    use crate::design::use_design;
+
+    /// The default theme and style read first inside a cold frame are made
+    /// live: the next live reader gets the same handles, and they work.
+    #[test]
+    fn the_defaults_read_first_in_a_cold_frame_are_live_ones() {
+        std::thread::spawn(|| {
+            gui::engine::in_cold_frame(|| (use_theme().scheme(), use_design().get()));
+            let (t, d) = (use_theme(), use_design());
+            t.update(|t| t.scheme = Scheme::Dark);
+            assert_eq!(t.scheme(), Scheme::Dark, "the theme works");
+            let before = d.get();
+            d.set(before.clone());
+            assert!(d.get() == before, "the style works");
+        })
+        .join()
+        .expect("the thread ends");
+    }
 }

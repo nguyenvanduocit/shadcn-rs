@@ -2,164 +2,33 @@
 //! you type, highlighted by the pointer and the arrow keys, picked with a
 //! click or Enter. Combobox's list is a command list too.
 //!
-//! As in shadcn-vue's `Command.vue`, every item is known by its value: an
-//! item hides when its value does not contain the search (case-insensitive),
-//! a group hides when all its items do, and the empty state shows when a
-//! search hides them all.
-//!
+//! The behaviour is `primitives::command`'s (the filter, the highlight, the
+//! keys, the pick, what assistive technology is told); this module draws it.
 //! The list is data ([`CommandSection`]s of [`CommandItem`]s) laid out on a
 //! virtual list (ADR-0014): only the rows in view and a margin around them
 //! are built, so a palette of a million items opens and filters as one of
-//! ten does. The keys walk the data, not what is built: the highlight is an
-//! index into the items the search leaves, and the row it lands on is
-//! scrolled into view (built if it was not).
+//! ten does.
 //!
 //! The parts nest as in Vue: [`command`] keeps the search (its own, or the
 //! caller's, `search`) and the highlight (and the value picked last,
 //! `model`); its [`command_input`] and [`command_list`] read them.
 
-use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use gui::list::{ListState, virtual_list_in};
+use gui::list::virtual_list_in;
 use gui::prelude::*;
 use gui::{
-    Bind, Callback, Computed, Div, ElementKey, Icon, KeyEvent, Members, Model, NamedKey, Signal, Slot, Text, TextField,
-    component, div, icon, key_of, provide, text, text_input, use_context, use_model, watch,
+    Bind, Callback, Div, Icon, Model, Slot, Text, TextField, component, div, icon, provide, text, text_input,
+    use_context, use_model,
 };
 
-use crate::dropdown_menu::{menu_nav_key, menu_step};
+use primitives::command::{Command, CommandList as ListModel, FlatRows, Row, options_of};
+pub use primitives::command::{CommandItem, CommandSection};
+
 use crate::focus::StateLook;
 use crate::part::Part;
 use crate::theme::theme;
-
-/// An item of a command list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CommandItem {
-    /// What the search matches and what picking it hands over.
-    pub value: String,
-    /// Shown dimmed, skipped by the keys, not picked.
-    pub disabled: bool,
-    /// Valued `null` (`<ComboboxItem :value="null">`, a "Create …" row): its
-    /// `value` is only what the search matches.
-    pub null: bool,
-}
-
-impl CommandItem {
-    #[must_use]
-    pub fn new(value: impl Into<String>) -> Self {
-        Self {
-            value: value.into(),
-            disabled: false,
-            null: false,
-        }
-    }
-
-    /// An item shown dimmed that cannot be picked.
-    #[must_use]
-    pub fn disabled(value: impl Into<String>) -> Self {
-        Self {
-            disabled: true,
-            ..Self::new(value)
-        }
-    }
-
-    /// An item valued `null`, searched as `label`.
-    #[must_use]
-    pub fn null(label: impl Into<String>) -> Self {
-        Self {
-            null: true,
-            ..Self::new(label)
-        }
-    }
-}
-
-/// A part of a command list, in order.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CommandSection {
-    /// A group (`p-1`) under an optional heading; hidden when the search
-    /// hides all its items.
-    Group {
-        heading: Option<String>,
-        items: Vec<CommandItem>,
-    },
-    /// Items straight in the list, no group around them (reka's `ListboxContent`).
-    Items(Vec<CommandItem>),
-    /// `bg-border -mx-1 h-px`, always shown.
-    Separator,
-    /// `py-6 text-center text-sm`, shown when no item shows.
-    Empty(String),
-}
-
-impl CommandSection {
-    /// A group of `items` under `heading`.
-    #[must_use]
-    pub fn group(heading: Option<&str>, items: impl IntoIterator<Item = CommandItem>) -> Self {
-        Self::Group {
-            heading: heading.map(str::to_owned),
-            items: items.into_iter().collect(),
-        }
-    }
-
-    /// The empty state, saying `message`.
-    #[must_use]
-    pub fn empty(message: &str) -> Self {
-        Self::Empty(message.to_owned())
-    }
-
-    fn items(&self) -> &[CommandItem] {
-        match self {
-            Self::Group { items, .. } | Self::Items(items) => items,
-            Self::Separator | Self::Empty(_) => &[],
-        }
-    }
-}
-
-/// Whether an item valued `value` shows under `search`.
-#[must_use]
-pub fn command_matches(value: &str, search: &str) -> bool {
-    search.is_empty() || value.to_lowercase().contains(&search.to_lowercase())
-}
-
-/// What is highlighted, and the search it was highlighted under: once the
-/// search changes, the first item is highlighted instead (reka highlights the
-/// first item on every search).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct Highlight {
-    /// `None`: the first item.
-    value: Option<String>,
-    search: String,
-}
-
-/// A row of the list as laid out: one per heading, item, separator and
-/// empty state the search leaves.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Row {
-    Heading {
-        section: usize,
-    },
-    /// `first`/`last`: the first and last rows of its group (its padding).
-    Item {
-        section: usize,
-        item: usize,
-        first: bool,
-        last: bool,
-    },
-    Separator {
-        section: usize,
-    },
-    Empty {
-        section: usize,
-    },
-}
-
-/// An item the keys reach: where it is in the data and the row it is on
-/// (`None` in a footer, which is not virtual).
-#[derive(Clone, Debug)]
-struct Nav {
-    item: CommandItem,
-    row: Option<u64>,
-}
 
 /// What the rows of a list are named (`command-item`, `combobox-item`, …).
 #[derive(Clone, Copy)]
@@ -181,180 +50,52 @@ const COMMAND_NAMES: Names = Names {
     empty: "command-empty",
 };
 
-/// What a list shows under the current search: its rows, its footer's,
-/// their keys, and the items the keys reach. Compared by pointer, so a
-/// million rows are never compared.
-#[derive(Clone)]
-struct Flat(Rc<FlatRows>);
+/// What a list joining a command does as it is set up (a combobox reads its
+/// options through it).
+pub(crate) type OnList = gui::Callback<ListModel>;
 
-struct FlatRows {
-    rows: Vec<Row>,
-    tail: Vec<Row>,
-    keys: Vec<ElementKey>,
-    nav: Vec<Nav>,
-}
-
-impl PartialEq for Flat {
-    fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0)
-    }
-}
-
-/// Sections compared by pointer (a computed's cutoff).
-#[derive(Clone)]
-struct SectionsRef(Rc<Vec<CommandSection>>, Rc<Vec<CommandSection>>);
-
-impl PartialEq for SectionsRef {
-    fn eq(&self, other: &Self) -> bool {
-        Rc::ptr_eq(&self.0, &other.0) && Rc::ptr_eq(&self.1, &other.1)
-    }
-}
-
-/// A list inside a command, as its keys reach it.
-#[derive(Clone)]
-struct ListHandle {
-    flat: Computed<Flat>,
-    list: ListState,
-    on_select: Option<Callback<CommandItem>>,
-}
-
-/// What the parts of a command read (and a combobox, whose list is a
-/// command's): the search, the highlight, its lists as last laid out, and
-/// what picking an item does at the root.
+/// What the parts of a command read (and a combobox's, whose list is a
+/// command's): the command and its search field.
 #[derive(Clone)]
 pub(crate) struct CommandContext {
+    pub(crate) cmd: Command,
     /// The search box (`filterState.search`).
     pub(crate) search: TextField,
-    /// The search's text, cut off from caret moves.
-    query: Computed<String>,
-    highlight: Signal<Highlight>,
-    lists: Members<ListHandle>,
-    /// Bring the highlighted item into view as the list mounts (a combobox
-    /// opening on its chosen value).
-    reveal: Rc<Cell<bool>>,
-    /// What the root does with an item picked.
-    on_pick: Rc<dyn Fn(&CommandItem)>,
+    pub(crate) on_list: Option<OnList>,
 }
 
 impl CommandContext {
-    /// A command's state, made in its root's setup, filtered by what is
-    /// typed in `search`; `on_pick` runs at the root.
-    #[track_caller]
-    pub(crate) fn new(search: TextField, on_pick: impl Fn(&CommandItem) + 'static) -> Self {
-        Self {
-            search,
-            query: Computed::new(move || search.edit.with(|e| e.text.clone())),
-            highlight: Signal::labeled("command highlight", Highlight::default()),
-            lists: Members::new(),
-            reveal: Rc::new(Cell::new(false)),
-            on_pick: Rc::new(on_pick),
-        }
-    }
-
     /// The nearest command's, from a part's setup.
     pub(crate) fn find() -> Option<Self> {
         use_context::<Self>()
     }
 
-    fn list(&self) -> Option<ListHandle> {
-        self.lists.with(|l| l.first().cloned())
-    }
-
-    /// The highlighted item's index among `nav`, tracked.
-    fn highlighted_in(&self, nav: &[Nav]) -> Option<usize> {
-        let query = self.query.get();
-        self.highlight.with(|h| match &h.value {
-            Some(v) if h.search == query => nav.iter().position(|n| n.item.value == *v),
-            _ => (!nav.is_empty()).then_some(0),
-        })
-    }
-
     /// The highlighted value, untracked.
     #[cfg(test)]
     fn highlighted(&self) -> Option<String> {
-        let list = self.list()?;
-        gui::untracked(|| {
-            let flat = list.flat.get();
-            self.highlighted_in(&flat.0.nav)
-                .and_then(|i| flat.0.nav.get(i).map(|n| n.item.value.clone()))
-        })
-    }
-
-    /// Highlight `value` under the current search.
-    fn highlight(&self, value: Option<String>) {
-        let next = Highlight {
-            value,
-            search: self.query.get_untracked(),
-        };
-        if self.highlight.get_untracked() != next {
-            self.highlight.set(next);
-        }
-    }
-
-    /// Highlight `value`, or the first item when it is `None`, and show it
-    /// (a combobox opening on its chosen value).
-    pub(crate) fn highlight_and_reveal(&self, value: Option<String>) {
-        self.highlight(value);
-        match self.list() {
-            Some(list) => reveal(self, &list),
-            None => self.reveal.set(true),
-        }
-    }
-
-    fn pick(&self, list: &ListHandle, item: &CommandItem) {
-        if let Some(f) = &list.on_select {
-            f.call(item.clone());
-        }
-        (self.on_pick)(item);
-        self.search.set_text("");
-    }
-
-    /// The list's keys: arrows and Home/End move the highlight over the
-    /// items the search leaves (built or not), scrolling the one reached
-    /// into view; Enter picks. [`command`] takes them itself; a search field
-    /// outside it (a combobox's list) hands them over.
-    pub(crate) fn key(&self, ev: &KeyEvent) -> bool {
-        let Some(list) = self.list() else {
-            return false;
-        };
-        let flat = list.flat.get_untracked();
-        let nav = &flat.0.nav;
-        let current = gui::untracked(|| self.highlighted_in(nav));
-        if let Some(step) = menu_nav_key(ev) {
-            if let Some(n) = menu_step(nav.len(), current, step).and_then(|i| nav.get(i)) {
-                self.highlight(Some(n.item.value.clone()));
-                if let Some(row) = n.row {
-                    list.list.scroll_into_view(row);
-                }
-            }
-            return true;
-        }
-        if ev.is(NamedKey::Enter) {
-            if let Some(item) = current.and_then(|i| nav.get(i)).map(|n| n.item.clone()) {
-                self.pick(&list, &item);
-            }
-            return true;
-        }
-        false
-    }
-}
-
-/// Scroll `list` to the highlighted item, or to its top.
-fn reveal(cmd: &CommandContext, list: &ListHandle) {
-    let flat = list.flat.get_untracked();
-    let at = gui::untracked(|| cmd.highlighted_in(&flat.0.nav)).and_then(|i| flat.0.nav.get(i).and_then(|n| n.row));
-    match at {
-        Some(r) => list.list.scroll_into_view(r),
-        None => list.list.scroll_to_row(0),
+        self.cmd.highlighted()
     }
 }
 
 /// What [`command`] is given: the value picked last (reka's `modelValue`),
 /// and its search (`filterState.search`, `v-model:search`).
-#[derive(Clone, PartialEq, Default)]
+#[derive(Clone, PartialEq)]
 pub struct CommandProps {
     value: Bind<String>,
     search: Bind<String>,
+}
+
+impl Default for CommandProps {
+    /// No value of its own: shadcn-vue's `Command` passes `modelValue`
+    /// `''` unless the caller binds one, so without a [`model`](Part::model)
+    /// a pick is an action (heard by `on_change`) and nothing is ever read
+    /// as selected.
+    fn default() -> Self {
+        Self {
+            value: Bind::value(String::new()),
+            search: Bind::default(),
+        }
+    }
 }
 
 impl Part<CommandProps> {
@@ -366,7 +107,7 @@ impl Part<CommandProps> {
 
     /// Call `f` with each value picked (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<String>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 
@@ -387,7 +128,7 @@ impl Part<CommandProps> {
 
     /// Call `f` with the search after each change (`@update:search`).
     #[must_use]
-    pub fn on_search_change(self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_search_change(self, f: impl Into<gui::Callback<String>>) -> Self {
         self.with_props(|p| p.search = p.search.clone().on_change(f))
     }
 }
@@ -415,17 +156,27 @@ pub fn command() -> Part<CommandProps> {
             let typed = use_model(props, |p| &p.props.search);
             let search = TextField::new(typed.get_untracked());
             crate::part::bind_field(search, typed);
-            let cmd = CommandContext::new(search, move |item: &CommandItem| {
-                if !item.null {
-                    value.set(item.value.clone());
-                }
+            let cmd = Command::new(
+                search,
+                move || search.text(),
+                Command::listbox(),
+                move |item: &CommandItem| !item.null && value.with(|v| *v == item.value),
+                move |item: CommandItem| {
+                    if !item.null {
+                        value.set(item.value);
+                    }
+                    search.set_text("");
+                },
+            );
+            provide(CommandContext {
+                cmd,
+                search,
+                on_list: None,
             });
-            provide(cmd.clone());
             move || {
-                let keys = cmd.clone();
                 props
                     .with(|p| p.slot.0.clone())
-                    .on_key_down(move |ev| keys.key(ev))
+                    .on_key_down(move |ev| cmd.key(ev))
                     .into_element()
             }
         })
@@ -462,22 +213,20 @@ pub fn command_input(placeholder: &str) -> Part<String> {
                     return root.into_element();
                 };
                 let t = theme();
-                root.child(
-                    text_input(&cmd.search)
-                        .named("command-input")
-                        .placeholder(placeholder)
-                        .placeholder_color(t.muted_foreground)
-                        .selection_color(t.primary.opacity(0.35))
-                        .display(Display::Flex)
-                        .height(40.0)
-                        .width(pct(100.0))
-                        .radius(8.0)
-                        .padding_y(12.0)
-                        .text_size(14.0)
-                        .line_height(20.0)
-                        .with_interaction(|d, i| d.cursor_disabled(i).dim_disabled(i, 0.5)),
-                )
-                .into_element()
+                let input = text_input(&cmd.search)
+                    .named("command-input")
+                    .placeholder(placeholder)
+                    .placeholder_color(t.muted_foreground)
+                    .selection_color(t.primary.opacity(0.35))
+                    .display(Display::Flex)
+                    .height(40.0)
+                    .width(pct(100.0))
+                    .radius(8.0)
+                    .padding_y(12.0)
+                    .text_size(14.0)
+                    .line_height(20.0)
+                    .with_interaction(|d, i| d.cursor_disabled(i).dim_disabled(i, 0.5));
+                root.child(cmd.cmd.field(input)).into_element()
             }
         })
     })
@@ -491,14 +240,15 @@ type RowFn = Rc<dyn Fn(&CommandItem, Div) -> Div>;
 /// row (`|item, row| row.child(…)`). Icons take `text-muted-foreground` from
 /// the caller, as shadcn's `[&_svg]` rule gives them. Only the rows in view
 /// are built. Hold the sections in an `Rc` the caller keeps, so a list of a
-/// million items is filtered again only when the search changes.
+/// million items is filtered again only when the search changes, and off
+/// the UI thread (`primitives::command::FILTER_AT_ONCE`).
 pub fn command_list(
-    sections: impl Into<Rc<Vec<CommandSection>>>,
+    sections: impl Into<Arc<Vec<CommandSection>>>,
     row: impl Fn(&CommandItem, Div) -> Div + 'static,
 ) -> CommandList {
     CommandList {
         sections: sections.into(),
-        footer: Rc::new(Vec::new()),
+        footer: Arc::new(Vec::new()),
         on_select: None,
         row: Slot(Rc::new(row)),
         max_h: Some(300.0),
@@ -510,8 +260,8 @@ pub fn command_list(
 #[must_use]
 #[derive(Clone)]
 pub struct CommandList {
-    sections: Rc<Vec<CommandSection>>,
-    footer: Rc<Vec<CommandSection>>,
+    sections: Arc<Vec<CommandSection>>,
+    footer: Arc<Vec<CommandSection>>,
     on_select: Option<Callback<CommandItem>>,
     row: Slot<RowFn>,
     max_h: Option<f32>,
@@ -527,8 +277,8 @@ impl PartialEq for CommandList {
 
 impl CommandList {
     /// Run `f` with the item picked (`@select`).
-    pub fn on_select(mut self, f: impl Fn(&CommandItem) + 'static) -> Self {
-        self.on_select = Some(Callback::new(move |item: CommandItem| f(&item)));
+    pub fn on_select(mut self, f: impl Into<Callback<CommandItem>>) -> Self {
+        self.on_select = Some(f.into());
         self
     }
 
@@ -547,7 +297,7 @@ impl CommandList {
     /// Sections below the scrolling rows, always in view (a "Create …"
     /// group under a combobox's viewport); the keys reach their items after
     /// the list's.
-    pub fn footer(mut self, sections: impl Into<Rc<Vec<CommandSection>>>) -> Self {
+    pub fn footer(mut self, sections: impl Into<Arc<Vec<CommandSection>>>) -> Self {
         self.footer = sections.into();
         self
     }
@@ -558,108 +308,71 @@ impl CommandList {
     }
 }
 
+/// An item's row height before it is measured (`py-1.5` around a 20px line).
+const ROW: f32 = 32.0;
+
 impl IntoElement for CommandList {
     fn into_element(self) -> gui::Element {
         component(self, |cx| {
             let props = cx.props();
-            let Some(cmd) = CommandContext::find() else {
-                let empty: Box<dyn FnMut() -> gui::Element> = Box::new(|| gui::Element::Empty);
+            let Some(ctx) = CommandContext::find() else {
+                let empty: Box<dyn Fn() -> gui::Element> = Box::new(|| gui::Element::Empty);
                 return empty;
             };
-            let list = ListState::new(32.0);
-            let sections =
-                Computed::new(move || props.with(|p| SectionsRef(Rc::clone(&p.sections), Rc::clone(&p.footer))));
-            let query = cmd.query;
-            let flat = Computed::new(move || {
-                let SectionsRef(sections, footer) = sections.get();
-                let search = query.get();
-                let mut nav = Vec::new();
-                let rows = flatten(&sections, &search, &mut nav, true);
-                let tail = flatten(&footer, &search, &mut nav, false);
-                let keys = rows.iter().map(|r| row_key(&sections, r)).collect();
-                Flat(Rc::new(FlatRows { rows, tail, keys, nav }))
-            });
-            // The list's rows follow the data: other rows have other heights,
-            // and the list starts at its top again.
-            let first = flat.get_untracked();
-            list.splice(0, 0, u64::try_from(first.0.keys.len()).unwrap_or(u64::MAX));
-            // Rows inserted before the anchor push it down: start at the top.
-            list.scroll_to_row(0);
-            {
-                let list = list.clone();
-                watch(
-                    move || flat.get(),
-                    move |new, old| {
-                        if new.0.keys != old.0.keys {
-                            let old_len = u64::try_from(old.0.keys.len()).unwrap_or(u64::MAX);
-                            list.splice(
-                                0,
-                                old_len.min(list.len()),
-                                u64::try_from(new.0.keys.len()).unwrap_or(u64::MAX),
-                            );
-                            list.scroll_to_row(0);
-                        }
-                    },
-                );
-            }
-            let handle = move || ListHandle {
-                flat,
-                list: list.clone(),
-                on_select: props.with_untracked(|p| p.on_select.clone()),
-            };
-            if cmd.reveal.replace(false) {
-                reveal(&cmd, &handle());
+            let cmd = ctx.cmd;
+            let model = cmd.list_setup(
+                move || props.with(|p| (Arc::clone(&p.sections), Arc::clone(&p.footer))),
+                ROW,
+                // A handle: the `on_select` passed last, when it is picked.
+                Some(cx.event_opt(|p| p.on_select.as_ref())),
+            );
+            if let Some(f) = &ctx.on_list {
+                f.call(model.clone());
             }
             Box::new(move || {
-                let h = handle();
-                let flat = flat.get();
-                let FlatRows { rows, tail, keys, nav } = &*flat.0;
+                let flat = model.flat.get();
+                let data = &*flat.0;
+                let FlatRows { rows, tail, .. } = data;
                 let (sections, footer, row, max_h, names) = props.with(|p| {
                     (
-                        Rc::clone(&p.sections),
-                        Rc::clone(&p.footer),
+                        Arc::clone(&p.sections),
+                        Arc::clone(&p.footer),
                         Rc::clone(&p.row.0),
                         p.max_h,
                         p.names,
                     )
                 });
-                let list = &h.list;
-                list.fit_rows(Some(max_h.unwrap_or(f32::INFINITY)));
-                let at = cmd.highlighted_in(nav);
-                let on = at.and_then(|i| nav.get(i).map(|n| n.item.value.clone()));
-                // The highlighted option stays built while scrolled away (ADR-0021).
-                list.set_active(at.and_then(|i| nav.get(i).and_then(|n| n.row)));
+                let state = &model.state;
+                state.fit_rows(Some(max_h.unwrap_or(f32::INFINITY)));
+                let on = cmd
+                    .highlighted_in(data)
+                    .and_then(|i| data.item(i).map(|n| n.value.clone()));
                 // Each option's place among the options (headings and separators are not).
                 let options = options_of(rows);
-                let ctx = Rows {
-                    cmd: &cmd,
-                    list: &h,
+                let look = Rows {
+                    cmd,
+                    list: &model,
                     on: on.as_deref(),
                     row: &*row,
                     names,
                 };
                 let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
                 let body = virtual_list_in(
-                    list,
+                    state,
                     n,
-                    |i| {
-                        keys.get(usize::try_from(i).unwrap_or(usize::MAX))
-                            .copied()
-                            .unwrap_or_default()
-                    },
+                    |i| data.key(usize::try_from(i).unwrap_or(usize::MAX)),
                     |i| {
                         let i = usize::try_from(i).unwrap_or(usize::MAX);
                         rows.get(i).map_or(gui::Element::Empty, |r| {
-                            ctx.build(&sections, r, options.get(i).copied().flatten())
+                            look.build(&sections, r, options.get(i).copied().flatten())
                                 .into_element()
                         })
                     },
                     |viewport| viewport.overflow_x(Overflow::Hidden),
                 )
                 .named(names.list)
-                .role(gui::Role::ListBox)
-                .width(pct(100.0))
-                .member(&cmd.lists, h.clone());
+                .width(pct(100.0));
+                let body = cmd.list_node(body, &model);
                 if tail.is_empty() {
                     return body.into_element();
                 }
@@ -667,7 +380,7 @@ impl IntoElement for CommandList {
                 let tail_rows = tail
                     .iter()
                     .enumerate()
-                    .map(|(i, r)| ctx.build(&footer, r, tail_options.get(i).copied().flatten()));
+                    .map(|(i, r)| look.build(&footer, r, tail_options.get(i).copied().flatten()));
                 div()
                     .display(Display::Flex)
                     .flex_direction(FlexDirection::Column)
@@ -683,8 +396,8 @@ impl IntoElement for CommandList {
 
 /// What building a row reads.
 struct Rows<'a> {
-    cmd: &'a CommandContext,
-    list: &'a ListHandle,
+    cmd: Command,
+    list: &'a ListModel,
     on: Option<&'a str>,
     row: &'a dyn Fn(&CommandItem, Div) -> Div,
     names: Names,
@@ -711,10 +424,10 @@ impl Rows<'_> {
         };
         match *r {
             Row::Heading { section } => {
-                let heading = match sections.get(section) {
-                    Some(CommandSection::Group { heading: Some(h), .. }) => h.clone(),
-                    _ => String::new(),
-                };
+                let heading = sections
+                    .get(section)
+                    .and_then(CommandSection::heading)
+                    .unwrap_or_default();
                 group_part(section, true, false).child(
                     div()
                         .named(names.heading)
@@ -724,7 +437,7 @@ impl Rows<'_> {
                         .line_height(16.0)
                         .font_weight(500)
                         .text_color(t.muted_foreground)
-                        .child(heading),
+                        .child(heading.to_owned()),
                 )
             }
             Row::Item {
@@ -736,7 +449,8 @@ impl Rows<'_> {
                 let Some(it) = sections.get(section).and_then(|s| s.items().get(item)) else {
                     return div();
                 };
-                group_part(section, first, last).child((self.row)(it, self.item_row(it, set)))
+                let group = sections.get(section).and_then(CommandSection::heading);
+                group_part(section, first, last).child((self.row)(it, self.item_row(it, group, set)))
             }
             Row::Separator { .. } => command_separator().named(names.separator).role(gui::Role::Splitter),
             Row::Empty { section } => {
@@ -751,116 +465,15 @@ impl Rows<'_> {
         }
     }
 
-    /// An item's row: highlighted, hovered and clicked as the list's; an
-    /// option to a screen reader, at its place `set` among the options.
-    fn item_row(&self, item: &CommandItem, set: Option<(usize, usize)>) -> Div {
-        let on = self.on == Some(item.value.as_str());
+    /// An item's row: the accent while highlighted, dimmed while disabled.
+    fn item_row(&self, item: &CommandItem, group: Option<&str>, set: Option<(usize, usize)>) -> Div {
+        let on = !item.disabled && self.on == Some(item.value.as_str());
+        let t = theme();
         let d = command_item_row()
             .named(self.names.item)
-            .role(gui::Role::ListBoxOption)
-            .aria_selected(on);
-        let d = match set {
-            Some((at, of)) => d.aria_pos_in_set(at, of),
-            None => d,
-        };
-        if item.disabled {
-            return d.disabled(true).opacity(0.5);
-        }
-        let t = theme();
-        let (hover, click, list) = (self.cmd.clone(), self.cmd.clone(), self.list.clone());
-        let (hovered, picked) = (item.value.clone(), item.clone());
-        d.when(on, |d| d.background(t.accent).text_color(t.accent_foreground))
-            .on_hover(move |inside| {
-                if inside {
-                    hover.highlight(Some(hovered.clone()));
-                }
-            })
-            .on_click(move |_| click.pick(&list, &picked))
-    }
-}
-
-/// The rows `sections` show under `search`, and the items the keys reach.
-fn flatten(sections: &[CommandSection], search: &str, nav: &mut Vec<Nav>, virtual_rows: bool) -> Vec<Row> {
-    let any = sections
-        .iter()
-        .any(|s| s.items().iter().any(|i| command_matches(&i.value, search)));
-    let mut rows = Vec::new();
-    for (section, s) in sections.iter().enumerate() {
-        match s {
-            CommandSection::Separator => rows.push(Row::Separator { section }),
-            CommandSection::Empty(_) => {
-                if !any {
-                    rows.push(Row::Empty { section });
-                }
-            }
-            CommandSection::Group { .. } | CommandSection::Items(_) => {
-                let items = s.items();
-                let heading = match s {
-                    CommandSection::Group { heading, .. } => heading.as_ref(),
-                    _ => None,
-                };
-                let shown: Vec<usize> = items
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, i)| command_matches(&i.value, search))
-                    .map(|(k, _)| k)
-                    .collect();
-                if shown.is_empty() {
-                    continue;
-                }
-                let grouped = matches!(s, CommandSection::Group { .. });
-                if grouped && heading.is_some() {
-                    rows.push(Row::Heading { section });
-                }
-                let last_k = shown.len().saturating_sub(1);
-                for (k, &item) in shown.iter().enumerate() {
-                    let at = u64::try_from(rows.len()).unwrap_or(u64::MAX);
-                    if let Some(i) = items.get(item).filter(|i| !i.disabled) {
-                        nav.push(Nav {
-                            item: i.clone(),
-                            row: virtual_rows.then_some(at),
-                        });
-                    }
-                    rows.push(Row::Item {
-                        section,
-                        item,
-                        first: grouped && k == 0 && heading.is_none(),
-                        last: grouped && k == last_k,
-                    });
-                }
-            }
-        }
-    }
-    rows
-}
-
-/// Each row's place among the item rows, from 1, and how many there are.
-fn options_of(rows: &[Row]) -> Vec<Option<(usize, usize)>> {
-    let total = rows.iter().filter(|r| matches!(r, Row::Item { .. })).count();
-    let mut n = 0_usize;
-    rows.iter()
-        .map(|r| {
-            matches!(r, Row::Item { .. }).then(|| {
-                n = n.saturating_add(1);
-                (n, total)
-            })
-        })
-        .collect()
-}
-
-/// A row's key: its place in the data.
-fn row_key(sections: &[CommandSection], r: &Row) -> ElementKey {
-    match *r {
-        Row::Heading { section } => key_of(&format!("h{section}")),
-        Row::Item { section, item, .. } => {
-            let value = sections
-                .get(section)
-                .and_then(|s| s.items().get(item))
-                .map_or("", |i| i.value.as_str());
-            key_of(&format!("i{section}/{item}/{value}"))
-        }
-        Row::Separator { section } => key_of(&format!("s{section}")),
-        Row::Empty { section } => key_of(&format!("e{section}")),
+            .when(item.disabled, |d| d.opacity(0.5))
+            .when(on, |d| d.background(t.accent).text_color(t.accent_foreground));
+        self.cmd.option(d, self.list, item, group, on, set)
     }
 }
 
@@ -914,24 +527,28 @@ pub fn command_shortcut(keys: &str) -> Text {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "test and example state the test reads back, not a component's"
+)]
 mod tests {
     use std::cell::RefCell;
 
     use super::*;
-    use gui::{Modifiers, Scenario, Signal, text};
+    use gui::{KeyEvent, Modifiers, NamedKey, Scenario, Signal, text};
 
     const ITEMS: usize = 10_000;
 
-    thread_local! {
-        /// The context the probe found.
-        static FOUND: RefCell<Option<CommandContext>> = const { RefCell::new(None) };
+    gui::engine_local! {
+        /// The context the probe found (the live frame's: a cold frame's is put back).
+        [Fork] static FOUND: RefCell<Option<Rc<CommandContext>>> = RefCell::new(None);
     }
 
     /// A part inside the command that hands its context to the test.
     fn probe() -> Part<()> {
         Part::new((), div(), |p| {
             component(p, |cx| {
-                FOUND.set(CommandContext::find());
+                FOUND.set(CommandContext::find().map(Rc::new));
                 let props = cx.props();
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })
@@ -957,7 +574,7 @@ mod tests {
             .child(probe())
             .child(
                 command_list(sections, |item, row| row.child(text(item.value.clone())))
-                    .on_select(move |item| picked.set(item.value.clone())),
+                    .on_select(move |item: CommandItem| picked.set(item.value)),
             )
             .into_element()
     }
@@ -982,7 +599,7 @@ mod tests {
             modifiers: Modifiers::default(),
         };
         s.act("key", || {
-            cmd.key(&ev);
+            cmd.cmd.key(&ev);
         });
         s.settle().unwrap();
     }
@@ -993,7 +610,7 @@ mod tests {
         let mut s = Scenario::measuring(move || palette(search, picked), 400, 500, 1.0).unwrap();
         s.settle().unwrap();
         let cmd = FOUND
-            .with_borrow(Clone::clone)
+            .with(|f| f.borrow().as_deref().cloned())
             .expect("the command provides its context");
         (s, cmd, search, picked)
     }
@@ -1024,6 +641,22 @@ mod tests {
     }
 
     #[test]
+    fn without_a_model_a_pick_selects_nothing() {
+        // shadcn-vue's Command passes modelValue '': a pick is an action.
+        let (mut s, cmd, _, picked) = mount();
+        press(&mut s, &cmd, NamedKey::Enter);
+        assert_eq!(picked.get(), "alpha");
+        let mut ts = gui::text::TextSystem::new();
+        let update = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+        let selected = update
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.is_selected() == Some(true))
+            .count();
+        assert_eq!(selected, 0, "no item is read as selected");
+    }
+
+    #[test]
     fn a_search_filters_the_data_and_highlights_its_first_item() {
         let (mut s, cmd, search, _) = mount();
         s.act("search", || search.set("number 99".to_owned()));
@@ -1037,6 +670,6 @@ mod tests {
         s.settle().unwrap();
         assert_eq!(cmd.highlighted(), None);
         assert!(s.last().nodes.iter().any(|n| matches!(&n.content,
-            gui::layout::Content::Text { content, .. } if content.as_str() == "No results found.")));
+            gui::layout::Content::Text { content, .. } if &**content == "No results found.")));
     }
 }

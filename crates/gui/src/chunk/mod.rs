@@ -102,10 +102,53 @@ impl GridSnapshot {
     }
 }
 
+impl GridSnapshot {
+    /// Whether it holds the same values as `other` (to the bit), whichever
+    /// grid holds them: the cold check's compare ([`Source`]'s).
+    fn same_values(&self, other: &Self) -> bool {
+        self.0.width == other.0.width
+            && self.0.height == other.0.height
+            && self.0.values.len() == other.0.values.len()
+            && self
+                .0
+                .values
+                .iter()
+                .zip(&other.0.values)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
 impl PartialEq for GridSnapshot {
     fn eq(&self, other: &Self) -> bool {
         self.0.id == other.0.id && self.0.version == other.0.version
     }
+}
+
+crate::engine::engine_local! {
+    /// While the cold check compares two scenes ([`comparing_content`]).
+    [Shared("a flag set only around the cold check's compare, which no frame reads")]
+    static BY_CONTENT: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+/// Whether data sources compare by what they hold, not which allocation
+/// they are.
+fn by_content() -> bool {
+    BY_CONTENT.try_with(std::cell::Cell::get).unwrap_or(false)
+}
+
+/// Run `f` with data sources ([`Source`]) compared by content: the cold
+/// check's compare, where a frame built afresh holds the same data in
+/// allocations of its own. Live caching compares ids.
+pub(crate) fn comparing_content<R>(f: impl FnOnce() -> R) -> R {
+    /// The flag cleared however `f` ends.
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BY_CONTENT.try_with(|b| b.set(self.0)).ok();
+        }
+    }
+    let _reset = Reset(BY_CONTENT.replace(true));
+    f()
 }
 
 /// Bytes a kind reads as it lays them out (instances it draws, say),
@@ -136,11 +179,28 @@ impl PartialEq for Bytes {
 }
 
 /// What a data chunk reads.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Source {
     Series(series::SeriesSnapshot),
     Grid(GridSnapshot),
     Bytes(Bytes),
+}
+
+/// The same source: the same one by identity (what live caching
+/// compares), or, in the cold check's compare ([`comparing_content`]),
+/// one holding the same data, as a frame built afresh holds it in
+/// allocations of its own. One match over every kind of source, both
+/// ways: a new kind is compared by content, or does not compile.
+impl PartialEq for Source {
+    fn eq(&self, other: &Self) -> bool {
+        let content = by_content();
+        match (self, other) {
+            (Self::Series(a), Self::Series(b)) => a == b || (content && a.same_points(b)),
+            (Self::Grid(a), Self::Grid(b)) => a == b || (content && a.same_values(b)),
+            (Self::Bytes(a), Self::Bytes(b)) => a == b || (content && a.data() == b.data()),
+            (Self::Series(_) | Self::Grid(_) | Self::Bytes(_), _) => false,
+        }
+    }
 }
 
 impl Source {

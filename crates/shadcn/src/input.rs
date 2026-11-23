@@ -13,9 +13,14 @@ use std::rc::Rc;
 use gui::prelude::*;
 use gui::value::Bindings;
 use gui::{
-    Bind, Color, Div, Element, InputType, Model, Properties, Signal, Slot, Style, TextField, TextInput, TimeInput,
-    component, div, text, text_input, time_input, use_model,
+    Bind, Color, Div, Element, InputType, Interaction, Model, Properties, Signal, Slot, Style, TextField, TextInput,
+    component, div, text, text_input, use_model,
 };
+use primitives::Availability;
+use primitives::date::DateStrings;
+use primitives::date_field::{HourCycle, Piece, Precision};
+use primitives::direction::ReadDirection;
+use primitives::time_field::{Time, TimeField, TimeFieldOptions};
 
 use crate::focus::StateLook;
 use crate::focus::focus_ring;
@@ -88,7 +93,7 @@ impl Input {
 
     /// Call `f` with the text after each edit (`@update:model-value`).
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_change(mut self, f: impl Into<gui::Callback<String>>) -> Self {
         self.value = self.value.on_change(f);
         self
     }
@@ -117,8 +122,8 @@ impl Input {
 
     /// `readonly`: selected and copied, not edited.
     #[must_use]
-    pub fn read_only(mut self) -> Self {
-        self.read_only = true;
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
         self
     }
 
@@ -289,4 +294,209 @@ fn frame<S: Styled>(el: S, t: &Colors) -> S {
             spread: 0.0,
             color: Color::BLACK.opacity(0.05),
         })
+}
+
+/// A time input being built ([`input_time`]): Chrome's hour, minute and
+/// second segments (`primitives::time_field`, which holds how they step and
+/// are typed), drawn in a box the caller styles as a `Div`. Its value is a
+/// [`Time`] to the second, the segments as they stand (`Time::value` is the
+/// `HH:MM:SS` the input's `value` reads, empty until every segment has one),
+/// its own (`default_value`) or the caller's (`model`, `v-model`). It tells
+/// the time on 24 hours, as the reference's Chrome draws `type="time"`.
+#[derive(Clone)]
+pub struct TimeInput {
+    value: Bind<Time>,
+    root: Div,
+    field: Option<SegmentLook>,
+    strings: Option<DateStrings>,
+    availability: Rc<dyn Fn() -> Availability>,
+    read_only: bool,
+}
+
+/// What the caller adds to each segment's box, given its [`Interaction`].
+type SegmentLook = Rc<dyn Fn(Div, Interaction) -> Div>;
+
+/// Chrome sizes each segment 2 px × `devicePixelRatio` wider than the
+/// widest value it can show (`DateTimeFieldElement::MaximumWidth`), while
+/// drawing it with 1 px of padding a side: at the 2x a Retina screen and the
+/// reference draw at, 2 px a side, the rest left empty after the segments.
+const SIZING_PADDING: f32 = 2.0;
+
+/// A time input: Chrome's segments, empty until given a value.
+fn time_input() -> TimeInput {
+    TimeInput {
+        value: Bind::default().with_default(Time::empty(Precision::Second)),
+        root: div()
+            .named("time-input")
+            .display(Display::Flex)
+            .align_items(Align::Center),
+        field: None,
+        strings: None,
+        availability: Rc::new(|| Availability::Enabled),
+        read_only: false,
+    }
+}
+
+/// Built anew by each render of its parent, it is never equal: the instance
+/// renders again with what its parent passes now.
+impl PartialEq for TimeInput {
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
+}
+
+impl TimeInput {
+    /// The value, kept by the caller (`v-model`).
+    #[must_use]
+    pub fn model(mut self, model: impl Into<Model<Time>>) -> Self {
+        self.value = self.value.with_model(model);
+        self
+    }
+
+    /// The value it starts at when no model is given (`default-value`):
+    /// a [`Time`], or its `HH:MM:SS`.
+    #[must_use]
+    pub fn default_value(mut self, value: impl Into<Time>) -> Self {
+        self.value = self.value.with_default(value.into());
+        self
+    }
+
+    /// Call `f` with each value written (`@update:model-value`), partly
+    /// typed ones included.
+    #[must_use]
+    pub fn on_change(mut self, f: impl Into<gui::Callback<Time>>) -> Self {
+        self.value = self.value.on_change(f);
+        self
+    }
+
+    /// `disabled`: no focus, no keys, not sent with a form.
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.availability(Availability::from_disabled(disabled))
+    }
+
+    /// Whether it can be used ([`Availability`]), a value or a closure
+    /// (read tracked, so it follows the signals it reads): an unavailable
+    /// one keeps focus and moves between its segments, but is not changed.
+    /// Give its `FormField` the same value or closure
+    /// (`FormField::availability`), so the form and the input agree.
+    #[must_use]
+    pub fn availability<M>(mut self, availability: impl gui::value::IntoValue<Availability, M>) -> Self {
+        self.availability = match availability.into_value() {
+            gui::value::Value::Fixed(a) => Rc::new(move || a),
+            gui::value::Value::Bound(f) => f,
+        };
+        self
+    }
+
+    /// `readonly`: focused and moved through, its value not changed.
+    #[must_use]
+    pub fn read_only(mut self, read_only: bool) -> Self {
+        self.read_only = read_only;
+        self
+    }
+
+    /// What a screen reader calls each segment, and an empty one (the
+    /// locale's, Chrome's English strings, by default).
+    #[must_use]
+    pub fn strings(mut self, strings: DateStrings) -> Self {
+        self.strings = Some(strings);
+        self
+    }
+
+    /// Add to each segment's box, given the [`Interaction`] its bindings
+    /// read: the segment holding focus is the one whose `i.focused()` holds
+    /// (`::-webkit-datetime-edit-hour-field:focus`).
+    #[must_use]
+    pub fn map_field(mut self, f: impl Fn(Div, Interaction) -> Div + 'static) -> Self {
+        self.field = Some(Rc::new(f));
+        self
+    }
+
+    /// Change the box as a `Div`.
+    #[must_use]
+    pub fn map_root(mut self, f: impl FnOnce(Div) -> Div) -> Self {
+        self.root = f(self.root);
+        self
+    }
+}
+
+impl Fluent for TimeInput {}
+
+impl Styled for TimeInput {
+    fn style_and_bindings(&mut self) -> (&mut Style, Option<&mut Bindings>) {
+        self.root.style_and_bindings()
+    }
+}
+
+impl IntoElement for TimeInput {
+    fn into_element(self) -> Element {
+        component(self, |cx| {
+            let props = cx.props();
+            let value = use_model(props, |p: &TimeInput| &p.value);
+            let segments = TimeField::new(
+                value,
+                move || {
+                    props.with(|p| TimeFieldOptions {
+                        availability: (p.availability)(),
+                        readonly: p.read_only,
+                        hour_cycle: Some(HourCycle::H23),
+                        strings: p.strings.clone(),
+                        ..TimeFieldOptions::default()
+                    })
+                },
+                ReadDirection::fixed(gui::Direction::Ltr),
+            );
+            move || props.with(|p| render_time(segments, p)).into_element()
+        })
+        .named("time-input")
+        .into_element()
+    }
+}
+
+/// The segments in a box as wide as Chrome makes a time input's.
+fn render_time(segments: TimeField<TimeInput>, p: &TimeInput) -> Div {
+    let mut fields = div()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .grid_row_start(1)
+        .grid_column_start(1);
+    let mut sizer = div()
+        .display(Display::Flex)
+        .align_items(Align::Center)
+        .grid_row_start(1)
+        .grid_column_start(1)
+        .invisible(true);
+    for piece in segments.pieces() {
+        let s = match piece {
+            Piece::Literal(t) => {
+                // Hidden from assistive technology, as the field's literals are.
+                fields = fields.child(text(t).aria_hidden());
+                sizer = sizer.child(text(t));
+                continue;
+            }
+            Piece::Segment(s) => s,
+        };
+        let shown = segments.text(s);
+        let it = Interaction::new();
+        let one = segments.segment(s, div().interaction(it).padding(1.0).child(shown.clone()));
+        fields = fields.child(match &p.field {
+            Some(f) => f(one, it),
+            None => one,
+        });
+        // The widest of what the segment can show, stacked in one cell.
+        let max = segments.bounds(s).1;
+        let widest = ["--".to_owned(), format!("{max:02}"), shown]
+            .map(|t| text(t).grid_row_start(1).grid_column_start(1).into_element());
+        sizer = sizer.child(div().display(Display::Grid).padding_x(SIZING_PADDING).children(widest));
+    }
+    // `disabled:opacity-50 disabled:cursor-not-allowed`, unavailable too.
+    let root = if segments.availability().dimmed() {
+        p.root.clone().opacity(0.5).cursor(Cursor::NotAllowed)
+    } else {
+        p.root.clone()
+    };
+    segments
+        .root(root)
+        .child(div().display(Display::Grid).child(sizer).child(fields))
 }

@@ -1425,3 +1425,76 @@ fn a_disposed_owner_leaves_no_list_in_its_slot() {
     }
     assert_eq!(runtime::with(|rt| rt.free_owned_capacity()), 0);
 }
+
+/// The effects a render makes all run once it returns, though one of them
+/// panics: the panic goes on after the last has run.
+#[test]
+fn a_panicking_deferred_effect_leaves_none_after_it_unrun() {
+    let ran = counter();
+    let r = Rc::clone(&ran);
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        runtime::rendering("panics", || {
+            let _first = Effect::new(|| panic!("the first effect fails"));
+            let r = Rc::clone(&r);
+            let _second = Effect::new(move || bump(&r));
+        });
+    }));
+    assert!(out.is_err(), "the panic goes on");
+    assert_eq!(ran.get(), 1, "the effect after it ran");
+}
+
+/// What a deferred effect reads is read in the effect phase, not the
+/// render's: a paint-phase write of it is not late for a render.
+#[test]
+fn a_deferred_effects_reads_are_no_renders() {
+    let x = Signal::new(0_u32);
+    runtime::begin_frame();
+    runtime::in_phase(Phase::Render, false, || {
+        runtime::rendering("reads", || {
+            let _e = Effect::new(move || {
+                let _ = x.get();
+            });
+        });
+    });
+    drop(runtime::take_late_writes());
+    runtime::in_phase(Phase::Paint, false, || x.set(1));
+    assert!(
+        runtime::take_late_writes().is_empty(),
+        "read by the effect, not by a render"
+    );
+    runtime::in_phase(Phase::Idle, false, || {});
+}
+
+/// A cold re-render that panics leaves nothing cold behind it: the
+/// effects a later live render makes still run.
+#[test]
+fn a_panicking_cold_render_leaves_later_effects_running() {
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _cold = crate::engine::ColdFrame::begin();
+        runtime::rendering("cold", || panic!("the cold render fails"))
+    }));
+    assert!(out.is_err(), "the panic goes on");
+    let ran = counter();
+    let r = Rc::clone(&ran);
+    runtime::rendering("live", || {
+        let r = Rc::clone(&r);
+        let _e = Effect::new(move || bump(&r));
+    });
+    assert_eq!(ran.get(), 1, "a live render's effect runs");
+}
+
+/// Two cleanups of a scope, the first panicking: the second runs all the
+/// same as the scope is disposed, and the panic goes on.
+#[test]
+fn a_panicking_cleanup_leaves_none_after_it_unrun() {
+    let ran = counter();
+    let r = Rc::clone(&ran);
+    let scope = Scope::new();
+    scope.run(|| {
+        on_cleanup(|| panic!("the first cleanup fails"));
+        on_cleanup(move || bump(&r));
+    });
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.dispose()));
+    assert!(out.is_err(), "the panic goes on");
+    assert_eq!(ran.get(), 1, "the cleanup after it ran");
+}

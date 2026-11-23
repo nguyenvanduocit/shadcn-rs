@@ -47,10 +47,8 @@ fn open(label: &str) -> Button {
 }
 
 /// An avatar with its picture, or its initials until there is one.
-fn person(image: Option<&ImageSource>, initials: &str) -> gui::Div {
-    avatar()
-        .child(avatar_image(image))
-        .child(avatar_fallback(image, initials))
+fn person(image: Option<&ImageSource>, initials: &str) -> shadcn::Part<()> {
+    avatar().child(avatar_image(image)).child(avatar_fallback(initials))
 }
 
 /// The first letter of a login, as the demos' fallback (`username.charAt(0)`).
@@ -252,8 +250,8 @@ pub fn render() -> Render {
                                 item_media_described(ItemMediaVariant::Default).child(
                                     avatar()
                                         .size(32.0)
-                                        .child(avatar_image(image_of(login)).map(|e| e.filters(Filter::Grayscale(1.0))))
-                                        .child(avatar_fallback(image_of(login), initial(login))),
+                                        .child(avatar_image(image_of(login)).filters(Filter::Grayscale(1.0)))
+                                        .child(avatar_fallback(initial(login))),
                                 ),
                             )
                             .child(

@@ -135,7 +135,7 @@ fn swatch(i: usize) -> ComponentElement {
 type Installed = Rc<Cell<Option<(ThemeHandle, DesignHandle)>>>;
 
 /// An app installing `Theme::default()` and vega in its root's setup, around what `body` builds.
-fn app<B: IntoElement>(body: impl Fn() -> B + Clone + 'static) -> (impl FnMut() -> gui::Element, Installed) {
+fn app<B: IntoElement>(body: impl Fn() -> B + Clone + 'static) -> (impl Fn() -> gui::Element, Installed) {
     let installed: Installed = Rc::new(Cell::new(None));
     let keep = Rc::clone(&installed);
     let render = move || {

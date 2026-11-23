@@ -11,6 +11,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+# The per-thread slots engine state is stored in (crate::engine).
+gui-tls = { path = "../gui-tls" }
 # What a screen reader is told about each frame (AccessKit), and its adapter
 # to the platform's accessibility API through the winit window.
 accesskit = "0.25"
@@ -54,6 +56,10 @@ pollster = "0.4"
 # Fast hashing for the glyph and shape caches (keys are ours, not attacker-chosen).
 foldhash = "0.2"
 parley = { version = "0.13", features = ["complex-scripts"] }
+# The grapheme clusters and words of text a clamp hides, read to a screen
+# reader without shaping it: Parley's own analysis, so they are the words
+# its shaped text has.
+parley_engine = "0.13"
 skrifa = "0.49"
 # Colour glyphs (COLRv0/v1 emoji) are painted by vello_cpu, which has
 # every gradient COLRv1 needs (sweep included) and blend modes.

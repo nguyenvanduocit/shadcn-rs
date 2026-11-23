@@ -282,6 +282,24 @@ pub enum Cursor {
     Grab,
     ResizeColumn,
     ResizeRow,
+    /// Resizes along either horizontal way (`ew-resize`).
+    ResizeEastWest,
+    /// Resizes along either vertical way (`ns-resize`).
+    ResizeNorthSouth,
+    /// Resizes only toward the east (`e-resize`): what a splitter at its
+    /// limit shows, as VS Code does.
+    ResizeEast,
+    ResizeWest,
+    ResizeNorth,
+    ResizeSouth,
+    /// Resizes only toward the north-east (`ne-resize`), and so on: two
+    /// splitter handles crossing, each at a limit.
+    ResizeNorthEast,
+    ResizeNorthWest,
+    ResizeSouthEast,
+    ResizeSouthWest,
+    /// Moves either way (`move`): two splitter handles crossing.
+    Move,
 }
 
 /// A box shadow; `inset` shadows are not drawn.
@@ -746,7 +764,7 @@ pub struct TextStyle {
     pub italic: Option<bool>,
     pub underline: Option<bool>,
     /// How far below the baseline an underline sits (`underline-offset-*`);
-    /// `None` takes the font's own position.
+    /// `None` leaves a gap of half the line's thickness, as CSS's `auto`.
     pub underline_offset: Option<f32>,
     pub line_through: Option<bool>,
     /// Letter spacing in em.
@@ -808,10 +826,306 @@ pub struct ContentStyle {
     pub icon_size: Option<f32>,
 }
 
+/// The decoration lines one box declares, as that box (CSS's decorating
+/// box) draws them over all it holds, whatever the text under it is
+/// styled: in that box's colour, by that box's font (a line-through sits
+/// by its ascent, a line is as thick as its size makes it) and (an
+/// underline) at that box's offset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TextDecoration {
+    pub lines: DecorationLines,
+    pub color: Color,
+    /// The declaring box's font: its size (the lines' thickness), and with
+    /// its family, weight and slant the ascent a line-through sits by.
+    pub size: f32,
+    pub family: FontFamily,
+    pub weight: u16,
+    pub italic: bool,
+    /// How far below the baseline an underline sits; `None` is CSS's `auto`.
+    pub offset: Option<f32>,
+}
+
+/// Which lines a box declares: an underline, a line-through, both or
+/// neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct DecorationLines(u8);
+
+impl DecorationLines {
+    pub const NONE: Self = Self(0);
+    pub const UNDERLINE: Self = Self(1);
+    pub const LINE_THROUGH: Self = Self(2);
+
+    /// The lines `underline` and `line_through` say.
+    #[must_use]
+    pub const fn of(underline: bool, line_through: bool) -> Self {
+        let u = if underline { Self::UNDERLINE.0 } else { 0 };
+        let l = if line_through { Self::LINE_THROUGH.0 } else { 0 };
+        Self(u | l)
+    }
+
+    #[must_use]
+    pub const fn underline(self) -> bool {
+        self.0 & Self::UNDERLINE.0 != 0
+    }
+
+    #[must_use]
+    pub const fn line_through(self) -> bool {
+        self.0 & Self::LINE_THROUGH.0 != 0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl TextDecoration {
+    /// The lines `t` draws when it declares them (none yet).
+    #[must_use]
+    pub fn of(t: &ResolvedText) -> Self {
+        Self {
+            lines: DecorationLines::NONE,
+            color: t.color,
+            size: t.size,
+            family: t.family,
+            weight: t.weight,
+            italic: t.italic,
+            offset: t.underline_offset,
+        }
+    }
+
+    /// The content whose primary font is this box's: what places its
+    /// line-through, in `t`'s other fields.
+    #[must_use]
+    pub fn font_in(&self, t: &ResolvedText) -> ResolvedText {
+        ResolvedText {
+            size: self.size,
+            family: self.family,
+            weight: self.weight,
+            italic: self.italic,
+            ..t.clone().shape()
+        }
+    }
+}
+
+/// The decorating boxes whose lines a text is drawn with: CSS draws each
+/// box's own lines (css-text-decor-3 §2.1), so an underline a node declares
+/// inside an underlined container adds a line, it does not take the
+/// container's place, however deep the boxes nest.
+///
+/// A shared chain of boxes, each one box and the chain of boxes enclosing
+/// it: cloning is a count, and a chain lives as long as anything holds it,
+/// so text keeps its lines however long it goes undrawn. Chains are
+/// hash-consed: providing the same box inside the same chain (a tree
+/// resolved again) while the chain is held gives the same chain and
+/// allocates nothing, so equal chains are the same chain.
+#[derive(Clone, Default)]
+pub struct TextDecorations(Option<std::sync::Arc<Link>>);
+
+/// One link of a [`TextDecorations`] chain: its box, the chain it is
+/// inside (which it holds), and its table's count of links let go.
+struct Link {
+    deco: TextDecoration,
+    parent: TextDecorations,
+    dead: &'static std::sync::atomic::AtomicUsize,
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.dead.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The shared table's links let go since it was last swept: each leaves
+/// an entry that finds nothing, swept once they are many ([`Chains::sweep`]).
+static DEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// What a link is found by when provided again: its box's fields by their
+/// bits, and the chain it is inside by its address (alive, and so not
+/// reused, while the link found holds it).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LinkKey {
+    parent: usize,
+    lines: DecorationLines,
+    color: [u32; 4],
+    size: u32,
+    family: FontFamily,
+    weight: u16,
+    italic: bool,
+    offset: Option<u32>,
+}
+
+impl LinkKey {
+    fn of(parent: &TextDecorations, d: &TextDecoration) -> Self {
+        let c = d.color;
+        Self {
+            parent: parent.addr(),
+            lines: d.lines,
+            color: [c.r.to_bits(), c.g.to_bits(), c.b.to_bits(), c.a.to_bits()],
+            size: d.size.to_bits(),
+            family: d.family,
+            weight: d.weight,
+            italic: d.italic,
+            offset: d.offset.map(f32::to_bits),
+        }
+    }
+}
+
+/// Every held [`TextDecorations`] link, by what it links. Entries whose
+/// link nothing holds are swept once they are half the table (and more
+/// than [`Chains::FLOOR`]), however few links are made after: what a view
+/// that closed held goes with the next frame's end.
+struct Chains {
+    found: foldhash::HashMap<LinkKey, std::sync::Weak<Link>>,
+    /// Its links let go since it was last swept.
+    dead: &'static std::sync::atomic::AtomicUsize,
+}
+
+static CHAINS: std::sync::LazyLock<std::sync::Mutex<Chains>> = std::sync::LazyLock::new(|| {
+    std::sync::Mutex::new(Chains {
+        found: foldhash::HashMap::default(),
+        dead: &DEAD,
+    })
+});
+
+fn chains() -> std::sync::MutexGuard<'static, Chains> {
+    CHAINS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+impl Chains {
+    /// Entries let go that are kept unswept, however small the table.
+    const FLOOR: usize = 64;
+
+    /// Sweep the entries whose link was let go, when they are many: half
+    /// the table, and past [`Self::FLOOR`]. Allocates nothing.
+    fn sweep(&mut self) {
+        use std::sync::atomic::Ordering;
+        let dead = self.dead.load(Ordering::Relaxed);
+        if dead <= Self::FLOOR || dead.saturating_mul(2) < self.found.len() {
+            return;
+        }
+        // Links let go while it sweeps count toward the next sweep.
+        self.dead.fetch_sub(dead, Ordering::Relaxed);
+        self.found.retain(|_, w| w.strong_count() > 0);
+    }
+
+    /// The chain of box `d` inside `parent`: the one held, or a new one.
+    fn push(&mut self, parent: &TextDecorations, d: TextDecoration) -> TextDecorations {
+        let key = LinkKey::of(parent, &d);
+        if let Some(link) = self.found.get(&key).and_then(std::sync::Weak::upgrade) {
+            return TextDecorations(Some(link));
+        }
+        self.sweep();
+        let link = std::sync::Arc::new(Link {
+            deco: d,
+            parent: parent.clone(),
+            dead: self.dead,
+        });
+        self.found.insert(key, std::sync::Arc::downgrade(&link));
+        TextDecorations(Some(link))
+    }
+}
+
+impl TextDecorations {
+    /// No line.
+    pub const NONE: Self = Self(None);
+
+    /// The one box `d`.
+    #[must_use]
+    pub fn one(d: TextDecoration) -> Self {
+        let mut all = Self::NONE;
+        all.push(d);
+        all
+    }
+
+    /// Add the lines of a box inside the ones held (none when it declares none).
+    pub fn push(&mut self, d: TextDecoration) {
+        if d.lines.is_empty() {
+            return;
+        }
+        *self = chains().push(self, d);
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_none()
+    }
+
+    fn addr(&self) -> usize {
+        self.0.as_ref().map_or(0, |l| std::sync::Arc::as_ptr(l).addr())
+    }
+
+    /// The boxes, innermost first.
+    fn walk(&self) -> impl Iterator<Item = &TextDecoration> {
+        std::iter::successors(self.0.as_deref(), |l| l.parent.0.as_deref()).map(|l| &l.deco)
+    }
+
+    /// Write the boxes into `out`, outermost first (its room is kept: a
+    /// paragraph drawn again allocates nothing).
+    pub fn collect(&self, out: &mut Vec<TextDecoration>) {
+        out.clear();
+        out.extend(self.walk().copied());
+        out.reverse();
+    }
+
+    /// The boxes, outermost first.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<TextDecoration> {
+        let mut out = Vec::new();
+        self.collect(&mut out);
+        out
+    }
+
+    /// Whether any box draws an underline.
+    #[must_use]
+    pub fn underline(&self) -> bool {
+        self.walk().any(|d| d.lines.underline())
+    }
+
+    /// Whether any box draws a line-through.
+    #[must_use]
+    pub fn line_through(&self) -> bool {
+        self.walk().any(|d| d.lines.line_through())
+    }
+
+    /// Sweep what links let go left in the table, when it is much of it:
+    /// called at each frame's end, so a table no link is made in after a
+    /// view closes lets that view's go.
+    pub(crate) fn sweep() {
+        chains().sweep();
+    }
+
+    /// Links held (every thread's).
+    #[must_use]
+    pub fn held() -> usize {
+        chains().found.values().filter(|w| w.strong_count() > 0).count()
+    }
+}
+
+impl PartialEq for TextDecorations {
+    fn eq(&self, other: &Self) -> bool {
+        self.addr() == other.addr()
+    }
+}
+
+impl Eq for TextDecorations {}
+
+impl std::hash::Hash for TextDecorations {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.addr().hash(state);
+    }
+}
+
+impl std::fmt::Debug for TextDecorations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.to_vec()).finish()
+    }
+}
+
 /// The content a node holds or passes on, every provider above it applied
 /// ([`ContentStyle`]), with the node's [`Direction`]: what a paragraph,
 /// an icon or a text field is drawn with.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedText {
     pub color: Color,
     pub size: f32,
@@ -823,9 +1137,11 @@ pub struct ResolvedText {
     pub nowrap: bool,
     pub truncate: bool,
     pub italic: bool,
-    pub underline: bool,
+    /// The lines drawn under and over its text, each as the box that
+    /// declares it draws it (the box itself, and those enclosing it).
+    pub decorations: TextDecorations,
+    /// How far below the baseline an underline this box declares sits.
     pub underline_offset: Option<f32>,
-    pub line_through: bool,
     pub tracking: f32,
     pub tabular_nums: bool,
     pub line_clamp: Option<u16>,
@@ -849,15 +1165,27 @@ impl ResolvedText {
             nowrap: false,
             truncate: false,
             italic: false,
-            underline: false,
+            decorations: TextDecorations::NONE,
             underline_offset: None,
-            line_through: false,
             tracking: 0.0,
             tabular_nums: false,
             line_clamp: None,
             wrap_style: WrapStyle::Auto,
             // Lucide's own 24-unit grid drawn at 16px.
             icon_size: 16.0,
+        }
+    }
+
+    /// This text as it is laid out while being edited (a focused field,
+    /// its caret active): never cut short, as Chrome drops a focused
+    /// input's ellipsis and shows the text the caret moves through. Neither
+    /// `text-overflow` nor a line clamp applies; the field scrolls instead.
+    #[must_use]
+    pub fn editing(self) -> Self {
+        Self {
+            truncate: false,
+            line_clamp: None,
+            ..self
         }
     }
 
@@ -872,7 +1200,9 @@ impl ResolvedText {
     }
 
     /// This content with what `own` provides in place of its fields; the
-    /// direction stays (it is not content).
+    /// direction stays (it is not content), and so does an underline or a
+    /// line-through, which `own` can add but not take off (CSS's
+    /// decorations propagate to all a box holds).
     #[must_use]
     pub fn provide(&self, own: &ContentStyle) -> Self {
         let t = &own.text;
@@ -884,7 +1214,8 @@ impl ResolvedText {
             None if t.size.is_some() => size * (self.line_height / self.size.max(1.0)),
             None => self.line_height,
         };
-        Self {
+        let underline_offset = t.underline_offset.or(self.underline_offset);
+        let mut out = Self {
             color: own.color.unwrap_or(self.color),
             size,
             line_height,
@@ -895,14 +1226,29 @@ impl ResolvedText {
             nowrap: t.nowrap.unwrap_or(self.nowrap),
             truncate: t.truncate.unwrap_or(self.truncate),
             italic: t.italic.unwrap_or(self.italic),
-            underline: t.underline.unwrap_or(self.underline),
-            underline_offset: t.underline_offset.or(self.underline_offset),
-            line_through: t.line_through.unwrap_or(self.line_through),
+            decorations: self.decorations.clone(),
+            underline_offset,
             tracking: t.tracking.unwrap_or(self.tracking),
             tabular_nums: t.tabular_nums.unwrap_or(self.tabular_nums),
             line_clamp: t.line_clamp.or(self.line_clamp),
             wrap_style: t.wrap_style.unwrap_or(self.wrap_style),
             icon_size: own.icon_size.unwrap_or(self.icon_size),
+        };
+        // CSS draws a decoration by the box that declares it (its
+        // decorating box) over all that box holds: in its colour, by its
+        // font, at its offset; a descendant can neither take it off nor
+        // restyle it, and one it declares itself is drawn besides.
+        out.decorations.push(out.declares(own));
+        out
+    }
+
+    /// The lines `own` declares (none, or an underline, a line-through or
+    /// both), drawn as this content draws them.
+    #[must_use]
+    pub fn declares(&self, own: &ContentStyle) -> TextDecoration {
+        TextDecoration {
+            lines: DecorationLines::of(own.text.underline == Some(true), own.text.line_through == Some(true)),
+            ..TextDecoration::of(self)
         }
     }
 
@@ -913,9 +1259,40 @@ impl ResolvedText {
     pub fn shape(self) -> Self {
         Self {
             color: Color::TRANSPARENT,
-            underline: false,
+            decorations: TextDecorations::NONE,
             underline_offset: None,
-            line_through: false,
+            ..self
+        }
+    }
+
+    /// This content with an underline it declares itself added: drawn in
+    /// its colour, by its font, at its offset.
+    #[must_use]
+    pub fn underlined(self) -> Self {
+        self.declaring(DecorationLines::UNDERLINE)
+    }
+
+    /// This content with a line-through it declares itself added.
+    #[must_use]
+    pub fn struck(self) -> Self {
+        self.declaring(DecorationLines::LINE_THROUGH)
+    }
+
+    fn declaring(mut self, lines: DecorationLines) -> Self {
+        self.decorations.push(TextDecoration {
+            lines,
+            ..TextDecoration::of(&self)
+        });
+        self
+    }
+
+    /// The decorations an enclosing box declared, let go: what an atomic
+    /// inline or an out-of-flow box (`position: absolute`) gets, as CSS
+    /// propagates decorations to neither (css-text-decor-3 §2.1).
+    #[must_use]
+    pub fn undecorated(self) -> Self {
+        Self {
+            decorations: TextDecorations::NONE,
             ..self
         }
     }
@@ -925,9 +1302,8 @@ impl ResolvedText {
     pub fn painted_as(self, paint: &Self) -> Self {
         Self {
             color: paint.color,
-            underline: paint.underline,
+            decorations: paint.decorations.clone(),
             underline_offset: paint.underline_offset,
-            line_through: paint.line_through,
             ..self
         }
     }
@@ -1267,6 +1643,29 @@ impl Style {
         self.overflow_x != Overflow::Visible || self.overflow_y != Overflow::Visible
     }
 
+    /// Whether the decorations an enclosing box declares reach this box's
+    /// text: CSS propagates them to in-flow, non-atomic content only, so
+    /// neither an atomic inline (`inline`) nor an out-of-flow box
+    /// (`position: absolute`) takes them (css-text-decor-3 §2.1).
+    #[must_use]
+    pub fn takes_decorations(&self) -> bool {
+        !self.inline && self.position != Position::Absolute
+    }
+
+    /// The content this box holds, within `enclosing` (its parent's): what
+    /// it provides applied ([`ResolvedText::provide`]), the enclosing
+    /// boxes' decorations let go where CSS stops them
+    /// ([`Style::takes_decorations`]).
+    #[must_use]
+    pub fn content_in(&self, enclosing: &ResolvedText) -> ResolvedText {
+        let enclosing = if self.takes_decorations() {
+            enclosing.clone()
+        } else {
+            enclosing.clone().undecorated()
+        };
+        enclosing.provide(&self.content)
+    }
+
     /// The layout half of this style, as the layout tree keeps it and Taffy
     /// reads it, in the node's inherited `direction`.
     #[must_use]
@@ -1359,5 +1758,86 @@ impl Style {
             },
         }
         .settled()
+    }
+}
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+
+    fn line(n: u32) -> TextDecoration {
+        TextDecoration {
+            lines: DecorationLines::UNDERLINE,
+            ..TextDecoration::of(&ResolvedText::root(Color::hex(n)))
+        }
+    }
+
+    fn colors(d: &TextDecorations) -> Vec<Color> {
+        d.to_vec().iter().map(|d| d.color).collect()
+    }
+
+    /// A table of its own, counting its own links let go.
+    fn table() -> Chains {
+        Chains {
+            found: foldhash::HashMap::default(),
+            dead: Box::leak(Box::new(std::sync::atomic::AtomicUsize::new(0))),
+        }
+    }
+
+    #[test]
+    fn chains_are_hash_consed_while_held() {
+        let mut c = table();
+        let none = TextDecorations::NONE;
+        let outer = c.push(&none, line(1));
+        let inner = c.push(&outer, line(2));
+        assert!(c.push(&none, line(1)) == outer, "the same box in the same chain");
+        assert!(c.push(&outer, line(2)) == inner);
+        assert!(c.push(&none, line(2)) != inner, "another chain");
+        assert_eq!(colors(&inner), [Color::hex(1), Color::hex(2)], "outermost first");
+    }
+
+    #[test]
+    fn a_held_chain_keeps_its_lines_however_many_come_and_go() {
+        let mut c = table();
+        let outer = c.push(&TextDecorations::NONE, line(1));
+        let held = c.push(&outer, line(2));
+        drop(outer);
+        // Chains made and let go, as colours animated under a line make.
+        for n in 10..20_000 {
+            drop(c.push(&TextDecorations::NONE, line(n)));
+        }
+        assert_eq!(colors(&held), [Color::hex(1), Color::hex(2)], "held, with its parent");
+        assert!(
+            c.found.len() <= 4 * Chains::FLOOR,
+            "what nothing holds is swept: {}",
+            c.found.len()
+        );
+        // Still found while held: providing it again allocates nothing.
+        let outer = c.push(&TextDecorations::NONE, line(1));
+        assert!(c.push(&outer, line(2)) == held);
+    }
+
+    #[test]
+    fn a_chain_let_go_is_made_anew_with_the_same_lines() {
+        let mut c = table();
+        let first = colors(&c.push(&TextDecorations::NONE, line(7)));
+        for n in 10..2_000 {
+            drop(c.push(&TextDecorations::NONE, line(n)));
+        }
+        assert_eq!(colors(&c.push(&TextDecorations::NONE, line(7))), first);
+    }
+
+    #[test]
+    fn what_a_closed_view_held_is_swept_with_no_chain_made_after() {
+        // A large view holds 10,000 chains, then closes: no chain is made
+        // after it, and the frame's sweep lets its entries go.
+        let mut c = table();
+        let view: Vec<TextDecorations> = (0..10_000).map(|n| c.push(&TextDecorations::NONE, line(n))).collect();
+        assert_eq!(c.found.len(), 10_000);
+        let kept = view.first().cloned();
+        drop(view);
+        c.sweep();
+        assert_eq!(c.found.len(), 1, "only the chain still held");
+        assert!(kept.is_some_and(|k| colors(&k) == [Color::hex(0)]));
     }
 }

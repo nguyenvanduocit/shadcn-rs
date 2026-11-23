@@ -1,154 +1,163 @@
 //! Accordion (`ui/accordion`): stacked headings, each opening its own section.
 //!
-//! Keyboard as reka's: Up and Down (wrapping), Home and End move between the
-//! triggers; Enter and Space open and close.
+//! The behaviour is `primitives::accordion` (reka's `Accordion`): which
+//! sections are open, one at most ([`accordion`], an `Option<String>`) or
+//! any number ([`accordion_multiple`], a `Vec<String>`); each trigger its
+//! own Tab stop, Up and Down (wrapping), Home and End moving between this
+//! accordion's usable triggers; Enter and Space opening and closing. This
+//! file draws the parts.
 
 use gui::prelude::*;
-use gui::{
-    Animation, Bind, Element, FocusHandle, Icon, KeyEvent, Members, Model, NamedKey, Signal, UseModel, component, div,
-    icon, provide, use_context, use_model,
-};
+use gui::{Animation, Axis, Bind, Icon, Model, Signal, component, div, icon, provide, use_model};
+
+use primitives::Availability;
+use primitives::accordion::{Accordion, AccordionOptions, Section, SectionItem};
+use primitives::context::use_root;
+use primitives::use_direction;
 
 use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
-/// How many sections may be open at once (reka's `type`, with `collapsible`
-/// meaningful only for one).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AccordionKind {
-    /// At most one; `collapsible` lets the open one close, leaving none.
-    Single { collapsible: bool },
-    /// Any number.
-    Multiple,
-}
-
-/// What [`accordion`] is given.
+/// What [`accordion`] (`V = Option<String>`) and [`accordion_multiple`]
+/// (`V = Vec<String>`) are given.
 #[derive(Clone, Debug, PartialEq)]
-pub struct AccordionProps {
-    kind: AccordionKind,
-    value: Bind<Vec<String>>,
+pub struct AccordionProps<V: 'static> {
+    value: Bind<V>,
+    disabled: bool,
+    collapsible: bool,
+    orientation: Axis,
+    keep_mounted: bool,
 }
 
-impl Default for AccordionProps {
+impl<V: Default + 'static> Default for AccordionProps<V> {
     fn default() -> Self {
         Self {
-            kind: AccordionKind::Single { collapsible: false },
             value: Bind::default(),
+            disabled: false,
+            collapsible: false,
+            orientation: Axis::Vertical,
+            keep_mounted: false,
         }
     }
 }
 
-/// What the parts below [`accordion`] read.
-#[derive(Clone)]
-struct AccordionContext {
-    props: Signal<PartProps<AccordionProps>>,
-    open: UseModel<PartProps<AccordionProps>, Vec<String>>,
-    /// The triggers in tree order, as last laid out.
-    triggers: Members<FocusHandle>,
-}
-
-impl AccordionContext {
-    fn is_open(&self, value: &str) -> bool {
-        self.open.with(|open| open.iter().any(|v| v == value))
-    }
-
-    fn toggle(&self, value: &str) {
-        let kind = self.props.with_untracked(|p| p.props.kind);
-        self.open
-            .update(|open| *open = toggled(kind, std::mem::take(open), value));
-    }
-
-    /// Move focus from the trigger `from` as `key` asks; whether the key was
-    /// one of the accordion's.
-    fn navigate(&self, from: FocusHandle, key: &KeyEvent) -> bool {
-        let target = self.triggers.with(|triggers| {
-            let current = triggers.iter().position(|h| *h == from);
-            roving_target(triggers.len(), current, key).map(|i| triggers.get(i).copied())
-        });
-        let Some(target) = target else {
-            return false;
-        };
-        if let Some(handle) = target {
-            gui::focus::set_focus(Some(handle.id()), true);
+impl<V: 'static> AccordionProps<V> {
+    fn options(&self) -> AccordionOptions {
+        AccordionOptions {
+            availability: Availability::from_disabled(self.disabled),
+            orientation: self.orientation,
+            collapsible: self.collapsible,
+            keep_mounted: self.keep_mounted,
         }
-        true
     }
 }
 
-/// What an [`accordion_item`] gives its trigger and content: its value.
+/// What the parts below an accordion read: its primitive.
 #[derive(Clone, Copy)]
-struct ItemContext {
-    props: Signal<PartProps<AccordionItemProps>>,
+struct AccordionContext(Accordion<String>);
+
+/// What an [`accordion_item`] gives its trigger and content: its section.
+#[derive(Clone, Copy)]
+struct ItemContext(Section<String>);
+
+fn root<V>(mount: fn(PartProps<AccordionProps<V>>) -> gui::ComponentElement) -> Part<AccordionProps<V>>
+where
+    V: Default + 'static,
+{
+    Part::new(AccordionProps::default(), div().named("accordion"), mount)
 }
 
-impl ItemContext {
-    fn value(&self) -> String {
-        self.props.with(|p| p.props.value.clone())
-    }
-}
-
-/// The open values after pressing the trigger of `value`.
-fn toggled(kind: AccordionKind, open: Vec<String>, value: &str) -> Vec<String> {
-    let was_open = open.iter().any(|v| v == value);
-    match (kind, was_open) {
-        (AccordionKind::Single { collapsible: false }, true) => open,
-        (AccordionKind::Single { .. }, true) => Vec::new(),
-        (AccordionKind::Single { .. }, false) => vec![value.to_owned()],
-        (AccordionKind::Multiple, true) => open.into_iter().filter(|v| v != value).collect(),
-        (AccordionKind::Multiple, false) => open.into_iter().chain([value.to_owned()]).collect(),
-    }
-}
-
-/// Where a vertical, wrapping arrow navigation goes from `current` among `len`
-/// triggers on `key` (reka's `useArrowNavigation`).
-fn roving_target(len: usize, current: Option<usize>, key: &KeyEvent) -> Option<usize> {
-    let last = len.checked_sub(1)?;
-    let i = current?;
-    if key.is(NamedKey::ArrowDown) {
-        Some(if i >= last { 0 } else { i.saturating_add(1) })
-    } else if key.is(NamedKey::ArrowUp) {
-        Some(i.checked_sub(1).unwrap_or(last))
-    } else if key.is(NamedKey::Home) {
-        Some(0)
-    } else if key.is(NamedKey::End) {
-        Some(last)
-    } else {
-        None
-    }
-}
-
-/// The accordion: its items go inside. One section opens at a time unless
-/// it is made [`multiple`](Part::multiple).
+/// The accordion: its items go inside. At most one section is open; it
+/// closes again only when the accordion is [`collapsible`](Part::collapsible).
 #[must_use]
-pub fn accordion() -> Part<AccordionProps> {
-    Part::new(AccordionProps::default(), div().named("accordion"), |p| {
+pub fn accordion() -> Part<AccordionProps<Option<String>>> {
+    root(|p| {
         component(p, |cx| {
-            let props = cx.props();
-            provide(AccordionContext {
-                props,
-                open: use_model(props, |p| &p.props.value),
-                triggers: Members::new(),
-            });
+            let props: Signal<PartProps<AccordionProps<Option<String>>>> = cx.props();
+            provide(AccordionContext(Accordion::single(
+                use_model(props, |p: &PartProps<AccordionProps<_>>| &p.props.value),
+                move || props.with(|p| p.props.options()),
+                use_direction(None),
+            )));
             move || props.with(|p| p.slot.0.clone()).into_element()
         })
     })
 }
 
-impl Part<AccordionProps> {
-    /// At most one section open (reka's `type="single"`); `collapsible` lets
-    /// the open one close, leaving none.
+/// An accordion with any number of sections open (reka's `type="multiple"`).
+#[must_use]
+pub fn accordion_multiple() -> Part<AccordionProps<Vec<String>>> {
+    root(|p| {
+        component(p, |cx| {
+            let props: Signal<PartProps<AccordionProps<Vec<String>>>> = cx.props();
+            provide(AccordionContext(Accordion::multiple(
+                use_model(props, |p: &PartProps<AccordionProps<_>>| &p.props.value),
+                move || props.with(|p| p.props.options()),
+                use_direction(None),
+            )));
+            move || props.with(|p| p.slot.0.clone()).into_element()
+        })
+    })
+}
+
+impl<V: Clone + PartialEq + Default + 'static> Part<AccordionProps<V>> {
+    /// The open sections, kept by the caller (`v-model`).
     #[must_use]
-    pub fn single(self, collapsible: bool) -> Self {
-        self.with_props(|p| p.kind = AccordionKind::Single { collapsible })
+    pub fn model(self, model: impl Into<Model<V>>) -> Self {
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_model(model))
     }
 
-    /// Any number open (reka's `type="multiple"`).
+    /// Called with the open sections after each toggle (`@update:model-value`).
     #[must_use]
-    pub fn multiple(self) -> Self {
-        self.with_props(|p| p.kind = AccordionKind::Multiple)
+    pub fn on_change(self, f: impl Into<gui::Callback<V>>) -> Self {
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).on_change(f))
     }
 
+    /// Every trigger disabled (reka's `disabled` on the root).
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.disabled = disabled)
+    }
+
+    /// The axis the triggers' arrow keys run along (vertical unless set).
+    #[must_use]
+    pub fn orientation(self, orientation: Axis) -> Self {
+        self.with_props(|p| p.orientation = orientation)
+    }
+
+    /// Closed sections' content stays mounted, hidden and inert (reka's
+    /// `unmount-on-hide="false"`).
+    #[must_use]
+    pub fn keep_mounted(self, keep: bool) -> Self {
+        self.with_props(|p| p.keep_mounted = keep)
+    }
+}
+
+impl Part<AccordionProps<Option<String>>> {
+    /// The open section may close, leaving none (reka's `collapsible`).
+    #[must_use]
+    pub fn collapsible(self, collapsible: bool) -> Self {
+        self.with_props(|p| p.collapsible = collapsible)
+    }
+
+    /// The section open first, when no model is given (reka's `default-value`).
+    #[must_use]
+    pub fn default_value(self, value: &str) -> Self {
+        let value = Some(value.to_owned());
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_default(value))
+    }
+
+    /// The open section as the caller shows it (`:model-value`); a toggle
+    /// only calls `on_change`.
+    #[must_use]
+    pub fn value(self, value: Option<&str>) -> Self {
+        let value = value.map(str::to_owned);
+        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_value(value))
+    }
+}
+
+impl Part<AccordionProps<Vec<String>>> {
     /// The sections open first, when no model is given (reka's `default-value`).
     #[must_use]
     pub fn default_value(self, values: &[&str]) -> Self {
@@ -156,24 +165,12 @@ impl Part<AccordionProps> {
         self.with_props(|p| p.value = std::mem::take(&mut p.value).with_default(values))
     }
 
-    /// The open values, kept by the caller (`v-model`).
-    #[must_use]
-    pub fn model(self, model: impl Into<Model<Vec<String>>>) -> Self {
-        self.with_props(|p| p.value = std::mem::take(&mut p.value).with_model(model))
-    }
-
-    /// The open values as the caller shows them (`:model-value`); a toggle
-    /// only calls `on_change`.
+    /// The open sections as the caller shows them (`:model-value`); a
+    /// toggle only calls `on_change`.
     #[must_use]
     pub fn value(self, values: &[&str]) -> Self {
         let values = values.iter().map(|v| (*v).to_owned()).collect();
         self.with_props(|p| p.value = std::mem::take(&mut p.value).with_value(values))
-    }
-
-    /// Called with the open values after each toggle (`@update:model-value`).
-    #[must_use]
-    pub fn on_change(self, f: impl Fn(Vec<String>) + 'static) -> Self {
-        self.with_props(|p| p.value = std::mem::take(&mut p.value).on_change(f))
     }
 }
 
@@ -181,6 +178,34 @@ impl Part<AccordionProps> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct AccordionItemProps {
     value: String,
+    disabled: bool,
+    keep_mounted: Option<bool>,
+}
+
+impl AccordionItemProps {
+    fn section(&self) -> SectionItem<String> {
+        SectionItem {
+            value: self.value.clone(),
+            availability: Availability::from_disabled(self.disabled),
+            keep_mounted: self.keep_mounted,
+        }
+    }
+}
+
+impl Part<AccordionItemProps> {
+    /// Its trigger takes no focus and no press, and the arrow keys, Home
+    /// and End pass it by (reka's `disabled` on an item).
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.disabled = disabled)
+    }
+
+    /// Its content stays mounted while closed, or not, whatever the
+    /// accordion says (reka's `unmount-on-hide` on an item).
+    #[must_use]
+    pub fn keep_mounted(self, keep: bool) -> Self {
+        self.with_props(|p| p.keep_mounted = Some(keep))
+    }
 }
 
 /// One section, opening as `value`: its [`accordion_trigger`] and
@@ -190,10 +215,22 @@ pub struct AccordionItemProps {
 pub fn accordion_item(value: impl Into<String>) -> Part<AccordionItemProps> {
     let t = theme();
     let root = div().named("accordion-item").border_bottom(1.0).border_color(t.border);
-    Part::new(AccordionItemProps { value: value.into() }, root, |p| {
+    let props = AccordionItemProps {
+        value: value.into(),
+        disabled: false,
+        keep_mounted: None,
+    };
+    Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            provide(ItemContext { props });
+            if let Some(AccordionContext(accordion)) = use_root("accordion_item", "accordion") {
+                let section = accordion.section(props.with_untracked(|p| p.props.section()));
+                gui::watch(
+                    move || props.with(|p| p.props.section()),
+                    move |item, _| section.set(item.clone()),
+                );
+                provide(ItemContext(section));
+            }
             move || props.with(|p| p.slot.0.clone()).into_element()
         })
     })
@@ -227,37 +264,26 @@ pub fn accordion_trigger(label: impl IntoElement) -> Part<()> {
     Part::new((), trigger, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let root = use_context::<AccordionContext>();
-            let item = use_context::<ItemContext>();
-            let handle = FocusHandle::new();
+            let item = use_root::<ItemContext>("accordion_trigger", "accordion_item");
             move || {
                 let trigger = props.with(|p| p.slot.0.clone());
-                let (Some(root), Some(item)) = (root.clone(), item) else {
+                let Some(ItemContext(section)) = item else {
                     return trigger.into_element();
                 };
                 let t = theme();
-                let value = item.value();
-                let open = root.is_open(&value);
-                let (on_click, on_key) = (root.clone(), root.clone());
-                let trigger = trigger
-                    .aria_expanded(open)
-                    .track_focus(handle)
-                    .member(&root.triggers, handle)
-                    .on_click(move |_| on_click.toggle(&value))
-                    .on_key_down(move |key| on_key.navigate(handle, key))
-                    .child(
-                        icon(Icon::ChevronDown)
-                            .named("accordion-chevron")
-                            .text_color(t.muted_foreground)
-                            // `translate-y-0.5`: a 2px nudge that does not grow the row.
-                            .margin_top(2.0)
-                            .transition(Properties::TRANSFORM)
-                            .duration_ms(200.0)
-                            .when(open, |i| i.rotate(180.0)),
-                    );
-                div()
-                    .named("accordion-header")
-                    .display(Display::Flex)
+                let open = section.is_open();
+                let trigger = section.trigger(trigger).child(
+                    icon(Icon::ChevronDown)
+                        .named("accordion-chevron")
+                        .text_color(t.muted_foreground)
+                        // `translate-y-0.5`: a 2px nudge that does not grow the row.
+                        .margin_top(2.0)
+                        .transition(Properties::TRANSFORM)
+                        .duration_ms(200.0)
+                        .when(open, |i| i.rotate(180.0)),
+                );
+                section
+                    .header(div().named("accordion-header").display(Display::Flex))
                     .child(trigger)
                     .into_element()
             }
@@ -274,26 +300,74 @@ pub fn accordion_content() -> Part<()> {
     Part::new((), div().padding_top(0.0).padding_bottom(16.0), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let root = use_context::<AccordionContext>();
-            let item = use_context::<ItemContext>();
+            let item = use_root::<ItemContext>("accordion_content", "accordion_item");
             move || {
-                let open = match (&root, item) {
-                    (Some(root), Some(item)) => root.is_open(&item.value()),
-                    _ => true,
-                };
-                if !open {
-                    return Element::Empty;
-                }
-                div()
+                let inner = props.with(|p| p.slot.0.clone());
+                let content = div()
                     .named("accordion-content")
                     .overflow(Overflow::Hidden)
                     .text_size(14.0)
                     .line_height(20.0)
                     .animation(Animation::accordion_down().after_mount())
                     .exit_animation(Animation::accordion_up())
-                    .child(props.with(|p| p.slot.0.clone()))
-                    .into_element()
+                    .child(inner);
+                match item {
+                    Some(ItemContext(section)) => section.content(content),
+                    None => content.into_element(),
+                }
             }
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gui::{Modifiers, NamedKey, Scenario};
+
+    /// The label of the trigger holding focus, as a screen reader is told it.
+    fn focused_trigger(s: &Scenario) -> Option<String> {
+        let mut ts = gui::text::TextSystem::new();
+        let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+        let nodes: std::collections::HashMap<_, _> = tree.nodes.iter().cloned().collect();
+        let focus = nodes.get(&tree.focus)?;
+        focus.children().iter().find_map(|c| {
+            nodes
+                .get(c)
+                .and_then(|n| n.label().or_else(|| n.value()).map(str::to_owned))
+        })
+    }
+
+    fn key(s: &mut Scenario, k: NamedKey) {
+        s.press(k, Modifiers::default());
+        s.settle().expect("settled");
+    }
+
+    #[test]
+    fn a_disabled_items_trigger_is_skipped_home_and_end_included() {
+        let mut s = Scenario::measuring(
+            || {
+                accordion()
+                    .child(accordion_item("a").child(accordion_trigger("A")))
+                    .child(accordion_item("b").child(accordion_trigger("B")))
+                    .child(accordion_item("c").disabled(true).child(accordion_trigger("C")))
+                    .into_element()
+            },
+            400,
+            300,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("settled");
+        key(&mut s, NamedKey::Tab);
+        assert_eq!(focused_trigger(&s).as_deref(), Some("A"));
+        key(&mut s, NamedKey::End);
+        assert_eq!(focused_trigger(&s).as_deref(), Some("B"), "End passes the disabled C");
+        key(&mut s, NamedKey::ArrowDown);
+        assert_eq!(focused_trigger(&s).as_deref(), Some("A"), "ArrowDown wraps past C");
+        key(&mut s, NamedKey::ArrowUp);
+        assert_eq!(focused_trigger(&s).as_deref(), Some("B"));
+        key(&mut s, NamedKey::Tab);
+        assert_ne!(focused_trigger(&s).as_deref(), Some("C"), "Tab does not stop on C");
+    }
 }

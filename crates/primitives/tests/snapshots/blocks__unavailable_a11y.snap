@@ -1,0 +1,12 @@
+---
+source: crates/primitives/tests/blocks.rs
+expression: dump(&tree)
+---
+Window "w"
+  Toolbar
+    Button "X"
+      Label "X"
+    Button "Y" disabled
+      Label "Y" disabled
+    Button "Z"
+      Label "Z"

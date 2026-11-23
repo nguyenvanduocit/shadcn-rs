@@ -1,19 +1,22 @@
-//! Context menu (`ui/context-menu`): a menu opened by a right click, at the
-//! pointer. Its behaviour is the menu primitive's (see [`crate::dropdown_menu`]).
+//! Context menu (`ui/context-menu`): a menu opened by a right click (or a
+//! long press, or the context-menu key), at the pointer. Its behaviour is
+//! `primitives`' ([`primitives::context_menu::ContextMenu`] on the menu
+//! engine); the parts draw it (see [`crate::dropdown_menu`]).
 //!
 //! The parts nest as in Vue: [`context_menu`] keeps whether it is open
 //! (`on_open_change` hears it) and where it opened; it holds the
 //! [`context_menu_trigger`] area and the [`context_menu_content`].
 
-use std::rc::Rc;
-
 use gui::prelude::*;
-use gui::{Div, Icon, Signal, Text, component, div, icon, provide, use_model};
+use gui::{Div, Icon, Text, component, div, icon, provide, use_context, use_model};
+
+use primitives::Availability;
+use primitives::context_menu::ContextMenu;
 
 use crate::dropdown_menu::{
-    MenuCheckboxItemProps, MenuContentProps, MenuItem, MenuItemProps, MenuPlace, MenuPointer, MenuRadioGroupProps,
-    MenuRadioItemProps, MenuRootProps, MenuState, MenuSubTriggerProps, menu_box, menu_checkbox_item, menu_content,
-    menu_item, menu_level, menu_radio_group, menu_radio_item, menu_row_base, menu_separator, menu_shortcut, menu_sub,
+    MenuCheckboxItemProps, MenuContentProps, MenuItem, MenuItemProps, MenuPlace, MenuRadioGroupProps,
+    MenuRadioItemProps, MenuRootProps, MenuSubTriggerProps, menu_box, menu_checkbox_item, menu_content, menu_group,
+    menu_item, menu_item_separator, menu_radio_group, menu_radio_item, menu_row_base, menu_shortcut, menu_sub,
     menu_sub_trigger,
 };
 use gui::style::Origin;
@@ -32,38 +35,35 @@ pub fn context_menu() -> Part<MenuRootProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let level = MenuState::with_open(Rc::new(use_model(props, |p| p.props.open_bind())), None);
-                level.return_focus_on_close();
-                provide(level);
-                provide(MenuPointer(Signal::labeled("context menu at", (0.0, 0.0))));
+                let (options, delay) = props.with_untracked(|p| (p.props.options(), p.props.press_open_delay()));
+                let menu = ContextMenu::new(use_model(props, |p| p.props.open_bind()), options);
+                let menu = match delay {
+                    Some(d) => menu.press_open_delay(d),
+                    None => menu,
+                };
+                provide(menu);
+                provide(menu.menu());
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })
         },
     )
 }
 
-/// The area a right click opens the menu in, at the pointer
-/// (`ContextMenuTrigger as-child`); a press of the primary button inside it
-/// closes the menu, as it is outside the content.
+/// The area a right click, a long press or the context-menu key opens the
+/// menu in, at the pointer (`ContextMenuTrigger as-child`); a primary press
+/// inside it closes the menu, as it is outside the content.
 #[must_use]
 pub fn context_menu_trigger(area: Div) -> Part<()> {
     Part::new((), area.named("context-menu-trigger"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let level = menu_level();
-            let at = gui::use_context::<MenuPointer>();
+            let menu = use_context::<ContextMenu>();
             move || {
                 let root = props.with(|p| p.slot.0.clone());
-                let (Some(level), Some(at)) = (level.clone(), at) else {
-                    return root.into_element();
-                };
-                let close = level.clone();
-                root.on_secondary_click(move |ev| {
-                    level.close();
-                    at.0.set((ev.x, ev.y));
-                    level.open();
-                })
-                .on_mouse_down(move |_| close.close())
+                match menu {
+                    Some(m) => m.area(root, Availability::Enabled),
+                    None => root,
+                }
                 .into_element()
             }
         })
@@ -79,7 +79,6 @@ pub fn context_menu_content() -> Part<MenuContentProps> {
         popper(
             menu_box(&t)
                 .named("context-menu-content")
-                .role(gui::Role::Menu)
                 .overflow_y(Overflow::Scroll)
                 .overflow_x(Overflow::Hidden)
                 .shadow(crate::popover::POPUP_SHADOW),
@@ -91,7 +90,7 @@ pub fn context_menu_content() -> Part<MenuContentProps> {
 
 #[must_use]
 pub fn context_menu_group() -> Div {
-    div().named("context-menu-group")
+    menu_group(div().named("context-menu-group"))
 }
 
 /// A group of radio items, their chosen value its own (`default_value`) or
@@ -106,13 +105,7 @@ pub fn context_menu_radio_group() -> Part<MenuRadioGroupProps> {
 #[must_use]
 pub fn context_menu_item(id: &str, item: MenuItem) -> Part<MenuItemProps> {
     let t = theme();
-    menu_item(
-        menu_row_base(&t, item)
-            .named("context-menu-item")
-            .role(gui::Role::MenuItem),
-        id,
-        item,
-    )
+    menu_item(menu_row_base(&t, item).named("context-menu-item"), id, item)
 }
 
 /// A checkbox item labelled `label`; picking it toggles.
@@ -172,7 +165,7 @@ pub fn context_menu_label(label: &str, inset: bool) -> Div {
 
 #[must_use]
 pub fn context_menu_separator() -> Div {
-    menu_separator(&theme()).named("context-menu-separator")
+    menu_item_separator(&theme()).named("context-menu-separator")
 }
 
 #[must_use]
@@ -188,7 +181,7 @@ pub fn context_menu_sub() -> Part<MenuRootProps> {
 }
 
 /// The row opening its submenu (`data-[state=open]:bg-accent`, no gap,
-/// chevron in the text colour); the content opens to its right.
+/// chevron in the text colour); the content opens on the inline end.
 #[must_use]
 pub fn context_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
     let t = theme();
@@ -200,7 +193,6 @@ pub fn context_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTrig
             .child(icon(Icon::ChevronRight).margin_left(Length::Auto)),
         label,
         item,
-        true,
     )
 }
 

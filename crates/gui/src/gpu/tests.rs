@@ -997,3 +997,1035 @@ fn damage_under_a_blurred_backdrop_redraws_its_box() {
     assert!(d.damage >= 64 * 48, "the box is redrawn whole: {d}");
     canvas_is_whole(&mut gpu, &next, &mut text);
 }
+
+/// A clip within another ([`crate::scene::ClipNode::parent`]): the shaders
+/// walk each clip's chain, so when the outer one alone changes (the
+/// compositor moving it), its entry alone is written, and what the inner
+/// one clips is drawn again, cut anew.
+#[test]
+fn a_clip_within_another_cuts_anew_when_the_outer_one_alone_changes() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let clip = |h: f32| Clip {
+        bounds: rect(0.0, 0.0, 64.0, h),
+        radius: Corners::default(),
+        curve: crate::shape::ROUND,
+    };
+    let outer = scene.add_clip(clip(40.0), 0);
+    let inner = scene.add_clip(clip(64.0), 0);
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(inner).unwrap_or(0)) {
+        n.parent = outer;
+    }
+    scene.push_under(
+        State {
+            clip: inner,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let ink = |p: &Pixels, y: u32| p.pixel(10, y).is_some_and(|c| c[0] < 128);
+    let first = gpu.read_canvas().expect("a canvas");
+    assert!(ink(&first, 30) && !ink(&first, 50), "cut at the outer clip's 40");
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(outer).unwrap_or(0)) {
+        n.clip.bounds = rect(0.0, 0.0, 64.0, 20.0);
+    }
+    let changed = Changed {
+        clips: vec![outer],
+        ..Changed::default()
+    };
+    gpu.render(&scene, &changed, &mut text);
+    gpu.end_frame();
+    assert_eq!(gpu.drawn().clips_written, 1, "the outer clip's entry alone");
+    let next = gpu.read_canvas().expect("a canvas");
+    assert!(ink(&next, 10) && !ink(&next, 30), "cut at the outer clip's 20 now");
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A scene of 64 by 64 on white: a clip `outer`, and `inner` within it,
+/// a black rect over all of it under `inner`, and a white star path
+/// under it too, drawn by the path pipeline.
+fn clipped_in_clip(outer: Clip, inner: Clip) -> Scene {
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let outer = scene.add_clip(outer, 0);
+    let inner = scene.add_clip(inner, 0);
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(inner).unwrap_or(0)) {
+        n.parent = outer;
+    }
+    let under = State {
+        clip: inner,
+        ..State::default()
+    };
+    scene.push_under(
+        under,
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    // A path over the bottom left corner (the path pipeline's clips).
+    let path = Path::builder()
+        .move_to(0.0, 40.0)
+        .line_to(24.0, 40.0)
+        .line_to(24.0, 64.0)
+        .line_to(0.0, 64.0)
+        .close()
+        .build();
+    scene.push_under(
+        under,
+        vec![Item::Path {
+            origin: (0.0, 0.0),
+            path,
+            style: PathStyle::fill(Gradient::Solid(Color::hex(0xdc2626))),
+        }],
+    );
+    scene
+}
+
+/// A square clip (a text field's) within a rounded one (an overflow
+/// container's): the container's corners stay as the page was, under
+/// the quads and the paths alike; inside, all is drawn.
+#[test]
+fn a_square_clip_in_a_rounded_one_leaves_the_rounded_ones_corners_untouched() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let scene = clipped_in_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            radius: Corners::all(16.0),
+            curve: crate::shape::ROUND,
+        },
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    for (x, y) in [(1, 1), (62, 1), (62, 62), (1, 62)] {
+        assert_eq!(
+            at(&p, x, y),
+            [255, 255, 255, 255],
+            "the container's corner at ({x}, {y})"
+        );
+    }
+    assert_eq!(at(&p, 32, 32), [0, 0, 0, 255], "inside: drawn");
+    assert_eq!(at(&p, 12, 52), [0xdc, 0x26, 0x26, 255], "the path, inside");
+}
+
+/// A rounded clip (a text field's) its container cuts square across: its
+/// own corners mask it, and the cut is a straight edge, no corner on it.
+#[test]
+fn a_rounded_clip_cut_by_a_square_one_keeps_its_corners_on_its_own_corners() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let scene = clipped_in_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 32.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            radius: Corners::all(12.0),
+            curve: crate::shape::ROUND,
+        },
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 1, 1), [255, 255, 255, 255], "its own top left corner");
+    assert_eq!(at(&p, 62, 1), [255, 255, 255, 255], "its own top right corner");
+    for x in [0, 1, 62, 63] {
+        assert_eq!(at(&p, x, 31), [0, 0, 0, 255], "on the cut at ({x}, 31): no corner");
+    }
+    assert_eq!(at(&p, 32, 40), [255, 255, 255, 255], "past the cut: none");
+}
+
+/// Fifty fields, each its own clip within a container's that moves each
+/// frame: each frame writes the container's entry alone and signs no
+/// chunk again, however many fields lie in it; its damage, what the
+/// container showed and shows, draws its corners where they now are.
+#[test]
+fn moving_a_clip_over_many_fields_writes_one_clip_entry_a_frame() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((128, 128), 1.0, Some(Color::WHITE));
+    let outer = scene.add_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 128.0, 64.0),
+            radius: Corners::all(8.0),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    for k in 0..50_u16 {
+        let y = f32::from(k) * 2.0;
+        let field = scene.add_clip(
+            Clip {
+                bounds: rect(0.0, y, 128.0, 2.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(field).unwrap_or(0)) {
+            n.parent = outer;
+        }
+        scene.push_under(
+            State {
+                clip: field,
+                ..State::default()
+            },
+            vec![Item::Rect {
+                bounds: rect(0.0, y, 128.0, 2.0),
+                color: Color::BLACK,
+            }],
+        );
+    }
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    for frame in 1..=3_u8 {
+        let h = 64.0 + f32::from(frame) * 8.0;
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(outer).unwrap_or(0)) {
+            n.clip.bounds = rect(0.0, 0.0, 128.0, h);
+        }
+        let changed = Changed {
+            clips: vec![outer],
+            ..Changed::default()
+        };
+        gpu.render(&scene, &changed, &mut text);
+        let d = gpu.drawn();
+        assert_eq!(d.clips_written, 1, "frame {frame}: one entry");
+        assert!(!d.planned_whole, "frame {frame}: planned from what changed");
+        assert_eq!(d.signed, 0, "frame {frame}: no chunk signed again");
+        gpu.end_frame();
+        // The corners went down with it: where the last frame's bottom
+        // corners were is drawn now, and where they are now is not.
+        let p = gpu.read_canvas().expect("a canvas");
+        let bottom = crate::convert::f32_to_u32(h) - 1;
+        if frame > 1 {
+            assert_eq!(
+                at(&p, 1, bottom - 8),
+                [0, 0, 0, 255],
+                "frame {frame}: the old corner, drawn"
+            );
+        }
+        assert_eq!(at(&p, 1, bottom), [255, 255, 255, 255], "frame {frame}: the new corner");
+        canvas_is_whole(&mut gpu, &scene, &mut text);
+    }
+}
+
+/// A chain of `n` clips and a black rect over all under the innermost
+/// (`clips[n - 1]`): the first square over the window, the second square
+/// from 1 to 40 across, and every other rounded with its corners off the
+/// window (so in the chain the shaders walk, the second `n - 2` clips up
+/// it). The scene, and the clips' ids, outermost first.
+fn nested_clips(n: u16) -> (Scene, Vec<u32>) {
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let mut ids = Vec::new();
+    let mut up = 0;
+    for k in 0..n {
+        let (bounds, radius) = match k {
+            0 => (rect(0.0, 0.0, 64.0, 64.0), Corners::default()),
+            1 => (rect(1.0, 1.0, 39.0, 63.0), Corners::default()),
+            _ => (rect(-8.0, -8.0, 80.0, 80.0), Corners::all(2.0)),
+        };
+        let id = scene.add_clip(
+            Clip {
+                bounds,
+                radius,
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        if let Some(c) = scene.properties.clips.get_mut(usize::try_from(id).unwrap_or(0)) {
+            c.parent = up;
+        }
+        ids.push(id);
+        up = id;
+    }
+    scene.push_under(
+        State {
+            clip: up,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    (scene, ids)
+}
+
+/// Sixty-six nested clips: the shaders walk each chain to its end (no
+/// depth they stop at), so the second, 64 clips up the innermost's chain,
+/// still cuts at 1 and 40; the outermost, left out of the chains it
+/// contains, moving to cut alone cuts what the innermost holds (the clips
+/// that looked at it decided again).
+#[test]
+fn sixty_six_nested_clips_intersect_and_the_outermost_moving_moves_the_leaf() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let (mut scene, ids) = nested_clips(66);
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    assert_eq!(gpu.clip_tree.walk_len(ids.last().copied().unwrap_or(0)), 65);
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 0, 50), [255, 255, 255, 255], "before the second: not drawn");
+    assert_eq!(at(&p, 2, 50), [0, 0, 0, 255], "inside all: drawn");
+    assert_eq!(at(&p, 38, 50), [0, 0, 0, 255], "inside all: drawn");
+    assert_eq!(at(&p, 40, 50), [255, 255, 255, 255], "past the second: not drawn");
+    let outer = ids.first().copied().unwrap_or(0);
+    if let Some(c) = scene.properties.clips.get_mut(usize::try_from(outer).unwrap_or(0)) {
+        c.clip.bounds = rect(0.0, 0.0, 36.0, 64.0);
+    }
+    let changed = Changed {
+        clips: vec![outer],
+        ..Changed::default()
+    };
+    gpu.render(&scene, &changed, &mut text);
+    assert!(!gpu.drawn().planned_whole);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 35, 50), [0, 0, 0, 255], "inside all: drawn");
+    assert_eq!(
+        at(&p, 37, 50),
+        [255, 255, 255, 255],
+        "past the outermost, moved: not drawn"
+    );
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A rounded clip seventeen deep, every clip of its chain walked, cut
+/// square across by an ancestor: its own corners stay on its own
+/// corners, never on the cut.
+#[test]
+fn a_rounded_clip_seventeen_deep_cut_by_a_square_ancestor_keeps_its_own_corners() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let mut up = 0;
+    for k in 0..17_u16 {
+        let (bounds, radius) = match k {
+            // The cut, square, the seventeenth clip of the chain.
+            0 => (rect(0.0, 0.0, 64.0, 32.0), Corners::default()),
+            16 => (rect(0.0, 0.0, 64.0, 64.0), Corners::all(12.0)),
+            // Rounded, so each is in the chain the shaders walk; their
+            // corners off the window.
+            _ => (rect(-8.0, -8.0, 80.0, 80.0), Corners::all(2.0)),
+        };
+        let id = scene.add_clip(
+            Clip {
+                bounds,
+                radius,
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        if let Some(c) = scene.properties.clips.get_mut(usize::try_from(id).unwrap_or(0)) {
+            c.parent = up;
+        }
+        up = id;
+    }
+    scene.push_under(
+        State {
+            clip: up,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 1, 1), [255, 255, 255, 255], "its own top left corner");
+    for x in [0, 1, 62, 63] {
+        assert_eq!(at(&p, x, 31), [0, 0, 0, 255], "on the cut at ({x}, 31): no corner");
+    }
+    assert_eq!(at(&p, 32, 40), [255, 255, 255, 255], "past the cut: none");
+}
+
+/// A typical deep tree (nested containers, each square and inside the
+/// last, a rounded card among them, a scroll viewport cutting): the
+/// effective chain the shaders walk stays short however deep it is.
+#[test]
+fn the_effective_clip_chain_of_a_deep_tree_stays_short() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((256, 256), 1.0, Some(Color::WHITE));
+    let mut up = 0;
+    for k in 0..40_u16 {
+        let d = f32::from(k);
+        let (bounds, radius) = match k {
+            // A card.
+            10 => (rect(d, d, 200.0, 200.0), Corners::all(12.0)),
+            // A viewport cutting what is in it.
+            20 => (rect(d, d, 200.0, 60.0), Corners::default()),
+            _ => (rect(d, d, 220.0 - d, 220.0 - d), Corners::default()),
+        };
+        let id = scene.add_clip(
+            Clip {
+                bounds,
+                radius,
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        if let Some(c) = scene.properties.clips.get_mut(usize::try_from(id).unwrap_or(0)) {
+            c.parent = up;
+        }
+        up = id;
+    }
+    scene.push_under(
+        State {
+            clip: up,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 256.0, 256.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    let d = gpu.drawn();
+    gpu.end_frame();
+    // The leaf, the viewport that cuts it and the card's corners.
+    assert!(d.clip_chain <= 3, "forty deep, walked: {}", d.clip_chain);
+    assert_eq!(gpu.clip_tree.walk_len(up), 3);
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A clip's corners changing inside a layer that a filter keeps: the
+/// layer's texture is drawn again (its content holds the clip chain's
+/// revision), under a whole plan as under one from what changed.
+#[test]
+fn a_clip_radius_change_inside_a_cached_filter_layer_shows_the_new_corners() {
+    for whole in [true, false] {
+        let mut gpu = gpu();
+        let mut text = Glyphs::for_os();
+        let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+        let clip = scene.add_clip(
+            Clip {
+                bounds: rect(0.0, 0.0, 64.0, 64.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        let effect = scene.add_effect(EffectNode {
+            filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+            region: Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }),
+            ..EffectNode::default()
+        });
+        scene.push_under(
+            State {
+                clip,
+                effect,
+                ..State::default()
+            },
+            vec![Item::Rect {
+                bounds: rect(0.0, 0.0, 64.0, 64.0),
+                color: Color::BLACK,
+            }],
+        );
+        gpu.render(&scene, &Changed::all(), &mut text);
+        gpu.end_frame();
+        assert_eq!(at(&gpu.read_canvas().expect("a canvas"), 1, 1), [0, 0, 0, 255]);
+        if let Some(c) = scene.properties.clips.get_mut(usize::try_from(clip).unwrap_or(0)) {
+            c.clip.radius = Corners::all(16.0);
+        }
+        let changed = if whole {
+            Changed::all()
+        } else {
+            Changed {
+                clips: vec![clip],
+                ..Changed::default()
+            }
+        };
+        gpu.render(&scene, &changed, &mut text);
+        gpu.end_frame();
+        let p = gpu.read_canvas().expect("a canvas");
+        assert_eq!(at(&p, 1, 1), [255, 255, 255, 255], "the new corner (whole: {whole})");
+        assert_eq!(at(&p, 32, 32), [0, 0, 0, 255], "inside (whole: {whole})");
+        canvas_is_whole(&mut gpu, &scene, &mut text);
+    }
+}
+
+/// A filtered layer turned half round under a clip of the canvas that
+/// stays, its region and origin the same: the clip keeps other texels of
+/// the layer now, so its texture is drawn again (its content's key holds
+/// the clip as the layer's texels see it).
+#[test]
+fn a_cached_filtered_layer_turned_under_a_clip_that_stays_is_drawn_again() {
+    for whole in [true, false] {
+        let mut gpu = gpu();
+        let mut text = Glyphs::for_os();
+        let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+        let turn = |rotate: f32| GroupTransform {
+            origin: (32.0, 32.0),
+            scale: 1.0,
+            rotate,
+        };
+        let t = scene.add_transform((0.0, 0.0), Some(turn(0.0)));
+        // The canvas's left half.
+        let clip = scene.add_clip(
+            Clip {
+                bounds: rect(0.0, 0.0, 32.0, 64.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        let effect = scene.add_effect(EffectNode {
+            filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+            transform: t,
+            transformed: true,
+            region: Some(PixelRect {
+                x: 0,
+                y: 0,
+                width: 64,
+                height: 64,
+            }),
+            ..EffectNode::default()
+        });
+        // The layer's top half.
+        scene.push_under(
+            State {
+                transform: t,
+                clip,
+                effect,
+            },
+            vec![Item::Rect {
+                bounds: rect(0.0, 0.0, 64.0, 32.0),
+                color: Color::BLACK,
+            }],
+        );
+        gpu.render(&scene, &Changed::all(), &mut text);
+        gpu.end_frame();
+        let p = gpu.read_canvas().expect("a canvas");
+        assert_eq!(at(&p, 16, 16), [0, 0, 0, 255], "top left");
+        assert_eq!(at(&p, 48, 16), [255, 255, 255, 255], "top right, clipped");
+        if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(t).unwrap_or(0)) {
+            n.matrix = Some(turn(180.0));
+        }
+        let changed = if whole {
+            Changed::all()
+        } else {
+            Changed {
+                transforms: vec![t],
+                effects: vec![effect],
+                ..Changed::default()
+            }
+        };
+        gpu.render(&scene, &changed, &mut text);
+        let d = gpu.drawn();
+        gpu.end_frame();
+        assert_eq!(d.layers, 1, "drawn again (whole: {whole}): {d}");
+        let p = gpu.read_canvas().expect("a canvas");
+        // The top half turned to the bottom, the left half kept.
+        assert_eq!(at(&p, 16, 48), [0, 0, 0, 255], "bottom left (whole: {whole})");
+        assert_eq!(at(&p, 48, 48), [255, 255, 255, 255], "bottom right (whole: {whole})");
+        assert_eq!(at(&p, 16, 16), [255, 255, 255, 255], "top left (whole: {whole})");
+        canvas_is_whole(&mut gpu, &scene, &mut text);
+    }
+}
+
+/// A filtered card scrolled with its own clip: the clip keeps the same
+/// texels of its layer, so the texture is kept and only composited where
+/// it lies now.
+#[test]
+fn a_filtered_card_scrolled_with_its_clip_keeps_its_layer() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((128, 128), 1.0, Some(Color::WHITE));
+    let t = scene.add_transform((0.0, 0.0), None);
+    let clip = scene.add_clip(
+        Clip {
+            bounds: rect(20.0, 40.0, 60.0, 60.0),
+            radius: Corners::all(12.0),
+            curve: crate::shape::ROUND,
+        },
+        t,
+    );
+    let effect = scene.add_effect(EffectNode {
+        filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+        transform: t,
+        region: Some(PixelRect {
+            x: 20,
+            y: 40,
+            width: 60,
+            height: 60,
+        }),
+        ..EffectNode::default()
+    });
+    scene.push_under(
+        State {
+            transform: t,
+            clip,
+            effect,
+        },
+        vec![Item::Rect {
+            bounds: rect(20.0, 40.0, 60.0, 60.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    // Scrolled up 24: the transform, the clip and the region together.
+    if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(t).unwrap_or(0)) {
+        n.offset = (0.0, -24.0);
+    }
+    if let Some(c) = scene.properties.clips.get_mut(usize::try_from(clip).unwrap_or(0)) {
+        c.clip.bounds = rect(20.0, 16.0, 60.0, 60.0);
+    }
+    if let Some(r) = scene
+        .properties
+        .effects
+        .get_mut(usize::try_from(effect).unwrap_or(0))
+        .and_then(|e| e.region.as_mut())
+    {
+        r.y = 16;
+    }
+    gpu.render(
+        &scene,
+        &Changed {
+            transforms: vec![t],
+            clips: vec![clip],
+            effects: vec![effect],
+            ..Changed::default()
+        },
+        &mut text,
+    );
+    let d = gpu.drawn();
+    gpu.end_frame();
+    assert_eq!((d.layers, d.layers_kept), (0, 1), "the texture kept: {d}");
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 50, 30), [0, 0, 0, 255], "the card where it lies now");
+    assert_eq!(at(&p, 21, 17), [255, 255, 255, 255], "its corner, cut");
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A root chunk's clip changing its corners alone, on an opaque canvas,
+/// under a whole plan: its key holds the chain's revision, so it is
+/// damage and drawn.
+#[test]
+fn a_clip_radius_change_alone_repaints_under_a_whole_plan() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let clip = scene.add_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    scene.push_under(
+        State {
+            clip,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    if let Some(c) = scene.properties.clips.get_mut(usize::try_from(clip).unwrap_or(0)) {
+        c.clip.radius = Corners::all(16.0);
+    }
+    gpu.render(&scene, &Changed::all(), &mut text);
+    assert!(gpu.drawn().damage > 0, "the corners are damage");
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 1, 1), [255, 255, 255, 255], "the new corner");
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A clip moved from a parent on the left to one on the right: the damage
+/// is what its old chain kept and what its new one keeps, each frame's
+/// from its own ancestry, so nothing is left where it was.
+#[test]
+fn reparenting_a_clip_from_left_to_right_leaves_nothing_behind() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let square = |x: f32, w: f32| Clip {
+        bounds: rect(x, 0.0, w, 64.0),
+        radius: Corners::default(),
+        curve: crate::shape::ROUND,
+    };
+    let left = scene.add_clip(square(0.0, 24.0), 0);
+    let right = scene.add_clip(square(40.0, 24.0), 0);
+    let leaf = scene.add_clip(square(0.0, 64.0), 0);
+    if let Some(c) = scene.properties.clips.get_mut(usize::try_from(leaf).unwrap_or(0)) {
+        c.parent = left;
+    }
+    scene.push_under(
+        State {
+            clip: leaf,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    assert_eq!(at(&gpu.read_canvas().expect("a canvas"), 10, 10), [0, 0, 0, 255]);
+    if let Some(c) = scene.properties.clips.get_mut(usize::try_from(leaf).unwrap_or(0)) {
+        c.parent = right;
+    }
+    let changed = Changed {
+        clips: vec![leaf],
+        ..Changed::default()
+    };
+    gpu.render(&scene, &changed, &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 10, 10), [255, 255, 255, 255], "the left: nothing left behind");
+    assert_eq!(at(&p, 50, 10), [0, 0, 0, 255], "the right: drawn");
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A chunk as large as the window under a small clip, recorded again: its
+/// damage is what its chain keeps, not all it draws.
+#[test]
+fn a_viewport_sized_chunk_under_a_small_clip_damages_no_more_than_the_clip() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let key = text.test_glyph(24.0).expect("a glyph");
+    let build = |color: Color| {
+        let mut scene = Scene::new((256, 256), 1.0, Some(Color::WHITE));
+        let clip = scene.add_clip(
+            Clip {
+                bounds: rect(100.0, 100.0, 16.0, 16.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        // Text over all of the window.
+        let mut items = Vec::new();
+        for row in 0..10_i32 {
+            for col in 0..12_i32 {
+                items.push(Item::Glyph {
+                    key,
+                    x: col * 20,
+                    y: 20 + row * 24,
+                    color,
+                });
+            }
+        }
+        scene.chunks.push(crate::scene::Chunk {
+            id: crate::scene::ChunkId(7),
+            state: State {
+                clip,
+                ..State::default()
+            },
+            display: std::sync::Arc::new(crate::scene::Display::new(items)),
+        });
+        scene
+    };
+    gpu.render(&build(Color::BLACK), &Changed::all(), &mut text);
+    gpu.end_frame();
+    let next = build(Color::hex(0x2563eb));
+    let changed = Changed {
+        chunks: vec![0],
+        ..Changed::default()
+    };
+    gpu.render(&next, &changed, &mut text);
+    let d = gpu.drawn();
+    gpu.end_frame();
+    assert!(!d.planned_whole);
+    // The clip and a pixel of anti-aliasing around it.
+    assert!(d.damage > 0 && d.damage <= 18 * 18, "{d}");
+    canvas_is_whole(&mut gpu, &next, &mut text);
+}
+
+/// Curve text (`slug.wgsl`) under a square clip within a rounded one: the
+/// rounded one's corner cuts its ink, as it cuts quads and paths.
+#[test]
+fn curve_text_in_a_square_clip_within_a_rounded_one_is_cut_by_its_corner() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let (plain, key) = glyph_scene(&mut text, 200.0, None);
+    let whole = gpu.capture(&plain, None, &mut text).expect("read back");
+    let (w, h) = (whole.width(), whole.height());
+    let ink: Vec<(u32, u32)> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .filter(|&(x, y)| at(&whole, x, y)[0] < 32)
+        .collect();
+    // The ink's top left: the rounded clip's corner goes just above it.
+    let &(px, py) = ink.iter().min_by_key(|(x, y)| x + y).expect("ink");
+    let &(qx, qy) = ink
+        .iter()
+        .find(|&&(x, y)| x >= px + 40 && y >= py + 40)
+        .expect("ink well inside");
+    let (cx, cy) = (i32_to_f32(px.cast_signed()) - 5.0, i32_to_f32(py.cast_signed()) - 5.0);
+    let size = (i32_to_f32(w.cast_signed()), i32_to_f32(h.cast_signed()));
+    let Some(Item::Glyph { x, y, .. }) = plain.items().next().cloned() else {
+        panic!()
+    };
+    let mut scene = Scene::new((w, h), 1.0, Some(Color::WHITE));
+    let bounds = rect(cx, cy, size.0 - cx, size.1 - cy);
+    let outer = scene.add_clip(
+        Clip {
+            bounds,
+            radius: Corners::all(30.0),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let inner = scene.add_clip(
+        Clip {
+            bounds,
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(inner).unwrap_or(0)) {
+        n.parent = outer;
+    }
+    scene.push_under(
+        State {
+            clip: inner,
+            ..State::default()
+        },
+        vec![Item::Glyph {
+            key,
+            x,
+            y,
+            color: Color::BLACK,
+        }],
+    );
+    let cut = gpu.capture(&scene, None, &mut text).expect("read back");
+    assert_eq!(
+        at(&cut, px, py),
+        [255, 255, 255, 255],
+        "outside the rounded corner: no ink"
+    );
+    assert_eq!(at(&cut, qx, qy), at(&whole, qx, qy), "well inside: as drawn unclipped");
+}
+
+/// Two turned groups, each inside a clip of its own (the outer group in
+/// one, the inner in one inside the outer group): what the inner holds,
+/// drawn through both turns as paths and curve glyphs, is cut by both
+/// clips, each tested in its own space (one chain across the turns).
+#[test]
+fn nested_turned_groups_cut_paths_and_curve_glyphs_by_both_clips() {
+    use crate::app::Scenario;
+    use crate::element::{IntoElement, div, text};
+    use crate::style::Overflow;
+    use crate::styled::Styled;
+    // The outer clip keeps 20..160 across; the outer group, wider (160),
+    // turns half about (100, 100); the clip inside it keeps 20..100 across
+    // there, so 100..180 on screen; the inner group, turned half about its
+    // own centre, spans -20..180 on screen. The clips cross: 24..96 only
+    // the inner one cuts, 164..176 only the outer one, 104..156 neither.
+    let shot = |content: fn() -> crate::element::Element| {
+        let mut s = Scenario::measuring(
+            move || {
+                div()
+                    .background(Color::WHITE)
+                    .width(200.0)
+                    .height(200.0)
+                    .padding_top(20.0)
+                    .padding_left(20.0)
+                    .child(
+                        div().width(140.0).height(160.0).overflow(Overflow::Hidden).child(
+                            div().width(160.0).height(160.0).flex_shrink(0.0).rotate(180.0).child(
+                                div().width(80.0).height(160.0).overflow(Overflow::Hidden).child(
+                                    div()
+                                        .width(200.0)
+                                        .height(160.0)
+                                        .flex_shrink(0.0)
+                                        .rotate(180.0)
+                                        .child(content()),
+                                ),
+                            ),
+                        ),
+                    )
+                    .into_element()
+            },
+            200,
+            200,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("settled");
+        s.shot(false).expect("a shot")
+    };
+    let dark = |p: &Pixels, x0: u32, x1: u32| {
+        (24..176)
+            .flat_map(|y| (x0..x1).map(move |x| (x, y)))
+            .filter(|&(x, y)| at(p, x, y)[0] < 128)
+            .count()
+    };
+    // A box: a path through the turns.
+    let boxed = shot(|| div().width(200.0).height(160.0).background(Color::BLACK).into_element());
+    assert_eq!(dark(&boxed, 24, 96), 0, "the inner clip cuts the path");
+    assert_eq!(dark(&boxed, 104, 156), 52 * 152, "inside both: the path");
+    assert_eq!(dark(&boxed, 164, 176), 0, "the outer clip cuts the path");
+    assert_eq!(
+        at(&boxed, 60, 100),
+        [255, 255, 255, 255],
+        "only the inner clip cuts here"
+    );
+    assert_eq!(at(&boxed, 130, 100), [0, 0, 0, 255], "neither cuts here");
+    assert_eq!(
+        at(&boxed, 170, 100),
+        [255, 255, 255, 255],
+        "only the outer clip cuts here"
+    );
+    // Text: curve glyphs through the turns.
+    let glyphs = shot(|| {
+        div()
+            .width(200.0)
+            .height(160.0)
+            .text_size(40.0)
+            .text_color(Some(Color::BLACK))
+            .child(text(
+                "MMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMMM",
+            ))
+            .into_element()
+    });
+    assert_eq!(dark(&glyphs, 24, 96), 0, "the inner clip cuts the glyphs");
+    assert!(dark(&glyphs, 104, 156) > 300, "inside both: the glyphs");
+    assert_eq!(dark(&glyphs, 164, 176), 0, "the outer clip cuts the glyphs");
+}
+
+/// Pure green: a pixel [`super::path::ClipSkip::Mark`] marked.
+fn marked(p: [u8; 4]) -> bool {
+    p[0] < 32 && p[1] > 224 && p[2] < 32
+}
+
+/// Paths and curve glyphs whose quad lies wholly inside their clip chain
+/// test no clip per pixel (`clip_needed` in `path_render.wgsl` and
+/// `slug.wgsl`), and draw what testing it would: marked where skipped,
+/// not where a quad crosses a clip's edge, and the same pixels skipped or
+/// not.
+#[test]
+fn paths_and_curve_glyphs_inside_their_clips_skip_the_clip_test_and_draw_the_same() {
+    use super::path::ClipSkip;
+    let mut text = Glyphs::for_os();
+    // Paths: one wholly inside a square clip, one across its edge.
+    let mut paths = Scene::new((128, 64), 1.0, Some(Color::WHITE));
+    let clip = paths.add_clip(
+        Clip {
+            bounds: rect(8.0, 8.0, 112.0, 48.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let square = |x: f32, y: f32, w: f32| {
+        Path::builder()
+            .move_to(x, y)
+            .line_to(x + w, y)
+            .line_to(x + w, y + w)
+            .line_to(x, y + w)
+            .close()
+            .build()
+    };
+    for (x, y, w) in [(40.0, 24.0, 16.0), (0.0, 0.0, 14.0)] {
+        paths.push_under(
+            State {
+                clip,
+                ..State::default()
+            },
+            vec![Item::Path {
+                origin: (0.0, 0.0),
+                path: square(x, y, w),
+                style: PathStyle::fill(Gradient::Solid(Color::BLACK)),
+            }],
+        );
+    }
+    // A curve glyph in a clip containing it, and in one cutting it.
+    let (plain, key) = glyph_scene(&mut text, 200.0, None);
+    let Some(Item::Glyph { x, y, .. }) = plain.items().next().cloned() else {
+        panic!()
+    };
+    let glyph = |cut: bool| {
+        let mut scene = Scene::new(plain.size, 1.0, Some(Color::WHITE));
+        let (w, h) = (
+            crate::convert::u32_to_f32(plain.size.0),
+            crate::convert::u32_to_f32(plain.size.1),
+        );
+        let clip = scene.add_clip(
+            Clip {
+                bounds: if cut {
+                    rect(0.0, 0.0, w / 2.0, h)
+                } else {
+                    rect(0.0, 0.0, w, h)
+                },
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        scene.push_under(
+            State {
+                clip,
+                ..State::default()
+            },
+            vec![Item::Glyph {
+                key,
+                x,
+                y,
+                color: Color::BLACK,
+            }],
+        );
+        scene
+    };
+    let shots = |mode: ClipSkip, text: &mut Glyphs| {
+        let mut gpu = gpu();
+        gpu.paths.clip_skip = mode;
+        [&paths, &glyph(false), &glyph(true)].map(|s| gpu.capture(s, None, text).expect("read back"))
+    };
+    let skip = shots(ClipSkip::Skip, &mut text);
+    let never = shots(ClipSkip::Never, &mut text);
+    let mark = shots(ClipSkip::Mark, &mut text);
+    for (a, b) in skip.iter().zip(&never) {
+        assert_eq!(a.data(), b.data(), "skipped or not, the same pixels");
+    }
+    let [paths_marked, inside, cut] = &mark;
+    assert!(marked(at(paths_marked, 48, 32)), "the path inside: skipped");
+    assert_eq!(
+        at(paths_marked, 10, 10),
+        [0, 0, 0, 255],
+        "the path across the edge: tested"
+    );
+    assert_eq!(at(paths_marked, 4, 4), [255, 255, 255, 255], "and cut");
+    let count = |p: &Pixels| {
+        (0..p.height())
+            .flat_map(|y| (0..p.width()).map(move |x| (x, y)))
+            .filter(|&(x, y)| marked(at(p, x, y)))
+            .count()
+    };
+    assert!(count(inside) > 500, "the glyph inside its clip: skipped");
+    assert_eq!(count(cut), 0, "the glyph its clip cuts: tested");
+    assert!(
+        never.iter().all(|p| count(p) == 0) && skip.iter().all(|p| count(p) == 0),
+        "marked only when asked"
+    );
+}

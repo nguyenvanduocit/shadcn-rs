@@ -15,7 +15,7 @@ pub fn render() -> Render {
     let person = Signal::labeled("person", String::from("pedro"));
     Box::new(move || {
         let t = theme();
-        let act = |name: &'static str| move || last.set(name.to_owned());
+        let act = |name: &'static str| move |_| last.set(name.to_owned());
         let item = |name: &'static str, opts: MenuItem| context_menu_item(name, opts).on_select(act(name)).child(name);
         let with_icon = |glyph: Icon, name: &'static str, opts: MenuItem| {
             let muted = opts.variant == shadcn::MenuItemVariant::Default;

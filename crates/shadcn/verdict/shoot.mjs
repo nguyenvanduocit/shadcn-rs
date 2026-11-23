@@ -1,10 +1,13 @@
 // Shoot shadcn-vue's demos for the gallery's verdict.
 //
-//   node shoot.mjs <dir> --now=<ms> --zone=<IANA zone> [--dark] < demos.txt
+//   node shoot.mjs <dir> --now=<ms> --zone=<IANA zone> [--style=<name>] [--theme=<spec>] [--dark] < demos.txt
 //
 // Reads `<page> <Demo>.vue` lines (the gallery's `--demos`), and for each
 // writes `<dir>/<page>/<Demo>/ref-full.png` (the page at 2x) and `ref.rect`
-// (the demo's box, logical px: "x y w h"). The browser runs in `--zone` (its
+// (the demo's box, logical px: "x y w h"). Each demo renders in `--style`
+// (vega when not given) and the theme `--theme` names (`docs --spec`'s
+// canonical spec; upstream's defaults when not given), as main.ts applies
+// them; a choice the page cannot render fails the demo. The browser runs in `--zone` (its
 // TZ) and each page's clock starts at `--now` (index.html), the instant the
 // docs are at (`docs --clock`), so a demo that shows today shows the docs'
 // day, whatever the date. Needs the reference app served on
@@ -18,13 +21,15 @@ import { join } from "node:path"
 
 const [dir, ...flags] = process.argv.slice(2)
 if (!dir) {
-  console.error("usage: node shoot.mjs <dir> --now=<ms> --zone=<IANA zone> [--dark] < demos.txt")
+  console.error("usage: node shoot.mjs <dir> --now=<ms> --zone=<IANA zone> [--style=<name>] [--theme=<spec>] [--dark] < demos.txt")
   process.exit(2)
 }
 const dark = flags.includes("--dark")
 const flag = name => flags.find(f => f.startsWith(`--${name}=`))?.slice(name.length + 3)
 const now = Number(flag("now"))
 const zone = flag("zone")
+const style = flag("style") ?? "vega"
+const theme = flag("theme") ?? ""
 if (!Number.isSafeInteger(now) || now <= 0 || !zone) {
   console.error("shoot.mjs: --now=<ms since the epoch> and --zone=<IANA zone> are required (docs --clock)")
   process.exit(2)
@@ -61,7 +66,8 @@ for (const line of lines) {
   const out = join(dir, page, demo)
   mkdirSync(out, { recursive: true })
   try {
-    browser("open", `http://127.0.0.1:5298/?demo=${demo}&now=${now}${dark ? "&dark=1" : ""}`)
+    const query = new URLSearchParams({ demo, now: String(now), style, theme, ...(dark && { dark: "1" }) })
+    browser("open", `http://127.0.0.1:5298/?${query}`)
     browser("wait", "--fn", "document.querySelector('#specimen')?.dataset.ready || document.querySelector('#specimen')?.dataset.error || document.body.dataset.error")
     const probe = JSON.parse(JSON.parse(browser("eval", `JSON.stringify((() => {
       const s = document.querySelector('#specimen')

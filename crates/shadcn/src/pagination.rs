@@ -1,13 +1,16 @@
 //! Pagination (`ui/pagination`): page links between previous and next,
 //! styled as ghost buttons with the current page outlined.
 //!
-//! [`pagination`] keeps the page; the links below it read and move it.
+//! The behaviour is `primitives::pagination` (reka's `Pagination`):
+//! [`pagination`] keeps the page, from 1; the list below it is worked out
+//! from the page, the page count and the siblings; the step buttons are
+//! disabled at their ends. This file draws the parts.
 
 use gui::prelude::*;
-use gui::{
-    Bind, ComponentElement, Div, Icon, Model, Signal, UseModel, component, div, icon, provide, text, use_context,
-    use_model,
-};
+use gui::{Bind, ComponentElement, Div, Icon, Model, component, div, icon, provide, text, use_model};
+use primitives::Availability;
+use primitives::context::use_root;
+use primitives::pagination::{Entry, Pagination, PaginationOptions, Step};
 
 use crate::button::{Button, ButtonSize, ButtonVariant, button};
 use crate::part::{Part, PartProps};
@@ -21,6 +24,8 @@ pub struct PaginationProps {
     items_per_page: usize,
     sibling_count: usize,
     show_edges: bool,
+    disabled: bool,
+    clamp: bool,
 }
 
 impl Default for PaginationProps {
@@ -29,85 +34,31 @@ impl Default for PaginationProps {
             page: Bind::default_value(1),
             total: 0,
             items_per_page: 10,
+            // shadcn's demos list one page each side; reka's default is 2.
             sibling_count: 1,
             show_edges: false,
+            disabled: false,
+            clamp: false,
         }
     }
 }
 
-/// One entry of the page list.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaginationEntry {
-    Page(usize),
-    Ellipsis,
-}
-
-/// What the parts below [`pagination`] read.
-#[derive(Clone)]
-struct PaginationContext {
-    props: Signal<PartProps<PaginationProps>>,
-    page: UseModel<PartProps<PaginationProps>, usize>,
-}
-
-impl PaginationContext {
-    fn find() -> Option<Self> {
-        use_context::<Self>()
-    }
-
-    fn page_count(&self) -> usize {
-        self.props
-            .with(|p| p.props.total.div_ceil(p.props.items_per_page.max(1)).max(1))
-    }
-
-    /// The pages and ellipses to list around the current page.
-    fn entries(&self) -> Vec<PaginationEntry> {
-        let (siblings, edges) = self.props.with(|p| (p.props.sibling_count, p.props.show_edges));
-        pagination_range(self.page.get(), self.page_count(), siblings, edges)
-    }
-
-    /// Go to `page`, kept within the pages there are.
-    fn go(&self, page: usize) {
-        self.page.set(page.clamp(1, self.page_count()));
+impl PaginationProps {
+    fn options(&self) -> PaginationOptions {
+        PaginationOptions {
+            total: self.total,
+            items_per_page: self.items_per_page,
+            siblings: self.sibling_count,
+            show_edges: self.show_edges,
+            availability: Availability::from_disabled(self.disabled),
+            clamp: self.clamp,
+        }
     }
 }
 
-/// reka-ui's `getRange`: which pages to list for `page` of `count`.
-#[must_use]
-pub fn pagination_range(page: usize, count: usize, siblings: usize, show_edges: bool) -> Vec<PaginationEntry> {
-    use PaginationEntry::{Ellipsis, Page};
-    let pages = |from: usize, to: usize| (from..=to).map(Page);
-    let left = page.saturating_sub(siblings).max(1);
-    let right = page.saturating_add(siblings).min(count);
-    if show_edges {
-        let total_numbers = siblings.saturating_mul(2).saturating_add(5).min(count);
-        let item_count = total_numbers.saturating_sub(2);
-        let show_left = left > 3 && count.abs_diff(item_count) > 2 && left.abs_diff(1) > 2;
-        let show_right = right.saturating_add(2) < count && count.abs_diff(item_count) > 2 && count.abs_diff(right) > 2;
-        return match (show_left, show_right) {
-            (false, true) => pages(1, item_count).chain([Ellipsis, Page(count)]).collect(),
-            (true, false) => [Page(1), Ellipsis]
-                .into_iter()
-                .chain(pages(count.saturating_sub(item_count).saturating_add(1), count))
-                .collect(),
-            (true, true) => [Page(1), Ellipsis]
-                .into_iter()
-                .chain(pages(left, right))
-                .chain([Ellipsis, Page(count)])
-                .collect(),
-            (false, false) => pages(1, count).collect(),
-        };
-    }
-    let item_count = siblings.saturating_mul(2).saturating_add(1);
-    if count < item_count {
-        pages(1, count).collect()
-    } else if page <= siblings.saturating_add(1) {
-        pages(1, item_count).collect()
-    } else if count.saturating_sub(page) <= siblings {
-        pages(count.saturating_sub(item_count).saturating_add(1), count).collect()
-    } else {
-        pages(left, right).collect()
-    }
-}
+/// What the parts below [`pagination`] read: its primitive.
+#[derive(Clone, Copy)]
+struct PaginationContext(Pagination<PartProps<PaginationProps>>);
 
 /// The `<nav>`: centred in its row. It keeps the page: its own, from
 /// `default_page`, the caller's through `.model(…)` (`v-model:page`), or one
@@ -123,11 +74,12 @@ pub fn pagination() -> Part<PaginationProps> {
     Part::new(PaginationProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            provide(PaginationContext {
-                props,
-                page: use_model(props, |p| &p.props.page),
-            });
-            move || props.with(|p| p.slot.0.clone()).into_element()
+            let pagination = Pagination::new(
+                use_model(props, |p: &PartProps<PaginationProps>| &p.props.page),
+                move || props.with(|p| p.props.options()),
+            );
+            provide(PaginationContext(pagination));
+            move || pagination.root(props.with(|p| p.slot.0.clone())).into_element()
         })
     })
 }
@@ -163,7 +115,7 @@ impl Part<PaginationProps> {
 
     /// Called with each page moved to (`@update:page`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(usize) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<usize>>) -> Self {
         self.with_props(|p| p.page = std::mem::take(&mut p.page).on_change(f))
     }
 
@@ -177,6 +129,19 @@ impl Part<PaginationProps> {
     #[must_use]
     pub fn show_edges(self, show: bool) -> Self {
         self.with_props(|p| p.show_edges = show)
+    }
+
+    /// Every button disabled (reka's `disabled`).
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.disabled = disabled)
+    }
+
+    /// A page the caller sets out of range is corrected, and the caller
+    /// told (reka's `clamp`; off unless set).
+    #[must_use]
+    pub fn clamp(self, clamp: bool) -> Self {
+        self.with_props(|p| p.clamp = clamp)
     }
 }
 
@@ -198,15 +163,15 @@ pub fn pagination_list() -> Part<()> {
     Part::new((), pagination_content(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = PaginationContext::find();
+            let ctx = use_root::<PaginationContext>("pagination_list", "pagination");
             move || {
                 let row = props.with(|p| p.slot.0.clone());
-                let Some(ctx) = &ctx else {
+                let Some(PaginationContext(pagination)) = ctx else {
                     return row.into_element();
                 };
-                row.children(ctx.entries().into_iter().map(|e| match e {
-                    PaginationEntry::Page(n) => pagination_item(n).into_element(),
-                    PaginationEntry::Ellipsis => pagination_ellipsis().into_element(),
+                row.children(pagination.entries().into_iter().map(|e| match e {
+                    Entry::Page(n) => pagination_item(n).into_element(),
+                    Entry::Ellipsis => pagination_ellipsis().into_element(),
                 }))
                 .into_element()
             }
@@ -226,25 +191,23 @@ pub struct PaginationItemProps {
 pub fn pagination_item(page: usize) -> ComponentElement {
     component(PaginationItemProps { page }, |cx| {
         let props = cx.props();
-        let ctx = PaginationContext::find();
+        let ctx = use_root::<PaginationContext>("pagination_item", "pagination");
         move || {
             let page = props.with(|p| p.page);
-            let active = ctx.as_ref().is_some_and(|c| c.page.get() == page);
-            let go = ctx.clone();
+            let active = ctx.is_some_and(|PaginationContext(c)| c.is_current(page));
             let variant = if active {
                 ButtonVariant::Outline
             } else {
                 ButtonVariant::Ghost
             };
-            button(variant, ButtonSize::Icon)
+            let link = button(variant, ButtonSize::Icon)
                 .named("pagination-item")
-                .on_click(move |_| {
-                    if let Some(go) = &go {
-                        go.go(page);
-                    }
-                })
                 .child(page.to_string())
-                .into_element()
+                .into_div();
+            match ctx {
+                Some(PaginationContext(pagination)) => pagination.page_button(link, page).into_element(),
+                None => link.into_element(),
+            }
         }
     })
 }
@@ -267,32 +230,17 @@ pub struct PaginationStepProps {
     to: Step,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Step {
-    First,
-    Previous,
-    Next,
-    Last,
-}
-
 fn step(to: Step, root: Button) -> Part<PaginationStepProps> {
     Part::new(PaginationStepProps { to }, root.into_div(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = PaginationContext::find();
+            let ctx = use_root::<PaginationContext>("pagination_step", "pagination");
             move || {
                 let (to, root) = props.with(|p| (p.props.to, p.slot.0.clone()));
-                let Some(ctx) = ctx.clone() else {
-                    return root.into_element();
-                };
-                let (page, count) = (ctx.page.get(), ctx.page_count());
-                let (target, enabled) = match to {
-                    Step::First => (1, page > 1),
-                    Step::Previous => (page.saturating_sub(1), page > 1),
-                    Step::Next => (page.saturating_add(1), page < count),
-                    Step::Last => (count, page < count),
-                };
-                root.disabled(!enabled).on_click(move |_| ctx.go(target)).into_element()
+                match ctx {
+                    Some(PaginationContext(pagination)) => pagination.step_button(root, to).into_element(),
+                    None => root.into_element(),
+                }
             }
         })
     })

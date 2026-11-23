@@ -1,70 +1,56 @@
 //! Tags input (`ui/tags-input`): a list of tags and a field that adds them.
 //!
-//! As reka-ui's: Enter adds the typed text as a tag (once; a duplicate is
-//! refused and stays typed), the delete button on a tag removes it, and a click anywhere in
-//! the box focuses its field. The root keeps the tags, its own
-//! (`default_value`) or the caller's (`model`, `v-model`).
-
-use std::rc::Rc;
+//! The behaviour is `primitives::tags_input`'s: Enter (or the `,`
+//! delimiter) adds the typed text, trimmed, as a tag (a duplicate is
+//! refused and stays typed), the keys select and remove tags from the
+//! field's start, the delete button on a tag removes it, and a click
+//! anywhere in the box focuses its field. The root keeps the tags, its own
+//! (`default_value`) or the caller's (`model`, `v-model`); this module draws
+//! it.
 
 use gui::Properties;
 use gui::prelude::*;
 use gui::{
-    Bind, Color, Div, Element, Icon, KeyEvent, Model, NamedKey, Slot, Style, TextField, UseModel, component, div, icon,
-    provide, text, text_input, use_context, use_model,
+    Bind, Color, Div, Element, Icon, KeyEvent, Model, Style, TextField, component, div, icon, provide, text,
+    text_input, use_context, use_model,
 };
+
+use primitives::Availability;
+use primitives::listbox::Bound;
+pub use primitives::tags_input::Delimiter;
+use primitives::tags_input::{TagsConfig, TagsInput};
 
 use crate::focus::{StateLook, destructive_ring, focus_ring};
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
 /// What [`tags_input`] is given.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct TagsInputProps {
     tags: Bind<Vec<String>>,
     text: Bind<String>,
     invalid: bool,
-    add_on_enter: bool,
-}
-
-impl Default for TagsInputProps {
-    fn default() -> Self {
-        Self {
-            tags: Bind::default(),
-            text: Bind::default(),
-            invalid: false,
-            add_on_enter: true,
-        }
-    }
+    disabled: bool,
+    /// How it adds (reka's `delimiter`, `max`, `addOnPaste`, `addOnTab`,
+    /// `addOnBlur`, `duplicate`, and whether Enter adds).
+    config: TagsConfig,
 }
 
 /// What the parts below a [`tags_input`] read.
 #[derive(Clone, Copy)]
 struct TagsInputContext {
-    tags: UseModel<PartProps<TagsInputProps>, Vec<String>>,
-    /// The text being typed.
-    field: TextField,
+    tags: TagsInput<String>,
 }
 
 impl TagsInputContext {
-    /// Add the typed text as a tag and clear the field; a duplicate is
-    /// refused and stays typed. Whether Enter was the input's.
-    fn add(self) -> bool {
-        let typed = self.field.edit.with_untracked(|e| e.text.clone());
-        let tag = typed.trim();
-        if tag.is_empty() {
-            return false;
-        }
-        if !self.tags.with(|tags| tags.iter().any(|t| t == tag)) {
-            let tag = tag.to_owned();
-            self.tags.update(|tags| tags.push(tag));
-            self.field.set_text("");
-        }
-        true
+    /// The field's keys: the tags input's table.
+    fn key(self, ev: &KeyEvent) -> bool {
+        self.tags.key(ev)
     }
 
-    fn remove(self, tag: &str) {
-        self.tags.update(|tags| tags.retain(|t| t != tag));
+    /// The place of `tag` among the tags (tracked).
+    fn index_of(self, tag: &str) -> Option<usize> {
+        self.tags.tags().iter().position(|t| t == tag)
     }
 }
 
@@ -100,21 +86,28 @@ pub fn tags_input() -> Part<TagsInputProps> {
     Part::new(TagsInputProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let text = use_model(props, |p| &p.props.text);
+            let text = use_model(props, |p: &PartProps<TagsInputProps>| &p.props.text);
             let field = TextField::new(text.get_untracked());
             // The typed text up to the caller's model, and back.
             crate::part::bind_field(field, text);
-            let ctx = TagsInputContext {
-                tags: use_model(props, |p| &p.props.tags),
+            let tags = TagsInput::strings(
+                Bound::new(use_model(props, |p: &PartProps<TagsInputProps>| &p.props.tags)),
                 field,
-            };
-            provide(ctx);
+                props.with_untracked(|p| p.props.config.clone()),
+                primitives::use_direction(None),
+            );
+            let disabled = move || Availability::from_disabled(props.with(|p| p.props.disabled));
+            tags.set_availability(gui::untracked(disabled));
+            gui::watch(disabled, move |now, _| tags.set_availability(*now));
+            gui::watch(
+                move || props.with(|p| p.props.config.clone()),
+                move |now, _| tags.set_config(now.clone()),
+            );
+            provide(TagsInputContext { tags });
             move || {
                 let t = theme();
-                let (invalid, adds, root) = props.with(|p| (p.props.invalid, p.props.add_on_enter, p.slot.0.clone()));
-                let d = root
-                    .on_click(move |_| field.focus.focus())
-                    .when(adds, |d| d.on_key_down(move |ev| ev.is(NamedKey::Enter) && ctx.add()));
+                let (invalid, root) = props.with(|p| (p.props.invalid, p.slot.0.clone()));
+                let d = tags.root(root);
                 // `focus-within:` and `aria-invalid:` are states of the box,
                 // not of the field that holds focus: the box's own
                 // `focus_within`, bound to its border and ring.
@@ -149,7 +142,7 @@ impl Part<TagsInputProps> {
 
     /// Call `f` with the tags after each change (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(Vec<String>) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<Vec<String>>>) -> Self {
         self.with_props(|p| p.tags = p.tags.clone().on_change(f))
     }
 
@@ -172,22 +165,87 @@ impl Part<TagsInputProps> {
     /// Enter picks from a listbox, `@keydown.enter.prevent`, says `false`).
     #[must_use]
     pub fn add_on_enter(self, adds: bool) -> Self {
-        self.with_props(|p| p.add_on_enter = adds)
+        self.with_props(|p| p.config.add_on_enter = adds)
+    }
+
+    /// What separates tags typed or pasted at once (`delimiter`; `,`).
+    #[must_use]
+    pub fn delimiter(self, delimiter: Delimiter) -> Self {
+        self.with_props(|p| p.config.delimiter = delimiter)
+    }
+
+    /// The most tags it holds (`max`; 0, the default, is no limit).
+    #[must_use]
+    pub fn max(self, max: usize) -> Self {
+        self.with_props(|p| p.config.max = max)
+    }
+
+    /// A paste adds its pieces as tags (`add-on-paste`).
+    #[must_use]
+    pub fn add_on_paste(self, adds: bool) -> Self {
+        self.with_props(|p| p.config.add_on_paste = adds)
+    }
+
+    /// Tab adds the typed text (`add-on-tab`).
+    #[must_use]
+    pub fn add_on_tab(self, adds: bool) -> Self {
+        self.with_props(|p| p.config.add_on_tab = adds)
+    }
+
+    /// The field losing focus adds the typed text (`add-on-blur`).
+    #[must_use]
+    pub fn add_on_blur(self, adds: bool) -> Self {
+        self.with_props(|p| p.config.add_on_blur = adds)
+    }
+
+    /// The same tag may be added twice (`duplicate`).
+    #[must_use]
+    pub fn duplicate(self, duplicate: bool) -> Self {
+        self.with_props(|p| p.config.duplicates = duplicate)
+    }
+
+    /// Not usable (`disabled`): nothing adds, removes or selects a tag.
+    #[must_use]
+    pub fn disabled(self, disabled: bool) -> Self {
+        self.with_props(|p| p.disabled = disabled)
     }
 }
 
-/// One tag; its text and delete button go in with `.child`.
+/// The tag `tag`; its text and delete button go in with `.child`. While the
+/// keyboard selects it, it carries the ring (`data-[state=active]:ring-2
+/// ring-ring ring-offset-2`).
 #[must_use]
-pub fn tags_input_item() -> Div {
+pub fn tags_input_item(tag: impl Into<String>) -> Part<String> {
     let t = theme();
-    div()
+    let root = div()
         .named("tags-input-item")
         .display(Display::Flex)
         .height(20.0)
         .align_items(Align::Center)
         .radius(8.0)
         .background(t.secondary)
-        .text_color(t.secondary_foreground)
+        .text_color(t.secondary_foreground);
+    Part::new(tag.into(), root, |p| {
+        component(p, |cx| {
+            let props = cx.props();
+            let ctx = use_context::<TagsInputContext>();
+            move || {
+                let (tag, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
+                let Some(ctx) = ctx else {
+                    return root.into_element();
+                };
+                let Some(index) = ctx.index_of(&tag) else {
+                    return root.into_element();
+                };
+                let t = theme();
+                let selected = ctx.tags.selected() == Some(index);
+                ctx.tags
+                    .item(root, index)
+                    .when(selected, |d| d.ring(Ring::new(2.0, t.ring).offset(2.0)))
+                    .into_element()
+            }
+        })
+    })
 }
 
 /// A tag's text.
@@ -214,7 +272,6 @@ pub fn tags_input_item_delete(tag: impl Into<String>) -> Part<String> {
         .margin_right(4.0)
         .cursor(Cursor::Pointer)
         .focusable()
-        .aria_label("Remove")
         .child(icon(Icon::X));
     Part::new(tag.into(), root, |p| {
         component(p, |cx| {
@@ -222,8 +279,8 @@ pub fn tags_input_item_delete(tag: impl Into<String>) -> Part<String> {
             let ctx = use_context::<TagsInputContext>();
             move || {
                 let (tag, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
-                match ctx {
-                    Some(ctx) => root.on_click(move |_| ctx.remove(&tag)),
+                match ctx.and_then(|c| c.index_of(&tag).map(|i| (c, i))) {
+                    Some((ctx, index)) => ctx.tags.delete(root, index),
                     None => root,
                 }
                 .into_element()
@@ -242,13 +299,13 @@ pub fn tags_input_input() -> TagsInputInput {
 }
 
 /// A key handler that returns whether it took the key.
-type KeyHandler = Rc<dyn Fn(&KeyEvent) -> bool>;
+type KeyHandler = gui::Callback<KeyEvent, bool>;
 
 /// A [`tags_input_input`] being built.
 #[derive(Clone, PartialEq)]
 pub struct TagsInputInput {
     placeholder: String,
-    keys: Option<Slot<KeyHandler>>,
+    keys: Option<KeyHandler>,
 }
 
 impl TagsInputInput {
@@ -260,8 +317,9 @@ impl TagsInputInput {
 
     /// Keys it takes before the box does (`@keydown`); whether `f` took one.
     #[must_use]
-    pub fn on_key_down(mut self, f: impl Fn(&KeyEvent) -> bool + 'static) -> Self {
-        self.keys = Some(Slot(Rc::new(f)));
+    pub fn on_key_down(mut self, f: impl Into<gui::Callback<KeyEvent, bool>>) -> Self {
+        // Made here, so it runs as the caller's, not as the input's.
+        self.keys = Some(f.into());
         self
     }
 }
@@ -271,13 +329,16 @@ impl IntoElement for TagsInputInput {
         component(self, |cx| {
             let props = cx.props();
             let ctx = use_context::<TagsInputContext>();
+            // The caller's keys as passed last (a handle: the field keeps
+            // its handler while new ones are passed).
+            let keys = cx.event_opt(|p: &TagsInputInput| p.keys.as_ref());
             move || {
                 let Some(ctx) = ctx else {
                     return Element::Empty;
                 };
                 let t = theme();
                 props.with(|p| {
-                    text_input(&ctx.field)
+                    text_input(&ctx.tags.field())
                         .named("tags-input-input")
                         .placeholder(p.placeholder.clone())
                         .placeholder_color(t.muted_foreground)
@@ -289,7 +350,12 @@ impl IntoElement for TagsInputInput {
                         .flex(Flex::grow(1.0))
                         .background(Color::TRANSPARENT)
                         .padding_x(4.0)
-                        .when_some(p.keys.clone(), |i, keys| i.on_key_down(move |ev| keys(ev)))
+                        .on_key_down({
+                            // The caller's keys first, then the tags input's
+                            // (before the field's own editing).
+                            let keys = keys.clone();
+                            move |ev| keys.call(ev.clone()) || ctx.key(ev)
+                        })
                         .into_element()
                 })
             }

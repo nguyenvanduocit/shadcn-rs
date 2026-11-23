@@ -1,14 +1,15 @@
 use gui::prelude::*;
 use gui::{Div, FocusHandle, Model, NamedKey, ScenarioError, Signal, div, text};
 use shadcn::{
-    ButtonSize, ButtonVariant, DialogProps, Part, QuestionnaireAnswer, QuestionnaireItem, QuestionnaireItemProps,
-    QuestionnaireProgressState, QuestionnaireProps, QuestionnaireShortcuts, QuestionnaireStatus, Toast, ToastKind,
-    button, card, card_action, card_content, card_description, card_footer, card_header, dialog, dialog_close,
-    dialog_content, dialog_description, dialog_footer, dialog_header, dialog_title, dialog_trigger, native_select,
-    native_select_option, questionnaire, questionnaire_actions, questionnaire_choice, questionnaire_choices,
-    questionnaire_description, questionnaire_error, questionnaire_error_with, questionnaire_input, questionnaire_item,
-    questionnaire_next, questionnaire_previous, questionnaire_progress, questionnaire_progress_with,
-    questionnaire_reset, questionnaire_skip, questionnaire_submit, questionnaire_title, theme, toaster,
+    ButtonSize, ButtonVariant, DialogProps, Part, Questionnaire, QuestionnaireAnswer, QuestionnaireItem,
+    QuestionnaireItemProps, QuestionnaireProgressState, QuestionnaireProps, QuestionnaireShortcuts,
+    QuestionnaireStatus, Toast, ToastKind, button, card, card_action, card_content, card_description, card_footer,
+    card_header, dialog, dialog_close, dialog_content, dialog_description, dialog_footer, dialog_header, dialog_title,
+    dialog_trigger, native_select, native_select_option, questionnaire, questionnaire_actions, questionnaire_choice,
+    questionnaire_choices, questionnaire_description, questionnaire_error, questionnaire_error_with,
+    questionnaire_input, questionnaire_item, questionnaire_next, questionnaire_previous, questionnaire_progress,
+    questionnaire_progress_with, questionnaire_reset, questionnaire_skip, questionnaire_submit, questionnaire_title,
+    theme, toaster,
 };
 
 use crate::{Render, Shot, demo, page};
@@ -83,7 +84,7 @@ fn the_demo(saved: &Signal<String>) -> Part<QuestionnaireProps> {
     ])
     .default_item("direction")
     .shortcuts(Some(QuestionnaireShortcuts::Letters))
-    .on_submit(move |_, answers| {
+    .on_submit(move |(_, answers): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         let summary: Vec<String> = answers
             .iter()
             .map(|a| format!("{}: {}", a.name, values_of(&answers, &a.name)))
@@ -179,7 +180,7 @@ fn animated() -> Part<QuestionnaireProps> {
         item("delivery", &["summary", "diff", "handoff"]),
     ])
     .default_item("task")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Agent workflow saved",
             format!(
@@ -238,7 +239,7 @@ fn card_questionnaire() -> Part<QuestionnaireProps> {
     ])
     .default_item("task")
     .shortcuts(Some(QuestionnaireShortcuts::Numbers))
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Agent task created",
             format!(
@@ -299,7 +300,7 @@ fn conditional() -> Part<QuestionnaireProps> {
         item("approval", &["writes", "commands", "sensitive"]),
     ])
     .default_item("runtime")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Execution plan saved",
             format!(
@@ -311,7 +312,7 @@ fn conditional() -> Part<QuestionnaireProps> {
         );
     })
     // `@change="runtime = …"` and `:disabled="runtime !== 'cloud'"`.
-    .on_change(|q, name, value| {
+    .on_change(|(q, name, value): (Questionnaire, String, String)| {
         if name == "runtime" {
             q.set_disabled("environment", value != "cloud");
         }
@@ -358,7 +359,7 @@ fn controlled() -> Part<QuestionnaireProps> {
         item("output", &["summary", "diff", "handoff"]),
     ])
     .default_item("scope")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Agent workflow configured",
             format!(
@@ -438,7 +439,7 @@ fn dialog_questionnaire(open: Signal<bool>) -> Part<QuestionnaireProps> {
         item("tests", &["targeted", "package", "full"]),
     ])
     .default_item("scope")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         open.set(false);
         toast(
             "Clarification sent",
@@ -505,7 +506,7 @@ fn freeform() -> Part<QuestionnaireProps> {
         item("approach", &["incremental", "module", "rewrite"]).with_input(),
     ])
     .shortcuts(Some(QuestionnaireShortcuts::Letters))
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Approach selected",
             format!("Approach: {}", value_of(&a, "approach", "None")),
@@ -540,7 +541,7 @@ fn multiple() -> Part<QuestionnaireProps> {
         item("context", &["source", "tests", "docs", "history"]).multiple(),
     ])
     .shortcuts(Some(QuestionnaireShortcuts::Letters))
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast("Context selected", format!("Context: {}", values_of(&a, "context")));
     })
 }
@@ -568,7 +569,7 @@ fn navigation_state() -> Part<QuestionnaireProps> {
         item("verification", &["tests", "types", "all"]),
     ])
     .default_item("permission")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Permissions saved",
             format!(
@@ -625,7 +626,7 @@ fn progress() -> Part<QuestionnaireProps> {
         item("delivery", &["patch", "commit", "branch"]),
     ])
     .default_item("scope")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Pull request plan ready",
             format!(
@@ -713,7 +714,7 @@ fn resume() -> Part<QuestionnaireProps> {
         QuestionnaireItem::new("notes", &[]).default_value("Keep the existing public API stable."),
     ])
     .default_item("verification")
-    .on_submit(move |_, a| {
+    .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         toast(
             "Draft updated",
             format!(
@@ -727,7 +728,7 @@ fn resume() -> Part<QuestionnaireProps> {
 }
 
 fn resume_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
-    root.on_reset(move |_| {
+    root.on_reset(move |_: Questionnaire| {
         shadcn::toast("Saved answers restored");
     })
     .margin_x(Length::Auto)
@@ -770,7 +771,7 @@ fn resume_demo(root: Part<QuestionnaireProps>) -> Part<QuestionnaireProps> {
 fn shortcuts() -> Part<QuestionnaireProps> {
     questionnaire(vec![item("action", &["inspect", "tests", "patch"])])
         .shortcuts(Some(QuestionnaireShortcuts::Letters))
-        .on_submit(move |_, a| {
+        .on_submit(move |(_, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
             toast(
                 "Next action selected",
                 format!("Action: {}", value_of(&a, "action", "None")),
@@ -829,7 +830,7 @@ fn skip() -> Part<QuestionnaireProps> {
         item("review", &["tests", "diff", "both"]),
     ])
     .default_item("task")
-    .on_submit(move |q, a| {
+    .on_submit(move |(q, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         let constraints = if q.status("constraints") == Some(QuestionnaireStatus::Skipped) {
             "Skipped".to_owned()
         } else {
@@ -900,7 +901,7 @@ fn validation(error: &Signal<Option<String>>) -> Part<QuestionnaireProps> {
         item("audience", &["team", "public"]),
     ])
     .default_item("detail")
-    .on_submit(move |q, a| {
+    .on_submit(move |(q, a): (Questionnaire, Vec<QuestionnaireAnswer>)| {
         let (detail, audience) = (value_of(&a, "detail", ""), value_of(&a, "audience", ""));
         if audience == "public" && detail == "summary" {
             error.set(Some(PUBLIC_NEEDS_DETAIL.to_owned()));
@@ -914,7 +915,7 @@ fn validation(error: &Signal<Option<String>>) -> Part<QuestionnaireProps> {
         );
     })
     // `@change="clearError('detail')"`: only `detail` ever carries an error.
-    .on_change(move |q, name, _| {
+    .on_change(move |(q, name, _): (Questionnaire, String, String)| {
         if name == "detail" && cleared.get().is_some() {
             cleared.set(None);
             q.set_invalid("detail", false);
@@ -1034,7 +1035,7 @@ fn nth_text(s: &Shot, label: &str, nth: usize) -> Result<(f32, f32), ScenarioErr
     s.last()
         .nodes
         .iter()
-        .filter(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if content == label))
+        .filter(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == label))
         .nth(nth)
         .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound(label.to_owned()))
@@ -1106,7 +1107,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .last()
         .nodes
         .iter()
-        .filter(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if content == "Next"))
+        .filter(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == "Next"))
         .count();
     click_nth(s, "Next", nexts.saturating_sub(1))?;
     s.frame("validation audience")?;
@@ -1124,7 +1125,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .nodes
         .iter()
         .filter(|n| {
-            n.layer > 0 && matches!(&n.content, gui::layout::Content::Text { content, .. } if content == "Next")
+            n.layer > 0 && matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == "Next")
         })
         .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
         .next()

@@ -46,27 +46,86 @@ impl<P: 'static> Ctx<P> {
     pub fn props(&self) -> Signal<P> {
         self.props
     }
+
+    /// A stable handle to the event callback `field` finds in the props
+    /// (React's `useEffectEvent`): each call reads the instance's props as
+    /// they are then and calls the callback there. Kept in setup, a timer
+    /// or a handler on its output, it calls the closure the parent passed
+    /// last, which renders nothing again (callbacks compare equal). The
+    /// handle is the instance's own: it writes nothing anywhere, and
+    /// called once the instance is gone it does nothing (`R::default()`).
+    #[must_use]
+    pub fn event<A: 'static, R: Default + 'static>(
+        &self,
+        field: impl Fn(&P) -> &Callback<A, R> + 'static,
+    ) -> Callback<A, R> {
+        self.event_opt(move |p| Some(field(p)))
+    }
+
+    /// [`Self::event`] for an optional callback: one absent when called
+    /// gives `R::default()`.
+    #[must_use]
+    pub fn event_opt<A: 'static, R: Default + 'static>(
+        &self,
+        field: impl Fn(&P) -> Option<&Callback<A, R>> + 'static,
+    ) -> Callback<A, R> {
+        let props = self.props;
+        Callback {
+            f: Rc::new(move |arg| {
+                let now = props
+                    .is_alive()
+                    .then(|| props.with_untracked(|p| field(p).cloned()))
+                    .flatten();
+                now.map_or_else(R::default, |f| f.call(arg))
+            }),
+            // The callback it finds runs as its own maker.
+            owner: None,
+        }
+    }
 }
 
-/// A function a parent passes down, compared equal whatever it holds, so
-/// passing a new closure each render does not render the child again; the
-/// child always calls the latest one (Vue's event handlers, React's
-/// `useEffectEvent`).
-pub struct Callback<A: 'static, R: 'static = ()>(Rc<dyn Fn(A) -> R>);
+/// A function a parent passes down for an *event* (a click, a change, a
+/// pick), compared equal whatever it holds, so passing a new closure each
+/// render does not render the child again. It is immutable: a clone is
+/// the same closure. It runs untracked, in the instance it was made in
+/// (the parent whose render made it, [`handler_owner`]), wherever it is
+/// called from: a timer or effect it makes is the parent's, and outlives
+/// the child that called it.
+///
+/// A child that keeps a callback beyond the render that read it (in
+/// setup, a timer, a handler on an output that is not rendered again)
+/// keeps [`Ctx::event`]'s handle, which calls the one passed last.
+///
+/// A function a child calls *while it renders*, to compute what it shows
+/// (a predicate, a formatter), is a [`Derive`] instead.
+pub struct Callback<A: 'static, R: 'static = ()> {
+    f: Rc<dyn Fn(A) -> R>,
+    owner: Option<crate::reactive::OwnerId>,
+}
 
 impl<A: 'static, R: 'static> Callback<A, R> {
     pub fn new(f: impl Fn(A) -> R + 'static) -> Self {
-        Self(Rc::new(f))
+        Self {
+            f: Rc::new(f),
+            owner: handler_owner(),
+        }
     }
 
+    /// Call it, untracked, in the instance that made it.
     pub fn call(&self, arg: A) -> R {
-        (self.0)(arg)
+        match self.owner {
+            Some(owner) => crate::reactive::run_owned(Some(owner), || (self.f)(arg)),
+            None => crate::reactive::untracked(|| (self.f)(arg)),
+        }
     }
 }
 
 impl<A: 'static, R: 'static> Clone for Callback<A, R> {
     fn clone(&self) -> Self {
-        Self(Rc::clone(&self.0))
+        Self {
+            f: Rc::clone(&self.f),
+            owner: self.owner,
+        }
     }
 }
 
@@ -83,6 +142,49 @@ impl<A: 'static, R: 'static> fmt::Debug for Callback<A, R> {
 }
 
 impl<A: 'static, R: 'static, F: Fn(A) -> R + 'static> From<F> for Callback<A, R> {
+    fn from(f: F) -> Self {
+        Self::new(f)
+    }
+}
+
+/// A function a component calls while it renders, to compute what it
+/// shows: a predicate (a calendar's `is_date_disabled`), a formatter, a
+/// derivation. Called inline, tracked as the render that calls it: the
+/// signals it reads render that again when they change. Props holding one
+/// compare by pointer: a parent passing a new closure renders the child
+/// again (one made once, in setup, does not).
+pub struct Derive<A: 'static, R: 'static = ()>(Rc<dyn Fn(A) -> R>);
+
+impl<A: 'static, R: 'static> Derive<A, R> {
+    pub fn new(f: impl Fn(A) -> R + 'static) -> Self {
+        Self(Rc::new(f))
+    }
+
+    /// Call it here, tracked as the caller.
+    pub fn call(&self, arg: A) -> R {
+        (self.0)(arg)
+    }
+}
+
+impl<A: 'static, R: 'static> Clone for Derive<A, R> {
+    fn clone(&self) -> Self {
+        Self(Rc::clone(&self.0))
+    }
+}
+
+impl<A: 'static, R: 'static> PartialEq for Derive<A, R> {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<A: 'static, R: 'static> fmt::Debug for Derive<A, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Derive")
+    }
+}
+
+impl<A: 'static, R: 'static, F: Fn(A) -> R + 'static> From<F> for Derive<A, R> {
     fn from(f: F) -> Self {
         Self::new(f)
     }
@@ -174,9 +276,11 @@ impl<T: Clone + PartialEq + 'static> Model<T> {
     }
 
     /// Call `f` with each new value written through the model.
+    /// A closure becomes a [`Callback`] here, run as the owner that gave
+    /// it: what it makes outlives the child that writes.
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(T) + 'static) -> Self {
-        self.on_change = Some(Callback::new(f));
+    pub fn on_change(mut self, f: impl Into<Callback<T>>) -> Self {
+        self.on_change = Some(f.into());
         self
     }
 
@@ -344,9 +448,11 @@ impl<T: 'static> Bind<T> {
     }
 
     /// Call `f` with each value written (`@update:model-value`).
+    /// A closure becomes a [`Callback`] here, run as the owner that gave
+    /// it: what it makes outlives the child that writes.
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(T) + 'static) -> Self {
-        self.on_change = Some(Callback::new(f));
+    pub fn on_change(mut self, f: impl Into<Callback<T>>) -> Self {
+        self.on_change = Some(f.into());
         self
     }
 
@@ -374,6 +480,9 @@ pub struct UseModel<P: 'static, T: 'static> {
     props: Signal<P>,
     pick: fn(&P) -> &Bind<T>,
     local: Signal<T>,
+    /// Whether the caller keeps the value: decided once, by the bind the
+    /// instance was made with (reka's `useVModel` and its `passive` flag).
+    caller: bool,
 }
 
 impl<P: 'static, T: 'static> Clone for UseModel<P, T> {
@@ -393,20 +502,49 @@ impl<P: 'static, T: 'static> fmt::Debug for UseModel<P, T> {
 /// The model of the [`Bind`] that `pick` finds in `props`, called in setup:
 /// a value the component keeps itself is made here, starting at the
 /// bind's default (or, when it is bound, at the bound value).
+///
+/// Who keeps the value is decided here, once, as reka's `useVModel` decides
+/// it (ADR-0025): a bind made with a model or a value is the caller's for
+/// the instance's life, one made with a default the instance's own. A caller
+/// that later drops its value shows the bind's default; one that later
+/// passes a value to an instance keeping its own pushes that value in,
+/// which no `on_change` echoes; a model it later binds is written by
+/// [`UseModel::set`] too.
 #[must_use]
 #[track_caller]
 pub fn use_model<P: 'static, T: Clone + PartialEq + 'static>(
     props: Signal<P>,
     pick: fn(&P) -> &Bind<T>,
 ) -> UseModel<P, T> {
-    let first = props.with_untracked(|p| match &pick(p).source {
-        Source::Model(m) => m.get_untracked(),
-        Source::Value(v) | Source::Default(v) => v.clone(),
+    let (first, caller) = props.with_untracked(|p| match &pick(p).source {
+        Source::Model(m) => (m.get_untracked(), true),
+        Source::Value(v) => (v.clone(), true),
+        Source::Default(v) => (v.clone(), false),
     });
+    let local = Signal::new(first);
+    if !caller {
+        crate::reactive::watch(
+            move || {
+                props.with(|p| match &pick(p).source {
+                    Source::Model(m) => Some(m.get()),
+                    Source::Value(v) => Some(v.clone()),
+                    Source::Default(_) => None,
+                })
+            },
+            move |pushed, _| {
+                if let Some(v) = pushed
+                    && local.with_untracked(|l| l != v)
+                {
+                    local.set(v.clone());
+                }
+            },
+        );
+    }
     UseModel {
         props,
         pick,
-        local: Signal::new(first),
+        local,
+        caller,
     }
 }
 
@@ -414,12 +552,20 @@ impl<P: 'static, T: Clone + PartialEq + 'static> UseModel<P, T> {
     /// The value, tracked.
     #[must_use]
     pub fn get(&self) -> T {
-        let local = self.local;
+        if !self.caller {
+            return self.local.get();
+        }
         self.props.with(|p| match &(self.pick)(p).source {
             Source::Model(m) => m.get(),
-            Source::Value(v) => v.clone(),
-            Source::Default(_) => local.get(),
+            Source::Value(v) | Source::Default(v) => v.clone(),
         })
+    }
+
+    /// Whether the caller keeps the value (controlled), decided as the
+    /// instance was made.
+    #[must_use]
+    pub fn is_controlled(&self) -> bool {
+        self.caller
     }
 
     /// The value, untracked.
@@ -430,33 +576,40 @@ impl<P: 'static, T: Clone + PartialEq + 'static> UseModel<P, T> {
 
     /// Borrow the value, tracked.
     pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
-        let local = self.local;
+        if !self.caller {
+            return self.local.with(f);
+        }
         self.props.with(|p| match &(self.pick)(p).source {
             Source::Model(m) => m.with(f),
-            Source::Value(v) => f(v),
-            Source::Default(_) => local.with(f),
+            Source::Value(v) | Source::Default(v) => f(v),
         })
     }
 
     /// Write `value`: up to the caller's model, or to the component's own;
-    /// then `on_change`. Nothing happens when it equals the current value.
+    /// then `on_change`. A caller holding a plain value is only told (it
+    /// writes the value back, or the shown value stays). An instance
+    /// keeping its own value that a caller later binds to a model writes
+    /// both, so the model keeps matching what is shown (Vue's passive
+    /// `v-model` emits `update:modelValue` the same way). Nothing happens
+    /// when it equals the current value, whoever keeps it: one equality
+    /// rule, `T`'s `PartialEq` (ADR-0025).
     pub fn set(&self, value: T) {
         let (model, on_change) = self.props.with_untracked(|p| {
             let b = (self.pick)(p);
             let model = match &b.source {
-                Source::Model(m) => Some(Some(m.clone())),
-                Source::Value(_) => Some(None),
-                Source::Default(_) => None,
+                Source::Model(m) => Some(m.clone()),
+                Source::Value(_) | Source::Default(_) => None,
             };
             (model, b.on_change.clone())
         });
         if self.get_untracked() == value {
             return;
         }
-        match model {
-            Some(Some(m)) => m.set(value.clone()),
-            Some(None) => {}
-            None => self.local.set(value.clone()),
+        if !self.caller {
+            self.local.set(value.clone());
+        }
+        if let Some(m) = model {
+            m.set(value.clone());
         }
         if let Some(f) = on_change {
             f.call(value);
@@ -507,12 +660,16 @@ impl<T> std::ops::Deref for Slot<T> {
 /// Made by a parent's render and consumed when the frame resolves it.
 trait Mount {
     /// Run setup (inside the instance's scope); the props signal and render.
-    fn setup(&self) -> (Box<dyn Any>, Render);
+    fn setup(&self) -> (Rc<dyn Any>, Render);
     /// Pass new props to a live instance; it renders again if they differ.
     fn update(&self, props: &dyn Any);
 }
 
-type Render = Box<dyn FnMut() -> Element>;
+/// A render: `Fn`, as Compose's and Flutter's are. What it keeps between
+/// runs lives in signals and hooks (made in setup, or `remember`ed), never
+/// in its own captures, so running it again (the cold check does) changes
+/// nothing of the instance's.
+type Render = Rc<dyn Fn() -> Element>;
 
 struct Pending<P, S> {
     props: P,
@@ -523,21 +680,27 @@ impl<P, S, R> Mount for Pending<P, S>
 where
     P: Clone + PartialEq + 'static,
     S: Clone + FnOnce(Ctx<P>) -> R + 'static,
-    R: FnMut() -> Element + 'static,
+    R: Fn() -> Element + 'static,
 {
-    fn setup(&self) -> (Box<dyn Any>, Render) {
+    fn setup(&self) -> (Rc<dyn Any>, Render) {
         let props = Signal::new(self.props.clone());
         let render = (self.setup.clone())(Ctx { props });
-        (Box::new(props), Box::new(render))
+        (Rc::new(props), Rc::new(render))
     }
 
     fn update(&self, props: &dyn Any) {
         let Some(signal) = props.downcast_ref::<Signal<P>>() else {
             return;
         };
+        // A cold frame passes them all, to its own copy of the signal.
+        #[cfg(debug_assertions)]
+        if crate::reactive::is_cold() {
+            signal.store_cold(self.props.clone());
+            return;
+        }
         if signal.with_untracked(|old| *old == self.props) {
-            // Equal (a `Callback` always is): stored quietly, so the child
-            // calls the latest closures without rendering again.
+            // Equal (a `Callback` always is): stored quietly, so a handle
+            // calls the latest closures and the child does not render again.
             signal.store_quiet(self.props.clone());
         } else {
             signal.set(self.props.clone());
@@ -550,9 +713,6 @@ pub struct ComponentElement {
     pub(crate) key: Option<ElementKey>,
     pub(crate) name: &'static str,
     mount: Box<dyn Mount>,
-    /// Whether a frame has resolved it: met again (its parent's render
-    /// reused it), its instance keeps the props it has.
-    used: Cell<bool>,
     type_id: TypeId,
     /// The style its parent gives its output's root (Vue's attribute
     /// fallthrough: a parent that joins or sizes its children by position
@@ -589,19 +749,59 @@ impl IntoElement for ComponentElement {
 /// A component instance at this place in the tree: `setup` runs once, the
 /// render it returns runs tracked, again only when what it read changed or
 /// the parent passes `props` that differ.
+///
+/// Its place is its [`ComponentElement::key`] among its siblings, else its
+/// position, as Compose's and React's are: an unkeyed component that a
+/// sibling is inserted before is another instance (its state, scopes and
+/// a drag on its output start over). Children that come and go before
+/// others take keys.
+///
+/// The render is `Fn`, as Compose's composables and Flutter's `build`
+/// are: what it keeps from one run to the next is state the runtime holds
+/// (a signal or a computed made in `setup`), never a capture it mutates,
+/// so a cold frame (the debug check that incremental equals cold) works
+/// on that state as it does on the rest of the runtime. A render that
+/// memoises keeps its memo in a hook:
+///
+/// ```
+/// use gui::{Computed, Ctx, IntoElement, component, div, text};
+/// let _ = component(2_u32, |cx: Ctx<u32>| {
+///     let props = cx.props();
+///     let squared = Computed::new(move || props.get() * props.get());
+///     move || div().child(text(squared.get().to_string())).into_element()
+/// });
+/// ```
+///
+/// A memo in a mutable capture does not compile:
+///
+/// ```compile_fail,E0594
+/// use gui::{Ctx, IntoElement, component, div, text};
+/// let _ = component(2_u32, |cx: Ctx<u32>| {
+///     let props = cx.props();
+///     let mut memo: Option<(u32, u32)> = None;
+///     move || {
+///         let p = props.get();
+///         let squared = match memo {
+///             Some((q, s)) if q == p => s,
+///             _ => p * p,
+///         };
+///         memo = Some((p, squared));
+///         div().child(text(squared.to_string())).into_element()
+///     }
+/// });
+/// ```
 #[must_use]
 pub fn component<P, S, R>(props: P, setup: S) -> ComponentElement
 where
     P: Clone + PartialEq + 'static,
     S: Clone + FnOnce(Ctx<P>) -> R + 'static,
-    R: FnMut() -> Element + 'static,
+    R: Fn() -> Element + 'static,
 {
     ComponentElement {
         key: None,
         name: short_name::<S>(),
         type_id: TypeId::of::<S>(),
         mount: Box::new(Pending { props, setup }),
-        used: Cell::new(false),
         fallthrough: None,
     }
 }
@@ -620,19 +820,41 @@ struct InstanceKey {
     type_id: TypeId,
 }
 
-type Id = usize;
+/// An instance: its slot and the generation the slot had when it was
+/// made. A slot freed and used again has a new generation, so an id kept
+/// past its instance (a parent's, a root's) finds nothing, never the
+/// instance made in its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct Id {
+    slot: usize,
+    generation: u32,
+}
 
 type Context = Rc<HashMap<TypeId, Rc<dyn Any>>>;
 
 struct Instance {
     generation: u32,
+    /// The key its output's root is placed by ([`Chain`]): every keyed
+    /// component in the chain whose root it is, nested. Its output's root
+    /// keeps its place (its path) as keyed siblings move.
+    key: Option<ElementKey>,
+    /// The place among its siblings of the outermost component in that
+    /// chain: what tells apart the roots of unkeyed siblings that key
+    /// theirs alike.
+    at: usize,
+    /// Its last render's output as given and as marked ([`marked`]), when
+    /// it was given a node shared with another (a cached output): the
+    /// same output given again is the same marked node.
+    marked: Option<(Element, Element)>,
     parent: Option<Id>,
     depth: u32,
     name: &'static str,
     scope: Scope,
     node: Option<RenderNode>,
-    props: Box<dyn Any>,
-    render: Option<Render>,
+    /// Shared, so new props are passed to it without taking it out (the
+    /// reactive code they run may panic).
+    props: Rc<dyn Any>,
+    render: Render,
     /// The scopes of the last renders (what a render makes, such as a
     /// builder's signal, lives while its output may be on screen).
     render_scopes: Vec<Scope>,
@@ -657,38 +879,148 @@ struct Instance {
     mounted: Vec<Box<dyn FnOnce()>>,
     updated: Vec<Rc<dyn Fn()>>,
     renders: u64,
+    /// The placeholder it was last resolved from: met again (its parent's
+    /// render reused it), it keeps the props it has. Kept here, in the
+    /// instance tree, not on the placeholder its parent's output shares.
+    met: std::rc::Weak<ComponentElement>,
+}
+
+#[cfg(debug_assertions)]
+impl Instance {
+    fn cold_copy(&self) -> Self {
+        Self {
+            generation: self.generation,
+            key: self.key,
+            at: self.at,
+            marked: self.marked.clone(),
+            parent: self.parent,
+            depth: self.depth,
+            name: self.name,
+            scope: self.scope,
+            node: self.node,
+            props: Rc::clone(&self.props),
+            render: Rc::clone(&self.render),
+            render_scopes: self.render_scopes.clone(),
+            dirty: self.dirty,
+            why: self.why,
+            lane: self.lane,
+            below: self.below,
+            raw: self.raw.clone(),
+            output: self.output.clone(),
+            children: self.children.clone(),
+            styled: self.styled.clone(),
+            context: Rc::clone(&self.context),
+            mounted: Vec::new(),
+            updated: self.updated.clone(),
+            renders: self.renders,
+            met: self.met.clone(),
+        }
+    }
 }
 
 #[derive(Default)]
 struct Tree {
     slab: Vec<Option<Instance>>,
     generations: Vec<u32>,
-    free: Vec<Id>,
+    free: Vec<usize>,
     /// The instance whose setup or render runs now.
     current: Vec<Id>,
+    /// While a cold frame runs: its undo log ([`TreeLog`]).
+    #[cfg(debug_assertions)]
+    cold: Option<Box<TreeLog>>,
+}
+
+/// One step a cold frame took on the instances, undone at its end.
+#[cfg(debug_assertions)]
+enum TreeUndo {
+    /// A slot that was there before the frame, and its generation, as
+    /// they were then.
+    Slot(usize, Option<Box<Instance>>, u32),
+    FreePop(usize),
+    FreePush,
+}
+
+/// What a cold frame did to the instance tree (decision B): each slot that
+/// was there before it, kept as it was on its first write.
+#[cfg(debug_assertions)]
+struct TreeLog {
+    undo: Vec<TreeUndo>,
+    logged: std::collections::HashSet<usize>,
+    len: usize,
+    current: Vec<Id>,
+}
+
+/// The tree's cold policy ([`TREE`], Fork by undo log): the log starts.
+#[cfg(debug_assertions)]
+fn tree_cold_enter() -> Box<dyn Any> {
+    with_tree(|t| {
+        t.cold = Some(Box::new(TreeLog {
+            undo: Vec::new(),
+            logged: std::collections::HashSet::new(),
+            len: t.slab.len(),
+            current: std::mem::take(&mut t.current),
+        }));
+    });
+    Box::new(())
+}
+
+/// What the frame made, taken out of the tree while it still runs: the
+/// instances in the slots it wrote or added.
+#[cfg(debug_assertions)]
+fn tree_cold_drain(_: &dyn Any) -> Box<dyn Any> {
+    let made = TREE.try_with(|t| t.try_borrow_mut().map(|mut t| t.drain_cold()).unwrap_or_default());
+    Box::new(made.unwrap_or_default())
+}
+
+/// The tree put back as it was; what the frame made, to drop.
+#[cfg(debug_assertions)]
+fn tree_cold_exit(_: Box<dyn Any>) -> Box<dyn Any> {
+    let made = TREE.try_with(|t| t.try_borrow_mut().map(|mut t| t.rollback()).unwrap_or_default());
+    Box::new(made.unwrap_or_default())
+}
+
+/// How many steps the running cold frame's tree log holds (its cost).
+#[cfg(all(debug_assertions, test))]
+pub(crate) fn cold_tree_steps() -> usize {
+    with_tree(|t| t.cold.as_ref().map_or(0, |l| l.undo.len()))
 }
 
 /// A render node's mark: instance, generation, the write that woke it, its lane.
 type Mark = (Id, u32, Option<SignalRef>, Priority);
 
-thread_local! {
-    static TREE: RefCell<Tree> = RefCell::new(Tree::default());
+/// A hook due after layout, and the scope that owns it: the instance's, or
+/// the owner a handler runs in. Disposed meanwhile, it never runs.
+type PostHook = (crate::reactive::OwnerId, Box<dyn FnOnce()>);
+
+crate::engine::engine_local! {
+    /// The instances. A cold frame writes them in place, each slot's live
+    /// instance kept on its first write and put back at the end.
+    [Fork(tree_cold_enter, tree_cold_drain, tree_cold_exit)] static TREE: RefCell<Tree> = RefCell::new(Tree::default());
     /// Instances whose render was marked since the last resolve: their
     /// generation and the signal whose write marked them.
-    static MARKED: RefCell<Vec<Mark>> = const { RefCell::new(Vec::new()) };
+    [Fresh] static MARKED: RefCell<Vec<Mark>> = const { RefCell::new(Vec::new()) };
     /// Idle instances left dirty by the last resolve (its budget ran out).
-    static DEFERRED: RefCell<Vec<(Id, u32)>> = const { RefCell::new(Vec::new()) };
+    [Fresh] static DEFERRED: RefCell<Vec<(Id, u32)>> = const { RefCell::new(Vec::new()) };
     /// The priority writes made now mark renders with.
-    static PRIORITY: Cell<Priority> = const { Cell::new(Priority::Input) };
+    [Fork] static PRIORITY: Cell<Priority> = const { Cell::new(Priority::Input) };
     /// Until when the resolve running now may render idle instances.
-    static DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+    [Fork] static DEADLINE: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
     /// Hooks due after the frame is laid out (`on_mounted`, `on_updated`).
-    static POST: RefCell<Vec<Box<dyn FnOnce()>>> = RefCell::new(Vec::new());
+    /// Each by the scope that owns it: one whose owner was disposed
+    /// meanwhile never runs.
+    [Fresh] static POST: RefCell<Vec<PostHook>> = RefCell::new(Vec::new());
+    /// While a resolve that leaves disposal to its caller runs
+    /// ([`Root::resolve_leaving`]): the scopes of the instances it unmounted,
+    /// disposed once the caller let go of what they hold.
+    [Fresh] static LEAVING: RefCell<Option<Vec<Scope>>> = const { RefCell::new(None) };
     /// Something outside a render that the frame read changed.
-    static FRAME_DUE: Cell<bool> = const { Cell::new(false) };
+    [Fresh] static FRAME_DUE: Cell<bool> = const { Cell::new(false) };
+    /// The last resolve left an instance due below the root (marked as
+    /// its siblings resolved): another pass is.
+    [Fresh] static STRANDED: Cell<bool> = const { Cell::new(false) };
     /// The instances rendered since the last [`take_rendered`].
-    static RENDERED: RefCell<Vec<Rendered>> = const { RefCell::new(Vec::new()) };
-    static STATS: Cell<Stats> = const { Cell::new(Stats { renders: 0, setups: 0, unmounts: 0 }) };
+    [Fresh] static RENDERED: RefCell<Vec<Rendered>> = const { RefCell::new(Vec::new()) };
+    [Fork] static STATS: Cell<Stats> = const { Cell::new(Stats { renders: 0, setups: 0, unmounts: 0 }) };
 }
 
 /// How soon a render a write causes must show (ADR-0013's scheduler).
@@ -721,9 +1053,9 @@ pub fn idle<R>(f: impl FnOnce() -> R) -> R {
     with_priority(Priority::Idle, f)
 }
 
-thread_local! {
+crate::engine::engine_local! {
     /// How long a frame may spend on idle renders.
-    static IDLE_BUDGET: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::from_millis(4)) };
+    [Fork] static IDLE_BUDGET: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::from_millis(4)) };
 }
 
 /// Set how long a frame may spend on idle renders (4 ms by default).
@@ -740,8 +1072,6 @@ pub enum Why {
     Signal(SignalRef),
     /// Its parent passed props that differ.
     Props,
-    /// Every instance rendered again (a cold frame).
-    All,
 }
 
 impl fmt::Display for Why {
@@ -750,7 +1080,6 @@ impl fmt::Display for Why {
             Self::Mount => f.write_str("mount"),
             Self::Signal(s) => write!(f, "{s}"),
             Self::Props => f.write_str("props"),
-            Self::All => f.write_str("all"),
         }
     }
 }
@@ -770,8 +1099,8 @@ pub struct Stats {
     pub unmounts: u64,
 }
 
-thread_local! {
-    static BINDINGS: Cell<u64> = const { Cell::new(0) };
+crate::engine::engine_local! {
+    [Fresh] static BINDINGS: Cell<u64> = const { Cell::new(0) };
 }
 
 /// A bound closure ran (a style or text binding, at layout).
@@ -803,6 +1132,7 @@ fn count(f: impl FnOnce(&mut Stats)) {
 pub fn take_due() -> bool {
     let frame = FRAME_DUE.replace(false);
     frame
+        || STRANDED.get()
         || MARKED.with(|m| !m.borrow().is_empty())
         || DEFERRED.with(|d| !d.borrow().is_empty())
         // A hook waiting for layout: the next input is routed after it ran.
@@ -815,34 +1145,138 @@ pub(crate) fn frame_due() {
 }
 
 fn with_tree<R>(f: impl FnOnce(&mut Tree) -> R) -> R {
+    #[cfg(debug_assertions)]
+    crate::engine::no_component_context();
     TREE.with(|t| f(&mut t.borrow_mut()))
 }
 
 impl Tree {
     fn get(&self, id: Id) -> Option<&Instance> {
-        self.slab.get(id).and_then(Option::as_ref)
+        self.slab
+            .get(id.slot)
+            .and_then(Option::as_ref)
+            .filter(|i| i.generation == id.generation)
     }
 
     fn get_mut(&mut self, id: Id) -> Option<&mut Instance> {
-        self.slab.get_mut(id).and_then(Option::as_mut)
+        self.log(id.slot);
+        self.slab
+            .get_mut(id.slot)
+            .and_then(Option::as_mut)
+            .filter(|i| i.generation == id.generation)
     }
 
-    fn insert(&mut self, inst: Instance) -> Id {
-        if let Some(id) = self.free.pop() {
+    /// In a cold frame, slot `id` as it was, kept on its first write.
+    #[cfg(debug_assertions)]
+    fn log(&mut self, id: usize) {
+        if let Some(log) = self.cold.as_deref_mut()
+            && id < log.len
+            && log.logged.insert(id)
+            && let Some(slot) = self.slab.get_mut(id)
+        {
+            let copy = slot.as_ref().map(Instance::cold_copy);
+            let old = std::mem::replace(slot, copy).map(Box::new);
             let generation = self.generations.get(id).copied().unwrap_or(0);
-            if let Some(s) = self.slab.get_mut(id) {
-                *s = Some(Instance { generation, ..inst });
-            }
-            id
-        } else {
-            self.slab.push(Some(inst));
-            self.generations.push(0);
-            self.slab.len().saturating_sub(1)
+            log.undo.push(TreeUndo::Slot(id, old, generation));
+            crate::engine::fork_work(1);
         }
     }
 
-    fn generation(&self, id: Id) -> u32 {
-        self.generations.get(id).copied().unwrap_or(0)
+    #[cfg(not(debug_assertions))]
+    #[inline]
+    fn log(&mut self, _: usize) {}
+
+    #[cfg(debug_assertions)]
+    fn step(&mut self, step: TreeUndo) {
+        if let Some(log) = self.cold.as_deref_mut() {
+            log.undo.push(step);
+            crate::engine::fork_work(1);
+        }
+    }
+
+    /// The instances the cold frame wrote or added, taken out while it
+    /// still runs (each slot's live instance is in the log).
+    #[cfg(debug_assertions)]
+    fn drain_cold(&mut self) -> Vec<Box<dyn Any>> {
+        let Some(log) = self.cold.as_deref() else {
+            return Vec::new();
+        };
+        let slots: Vec<usize> = log.logged.iter().copied().chain(log.len..self.slab.len()).collect();
+        slots
+            .into_iter()
+            .filter_map(|i| self.slab.get_mut(i).and_then(Option::take))
+            .map(|i| -> Box<dyn Any> { Box::new(i) })
+            .collect()
+    }
+
+    /// Put back what the cold frame changed; what it made, to drop.
+    #[cfg(debug_assertions)]
+    fn rollback(&mut self) -> Vec<Box<dyn Any>> {
+        let mut made: Vec<Box<dyn Any>> = Vec::new();
+        let Some(log) = self.cold.take() else { return made };
+        let TreeLog { undo, len, current, .. } = *log;
+        for step in undo.into_iter().rev() {
+            match step {
+                TreeUndo::Slot(id, old, generation) => {
+                    if let Some(slot) = self.slab.get_mut(id) {
+                        made.push(Box::new(std::mem::replace(slot, old.map(|b| *b))));
+                    }
+                    if let Some(g) = self.generations.get_mut(id) {
+                        *g = generation;
+                    }
+                }
+                TreeUndo::FreePop(id) => self.free.push(id),
+                TreeUndo::FreePush => {
+                    self.free.pop();
+                }
+            }
+        }
+        made.extend(
+            self.slab
+                .drain(len.min(self.slab.len())..)
+                .map(|i| -> Box<dyn Any> { Box::new(i) }),
+        );
+        self.generations.truncate(len);
+        made.push(Box::new(std::mem::replace(&mut self.current, current)));
+        made
+    }
+
+    /// Take instance `id` out (it unmounts): its slot freed, with a new
+    /// generation.
+    fn take(&mut self, id: Id) -> Option<Instance> {
+        self.get(id)?;
+        self.log(id.slot);
+        let inst = self.slab.get_mut(id.slot).and_then(Option::take)?;
+        // A slot whose generations ran out is retired, never reused: an id
+        // from before could not be told from one issued after.
+        let next = self.generations.get(id.slot).and_then(|g| g.checked_add(1));
+        if let (Some(g), Some(next)) = (self.generations.get_mut(id.slot), next) {
+            *g = next;
+            self.free.push(id.slot);
+            #[cfg(debug_assertions)]
+            self.step(TreeUndo::FreePush);
+        }
+        Some(inst)
+    }
+
+    fn insert(&mut self, inst: Instance) -> Id {
+        if let Some(slot) = self.free.pop() {
+            #[cfg(debug_assertions)]
+            self.step(TreeUndo::FreePop(slot));
+            self.log(slot);
+            let generation = self.generations.get(slot).copied().unwrap_or(0);
+            if let Some(s) = self.slab.get_mut(slot) {
+                *s = Some(Instance { generation, ..inst });
+            }
+            Id { slot, generation }
+        } else {
+            self.slab.push(Some(Instance { generation: 0, ..inst }));
+            self.generations.push(0);
+            Id {
+                slot: self.slab.len().saturating_sub(1),
+                generation: 0,
+            }
+        }
     }
 
     /// Mark `id` to render and its ancestors as having work below.
@@ -884,21 +1318,86 @@ fn apply_marks() {
 }
 
 /// A tree of instances under one root, which a pipeline resolves each frame.
+///
+/// A panic out of user code as it resolves (a setup, a render, an effect,
+/// a cleanup, props compared) poisons the root, as an uncaught render
+/// error unmounts a React root: its whole tree is torn down at once, every
+/// cleanup run, and the panic goes on to the caller, once. The next
+/// resolve mounts the tree again from the root's render, fresh: nothing a
+/// frame left half done is ever reused (ADR-0013).
 pub struct Root {
-    id: Id,
+    id: Cell<Id>,
+    render: Render,
+    poisoned: Cell<bool>,
 }
 
 impl Root {
     /// A root instance rendering `render` (owned by nothing).
-    pub fn new(render: impl FnMut() -> Element + 'static) -> Self {
-        let scope = Scope::detached();
-        let id = create(None, scope, Box::new(()), Box::new(render), "app");
-        Self { id }
+    pub fn new(render: impl Fn() -> Element + 'static) -> Self {
+        let render: Render = Rc::new(render);
+        let id = create(None, Scope::detached(), Box::new(()), Rc::clone(&render), "app");
+        Self {
+            id: Cell::new(id),
+            render,
+            poisoned: Cell::new(false),
+        }
+    }
+
+    /// Whether a panic tore the tree down since the last resolve: the next
+    /// mounts it again.
+    #[must_use]
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.get()
     }
 
     /// Expand the tree: render what is dirty, reuse what is not. The root's
-    /// output with every placeholder replaced.
+    /// output with every placeholder replaced. A panic out of user code
+    /// poisons the root ([`Root`]) and goes on.
     pub fn resolve(&self) -> Element {
+        if self.poisoned.replace(false) {
+            let id = create(None, Scope::detached(), Box::new(()), Rc::clone(&self.render), "app");
+            self.id.set(id);
+        }
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.resolve_live())) {
+            Ok(out) => out,
+            Err(p) => {
+                self.poison();
+                std::panic::resume_unwind(p)
+            }
+        }
+    }
+
+    /// Tear the whole tree down in one pass, every teardown run though one
+    /// panics (those panics dropped: the one that poisoned it goes on).
+    fn poison(&self) {
+        DEADLINE.set(None);
+        STRANDED.set(false);
+        // What this resolve left its caller to dispose goes now, with the
+        // rest: nothing of the tree outlives it.
+        let left = LEAVING.with(|l| l.borrow_mut().as_mut().map(std::mem::take));
+        let outer = LEAVING.with(|l| l.borrow_mut().take());
+        let id = self.id.get();
+        drop(std::panic::catch_unwind(|| unmount(id)));
+        drop(std::panic::catch_unwind(|| {
+            each_to_completion(left.unwrap_or_default(), Scope::dispose);
+        }));
+        LEAVING.with(|l| *l.borrow_mut() = outer);
+        // The hooks queued for the instances torn down are cancelled.
+        let queued = POST.with(|p| std::mem::take(&mut *p.borrow_mut()));
+        let live: Vec<_> = queued
+            .into_iter()
+            .filter(|(owner, _)| crate::reactive::is_live(*owner))
+            .collect();
+        POST.with(|p| {
+            let mut p = p.borrow_mut();
+            let since = std::mem::replace(&mut *p, live);
+            p.extend(since);
+        });
+        self.poisoned.set(true);
+    }
+
+    fn resolve_live(&self) -> Element {
+        let root = self.id.get();
         // What the last resolve left for later is due again.
         let deferred = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
         with_tree(|t| {
@@ -909,45 +1408,89 @@ impl Root {
         });
         apply_marks();
         DEADLINE.set(std::time::Instant::now().checked_add(IDLE_BUDGET.get()));
-        let out = resolve(self.id);
+        let out = resolve(root);
         DEADLINE.set(None);
+        let left = with_tree(|t| t.get(root).is_some_and(|i| i.dirty || i.below));
+        STRANDED.set(left);
         out
     }
 
-    /// The output with every instance rendered again, as a cold build gives
-    /// it (the debug check that incremental equals cold). Hooks the extra
-    /// renders queue are dropped, and they are not counted or logged as
-    /// renders: the check leaves the frame's report as it was.
-    pub fn resolve_cold(&self) -> Element {
-        let queued = POST.with(|p| p.borrow().len());
-        let logged = RENDERED.with(|r| r.borrow().len());
-        let stats = STATS.get();
-        self.invalidate_all();
+    /// [`Self::resolve`], the instances it unmounted left undisposed: the
+    /// engine first cancels what their nodes captured (a drag, a touch),
+    /// each handler run while its instance is alive, then drops the
+    /// [`Leaving`], which disposes them.
+    pub(crate) fn resolve_leaving(&self) -> (Element, Leaving) {
+        let outer = LEAVING.with(|l| l.borrow_mut().replace(Vec::new()));
+        let guard = LeaveGuard(outer);
         let out = self.resolve();
-        POST.with(|p| p.borrow_mut().truncate(queued));
-        RENDERED.with(|r| r.borrow_mut().truncate(logged));
-        STATS.set(stats);
-        out
+        let left = LEAVING.with(|l| l.borrow_mut().take()).unwrap_or_default();
+        drop(guard);
+        (out, Leaving(left))
     }
 
-    /// Mark every instance to render again (a frame built cold).
-    pub fn invalidate_all(&self) {
+    /// Start a cold frame of this tree ([`ColdFrame`]), the debug check
+    /// that incremental equals cold.
+    #[cfg(debug_assertions)]
+    pub fn cold(&self) -> ColdFrame {
+        ColdFrame::begin(self.id.get())
+    }
+}
+
+/// A frame built cold, from [`Root::cold`] until it drops: one transaction
+/// over every piece of per-thread engine state
+/// ([`crate::engine::ColdFrame`]), the root's instances all due to render.
+/// Whatever it does (renders, props passed, instances mounted or
+/// unmounted, hooks and cleanups registered, its layout, bindings and
+/// paint) is undone when it drops, on return or unwind, running nothing.
+#[cfg(debug_assertions)]
+#[must_use]
+pub struct ColdFrame {
+    root: Id,
+    engine: crate::engine::ColdFrame,
+}
+
+#[cfg(debug_assertions)]
+impl ColdFrame {
+    fn begin(root: Id) -> Self {
+        let engine = crate::engine::ColdFrame::begin();
+        // Every instance under the root renders, as a tree built from
+        // nothing does; another root's are not touched.
         with_tree(|t| {
-            let n = t.slab.len();
-            for id in 0..n {
-                let generation = t.get(id).map(|i| i.generation);
-                if let Some(generation) = generation {
-                    t.mark(id, generation, Why::All, Priority::Input);
-                }
+            let mut todo = vec![root];
+            while let Some(id) = todo.pop() {
+                let Some(inst) = t.get(id) else { continue };
+                let generation = inst.generation;
+                todo.extend(inst.children.values().copied());
+                t.mark(id, generation, Why::Props, Priority::Input);
             }
         });
+        Self { root, engine }
+    }
+
+    /// The root's output, the tree resolved cold.
+    pub fn resolve(&self) -> Element {
+        apply_marks();
+        resolve(self.root)
+    }
+
+    /// The live signals the frame tried to write (none: a render, a
+    /// getter or a binding is pure).
+    #[must_use]
+    pub fn wrote(&self) -> Vec<String> {
+        let _ = &self.engine;
+        crate::reactive::cold_wrote()
     }
 }
 
 impl Drop for Root {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            unmount(self.id);
+        let id = self.id.get();
+        if std::thread::panicking() {
+            // Dropped as a panic unwinds: torn down all the same, a panic
+            // of its teardown dropped, never raised over the one going on.
+            drop(std::panic::catch_unwind(|| unmount(id)));
+        } else {
+            unmount(id);
         }
     }
 }
@@ -959,16 +1502,19 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
             (p.depth.saturating_add(1), Rc::clone(&p.context))
         })
     });
-    let (id, generation) = with_tree(|t| {
-        let id = t.insert(Instance {
+    let id = with_tree(|t| {
+        t.insert(Instance {
             generation: 0,
+            key: None,
+            at: 0,
+            marked: None,
             parent,
             depth,
             name,
             scope,
             node: None,
-            props,
-            render: Some(render),
+            props: Rc::from(props),
+            render,
             render_scopes: Vec::new(),
             dirty: true,
             why: Why::Mount,
@@ -982,9 +1528,10 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
             mounted: Vec::new(),
             updated: Vec::new(),
             renders: 0,
-        });
-        (id, t.generation(id))
+            met: std::rc::Weak::new(),
+        })
     });
+    let generation = id.generation;
     let node = scope.run(|| {
         RenderNode::new(move || {
             let by = crate::reactive::waking();
@@ -1000,21 +1547,28 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
     id
 }
 
-/// Mount a child from `mount` under `parent`.
-fn mount_child(parent: Id, mount: &dyn Mount, name: &'static str) -> Id {
+/// Mount a child from `mount` under `parent`, at `slot` among its children.
+fn mount_child(parent: Id, slot: InstanceKey, mount: &dyn Mount, name: &'static str) -> Id {
     let scope = with_tree(|t| t.get(parent).map(|p| p.scope));
     let scope = scope.map_or_else(Scope::detached, |s| s.run(Scope::new));
     // Setup runs as the instance, so `provide`, hooks and context find it;
     // it is pushed before it exists and filled in after.
-    let id = create(Some(parent), scope, Box::new(()), Box::new(Element::default), name);
+    let id = create(Some(parent), scope, Box::new(()), Rc::new(Element::default), name);
+    // Its parent owns it before its setup runs: a setup that panics
+    // poisons the root, whose teardown reaches it through its parent.
+    with_tree(|t| {
+        if let Some(p) = t.get_mut(parent) {
+            p.children.insert(slot, id);
+        }
+    });
     with_tree(|t| t.current.push(id));
     let guard = PopCurrent;
-    let (props, render) = scope.run(|| mount.setup());
+    let (props, render) = scope.run(|| crate::reactive::rendering(name, || mount.setup()));
     drop(guard);
     with_tree(|t| {
         if let Some(inst) = t.get_mut(id) {
             inst.props = props;
-            inst.render = Some(render);
+            inst.render = render;
         }
     });
     count(|s| s.setups = s.setups.saturating_add(1));
@@ -1035,25 +1589,94 @@ impl Drop for PopCurrent {
 
 /// Unmount `id` and everything below it: hooks, then its scope.
 fn unmount(id: Id) {
-    let Some(inst) = with_tree(|t| {
-        let inst = t.slab.get_mut(id).and_then(Option::take)?;
-        if let Some(g) = t.generations.get_mut(id) {
-            *g = g.wrapping_add(1);
-        }
-        t.free.push(id);
-        Some(inst)
-    }) else {
+    let Some(inst) = with_tree(|t| t.take(id)) else {
         return;
     };
+    // Each child, then each scope, though one's hooks panic: the first
+    // panic goes on once all are down.
+    let mut first = None;
     for child in inst.children.values() {
-        unmount(*child);
+        if let Err(p) = std::panic::catch_unwind(|| unmount(*child)) {
+            first.get_or_insert(p);
+        }
     }
-    for s in inst.render_scopes {
-        s.dispose();
+    let mut scopes = inst.render_scopes;
+    scopes.push(inst.scope);
+    // Left to the resolve's caller, or disposed now: `on_unmounted` and
+    // `on_cleanup` run as the scope is disposed.
+    let kept = LEAVING.with(|l| match l.borrow_mut().as_mut() {
+        Some(leaving) => {
+            leaving.append(&mut scopes);
+            true
+        }
+        None => false,
+    });
+    if !kept && let Err(p) = std::panic::catch_unwind(|| each_to_completion(scopes, Scope::dispose)) {
+        first.get_or_insert(p);
     }
-    // `on_unmounted` and `on_cleanup` run as the scope is disposed.
-    inst.scope.dispose();
     count(|s| s.unmounts = s.unmounts.saturating_add(1));
+    if let Some(p) = first {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// The instances a resolve unmounted, their scopes not yet disposed
+/// ([`Root::resolve_leaving`]): what they own is alive until it is dropped,
+/// which disposes them, each instance's render scopes then its own, the
+/// deepest first.
+#[must_use]
+pub(crate) struct Leaving(Vec<Scope>);
+
+impl Leaving {
+    /// Whether no instance left.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `owner` (as [`handler_owner`] gives it) is what a leaving
+    /// instance owns its handlers by.
+    pub(crate) fn holds(&self, owner: crate::reactive::OwnerId) -> bool {
+        self.0.iter().any(|s| s.id() == owner)
+    }
+}
+
+impl Drop for Leaving {
+    fn drop(&mut self) {
+        // Every one is disposed, though one's cleanup panics. Dropped as a
+        // panic unwinds, a cleanup's panic is dropped: raised over the one
+        // going on, it would abort the process.
+        if std::thread::panicking() {
+            drop(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                each_to_completion(self.0.drain(..), Scope::dispose);
+            })));
+        } else {
+            each_to_completion(self.0.drain(..), Scope::dispose);
+        }
+    }
+}
+
+/// Run `f` on every item, though one panics: the first panic goes on once
+/// all have run (a teardown a panic skipped would never run).
+pub(crate) fn each_to_completion<T>(items: impl IntoIterator<Item = T>, mut f: impl FnMut(T)) {
+    let mut first = None;
+    for item in items {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))) {
+            first.get_or_insert(p);
+        }
+    }
+    if let Some(p) = first {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// Puts back the disposal a resolve left to its caller, should it unwind.
+struct LeaveGuard(Option<Vec<Scope>>);
+
+impl Drop for LeaveGuard {
+    fn drop(&mut self) {
+        let left = LEAVING.with(|l| std::mem::replace(&mut *l.borrow_mut(), self.0.take()));
+        drop(left.map(Leaving));
+    }
 }
 
 /// How many render scopes an instance keeps: what is on screen and what a
@@ -1084,27 +1707,66 @@ fn resolve(id: Id) -> Element {
         return Element::Empty;
     }
     // Expand the raw output: placeholders become their instance's output.
-    let raw = with_tree(|t| t.get_mut(id).and_then(|i| i.raw.take()));
+    // Shared, not taken (an `Rc` clone): the children's setups, renders and
+    // effects run within, and one that panics leaves it in place.
+    let raw = with_tree(|t| t.get(id).and_then(|i| i.raw.clone()));
     let Some(raw) = raw else {
         return Element::Empty;
     };
     let before: HashMap<InstanceKey, Id> = with_tree(|t| t.get(id).map(|i| i.children.clone()).unwrap_or_default());
     let mut seen: HashMap<InstanceKey, Id> = HashMap::with_capacity(before.len());
-    let out = expand(id, &raw, 0, &before, &mut seen).unwrap_or_else(|| raw.clone());
-    for (slot, child) in &before {
-        if seen.get(slot) != Some(child) {
-            unmount(*child);
-        }
-    }
+    // A component that is the root of this output is placed by this
+    // instance's key, its own nested in it.
+    let chain = with_tree(|t| t.get(id).map(|i| Chain::Root(i.key, i.at))).unwrap_or(Chain::Child(0));
+    let out = expand(id, &raw, 0, chain, &before, &mut seen).unwrap_or_else(|| raw.clone());
+    each_to_completion(
+        before.iter().filter(|(slot, child)| seen.get(*slot) != Some(*child)),
+        |(_, child)| unmount(*child),
+    );
     with_tree(|t| {
+        // A child marked while its siblings resolved (an effect of a later
+        // one's wrote what it read) is still due: the work below stays
+        // marked, so the next pass reaches it (never cleared while one is).
+        let pending = seen.values().any(|&c| t.get(c).is_some_and(|c| c.dirty || c.below));
         if let Some(i) = t.get_mut(id) {
             i.raw = Some(raw);
             i.children = seen;
             i.output = Some(out.clone());
-            i.below = false;
+            i.below = pending;
         }
     });
     out
+}
+
+/// Where a component sits, for the key its output's root is placed by.
+#[derive(Clone, Copy)]
+enum Chain {
+    /// Child `n` of a node.
+    Child(usize),
+    /// The root of an instance's output: that instance's key (the chain's
+    /// so far), and its outermost's place.
+    Root(Option<ElementKey>, usize),
+}
+
+impl Chain {
+    /// The key a component keyed `own` placed here is placed by, and its
+    /// outermost's place. Every component of a chain of roots adds its
+    /// own: wrappers keyed 1 and 2 whose roots are each keyed 7 place them
+    /// apart, as do unkeyed wrappers side by side, by their places.
+    fn place(self, own: Option<ElementKey>) -> (Option<ElementKey>, usize) {
+        match (self, own) {
+            (Self::Child(n), own) => (own, n),
+            (Self::Root(outer, n), None) => (outer, n),
+            (Self::Root(Some(outer), n), Some(own)) => (Some(path_step(path_step(0x6e65_7374, outer), own)), n),
+            (Self::Root(None, n), Some(own)) => (
+                Some(path_step(
+                    path_step(0x0070_6c63, u64::try_from(n).unwrap_or(u64::MAX)),
+                    own,
+                )),
+                n,
+            ),
+        }
+    }
 }
 
 fn path_step(path: u64, step: u64) -> u64 {
@@ -1122,6 +1784,7 @@ fn expand(
     parent: Id,
     raw: &Element,
     path: u64,
+    chain: Chain,
     before: &HashMap<InstanceKey, Id>,
     seen: &mut HashMap<InstanceKey, Id>,
 ) -> Option<Element> {
@@ -1138,28 +1801,59 @@ fn expand(
                 );
                 return Some(Element::Empty);
             }
-            // A placeholder met before (its parent's render reused it)
-            // passes nothing new; one whose instance left mounts again.
-            let fresh = !c.used.replace(true);
+            // The placeholder its instance last met (its parent's render
+            // reused it) passes nothing new; one whose instance left mounts
+            // again.
             let child = match before.get(&slot) {
-                Some(&child) if fresh => {
-                    // Taken out while new props are passed: writing them
-                    // runs reactive code that may read the tree.
-                    let props = with_tree(|t| t.get_mut(child).map(|i| std::mem::replace(&mut i.props, Box::new(()))));
+                Some(&child) => {
+                    let fresh = with_tree(|t| {
+                        t.get_mut(child).is_some_and(|i| {
+                            let met = std::rc::Weak::ptr_eq(&i.met, &Rc::downgrade(c));
+                            if !met {
+                                i.met = Rc::downgrade(c);
+                            }
+                            !met
+                        })
+                    });
+                    // Shared, not taken out, while new props are passed:
+                    // writing them runs reactive code that may read the
+                    // tree, or panic.
+                    let props = fresh
+                        .then(|| with_tree(|t| t.get(child).map(|i| Rc::clone(&i.props))))
+                        .flatten();
                     if let Some(props) = props {
                         c.mount.update(&*props);
-                        with_tree(|t| {
-                            if let Some(i) = t.get_mut(child) {
-                                i.props = props;
-                            }
-                        });
                     }
                     child
                 }
-                Some(&child) => child,
-                None => mount_child(parent, &*c.mount, c.name),
+                None => {
+                    let child = mount_child(parent, slot, &*c.mount, c.name);
+                    with_tree(|t| {
+                        if let Some(i) = t.get_mut(child) {
+                            i.met = Rc::downgrade(c);
+                        }
+                    });
+                    child
+                }
             };
             seen.insert(slot, child);
+            let (key, at) = chain.place(c.key);
+            with_tree(|t| {
+                if let Some(i) = t.get_mut(child)
+                    && (i.key, i.at) != (key, at)
+                {
+                    i.key = key;
+                    i.at = at;
+                    // Kept, its place changed: its root marked again from
+                    // the chain as it is now, and its output expanded
+                    // again (a root component of its takes the new chain),
+                    // with no render.
+                    if let Some(raw) = i.raw.take() {
+                        i.raw = Some(mark_root(&mut i.marked, raw, key, i.scope.id()));
+                        i.below = true;
+                    }
+                }
+            });
             apply_marks();
             let out = resolve(child);
             Some(match &c.fallthrough {
@@ -1173,7 +1867,7 @@ fn expand(
             let mut kids: Option<Vec<Element>> = None;
             for (i, rc) in all.iter().enumerate() {
                 let step = child_step(rc, i);
-                if let Some(new) = expand(parent, rc, path_step(path, step), before, seen)
+                if let Some(new) = expand(parent, rc, path_step(path, step), Chain::Child(i), before, seen)
                     && let Some(at) = kids.get_or_insert_with(|| all.to_vec()).get_mut(i)
                 {
                     *at = new;
@@ -1183,15 +1877,81 @@ fn expand(
         }
         // A layer adds no step: what moves between its place in the flow and
         // a floating layer keeps its instances (Vue's `Teleport`).
-        Element::Deferred(r) => expand(parent, &r.child, path, before, seen).map(|child| {
+        Element::Deferred(r) => expand(parent, &r.child, path, chain, before, seen).map(|child| {
             Element::Deferred(Rc::new(crate::element::Deferred {
                 positioning: r.positioning,
                 placed: r.placed,
+                anchor_part: r.anchor_part,
+                tab_after: r.tab_after,
                 child,
             }))
         }),
         _ => None,
     }
+}
+
+/// Instance's render output `raw`, its root marked ([`marked`]) where it
+/// is not yet: written in place when the output is its own; copied when
+/// shared (a cached output), the copy kept in `cache`, so the same output
+/// given again is the same marked node.
+fn mark_root(
+    cache: &mut Option<(Element, Element)>,
+    raw: Element,
+    key: Option<ElementKey>,
+    owner: crate::reactive::OwnerId,
+) -> Element {
+    if !unmarked(&raw, key, owner) {
+        return raw;
+    }
+    if !raw.is_shared() {
+        *cache = None;
+        return marked(raw, key, owner);
+    }
+    if let Some((from, to)) = cache.as_ref()
+        && from.ptr_eq(&raw)
+    {
+        return to.clone();
+    }
+    let to = marked(raw.clone(), key, owner);
+    *cache = Some((raw, to.clone()));
+    to
+}
+
+/// Whether `raw`'s root (through a layer around it) lacks the mark
+/// [`marked`] writes.
+fn unmarked(raw: &Element, key: Option<ElementKey>, owner: crate::reactive::OwnerId) -> bool {
+    match raw {
+        // A component at the root marks its own, placed by this key.
+        Element::Component(_) => false,
+        Element::Deferred(d) => unmarked(&d.child, key, owner),
+        other => other
+            .common()
+            .is_some_and(|c| c.component_key != key || c.handlers.instance != Some(owner)),
+    }
+}
+
+/// An instance's render output `raw` with its root (through a layer around
+/// it) marked: placed by the instance's key when it is keyed (its own
+/// path segment, [`crate::geometry::PathSeg::Component`]: the root keeps
+/// its path as keyed siblings are reordered, as React keeps a keyed
+/// component's DOM, and shares it with no sibling), and made by the
+/// instance (`owner`, its scope): what tells a node it made from one
+/// another instance made at its path.
+fn marked(mut raw: Element, key: Option<ElementKey>, owner: crate::reactive::OwnerId) -> Element {
+    if let Element::Deferred(d) = &raw {
+        return Element::Deferred(Rc::new(crate::element::Deferred {
+            positioning: d.positioning,
+            placed: d.placed,
+            anchor_part: d.anchor_part,
+            tab_after: d.tab_after,
+            child: marked(d.child.clone(), key, owner),
+        }));
+    }
+    if let Some(c) = raw.common_mut() {
+        c.component_key = key;
+        c.handlers.instance = Some(owner);
+    }
+    raw
 }
 
 /// Instance `id`'s output `out` with its parent's fallthrough `f` on its
@@ -1238,22 +1998,23 @@ fn render(id: Id) {
             name: i.name,
             why: i.why,
         };
-        Some((i.render.take()?, i.node?, i.scope, Some(rendered)))
+        Some((Rc::clone(&i.render), i.node?, i.scope, Some(rendered)))
     }) else {
         return;
     };
     let rs = scope.run(Scope::new);
     with_tree(|t| t.current.push(id));
     let pop = PopCurrent;
-    let mut holder = Holder { id, f: Some(f) };
-    let raw = rs.run(|| node.track(|| holder.f.as_mut().map_or(Element::Empty, |f| f())));
+    let name = rendered.as_ref().map_or("component", |r| r.name);
+    // Running already (a render that resolves itself), it gives nothing.
+    let raw = rs.run(|| crate::reactive::rendering(name, || node.track(|| f())));
     drop(pop);
-    drop(holder);
-    let (old, first, updated) = with_tree(|t| {
+    let (old, first, updated, scope) = with_tree(|t| {
         let Some(i) = t.get_mut(id) else {
-            return (Vec::new(), true, Vec::new());
+            return (Vec::new(), true, Vec::new(), None);
         };
-        i.raw = Some(raw);
+        let (key, owner) = (i.key, i.scope.id());
+        i.raw = Some(mark_root(&mut i.marked, raw, key, owner));
         i.renders = i.renders.saturating_add(1);
         i.render_scopes.push(rs);
         let excess = i.render_scopes.len().saturating_sub(KEPT_RENDERS);
@@ -1262,19 +2023,19 @@ fn render(id: Id) {
         let updated = if first { Vec::new() } else { i.updated.clone() };
         if first {
             let mounted = std::mem::take(&mut i.mounted);
-            POST.with(|p| p.borrow_mut().extend(mounted));
+            POST.with(|p| p.borrow_mut().extend(mounted.into_iter().map(|f| (owner, f))));
         }
-        (old, first, updated)
+        (old, first, updated, Some(owner))
     });
-    for s in old {
-        s.dispose();
-    }
-    if !first {
+    each_to_completion(old, Scope::dispose);
+    if let Some(owner) = scope
+        && !first
+    {
         POST.with(|p| {
             p.borrow_mut().extend(
                 updated
                     .into_iter()
-                    .map(|f| -> Box<dyn FnOnce()> { Box::new(move || f()) }),
+                    .map(|f| -> PostHook { (owner, Box::new(move || f())) }),
             );
         });
     }
@@ -1290,33 +2051,25 @@ pub fn take_rendered() -> Vec<Rendered> {
     RENDERED.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
-/// Puts an instance's render back, on return and on unwind (a render that
-/// panicked renders again next time).
-struct Holder {
-    id: Id,
-    f: Option<Render>,
-}
-
-impl Drop for Holder {
-    fn drop(&mut self) {
-        let Some(f) = self.f.take() else { return };
-        let id = self.id;
-        TREE.with(|t| {
-            if let Ok(mut t) = t.try_borrow_mut()
-                && let Some(i) = t.get_mut(id)
-            {
-                i.render = Some(f);
-            }
-        });
-    }
-}
-
 /// Run the hooks due after the frame was laid out; whether there were any.
 pub fn run_post() -> bool {
     let hooks = POST.with(|p| std::mem::take(&mut *p.borrow_mut()));
     let any = !hooks.is_empty();
-    for f in hooks {
-        f();
+    // Every one runs, though one panics: the first panic goes on once all
+    // have (taken out, a hook a panic skipped would never run).
+    let mut first = None;
+    for (owner, f) in hooks {
+        // Its owner was disposed since it was queued (its instance
+        // unmounted): cancelled.
+        if !crate::reactive::is_live(owner) {
+            continue;
+        }
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+            first.get_or_insert(p);
+        }
+    }
+    if let Some(p) = first {
+        std::panic::resume_unwind(p);
     }
     any
 }
@@ -1325,11 +2078,57 @@ fn current() -> Option<Id> {
     with_tree(|t| t.current.last().copied())
 }
 
+/// What a handler made now runs in ([`crate::Div::on_click`] and the
+/// rest): the component instance rendering now, by its scope, which lives
+/// as long as it does (not the render's own scope, which a later render
+/// replaces); else what owns what is made now.
+pub(crate) fn handler_owner() -> Option<crate::reactive::OwnerId> {
+    current()
+        .and_then(|id| with_tree(|t| t.get(id).map(|i| i.scope.id())))
+        .or_else(crate::reactive::owner)
+}
+
+/// Whether a cold frame runs ([`ColdFrame`]): its renders, its layout and
+/// its bindings, which render every instance again to compare. For what
+/// counts renders or binding runs (a test's "renders nothing"). Never in
+/// a release build.
+#[must_use]
+pub fn is_cold_render() -> bool {
+    crate::reactive::is_cold()
+}
+
 /// Run `f` once, after the next layout pass (Vue's `nextTick`): what it
 /// writes shows in the same frame. For code that needs what is on screen,
 /// such as a menu that opens on its first item ([`crate::Members`]).
+/// Owned by what runs now (the instance rendering, or the owner a handler
+/// runs in): if that is disposed before the layout, `f` never runs. Called
+/// with no owner, it is a bug (a debug build panics) and `f` never runs.
 pub fn after_layout(f: impl FnOnce() + 'static) {
-    POST.with(|p| p.borrow_mut().push(Box::new(f)));
+    match Owner::current() {
+        Some(owner) => owner.after_layout(f),
+        None => debug_assert!(false, "gui: `after_layout` outside any owner never runs"),
+    }
+}
+
+/// What code runs in now, kept to queue work for it from code that runs
+/// outside it (a part's unmounting, telling the whole it belongs to): the
+/// instance rendering, or the owner a handler runs in. The work runs only
+/// while it is not disposed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Owner(crate::reactive::OwnerId);
+
+impl Owner {
+    /// What runs now's owner, if any ([`after_layout`]'s).
+    #[must_use]
+    pub fn current() -> Option<Self> {
+        handler_owner().map(Self)
+    }
+
+    /// [`after_layout`], for this owner: `f` never runs if it is disposed
+    /// before the layout.
+    pub fn after_layout(self, f: impl FnOnce() + 'static) {
+        POST.with(|p| p.borrow_mut().push((self.0, Box::new(f))));
+    }
 }
 
 /// Run `f` after this instance's first frame is laid out.
@@ -1365,6 +2164,8 @@ pub fn on_unmounted(f: impl FnOnce() + 'static) {
 /// Make `value` what [`use_context`] of its type returns in this instance and
 /// below it; outside any instance, everywhere.
 pub fn provide<T: 'static>(value: T) {
+    #[cfg(debug_assertions)]
+    crate::engine::no_component_context();
     let value: Rc<dyn Any> = Rc::new(value);
     let Some(id) = current() else {
         GLOBAL.with(|g| g.borrow_mut().insert(TypeId::of::<T>(), value));
@@ -1377,13 +2178,15 @@ pub fn provide<T: 'static>(value: T) {
     });
 }
 
-thread_local! {
-    static GLOBAL: RefCell<HashMap<TypeId, Rc<dyn Any>>> = RefCell::new(HashMap::new());
+crate::engine::engine_local! {
+    [Fork(log)] static GLOBAL: RefCell<crate::engine::ForkMap<TypeId, Rc<dyn Any>>> = RefCell::default();
 }
 
 /// The nearest value provided for `T` above this instance (or globally).
 #[must_use]
 pub fn use_context<T: Clone + 'static>() -> Option<T> {
+    #[cfg(debug_assertions)]
+    crate::engine::no_component_context();
     let key = TypeId::of::<T>();
     let local = current().and_then(|id| with_tree(|t| t.get(id).and_then(|i| i.context.get(&key).cloned())));
     let any = local.or_else(|| GLOBAL.with(|g| g.borrow().get(&key).cloned()))?;

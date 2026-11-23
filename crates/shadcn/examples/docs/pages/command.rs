@@ -1,5 +1,3 @@
-use std::rc::Rc;
-
 use gui::prelude::*;
 use gui::{Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text, text_bound};
 use shadcn::{CommandItem, CommandSection, command, command_input, command_list, command_shortcut, theme};
@@ -24,7 +22,7 @@ fn find(value: &str) -> Option<&'static (&'static str, Icon, &'static str, Optio
 
 pub fn render() -> Render {
     let last = Signal::labeled("last command", String::from("nothing yet"));
-    let sections = Rc::new(vec![
+    let sections = std::sync::Arc::new(vec![
         CommandSection::group(
             Some("Suggestions"),
             SUGGESTIONS.iter().map(|e| {
@@ -64,14 +62,16 @@ pub fn render() -> Render {
             .min_width(450.0)
             .child(command_input("Type a command or search..."))
             .child(
-                command_list(Rc::clone(&sections), move |item, row| match find(&item.value) {
-                    Some(&(_, glyph, label, keys)) => row
-                        .child(icon(glyph).text_color(t.muted_foreground))
-                        .child(text(label))
-                        .child(keys.map(command_shortcut)),
-                    None => row,
+                command_list(std::sync::Arc::clone(&sections), move |item, row| {
+                    match find(&item.value) {
+                        Some(&(_, glyph, label, keys)) => row
+                            .child(icon(glyph).text_color(t.muted_foreground))
+                            .child(text(label))
+                            .child(keys.map(command_shortcut)),
+                        None => row,
+                    }
                 })
-                .on_select(move |item| {
+                .on_select(move |item: CommandItem| {
                     if let Some(e) = find(&item.value) {
                         last.set(e.2.to_owned());
                     }

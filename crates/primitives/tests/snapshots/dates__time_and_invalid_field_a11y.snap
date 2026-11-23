@@ -1,0 +1,20 @@
+---
+source: crates/primitives/tests/dates.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer
+    Group invalid
+      SpinButton "Hours" value=7 in 1..=12 text="07" invalid
+        Label "07"
+      SpinButton "Minutes" value=5 in 0..=59 text="05" invalid
+        Label "05"
+      SpinButton "AM/PM" value=0 in 0..=1 text="AM" invalid
+        Label "AM"
+    Group invalid
+      SpinButton "Month" value=1 in 1..=12 text="01" invalid readonly
+        Label "01"
+      SpinButton "Day" value=2 in 1..=31 text="02" invalid readonly
+        Label "02"
+      SpinButton "Year" value=2024 in 1..=9999 text="2024" invalid readonly
+        Label "2024"

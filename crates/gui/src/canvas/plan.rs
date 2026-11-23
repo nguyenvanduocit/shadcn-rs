@@ -291,17 +291,18 @@ pub type Huge<'a> = dyn FnMut(u32, &Arc<Placed>) -> Option<(Path, (f64, f64))> +
 pub fn plan(world: &WorldSnapshot, view: &View, huge: &mut Huge<'_>, out: &mut Vec<Step>) {
     let visible = world.visible(&view.area());
     let objects = visible.iter().filter_map(|i| Some((*i, world.object(*i)?)));
-    plan_objects(objects, view, huge, out);
+    plan_objects(objects, &world.labels, view, huge, out);
 }
 
 /// The steps drawing everything of `world` meeting `view` as it is now:
 /// the lifted objects too, each in its place in the order.
 pub fn plan_live(world: &WorldSnapshot, view: &View, huge: &mut Huge<'_>, out: &mut Vec<Step>) {
-    plan_objects(world.drawn(&view.area()).into_iter(), view, huge, out);
+    plan_objects(world.drawn(&view.area()).into_iter(), &world.labels, view, huge, out);
 }
 
 fn plan_objects<'a>(
     objects: impl Iterator<Item = (u32, &'a Arc<Placed>)>,
+    labels: &super::Labels,
     view: &View,
     huge: &mut Huge<'_>,
     out: &mut Vec<Step>,
@@ -337,7 +338,7 @@ fn plan_objects<'a>(
                 });
             }
             Body::Text(t) => {
-                let Some(shaped) = t.shaped.get() else { continue };
+                let Some(shaped) = labels.get(t) else { continue };
                 let em = t.size * view.k;
                 if em < LOD_TEXT || extent < LOD_DROP {
                     // A grey bar where each line's letters stand.

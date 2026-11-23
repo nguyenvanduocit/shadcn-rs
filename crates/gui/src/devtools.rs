@@ -437,7 +437,11 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
                 target.send(Input::MouseDown { x, y });
                 target.send(Input::MouseUp { x, y })
             } else {
-                target.send(Input::SecondaryDown { x, y })
+                target.send(Input::ButtonDown {
+                    x,
+                    y,
+                    button: crate::layer::PointerButton::Secondary,
+                })
             };
             Ok(Done::Acted(format!("{about}\n{}", handled(&out))))
         }
@@ -878,9 +882,9 @@ fn texts(frame: &Frame, i: usize) -> Vec<&str> {
     let mut out = Vec::new();
     if let Some(n) = frame.nodes.get(i) {
         match &n.content {
-            Content::Text { content, .. } => out.push(content.as_str()),
+            Content::Text { content, .. } => out.push(&**content),
             Content::Input { edit, placeholder, .. } => {
-                out.push(edit.text.as_str());
+                out.push(&*edit.text);
                 if !placeholder.is_empty() {
                     out.push(placeholder.as_str());
                 }
@@ -926,7 +930,10 @@ fn behaviour(frame: &Frame, i: usize) -> String {
         (h.drag.is_some(), "drag"),
         (h.hover.is_some(), "hover"),
         (h.key_down.is_some(), "keys"),
-        (h.click_outside.is_some(), "click-outside"),
+        (h.long_press.is_some(), "long-press"),
+        (h.layer.as_ref().is_some_and(|l| !l.is_modal()), "layer"),
+        (h.layer.as_ref().is_some_and(|l| l.is_modal()), "modal-layer"),
+        (b.inert, "inert"),
         (b.field.is_some(), "input"),
         (b.disabled, "disabled"),
         (b.pass_through, "pass-through"),
@@ -1728,6 +1735,7 @@ fn diff(d: &LayoutDiff) -> String {
         let how = match &c.change {
             inspect::Change::Added { after } => format!("added {after}"),
             inspect::Change::Removed { before } => format!("removed {before}"),
+            inspect::Change::Reordered { at } => format!("reordered among its siblings, at {at}"),
             u @ inspect::Change::Updated { before, after, .. } => {
                 let mut w = Vec::new();
                 if u.moved() || u.resized() {
@@ -2356,7 +2364,14 @@ mod tests {
         assert!(found.contains("Text \"count is 0\""), "{found}");
         let clicked = s.run("click Add").expect("click");
         assert!(clicked.contains("handled: click"), "{clicked}");
-        assert!(clicked.contains("wrote [count]"), "{clicked}");
+        // The click writes `count`; the engine writes signals of its own
+        // too (where the pointer is), so `count` is among those written.
+        let wrote = clicked
+            .split_once("wrote [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("the signals written");
+        assert!(wrote.split(", ").any(|s| s == "count"), "{clicked}");
         assert!(s.run("find \"count is 1\"").expect("find").contains("1 found"));
         let listed = s.run("signals count").expect("signals");
         assert!(listed.contains("count: i32 = 1"), "{listed}");

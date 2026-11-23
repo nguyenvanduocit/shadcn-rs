@@ -2,17 +2,15 @@
 //!
 //! As reka's `SliderRoot` it keeps its values itself (`default_value`) or
 //! in the caller's model (`model`, `v-model`); `on_change` hears each move.
-
-use std::cell::Cell;
-use std::rc::Rc;
+//! Its behaviour (keys, the pointer, snapping, the thumbs' semantics) is
+//! `primitives::slider`'s; this module draws it.
 
 use gui::Color;
 use gui::Properties;
 use gui::prelude::*;
-use gui::{
-    Bind, Bounds, Div, DragEvent, DragPhase, FocusHandle, Key, KeyEvent, Model, NamedKey, UseModel, component, div, px,
-    use_model,
-};
+use gui::{Axis, Bind, Div, Model, component, div, px, use_model, watch};
+use primitives::slider::{Slide, Slider, SliderConfig};
+use primitives::{Availability, use_direction};
 
 use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
@@ -28,7 +26,7 @@ const THUMB: f32 = 16.0;
 /// bounds and step, and its orientation.
 #[derive(Clone, PartialEq)]
 pub struct SliderProps {
-    value: Bind<Vec<f32>>,
+    value: Bind<Vec<f64>>,
     range: Range,
     disabled: bool,
     orientation: Orientation,
@@ -37,119 +35,25 @@ pub struct SliderProps {
 /// A slider's bounds and step (reka's `min`, `max`, `step`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Range {
-    min: f32,
-    max: f32,
-    step: f32,
+    min: f64,
+    max: f64,
+    step: f64,
 }
 
-impl Range {
-    /// `v` clamped to the bounds and snapped to the nearest step, rounded to
-    /// the step's decimals so `0.1 * 3` reads `0.3`.
-    fn snap(self, v: f32) -> f32 {
-        let steps = if self.step > 0.0 {
-            ((v - self.min) / self.step).round()
-        } else {
-            0.0
+impl SliderProps {
+    /// What the primitive is told.
+    fn config(&self) -> (SliderConfig, Availability) {
+        let config = SliderConfig {
+            min: self.range.min,
+            max: self.range.max,
+            step: self.range.step,
+            orientation: match self.orientation {
+                Orientation::Horizontal => Axis::Horizontal,
+                Orientation::Vertical => Axis::Vertical,
+            },
+            ..SliderConfig::default()
         };
-        let snapped = (self.min + steps * self.step).clamp(self.min, self.max);
-        let decimals = self.step.to_string().split_once('.').map_or(0, |(_, d)| d.len());
-        let scale = 10_f32.powi(i32::try_from(decimals).unwrap_or(0));
-        (snapped * scale).round() / scale
-    }
-
-    /// Where `v` sits between the bounds, 0 to 1.
-    fn fraction(self, v: f32) -> f32 {
-        let span = self.max - self.min;
-        if span > 0.0 {
-            ((v - self.min) / span).clamp(0.0, 1.0)
-        } else {
-            0.0
-        }
-    }
-
-    /// The value under the pointer at `(x, y)` on a slider laid out in `b`.
-    fn value_at(self, orientation: Orientation, b: Bounds, x: f32, y: f32) -> f32 {
-        let p = match orientation {
-            Orientation::Horizontal if b.width > 0.0 => (x - b.x) / b.width,
-            Orientation::Vertical if b.height > 0.0 => (b.y + b.height - y) / b.height,
-            _ => 0.0,
-        };
-        self.min + p.clamp(0.0, 1.0) * (self.max - self.min)
-    }
-}
-
-/// What a slider's handlers move: its values, the thumbs' focus, and the
-/// thumb a drag or key moves.
-#[derive(Clone)]
-struct Thumbs {
-    value: UseModel<PartProps<SliderProps>, Vec<f32>>,
-    props: gui::Signal<PartProps<SliderProps>>,
-    focus: Rc<[FocusHandle]>,
-    active: Rc<Cell<usize>>,
-}
-
-impl Thumbs {
-    fn range(&self) -> Range {
-        self.props.with_untracked(|p| p.props.range)
-    }
-
-    /// Set the active thumb to `v`, keep the values ascending, and follow the
-    /// thumb to its new place among them.
-    fn set_active(&self, v: f32) {
-        let v = self.range().snap(v);
-        let mut values = self.value.get_untracked();
-        let Some(slot) = values.get_mut(self.active.get()) else {
-            return;
-        };
-        *slot = v;
-        values.sort_by(f32::total_cmp);
-        if let Some(i) = values.iter().position(|x| *x == v) {
-            self.active.set(i);
-        }
-        self.value.set(values);
-    }
-
-    fn drag(&self, orientation: Orientation, ev: &DragEvent) {
-        let v = self.range().value_at(orientation, ev.bounds, ev.x, ev.y);
-        if ev.phase == DragPhase::Start {
-            let values = self.value.get_untracked();
-            let nearest = values
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| (*a - v).abs().total_cmp(&(*b - v).abs()))
-                .map_or(0, |(i, _)| i);
-            self.active.set(nearest);
-        }
-        self.set_active(v);
-        if let Some(f) = self.focus.get(self.active.get()) {
-            f.focus();
-        }
-    }
-
-    /// Arrows step the thumb `at`, Page keys by ten steps, Home and End to the bounds.
-    fn key(&self, at: usize, ev: &KeyEvent) -> bool {
-        let Some(cur) = self.value.get_untracked().get(at).copied() else {
-            return false;
-        };
-        let r = self.range();
-        let big = r.step * 10.0;
-        let next = match &ev.key {
-            Key::Named(NamedKey::ArrowRight | NamedKey::ArrowUp) if ev.modifiers.shift => cur + big,
-            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowDown) if ev.modifiers.shift => cur - big,
-            Key::Named(NamedKey::ArrowRight | NamedKey::ArrowUp) => cur + r.step,
-            Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowDown) => cur - r.step,
-            Key::Named(NamedKey::PageUp) => cur + big,
-            Key::Named(NamedKey::PageDown) => cur - big,
-            Key::Named(NamedKey::Home) => r.min,
-            Key::Named(NamedKey::End) => r.max,
-            _ => return false,
-        };
-        self.active.set(at);
-        self.set_active(next);
-        if let Some(f) = self.focus.get(self.active.get()) {
-            gui::focus::set_focus(Some(f.id()), true);
-        }
-        true
+        (config, Availability::from_disabled(self.disabled))
     }
 }
 
@@ -186,16 +90,20 @@ pub fn slider(orientation: Orientation) -> Part<SliderProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let value = use_model(props, |p| &p.props.value);
-            let thumbs = Thumbs {
-                value,
-                props,
-                focus: (0..value.get_untracked().len()).map(|_| FocusHandle::new()).collect(),
-                active: Rc::new(Cell::new(0)),
+            let slider = Slider::new(
+                use_model(props, |p: &PartProps<SliderProps>| &p.props.value),
+                use_direction(None),
+            );
+            let tell = move |(config, availability): (SliderConfig, Availability)| {
+                slider.set_config(config);
+                slider.set_availability(availability);
             };
+            tell(props.with_untracked(|p| p.props.config()));
+            slider.set_thumb(true, f64::from(THUMB));
+            watch(move || props.with(|p| p.props.config()), move |c, _| tell(*c));
             move || {
-                let values = value.get();
-                props.with(|p| render(&p.props, p.slot.0.clone(), &values, &thumbs).into_element())
+                let values = slider.values();
+                props.with(|p| render(&p.props, p.slot.0.clone(), &values, slider).into_element())
             }
         })
     })
@@ -204,34 +112,34 @@ pub fn slider(orientation: Orientation) -> Part<SliderProps> {
 impl Part<SliderProps> {
     /// The values, kept by the caller (`v-model`).
     #[must_use]
-    pub fn model(self, model: impl Into<Model<Vec<f32>>>) -> Self {
+    pub fn model(self, model: impl Into<Model<Vec<f64>>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().with_model(model))
     }
 
     /// The thumbs' first values, when no model is given (`default-value`).
     #[must_use]
-    pub fn default_value(self, value: Vec<f32>) -> Self {
+    pub fn default_value(self, value: Vec<f64>) -> Self {
         self.with_props(|p| p.value = p.value.clone().with_default(value))
     }
 
     /// Call `f` with the values after each move (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(Vec<f32>) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<Vec<f64>>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 
     #[must_use]
-    pub fn min(self, min: f32) -> Self {
+    pub fn min(self, min: f64) -> Self {
         self.with_props(|p| p.range.min = min)
     }
 
     #[must_use]
-    pub fn max(self, max: f32) -> Self {
+    pub fn max(self, max: f64) -> Self {
         self.with_props(|p| p.range.max = max)
     }
 
     #[must_use]
-    pub fn step(self, step: f32) -> Self {
+    pub fn step(self, step: f64) -> Self {
         self.with_props(|p| p.range.step = step)
     }
 
@@ -242,27 +150,26 @@ impl Part<SliderProps> {
 }
 
 /// The slider's track, range and thumbs in `root`, the thumbs at `values`.
-fn render(p: &SliderProps, root: Div, values: &[f32], thumbs: &Thumbs) -> Div {
+fn render(p: &SliderProps, root: Div, values: &[f64], slider: Slider<PartProps<SliderProps>>) -> Div {
     let t = theme();
-    let (orientation, r, disabled) = (p.orientation, p.range, p.disabled);
-    let (lo, hi) = match values {
-        [one] => (0.0, r.fraction(*one)),
-        many => (
-            many.first().map_or(0.0, |v| r.fraction(*v)),
-            many.last().map_or(0.0, |v| r.fraction(*v)),
-        ),
-    };
-    let horizontal = orientation == Orientation::Horizontal;
+    let (config, _) = p.config();
+    let (lo, hi) = slider.range();
+    let (lo, hi) = (f64_to_f32(lo), f64_to_f32(hi));
+    let horizontal = p.orientation == Orientation::Horizontal;
+    // Right to left, a horizontal slider runs from the right, as its keys do.
+    let mirrored = horizontal && slider.slide() == Slide::FromRight;
     let range = div()
         .named("slider-range")
         .position(Position::Absolute)
         .background(t.primary);
     let range = if horizontal {
-        range
-            .top(0.0)
-            .bottom(0.0)
-            .left(Length::Fraction(lo))
-            .right(Length::Fraction(1.0 - hi))
+        let (start, end) = (Length::Fraction(lo), Length::Fraction(1.0 - hi));
+        let range = range.top(0.0).bottom(0.0);
+        if mirrored {
+            range.right(start).left(end)
+        } else {
+            range.left(start).right(end)
+        }
     } else {
         range
             .left(0.0)
@@ -282,19 +189,22 @@ fn render(p: &SliderProps, root: Div, values: &[f32], thumbs: &Thumbs) -> Div {
         .child(range);
     // Thumbs stay inside the track: each travels its length less one thumb.
     let rail = div().named("slider-thumbs").position(Position::Absolute).inset(0.0);
-    let rail = if horizontal {
-        rail.right(px(THUMB))
-    } else {
-        rail.top(px(THUMB))
+    let rail = match (horizontal, mirrored) {
+        (true, false) => rail.right(px(THUMB)),
+        (true, true) => rail.left(px(THUMB)),
+        (false, _) => rail.top(px(THUMB)),
     };
+    let count = values.len();
     let thumb_els = values.iter().enumerate().map(|(i, v)| {
-        let f = r.fraction(*v);
-        let keys = thumbs.clone();
-        div()
+        let f = f64_to_f32(primitives::slider::fraction(*v, &config));
+        let d = div()
             .named("slider-thumb")
             .transition(Properties::COLOR | Properties::SHADOW)
             .position(Position::Absolute)
-            .when(horizontal, |d| d.left(Length::Fraction(f)).top(px(THUMB_OVERHANG)))
+            .when(horizontal && !mirrored, |d| {
+                d.left(Length::Fraction(f)).top(px(THUMB_OVERHANG))
+            })
+            .when(mirrored, |d| d.right(Length::Fraction(f)).top(px(THUMB_OVERHANG)))
             .when(!horizontal, |d| d.bottom(Length::Fraction(f)).left(px(THUMB_OVERHANG)))
             .display(Display::Block)
             .size(16.0)
@@ -319,16 +229,16 @@ fn render(p: &SliderProps, root: Div, values: &[f32], thumbs: &Thumbs) -> Div {
                     color: Color::BLACK.opacity(0.1),
                 },
             ])
-            .when_some(thumbs.focus.get(i).copied(), Div::track_focus)
-            .disabled(disabled)
             .with_interaction(|d, it| {
                 d.ring(move || (it.hovered() || it.focus_visible()).then(|| Ring::new(4.0, t.ring.opacity(0.5))))
-            })
-            .on_key_down(move |ev| keys.key(i, ev))
+            });
+        slider.thumb(d, i, count)
     });
-    let drags = thumbs.clone();
-    root.disabled(disabled)
-        .on_drag(move |ev| drags.drag(orientation, ev))
-        .child(track)
-        .child(rail.children(thumb_els))
+    slider.root(root).child(track).child(rail.children(thumb_els))
+}
+
+/// A fraction of the track as layout takes it.
+#[expect(clippy::as_conversions, reason = "a fraction in 0..=1; `as` rounds to nearest")]
+fn f64_to_f32(v: f64) -> f32 {
+    v as f32
 }

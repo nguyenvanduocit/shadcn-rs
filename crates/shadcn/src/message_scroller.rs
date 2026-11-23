@@ -21,6 +21,10 @@
 //! list's offsets are its rows' boxes exactly. Scrolls jump: `gui` animates
 //! no scroll, so `behavior: "smooth"` lands at once.
 
+#[expect(
+    clippy::disallowed_types,
+    reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
+)]
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::ops::Range;
@@ -31,13 +35,16 @@ use gui::list::{Anchor, ListLayout, ListState, virtual_list_in};
 use gui::prelude::*;
 use gui::style::Calc;
 use gui::{
-    ComponentElement, Div, Easing, Element, ElementKey, Icon, Properties, Signal, clock, component, div, icon, key_of,
-    provide, use_context, watch,
+    ComponentElement, Div, Easing, Effect, Element, ElementKey, Icon, Properties, Signal, clock, component, div, icon,
+    key_of, provide, use_context, watch,
 };
 
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::focus::StateLook;
 use crate::theme::theme;
+
+/// Whether a message of the thread, by index, is an anchor.
+type IsAnchor = Rc<dyn Fn(u64) -> bool>;
 
 const SCROLL_EPSILON: f64 = 0.5;
 const AUTOSCROLLING_TIMEOUT: Duration = Duration::from_millis(180);
@@ -165,6 +172,10 @@ struct Change {
 }
 
 /// Vue's `createEngine`: the scroller's state between layouts.
+#[expect(
+    clippy::disallowed_types,
+    reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
+)]
 struct Engine {
     props: MessageScrollerProps,
     list: ListState,
@@ -180,11 +191,10 @@ struct Engine {
     len: u64,
     first: Option<ElementKey>,
     last: Option<ElementKey>,
-    /// The rows built: the first's index and whether each is an anchor.
-    built_first: u64,
-    built_anchors: Vec<bool>,
-    /// The last anchor above the rows built.
-    anchor_before: Option<u64>,
+    /// Whether a message of the data the viewport has is an anchor, read
+    /// after layout for the rows laid out; held by the viewport while it is
+    /// mounted.
+    anchor_of: gui::Holder<IsAnchor>,
     /// The last anchor of the thread (for `LastAnchor`, until it is applied).
     last_anchor: Option<u64>,
     /// "The last anchor at or before `from` is `found`", for the data as it is.
@@ -283,13 +293,6 @@ impl Engine {
         {
             self.last_anchor = len.checked_sub(1).and_then(|q| self.anchor_at_or_before(q, anchor));
         }
-    }
-
-    /// The rows the list built this render, from `first`.
-    fn built(&mut self, first: u64, anchors: Vec<bool>, anchor: &dyn Fn(u64) -> bool) {
-        self.built_first = first;
-        self.built_anchors = anchors;
-        self.anchor_before = first.checked_sub(1).and_then(|q| self.anchor_at_or_before(q, anchor));
     }
 
     /// The last anchor at or before row `q`, scanning only what the last
@@ -495,26 +498,24 @@ impl Engine {
         }
     }
 
-    /// Whether row `row` is an anchor, for a row built this render.
-    fn built_anchor(&self, row: u64) -> bool {
-        row.checked_sub(self.built_first)
-            .and_then(|j| usize::try_from(j).ok())
-            .and_then(|j| self.built_anchors.get(j))
-            .copied()
-            .unwrap_or(false)
-    }
-
     /// Vue's `computeVisibility`: what shows below the line a new turn settles at.
     fn sync_visibility(&mut self, l: &ListLayout) {
         let line = self.props.scroll_margin + self.props.scroll_previous_item_peek;
         let mut shown: Option<(u64, u64)> = None;
-        let mut current = self.anchor_before;
+        let anchor = self.anchor_of.get_untracked();
+        let is_anchor = |row: u64| anchor.as_ref().is_some_and(|f| f(row));
+        // The last anchor above the rows laid out, then the last of them at
+        // or above the line.
+        let mut current = match (l.rows.first(), &anchor) {
+            (Some(r), Some(f)) => r.row.checked_sub(1).and_then(|q| self.anchor_at_or_before(q, &**f)),
+            _ => None,
+        };
         for r in &l.rows {
             let bottom = r.top + self.visual_height_of(r.row, r.height);
             if bottom > line && r.top < l.viewport {
                 shown = Some(shown.map_or((r.row, r.row), |(a, _)| (a, r.row)));
             }
-            if r.top <= line + local(SCROLL_EPSILON) && self.built_anchor(r.row) {
+            if r.top <= line + local(SCROLL_EPSILON) && is_anchor(r.row) {
                 current = Some(r.row);
             }
         }
@@ -733,16 +734,23 @@ impl Engine {
 /// `useMessageScroller`). It is the provider's: it lives while the provider
 /// is mounted.
 #[derive(Clone)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
+)]
 pub struct MessageScroller {
     list: ListState,
     engine: Rc<RefCell<Engine>>,
     scrollable: Signal<MessageScrollerScrollable>,
     visibility: Signal<MessageScrollerVisibility>,
-    autoscrolling: Signal<bool>,
 }
 
 impl MessageScroller {
     /// Made in the provider's setup: what it makes belongs to the provider.
+    #[expect(
+        clippy::disallowed_types,
+        reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
+    )]
     fn new(props: MessageScrollerProps) -> Self {
         let list = ListState::new(ROW_ESTIMATE);
         list.follow_tail(props.auto_scroll);
@@ -763,9 +771,7 @@ impl MessageScroller {
                 len: 0,
                 first: None,
                 last: None,
-                built_first: 0,
-                built_anchors: Vec::new(),
-                anchor_before: None,
+                anchor_of: gui::Holder::new(),
                 last_anchor: None,
                 anchor_cache: None,
                 change: None,
@@ -786,6 +792,9 @@ impl MessageScroller {
                 dirty: false,
             })
         });
+        // No scrollbar while the engine scrolls the thread itself.
+        let hidden = list.clone();
+        Effect::new(move || hidden.hide_scrollbar(autoscrolling.get()));
         let weak = Rc::downgrade(&engine);
         list.on_layout(move |l| {
             weak.upgrade()
@@ -797,7 +806,6 @@ impl MessageScroller {
             engine,
             scrollable,
             visibility,
-            autoscrolling,
         }
     }
 
@@ -978,6 +986,9 @@ impl<T: 'static> IntoElement for MessageScrollerViewport<T> {
         component(self.0, |cx| {
             let props = cx.props();
             let scroller = use_message_scroller();
+            if let Some(state) = &scroller {
+                watch_data(state, props);
+            }
             move || {
                 let Some(state) = &scroller else {
                     return Element::Empty;
@@ -989,25 +1000,57 @@ impl<T: 'static> IntoElement for MessageScrollerViewport<T> {
     }
 }
 
+/// Message `i` of the data `p` gives.
+fn item_at<T>(p: &MessageScrollerViewportProps<T>, i: u64) -> Option<&T> {
+    usize::try_from(i).ok().and_then(|i| p.items.get(i))
+}
+
+/// Whether message `i` of the data `p` gives is an anchor.
+fn is_anchor_in<T>(p: &MessageScrollerViewportProps<T>, i: u64) -> bool {
+    item_at(p, i).is_some_and(|t| (p.meta)(t).1)
+}
+
+/// The engine follows the data the viewport is given (Vue's watcher on its
+/// items): an effect on the viewport's props, run as they change and before
+/// the viewport renders again, so the list hears of rows inserted above
+/// before it builds and the render itself writes nothing. The layout hook
+/// reads which of the rows laid out are anchors through the props too.
+fn watch_data<T: 'static>(state: &MessageScroller, props: Signal<MessageScrollerViewportProps<T>>) {
+    let mine: IsAnchor = Rc::new(move |i| props.with_untracked(|p| is_anchor_in(p, i)));
+    // The props go with the viewport; the engine is the provider's. Held
+    // from the viewport's mount to its unmount, by its registration: a
+    // viewport that replaced this one holds it after this one left.
+    let holder = state.engine.borrow().anchor_of;
+    holder.hold(mine);
+    let engine = Rc::downgrade(&state.engine);
+    Effect::new(move || {
+        props.with(|p| {
+            let len = u64::try_from(p.items.len()).unwrap_or(u64::MAX);
+            let key = |i: u64| item_at(p, i).map_or(ElementKey::default(), |t| key_of((p.meta)(t).0));
+            let anchor = |i: u64| is_anchor_in(p, i);
+            gui::untracked(|| {
+                if let Some(engine) = engine.upgrade()
+                    && let Ok(mut e) = engine.try_borrow_mut()
+                {
+                    e.data(len, p.gap, &key, &anchor);
+                }
+            });
+        });
+    });
+}
+
 fn viewport<T>(state: &MessageScroller, p: &MessageScrollerViewportProps<T>) -> Div {
     let items = &*p.items;
     let (meta, row, gap) = (&*p.meta, &*p.row, p.gap);
     let len = u64::try_from(items.len()).unwrap_or(u64::MAX);
     let at = |i: u64| usize::try_from(i).ok().and_then(|i| items.get(i));
     let key = |i: u64| at(i).map_or(ElementKey::default(), |t| key_of(meta(t).0));
-    let anchor = |i: u64| at(i).is_some_and(|t| meta(t).1);
-    if let Ok(mut e) = state.engine.try_borrow_mut() {
-        e.data(len, gap, &key, &anchor);
-    }
-    state.list.hide_scrollbar(state.autoscrolling.get());
-    let built = RefCell::new(Vec::new());
     let list = virtual_list_in(
         &state.list,
         len,
         key,
         |i| {
             let Some(t) = at(i) else { return Element::Empty };
-            built.borrow_mut().push(meta(t).1);
             div()
                 .named("message-scroller-item")
                 .width(pct(100.0))
@@ -1033,10 +1076,6 @@ fn viewport<T>(state: &MessageScroller, p: &MessageScrollerViewportProps<T>) -> 
             )
         },
     );
-    let window = state.list.window();
-    if let Ok(mut e) = state.engine.try_borrow_mut() {
-        e.built(window.start, built.into_inner(), &anchor);
-    }
     list.named("message-scroller-viewport")
         .display(Display::Flex)
         .flex_direction(FlexDirection::Column)
@@ -1130,6 +1169,10 @@ fn scroll_button(state: MessageScroller, direction: MessageScrollerDirection) ->
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::disallowed_types,
+    reason = "test and example state the test reads back, not a component's"
+)]
 mod tests {
     use super::*;
     use gui::layout::Content;
@@ -1193,6 +1236,9 @@ mod tests {
             1.0,
         )
         .unwrap();
+        // Every frame is checked against a cold one (the viewport's render
+        // writes nothing), with `GUI_COLD_CHECK` set or not.
+        s.check_cold(true);
         s.settle().unwrap();
         s.settle().unwrap();
         let state = got.borrow().clone().unwrap();
@@ -1224,6 +1270,63 @@ mod tests {
                 *y <= 0.0 && y + h > 0.0
             })
             .unwrap()
+    }
+
+    /// A viewport replaced by another in one update: the new one's setup
+    /// installs its anchor lookup before the old one's cleanup runs, which
+    /// takes back only its own, so the turn in view is still known.
+    #[test]
+    fn a_viewport_replaced_in_one_update_keeps_the_anchor_lookup() {
+        let msgs = Signal::new(thread_of(100));
+        let which = Signal::new(false);
+        let got: Rc<RefCell<Option<MessageScroller>>> = Rc::default();
+        let into = Rc::clone(&got);
+        let mut s = Scenario::measuring(
+            move || {
+                let into = Rc::clone(&into);
+                let capture = component((), move |_| {
+                    *into.borrow_mut() = use_message_scroller();
+                    || Element::Empty
+                });
+                div()
+                    .width(400.0)
+                    .height(HEIGHT)
+                    .child(message_scroller_provider(
+                        MessageScrollerProps::default(),
+                        message_scroller()
+                            .child(
+                                div()
+                                    .key(key_of(if which.get() { "second" } else { "first" }))
+                                    .size(pct(100.0))
+                                    .child(message_scroller_viewport(
+                                        msgs.get(),
+                                        |m: &Msg| (m.id.as_str(), m.user),
+                                        |_, m: &Msg| div().height(m.height).child(text(m.id.clone())),
+                                    )),
+                            )
+                            .child(capture),
+                    ))
+                    .into_element()
+            },
+            WIDTH,
+            600,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        let state = got.borrow().clone().unwrap();
+        let before = state.visibility().current_anchor;
+        assert!(before.is_some(), "a turn in view to begin with");
+        s.act("replace the viewport", || which.set(true));
+        s.settle().unwrap();
+        s.act("a reply streams on", || {
+            msgs.update(|m| m.push(msg(100)));
+        });
+        s.settle().unwrap();
+        assert!(
+            state.visibility().current_anchor.is_some(),
+            "the new viewport's anchors are still read"
+        );
     }
 
     #[test]

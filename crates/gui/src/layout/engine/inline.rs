@@ -86,6 +86,7 @@ pub(super) fn compute<S: NodeStyle, L: Measure>(view: &mut View<'_, S, L>, input
         let order = u32::try_from(i).unwrap_or(u32::MAX);
         if c.style.display() == Display::None {
             set_layout(c, Layout::with_order(order));
+            set_hidden(c, false);
             let hidden = LayoutInput {
                 run_mode: RunMode::PerformHiddenLayout,
                 ..input
@@ -93,7 +94,8 @@ pub(super) fn compute<S: NodeStyle, L: Measure>(view: &mut View<'_, S, L>, input
             compute_node(c, hidden, None, &mut **cx, schedule, stats);
             continue;
         }
-        let at = places.get(i).copied().unwrap_or(Point::ZERO);
+        let (at, shown) = places.get(i).copied().unwrap_or((Point::ZERO, true));
+        set_hidden(c, !shown);
         let (margin, c_padding, c_border, c_overflow, c_contain, scrollbar) = {
             let cs = c.style.view();
             (
@@ -154,6 +156,15 @@ pub(super) fn compute<S: NodeStyle, L: Measure>(view: &mut View<'_, S, L>, input
 fn set_layout<S: NodeStyle, L: Measure>(c: &mut Node<S, L>, layout: Layout) {
     if c.layout != layout {
         c.layout = layout;
+        c.moved = true;
+    }
+}
+
+/// Set whether `c` is hidden by its paragraph's clamp or cut, marking it
+/// moved when that changed (its frame node is written again).
+fn set_hidden<S: NodeStyle, L: Measure>(c: &mut Node<S, L>, hidden: bool) {
+    if c.inline_hidden != hidden {
+        c.inline_hidden = hidden;
         c.moved = true;
     }
 }

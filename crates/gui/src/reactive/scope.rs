@@ -47,6 +47,11 @@ impl Scope {
         f()
     }
 
+    /// Its node in the runtime: what owns what it makes.
+    pub(crate) fn id(&self) -> NodeId {
+        self.id
+    }
+
     /// Whether it was not disposed.
     #[must_use]
     pub fn is_alive(&self) -> bool {

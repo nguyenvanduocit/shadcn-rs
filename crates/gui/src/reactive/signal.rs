@@ -223,6 +223,10 @@ impl<T: 'static> Signal<T> {
             if slot.value == value {
                 return;
             }
+            runtime::check_write(self.id.index);
+            if runtime::cold_refuses(self.id) {
+                return;
+            }
             let old = std::mem::replace(&mut slot.value, value);
             if dirty { Some(old) } else { slot.before.replace(old) }
         };
@@ -237,6 +241,10 @@ impl<T: 'static> Signal<T> {
 
     /// Write `value` and run what read the signal, equal or not.
     pub fn replace(&self, value: T) {
+        runtime::check_write(self.id.index);
+        if runtime::cold_refuses(self.id) {
+            return;
+        }
         let (cell, _) = self.slot();
         let old = {
             let mut slot = borrow_mut(&cell, self.created_at);
@@ -252,11 +260,40 @@ impl<T: 'static> Signal<T> {
     /// Store `value` without waking anything: only for a value equal to the
     /// current one (a component's props whose `Callback`s are new).
     pub(crate) fn store_quiet(&self, value: T) {
+        if runtime::cold_refuses(self.id) {
+            return;
+        }
         let (cell, _) = self.slot();
         borrow_mut(&cell, self.created_at).value = value;
     }
 
+    /// The engine passes `value` (a component's props) in a cold frame: the
+    /// frame's own copy of the signal holds it, the live value untouched,
+    /// and what read it is told, as by a write.
+    #[cfg(debug_assertions)]
+    pub(crate) fn store_cold(&self, value: T) {
+        runtime::cold_owns(self.id);
+        runtime::replace_value(
+            self.id,
+            Rc::new(RefCell::new(Slot {
+                value,
+                before: None,
+                forced: true,
+            })),
+        );
+        runtime::with(|rt| {
+            if let Some(n) = rt.live_mut(self.id) {
+                n.check = None;
+            }
+        });
+        self.notify();
+    }
+
     pub fn update(&self, f: impl FnOnce(&mut T)) {
+        runtime::check_write(self.id.index);
+        if runtime::cold_refuses(self.id) {
+            return;
+        }
         let (cell, _) = self.slot();
         let _batch = runtime::BatchGuard::new();
         {
@@ -269,6 +306,10 @@ impl<T: 'static> Signal<T> {
 
     /// Run what read the signal, as if it had changed.
     pub fn trigger(&self) {
+        runtime::check_write(self.id.index);
+        if runtime::cold_refuses(self.id) {
+            return;
+        }
         let (cell, _) = self.slot();
         borrow_mut(&cell, self.created_at).forced = true;
         self.notify();
@@ -277,8 +318,9 @@ impl<T: 'static> Signal<T> {
     /// Take the signal out of the graph now, before its scope ends.
     /// Dispose it if the runtime can be reached now (from a `Drop`, which
     /// may run while the thread ends).
+    /// While the thread unwinds, what leaving runs waits for the next settle.
     pub(crate) fn dispose_quietly(self) {
-        if runtime::try_with(|rt| rt.dispose(self.id)).is_some() {
+        if runtime::try_with(|rt| rt.dispose(self.id)).is_some() && !std::thread::panicking() {
             runtime::settle();
         }
     }

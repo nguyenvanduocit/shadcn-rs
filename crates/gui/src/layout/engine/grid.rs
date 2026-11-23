@@ -258,8 +258,8 @@ fn remember<S: NodeStyle, L: Measure>(view: &mut View<'_, S, L>, c: &Constants, 
 const SPARE: usize = 8;
 const SPARE_ITEMS: usize = 256;
 
-thread_local! {
-    static SCRATCH: RefCell<Vec<Scratch>> = const { RefCell::new(Vec::new()) };
+crate::engine::engine_local! {
+    [Fresh] static SCRATCH: RefCell<Vec<Scratch>> = const { RefCell::new(Vec::new()) };
 }
 
 fn take_scratch() -> Scratch {

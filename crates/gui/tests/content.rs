@@ -39,7 +39,7 @@ fn text_color(frame: &Frame, label: &str) -> Color {
         .nodes
         .iter()
         .find_map(|n| match &n.content {
-            Content::Text { content, text, .. } if content == label => Some(text.color),
+            Content::Text { content, text, .. } if &**content == label => Some(text.color),
             _ => None,
         })
         .unwrap_or_else(|| panic!("no text {label:?}"))
@@ -191,7 +191,7 @@ fn a_provided_content_style_reaches_only_what_it_does_not_set() {
             .nodes
             .iter()
             .find_map(|n| match &n.content {
-                Content::Text { content, text, .. } if content == label => Some(*text),
+                Content::Text { content, text, .. } if &**content == label => Some(text.clone()),
                 _ => None,
             })
             .expect("the text")

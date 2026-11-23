@@ -35,9 +35,12 @@ allow_attributes_without_reason = "deny"
 # clippy keeps in its nursery group, off by default.
 redundant_clone = "deny"
 
-# Line tables keep a panic's backtrace and a profiler's samples readable at a fraction of full debug info's size.
+# No debug info in dev: on macOS any debug info keeps every object file on
+# disk (split-debuginfo=unpacked), tens of GB across the test binaries.
+# Panic messages keep their file:line; only backtrace line numbers go.
 [profile.dev]
-debug = "line-tables-only"
+debug = false
 
+# Line tables keep a profiler's samples readable at a fraction of full debug info's size.
 [profile.release]
 debug = "line-tables-only"

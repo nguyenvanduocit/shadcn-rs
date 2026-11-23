@@ -1,12 +1,15 @@
 use gui::prelude::*;
-use gui::{Div, Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text, text_bound};
+use gui::{Element, Icon, Modifiers, NamedKey, ScenarioError, Signal, div, icon, text, text_bound};
 use shadcn::focus::StateLook;
 use shadcn::{
-    navigation_menu, navigation_menu_content, navigation_menu_item, navigation_menu_link, navigation_menu_list,
-    navigation_menu_trigger, navigation_menu_trigger_style, theme,
+    navigation_menu, navigation_menu_content, navigation_menu_item, navigation_menu_link, navigation_menu_link_as,
+    navigation_menu_list, navigation_menu_trigger, navigation_menu_trigger_style, theme,
 };
 
 use crate::{Render, Shot, demo, motion_frames, page};
+
+/// How long the pointer moves on a trigger before its panel opens.
+const OPEN_DELAY: std::time::Duration = primitives::navigation_menu::OPEN_DELAY;
 
 const COMPONENTS: [(&str, &str); 6] = [
     (
@@ -36,7 +39,7 @@ pub fn render() -> Render {
     let visited = Signal::labeled("visited", String::from("nowhere yet"));
     Box::new(move || {
         let t = theme();
-        let go = |to: &'static str| move || visited.set(to.to_owned());
+        let go = |to: &'static str| move |()| visited.set(to.to_owned());
         // `NavigationMenuItem.vue`, the demo's list item.
         let list_item = |title: &'static str, body: &'static str| {
             navigation_menu_link(false, go(title))
@@ -71,7 +74,7 @@ pub fn render() -> Render {
                 .child(icon(glyph).text_color(t.muted_foreground))
                 .child(label)
         };
-        let stack = |width: f32, links: Vec<Div>| {
+        let stack = |width: f32, links: Vec<Element>| {
             div()
                 .display(Display::Grid)
                 .width(width)
@@ -86,10 +89,12 @@ pub fn render() -> Render {
             .width(pct(100.0))
             .justify_content(Justify::End)
             .radius(8.0)
-            .with_interaction(|d, i| {
-                // Over the link's rest: its hover and focus fill stay over it.
-                d.background(t.muted)
-                    .background_while(move || i.hovered() || i.focused(), t.accent)
+            .map_root(|d| {
+                d.with_interaction(|d, i| {
+                    // Over the link's rest: its hover and focus fill stay over it.
+                    d.background(t.muted)
+                        .background_while(move || i.hovered() || i.focused(), t.accent)
+                })
             })
             .padding(24.0)
             .child(
@@ -134,34 +139,35 @@ pub fn render() -> Render {
         let list = navigation_menu_content().child(stack(
             300.0,
             vec![
-                titled("Components", "Browse all components in the library."),
-                titled("Documentation", "Learn how to use the library."),
-                titled("Blog", "Read our latest blog posts."),
+                titled("Components", "Browse all components in the library.").into_element(),
+                titled("Documentation", "Learn how to use the library.").into_element(),
+                titled("Blog", "Read our latest blog posts.").into_element(),
             ],
         ));
         let simple = navigation_menu_content().child(stack(
             200.0,
-            vec![plain("Components"), plain("Documentation"), plain("Blocks")],
+            vec![
+                plain("Components").into_element(),
+                plain("Documentation").into_element(),
+                plain("Blocks").into_element(),
+            ],
         ));
         let icons = navigation_menu_content().child(stack(
             200.0,
             vec![
-                with_icon(Icon::CircleHelp, "Backlog"),
-                with_icon(Icon::Circle, "To Do"),
-                with_icon(Icon::CircleCheck, "Done"),
+                with_icon(Icon::CircleHelp, "Backlog").into_element(),
+                with_icon(Icon::Circle, "To Do").into_element(),
+                with_icon(Icon::CircleCheck, "Done").into_element(),
             ],
         ));
-        let docs = navigation_menu_trigger_style(false).on_click({
-            let go = go("Docs");
-            move |_| go()
-        });
+        let docs = navigation_menu_link_as(navigation_menu_trigger_style(false), false, go("Docs"));
 
         let entry = |value: &str, label: &str, content| {
             navigation_menu_item(value)
                 .child(navigation_menu_trigger(label))
                 .child(content)
         };
-        let menu = navigation_menu().child(
+        let menu = navigation_menu().viewport(false).child(
             navigation_menu_list()
                 .child(entry("home", "Home", home))
                 .child(entry("components", "Components", components))
@@ -189,7 +195,14 @@ pub fn render() -> Render {
 
 pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.frame("default")?;
-    motion_frames(s, "opening", &[0, 50, 100, 200], |s| s.click_text("Home"))?;
+    // The pointer moving on a trigger opens it after 200 ms, and a click
+    // within 300 ms of that move is ignored (reka's): it opens by the hover.
+    motion_frames(s, "opening", &[0, 50, 100, 200], |s| {
+        let (x, y) = s.locate("Home")?;
+        s.hover(x, y);
+        s.wait(OPEN_DELAY);
+        Ok(())
+    })?;
     motion_frames(s, "closing", &[0, 50, 100, 200], |s| {
         s.press(NamedKey::Escape, Modifiers::default());
         Ok(())
@@ -199,6 +212,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.hover(x, y);
     s.frame("hover docs")?;
     s.click_text("Home")?;
+    s.rest(OPEN_DELAY.saturating_mul(2))?;
     s.frame("home open")?;
     let (x, y) = s.locate("Installation")?;
     s.hover(x, y);
@@ -209,6 +223,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
     s.press(NamedKey::Escape, Modifiers::default());
     s.frame("escape closes")?;
     s.click_text("With Icon")?;
+    s.rest(OPEN_DELAY.saturating_mul(2))?;
     s.frame("with icon")?;
     s.click(900.0, 600.0);
     s.frame("click outside closes")?;

@@ -14,14 +14,17 @@ use std::rc::Rc;
 use gui::Color;
 use gui::prelude::*;
 use gui::{
-    Bind, Div, Element, FocusHandle, Icon, Model, NamedKey, Positioning, Side, SideAlign, TextField, component, div,
-    icon, provide, use_context, use_model,
+    Bind, Div, Element, Icon, Model, Positioning, Side, SideAlign, TextField, component, div, icon, provide,
+    use_context, use_model,
 };
 
 use crate::command::{CommandContext, CommandItem, CommandList, CommandSection, Names, command_input, command_list};
 use gui::style::Origin;
 
-use crate::dropdown_menu::{OpenModel, menu_picks};
+use primitives::combobox::{Combobox, ComboboxConfig};
+use primitives::command::Command;
+use primitives::listbox::{Bound, Options};
+
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
 use crate::select::SelectModel;
@@ -49,7 +52,7 @@ impl<M: SelectModel> Part<ComboboxProps<M>> {
 
     /// Call `f` with each value picked (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(M) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<M>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 
@@ -60,45 +63,47 @@ impl<M: SelectModel> Part<ComboboxProps<M>> {
     }
 }
 
-/// What the parts below a [`combobox`] read; its value seen as values chosen.
+/// The parts of a [`Combobox`] the parts below the root use, whatever it
+/// holds (they do not know the model's type).
+trait Parts {
+    fn is_open(&self) -> bool;
+    fn holds(&self, value: &str) -> bool;
+    fn button(&self, d: Div, open: bool) -> Div;
+    fn popup(&self, d: Div) -> Div;
+}
+
+impl<M: SelectModel> Parts for Combobox<String, M> {
+    fn is_open(&self) -> bool {
+        Combobox::is_open(*self)
+    }
+
+    fn holds(&self, value: &str) -> bool {
+        Combobox::holds(*self, &value.to_owned())
+    }
+
+    fn button(&self, d: Div, open: bool) -> Div {
+        Combobox::button(*self, d, open)
+    }
+
+    fn popup(&self, d: Div) -> Div {
+        Combobox::popup(*self, d)
+    }
+}
+
+/// What the parts below a [`combobox`] read.
 #[derive(Clone)]
 struct ComboboxContext {
-    open: Rc<dyn OpenModel>,
-    /// Whether a value is chosen (tracked).
-    holds: Rc<dyn Fn(&str) -> bool>,
-    /// The first value chosen (untracked).
-    first: Rc<dyn Fn() -> Option<String>>,
-    list: CommandContext,
-    trigger: FocusHandle,
-}
-
-impl ComboboxContext {
-    fn is_open(&self) -> bool {
-        self.open.get()
-    }
-
-    /// Open the list on the chosen item (or the first), focus in its search.
-    fn show(&self) {
-        self.open.set(true);
-        self.list.search.focus.focus();
-        self.list.highlight_and_reveal((self.first)());
-    }
-
-    /// Close the list, clear its search and give focus back to the trigger.
-    fn close(&self, by_keyboard: bool) {
-        close(&*self.open, &self.list, self.trigger, by_keyboard);
-    }
-}
-
-fn close(open: &dyn OpenModel, list: &CommandContext, trigger: FocusHandle, by_keyboard: bool) {
-    open.set(false);
-    list.search.set_text("");
-    gui::focus::set_focus(Some(trigger.id()), by_keyboard);
+    combobox: Rc<dyn Parts>,
+    list: Command,
 }
 
 /// A combobox: the anchor its list opens against. Give it a
 /// [`combobox_trigger`] and a [`combobox_list`]; it holds one value
 /// (`combobox::<Option<String>>()`) or several (`combobox::<Vec<String>>()`).
+///
+/// Its behaviour is `primitives::combobox`'s with the field inside the
+/// list (shadcn's: a button opens a searchable command list); the field is
+/// emptied as the list closes and as an item is picked.
 #[must_use]
 pub fn combobox<M: SelectModel>() -> Part<ComboboxProps<M>> {
     Part::new(
@@ -108,35 +113,46 @@ pub fn combobox<M: SelectModel>() -> Part<ComboboxProps<M>> {
             component(p, |cx| {
                 let props = cx.props();
                 let value = use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.value);
-                let open: Rc<dyn OpenModel> =
-                    Rc::new(use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.open));
-                let trigger = FocusHandle::new();
-                // Picking clears the search itself (`CommandContext::pick`).
-                let picked = {
-                    let open = Rc::clone(&open);
-                    CommandContext::new(TextField::new(""), move |item: &CommandItem| {
-                        let shut = || {
-                            open.set(false);
-                            gui::focus::set_focus(Some(trigger.id()), false);
-                        };
+                let open = use_model(props, |p: &PartProps<ComboboxProps<M>>| &p.props.open);
+                let field = TextField::new("");
+                let combobox: Combobox<String, M> =
+                    Combobox::new(Bound::new(value), Bound::new(open), field, ComboboxConfig::REKA, |_| {
+                        String::new()
+                    });
+                let list = Command::new(
+                    field,
+                    move || combobox.term(),
+                    combobox.list(),
+                    move |item: &CommandItem| !item.null && combobox.holds(&item.value),
+                    move |item: CommandItem| {
                         if item.null {
-                            value.set(M::default());
-                            shut();
+                            combobox.clear_value();
+                            combobox.close(true);
                             return;
                         }
-                        value.update(|m| m.pick(&item.value));
-                        if M::CLOSES_ON_PICK {
-                            shut();
+                        combobox.choose_value(&item.value, true);
+                        if M::MULTIPLE {
+                            combobox.clear_search();
                         }
-                    })
-                };
-                provide(picked.clone());
+                    },
+                )
+                .list_known_as(combobox.linked().content);
+                let on_list: crate::command::OnList =
+                    gui::Callback::new(move |model: primitives::command::CommandList| {
+                        let flat = model.flat;
+                        combobox.set_source(Rc::new(move || {
+                            let rows: Rc<dyn Options<String>> = flat.get().0;
+                            rows
+                        }));
+                    });
+                provide(CommandContext {
+                    cmd: list,
+                    search: field,
+                    on_list: Some(on_list),
+                });
                 provide(ComboboxContext {
-                    open,
-                    holds: Rc::new(move |v: &str| value.with(|m| m.holds(v))),
-                    first: Rc::new(move || value.get_untracked().chosen().into_iter().next()),
-                    list: picked,
-                    trigger,
+                    combobox: Rc::new(combobox),
+                    list,
                 });
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })
@@ -144,8 +160,8 @@ pub fn combobox<M: SelectModel>() -> Part<ComboboxProps<M>> {
     )
 }
 
-/// The trigger (usually an outline button): a click, Enter, Space or
-/// ArrowDown opens the list below it.
+/// The trigger (usually an outline button): a click, Enter, Space,
+/// ArrowDown or ArrowUp opens the list below it, focus in its search.
 #[must_use]
 pub fn combobox_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into().named("combobox-trigger"), |p| {
@@ -157,24 +173,8 @@ pub fn combobox_trigger(trigger: impl Into<Div>) -> Part<()> {
                 let Some(c) = combobox.clone() else {
                     return root.into_element();
                 };
-                let (click, keys) = (c.clone(), c.clone());
-                root.track_focus(c.trigger)
-                    .aria_expanded(c.is_open())
-                    .on_click(move |_| {
-                        if gui::untracked(|| click.is_open()) {
-                            click.close(false);
-                        } else {
-                            click.show();
-                        }
-                    })
-                    .on_key_down(move |ev| {
-                        if gui::untracked(|| keys.is_open()) || !(menu_picks(ev) || ev.is(NamedKey::ArrowDown)) {
-                            return false;
-                        }
-                        keys.show();
-                        true
-                    })
-                    .into_element()
+                let open = c.combobox.is_open();
+                c.combobox.button(root, open).into_element()
             }
         })
     })
@@ -246,20 +246,14 @@ pub fn combobox_list() -> Part<ComboboxListProps> {
                     let Some(c) = combobox.clone() else {
                         return Element::Empty;
                     };
-                    if !c.is_open() {
+                    if !c.combobox.is_open() {
                         return Element::Empty;
                     }
                     let (align, root) = props.with(|p| (p.props.align, p.slot.0.clone()));
-                    let (keys, outside) = (c.clone(), c);
-                    let list = root
-                        .on_click_outside(move || outside.close(false))
-                        .on_key_down(move |ev| {
-                            if ev.is(NamedKey::Escape) {
-                                keys.close(true);
-                                return true;
-                            }
-                            keys.list.key(ev)
-                        });
+                    let list = c.list;
+                    // The combobox's popup: it closes and gives focus back
+                    // as the primitive's layer says.
+                    let list = c.combobox.popup(root).on_key_down(move |ev| list.key(ev));
                     let placement = Positioning::Anchored {
                         side: Side::Bottom,
                         align,
@@ -297,7 +291,7 @@ const COMBOBOX_NAMES: Names = Names {
 /// it. Only the rows in view are built; `.footer(…)` adds sections below the
 /// viewport, always in view.
 pub fn combobox_items(
-    sections: impl Into<Rc<Vec<CommandSection>>>,
+    sections: impl Into<std::sync::Arc<Vec<CommandSection>>>,
     row: impl Fn(&CommandItem, Div) -> Div + 'static,
 ) -> CommandList {
     command_list(sections, row).names(COMBOBOX_NAMES)
@@ -317,7 +311,7 @@ pub fn combobox_item_indicator(value: &str) -> Part<String> {
             let combobox = use_context::<ComboboxContext>();
             move || {
                 let (value, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
-                if !combobox.as_ref().is_some_and(|c| (c.holds)(&value)) {
+                if !combobox.as_ref().is_some_and(|c| c.combobox.holds(&value)) {
                     return Element::Empty;
                 }
                 let t = theme();

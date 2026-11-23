@@ -31,6 +31,17 @@
 //! accessibility tree keeps a scroll offset apart from the boxes under it:
 //! a scroll sends the container alone.
 //!
+//! **Layers** (ADR-0024): a modal layer's region is marked modal, and
+//! while it is open every subtree below it (the page, the layers under it)
+//! is hidden, in the same update that moves focus into it; closing shows
+//! them again in the update that gives focus back. An inert subtree is
+//! left out.
+//!
+//! **Relations** (`labelled_by`, `described_by`, `controls`, `owns`,
+//! `active_descendant`) name their targets by [`NodeRef`], never by a
+//! string id, and are told only towards targets the tree holds: a node
+//! is sent again when one of its targets comes or goes.
+//!
 //! Ids are hashes of node paths, a text run's of its field's id and its
 //! index; debug builds check that no two nodes of a frame share one.
 
@@ -43,15 +54,84 @@ use accesskit::{
     TreeUpdate,
 };
 
-use crate::element::{InputType, Semantics};
+use crate::element::{InputType, Relations, Semantics};
 use crate::focus::FocusId;
 use crate::geometry::{Bounds, NodePath};
-use crate::layout::{Behaviour, Changed, Content, Frame, FrameNode, ReadAt, input_text};
+use crate::layout::{Behaviour, Changed, Content, Frame, FrameNode, ReadAt, Since, input_text};
 use crate::style::ResolvedText;
 use crate::text::{TextRun, TextSystem};
 
 /// The window, the root every layer hangs from.
 const WINDOW: NodeId = NodeId(0);
+
+crate::engine::engine_local! {
+    [Fork] static NEXT_REF: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// A node's name for other nodes' relations to it: made once (a
+/// component's setup), given to the node with `.node_ref`, and to others'
+/// `.labelled_by`, `.controls`… A relation to a node not in the tree is
+/// not told.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct NodeRef(u64);
+
+impl Default for NodeRef {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NodeRef {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(NEXT_REF.with(|n| {
+            let id = n.get();
+            n.set(id.wrapping_add(1));
+            id
+        }))
+    }
+}
+
+/// A node's relations as told: towards the nodes the tree holds.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Told {
+    labelled_by: Vec<NodeId>,
+    described_by: Vec<NodeId>,
+    controls: Vec<NodeId>,
+    owns: Vec<NodeId>,
+    active_descendant: Option<NodeId>,
+}
+
+impl Told {
+    fn of(r: &Relations, refs: &foldhash::HashMap<NodeRef, NodeId>) -> Self {
+        let ids = |v: &[NodeRef]| v.iter().filter_map(|n| refs.get(n).copied()).collect();
+        Self {
+            labelled_by: ids(&r.labelled_by),
+            described_by: ids(&r.described_by),
+            controls: ids(&r.controls),
+            owns: ids(&r.owns),
+            active_descendant: r.active_descendant.and_then(|n| refs.get(&n).copied()),
+        }
+    }
+
+    fn apply(&self, node: &mut Node) {
+        if !self.labelled_by.is_empty() {
+            node.set_labelled_by(self.labelled_by.clone());
+        }
+        if !self.described_by.is_empty() {
+            node.set_described_by(self.described_by.clone());
+        }
+        if !self.controls.is_empty() {
+            node.set_controls(self.controls.clone());
+        }
+        if !self.owns.is_empty() {
+            node.set_owns(self.owns.clone());
+        }
+        if let Some(a) = self.active_descendant {
+            node.set_active_descendant(a);
+        }
+    }
+}
 
 /// The hasher ids are made with: fast and the same in every run.
 fn hasher() -> impl Hasher {
@@ -73,10 +153,23 @@ fn run_id(parent: NodeId, index: usize) -> NodeId {
     NodeId(h.finish().max(1))
 }
 
-/// The node an action from assistive technology names, in `frame`.
+/// The node an action from assistive technology names, in `frame`: none
+/// when the tree leaves it out (it or an ancestor hidden, inert or not
+/// rendered), so an action queued for a node since dropped does nothing.
 #[must_use]
 pub fn target(frame: &Frame, id: NodeId) -> Option<usize> {
-    frame.nodes.iter().position(|n| id_of(&n.path) == id)
+    let i = frame.nodes.iter().position(|n| id_of(&n.path) == id)?;
+    // Shown ([`Frame::shown`]), and out of the tree by none of its
+    // ancestors' semantics.
+    let in_tree = |k: usize| frame.shown(k) && frame.behaviour(k).is_some_and(|b| !b.semantics.hidden);
+    let mut at = Some(i);
+    while let Some(k) = at {
+        if !in_tree(k) {
+            return None;
+        }
+        at = frame.nodes.get(k).and_then(|n| n.parent);
+    }
+    Some(i)
 }
 
 /// The whole tree for `frame`, laid out at `scale` physical pixels per
@@ -97,17 +190,35 @@ pub struct AccessStats {
     pub nodes: usize,
     /// Whether it was the whole tree.
     pub full: bool,
+    /// Text runs compared with those sent before, to send only what changed.
+    pub compared: usize,
+    /// Text runs built: only for a field whose text, box or look changed,
+    /// never for its caret or selection alone.
+    pub runs_built: usize,
     pub took: Duration,
 }
 
-/// What a field's text runs are built from.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// How much of a kept node an update changed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Dirty {
+    /// Nothing of its own (its child list, perhaps).
+    No,
+    /// The node, not a field's runs: its caret or selection moved, or it
+    /// scrolled (its runs are in its content's space).
+    Node,
+    /// A field's text, box or look: its runs are built again.
+    Runs,
+}
+
+/// What a field's text runs are built from (its caret and selection
+/// apart: they move over the runs, which stay).
+#[derive(Clone, Debug, PartialEq)]
 struct Field {
-    caret: usize,
-    anchor: usize,
     area: Bounds,
     text: ResolvedText,
     multiline: bool,
+    /// Being edited: its text is never cut short.
+    focused: bool,
 }
 
 /// Everything a node's AccessKit node is built from (its children aside).
@@ -123,6 +234,8 @@ struct Inputs<'f> {
     value: Option<Cow<'f, str>>,
     placeholder: Option<Cow<'f, str>>,
     field: Option<Field>,
+    /// A field's selection, (anchor, caret), in what it shows.
+    selection: Option<(usize, usize)>,
     read_only: bool,
     focusable: bool,
     clickable: bool,
@@ -131,11 +244,20 @@ struct Inputs<'f> {
     checked: Option<Toggled>,
     selected: Option<bool>,
     expanded: Option<bool>,
+    orientation: Option<crate::style::Axis>,
+    /// Its value in a range, and whether its keys step it.
+    range: Option<Cow<'f, crate::element::ValueRange>>,
     row_count: Option<usize>,
     /// Its index among its list's rows.
     row_index: Option<usize>,
     /// Its place in its set, from 1, and the set's size when known.
     set: Option<(usize, Option<usize>)>,
+    /// It is a modal layer's region (`aria-modal`).
+    modal: bool,
+    /// A root below the top modal layer: hidden with its subtree.
+    hidden: bool,
+    relations: Cow<'f, Relations>,
+    announce: Cow<'f, crate::element::Announce>,
 }
 
 fn owned(c: Option<Cow<'_, str>>) -> Option<Cow<'static, str>> {
@@ -152,6 +274,7 @@ impl Inputs<'_> {
             bounds: self.bounds,
             transform: self.transform,
             field: self.field,
+            selection: self.selection,
             read_only: self.read_only,
             focusable: self.focusable,
             clickable: self.clickable,
@@ -160,9 +283,15 @@ impl Inputs<'_> {
             checked: self.checked,
             selected: self.selected,
             expanded: self.expanded,
+            orientation: self.orientation,
+            range: self.range.map(|r| Cow::Owned(r.into_owned())),
             row_count: self.row_count,
             row_index: self.row_index,
             set: self.set,
+            modal: self.modal,
+            hidden: self.hidden,
+            relations: Cow::Owned(self.relations.into_owned()),
+            announce: Cow::Owned(self.announce.into_owned()),
         }
     }
 }
@@ -174,6 +303,8 @@ struct Kept {
     children: Vec<NodeId>,
     /// A field's text runs.
     runs: Vec<(NodeId, Node)>,
+    /// Its relations as last told.
+    told: Told,
     /// The update that last saw it.
     stamp: u64,
 }
@@ -196,6 +327,10 @@ struct Slot {
     set: Option<(Role, usize)>,
     /// It is inside a scroll container (or is one).
     scrolls: bool,
+    /// It or a node around it is unavailable ([`crate::Div::unavailable`]):
+    /// read as disabled, as Chrome reads what an `aria-disabled` element
+    /// holds, though it keeps its focus and its own actions.
+    unavailable: bool,
     /// Where the space its children's boxes are in starts, in window pixels:
     /// a scroll container's content, moving with it.
     space: (f32, f32),
@@ -204,9 +339,11 @@ struct Slot {
 /// What reading one frame node gave.
 struct Read {
     slot: Option<Slot>,
-    /// Its inputs differ from those last sent (or it is new).
-    dirty: bool,
+    /// How its inputs differ from those last sent (all, when it is new).
+    dirty: Dirty,
     focus: Option<FocusId>,
+    /// Its name for relations.
+    node: Option<NodeRef>,
 }
 
 /// The tree a screen reader holds, kept so each frame reads and sends only
@@ -236,6 +373,16 @@ pub struct Accessibility {
     roots: Vec<u32>,
     /// The node each focus handle is on.
     focus: foldhash::HashMap<FocusId, NodeId>,
+    /// Per frame node, its name for relations, as last read.
+    ref_at: Vec<Option<NodeRef>>,
+    /// The node each [`NodeRef`] names.
+    refs: foldhash::HashMap<NodeRef, NodeId>,
+    /// The nodes that have relations.
+    relating: foldhash::HashSet<NodeId>,
+    /// The layers of the frame last read, and its top modal layer's floor
+    /// then (everything before it is hidden).
+    layers: crate::layer::Stack,
+    floor: usize,
     /// Text runs kept, over every field.
     runs: usize,
     /// Scratch kept across updates.
@@ -273,15 +420,19 @@ impl Accessibility {
         let full = self.window.is_none();
         self.stamp = self.stamp.wrapping_add(1);
         let log = frame.changes.since(&mut self.read);
-        // What to send: frame indices, and whether their inputs changed
-        // (rather than only their child list).
-        let mut emit: Vec<(usize, bool)> = Vec::new();
+        // A modal layer came or went: what is hidden changed everywhere.
+        self.layers.refresh(frame);
+        let refloor = self.layers.floor != self.floor;
+        self.floor = self.layers.floor;
+        // What to send: frame indices, and how their inputs changed (not
+        // at all: only their child list).
+        let mut emit: Vec<(usize, Dirty)> = Vec::new();
         let mut window_moved = false;
         let visited = match log {
-            Some(log) if !full && self.slots.len() == frame.nodes.len() => {
+            Since::Logged(log) if !full && !refloor && self.slots.len() == frame.nodes.len() => {
                 self.patch(frame, log, &mut emit, &mut window_moved)
             }
-            _ => {
+            Since::Logged(_) | Since::Rebuilt | Since::FellBehind => {
                 window_moved = true;
                 self.walk(frame, &mut emit)
             }
@@ -289,23 +440,30 @@ impl Accessibility {
         emit.sort_unstable_by_key(|&(i, _)| i);
         emit.dedup_by(|b, a| {
             if a.0 == b.0 {
-                a.1 |= b.1;
+                a.1 = a.1.max(b.1);
                 true
             } else {
                 false
             }
         });
         let mut nodes = Vec::with_capacity(emit.len());
+        let (mut compared, mut runs_built) = (0_usize, 0_usize);
         for &(i, dirty) in &emit {
             let Some(slot) = self.slots.get(i).copied().flatten() else {
                 continue;
             };
             let Some(k) = self.kept.get_mut(&slot.id) else { continue };
-            if dirty && let Some(field) = k.inputs.field {
+            // A caret moved or a field scrolled keeps the runs sent.
+            let dirty = dirty == Dirty::Runs;
+            if dirty && let Some(field) = &k.inputs.field {
                 let value = k.inputs.value.as_deref().unwrap_or("");
-                let runs = run_nodes(slot.id, value, &field, text);
-                for (rid, run) in &runs {
-                    if !k.runs.iter().any(|(kid, kn)| kid == rid && kn == run) {
+                let runs = run_nodes(slot.id, value, field, text);
+                runs_built = runs_built.saturating_add(runs.len());
+                // A run's id is its index ([`run_id`]): each compared with
+                // the one sent at its index alone.
+                for (i, (rid, run)) in runs.iter().enumerate() {
+                    compared = compared.saturating_add(1);
+                    if k.runs.get(i).is_none_or(|(kid, kn)| kid != rid || kn != run) {
                         nodes.push((*rid, run.clone()));
                     }
                 }
@@ -315,16 +473,23 @@ impl Accessibility {
                 self.runs = self.runs.saturating_sub(k.runs.len());
                 k.runs.clear();
             }
-            let mut node = node_of(&k.inputs);
-            if let Some(field) = k.inputs.field
-                && let Some(sel) = selection_of(&k.runs, &field)
-            {
-                node.set_text_selection(sel);
+            k.told = Told::of(&k.inputs.relations, &self.refs);
+            nodes.push((slot.id, build(k)));
+        }
+        // A node whose relation's target came or went is told again.
+        if !self.relating.is_empty() {
+            let relating: Vec<NodeId> = self.relating.iter().copied().collect();
+            for id in relating {
+                let Some(k) = self.kept.get_mut(&id).filter(|k| !k.inputs.relations.is_empty()) else {
+                    self.relating.remove(&id);
+                    continue;
+                };
+                let told = Told::of(&k.inputs.relations, &self.refs);
+                if told != k.told && !nodes.iter().any(|(n, _)| *n == id) {
+                    k.told = told;
+                    nodes.push((id, build(k)));
+                }
             }
-            let mut all = k.children.clone();
-            all.extend(k.runs.iter().map(|(rid, _)| *rid));
-            node.set_children(all);
-            nodes.push((slot.id, node));
         }
 
         let children = if window_moved {
@@ -367,6 +532,8 @@ impl Accessibility {
             visited,
             nodes: self.kept.len().saturating_add(1).saturating_add(self.runs),
             full,
+            compared,
+            runs_built,
             took: started.elapsed(),
         };
         TreeUpdate {
@@ -378,12 +545,14 @@ impl Accessibility {
     }
 
     /// Read every node of `frame`; how many were read.
-    fn walk(&mut self, frame: &Frame, emit: &mut Vec<(usize, bool)>) -> usize {
+    fn walk(&mut self, frame: &Frame, emit: &mut Vec<(usize, Dirty)>) -> usize {
         let stamp = self.stamp;
         let count = frame.nodes.len();
         self.slots.clear();
         self.focus_at.clear();
         self.focus.clear();
+        self.ref_at.clear();
+        self.refs.clear();
         self.roots.clear();
         if self.kids.len() < count {
             self.kids.resize_with(count, Vec::new);
@@ -405,11 +574,15 @@ impl Accessibility {
                 if let Some(f) = r.focus {
                     self.focus.insert(f, slot.id);
                 }
-                if r.dirty {
-                    emit.push((i, true));
+                if let Some(n) = r.node {
+                    self.refs.insert(n, slot.id);
+                }
+                if r.dirty != Dirty::No {
+                    emit.push((i, r.dirty));
                 }
             }
             self.focus_at.push(r.focus.filter(|_| r.slot.is_some()));
+            self.ref_at.push(r.node.filter(|_| r.slot.is_some()));
             self.slots.push(r.slot);
         }
         if seen != self.kept.len() {
@@ -427,7 +600,7 @@ impl Accessibility {
         }
         for i in 0..count {
             if self.relist(i) {
-                emit.push((i, false));
+                emit.push((i, Dirty::No));
             }
         }
         count
@@ -435,7 +608,7 @@ impl Accessibility {
 
     /// Read the nodes `log` names (and what depends on them) again; how
     /// many were read.
-    fn patch(&mut self, frame: &Frame, log: &[Changed], emit: &mut Vec<(usize, bool)>, window: &mut bool) -> usize {
+    fn patch(&mut self, frame: &Frame, log: &[Changed], emit: &mut Vec<(usize, Dirty)>, window: &mut bool) -> usize {
         let stamp = self.stamp;
         let count = frame.nodes.len();
         self.seen.resize(count, 0);
@@ -493,6 +666,19 @@ impl Accessibility {
                 if let Some(at) = self.focus_at.get_mut(j) {
                     *at = now;
                 }
+                let was_ref = self.ref_at.get(j).copied().flatten();
+                if let (Some(n), Some(o)) = (was_ref, old)
+                    && self.refs.get(&n) == Some(&o.id)
+                {
+                    self.refs.remove(&n);
+                }
+                let now_ref = r.node.filter(|_| r.slot.is_some());
+                if let (Some(n), Some(slot)) = (now_ref, r.slot) {
+                    self.refs.insert(n, slot.id);
+                }
+                if let Some(at) = self.ref_at.get_mut(j) {
+                    *at = now_ref;
+                }
                 let parent = frame.nodes.get(j).and_then(|n| n.parent);
                 match (old, r.slot) {
                     (Some(o), None) => {
@@ -505,14 +691,14 @@ impl Accessibility {
                         }
                     }
                     (None, Some(_)) => {
-                        emit.push((j, true));
+                        emit.push((j, Dirty::Runs));
                         relist.push(j);
                         match parent {
                             Some(p) => relist.push(p),
                             None => *window = true,
                         }
                     }
-                    (Some(_), Some(_)) if r.dirty => emit.push((j, true)),
+                    (Some(_), Some(_)) if r.dirty != Dirty::No => emit.push((j, r.dirty)),
                     _ => {}
                 }
                 if let Some(s) = self.slots.get_mut(j) {
@@ -530,7 +716,7 @@ impl Accessibility {
         relist.dedup();
         for p in relist {
             if self.relist(p) {
-                emit.push((p, false));
+                emit.push((p, Dirty::No));
             }
         }
         visited
@@ -540,8 +726,9 @@ impl Accessibility {
     fn read(&mut self, frame: &Frame, i: usize, stamp: u64) -> Read {
         const NONE: Read = Read {
             slot: None,
-            dirty: false,
+            dirty: Dirty::No,
             focus: None,
+            node: None,
         };
         let Some(n) = frame.nodes.get(i) else { return NONE };
         let parent = match n.parent {
@@ -551,11 +738,12 @@ impl Accessibility {
             },
             None => None,
         };
-        let Some(b) = frame.behaviour(i).filter(|b| !n.look.invisible && !b.semantics.hidden) else {
+        let Some(b) = frame.behaviour(i).filter(|b| frame.shown(i) && !b.semantics.hidden) else {
             return NONE;
         };
         let set = parent.and_then(|s| s.set);
         let scrolls = parent.is_some_and(|s| s.scrolls);
+        let unavailable = b.semantics.unavailable || parent.is_some_and(|s| s.unavailable);
         let outer = parent.map_or((0.0, 0.0), |s| s.space);
         let space = n.scroll.map_or(outer, |sc| {
             let rtl = n.look.text.direction == crate::style::Direction::Rtl;
@@ -566,10 +754,14 @@ impl Accessibility {
             };
             (x, n.bounds.y - sc.offset.1)
         });
-        let Some(inputs) = inputs_of(frame, i, b, set, scrolls, outer, space) else {
+        let hidden = n.parent.is_none() && i < self.floor;
+        let Some(mut inputs) = inputs_of(frame, i, b, set, scrolls, unavailable, outer, space, hidden) else {
             return NONE;
         };
         let id = id_of(&n.path);
+        if !inputs.relations.is_empty() {
+            self.relating.insert(id);
+        }
         let dirty = match self.kept.get_mut(&id) {
             Some(k) => {
                 debug_assert!(
@@ -578,11 +770,21 @@ impl Accessibility {
                     n.path
                 );
                 k.stamp = stamp;
+                // Compared with the selection kept: a caret moved alone
+                // moves over the runs kept, and its text is not taken again.
+                let selection = std::mem::replace(&mut inputs.selection, k.inputs.selection);
                 if k.inputs == inputs {
-                    false
+                    if k.inputs.selection == selection {
+                        Dirty::No
+                    } else {
+                        k.inputs.selection = selection;
+                        Dirty::Node
+                    }
                 } else {
+                    let runs = k.inputs.field != inputs.field || k.inputs.value != inputs.value;
+                    inputs.selection = selection;
                     k.inputs = inputs.into_owned();
-                    true
+                    if runs { Dirty::Runs } else { Dirty::Node }
                 }
             }
             None => {
@@ -592,10 +794,11 @@ impl Accessibility {
                         inputs: inputs.into_owned(),
                         children: Vec::new(),
                         runs: Vec::new(),
+                        told: Told::default(),
                         stamp,
                     },
                 );
-                true
+                Dirty::Runs
             }
         };
         let s = &b.semantics;
@@ -605,10 +808,12 @@ impl Accessibility {
                 id,
                 set: s.row_count.map(|rows| (role, rows)).or(set),
                 scrolls: scrolls || n.scroll.is_some(),
+                unavailable,
                 space,
             }),
             dirty,
             focus: b.focus.map(|h| h.id()),
+            node: s.node,
         }
     }
 
@@ -668,20 +873,26 @@ impl Accessibility {
         if self.focus != other.focus {
             return Some("the focus map".to_owned());
         }
+        if self.refs != other.refs {
+            return Some("the node refs".to_owned());
+        }
         None
     }
 }
 
 /// What node `i` is built from; `None` leaves it out (an icon or a drawing
 /// with no name says nothing).
+#[expect(clippy::too_many_arguments, reason = "a node and what it is read under")]
 fn inputs_of<'f>(
     frame: &'f Frame,
     i: usize,
     b: &'f Behaviour,
     set: Option<(Role, usize)>,
     scrolls: bool,
+    unavailable: bool,
     outer: (f32, f32),
     space: (f32, f32),
+    hidden: bool,
 ) -> Option<Inputs<'f>> {
     let n = frame.nodes.get(i)?;
     let s = &b.semantics;
@@ -703,20 +914,29 @@ fn inputs_of<'f>(
         value: None,
         placeholder: None,
         field: None,
+        selection: None,
         read_only: false,
         focusable: b.focus.is_some(),
-        clickable: b.handlers.click.is_some(),
+        clickable: b.handlers.click.is_some() && b.takes_clicks(),
         scrolls_into_view: scrolls,
-        disabled: b.disabled,
+        // Disabled is inherited in the frame already; unavailable is read
+        // down from the slot around it.
+        disabled: b.disabled || unavailable,
         checked: s.checked,
         selected: s.selected,
         expanded: s.expanded,
+        orientation: s.orientation,
+        range: s.range.as_ref().map(Cow::Borrowed),
         row_count: s.row_count,
         row_index: s.row_index,
         set: s
             .set
             .map(|(at, of)| (at, Some(of)))
             .or_else(|| s.row_index.map(|r| (r.saturating_add(1), set.map(|(_, rows)| rows)))),
+        modal: b.handlers.layer.as_ref().is_some_and(|l| l.is_modal()),
+        hidden,
+        relations: Cow::Borrowed(&s.relations),
+        announce: Cow::Borrowed(&s.announce),
     };
     match &n.content {
         // Its atomic inlines are nodes of their own: their places are not read.
@@ -727,17 +947,22 @@ fn inputs_of<'f>(
             mode,
             text,
             multiline,
+            focused,
             ..
         } => {
-            inputs.value = Some(Cow::Borrowed(edit.text.as_str()));
+            inputs.value = Some(Cow::Borrowed(&*edit.text));
             inputs.placeholder = (!placeholder.is_empty()).then_some(Cow::Borrowed(placeholder.as_str()));
             inputs.read_only = mode.read_only;
+            inputs.selection = Some((edit.anchor, edit.caret));
+            // Its runs are in its content's space as laid out unscrolled:
+            // the node's transform carries its scroll, so a scroll alone
+            // moves the node and none of its runs.
+            let unscrolled = n.scroll.map_or(space, |_| (n.bounds.x, n.bounds.y));
             inputs.field = Some(Field {
-                caret: edit.caret,
-                anchor: edit.anchor,
-                area: local(n.content_box, space),
-                text: *text,
+                area: local(n.content_box, unscrolled),
+                text: text.clone(),
                 multiline: *multiline,
+                focused: *focused,
             });
         }
         _ => {}
@@ -745,9 +970,31 @@ fn inputs_of<'f>(
     Some(inputs)
 }
 
+/// The AccessKit node kept as `k`: its inputs, its text selection, its
+/// children and text runs, its relations as told.
+fn build(k: &Kept) -> Node {
+    let mut node = node_of(&k.inputs);
+    if let Some(selection) = k.inputs.selection
+        && let Some(sel) = selection_of(&k.runs, selection)
+    {
+        node.set_text_selection(sel);
+    }
+    let mut all = k.children.clone();
+    all.extend(k.runs.iter().map(|(rid, _)| *rid));
+    node.set_children(all);
+    k.told.apply(&mut node);
+    node
+}
+
 /// The AccessKit node `inputs` describe, children aside.
 fn node_of(inputs: &Inputs<'_>) -> Node {
     let mut node = Node::new(inputs.role);
+    if inputs.modal {
+        node.set_modal();
+    }
+    if inputs.hidden {
+        node.set_hidden();
+    }
     node.set_bounds(rect(inputs.bounds));
     if let Some((x, y)) = inputs.transform {
         node.set_transform(Affine::translate((f64::from(x), f64::from(y))));
@@ -790,6 +1037,31 @@ fn node_of(inputs: &Inputs<'_>) -> Node {
     if let Some(expanded) = inputs.expanded {
         node.set_expanded(expanded);
     }
+    if let Some(o) = inputs.orientation {
+        node.set_orientation(match o {
+            crate::style::Axis::Horizontal => accesskit::Orientation::Horizontal,
+            crate::style::Axis::Vertical => accesskit::Orientation::Vertical,
+        });
+    }
+    if let Some(range) = &inputs.range {
+        if let Some(now) = range.now {
+            node.set_numeric_value(now);
+        }
+        // An end that is not finite is no end: it is left out (no `aria-valuemin`).
+        if range.min.is_finite() {
+            node.set_min_numeric_value(range.min);
+        }
+        if range.max.is_finite() {
+            node.set_max_numeric_value(range.max);
+        }
+        if let Some(text) = &range.text {
+            node.set_value(text.as_str());
+        }
+        if inputs.focusable {
+            node.add_action(Action::Increment);
+            node.add_action(Action::Decrement);
+        }
+    }
     if let Some(rows) = inputs.row_count {
         node.set_row_count(rows);
     }
@@ -802,12 +1074,60 @@ fn node_of(inputs: &Inputs<'_>) -> Node {
             node.set_size_of_set(of);
         }
     }
+    let a = &*inputs.announce;
+    if let Some(level) = a.level {
+        // AccessKit counts levels from 0, ARIA from 1.
+        node.set_level(level.saturating_sub(1));
+    }
+    if let Some(current) = a.current {
+        node.set_aria_current(current);
+    }
+    if let Some(d) = &a.role_description {
+        node.set_role_description(d.as_str());
+    }
+    if let Some(d) = &a.description {
+        node.set_description(d.as_str());
+    }
+    if let Some(v) = &a.value {
+        node.set_value(v.as_str());
+    }
+    if let Some(live) = a.live {
+        node.set_live(live);
+    }
+    if a.multiselectable {
+        node.set_multiselectable();
+    }
+    if a.required {
+        node.set_required();
+    }
+    if a.invalid {
+        node.set_invalid(accesskit::Invalid::True);
+    }
+    if a.read_only {
+        node.set_read_only();
+    }
+    if let Some(popup) = a.has_popup {
+        node.set_has_popup(popup);
+    }
+    if let Some(complete) = a.auto_complete {
+        node.set_auto_complete(complete);
+    }
     node
 }
 
 /// A field's text runs as laid out where it paints them, in the space its area is in.
 fn field_runs(value: &str, field: &Field, text: &mut TextSystem) -> Vec<TextRun> {
-    let it = input_text(text, value, &field.text, field.area, field.multiline, field.caret);
+    // In the field's content space: its node's transform scrolls it, as
+    // a scroll container's moves its children.
+    let it = input_text(
+        text,
+        value,
+        &field.text,
+        field.area,
+        field.multiline,
+        field.focused,
+        (0.0, 0.0),
+    );
     let mut runs = text.text_runs(value, &it.t, it.width);
     for r in &mut runs {
         r.bounds.x += it.origin.0;
@@ -818,11 +1138,19 @@ fn field_runs(value: &str, field: &Field, text: &mut TextSystem) -> Vec<TextRun>
 
 /// The `TextRun` nodes of the field `parent` showing `value`.
 fn run_nodes(parent: NodeId, value: &str, field: &Field, text: &mut TextSystem) -> Vec<(NodeId, Node)> {
-    field_runs(value, field, text)
-        .into_iter()
+    let runs = field_runs(value, field, text);
+    // Runs on one visual line are linked on it.
+    let lines: Vec<usize> = runs.iter().map(|r| r.line).collect();
+    runs.into_iter()
         .enumerate()
         .map(|(i, r)| {
             let mut node = Node::new(Role::TextRun);
+            if let Some(before) = i.checked_sub(1).filter(|&b| lines.get(b) == Some(&r.line)) {
+                node.set_previous_on_line(run_id(parent, before));
+            }
+            if let Some(after) = i.checked_add(1).filter(|&a| lines.get(a) == Some(&r.line)) {
+                node.set_next_on_line(run_id(parent, after));
+            }
             node.set_bounds(rect(r.bounds));
             node.set_value(value.get(r.range.clone()).unwrap_or(""));
             node.set_text_direction(if r.rtl {
@@ -867,11 +1195,11 @@ fn position_of(runs: &[(NodeId, Node)], at: usize) -> Option<TextPosition> {
     None
 }
 
-/// A field's selection over its runs.
-fn selection_of(runs: &[(NodeId, Node)], field: &Field) -> Option<TextSelection> {
+/// A field's selection, (anchor, caret), over its runs.
+fn selection_of(runs: &[(NodeId, Node)], (anchor, caret): (usize, usize)) -> Option<TextSelection> {
     Some(TextSelection {
-        anchor: position_of(runs, field.anchor)?,
-        focus: position_of(runs, field.caret)?,
+        anchor: position_of(runs, anchor)?,
+        focus: position_of(runs, caret)?,
     })
 }
 
@@ -888,17 +1216,17 @@ pub(crate) fn selection_in(
         edit,
         text: t,
         multiline,
+        focused,
         ..
     } = &n.content
     else {
         return None;
     };
     let field = Field {
-        caret: edit.caret,
-        anchor: edit.anchor,
         area: n.content_box,
-        text: *t,
+        text: t.clone(),
         multiline: *multiline,
+        focused: *focused,
     };
     let parent = id_of(&n.path);
     let runs = field_runs(&edit.text, &field, text);

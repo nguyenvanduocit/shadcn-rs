@@ -2,12 +2,15 @@
 //!
 //! As reka's `Toggle` it keeps its own value (`default_pressed`), is bound
 //! to the caller's (`model`, `v-model`), or shows one the caller keeps
-//! (`pressed`, `:model-value`); `on_change` hears each click.
+//! (`pressed`, `:model-value`); `on_change` hears each click. Its behaviour
+//! (a button with `aria-pressed`, flipped by a click, Space or Enter, never
+//! while disabled) is `primitives::toggle`'s; this module draws it.
 
 use gui::Color;
 use gui::Properties;
 use gui::prelude::*;
 use gui::{Bind, Div, Element, Model, Slot, component, div, use_model};
+use primitives::{Availability, toggle as part};
 
 use crate::focus::StateLook;
 use crate::theme::theme;
@@ -76,7 +79,7 @@ impl Toggle {
 
     /// Call `f` with the value each click turns it to (`@update:model-value`).
     #[must_use]
-    pub fn on_change(mut self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_change(mut self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.pressed = self.pressed.on_change(f);
         self
     }
@@ -94,11 +97,14 @@ impl Toggle {
     }
 
     fn render(&self, on: bool, set: impl Fn(bool) + 'static) -> Element {
-        toggle_variants(self.variant, self.size, on)
-            .disabled(self.disabled)
-            .on_click(move |_| set(!on))
-            .children(self.children.0.iter().cloned())
-            .into_element()
+        part::root(
+            toggle_variants(self.variant, self.size, on),
+            on,
+            Availability::from_disabled(self.disabled),
+            set,
+        )
+        .children(self.children.0.iter().cloned())
+        .into_element()
     }
 }
 
@@ -123,7 +129,8 @@ impl IntoElement for Toggle {
 }
 
 /// `toggleVariants`: the look of a toggle that is `on` or not, without its
-/// behaviour; a toggle group's items share it.
+/// behaviour (`primitives::toggle::root` adds it); a toggle group's items
+/// share it.
 #[must_use]
 pub fn toggle_variants(variant: ToggleVariant, size: ToggleSize, on: bool) -> Div {
     let t = theme();
@@ -131,8 +138,6 @@ pub fn toggle_variants(variant: ToggleVariant, size: ToggleSize, on: bool) -> Di
     let d = div()
         .named("toggle")
         .interaction(i)
-        .role(gui::Role::Button)
-        .aria_checked(on)
         .transition(Properties::COLOR | Properties::SHADOW)
         .display(Display::Flex)
         .inline(true)
@@ -145,7 +150,6 @@ pub fn toggle_variants(variant: ToggleVariant, size: ToggleSize, on: bool) -> Di
         .font_weight(500)
         .nowrap(true)
         .border_color(t.border)
-        .focusable()
         .dim_disabled(i, 0.5);
     let d = match variant {
         ToggleVariant::Default => d,

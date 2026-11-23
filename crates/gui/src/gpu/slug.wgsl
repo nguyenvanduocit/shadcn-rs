@@ -64,6 +64,8 @@ struct SlugVarying {
     @builtin(position) position: vec4<f32>,
     @location(0) em: vec2<f32>,
     @location(1) @interpolate(flat) id: u32,
+    // Its two clips, each 0 when the glyph's quad lies wholly inside its chain.
+    @location(2) @interpolate(flat) clips_of: vec2<u32>,
 }
 
 fn sf(id: u32, i: u32) -> vec4<f32> {
@@ -86,6 +88,19 @@ fn vs_slug(@builtin(vertex_index) vertex: u32, @builtin(instance_index) id: u32)
     let window = vec2<f32>(m.x * em.x + m.z * em.y + t.x, m.y * em.x + m.w * em.y + t.y);
     let at = window - globals.origin;
     var out: SlugVarying;
+    let lo = ext.xy - vec2<f32>(grow);
+    let hi = ext.zw + vec2<f32>(grow);
+    let to_window = mat2x2<f32>(m.xy, m.zw);
+    let a = to_window * lo + t.xy;
+    let b = to_window * vec2<f32>(hi.x, lo.y) + t.xy;
+    let c = to_window * vec2<f32>(lo.x, hi.y) + t.xy;
+    let d = to_window * hi + t.xy;
+    let clip = sf(id, 4u);
+    out.clips_of = vec2<u32>(slug_clip_needed(bitcast<u32>(clip.x), a, b, c, d), slug_clip_needed(bitcast<u32>(clip.y), a, b, c, d));
+    // Never skipped (`path::ClipSkip`, tests).
+    if (bitcast<u32>(clip.z) == 2u) {
+        out.clips_of = bitcast<vec2<u32>>(clip.xy);
+    }
     out.position = vec4<f32>(at / globals.size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
     out.em = em;
     out.id = id;
@@ -274,12 +289,32 @@ fn slug(rc: vec2<f32>, ppe: vec2<f32>, loc: i32, full: bool, ppem: f32) -> f32 {
     return c;
 }
 
+// Clip entry `id` and the rest of its chain, their coverages multiplied.
 fn slug_clip(id: u32, p: vec2<f32>) -> f32 {
-    if (id == 0u) {
-        return 1.0;
+    var cov = 1.0;
+    var e = id;
+    let n = arrayLength(&clips) / PCLIP;
+    for (var d = 0u; d < n && e != 0u; d = d + 1u) {
+        let at = e * PCLIP;
+        cov = cov * clip_entry_cov(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], p);
+        e = bitcast<u32>(clips[at + 4u].x);
     }
-    let at = id * 4u;
-    return clip_entry_cov(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], p);
+    return cov;
+}
+
+// `id`, or 0 when the quad of corners `a`…`d` lies wholly inside each
+// clip of its chain (as a quad's is dropped, `shaders.wgsl`).
+fn slug_clip_needed(id: u32, a: vec2<f32>, b: vec2<f32>, c: vec2<f32>, d: vec2<f32>) -> u32 {
+    var e = id;
+    let n = arrayLength(&clips) / PCLIP;
+    for (var k = 0u; k < n && e != 0u; k = k + 1u) {
+        let at = e * PCLIP;
+        if (!entry_holds(clips[at], clips[at + 1u], clips[at + 2u], clips[at + 3u], a, b, c, d)) {
+            return id;
+        }
+        e = bitcast<u32>(clips[at + 4u].x);
+    }
+    return 0u;
 }
 
 struct SlugShaded {
@@ -290,8 +325,13 @@ struct SlugShaded {
 fn shade_slug(input: SlugVarying, full: bool) -> SlugShaded {
     let id = input.id;
     let t = sf(id, 2u);
-    let color = sf(id, 3u);
-    let clip = sf(id, 4u);
+    var color = sf(id, 3u);
+    // Marked where a clip's test was skipped (`path::ClipSkip`, tests).
+    let clip = bitcast<vec4<u32>>(sf(id, 4u));
+    let skipped = (clip.x != 0u && input.clips_of.x == 0u) || (clip.y != 0u && input.clips_of.y == 0u);
+    if (clip.z == 1u && skipped) {
+        color = vec4<f32>(0.0, 1.0, 0.0, 1.0);
+    }
     // Device pixels per curve pixel along each axis, at this fragment.
     let ppe = 1.0 / max(fwidth(input.em), vec2<f32>(1e-9));
     let ppem = min(ppe.x, ppe.y) * CURVE_EM;
@@ -300,7 +340,7 @@ fn shade_slug(input: SlugVarying, full: bool) -> SlugShaded {
     // Through the gamma table, as the atlas's glyphs are.
     cov = textureLoad(gamma_table, vec2<i32>(i32(round(saturate(cov) * 255.0)), i32(t.w)), 0).r;
     let window = input.position.xy + globals.origin;
-    cov *= slug_clip(bitcast<u32>(clip.x), window) * slug_clip(bitcast<u32>(clip.y), window);
+    cov *= slug_clip(input.clips_of.x, window) * slug_clip(input.clips_of.y, window);
     let out = premul(color) * cov;
     return SlugShaded(out, vec4<f32>(out.a));
 }

@@ -104,7 +104,8 @@ pub type Job<'a, S, L> = dyn Fn(&mut Node<S, L>, &mut <L as Measure>::Cx) -> Sta
 /// the pool (a batch inside a subtree a batch laid out), the groups run
 /// here in order with that job's context, `cx`: the pool is busy with the
 /// outer batch, and a nested job stolen by a thread whose context its own
-/// job holds would need a context made for it.
+/// job holds would need a context made for it. In a cold frame too, they
+/// run here.
 pub fn parallel<S: NodeStyle + Send, L: Measure>(
     groups: &mut [Vec<&mut Node<S, L>>],
     cx: &mut L::Cx,
@@ -112,13 +113,22 @@ pub fn parallel<S: NodeStyle + Send, L: Measure>(
 ) -> Stats {
     use rayon::prelude::*;
     let pool = pool();
-    if pool.current_thread_index().is_some() {
+    // A cold frame lays out on its own thread only: the pool threads'
+    // text systems are live caches no cold frame enters.
+    #[cfg(debug_assertions)]
+    let here = pool.current_thread_index().is_some() || crate::engine::is_cold();
+    #[cfg(not(debug_assertions))]
+    let here = pool.current_thread_index().is_some();
+    if here {
         let mut stats = Stats::default();
         for job in groups.iter_mut().flatten() {
             stats.add(run(job, cx));
         }
         return stats;
     }
+    DISPATCHED.with(|d| d.set(true));
+    #[cfg(test)]
+    HANDED.with(|h| h.set(h.get().saturating_add(1)));
     pool.install(|| {
         groups
             .par_iter_mut()
@@ -216,11 +226,12 @@ pub trait Measure: Send {
     }
 
     /// Where each of `boxes` (as [`Measure::measure_inline`] has them) has
-    /// its margin box's top-left corner in a content box `width` wide, one
-    /// to a box; the content box's corner for each by default.
-    fn place_inline(&self, cx: &mut Self::Cx, width: f32, boxes: &[InlineBox]) -> Vec<taffy::Point<f32>> {
+    /// its margin box's top-left corner in a content box `width` wide, and
+    /// whether it shows (a line clamp or a cut can hide it), one to a box;
+    /// the content box's corner for each, shown, by default.
+    fn place_inline(&self, cx: &mut Self::Cx, width: f32, boxes: &[InlineBox]) -> Vec<(taffy::Point<f32>, bool)> {
         let _ = (cx, width);
-        vec![taffy::Point::ZERO; boxes.len()]
+        vec![(taffy::Point::ZERO, true); boxes.len()]
     }
 }
 
@@ -271,6 +282,32 @@ impl Schedule {
             reverse: false,
         }
     }
+}
+
+crate::engine::engine_local! {
+    /// This thread handed jobs to the pool since it last asked
+    /// ([`take_dispatched`]).
+    [Fork] static DISPATCHED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+crate::engine::engine_local! {
+    /// The batches this thread handed the pool, cold frames' too (tests).
+    #[cfg(test)]
+    [Shared("a test's count of what reached the pool threads, which no cold frame enters")]
+    static HANDED: std::cell::Cell<u64> = std::cell::Cell::new(0);
+}
+
+/// The batches this thread handed the pool so far (tests).
+#[cfg(test)]
+pub(crate) fn handed() -> u64 {
+    HANDED.get()
+}
+
+/// Whether this thread handed jobs to the pool since it last asked: a
+/// layout pass that did not leaves the pool to whoever did (another
+/// thread's tree, which the pool is shared with).
+pub(crate) fn take_dispatched() -> bool {
+    DISPATCHED.with(std::cell::Cell::take)
 }
 
 /// The layout pool: ¾ of the logical cores, at most 8 (as Ladybird's
@@ -363,6 +400,9 @@ pub struct Node<S: NodeStyle, L> {
     count: u32,
     /// Its layout changed since [`Node::take_moved`].
     moved: bool,
+    /// An atomic inline its paragraph's line clamp or cut hides
+    /// ([`Node::inline_hidden`]).
+    inline_hidden: bool,
     /// Its current run of its own algorithm for a final layout.
     run: u64,
     /// The parent's run that last gave it its final layout.
@@ -409,9 +449,9 @@ static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1)
 /// How many names a thread takes at once.
 const RUN_BLOCK: u64 = 1 << 16;
 
-thread_local! {
+crate::engine::engine_local! {
     /// This thread's next name and the end of its block.
-    static NEXT_RUN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+    [Fork] static NEXT_RUN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// A name no other run has had.
@@ -457,6 +497,7 @@ impl<S: NodeStyle, L: Measure> Node<S, L> {
             root_space: None,
             stack: None,
             grid: grid::Memo::default(),
+            inline_hidden: false,
             inline: Vec::new(),
             reads_available_height: true,
             width_reads_height: true,
@@ -543,6 +584,13 @@ impl<S: NodeStyle, L: Measure> Node<S, L> {
     #[must_use]
     pub fn rounded(&self) -> &Layout {
         &self.rounded
+    }
+
+    /// An atomic inline on a line its paragraph's clamp hides, or past the
+    /// text its cut keeps: neither it nor its subtree paints or is hit.
+    #[must_use]
+    pub fn inline_hidden(&self) -> bool {
+        self.inline_hidden
     }
 
     /// Whether its layout changed since the last call.

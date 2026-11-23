@@ -53,13 +53,13 @@ fn change_color(change: &Change) -> u32 {
         Change::Removed { .. } => REMOVED,
         Change::Updated { .. } if change.resized() => RESIZED,
         Change::Updated { .. } if change.moved() => MOVED,
-        Change::Updated { .. } => REPAINTED,
+        Change::Updated { .. } | Change::Reordered { .. } => REPAINTED,
     }
 }
 
 fn changed_bounds(change: &Change) -> Bounds {
     match change {
-        Change::Added { after } | Change::Updated { after, .. } => *after,
+        Change::Added { after } | Change::Updated { after, .. } | Change::Reordered { at: after } => *after,
         Change::Removed { before } => *before,
     }
 }

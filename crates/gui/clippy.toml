@@ -1,0 +1,13 @@
+# The workspace's settings (clippy reads the nearest clippy.toml, this one for gui).
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+
+# Per-thread engine state is declared with `engine_local!`, which gives each
+# piece the policy a cold frame applies to it (crate::engine); a raw
+# `thread_local!` would be shared with the cold frame unseen. engine.rs,
+# the registry itself, is the one exception (allowed there by attribute).
+disallowed-macros = [
+    { path = "std::thread_local", reason = "declare per-thread engine state with crate::engine::engine_local!, which gives it a cold policy" },
+]

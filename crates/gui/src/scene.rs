@@ -99,7 +99,14 @@ impl Scene {
 
     /// A clip node; its id.
     pub fn add_clip(&mut self, clip: Clip, transform: u32) -> u32 {
-        push_id(&mut self.properties.clips, ClipNode { clip, transform })
+        push_id(
+            &mut self.properties.clips,
+            ClipNode {
+                clip,
+                transform,
+                parent: 0,
+            },
+        )
     }
 
     /// An effect node; its id.
@@ -141,21 +148,35 @@ pub struct Chunk {
 
 /// What a chunk paints: its items in its paint space. A recording has a
 /// generation of its own; a chunk replayed as it was keeps it.
+///
+/// The UI thread records it and the render thread draws it, behind one
+/// `Arc`. Once every holder but the painter let go of a display it
+/// replaced (the render thread drew what replaced it), the painter records
+/// the next chunk into it ([`Self::renew`]): its `Arc` and its items'
+/// buffer are reused, so a repaint allocates nothing for them.
 #[derive(Debug)]
 pub struct Display {
     pub generation: u64,
     pub items: Vec<Item>,
 }
 
+/// The generations recordings are numbered by.
+static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+
 impl Display {
     /// `items`, recorded now.
     #[must_use]
     pub fn new(items: Vec<Item>) -> Self {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
         Self {
-            generation: NEXT.fetch_add(1, Ordering::Relaxed),
+            generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
             items,
         }
+    }
+
+    /// Empty, under a generation of its own, for a recording made now.
+    pub fn renew(&mut self) {
+        self.items.clear();
+        self.generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -193,11 +214,26 @@ impl Properties {
             .unwrap_or(&ROOT)
     }
 
+    /// Clip `id`'s axis-aligned bounds as it clips now: its rectangle
+    /// within each it lies in ([`ClipNode::parent`]), each where its own
+    /// transform has it, its own corners and transform. What culls and
+    /// rejects early; the GPU's clip table keeps each clip's own rounded
+    /// rectangle and its parent, and the shaders walk the chain.
     #[must_use]
-    pub fn clip(&self, id: u32) -> Option<&ClipNode> {
-        (id != 0)
-            .then(|| usize::try_from(id).ok().and_then(|i| self.clips.get(i)))
-            .flatten()
+    pub fn clip(&self, id: u32) -> Option<ClipNode> {
+        let get = |id: u32| {
+            (id != 0)
+                .then(|| usize::try_from(id).ok().and_then(|i| self.clips.get(i)))
+                .flatten()
+        };
+        let mut c = *get(id)?;
+        let mut up = c.parent;
+        for _ in 0..64 {
+            let Some(p) = get(up) else { break };
+            c.clip.bounds = c.clip.bounds.intersect(&p.clip.bounds);
+            up = p.parent;
+        }
+        Some(c)
     }
 
     #[must_use]
@@ -261,6 +297,11 @@ pub struct TransformNode {
 pub struct ClipNode {
     pub clip: Clip,
     pub transform: u32,
+    /// The clip it lies within (0 for none), each moved by its own
+    /// transform: a text input's own clip within the container's that
+    /// clips it, which stays with the container as what is between them
+    /// scrolls or moves ([`Properties::clip`] intersects them).
+    pub parent: u32,
 }
 
 /// An effect node (CSS's stacking context with `opacity`, `filter`,
@@ -280,9 +321,6 @@ pub struct EffectNode {
     pub transform: u32,
     /// That node is its own scale or turn.
     pub transformed: bool,
-    /// The clip from outside it, applied once it is transformed (0 when it
-    /// is not).
-    pub clip: u32,
     /// The physical window pixels its subtree may paint, as untransformed.
     pub region: Option<PixelRect>,
 }
@@ -296,7 +334,6 @@ impl Default for EffectNode {
             mask: None,
             transform: 0,
             transformed: false,
-            clip: 0,
             region: None,
         }
     }
@@ -608,6 +645,12 @@ pub struct Drawn {
     /// the frame was planned whole (not from what changed).
     pub signed: usize,
     pub planned_whole: bool,
+    /// Clip table entries written: a clip that moved writes its own, not
+    /// those of the clips within it (the shaders walk each chain).
+    pub clips_written: usize,
+    /// The longest effective clip chain among the clips decided this frame
+    /// (the clips the shaders walk for it, [`crate::clip::needed`]).
+    pub clip_chain: usize,
     /// The GPU time of the last frame whose timestamps came back (a frame
     /// or two behind; `None` without timestamp queries), its first pass's
     /// start to its last pass's end, and what each kind of pass took.

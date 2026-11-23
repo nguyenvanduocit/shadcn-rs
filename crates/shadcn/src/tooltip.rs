@@ -1,12 +1,17 @@
 //! Tooltip (`ui/tooltip`): a short label that shows while the pointer rests
-//! on its trigger, or while the trigger holds focus reached by keyboard,
-//! with an arrow pointing at it.
+//! on its trigger, or while the trigger holds focus, with an arrow pointing
+//! at it.
 //!
 //! The parts nest as in Vue: [`tooltip`] is the anchor and keeps whether the
 //! tooltip is open, its own (`default_open`) or the caller's (`open`,
-//! `v-model:open`), and how long the pointer rests before it opens
-//! (`delay_duration`; shadcn's `TooltipProvider` makes it 0); it holds the
-//! [`tooltip_trigger`] and the [`tooltip_content`].
+//! `v-model:open`); it holds the [`tooltip_trigger`] and the
+//! [`tooltip_content`]. How long the pointer rests before it opens comes
+//! from the nearest [`tooltip_provider`] (shadcn's `TooltipProvider`, 0 ms),
+//! else from the window's, which has shadcn's 0 ms too; a tooltip's own
+//! `delay_duration` wins over both. The behaviour is
+//! `primitives::tooltip`'s (one open in the window, the skip-delay window,
+//! the grace area onto the content, keyboard focus, Escape); this module
+//! draws it.
 //!
 //! ```ignore
 //! tooltip()
@@ -19,34 +24,81 @@ use std::time::Duration;
 
 use gui::prelude::*;
 use gui::{
-    Bind, Color, Div, Element, FocusHandle, Model, NamedKey, Path, PathBuilder, Positioning, Side, SideAlign, Signal,
-    component, deferred, div, figures, provide, px, use_context, use_model, watch,
+    Bind, Color, Div, Element, Model, Path, PathBuilder, Side, SideAlign, component, div, figures, provide, px,
+    use_model,
 };
+use primitives::context::use_root;
+use primitives::popper::Popper;
+use primitives::presence::Presence;
+use primitives::tooltip::{Tooltip, TooltipOptions, TooltipOverrides, TooltipProvider};
 
 use gui::style::Origin;
 
-use crate::hover_card::HoverIntent;
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
+
+/// shadcn's `TooltipProvider` defaults: reka's, with no delay.
+const SHADCN: TooltipOptions = TooltipOptions {
+    delay: Duration::ZERO,
+    skip_delay: primitives::tooltip::SKIP_DELAY,
+    hoverable: true,
+    closing_trigger: true,
+    keyboard_focus_only: false,
+    disabled: false,
+};
+
+/// What [`tooltip_provider`] is given.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TooltipProviderProps {
+    options: TooltipOptions,
+}
+
+/// The tooltips inside share its delays (`TooltipProvider`; shadcn's
+/// opens at once): a plain `div` its caller lays out. One tooltip is open
+/// in the window whatever its provider.
+#[must_use]
+pub fn tooltip_provider() -> Part<TooltipProviderProps> {
+    Part::new(
+        TooltipProviderProps { options: SHADCN },
+        div().named("tooltip-provider"),
+        |p| {
+            component(p, |cx| {
+                let props = cx.props();
+                provide(TooltipProvider::new(move || props.with(|p| p.props.options)));
+                move || props.with(|p| p.slot.0.clone()).into_element()
+            })
+        },
+    )
+}
+
+impl Part<TooltipProviderProps> {
+    /// How long the pointer rests before a tooltip opens (`:delay-duration`).
+    #[must_use]
+    pub fn delay_duration(self, delay: Duration) -> Self {
+        self.with_props(|p| p.options.delay = delay)
+    }
+
+    /// How long after one closes another opens at once
+    /// (`:skip-delay-duration`, 300ms).
+    #[must_use]
+    pub fn skip_delay_duration(self, delay: Duration) -> Self {
+        self.with_props(|p| p.options.skip_delay = delay)
+    }
+}
 
 /// What [`tooltip`] is given.
 #[derive(Clone, PartialEq, Default)]
 pub struct TooltipProps {
     open: Bind<bool>,
-    delay: Duration,
+    delay: Option<Duration>,
 }
 
-/// What the parts below a [`tooltip`] read.
-#[derive(Clone, Copy)]
-struct TooltipContext {
-    intent: HoverIntent<PartProps<TooltipProps>>,
-    props: Signal<PartProps<TooltipProps>>,
-}
+/// The tooltip of a [`tooltip`] root.
+type TooltipState = Tooltip<PartProps<TooltipProps>>;
 
 /// The anchor the tooltip is placed against: wrap the trigger (and the
-/// content) in it. Closed, kept by itself, and opening as soon as the pointer
-/// arrives, until told otherwise.
+/// content) in it. Closed, and kept by itself, until told otherwise.
 #[must_use]
 pub fn tooltip() -> Part<TooltipProps> {
     Part::new(
@@ -55,10 +107,18 @@ pub fn tooltip() -> Part<TooltipProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                provide(TooltipContext {
-                    intent: HoverIntent::new(use_model(props, |p| &p.props.open)),
-                    props,
-                });
+                let provider = TooltipProvider::nearest_or_window(SHADCN);
+                let tip = Tooltip::new(
+                    use_model(props, |p: &PartProps<TooltipProps>| &p.props.open),
+                    provider,
+                    move || {
+                        props.with(|p| TooltipOverrides {
+                            delay: p.props.delay,
+                            ..TooltipOverrides::default()
+                        })
+                    },
+                );
+                provide(tip);
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })
         },
@@ -80,21 +140,20 @@ impl Part<TooltipProps> {
 
     /// Call `f` each time it opens or closes (`@update:open`).
     #[must_use]
-    pub fn on_open_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.open = p.open.clone().on_change(f))
     }
 
     /// How long the pointer rests on the trigger before it opens
-    /// (`:delay-duration`; 0, as shadcn's `TooltipProvider` sets it).
+    /// (`:delay-duration`; its provider's by default).
     #[must_use]
     pub fn delay_duration(self, delay: Duration) -> Self {
-        self.with_props(|p| p.delay = delay)
+        self.with_props(|p| p.delay = Some(delay))
     }
 }
 
 /// Make `trigger` show the tooltip while the pointer rests on it, or while
-/// it holds focus reached by keyboard; pressing it hides the tooltip
-/// (`TooltipTrigger as-child`).
+/// it holds focus; pressing it hides the tooltip (`TooltipTrigger as-child`).
 /// Give `trigger` its children first: a [`Button`](crate::Button) decides
 /// its padding from them as it becomes the box.
 #[must_use]
@@ -102,29 +161,11 @@ pub fn tooltip_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let tip = use_context::<TooltipContext>();
-            let handle = FocusHandle::new();
-            if let Some(c) = tip {
-                // Reka opens on a focus the keyboard made, and closes on blur.
-                watch(
-                    move || handle.is_focused() && gui::focus::focus_visible(),
-                    move |focused, _| c.intent.set_now(*focused),
-                );
-            }
+            let tip = use_root::<TooltipState>("tooltip_trigger", "tooltip");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match tip {
-                    Some(c) => root
-                        .track_focus(handle)
-                        .on_hover(move |inside| {
-                            if inside {
-                                let delay = c.props.with_untracked(|p| p.props.delay);
-                                c.intent.set_after(true, delay);
-                            } else {
-                                c.intent.set_now(false);
-                            }
-                        })
-                        .on_mouse_down(move |_| c.intent.set_now(false)),
+                    Some(c) => c.trigger(root),
                     None => root,
                 }
                 .into_element()
@@ -155,12 +196,13 @@ impl Part<TooltipContentProps> {
 }
 
 /// The tooltip above its anchor, centred on it, 4px away, with its arrow
-/// (`TooltipContent`); style and fill it as a `Div`. Escape closes it.
+/// (`TooltipContent`); style and fill it as a `Div`.
 #[must_use]
 pub fn tooltip_content() -> Part<TooltipContentProps> {
     let t = theme();
-    // `animate-in fade-in-0 zoom-in-95`, closing as a popper's content does.
-    let root = popper(div(), Origin::CENTER)
+    // `origin-(--reka-tooltip-content-transform-origin) animate-in fade-in-0
+    // zoom-in-95`, closing as a popper's content does.
+    let root = popper(div(), Origin::Anchor)
         .named("tooltip-content")
         .background(t.foreground)
         .text_color(t.background)
@@ -177,36 +219,23 @@ pub fn tooltip_content() -> Part<TooltipContentProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let tip = use_context::<TooltipContext>();
+            let tip = use_root::<TooltipState>("tooltip_content", "tooltip");
             move || {
                 let Some(c) = tip else {
                     return Element::Empty;
                 };
-                if !c.intent.is_open() {
+                if c.presence() != Presence::Open {
                     return Element::Empty;
                 }
                 let t = theme();
                 let (p, root) = props.with(|p| (p.props, p.slot.0.clone()));
-                let content = root
-                    .on_key_down(move |e| {
-                        let escape = e.is(NamedKey::Escape);
-                        if escape {
-                            c.intent.set_now(false);
-                        }
-                        escape
-                    })
-                    .child(tooltip_arrow(p.side, t.foreground));
-                deferred(
-                    Positioning::Anchored {
-                        side: p.side,
-                        align: p.align,
-                        offset: 4.0,
-                        match_width: false,
-                        fit_height: false,
-                    },
-                    content,
-                )
-                .into_element()
+                let at = Popper::DEFAULT.side(p.side).align(p.align).side_offset(4.0);
+                // The arrow points from the side it was placed on, flipped
+                // or not (reka's `data-side`); the one asked for until
+                // layout first places it.
+                let side = c.placement().map_or(p.side, |placed| placed.side);
+                c.floating(root.child(tooltip_arrow(side, t.foreground)), &at)
+                    .into_element()
             }
         })
     })

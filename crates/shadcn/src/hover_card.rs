@@ -5,7 +5,10 @@
 //! The parts nest as in Vue: [`hover_card`] is the anchor and keeps whether
 //! the card is open, its own (`default_open`) or the caller's (`open`,
 //! `v-model:open`), and its delays (`open_delay`, `close_delay`); it holds
-//! the [`hover_card_trigger`] and the [`hover_card_content`].
+//! the [`hover_card_trigger`] and the [`hover_card_content`]. The behaviour
+//! is `primitives::hover_card`'s (the delays, the grace area the pointer
+//! crosses from the trigger to the card, Escape, a press outside and a
+//! scroll closing it); this module draws it.
 //!
 //! ```ignore
 //! hover_card()
@@ -15,91 +18,18 @@
 
 use std::time::Duration;
 
-use gui::clock;
 use gui::prelude::*;
-use gui::{
-    Bind, Div, Element, Model, NamedKey, Positioning, Scope, Side, SideAlign, Signal, UseModel, component, deferred,
-    div, provide, use_context, use_model,
-};
+use gui::{Bind, Div, Element, Model, Side, SideAlign, component, div, provide, use_model};
+use primitives::context::use_root;
+use primitives::hover_card::{CLOSE_DELAY, HoverCard, HoverCardOptions, OPEN_DELAY};
+use primitives::popper::Popper;
+use primitives::presence::Presence;
 
 use gui::style::Origin;
 
 use crate::motion::popper;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
-
-/// An open model that follows the pointer after a delay: the one rule behind
-/// the hover card and the tooltip. A newer request replaces a pending one.
-/// Made in a root's setup, so a pending change belongs to the instance and
-/// goes with it.
-pub(crate) struct HoverIntent<P: 'static> {
-    pub(crate) open: UseModel<P, bool>,
-    /// The instance's scope, which owns each pending change's.
-    owner: Scope,
-    /// The scope of the change waiting for its delay.
-    pending: Signal<Option<Scope>>,
-}
-
-impl<P: 'static> Clone for HoverIntent<P> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<P: 'static> Copy for HoverIntent<P> {}
-
-impl<P: 'static> HoverIntent<P> {
-    /// In a root's setup: the intent over `open`.
-    #[track_caller]
-    pub(crate) fn new(open: UseModel<P, bool>) -> Self {
-        Self {
-            open,
-            owner: Scope::new(),
-            pending: Signal::labeled("hover-pending", None),
-        }
-    }
-
-    /// Whether it is open (tracked).
-    pub(crate) fn is_open(self) -> bool {
-        self.open.get()
-    }
-
-    /// Drop a change still waiting for its delay.
-    pub(crate) fn cancel(self) {
-        if let Some(s) = self.pending.get_untracked() {
-            self.pending.set(None);
-            s.dispose();
-        }
-    }
-
-    /// Open or close now, dropping any pending change.
-    pub(crate) fn set_now(self, open: bool) {
-        self.cancel();
-        self.open.set(open);
-    }
-
-    /// Open or close once `delay` has passed, unless something else is asked first.
-    pub(crate) fn set_after(self, open: bool, delay: Duration) {
-        if delay.is_zero() {
-            self.set_now(open);
-            return;
-        }
-        self.cancel();
-        if !self.owner.is_alive() {
-            return;
-        }
-        let s = self.owner.run(Scope::new);
-        s.run(|| {
-            clock::after(delay, move || self.open.set(open));
-        });
-        self.pending.set(Some(s));
-    }
-}
-
-/// Reka's `openDelay`: how long the pointer rests on the trigger before the card opens.
-const OPEN_DELAY: Duration = Duration::from_millis(700);
-/// Reka's `closeDelay`: how long after the pointer leaves before the card closes.
-const CLOSE_DELAY: Duration = Duration::from_millis(300);
 
 /// What [`hover_card`] is given.
 #[derive(Clone, PartialEq)]
@@ -109,24 +39,8 @@ pub struct HoverCardProps {
     close_delay: Duration,
 }
 
-/// What the parts below a [`hover_card`] read.
-#[derive(Clone, Copy)]
-struct HoverCardContext {
-    intent: HoverIntent<PartProps<HoverCardProps>>,
-    props: Signal<PartProps<HoverCardProps>>,
-}
-
-impl HoverCardContext {
-    /// The pointer entered (`true`) or left the trigger or the card.
-    fn hovered(self, inside: bool) {
-        let (open, close) = self.props.with_untracked(|p| (p.props.open_delay, p.props.close_delay));
-        if inside {
-            self.intent.set_after(true, open);
-        } else {
-            self.intent.set_after(false, close);
-        }
-    }
-}
+/// The hover card of a [`hover_card`] root.
+type HoverCardState = HoverCard<PartProps<HoverCardProps>>;
 
 /// The anchor the card is placed against: wrap the trigger (and the
 /// content) in it. Closed, and kept by itself, until told otherwise.
@@ -143,10 +57,17 @@ pub fn hover_card() -> Part<HoverCardProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                provide(HoverCardContext {
-                    intent: HoverIntent::new(use_model(props, |p| &p.props.open)),
-                    props,
-                });
+                let card = HoverCard::new(
+                    use_model(props, |p: &PartProps<HoverCardProps>| &p.props.open),
+                    move || {
+                        props.with(|p| HoverCardOptions {
+                            open_delay: p.props.open_delay,
+                            close_delay: p.props.close_delay,
+                            ..HoverCardOptions::default()
+                        })
+                    },
+                );
+                provide(card);
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })
         },
@@ -168,7 +89,7 @@ impl Part<HoverCardProps> {
 
     /// Call `f` each time it opens or closes (`@update:open`).
     #[must_use]
-    pub fn on_open_change(self, f: impl Fn(bool) + 'static) -> Self {
+    pub fn on_open_change(self, f: impl Into<gui::Callback<bool>>) -> Self {
         self.with_props(|p| p.open = p.open.clone().on_change(f))
     }
 
@@ -193,11 +114,11 @@ pub fn hover_card_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let card = use_context::<HoverCardContext>();
+            let card = use_root::<HoverCardState>("hover_card_trigger", "hover_card");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match card {
-                    Some(c) => root.on_hover(move |inside| c.hovered(inside)),
+                    Some(c) => c.trigger(root),
                     None => root,
                 }
                 .into_element()
@@ -235,12 +156,13 @@ impl Part<HoverCardContentProps> {
 }
 
 /// The card, below its anchor and centred on it, 4px away
-/// (`HoverCardContent`); style and fill it as a `Div`. Over the card it
-/// stays open; Escape or a press outside closes it.
+/// (`HoverCardContent`); style and fill it as a `Div`.
 #[must_use]
 pub fn hover_card_content() -> Part<HoverCardContentProps> {
     let t = theme();
-    let root = popper(div(), Origin::CENTER)
+    // `origin-(--reka-hover-card-content-transform-origin)`: the side it
+    // was placed on, flipped or not.
+    let root = popper(div(), Origin::Anchor)
         .named("hover-card-content")
         .background(t.popover)
         .text_color(t.popover_foreground)
@@ -258,43 +180,17 @@ pub fn hover_card_content() -> Part<HoverCardContentProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let card = use_context::<HoverCardContext>();
+            let card = use_root::<HoverCardState>("hover_card_content", "hover_card");
             move || {
                 let Some(c) = card else {
                     return Element::Empty;
                 };
-                if !c.intent.is_open() {
+                if c.presence() != Presence::Open {
                     return Element::Empty;
                 }
                 let (p, root) = props.with(|p| (p.props, p.slot.0.clone()));
-                let content = root
-                    .on_hover(move |inside| {
-                        // Over the card it stays open; leaving it starts the close delay.
-                        if inside {
-                            c.intent.cancel();
-                        } else {
-                            c.hovered(false);
-                        }
-                    })
-                    .on_key_down(move |e| {
-                        let escape = e.is(NamedKey::Escape);
-                        if escape {
-                            c.intent.set_now(false);
-                        }
-                        escape
-                    })
-                    .on_click_outside(move || c.intent.set_now(false));
-                deferred(
-                    Positioning::Anchored {
-                        side: p.side,
-                        align: p.align,
-                        offset: p.offset,
-                        match_width: false,
-                        fit_height: false,
-                    },
-                    content,
-                )
-                .into_element()
+                let at = Popper::DEFAULT.side(p.side).align(p.align).side_offset(p.offset);
+                c.floating(root, &at).into_element()
             }
         })
     })

@@ -163,7 +163,7 @@ pub fn render() -> Render {
                                     .text_align(TextAlign::Center)
                                     // `text-sm lg:text-base`: the reference renders at desktop width.
                                     .child(
-                                        stepper_title(title)
+                                        stepper_title(item, title)
                                             .text_size(16.0)
                                             .line_height(24.0)
                                             .font_weight(600)
@@ -171,7 +171,7 @@ pub fn render() -> Render {
                                     )
                                     // `text-xs lg:text-sm`; its `text-primary` loses to
                                     // `text-muted-foreground` in the stylesheet's order.
-                                    .child(stepper_description(description).text_size(14.0).line_height(20.0)),
+                                    .child(stepper_description(item, description).text_size(14.0).line_height(20.0)),
                             )
                     })
             }));

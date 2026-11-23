@@ -3,6 +3,9 @@
 # reason; it flags an entry once the demo scores PASS without it.
 #
 # <Demo>.vue<TAB>what ours does better (concrete: what a user sees or gets)
+# <Demo>.vue<TAB><scope><TAB>what ours does better: only in runs the scope holds
+#   for, comma-separated key=value over style, scheme (light, dark) and run.sh's
+#   --theme keys (iconLibrary=tabler, style=nova,scheme=dark).
 ChartDemo.vue	Shows the bar chart its title names: six months of Desktop and Mobile bars with their month ticks. shadcn-vue's draws an empty grid, because its VisGroupedBar and x VisAxis read month names (d.month) on unovis' continuous x scale, so no bar or tick lands, and margin-left -20 cuts its y labels to a sliver.
 MessageScrollerOpeningPositionDemo.vue	Opens on the last anchored turn with 64px of the reply before it in view, as the selected "last-anchor" tab says; theirs measures its items while content-visibility:auto still holds them at the 160px placeholder size, so scrollToMessage aims past the real end and the browser clamps it to the bottom (scrollTo 320, max 208, traced in Chrome)
 #
@@ -17,3 +20,21 @@ MessageScrollerOpeningPositionDemo.vue	Opens on the last anchored turn with 64px
 #   remixicon  RiArrowLeftDoubleLine, RiArrowRightDoubleLine (pagination first, last), RiAlertLine (sonner warning),
 #              RiCircleLine (radio group indicator)
 MessageScrollerPreviousContextDemo.vue	Opens at the end of the thread, as defaultScrollPosition "end" asks; theirs runs scrollToEnd while content-visibility:auto still holds both turns at the 160px placeholder size (scrollHeight 352, so scrollTop 33), and with no autoScroll nothing follows once they measure 109 and 214.75: it rests 4px short of the end (scrollTop 33, max 37, traced in Chrome)
+CommandDemo.vue	The disabled Calculator item is dimmed and takes no pointer, as shadcn-vue's data-[disabled=true]:opacity-50 and pointer-events-none mean; reka writes data-disabled="" (no "true"), so in Chrome the selector never matches and a disabled item looks usable
+#
+# Select and lists (M10 S6b group 5). Better than Chrome in behaviour and the AT tree, not in pixels, so not entries
+# (an entry excuses a pixel diff, and these demos draw the same). The record is ADR-0025
+# (docs/adr/0025-primitives-hold-behaviour-in-one-rule-per-concern.md), "Group 5: select and lists" item 9 and
+# "Group 5: review fixes" item 11:
+#   SelectMultipleDemo.vue   the listbox is aria-multiselectable, so a screen reader says several can be chosen
+#   CommandDemo.vue          the filter is a combobox that controls the list it filters
+#   TagsInputDemo.vue        a paste is trimmed and adds no blank tag; each delete button is named for its action
+#                            ("Remove apple"), not an unnamed button
+#
+# Line clamp (gui text, css-overflow-4 block-ellipsis). Not entries: no demo differs from Chrome by this alone, and an
+# entry would excuse the rest of its diff. A clamped last line gives its ellipsis room by displacing content "as if
+# wrapping, until the last soft wrap opportunity" that leaves the ellipsis room (css-overflow-4 §block-ellipsis),
+# falling back to whole grapheme clusters only when there is none (nowrap, one long word); Chrome's -webkit-line-clamp
+# cuts mid-word. Seen in (verdict A/B against a visual cut, 2026-11-23; scores unchanged, differ 0.1 point lower):
+#   MessageScrollerDemo.vue           the prompt ends "…driving me nuts.…" where Chrome's ends "…Every time the A…"
+#   MessageScrollerStreamingDemo.vue  the same prompt

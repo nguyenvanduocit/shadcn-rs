@@ -103,9 +103,9 @@ impl Item {
 const SPARE: usize = 8;
 const SPARE_ITEMS: usize = 256;
 
-thread_local! {
+crate::engine::engine_local! {
     /// The items a run works on, kept between runs (one per nesting level and thread).
-    static SCRATCH: RefCell<Vec<Vec<Item>>> = const { RefCell::new(Vec::new()) };
+    [Fresh] static SCRATCH: RefCell<Vec<Vec<Item>>> = const { RefCell::new(Vec::new()) };
 }
 
 fn take_scratch() -> Vec<Item> {

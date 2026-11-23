@@ -2,263 +2,43 @@
 //!
 //! As reka's `NumberFieldRoot`, [`number_field`] keeps the value, its own
 //! (`default_value`) or the caller's (`model`, `v-model`), with its bounds,
-//! step and format; the input and the two buttons inside read it. The text
-//! being typed is applied on Enter and when the input loses focus; a value
-//! written from outside (a form's reset) is what the input then shows.
+//! step and format; the input and the two buttons inside read it. Its
+//! behaviour (commit on Enter and blur, steps from the typed text, snapping,
+//! the keys, press-and-hold, the spin button's semantics) is
+//! `primitives::number_field`'s; this module draws it. The value is NaN
+//! while the field is empty, as it starts.
 
 use gui::prelude::*;
-use gui::{
-    Bind, Color, Div, Element, Icon, Key, Model, NamedKey, Signal, TextField, UseModel, component, div, icon, provide,
-    text_input, use_context, use_model, watch,
-};
+use gui::{Bind, Color, Div, Element, Icon, Model, component, div, icon, provide, text_input, use_model, watch};
+use primitives::Availability;
+use primitives::number_field::{NumberConfig, NumberField, StepDirection};
+pub use primitives::number_format::{NumberFormat, NumberStyle, SignDisplay, UnitWidth};
 
 use crate::focus::StateLook;
 use crate::part::{Part, PartProps};
 use crate::theme::theme;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Bounds {
-    min: Option<f64>,
-    max: Option<f64>,
-    step: f64,
-}
-
-impl Bounds {
-    /// `v` clamped and snapped to a step counted from `min` (or 0), rounded to
-    /// the step's decimals so `0.1 * 3` reads `0.3`.
-    fn fit(self, v: f64) -> f64 {
-        let base = self.min.unwrap_or(0.0);
-        let snapped = if self.step > 0.0 {
-            base + ((v - base) / self.step).round() * self.step
-        } else {
-            v
-        };
-        let decimals = self.step.to_string().split_once('.').map_or(0, |(_, d)| d.len());
-        let scale = 10_f64.powi(i32::try_from(decimals).unwrap_or(0));
-        let rounded = (snapped * scale).round() / scale;
-        let floor = self.min.map_or(rounded, |m| rounded.max(m));
-        self.max.map_or(floor, |m| floor.min(m))
-    }
-}
-
-/// How the value is written (`format-options`, `Intl.NumberFormatOptions`
-/// in en-US): plain by default, grouped thousands, at most three decimals.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NumberFormat {
-    pub style: NumberStyle,
-    pub sign: SignDisplay,
-    /// Decimals always written (`minimumFractionDigits`).
-    pub min_fraction: usize,
-    /// Decimals at most (`maximumFractionDigits`).
-    pub max_fraction: usize,
-}
-
-/// `style`: a plain number, a percentage, or an amount of a currency.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NumberStyle {
-    Decimal,
-    /// `percent`: the value times 100, then `%`.
-    Percent,
-    /// `currency` shown by its ISO `code` (`currencyDisplay: 'code'`);
-    /// `accounting` writes a negative amount in parentheses
-    /// (`currencySign: 'accounting'`).
-    Currency {
-        code: &'static str,
-        accounting: bool,
-    },
-}
-
-/// `signDisplay`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum SignDisplay {
-    /// A minus on negatives only.
-    #[default]
-    Auto,
-    /// A plus on positives and a minus on negatives; zero bare.
-    ExceptZero,
-}
-
-impl Default for NumberFormat {
-    fn default() -> Self {
-        Self {
-            style: NumberStyle::Decimal,
-            sign: SignDisplay::Auto,
-            min_fraction: 0,
-            max_fraction: 3,
-        }
-    }
-}
-
-impl NumberFormat {
-    /// `{ style: 'percent' }`: whole percents.
-    pub const PERCENT: Self = Self {
-        style: NumberStyle::Percent,
-        sign: SignDisplay::Auto,
-        min_fraction: 0,
-        max_fraction: 0,
-    };
-
-    /// `{ style: 'currency', currency: code, currencyDisplay: 'code' }`,
-    /// with the currency's two decimals.
-    #[must_use]
-    pub const fn currency(code: &'static str, accounting: bool) -> Self {
-        Self {
-            style: NumberStyle::Currency { code, accounting },
-            sign: SignDisplay::Auto,
-            min_fraction: 2,
-            max_fraction: 2,
-        }
-    }
-
-    /// `v` as `Intl.NumberFormat("en-US", options)` writes it.
-    #[must_use]
-    pub fn format(self, v: f64) -> String {
-        let scaled = if self.style == NumberStyle::Percent {
-            v * 100.0
-        } else {
-            v
-        };
-        let max = self.max_fraction.max(self.min_fraction);
-        let fixed = format!("{:.max$}", scaled.abs());
-        let (int, frac) = fixed.split_once('.').unwrap_or((fixed.as_str(), ""));
-        let mut frac = frac.to_owned();
-        while frac.len() > self.min_fraction && frac.ends_with('0') {
-            frac.pop();
-        }
-        let mut grouped = String::new();
-        for (i, c) in int.chars().enumerate() {
-            if i > 0 && int.len().saturating_sub(i).is_multiple_of(3) {
-                grouped.push(',');
-            }
-            grouped.push(c);
-        }
-        let zero = int.chars().chain(frac.chars()).all(|c| c == '0');
-        let number = if frac.is_empty() {
-            grouped
-        } else {
-            format!("{grouped}.{frac}")
-        };
-        let body = match self.style {
-            NumberStyle::Decimal => number,
-            NumberStyle::Percent => format!("{number}%"),
-            NumberStyle::Currency { code, .. } => format!("{code}\u{a0}{number}"),
-        };
-        let accounting = matches!(self.style, NumberStyle::Currency { accounting: true, .. });
-        match (scaled < 0.0 && !zero, self.sign) {
-            (true, _) if accounting => format!("({body})"),
-            (true, _) => format!("-{body}"),
-            (false, SignDisplay::ExceptZero) if !zero => format!("+{body}"),
-            (false, _) => body,
-        }
-    }
-
-    /// The number in `text` as this format writes it, or plainly typed:
-    /// group separators, the currency code, signs and `%` understood.
-    #[must_use]
-    pub fn parse(self, text: &str) -> Option<f64> {
-        let mut digits: String = text
-            .chars()
-            .filter(|c| c.is_ascii_digit() || matches!(c, '.' | '-'))
-            .collect();
-        let negative = text.contains('(') && text.contains(')');
-        if negative && !digits.starts_with('-') {
-            digits.insert(0, '-');
-        }
-        let v = digits.parse::<f64>().ok().filter(|v| v.is_finite())?;
-        Some(if self.style == NumberStyle::Percent {
-            v / 100.0
-        } else {
-            v
-        })
-    }
-}
-
 /// What [`number_field`] is given.
 #[derive(Clone, PartialEq)]
 pub struct NumberFieldProps {
     value: Bind<f64>,
-    bounds: Bounds,
-    format: NumberFormat,
-    disabled: bool,
+    config: NumberConfig,
 }
 
 /// What the parts below a [`number_field`] read.
 #[derive(Clone, Copy)]
 struct NumberFieldContext {
-    value: UseModel<PartProps<NumberFieldProps>, f64>,
-    /// The text being typed.
-    field: TextField,
-    props: Signal<PartProps<NumberFieldProps>>,
-}
-
-impl NumberFieldContext {
-    fn bounds(self) -> Bounds {
-        self.props.with_untracked(|p| p.props.bounds)
-    }
-
-    fn format(self) -> NumberFormat {
-        self.props.with_untracked(|p| p.props.format)
-    }
-
-    /// Whether it is disabled (tracked).
-    fn disabled(self) -> bool {
-        self.props.with(|p| p.props.disabled)
-    }
-
-    /// Take what the field holds as the value when it parses, and show the
-    /// value formatted either way; returns the value.
-    fn apply_text(self) -> f64 {
-        let (bounds, format) = (self.bounds(), self.format());
-        let v = format
-            .parse(&self.field.edit.with_untracked(|e| e.text.clone()))
-            .map_or_else(|| self.value.get_untracked(), |typed| bounds.fit(typed));
-        self.value.set(v);
-        self.show(v);
-        v
-    }
-
-    /// Write `v` formatted into the field, unless it shows that already.
-    fn show(self, v: f64) {
-        let shown = self.format().format(v);
-        if self.field.edit.with_untracked(|e| e.text != shown) {
-            self.field.set_text(shown);
-        }
-    }
-
-    /// Apply the typed text, then move the value `steps` steps.
-    fn step_by(self, steps: f64) {
-        let bounds = self.bounds();
-        let v = bounds.fit(self.apply_text() + steps * bounds.step);
-        self.value.set(v);
-        self.show(v);
-    }
-
-    /// Whether the value is at its minimum (tracked).
-    fn at_min(self) -> bool {
-        let min = self.props.with(|p| p.props.bounds.min);
-        min.is_some_and(|m| self.value.get() <= m)
-    }
-
-    fn at_max(self) -> bool {
-        let max = self.props.with(|p| p.props.bounds.max);
-        max.is_some_and(|m| self.value.get() >= m)
-    }
+    field: NumberField<PartProps<NumberFieldProps>>,
 }
 
 /// The field's grid (`NumberField`): its label, then
-/// [`number_field_content`]. It holds 0, unbounded, stepped by 1, written
+/// [`number_field_content`]. It is empty, unbounded, stepped by 1, written
 /// plainly, until told otherwise.
 #[must_use]
 pub fn number_field() -> Part<NumberFieldProps> {
     let props = NumberFieldProps {
-        value: Bind::default(),
-        bounds: Bounds {
-            min: None,
-            max: None,
-            step: 1.0,
-        },
-        format: NumberFormat::default(),
-        disabled: false,
+        value: Bind::default_value(f64::NAN),
+        config: NumberConfig::default(),
     };
     Part::new(
         props,
@@ -267,22 +47,13 @@ pub fn number_field() -> Part<NumberFieldProps> {
             component(p, |cx| {
                 let props = cx.props();
                 let value = use_model(props, |p| &p.props.value);
-                let (bounds, format) = props.with_untracked(|p| (p.props.bounds, p.props.format));
-                let field = TextField::new(format.format(bounds.fit(value.get_untracked())));
-                let ctx = NumberFieldContext { value, field, props };
-                // What was typed applies when the input loses focus.
+                let field = NumberField::new(value, props.with_untracked(|p| p.props.config.clone()));
                 watch(
-                    move || field.focus.is_focused(),
-                    move |focused, _| {
-                        if !*focused {
-                            ctx.apply_text();
-                        }
-                    },
+                    move || props.with(|p| p.props.config.clone()),
+                    move |c, _| field.set_config(c.clone()),
                 );
-                // A value written from outside shows formatted.
-                watch(move || value.get(), move |v, _| ctx.show(*v));
-                provide(ctx);
-                move || props.with(|p| p.slot.0.clone()).into_element()
+                provide(NumberFieldContext { field });
+                move || field.root(props.with(|p| p.slot.0.clone())).into_element()
             })
         },
     )
@@ -303,35 +74,41 @@ impl Part<NumberFieldProps> {
 
     /// Call `f` with each value it takes (`@update:model-value`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(f64) + 'static) -> Self {
+    pub fn on_change(self, f: impl Into<gui::Callback<f64>>) -> Self {
         self.with_props(|p| p.value = p.value.clone().on_change(f))
     }
 
     #[must_use]
     pub fn min(self, min: f64) -> Self {
-        self.with_props(|p| p.bounds.min = Some(min))
+        self.with_props(|p| p.config.min = Some(min))
     }
 
     #[must_use]
     pub fn max(self, max: f64) -> Self {
-        self.with_props(|p| p.bounds.max = Some(max))
+        self.with_props(|p| p.config.max = Some(max))
     }
 
     /// What the buttons and arrow keys move it by; values snap to it.
     #[must_use]
     pub fn step(self, step: f64) -> Self {
-        self.with_props(|p| p.bounds.step = step)
+        self.with_props(|p| p.config.step = step)
     }
 
     /// How the value is written (`format-options`).
     #[must_use]
     pub fn format(self, format: NumberFormat) -> Self {
-        self.with_props(|p| p.format = format)
+        self.with_props(|p| p.config.format = format)
     }
 
     #[must_use]
     pub fn disabled(self, disabled: bool) -> Self {
-        self.with_props(|p| p.disabled = disabled)
+        self.with_props(|p| p.config.availability = Availability::from_disabled(disabled))
+    }
+
+    /// Focusable and read, but not written (`readonly`).
+    #[must_use]
+    pub fn read_only(self, read_only: bool) -> Self {
+        self.with_props(|p| p.config.read_only = read_only)
     }
 }
 
@@ -350,13 +127,13 @@ pub fn number_field_content() -> Div {
 pub fn number_field_input() -> Part<()> {
     Part::new((), div(), |p| {
         component(p, |_| {
-            let ctx = use_context::<NumberFieldContext>();
+            let ctx = primitives::context::use_root::<NumberFieldContext>("number_field_input", "number_field");
             move || {
                 let Some(ctx) = ctx else {
                     return Element::Empty;
                 };
                 let t = theme();
-                text_input(&ctx.field)
+                let input = text_input(&ctx.field.field())
                     .named("number-field-input")
                     .transition(Properties::COLORS)
                     .placeholder_color(t.muted_foreground)
@@ -389,40 +166,28 @@ pub fn number_field_input() -> Part<()> {
                             color: Color::BLACK.opacity(0.1),
                         },
                     ])
-                    .disabled(ctx.disabled())
                     .with_interaction(|mut d, i| {
                         let base = d.style_mut().ring;
                         let focused = Ring::new(1.0, t.ring);
                         d.ring(move || if i.focus_visible() { Some(focused) } else { base })
                             .dim_disabled(i, 0.5)
                             .cursor_disabled(i)
-                    })
-                    .on_key_down(move |ev| {
-                        match &ev.key {
-                            Key::Named(NamedKey::ArrowUp) => ctx.step_by(1.0),
-                            Key::Named(NamedKey::ArrowDown) => ctx.step_by(-1.0),
-                            Key::Named(NamedKey::PageUp) => ctx.step_by(10.0),
-                            Key::Named(NamedKey::PageDown) => ctx.step_by(-10.0),
-                            Key::Named(NamedKey::Enter) => {
-                                ctx.apply_text();
-                            }
-                            _ => return false,
-                        }
-                        true
-                    })
-                    .into_element()
+                    });
+                ctx.field.input(input).into_element()
             }
         })
     })
 }
 
-/// The − button on the input's left; disabled at the minimum.
+/// The − button on the input's left; disabled at the minimum. Held, it
+/// repeats.
 #[must_use]
 pub fn number_field_decrement() -> Part<()> {
     stepper("decrement", Icon::Minus, -1.0)
 }
 
-/// The + button on the input's right; disabled at the maximum.
+/// The + button on the input's right; disabled at the maximum. Held, it
+/// repeats.
 #[must_use]
 pub fn number_field_increment() -> Part<()> {
     stepper("increment", Icon::Plus, 1.0)
@@ -443,24 +208,20 @@ fn stepper(name: &'static str, glyph: Icon, steps: f64) -> Part<()> {
         .child(icon(glyph));
     // `Part::new` takes a plain `fn`, so each sign has its own.
     if steps < 0.0 {
-        Part::new((), root, |p| step_part(p, -1.0))
+        Part::new((), root, |p| step_part(p, StepDirection::Down))
     } else {
-        Part::new((), root, |p| step_part(p, 1.0))
+        Part::new((), root, |p| step_part(p, StepDirection::Up))
     }
 }
 
-fn step_part(p: PartProps<()>, steps: f64) -> gui::ComponentElement {
+fn step_part(p: PartProps<()>, dir: StepDirection) -> gui::ComponentElement {
     component(p, move |cx| {
         let props = cx.props();
-        let ctx = use_context::<NumberFieldContext>();
+        let ctx = primitives::context::use_root::<NumberFieldContext>("number_field_button", "number_field");
         move || {
             let root = props.with(|p| p.slot.0.clone());
             match ctx {
-                Some(ctx) => {
-                    let end = if steps < 0.0 { ctx.at_min() } else { ctx.at_max() };
-                    root.disabled(ctx.disabled() || end)
-                        .on_click(move |_| ctx.step_by(steps))
-                }
+                Some(ctx) => ctx.field.button(root, dir),
                 None => root,
             }
             .into_element()

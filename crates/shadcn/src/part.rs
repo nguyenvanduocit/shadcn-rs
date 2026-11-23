@@ -20,14 +20,11 @@ use gui::{
 /// one. An edit writes the text up; a text written from outside (a form's
 /// reset, a sibling sharing the model) is what the field then shows.
 pub(crate) fn bind_field<P: 'static>(field: TextField, value: UseModel<P, String>) {
-    watch(
-        move || field.edit.with(|e| e.text.clone()),
-        move |text, _| value.set(text.clone()),
-    );
+    watch(move || field.text(), move |text, _| value.set(text.clone()));
     watch(
         move || value.get(),
         move |text, _| {
-            if field.edit.with_untracked(|e| e.text != *text) {
+            if field.edit.with_untracked(|e| e.text() != *text) {
                 field.set_text(text.clone());
             }
         },
@@ -97,8 +94,8 @@ impl<P: 'static> Part<P> {
         self.map_root(|d| d.named(name))
     }
 
-    /// Called on a click on the box (a part whose own click does something
-    /// else replaces this one).
+    /// Called on a click on the box, before the part's own click (handlers
+    /// add up: each one registered runs, in the order registered).
     #[must_use]
     pub fn on_click(self, f: impl Fn(&gui::ClickEvent) + 'static) -> Self {
         self.map_root(|d| d.on_click(f))

@@ -39,8 +39,8 @@ pub fn render() -> Render {
             demo(
                 "AccordionDemo.vue",
                 accordion()
-                    .single(true)
-                    .default_value(&["item-1"])
+                    .collapsible(true)
+                    .default_value("item-1")
                     .width(pct(100.0))
                     .children(ITEMS.iter().enumerate().map(|(i, (value, title, [first, second]))| {
                         accordion_item(*value)

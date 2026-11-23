@@ -22,6 +22,7 @@
 
 use std::any::Any;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use smallvec::SmallVec;
 
@@ -91,16 +92,26 @@ impl<T> Convert<Option<T>> for T {
 }
 
 /// A short list kept inline, so that writing it (a binding that sets a
-/// node's shadows on hover) allocates nothing; a longer one spills to the
-/// heap. Shadows, filters and grid tracks are kept so.
-#[derive(Clone, PartialEq)]
-pub struct Inline<T, const N: usize>(SmallVec<[T; N]>);
+/// node's shadows on hover) allocates nothing; a longer one is kept on the
+/// heap once and shared, so that copying it (a style resolved again, the
+/// node paint records from) copies a pointer. Writing a shared list copies
+/// it first. Shadows, filters and grid tracks are kept so.
+#[derive(Clone)]
+pub struct Inline<T, const N: usize>(Items<T, N>);
+
+/// What an [`Inline`] holds: at most `N` items in place, or more, shared.
+#[derive(Clone)]
+enum Items<T, const N: usize> {
+    /// Never spilled: a list longer than `N` is [`Items::Shared`].
+    Inline(SmallVec<[T; N]>),
+    Shared(Arc<Vec<T>>),
+}
 
 impl<T, const N: usize> Inline<T, N> {
     /// The empty list.
     #[must_use]
     pub const fn new() -> Self {
-        Self(SmallVec::new_const())
+        Self(Items::Inline(SmallVec::new_const()))
     }
 
     /// `n` copies of `item` (`repeat(3, Track::Fr(1.0))` is CSS's `repeat(3, 1fr)`).
@@ -109,21 +120,51 @@ impl<T, const N: usize> Inline<T, N> {
     where
         T: Clone,
     {
-        Self(SmallVec::from_elem(item, n))
+        Self::of(SmallVec::from_elem(item, n))
+    }
+
+    /// `items`, shared when they do not fit in place.
+    fn of(items: SmallVec<[T; N]>) -> Self {
+        if items.spilled() {
+            Self(Items::Shared(Arc::new(items.into_vec())))
+        } else {
+            Self(Items::Inline(items))
+        }
     }
 
     /// Whether it holds anything on the heap: it never does at `N` items or fewer.
     #[must_use]
     pub fn spilled(&self) -> bool {
-        self.0.spilled()
+        matches!(self.0, Items::Shared(_))
     }
 
-    pub fn push(&mut self, item: T) {
-        self.0.push(item);
+    pub fn push(&mut self, item: T)
+    where
+        T: Clone,
+    {
+        match &mut self.0 {
+            Items::Inline(v) if v.len() < N => v.push(item),
+            Items::Inline(v) => {
+                let mut heap = Vec::with_capacity(v.len().saturating_add(1).max(N.saturating_mul(2)));
+                heap.extend(v.drain(..));
+                heap.push(item);
+                self.0 = Items::Shared(Arc::new(heap));
+            }
+            Items::Shared(v) => Arc::make_mut(v).push(item),
+        }
     }
 
     pub fn clear(&mut self) {
-        self.0.clear();
+        self.0 = Items::Inline(SmallVec::new_const());
+    }
+}
+
+impl<T: PartialEq, const N: usize> PartialEq for Inline<T, N> {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Items::Shared(a), Items::Shared(b)) if Arc::ptr_eq(a, b) => true,
+            _ => **self == **other,
+        }
     }
 }
 
@@ -135,7 +176,7 @@ impl<T, const N: usize> Default for Inline<T, N> {
 
 impl<T: std::fmt::Debug, const N: usize> std::fmt::Debug for Inline<T, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.0.iter()).finish()
+        f.debug_list().entries(self.iter()).finish()
     }
 }
 
@@ -143,19 +184,26 @@ impl<T, const N: usize> std::ops::Deref for Inline<T, N> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
-        &self.0
+        match &self.0 {
+            Items::Inline(v) => v,
+            Items::Shared(v) => v,
+        }
     }
 }
 
-impl<T, const N: usize> std::ops::DerefMut for Inline<T, N> {
+/// Writing a shared list in place copies it first, if it is shared.
+impl<T: Clone, const N: usize> std::ops::DerefMut for Inline<T, N> {
     fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.0
+        match &mut self.0 {
+            Items::Inline(v) => v,
+            Items::Shared(v) => Arc::make_mut(v).as_mut_slice(),
+        }
     }
 }
 
 impl<T, const N: usize> FromIterator<T> for Inline<T, N> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+        Self::of(iter.into_iter().collect())
     }
 }
 
@@ -164,7 +212,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a Inline<T, N> {
     type IntoIter = std::slice::Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.iter()
+        self.iter()
     }
 }
 
@@ -182,9 +230,7 @@ impl<T, const N: usize> From<Vec<T>> for Inline<T, N> {
 
 impl<T, const N: usize> Convert<Inline<T, N>> for T {
     fn convert(self) -> Inline<T, N> {
-        let mut v = Inline::new();
-        v.push(self);
-        v
+        std::iter::once(self).collect()
     }
 }
 
@@ -580,10 +626,17 @@ impl Bindings {
         // earlier one goes, a restyle's (which writes what it writes)
         // stays before it.
         ops.retain(|o| o.kind == Kind::Restyle || !fields.covers(o.fields));
-        // Only fixed writes left: the fixed style holds them all.
-        if kind == Kind::Fixed && ops.iter().all(|o| o.kind == Kind::Fixed) {
-            self.0 = None;
-            return;
+        if kind == Kind::Fixed {
+            // Only fixed writes left: the fixed style holds them all.
+            if ops.iter().all(|o| o.kind == Kind::Fixed) {
+                self.0 = None;
+                return;
+            }
+            // What is left of the writes touches none of these fields: the
+            // fixed style holds this one as it stands under the replay.
+            if ops.iter().all(|o| o.kind != Kind::Restyle && !o.fields.meets(fields)) {
+                return;
+            }
         }
         ops.push(Op { fields, kind, run });
     }
@@ -870,5 +923,87 @@ mod tests {
             (s.transform.rotate - 90.0).abs() < f32::EPSILON,
             "the later fixed write owns rotate"
         );
+        assert_eq!(
+            b.ops().map(|o| o.len()),
+            Some(1),
+            "the binding it covered went, and with it what the fixed write replayed over"
+        );
+    }
+
+    #[test]
+    fn a_fixed_write_after_a_restyle_replays_after_it() {
+        let (mut style, mut b) = (Style::default(), Bindings::default());
+        set(
+            &mut style,
+            Some(&mut b),
+            Fields::of(&[Field::Opacity]),
+            || 0.5_f32,
+            opacity,
+        );
+        assert!(b.restyle(std::rc::Rc::new(|mut s: Style| {
+            s.opacity = 0.3;
+            s
+        })));
+        set(
+            &mut style,
+            Some(&mut b),
+            Fields::of(&[Field::Opacity]),
+            0.9_f32,
+            opacity,
+        );
+        let s = resolved(&style, &b);
+        assert!(
+            (s.opacity - 0.9).abs() < f32::EPSILON,
+            "written after the parent's restyle, the fixed value is the last word: {}",
+            s.opacity
+        );
+        assert_eq!(b.ops().map(|o| o.len()), Some(2), "the restyle and the fixed write");
+    }
+
+    #[test]
+    fn a_write_of_some_of_a_bindings_fields_replays_over_it() {
+        use crate::styled::Styled;
+        let left = std::rc::Rc::new(std::cell::Cell::new(4.0_f32));
+        let l = std::rc::Rc::clone(&left);
+        // Padding bound, then its sides fixed: the binding stays for the
+        // top and bottom, the fixed sides replay over it.
+        let mut d = crate::div().padding(move || l.get()).padding_x(10.0);
+        let (style, b) = d.style_and_bindings();
+        let b = b.expect("a node keeps bindings");
+        assert_eq!(b.ops().map(|o| o.len()), Some(2));
+        let s = resolved(style, b);
+        assert!((s.padding.top - 4.0).abs() < f32::EPSILON);
+        assert!((s.padding.left - 10.0).abs() < f32::EPSILON);
+        assert!((s.padding.right - 10.0).abs() < f32::EPSILON);
+        left.set(6.0);
+        let s = resolved(style, b);
+        assert!((s.padding.bottom - 6.0).abs() < f32::EPSILON, "the binding runs again");
+        assert!(
+            (s.padding.left - 10.0).abs() < f32::EPSILON,
+            "and the fixed sides stand"
+        );
+    }
+
+    #[test]
+    fn shape_setters_own_the_corners_they_write() {
+        use crate::shape::Shape;
+        use crate::style::Corners;
+        use crate::styled::Styled;
+        // Two corners bound, then all four fixed: the fixed radius owns them.
+        let mut d = crate::div().radius_top(move || 4.0).radius(8.0);
+        let (style, b) = d.style_and_bindings();
+        let b = b.expect("a node keeps bindings");
+        assert!(b.is_empty(), "the binding it covered went: nothing replays");
+        assert_eq!(resolved(style, b).shape, Shape::Rounded(Corners::all(8.0)));
+        // The shape bound, then two corners fixed: both replay, in order.
+        let mut d = crate::div()
+            .shape(move || Shape::Rounded(Corners::all(2.0)))
+            .radius_top(6.0);
+        let (style, b) = d.style_and_bindings();
+        let b = b.expect("a node keeps bindings");
+        assert_eq!(b.ops().map(|o| o.len()), Some(2));
+        let r = resolved(style, b).shape.radii();
+        assert!((r.top_left - 6.0).abs() < f32::EPSILON && (r.top_right - 6.0).abs() < f32::EPSILON);
+        assert!((r.bottom_left - 2.0).abs() < f32::EPSILON && (r.bottom_right - 2.0).abs() < f32::EPSILON);
     }
 }

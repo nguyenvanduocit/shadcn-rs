@@ -16,9 +16,9 @@ use super::prose::{code, h1, h2, inline, lead};
 use super::{Nav, Part};
 use crate::verdict::{self, Grade, Judged};
 
-/// Where `run.sh` writes the verdict of every page, light and dark.
-const LIGHT: &str = "/tmp/shadcn-verdict/all/verdict.json";
-const DARK: &str = "/tmp/shadcn-verdict-dark/all/verdict.json";
+/// Where `run.sh` writes the verdict of every page in vega, the default style, light and dark.
+const LIGHT: &str = "/tmp/shadcn-verdict/vega/all/verdict.json";
+const DARK: &str = "/tmp/shadcn-verdict/vega/all-dark/verdict.json";
 
 /// The last verdict runs, as found on disk.
 #[derive(Clone, Debug, Default, PartialEq)]

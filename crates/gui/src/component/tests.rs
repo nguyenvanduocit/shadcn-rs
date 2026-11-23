@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use super::*;
 use crate::element::{div, text};
+use crate::styled::Styled;
 
 fn counter() -> Rc<Cell<u32>> {
     Rc::new(Cell::new(0))
@@ -58,6 +59,22 @@ fn setup_runs_once_and_render_only_when_what_it_read_changes() {
     assert!(take_due());
     assert_eq!(texts(&root.resolve()), ["5"]);
     assert_eq!((setups.get(), renders.get()), (1, 2));
+}
+
+#[test]
+fn a_cold_re_render_leaves_what_is_due_to_render_due() {
+    let n = Signal::new(0_i32);
+    let root =
+        Root::new(move || component((), move |_| move || text(n.get().to_string()).into_element()).into_element());
+    assert_eq!(texts(&root.resolve()), ["0"]);
+    // Written after the frame's resolve: due in the next frame.
+    n.set(1);
+    let cold = {
+        let frame = root.cold();
+        texts(&frame.resolve())
+    };
+    assert_eq!(cold, ["1"], "the cold render reads the state as it is");
+    assert_eq!(texts(&root.resolve()), ["1"], "and the next frame still renders it");
 }
 
 #[test]
@@ -145,6 +162,182 @@ fn a_callback_is_always_the_latest_and_never_renders_the_child() {
     root.resolve();
     assert_eq!(f.map_or(0, |f| f.call(1)), 21, "the latest closure");
     assert_eq!(child_renders.get(), 1);
+}
+
+/// A handle the child kept in setup ([`Ctx::event`]) calls the closure
+/// the parent passed last, which captured another id; the new closure,
+/// equal as callbacks are, does not render the child again.
+#[test]
+fn a_callback_the_child_kept_in_setup_calls_the_closure_passed_last() {
+    let id = Signal::new(1_i32);
+    let child_renders = counter();
+    let c = Rc::clone(&child_renders);
+    let kept: Rc<RefCell<Option<Callback<(), i32>>>> = Rc::new(RefCell::new(None));
+    let k = Rc::clone(&kept);
+    let root = Root::new(move || {
+        let id = id.get();
+        let (k, c) = (Rc::clone(&k), Rc::clone(&c));
+        div()
+            .child(text(id.to_string()))
+            .child(component(
+                Callback::new(move |()| id),
+                move |cx: Ctx<Callback<(), i32>>| {
+                    *k.borrow_mut() = Some(cx.event(|p| p));
+                    move || {
+                        bump(&c);
+                        text("child").into_element()
+                    }
+                },
+            ))
+            .into_element()
+    });
+    root.resolve();
+    let kept = kept.borrow().clone().expect("kept in setup");
+    assert_eq!(kept.call(()), 1);
+    id.set(2);
+    root.resolve();
+    assert_eq!(kept.call(()), 2, "the closure passed last");
+    assert_eq!(child_renders.get(), 1, "the child not rendered again");
+}
+
+/// What a child keeps of its props: a plain clone of the callback (the
+/// same closure, never written over) and its handle.
+type KeptPair = Rc<RefCell<Vec<(Callback<(), &'static str>, Callback<(), &'static str>)>>>;
+
+fn keeping(kept: &KeptPair, cb: Callback<(), &'static str>) -> ComponentElement {
+    let kept = Rc::clone(kept);
+    component(cb, move |cx: Ctx<Callback<(), &'static str>>| {
+        kept.borrow_mut().push((cx.props().get_untracked(), cx.event(|p| p)));
+        || div().into_element()
+    })
+}
+
+/// One `save` given to two children; only the second is passed another
+/// closure later. Nothing writes into a callback: the first child's
+/// clone and handle still call `save`, the second's handle the new one.
+#[test]
+fn a_shared_callback_replaced_for_one_child_stays_for_the_other() {
+    let swapped = Signal::new(false);
+    let kept: KeptPair = Rc::default();
+    let k = Rc::clone(&kept);
+    let save: Callback<(), &'static str> = Callback::new(|()| "save");
+    let root = Root::new(move || {
+        let second = if swapped.get() {
+            Callback::new(|()| "other")
+        } else {
+            save.clone()
+        };
+        div()
+            .child(keeping(&k, save.clone()).key(1_u64))
+            .child(keeping(&k, second).key(2_u64))
+            .into_element()
+    });
+    root.resolve();
+    swapped.set(true);
+    root.resolve();
+    let kept = kept.borrow();
+    let calls: Vec<_> = kept
+        .iter()
+        .map(|(clone, handle)| (clone.call(()), handle.call(())))
+        .collect();
+    assert_eq!(calls, [("save", "save"), ("save", "other")]);
+}
+
+/// A parent passing, each render, a closure that wraps the one it passed
+/// before: the handle calls the newest, which calls the older once, with
+/// no recursion; and nothing keeps them once the tree is dropped.
+#[test]
+fn a_decorating_callback_calls_the_one_it_wraps_and_is_freed_with_the_tree() {
+    let n = Signal::new(0_i32);
+    let token = Rc::new(());
+    let weak = Rc::downgrade(&token);
+    let kept: Rc<RefCell<Option<Callback<i32, i32>>>> = Rc::default();
+    let k = Rc::clone(&kept);
+    let prev: Rc<RefCell<Option<Callback<i32, i32>>>> = Rc::default();
+    let root = Root::new(move || {
+        n.get();
+        let (t, before) = (Rc::clone(&token), prev.borrow().clone());
+        let cb = Callback::new(move |x: i32| {
+            let _ = &t;
+            before.as_ref().map_or(x, |b| b.call(x)) + 1
+        });
+        *prev.borrow_mut() = Some(cb.clone());
+        let k = Rc::clone(&k);
+        div()
+            .child(text(n.get_untracked().to_string()))
+            .child(component(cb, move |cx: Ctx<Callback<i32, i32>>| {
+                *k.borrow_mut() = Some(cx.event(|p| p));
+                || div().into_element()
+            }))
+            .into_element()
+    });
+    root.resolve();
+    n.set(1);
+    root.resolve();
+    let handle = kept.borrow().clone().expect("kept");
+    assert_eq!(handle.call(0), 2, "the newest, wrapping the first once");
+    drop(root);
+    assert!(weak.upgrade().is_none(), "freed with the tree");
+    assert_eq!(handle.call(0), 0, "its instance gone: nothing");
+}
+
+/// Props `(Option<Callback>, Callback)` going from `(None, b1)` to
+/// `(Some(a), b2)`: each handle calls what its own field holds.
+#[test]
+fn handles_to_an_optional_and_a_plain_callback_call_their_own_fields() {
+    type Named = Callback<(), &'static str>;
+    type Props = (Option<Named>, Named);
+    let with_a = Signal::new(false);
+    let kept: Rc<RefCell<Option<(Named, Named)>>> = Rc::default();
+    let k = Rc::clone(&kept);
+    let root = Root::new(move || {
+        let props: Props = if with_a.get() {
+            (Some(Callback::new(|()| "a")), Callback::new(|()| "b2"))
+        } else {
+            (None, Callback::new(|()| "b1"))
+        };
+        let k = Rc::clone(&k);
+        component(props, move |cx: Ctx<Props>| {
+            *k.borrow_mut() = Some((cx.event_opt(|p| p.0.as_ref()), cx.event(|p| &p.1)));
+            || div().into_element()
+        })
+        .into_element()
+    });
+    root.resolve();
+    let (a, b) = kept.borrow().clone().expect("kept");
+    assert_eq!((a.call(()), b.call(())), ("", "b1"));
+    with_a.set(true);
+    root.resolve();
+    assert_eq!((a.call(()), b.call(())), ("a", "b2"));
+}
+
+/// The cold check renders the parent again, which passes a closure of
+/// its own: a handle the child holds still calls the live one.
+#[test]
+fn a_cold_check_leaves_what_a_held_handle_calls() {
+    let renders = counter();
+    let r = Rc::clone(&renders);
+    let kept: Rc<RefCell<Option<Callback<(), u32>>>> = Rc::default();
+    let k = Rc::clone(&kept);
+    let root = Root::new(move || {
+        bump(&r);
+        let made = r.get();
+        let k = Rc::clone(&k);
+        component(Callback::new(move |()| made), move |cx: Ctx<Callback<(), u32>>| {
+            *k.borrow_mut() = Some(cx.event(|p| p));
+            || div().into_element()
+        })
+        .into_element()
+    });
+    root.resolve();
+    let handle = kept.borrow().clone().expect("kept");
+    assert_eq!(handle.call(()), 1);
+    let frame = root.cold();
+    frame.resolve();
+    assert_eq!(renders.get(), 2, "the cold check rendered the parent");
+    drop(frame);
+    assert_eq!(handle.call(()), 1, "the live closure, not the cold one");
+    assert_eq!(handle.call(()), 1);
 }
 
 #[test]
@@ -402,4 +595,1051 @@ fn a_parent_renders_before_its_child_and_a_child_it_rendered_is_not_rendered_twi
     let order: Vec<&str> = take_rendered().iter().map(|r| r.name).collect();
     assert_eq!(order.len(), 2, "{order:?}");
     assert_eq!(order.first().copied(), Some("app"), "parent first: {order:?}");
+}
+
+/// A child panicking in the cold check's render, the panic caught: the
+/// live props are back (a held handle calls the live closure) and no
+/// render is cold any more.
+#[test]
+fn a_cold_render_that_panics_leaves_the_live_props_and_ends_the_cold_check() {
+    let renders = counter();
+    let r = Rc::clone(&renders);
+    let kept: Rc<RefCell<Option<Callback<(), u32>>>> = Rc::default();
+    let k = Rc::clone(&kept);
+    let root = Root::new(move || {
+        bump(&r);
+        let made = r.get();
+        let k = Rc::clone(&k);
+        div()
+            .child(component(
+                Callback::new(move |()| made),
+                move |cx: Ctx<Callback<(), u32>>| {
+                    *k.borrow_mut() = Some(cx.event(|p| p));
+                    || div().into_element()
+                },
+            ))
+            .child(component((), |_| {
+                || {
+                    assert!(!is_cold_render(), "a cold render panics");
+                    div().into_element()
+                }
+            }))
+            .into_element()
+    });
+    root.resolve();
+    let handle = kept.borrow().clone().expect("kept");
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold().resolve()));
+    assert!(caught.is_err(), "the cold render panicked");
+    assert!(!is_cold_render(), "the cold check is over");
+    assert_eq!(handle.call(()), 1, "the live closure");
+}
+
+/// A child's props signal, kept by a test.
+type HeldCallback = Rc<RefCell<Option<Signal<Callback<(), u32>>>>>;
+
+/// The cold check reads the props a fresh placeholder passes and writes
+/// none: run while the child's props are borrowed, it neither aborts nor
+/// leaves the live props, or anything due to render, changed.
+#[test]
+fn a_cold_check_run_while_a_childs_props_are_borrowed_writes_none_of_them() {
+    let held: HeldCallback = Rc::default();
+    let (renders, cold_saw) = (counter(), Rc::new(Cell::new(0_u32)));
+    let (h, r, saw) = (Rc::clone(&held), Rc::clone(&renders), Rc::clone(&cold_saw));
+    let root = Root::new(move || {
+        let (h, r, saw) = (Rc::clone(&h), Rc::clone(&r), Rc::clone(&saw));
+        let made = if is_cold_render() { 2 } else { 1 };
+        // A fresh placeholder each render: its props are passed each time.
+        div()
+            .child(component(
+                Callback::new(move |()| made),
+                move |cx: Ctx<Callback<(), u32>>| {
+                    *h.borrow_mut() = Some(cx.props());
+                    let props = cx.props();
+                    move || {
+                        let called = props.with(|f| f.call(()));
+                        if is_cold_render() {
+                            saw.set(called);
+                        } else {
+                            bump(&r);
+                        }
+                        div().into_element()
+                    }
+                },
+            ))
+            .into_element()
+    });
+    root.resolve();
+    let props = held.borrow().expect("the child's props");
+    assert_eq!(renders.get(), 1);
+    props.with_untracked(|_| root.cold().resolve());
+    assert_eq!(
+        cold_saw.get(),
+        2,
+        "the cold render read the props its parent passed cold"
+    );
+    assert_eq!(
+        props.with_untracked(|f| f.call(())),
+        1,
+        "the live props are the live render's"
+    );
+    assert!(!take_due(), "nothing is due to render");
+    root.resolve();
+    assert_eq!(renders.get(), 1, "nothing rendered again live");
+}
+
+/// A cold render that makes a signal and panics leaks no scope: what the
+/// check made is disposed when it ends, however its renders ended.
+#[test]
+fn a_cold_render_that_panics_after_making_a_signal_leaks_no_scope() {
+    let root = Root::new(|| {
+        div()
+            .child(component((), |_| {
+                || {
+                    if is_cold_render() {
+                        let made = Signal::new(0_u32);
+                        assert_eq!(made.get_untracked(), 1, "a cold render panics");
+                    }
+                    div().into_element()
+                }
+            }))
+            .into_element()
+    });
+    root.resolve();
+    let check = || {
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold().resolve()));
+        assert!(caught.is_err(), "the cold render panicked");
+        crate::reactive::graph()
+    };
+    let first = check();
+    for _ in 0..3 {
+        let next = check();
+        assert_eq!(
+            (next.scopes, next.signals),
+            (first.scopes, first.signals),
+            "no scope leaked"
+        );
+    }
+}
+
+/// A cold check whose render panics leaves the live tree as it found it,
+/// as one that returns does: an update queued before it is still rendered
+/// live by the next frame, and effects run as before.
+#[test]
+fn an_update_queued_before_a_cold_check_that_panics_is_rendered_by_the_next_frame() {
+    let n = Signal::new(0_u32);
+    let live = Rc::new(Cell::new(u32::MAX));
+    let l = Rc::clone(&live);
+    let mounted = Rc::new(Cell::new(false));
+    let m = Rc::clone(&mounted);
+    let root = Root::new(move || {
+        let (l, m) = (Rc::clone(&l), Rc::clone(&m));
+        div()
+            .children((n.get() == 2).then(|| {
+                component((), move |_| {
+                    let m = Rc::clone(&m);
+                    let _ = crate::reactive::Effect::new(move || m.set(true));
+                    || div().into_element()
+                })
+            }))
+            .child(component((), move |_| {
+                let l = Rc::clone(&l);
+                move || {
+                    let v = n.get();
+                    if !is_cold_render() {
+                        l.set(v);
+                    }
+                    div().into_element()
+                }
+            }))
+            .child(component((), |_| {
+                || {
+                    assert!(!is_cold_render(), "a cold render panics");
+                    div().into_element()
+                }
+            }))
+            .into_element()
+    });
+    root.resolve();
+    assert_eq!(live.get(), 0);
+    n.set(1);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold().resolve()));
+    assert!(caught.is_err(), "the cold render panicked");
+    root.resolve();
+    assert_eq!(live.get(), 1, "the update queued before the check is rendered live");
+    let ran = Rc::new(Cell::new(0_u32));
+    let r = Rc::clone(&ran);
+    let _effect = crate::reactive::Effect::new(move || r.set(n.get()));
+    n.set(2);
+    assert_eq!(ran.get(), 2, "effects run as before the check");
+    root.resolve();
+    assert!(mounted.get(), "a setup's effect runs as before the check");
+}
+
+/// A node's handlers add up, as the DOM's `addEventListener`: clicks run
+/// each in the order registered; keys stop at the first that consumes;
+/// a press focuses when every rule allows it.
+#[test]
+fn handlers_given_to_one_node_add_up_by_their_rules() {
+    use crate::events::{ClickEvent, KeyEvent, Modifiers};
+    let log: Rc<RefCell<Vec<&'static str>>> = Rc::default();
+    let (a, b, c, d) = (Rc::clone(&log), Rc::clone(&log), Rc::clone(&log), Rc::clone(&log));
+    let node = div()
+        .on_click(move |_| a.borrow_mut().push("click 1"))
+        .on_click(move |_| b.borrow_mut().push("click 2"))
+        .on_key_down(move |k| {
+            c.borrow_mut().push("key 1");
+            k.is(crate::events::NamedKey::Enter)
+        })
+        .on_key_down(move |_| {
+            d.borrow_mut().push("key 2");
+            true
+        })
+        .focus_on_press(|_| true)
+        .focus_on_press(|m| !m.control);
+    let h = &node.common.handlers;
+    if let Some(f) = &h.click {
+        f(&ClickEvent {
+            x: 0.0,
+            y: 0.0,
+            bounds: crate::geometry::Bounds::default(),
+            modifiers: Modifiers::default(),
+        });
+    }
+    let key = |named| KeyEvent {
+        key: crate::events::Key::Named(named),
+        text: None,
+        modifiers: Modifiers::default(),
+    };
+    let took = h.key_down.as_ref().map(|f| {
+        (
+            f(&key(crate::events::NamedKey::Enter)),
+            f(&key(crate::events::NamedKey::Tab)),
+        )
+    });
+    assert_eq!(took, Some((true, true)));
+    assert_eq!(*log.borrow(), ["click 1", "click 2", "key 1", "key 1", "key 2"]);
+    let focuses = h.press_focus.as_ref().map(|f| {
+        (
+            f(&Modifiers::default()),
+            f(&Modifiers {
+                control: true,
+                ..Modifiers::default()
+            }),
+        )
+    });
+    assert_eq!(focuses, Some((true, false)), "any one refuses");
+    let (e, f) = (Rc::clone(&log), Rc::clone(&log));
+    let staged = div()
+        .on_stage(move |_| e.borrow_mut().push("stage 1"))
+        .on_stage(move |_| f.borrow_mut().push("stage 2"));
+    if let Some(r) = staged.common.style.motion.as_ref().and_then(|m| m.report.as_ref()) {
+        (r.0)(crate::motion::Stage::Entered);
+    }
+    assert_eq!(
+        log.borrow()[5..],
+        ["stage 1", "stage 2"],
+        "a node's stage handlers add up"
+    );
+}
+
+/// Every path of the scenario's last frame, which must all differ.
+fn unique_paths(s: &crate::app::Scenario) -> Vec<crate::geometry::NodePath> {
+    let paths: Vec<_> = s.last().nodes.iter().map(|n| n.path.clone()).collect();
+    for (i, p) in paths.iter().enumerate() {
+        assert!(!paths[..i].contains(p), "{p} twice in {paths:?}");
+    }
+    paths
+}
+
+#[test]
+fn a_keyed_component_and_a_sibling_node_with_its_key_never_share_a_path() {
+    use crate::element::IntoElement;
+    let mut s = crate::app::Scenario::measuring(
+        || {
+            // A keyed 7; B keyed 8, its root keyed 7 by itself.
+            let a = component((), |_| || div().width(10.0).height(10.0).into_element()).key(7_u64);
+            let b = component((0_u8,), |_| || div().key(7).width(10.0).height(10.0).into_element()).key(8_u64);
+            div().child(a).child(b).into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.settle().expect("a frame");
+    let segs: Vec<_> = unique_paths(&s).iter().filter_map(|p| p.0.last().copied()).collect();
+    assert!(segs.contains(&crate::geometry::PathSeg::Component(7, None)), "{segs:?}");
+    assert!(
+        segs.contains(&crate::geometry::PathSeg::Component(8, Some(7))),
+        "{segs:?}"
+    );
+}
+
+/// A wrapper keyed 1 whose root is a component keyed `k`, its props never
+/// changing: kept as `k` changes, and not rendered again, it is placed by
+/// its new key, as one made with that key from the start is.
+#[test]
+fn a_kept_root_whose_key_changed_is_placed_by_its_new_one_without_rendering() {
+    use crate::element::IntoElement;
+    let made = |k: Signal<u64>, renders: Rc<Cell<u32>>| {
+        let mut s = crate::app::Scenario::measuring(
+            move || {
+                let renders = Rc::clone(&renders);
+                let wrapper = component((), move |_| {
+                    let renders = Rc::clone(&renders);
+                    move || {
+                        let renders = Rc::clone(&renders);
+                        component((0_u8,), move |_| {
+                            let renders = Rc::clone(&renders);
+                            move || {
+                                // The cold check's renders are not the instance's.
+                                if !is_cold_render() {
+                                    bump(&renders);
+                                }
+                                div().width(10.0).height(10.0).into_element()
+                            }
+                        })
+                        .key(k.get())
+                        .into_element()
+                    }
+                })
+                .key(1_u64);
+                div().child(wrapper).into_element()
+            },
+            100,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("a frame");
+        s
+    };
+    let k = Signal::new(7_u64);
+    let renders = counter();
+    let mut s = made(k, Rc::clone(&renders));
+    let before = unique_paths(&s);
+    k.set(8);
+    s.settle().expect("a frame");
+    assert_eq!(renders.get(), 1, "kept, not rendered again");
+    let cold = made(Signal::new(8_u64), counter());
+    assert_ne!(unique_paths(&s), before, "placed by its new key");
+    assert_eq!(unique_paths(&s), unique_paths(&cold), "as one keyed so from the start");
+}
+
+/// A drag on the output of a keyed wrapper goes on, to the same node, as
+/// a sibling is inserted before the wrapper: its key keeps its instance
+/// and its path (an unkeyed one, by position, would be another).
+#[test]
+fn a_keyed_wrapper_keeps_its_drag_as_a_sibling_is_inserted_before_it() {
+    use crate::element::IntoElement;
+    use crate::events::DragPhase;
+    use crate::window::Input;
+    let before = Signal::new(false);
+    let log: Rc<RefCell<Vec<DragPhase>>> = Rc::default();
+    let l = Rc::clone(&log);
+    let mut s = crate::app::Scenario::measuring(
+        move || {
+            let l = Rc::clone(&l);
+            let wrapper = component((), move |_| {
+                let l = Rc::clone(&l);
+                move || {
+                    let l = Rc::clone(&l);
+                    div()
+                        .width(100.0)
+                        .height(40.0)
+                        .on_drag(move |e| l.borrow_mut().push(e.phase))
+                        .into_element()
+                }
+            })
+            .key(5_u64);
+            let mut root = div().width(200.0).height(200.0);
+            if before.get() {
+                root = root.child(div().key(1).width(100.0).height(20.0));
+            }
+            root.child(wrapper).into_element()
+        },
+        200,
+        200,
+        1.0,
+    )
+    .expect("a scenario");
+    s.settle().expect("a frame");
+    s.send(Input::PointerMoved { x: 10.0, y: 10.0 });
+    s.send(Input::MouseDown { x: 10.0, y: 10.0 });
+    s.send(Input::PointerMoved { x: 10.0, y: 30.0 });
+    s.settle().expect("a frame");
+    before.set(true);
+    s.settle().expect("a frame");
+    s.send(Input::PointerMoved { x: 10.0, y: 50.0 });
+    s.send(Input::MouseUp { x: 10.0, y: 50.0 });
+    s.settle().expect("a frame");
+    let log = log.borrow();
+    assert_eq!(log.first(), Some(&DragPhase::Start), "{log:?}");
+    assert_eq!(log.last(), Some(&DragPhase::End), "{log:?}");
+    assert!(!log.contains(&DragPhase::Cancel), "{log:?}");
+    assert!(log.iter().filter(|p| **p == DragPhase::Move).count() >= 2, "{log:?}");
+}
+
+/// The frame node whose last path segment is `seg`.
+fn node_by_seg(s: &crate::app::Scenario, seg: crate::geometry::PathSeg) -> Option<usize> {
+    s.last().nodes.iter().position(|n| n.path.0.last() == Some(&seg))
+}
+
+#[test]
+fn a_keyed_component_marks_a_root_in_a_layer_and_the_root_of_a_memoized_child() {
+    use crate::element::{IntoElement, Positioning, deferred};
+    let mut s = crate::app::Scenario::measuring(
+        || {
+            // Its root a layer around a box.
+            let layered = component((), |_| {
+                || deferred(Positioning::At { x: 0.0, y: 0.0 }, div().width(10.0).height(10.0)).into_element()
+            })
+            .key(5_u64);
+            // Its root a child component made once and given back again
+            // (a placeholder it cannot write in).
+            let memoized = component((0_u8,), |_| {
+                let inner = component((), |_| || div().width(10.0).height(10.0).into_element()).into_element();
+                move || inner.clone()
+            })
+            .key(6_u64);
+            div().child(layered).child(memoized).into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.settle().expect("a frame");
+    unique_paths(&s);
+    for key in [5, 6] {
+        let i = node_by_seg(&s, crate::geometry::PathSeg::Component(key, None))
+            .unwrap_or_else(|| panic!("the root of the component keyed {key} is placed by it"));
+        let marked = s.last().behaviour(i).and_then(|b| b.handlers.instance);
+        assert!(marked.is_some(), "and marked with its instance");
+    }
+}
+
+#[test]
+fn a_cached_root_given_again_is_marked_once_and_is_the_same_node() {
+    use crate::element::IntoElement;
+    let owner = crate::reactive::Scope::new().id();
+    let cached = div().width(10.0).into_element();
+    let mut cache = None;
+    let first = mark_root(&mut cache, cached.clone(), Some(7), owner);
+    let again = mark_root(&mut cache, cached.clone(), Some(7), owner);
+    assert!(first.ptr_eq(&again), "the same marked node");
+    assert!(!first.ptr_eq(&cached), "the cached one is left as it was");
+    assert_eq!(first.common().and_then(|c| c.handlers.instance), Some(owner));
+    assert_eq!(cached.common().and_then(|c| c.handlers.instance), None);
+}
+
+/// A computed a setup made, read first by a cold render: the cold frame
+/// computes it on its own copy, so the live one keeps no value and no link
+/// of the frame's, and the next live read computes the live value. Once
+/// live and clean, a cold frame computing it from other props leaves the
+/// live cache as it was.
+#[test]
+fn a_computed_read_first_cold_leaves_its_live_cache_and_links_as_they_were() {
+    let n = Signal::new(0_i32);
+    let tick = Signal::new(0_u32);
+    let root = Root::new(move || {
+        // Cold, the parent passes other props than it does live.
+        let props = if is_cold_render() { 7 } else { n.get() };
+        component(props, move |cx: Ctx<i32>| {
+            let props = cx.props();
+            let tenfold = crate::reactive::Computed::new(move || props.get() * 10);
+            move || {
+                tick.get();
+                // Read only once there are props: never live so far.
+                let shown = match props.get() {
+                    0 => "none".to_owned(),
+                    _ => tenfold.get().to_string(),
+                };
+                text(shown).into_element()
+            }
+        })
+        .into_element()
+    });
+    assert_eq!(texts(&root.resolve()), ["none"]);
+    let links = crate::reactive::graph().subscriptions;
+    let cold = {
+        let frame = root.cold();
+        texts(&frame.resolve())
+    };
+    assert_eq!(cold, ["70"], "the cold render computed it from the cold props");
+    assert_eq!(
+        crate::reactive::graph().subscriptions,
+        links,
+        "no link the cold frame made is live"
+    );
+    n.set(2);
+    assert_eq!(texts(&root.resolve()), ["20"], "the live value, not the cold one");
+    let cold = {
+        let frame = root.cold();
+        texts(&frame.resolve())
+    };
+    assert_eq!(cold, ["70"], "computed again cold, from the cold props");
+    // Rendered again live, the computed clean: its live cache is read.
+    tick.set(1);
+    assert_eq!(texts(&root.resolve()), ["20"], "the live cache is the live value");
+}
+
+/// A computed that reads its props untracked stays clean though they
+/// changed: the cold frame trusts no live cache and computes it again, so
+/// the check sees what the props now give.
+#[test]
+fn a_clean_computed_over_stale_props_is_computed_again_cold() {
+    let n = Signal::new(1_i32);
+    let root = Root::new(move || {
+        component(n.get(), move |cx: Ctx<i32>| {
+            let props = cx.props();
+            let doubled = crate::reactive::Computed::new(move || props.get_untracked() * 2);
+            move || text(doubled.get().to_string()).into_element()
+        })
+        .into_element()
+    });
+    assert_eq!(texts(&root.resolve()), ["2"]);
+    n.set(5);
+    assert_eq!(texts(&root.resolve()), ["2"], "live, the stale cache stays clean");
+    let cold = {
+        let frame = root.cold();
+        texts(&frame.resolve())
+    };
+    assert_eq!(cold, ["10"], "cold, computed again: the check catches the stale value");
+}
+
+/// A width binding reading the props runs in layout: the cold frame lasts
+/// through it, so the binding reads the props the cold render passed, and
+/// the check sees the width they give.
+#[test]
+fn a_width_binding_reads_the_props_the_cold_frame_passed() {
+    use crate::element::IntoElement;
+    let mut s = crate::app::Scenario::measuring(
+        || {
+            let w = if is_cold_render() { 80.0_f32 } else { 40.0 };
+            // Not the window's root, which fills the window whatever its width.
+            div()
+                .child(component(w, |cx: Ctx<f32>| {
+                    let props = cx.props();
+                    move || div().height(10.0).width(move || props.get()).into_element()
+                }))
+                .into_element()
+        },
+        200,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    // Unchecked (whatever `GUI_COLD_CHECK` says) until the frame checked here.
+    s.check_cold(false);
+    s.settle().expect("a frame");
+    s.check_cold(true);
+    let checked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.frame("checked").map(|_| ())));
+    let Err(p) = checked else {
+        panic!("the cold frame's binding read the live props");
+    };
+    let why = p
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+        .unwrap_or_default();
+    assert!(why.contains("differs from a cold one"), "{why}");
+}
+
+/// A child only the cold frame mounts registers hooks in its setup: they
+/// are the frame's, dropped with it, and never run, and the live state is
+/// as it was.
+#[test]
+fn hooks_a_cold_only_setup_registers_never_run() {
+    use crate::element::IntoElement;
+    let (unmounted, laid_out, mounted) = (counter(), counter(), counter());
+    let (u, l, m) = (Rc::clone(&unmounted), Rc::clone(&laid_out), Rc::clone(&mounted));
+    let mut s = crate::app::Scenario::measuring(
+        move || {
+            let (u, l, m) = (Rc::clone(&u), Rc::clone(&l), Rc::clone(&m));
+            let child = is_cold_render().then(|| {
+                component((), move |_| {
+                    let (u, l, m) = (Rc::clone(&u), Rc::clone(&l), Rc::clone(&m));
+                    on_unmounted(move || bump(&u));
+                    after_layout(move || bump(&l));
+                    on_mounted(move || bump(&m));
+                    // Nothing laid out: the frames compare equal.
+                    || Element::Empty
+                })
+            });
+            div().children(child).into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.settle().expect("a frame");
+    let cleanups = crate::reactive::cleanups();
+    s.check_cold(true);
+    for name in ["one", "two", "three"] {
+        s.frame(name).expect("a checked frame");
+    }
+    assert_eq!(
+        (unmounted.get(), laid_out.get(), mounted.get()),
+        (0, 0, 0),
+        "no hook of the cold frame's ran"
+    );
+    assert!(!run_post(), "no hook of the cold frame's is queued live");
+    assert_eq!(
+        crate::reactive::cleanups(),
+        cleanups,
+        "no cleanup of the cold frame's is live"
+    );
+}
+
+/// How many instances the tree holds.
+fn instances() -> usize {
+    with_tree(|t| t.slab.iter().flatten().count())
+}
+
+/// `f`'s panic, caught.
+fn panics(f: impl FnOnce()) -> bool {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err()
+}
+
+/// Sibling A mounts (registered with a registry), then sibling B's setup
+/// panics: the root is poisoned, A goes down with it (its entry too), and
+/// the next frame mounts both again, fresh. A leaving then takes its entry
+/// and its instance with it.
+#[test]
+fn a_sibling_whose_setup_panics_takes_the_one_mounted_before_it_down_with_the_root() {
+    use crate::element::IntoElement;
+    let owner = Scope::new();
+    let registry: crate::Registry<&'static str> = owner.run(crate::Registry::new);
+    let (show_a, tick) = (Signal::new(true), Signal::new(0_u32));
+    let armed = Rc::new(Cell::new(true));
+    let a_setups = counter();
+    let (a, s) = (Rc::clone(&armed), Rc::clone(&a_setups));
+    let mut sc = crate::app::Scenario::measuring(
+        move || {
+            tick.get();
+            let (a, s) = (Rc::clone(&a), Rc::clone(&s));
+            let first = show_a.get().then(|| {
+                component((), move |_| {
+                    bump(&s);
+                    registry.register("a");
+                    || Element::Empty
+                })
+            });
+            let second = component((), move |_| {
+                assert!(!a.replace(false), "b's setup panics, once");
+                || Element::Empty
+            });
+            div().children(first).child(second).into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    assert!(panics(|| drop(sc.frame("b panics"))), "b's setup panicked");
+    assert_eq!(registry.len_untracked(), 0, "a went down with the root");
+    assert_eq!(instances(), 0, "the whole tree is down");
+    sc.act("again", || tick.set(1));
+    sc.settle().expect("settled");
+    assert_eq!(a_setups.get(), 2, "a mounted again, fresh");
+    assert_eq!(registry.to_vec_untracked(), ["a"]);
+    sc.act("remove a", || show_a.set(false));
+    sc.settle().expect("settled");
+    assert_eq!(registry.len_untracked(), 0, "a's entry left with it");
+    assert_eq!(instances(), 2, "the root and b alone");
+    owner.dispose();
+}
+
+/// An observer of a registry panics as it sees the first entry, which a
+/// child's mount gave: the root is poisoned, and the owner that outlives
+/// it keeps no entry (the undo was the child's before the observer ran).
+#[test]
+fn an_observer_that_panics_at_a_registration_leaves_the_surviving_registry_empty() {
+    use crate::element::IntoElement;
+    let owner = Scope::new();
+    let armed = Rc::new(Cell::new(true));
+    let a = Rc::clone(&armed);
+    let registry: crate::Registry<&'static str> = owner.run(|| {
+        let registry = crate::Registry::new();
+        let _observer = crate::reactive::Effect::new(move || {
+            if registry.with(|mut it| it.next().is_some()) {
+                assert!(!a.replace(false), "the observer fails at the first entry");
+            }
+        });
+        registry
+    });
+    let mut sc = crate::app::Scenario::measuring(
+        move || {
+            component((), move |_| {
+                registry.register("a");
+                || Element::Empty
+            })
+            .into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    assert!(
+        panics(|| drop(sc.frame("the observer panics"))),
+        "the observer panicked"
+    );
+    assert!(!armed.get(), "it saw the entry");
+    assert_eq!(registry.len_untracked(), 0, "the entry went down with the root");
+    owner.dispose();
+}
+
+/// Sibling A queues an `on_mounted` hook as it renders, then sibling B's
+/// setup panics: the root is poisoned and mounts again. A's first hook
+/// (for the instance torn down) never runs; the new instance's runs once.
+#[test]
+fn a_mounted_hook_of_an_instance_a_poison_tore_down_never_runs() {
+    let ran = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let a_setups = counter();
+    let armed = Rc::new(Cell::new(true));
+    let (r, s, a) = (Rc::clone(&ran), Rc::clone(&a_setups), Rc::clone(&armed));
+    let root = Root::new(move || {
+        let (r, s, a) = (Rc::clone(&r), Rc::clone(&s), Rc::clone(&a));
+        let first = component((), move |_| {
+            bump(&s);
+            let (r, n) = (Rc::clone(&r), s.get());
+            on_mounted(move || r.borrow_mut().push(n));
+            || text("a").into_element()
+        });
+        let second = component((), move |_| {
+            assert!(!a.replace(false), "b's setup panics, once");
+            || text("b").into_element()
+        });
+        div().child(first).child(second).into_element()
+    });
+    assert!(panics(|| drop(root.resolve())), "b's setup panicked");
+    assert_eq!(texts(&root.resolve()), ["a", "b"]);
+    run_post();
+    assert_eq!(a_setups.get(), 2, "a mounted again");
+    assert_eq!(*ran.borrow(), [2], "the new instance's hook alone ran");
+}
+
+/// A child holds a fresh key of an owner that outlives the root, then its
+/// setup panics: after the poison and a mount holding another key, the
+/// abandoned key is gone.
+#[test]
+fn a_key_held_by_a_setup_that_panics_is_let_go_with_the_poison() {
+    let owner = Scope::new();
+    let keyed: crate::Keyed<u32, u64> = owner.run(crate::Keyed::new);
+    let key = Rc::new(Cell::new(1_u32));
+    let armed = Rc::new(Cell::new(true));
+    let (k, a) = (Rc::clone(&key), Rc::clone(&armed));
+    let root = Root::new(move || {
+        let (k, a) = (Rc::clone(&k), Rc::clone(&a));
+        component((), move |_| {
+            keyed.hold(&k.get(), || u64::from(k.get()));
+            assert!(!a.replace(false), "the setup fails, once");
+            || text("kid").into_element()
+        })
+        .into_element()
+    });
+    assert!(panics(|| drop(root.resolve())), "the setup panicked");
+    key.set(2);
+    assert_eq!(texts(&root.resolve()), ["kid"]);
+    assert_eq!(keyed.peek(&1), None, "the abandoned key is gone");
+    assert_eq!(keyed.peek(&2), Some(2));
+    assert_eq!(keyed.len(), 1);
+    owner.dispose();
+}
+
+/// A click handler queues a hook that reads its instance's signal, then
+/// unmounts that instance: the hook, owned by the instance the handler ran
+/// in, never runs.
+#[test]
+fn a_hook_a_handler_queued_never_runs_once_its_instance_left() {
+    use crate::element::IntoElement;
+    let show = Signal::new(true);
+    let ran = counter();
+    let r = Rc::clone(&ran);
+    let mut sc = crate::app::Scenario::measuring(
+        move || {
+            let r = Rc::clone(&r);
+            let kid = show.get().then(|| {
+                component((), move |_| {
+                    let n = Signal::new(1_u32);
+                    let r = Rc::clone(&r);
+                    move || {
+                        let r = Rc::clone(&r);
+                        div()
+                            .width(50.0)
+                            .height(50.0)
+                            .on_click(move |_| {
+                                let r = Rc::clone(&r);
+                                after_layout(move || {
+                                    n.get();
+                                    bump(&r);
+                                });
+                                show.set(false);
+                            })
+                            .into_element()
+                    }
+                })
+            });
+            div().width(100.0).height(100.0).children(kid).into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    sc.settle().expect("settled");
+    sc.click(10.0, 10.0);
+    sc.settle().expect("settled");
+    assert!(!show.get_untracked(), "the handler ran");
+    assert_eq!(ran.get(), 0, "the hook of the instance that left never ran");
+}
+
+/// A slot whose generations run out is retired: never given to another
+/// instance, so an id from before never reaches one.
+#[test]
+fn a_slot_whose_generations_ran_out_is_never_reused() {
+    let show = Signal::new(true);
+    let ids: Rc<std::cell::RefCell<Vec<Id>>> = Rc::default();
+    let i = Rc::clone(&ids);
+    let root = Root::new(move || {
+        let i = Rc::clone(&i);
+        div()
+            .children(show.get().then(|| {
+                component((), move |_| {
+                    i.borrow_mut().extend(current());
+                    || text("kid").into_element()
+                })
+            }))
+            .into_element()
+    });
+    assert_eq!(texts(&root.resolve()), ["kid"]);
+    show.set(false);
+    assert_eq!(texts(&root.resolve()), Vec::<String>::new());
+    // The kid's slot, free, at its last generation: the next kid takes it.
+    let slot = ids.borrow().first().expect("the kid mounted").slot;
+    with_tree(|t| {
+        if let Some(g) = t.generations.get_mut(slot) {
+            *g = u32::MAX;
+        }
+    });
+    show.set(true);
+    assert_eq!(texts(&root.resolve()), ["kid"]);
+    let last = *ids.borrow().last().expect("the kid mounted again");
+    assert_eq!((last.slot, last.generation), (slot, u32::MAX), "it took the slot");
+    show.set(false);
+    assert_eq!(texts(&root.resolve()), Vec::<String>::new());
+    show.set(true);
+    assert_eq!(texts(&root.resolve()), ["kid"]);
+    let again = *ids.borrow().last().expect("the kid mounted a third time");
+    assert_ne!(again.slot, slot, "the retired slot is given to no one");
+    with_tree(|t| {
+        assert!(t.get(last).is_none(), "the old id reaches nothing");
+        assert!(t.slab.get(slot).is_some_and(Option::is_none), "its slot stays empty");
+    });
+}
+
+/// What a panic said.
+fn said(p: &(dyn std::any::Any + Send)) -> String {
+    p.downcast_ref::<String>()
+        .cloned()
+        .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+        .unwrap_or_default()
+}
+
+/// A setup installs a cleanup that panics, then panics itself, in a
+/// resolve that leaves disposal to its caller: the process goes on (no
+/// second panic raised as the first unwinds), the setup's panic reaches the
+/// caller once, the root is poisoned with its tree down, and the next
+/// resolve mounts it again.
+#[test]
+fn a_setup_that_panics_after_a_panicking_cleanup_poisons_its_root_once() {
+    let cleaned = counter();
+    let armed = Rc::new(Cell::new(true));
+    let (c, a) = (Rc::clone(&cleaned), Rc::clone(&armed));
+    let root = Root::new(move || {
+        let (c, a) = (Rc::clone(&c), Rc::clone(&a));
+        div()
+            .child(component((), move |_| {
+                let c = Rc::clone(&c);
+                crate::reactive::on_cleanup(move || {
+                    bump(&c);
+                    assert!(c.get() > 1, "the cleanup fails");
+                });
+                assert!(!a.replace(false), "the setup fails");
+                || text("up").into_element()
+            }))
+            .into_element()
+    });
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(root.resolve_leaving())));
+    let payload = caught.expect_err("the setup's panic goes on");
+    assert!(said(&*payload).contains("the setup fails"), "{}", said(&*payload));
+    assert!(root.is_poisoned(), "the root is poisoned");
+    assert_eq!(cleaned.get(), 1, "the cleanup ran, once");
+    assert_eq!(instances(), 0, "the whole tree is down");
+    assert_eq!(texts(&root.resolve()), ["up"], "the next resolve mounts it again");
+    assert!(!root.is_poisoned());
+}
+
+/// A child whose cleanup panics leaves: the first root is poisoned, its
+/// tree down. A second root made next, then the first dropped: no id the
+/// first kept reaches the second's instances.
+#[test]
+fn a_child_whose_cleanup_panics_leaves_another_roots_instances_alone() {
+    let show = Signal::new(true);
+    let first = Root::new(move || {
+        div()
+            .children(show.get().then(|| {
+                component((), |_| {
+                    crate::reactive::on_cleanup(|| panic!("the child's cleanup fails"));
+                    || text("child").into_element()
+                })
+            }))
+            .into_element()
+    });
+    assert_eq!(texts(&first.resolve()), ["child"]);
+    show.set(false);
+    assert!(panics(|| drop(first.resolve())), "the cleanup panicked");
+    let cleaned = counter();
+    let c = Rc::clone(&cleaned);
+    let second = Root::new(move || {
+        let c = Rc::clone(&c);
+        component((), move |_| {
+            let c = Rc::clone(&c);
+            crate::reactive::on_cleanup(move || bump(&c));
+            || text("second").into_element()
+        })
+        .into_element()
+    });
+    assert_eq!(texts(&second.resolve()), ["second"]);
+    let alive = instances();
+    drop(first);
+    assert_eq!(instances(), alive, "the second root's instances are all there");
+    assert_eq!(cleaned.get(), 0, "none of them torn down");
+    assert_eq!(texts(&second.resolve()), ["second"]);
+}
+
+/// A root invalidated, its new child's setup panicking once: the next
+/// resolve gives the child, not the output from before the change.
+#[test]
+fn a_poisoned_root_mounts_its_new_child_again_not_the_stale_output() {
+    let show = Signal::new(false);
+    let armed = Rc::new(Cell::new(true));
+    let a = Rc::clone(&armed);
+    let root = Root::new(move || {
+        let a = Rc::clone(&a);
+        let kid = show.get().then(|| {
+            component((), move |_| {
+                assert!(!a.replace(false), "the new child's setup fails, once");
+                || text("new").into_element()
+            })
+        });
+        div().child(text("old")).children(kid).into_element()
+    });
+    assert_eq!(texts(&root.resolve()), ["old"]);
+    show.set(true);
+    assert!(panics(|| drop(root.resolve())), "the setup panicked");
+    assert_eq!(texts(&root.resolve()), ["old", "new"]);
+}
+
+/// Two registered siblings removed in one update, each with a cleanup
+/// that panics: the teardown runs to the end, so neither keeps its entry.
+#[test]
+fn siblings_removed_together_are_all_torn_down_though_a_cleanup_panics() {
+    use crate::element::IntoElement;
+    let owner = Scope::new();
+    let registry: crate::Registry<&'static str> = owner.run(crate::Registry::new);
+    let show = Signal::new(true);
+    let mut sc = crate::app::Scenario::measuring(
+        move || {
+            let kids = show.get().then(|| {
+                ["x", "y"].map(|name| {
+                    component((), move |_| {
+                        registry.register(name);
+                        crate::reactive::on_cleanup(move || panic!("{name}'s cleanup"));
+                        || Element::Empty
+                    })
+                })
+            });
+            div().children(kids.into_iter().flatten()).into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    sc.settle().expect("settled");
+    assert_eq!(registry.len_untracked(), 2);
+    show.set(false);
+    assert!(panics(|| drop(sc.settle())), "a cleanup panicked");
+    assert_eq!(registry.len_untracked(), 0, "both siblings unregistered");
+    owner.dispose();
+}
+
+/// A placeholder the cold check meets before the live frame does (its
+/// parent held it, then passed it again) still passes its props live: what
+/// the cold frame noted of it is gone with the cold frame.
+#[test]
+fn a_cold_check_then_a_live_update_to_the_same_placeholder_passes_its_props() {
+    let child = |n: u32| {
+        component(n, |cx: Ctx<u32>| {
+            let p = cx.props();
+            move || text(p.get().to_string()).into_element()
+        })
+        .into_element()
+    };
+    let held = Rc::new(std::cell::RefCell::new(child(1)));
+    let tick = Signal::new(0_u32);
+    let h = Rc::clone(&held);
+    let root = Root::new(move || {
+        tick.get();
+        div().child(h.borrow().clone()).into_element()
+    });
+    assert_eq!(texts(&root.resolve()), ["1"]);
+    *held.borrow_mut() = child(2);
+    tick.set(1);
+    root.cold().resolve();
+    assert_eq!(texts(&root.resolve()), ["2"], "the new props passed live");
+}
+
+/// What a cold frame costs is what it writes, not what the thread holds:
+/// beside another window of a hundred or ten thousand signals and
+/// instances, checking a small one logs the same steps.
+#[test]
+fn a_cold_frame_costs_its_writes_not_the_size_of_another_window() {
+    let steps = |other: usize| {
+        let big = Root::new(move || {
+            let cells: Vec<Element> = (0..other)
+                .map(|i| {
+                    component(i, |cx: Ctx<usize>| {
+                        let p = cx.props();
+                        let own = Signal::new(0_u32);
+                        move || text(format!("{} {}", p.get(), own.get())).into_element()
+                    })
+                    .key(u64::try_from(i).unwrap())
+                    .into_element()
+                })
+                .collect();
+            div().children(cells).into_element()
+        });
+        big.resolve();
+        let n = Signal::new(1_u32);
+        let small = Root::new(move || {
+            div()
+                .child(component((), move |_| move || text(n.get().to_string()).into_element()))
+                .into_element()
+        });
+        small.resolve();
+        let cold = small.cold();
+        cold.resolve();
+        let cost = (crate::reactive::cold_steps(), cold_tree_steps());
+        drop(cold);
+        drop((small, big));
+        cost
+    };
+    let (few, many) = (steps(100), steps(10_000));
+    assert!(few.0 > 0 && few.1 > 0, "the check logs its writes: {few:?}");
+    assert_eq!(few, many, "the same steps however large the other window");
 }

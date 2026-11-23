@@ -30,7 +30,7 @@ pub fn render() -> Render {
                             .child(
                                 alert_dialog_footer()
                                     .child(alert_dialog_cancel().child("Cancel"))
-                                    .child(alert_dialog_action(move || count.update(|n| *n = n.saturating_add(1))).child("Continue")),
+                                    .child(alert_dialog_action(move |()| count.update(|n| *n = n.saturating_add(1))).child("Continue")),
                             )),
                 ))
                 .child(text_bound(move || format!("Continued {} times", confirmed.get())).text_size(14.0).line_height(20.0)),

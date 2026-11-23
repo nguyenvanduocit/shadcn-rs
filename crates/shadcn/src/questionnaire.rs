@@ -726,7 +726,7 @@ impl Part<QuestionnaireProps> {
 
     /// Called with the name of each question opened (`@update:item`).
     #[must_use]
-    pub fn on_item_change(self, f: impl Fn(String) + 'static) -> Self {
+    pub fn on_item_change(self, f: impl Into<gui::Callback<String>>) -> Self {
         self.with_props(|p| p.item = p.item.clone().on_change(f))
     }
 
@@ -738,23 +738,23 @@ impl Part<QuestionnaireProps> {
 
     /// Called with the questionnaire and every answer once all are valid (`@submit`).
     #[must_use]
-    pub fn on_submit(self, f: impl Fn(&Questionnaire, Vec<QuestionnaireAnswer>) + 'static) -> Self {
-        let f = Callback::new(move |(q, answers): (Questionnaire, Vec<QuestionnaireAnswer>)| f(&q, answers));
+    pub fn on_submit(self, f: impl Into<Callback<(Questionnaire, Vec<QuestionnaireAnswer>)>>) -> Self {
+        let f = f.into();
         self.with_props(|p| p.on_submit = Some(f))
     }
 
     /// Called with the questionnaire, the item's name and the choice's value
     /// each time a choice is checked or unchecked (a choice's `@change`).
     #[must_use]
-    pub fn on_change(self, f: impl Fn(&Questionnaire, &str, &str) + 'static) -> Self {
-        let f = Callback::new(move |(q, name, value): (Questionnaire, String, String)| f(&q, &name, &value));
+    pub fn on_change(self, f: impl Into<Callback<(Questionnaire, String, String)>>) -> Self {
+        let f = f.into();
         self.with_props(|p| p.on_change = Some(f))
     }
 
     /// Called after the answers are reset (`@reset`).
     #[must_use]
-    pub fn on_reset(self, f: impl Fn(&Questionnaire) + 'static) -> Self {
-        let f = Callback::new(move |q: Questionnaire| f(&q));
+    pub fn on_reset(self, f: impl Into<Callback<Questionnaire>>) -> Self {
+        let f = f.into();
         self.with_props(|p| p.on_reset = Some(f))
     }
 }
@@ -1214,7 +1214,7 @@ enum Nav {
 
 /// When a navigation button is disabled: from the open question's status
 /// (the buttons' slot `status`).
-type DisabledWhen = Rc<dyn Fn(Option<QuestionnaireStatus>) -> bool>;
+type DisabledWhen = gui::Derive<Option<QuestionnaireStatus>, bool>;
 
 /// What a navigation button is given.
 #[derive(Clone)]
@@ -1227,9 +1227,8 @@ pub struct QuestionnaireNavProps {
 
 impl PartialEq for QuestionnaireNavProps {
     fn eq(&self, other: &Self) -> bool {
-        // `disabled_when` is a closure the parent makes anew: never equal.
-        self.disabled_when.is_none()
-            && other.disabled_when.is_none()
+        // `disabled_when` compares by pointer: one made anew is not equal.
+        self.disabled_when == other.disabled_when
             && (self.nav, &self.label, self.variant) == (other.nav, &other.label, other.variant)
     }
 }
@@ -1257,8 +1256,8 @@ impl QuestionnaireNav {
     /// Disabled while `f` says so of the open question's status (Vue's
     /// `v-slot="{ status }" :disabled="…"`).
     #[must_use]
-    pub fn disabled_when(mut self, f: impl Fn(Option<QuestionnaireStatus>) -> bool + 'static) -> Self {
-        self.0.disabled_when = Some(Rc::new(f));
+    pub fn disabled_when(mut self, f: impl Into<DisabledWhen>) -> Self {
+        self.0.disabled_when = Some(f.into());
         self
     }
 }
@@ -1291,7 +1290,7 @@ fn nav_button(q: Questionnaire, p: &QuestionnaireNavProps) -> Option<Div> {
     if !shown {
         return None;
     }
-    let disabled = p.disabled_when.as_ref().is_some_and(|f| f(q.active_status()));
+    let disabled = p.disabled_when.as_ref().is_some_and(|f| f.call(q.active_status()));
     let (name, column) = match p.nav {
         Nav::Previous => ("questionnaire-previous", 1),
         Nav::Skip => ("questionnaire-skip", 2),

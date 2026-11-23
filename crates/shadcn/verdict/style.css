@@ -1,17 +1,35 @@
 /* shadcn-vue's base, as its apps/v4 sets it up (assets/css/main.css), with
-   the GUI's fonts. Token values come from themes.ts at runtime (main.ts). */
+   the GUI's fonts. Token values come from themes.ts at runtime (main.ts), and
+   the look from the style under `.style-<name>` on the body. */
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "./.shadcn-vue/packages/cli/src/tailwind.css";
 /* After Tailwind, as apps/v4 imports it: the Markdown component's prose. */
 @import "./.shadcn-vue/apps/v4/public/typeset.css";
+/* Every style, each scoped to its `.style-<name>` class, in the base layer, as
+   main.css imports them; the page's class picks one. */
+@import "./.shadcn-vue/apps/v4/registry/styles/style-vega.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-nova.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-lyra.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-maia.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-mira.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-luma.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-sera.css" layer(base);
+@import "./.shadcn-vue/apps/v4/registry/styles/style-rhea.css" layer(base);
 
 /* The sources live in a git-ignored checkout, so name them explicitly. */
 @source "./.shadcn-vue/apps/v4/components";
-@source "./.shadcn-vue/apps/v4/registry/new-york-v4";
 @source "./.shadcn-vue/apps/v4/registry/bases";
 @source "./main.ts";
 
+@custom-variant style-vega (&:where(.style-vega *));
+@custom-variant style-nova (&:where(.style-nova *));
+@custom-variant style-lyra (&:where(.style-lyra *));
+@custom-variant style-maia (&:where(.style-maia *));
+@custom-variant style-mira (&:where(.style-mira *));
+@custom-variant style-luma (&:where(.style-luma *));
+@custom-variant style-sera (&:where(.style-sera *));
+@custom-variant style-rhea (&:where(.style-rhea *));
 @custom-variant dark (&:is(.dark *));
 
 @font-face {
@@ -25,8 +43,15 @@
   font-weight: 100 900;
 }
 
+/* The theme's fonts (main.ts sets them by its `font` and `fontHeading`). */
+:root {
+  --verdict-sans: "Inter", sans-serif;
+  --verdict-heading: var(--verdict-sans);
+}
+
 @theme inline {
-  --font-sans: "Inter", sans-serif;
+  --font-sans: var(--verdict-sans);
+  --font-heading: var(--verdict-heading);
   --font-mono: "Geist Mono", monospace;
   --radius-sm: calc(var(--radius) * 0.6);
   --radius-md: calc(var(--radius) * 0.8);
@@ -76,5 +101,8 @@
     @apply bg-background text-foreground font-sans;
     margin: 0;
     font-synthesis-weight: none;
+  }
+  .cn-font-heading {
+    @apply font-heading;
   }
 }

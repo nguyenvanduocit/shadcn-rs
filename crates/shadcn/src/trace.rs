@@ -166,13 +166,12 @@ pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<(
             let ctx = CollapsibleContext::find();
             move || {
                 let control = props.with(|p| p.slot.0.clone());
-                let Some(ctx) = ctx.clone() else {
+                let Some(ctx) = ctx else {
                     return control.into_element();
                 };
                 let open = ctx.is_open();
-                control
-                    .aria_expanded(open)
-                    .on_click(move |_| ctx.toggle())
+                ctx.0
+                    .trigger(control)
                     .child(
                         trace_icon(icon(Icon::ChevronRight))
                             .transition(Properties::TRANSFORM)

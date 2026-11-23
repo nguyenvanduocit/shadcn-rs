@@ -80,14 +80,16 @@ impl InputGroupControl {
     /// as the chat demos' `@keydown` does (`preventDefault`, then
     /// `requestSubmit`); Shift+Enter still breaks the line.
     #[must_use]
-    pub fn on_submit(self, submit: impl Fn() + 'static) -> Self {
-        let submit = std::rc::Rc::new(submit);
+    pub fn on_submit(self, submit: impl Into<gui::Callback<()>>) -> Self {
+        // Made here, so it runs as the caller's: the key handler below is
+        // attached inside the input's own component.
+        let submit: gui::Callback<()> = submit.into();
         let el = self.el.map(move |el| {
-            let submit = std::rc::Rc::clone(&submit);
+            let submit = submit.clone();
             el.on_key_down(move |ev| {
                 let sends = ev.is(NamedKey::Enter) && !ev.modifiers.shift;
                 if sends {
-                    submit();
+                    submit.call(());
                 }
                 sends
             })

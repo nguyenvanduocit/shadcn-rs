@@ -2,7 +2,6 @@
 //! [`Design::parts`], each a computed of the whole value with equality cutoff. A style switch reruns only the
 //! bindings that read a group it changed: editing a subtree's accordion frame reruns only accordion bindings.
 
-use std::cell::OnceCell;
 use std::rc::Rc;
 
 use gui::{ComponentElement, Computed, IntoElement, Signal, Slot, component, detached, provide, use_context};
@@ -135,17 +134,17 @@ impl DesignHandle {
     }
 }
 
-thread_local! {
+gui::engine_local! {
     /// The style read where none is installed: vega. Made once per thread, owned by nothing.
-    static DEFAULT: OnceCell<DesignHandle> = const { OnceCell::new() };
+    [Shared("a handle to signals made outside any cold frame, in the live arena")]
+    static DEFAULT: DesignHandle = detached(|| DesignHandle::root(VEGA));
 }
 
 /// The style in scope: the nearest [`with_design`] above, else the one [`crate::theme::install`]ed, else
 /// [`VEGA`].
 #[must_use]
 pub fn use_design() -> DesignHandle {
-    use_context::<DesignHandle>()
-        .unwrap_or_else(|| DEFAULT.with(|d| *d.get_or_init(|| detached(|| DesignHandle::root(VEGA)))))
+    use_context::<DesignHandle>().unwrap_or_else(|| DEFAULT.with(|d| *d))
 }
 
 /// `child` under the style around it edited by `edit` (`with_design(|d| d.field.kind = FieldKind::Underline, form)`):

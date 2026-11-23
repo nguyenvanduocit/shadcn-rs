@@ -226,7 +226,7 @@ fn data_table(dt: &DataTable) -> Div {
                                 .child(dropdown_menu_label("Actions", false))
                                 .child(
                                     dropdown_menu_item("Copy payment ID", MenuItem::default())
-                                        .on_select(move || {
+                                        .on_select(move |_| {
                                             gui::clipboard::copy(id);
                                         })
                                         .child("Copy payment ID"),

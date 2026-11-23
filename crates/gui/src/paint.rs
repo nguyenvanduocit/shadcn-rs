@@ -25,12 +25,12 @@ use std::time::Duration;
 
 use crate::clock;
 use crate::color::Color;
-use crate::compositor::{Commit, PropertiesDelta};
+use crate::compositor::Commit;
 use crate::compositor::{Compositing, Hit, MovingNode, NodeKey, ScrollNode, ThumbNode};
 use crate::effects;
 use crate::geometry::{Bounds, NodePath};
 use crate::inspect::{PaintStats, Repaint};
-use crate::layout::{Changed, Content, Frame, FrameNode, Look, ReadAt, input_text, text_width};
+use crate::layout::{Changed, Content, Frame, FrameNode, Look, ReadAt, Since, input_text, text_width};
 use crate::scene::{
     Chunk, ChunkId, Clip, ClipNode, Display, EffectNode, GroupTransform, Item, Properties, Scene, State, TransformNode,
 };
@@ -62,6 +62,14 @@ pub struct Painter {
     compositing: Compositing,
     /// The thumbs placed, by scroll container.
     thumb_nodes: foldhash::HashMap<NodeKey, ThumbNode>,
+    /// Each scroll container of the last tables, by its identity (its key
+    /// and the component instance whose output it is), as the instance it
+    /// is ([`ScrollNode::instance`]): one that leaves them and comes back
+    /// under the same key, or whose component another replaced at its key,
+    /// is a new one.
+    scroll_instances: foldhash::HashMap<(NodeKey, Option<crate::reactive::OwnerId>), u64>,
+    /// The instance the next new scroll container is.
+    next_scroll: u64,
     /// The scene as last recorded (and committed).
     scene: Scene,
     /// Where it read the frame's changes up to, and what it recorded for.
@@ -78,11 +86,281 @@ pub struct Painter {
     /// over its content, painted after its subtree).
     overlay_of: Vec<Option<usize>>,
     region: Vec<bool>,
-    hit_rect: Vec<Option<Bounds>>,
+    hit_rect: Vec<Option<HitBox>>,
     /// Focused inputs, whose caret blinks.
     blinkers: Vec<usize>,
     /// Scratch: the nodes a record visits.
     work: Vec<usize>,
+    /// Displays chunks no longer show, until the renderer lets go of them,
+    /// and those it let go of, empty, to record into ([`Painter::blank`]).
+    retired: Vec<Arc<Display>>,
+    ready: Pool,
+    /// Scratch kept across records, so a repaint allocates nothing: what
+    /// in-place writes replaced, the chunks recorded again and their
+    /// places, the scroll containers visited and their thumbs, the ids
+    /// written, the displays of chunks that left.
+    undo: Vec<Undo>,
+    rewritten: Vec<(usize, Chunk)>,
+    thumb_work: Vec<usize>,
+    thumb_chunks: Vec<Chunk>,
+    ids: (Vec<u32>, Vec<u32>, Vec<u32>),
+    gone: Vec<Arc<Display>>,
+    /// Scratch: the displays the renderer let go of, being taken back.
+    freed: Vec<Arc<Display>>,
+    /// Scratch: the items of a chunk whose size is not known before it is
+    /// recorded (new, or not `steady`), the most it held over the records
+    /// since [`AGE`] was last counted, and for how many records its room
+    /// was large and past twice that.
+    recording: Vec<Item>,
+    recording_peak: usize,
+    recording_wide: u32,
+}
+
+/// How many empty displays are kept to record into at least: what a burst
+/// of repaints frees is reused by the next, and more is let go. Past it
+/// the pool follows the working set ([`Pool::caps`]).
+const READY: usize = 512;
+
+/// How many bytes of items the displays kept to record into may hold
+/// between them at least, with those still waiting for the renderer to let
+/// go of them: more is let go. Large displays ([`LARGE_BYTES`]) are kept
+/// apart, outside it. Past it the pool follows the working set.
+const READY_BYTES: usize = 2 << 20;
+
+/// A display whose room is past this many bytes is large: it is kept to
+/// record into in a slot of its own ([`LARGE`]), outside [`READY_BYTES`],
+/// so the one chunk that needs it (a long text) takes it back each repaint
+/// and small chunks keep their pool; taken back, it is cut to what it last
+/// held (and [`SLACK`] past twice that keeps its room).
+const LARGE_BYTES: usize = 256 << 10;
+
+/// How many large displays are kept to record into: the chunk being
+/// recorded again takes one back while the renderer still draws the one
+/// it replaced.
+const LARGE: usize = 2;
+
+/// The room past twice what a display last held that it may keep.
+const SLACK: usize = 16;
+
+/// How many records a display may wait unused to be recorded into before
+/// it is let go: what a repaint frees, the next takes, and what no record
+/// takes for this long was room a burst grew. The scratch a chunk records
+/// into keeps a large room no longer used for as long.
+const AGE: u32 = 8;
+
+/// The empty displays kept to record into, by size class: class 0 holds
+/// those with no room, class `k` those with room for `2^(k-1)` to `2^k - 1`
+/// items. A chunk recorded takes one of the class whose least room holds
+/// what it records, and a new display gets the class's least room, so two
+/// chunks of different sizes recorded each frame (a hover leaving one row
+/// for another) each take back a display of its own class, none grows
+/// nor is cut again, and a small chunk never takes the room a big one
+/// needs. Taking and keeping are O(1); each class is oldest first, so
+/// aging drops from its front.
+#[derive(Default)]
+struct Pool {
+    classes: Vec<std::collections::VecDeque<Pooled>>,
+    /// How many displays the classes hold, and the bytes of their room.
+    count: usize,
+    bytes: usize,
+    /// The large displays kept ([`LARGE`]), and the bytes of their room.
+    large: Vec<Pooled>,
+    large_bytes: usize,
+    /// The records passed, to age by.
+    now: u64,
+    /// The small displays this record took (or made, none kept), and the
+    /// bytes of their room: the working set.
+    taken: (usize, usize),
+    /// The most taken by a record in this window of [`AGE`] records and
+    /// the one before: what the pool keeps room for ([`Pool::caps`]).
+    peak: [(usize, usize); 2],
+}
+
+/// A display kept to record into, and the record it was kept at.
+struct Pooled {
+    display: Arc<Display>,
+    at: u64,
+}
+
+impl Pooled {
+    fn room(&self) -> usize {
+        self.display.items.capacity()
+    }
+
+    fn stale(&self, now: u64) -> bool {
+        now.saturating_sub(self.at) > u64::from(AGE)
+    }
+}
+
+fn item_bytes(n: usize) -> usize {
+    n.saturating_mul(std::mem::size_of::<Item>())
+}
+
+/// Whether a display with room for `room` items is large ([`LARGE_BYTES`]).
+fn large(room: usize) -> bool {
+    item_bytes(room) > LARGE_BYTES
+}
+
+/// The size class of a display with room for `room` items.
+fn class_of(room: usize) -> usize {
+    usize::try_from(usize::BITS.saturating_sub(room.leading_zeros())).unwrap_or(usize::MAX)
+}
+
+/// The class whose every display has room for `want` items.
+fn class_for(want: usize) -> usize {
+    match want.checked_sub(1) {
+        None => 0,
+        Some(below) => class_of(below).saturating_add(1),
+    }
+}
+
+/// The room a display taken for `want` items has at least, and a new one
+/// is given: its class's least, or as many when large.
+fn room_for(want: usize) -> usize {
+    if want == 0 {
+        0
+    } else {
+        match want.checked_next_power_of_two() {
+            Some(room) if !large(room) => room,
+            _ => want,
+        }
+    }
+}
+
+/// Whether the display taken for `held` items holds `recorded`, and the
+/// one taken for `recorded` holds `held`: both want one of the same class,
+/// or, large, no more than the one held.
+fn like(held: usize, recorded: usize) -> bool {
+    class_for(held) == class_for(recorded) && (!large(room_for(held)) || recorded <= held)
+}
+
+impl Pool {
+    /// A display with room for `want` items, the latest kept of its class;
+    /// a large one, the smallest that holds them.
+    fn take(&mut self, want: usize) -> Option<Arc<Display>> {
+        if large(room_for(want)) {
+            let at = self
+                .large
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.room() >= want)
+                .min_by_key(|(_, p)| p.room())
+                .map(|(at, _)| at)?;
+            let p = self.large.swap_remove(at);
+            self.large_bytes = self.large_bytes.saturating_sub(item_bytes(p.room()));
+            return Some(p.display);
+        }
+        self.taken = (
+            self.taken.0.saturating_add(1),
+            self.taken.1.saturating_add(item_bytes(room_for(want))),
+        );
+        let p = self.classes.get_mut(class_for(want))?.pop_back()?;
+        self.count = self.count.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(item_bytes(p.room()));
+        Some(p.display)
+    }
+
+    /// Keep `display`, empty, beside the `waiting` bytes of small displays
+    /// the renderer has yet to let go of, within [`READY`] displays and
+    /// [`READY_BYTES`]: past them the oldest of the largest class kept
+    /// gives way to a smaller one, so what a full pool holds is the room
+    /// most chunks need, and stays so cycle after cycle. A large display
+    /// takes the place of the oldest large one kept.
+    fn keep(&mut self, display: Arc<Display>, waiting: usize) {
+        let room = display.items.capacity();
+        let bytes = item_bytes(room);
+        let kept = Pooled { display, at: self.now };
+        if large(room) {
+            if self.large.len() >= LARGE
+                && let Some(at) = self
+                    .large
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, p)| p.at)
+                    .map(|(at, _)| at)
+            {
+                let gone = self.large.swap_remove(at);
+                self.large_bytes = self.large_bytes.saturating_sub(item_bytes(gone.room()));
+            }
+            self.large.push(kept);
+            self.large_bytes = self.large_bytes.saturating_add(bytes);
+            return;
+        }
+        let class = class_of(room);
+        let (most, most_bytes) = self.caps();
+        while self.count >= most || self.bytes.saturating_add(waiting).saturating_add(bytes) > most_bytes {
+            let above = class.saturating_add(1);
+            let Some(gone) = self
+                .classes
+                .get_mut(above..)
+                .and_then(|c| c.iter_mut().rev().find(|c| !c.is_empty()))
+                .and_then(std::collections::VecDeque::pop_front)
+            else {
+                return;
+            };
+            self.count = self.count.saturating_sub(1);
+            self.bytes = self.bytes.saturating_sub(item_bytes(gone.room()));
+        }
+        if self.classes.len() <= class {
+            self.classes.resize_with(class.saturating_add(1), Default::default);
+        }
+        if let Some(c) = self.classes.get_mut(class) {
+            c.push_back(kept);
+            self.count = self.count.saturating_add(1);
+            self.bytes = self.bytes.saturating_add(bytes);
+        }
+    }
+
+    /// How many small displays, and bytes of their room, the pool keeps:
+    /// [`READY`] and [`READY_BYTES`], or twice what a recent record took
+    /// if more, so a repaint of more chunks than those (a thousand rows
+    /// recorded again) takes back what the last freed, and allocates
+    /// nothing. Recent: this window of [`AGE`] records and the one before,
+    /// so once repaints shrink the caps do, and with [`AGE`] what an idle
+    /// pool holds.
+    fn caps(&self) -> (usize, usize) {
+        let [a, b] = self.peak;
+        let count = a.0.max(b.0).max(self.taken.0);
+        let bytes = a.1.max(b.1).max(self.taken.1);
+        (
+            READY.max(count.saturating_mul(2)),
+            READY_BYTES.max(bytes.saturating_mul(2)),
+        )
+    }
+
+    /// One record passed: what waited [`AGE`] records unused is let go.
+    fn age(&mut self) {
+        let [now_peak, _] = &mut self.peak;
+        *now_peak = (now_peak.0.max(self.taken.0), now_peak.1.max(self.taken.1));
+        self.taken = (0, 0);
+        if self.now.is_multiple_of(u64::from(AGE)) {
+            let [last, _] = self.peak;
+            self.peak = [(0, 0), last];
+        }
+        self.now = self.now.saturating_add(1);
+        let now = self.now;
+        for c in &mut self.classes {
+            while let Some(p) = c.front().filter(|p| p.stale(now)) {
+                self.bytes = self.bytes.saturating_sub(item_bytes(p.room()));
+                self.count = self.count.saturating_sub(1);
+                c.pop_front();
+            }
+        }
+        let mut gone = 0_usize;
+        self.large.retain(|p| {
+            let keep = !p.stale(now);
+            if !keep {
+                gone = gone.saturating_add(item_bytes(p.room()));
+            }
+            keep
+        });
+        self.large_bytes = self.large_bytes.saturating_sub(gone);
+    }
+
+    /// The bytes of the room kept.
+    fn held(&self) -> usize {
+        self.bytes.saturating_add(self.large_bytes)
+    }
 }
 
 /// A chunk kept across frames, and what it was recorded from.
@@ -94,6 +372,10 @@ struct Retained {
     /// Its properties as last painted: a change alone is `NeedsProperty`.
     properties: Moved,
     seen: u64,
+    /// Whether a display with room for what it last held holds what it
+    /// records next: it held as many the last time, so it records straight
+    /// into one (`Painter::chunk`).
+    steady: bool,
 }
 
 /// What a chunk is recorded from.
@@ -241,6 +523,46 @@ fn same_look(a: &Look, b: &Look) -> bool {
 /// The node as its chunk records it: in its paint space, unclipped (its
 /// clip is the chunk's state), its properties aside.
 fn in_space(node: &FrameNode) -> FrameNode {
+    FrameNode {
+        content: node.content.clone(),
+        ..bare_in_space(node)
+    }
+}
+
+/// [`in_space`] written over `into`, the buffers of its content kept: a
+/// chunk recorded again keeps what it records from without allocating.
+fn in_space_into(node: &FrameNode, into: &mut FrameNode) {
+    let mut content = std::mem::replace(&mut into.content, Content::None);
+    match (&mut content, &node.content) {
+        (
+            Content::Text {
+                content: c,
+                text: t,
+                runs: r,
+                boxes: b,
+            },
+            Content::Text {
+                content: from,
+                text,
+                runs,
+                boxes,
+            },
+        ) => {
+            c.clone_from(from);
+            *t = text.clone();
+            r.clone_from(runs);
+            b.clone_from(boxes);
+        }
+        (to, from) => to.clone_from(from),
+    }
+    *into = FrameNode {
+        content,
+        ..bare_in_space(node)
+    };
+}
+
+/// [`in_space`] without its content.
+fn bare_in_space(node: &FrameNode) -> FrameNode {
     let mut look = node.look.clone();
     look.opacity = 1.0;
     look.transform = crate::style::Painted {
@@ -267,7 +589,7 @@ fn in_space(node: &FrameNode) -> FrameNode {
         layer: node.layer,
         parent: None,
         look,
-        content: node.content.clone(),
+        content: Content::None,
         scroll: None,
     }
 }
@@ -292,8 +614,9 @@ struct Placed {
     clip: u32,
     /// Its edges snap: no scale or turn above it.
     snap: bool,
-    /// The clip a transformed group above it applies once transformed.
-    lifted: Option<u32>,
+    /// A text input's own clip, its padding box (0 for none): what its
+    /// content paints under, as Chrome clips an input's or a textarea's.
+    field: u32,
 }
 
 /// Where [`Painter::place`] writes property entries: the table being made
@@ -360,8 +683,22 @@ impl Placed {
     fn state(self) -> State {
         State {
             transform: self.transform,
-            clip: if self.lifted == Some(self.clip) { 0 } else { self.clip },
+            clip: self.clip,
             effect: self.effect,
+        }
+    }
+
+    /// The state its overlay chunk paints under: a text input's content
+    /// (recorded there) under its scroll offset (its content transform, as
+    /// a scroll container's children are), within the input's own clip.
+    fn over_state(self) -> State {
+        if self.field == 0 {
+            return self.state();
+        }
+        State {
+            transform: self.content,
+            clip: self.field,
+            ..self.state()
         }
     }
 }
@@ -371,22 +708,19 @@ fn is_blinker(node: &FrameNode) -> bool {
     matches!(node.content, Content::Input { focused: true, .. })
 }
 
-/// The box the compositor hit-tests a node by: its border box in its
-/// paint space, grown by its hit slop.
-fn hit_box(node: &FrameNode) -> Bounds {
-    let e = node.look.hit_slop;
-    let b = node.space;
-    Bounds {
-        x: b.x - e.left,
-        y: b.y - e.top,
-        width: (b.width + e.left + e.right).max(0.0),
-        height: (b.height + e.top + e.bottom).max(0.0),
-    }
+/// The box the compositor hit-tests a node by.
+fn hit_box(node: &FrameNode) -> HitBox {
+    (node.space, node.look.shape, node.look.hit_slop)
 }
+
+/// What the compositor hit-tests a node by, as the UI does
+/// ([`crate::shape::takes_pointer`]): its border box in its paint space,
+/// its shape and its hit slop.
+type HitBox = (Bounds, crate::shape::Shape, crate::style::Edges<f32>);
 
 /// Whether the node paints over its subtree.
 fn has_overlay(node: &FrameNode) -> bool {
-    node.look.decoration.overlay.is_some()
+    node.look.decoration.overlay.is_some() || matches!(node.content, Content::Input { .. })
 }
 
 /// A scroll container that shows a thumb.
@@ -394,16 +728,12 @@ fn has_thumb(node: &FrameNode) -> bool {
     node.scroll.is_some_and(|s| s.max.1 > 0.0 && !s.thumb.is_transparent())
 }
 
-/// The entries of `props` that in-place writes (`undo`) changed.
-fn written(props: &Properties, undo: &[Undo]) -> PropertiesDelta {
-    fn of<T: Clone>(v: &[T], mut ids: Vec<u32>) -> Vec<(u32, T)> {
-        ids.sort_unstable();
-        ids.dedup();
-        ids.into_iter()
-            .filter_map(|id| Some((id, v.get(usize::try_from(id).ok()?)?.clone())))
-            .collect()
-    }
-    let (mut t, mut c, mut e) = (Vec::new(), Vec::new(), Vec::new());
+/// The ids of the transforms, clips and effects in-place writes (`undo`)
+/// changed, each list sorted and without repeats.
+fn written_ids(undo: &[Undo], t: &mut Vec<u32>, c: &mut Vec<u32>, e: &mut Vec<u32>) {
+    t.clear();
+    c.clear();
+    e.clear();
     for u in undo {
         match u {
             Undo::Transform(id, _) => t.push(*id),
@@ -411,11 +741,9 @@ fn written(props: &Properties, undo: &[Undo]) -> PropertiesDelta {
             Undo::Effect(id, _) => e.push(*id),
         }
     }
-    PropertiesDelta {
-        lens: (props.transforms.len(), props.clips.len(), props.effects.len()),
-        transforms: of(&props.transforms, t),
-        clips: of(&props.clips, c),
-        effects: of(&props.effects, e),
+    for ids in [t, c, e] {
+        ids.sort_unstable();
+        ids.dedup();
     }
 }
 
@@ -437,6 +765,11 @@ impl Painter {
     /// walked, its chunks stand as kept. A frame rebuilt since (nodes came,
     /// went or moved) is walked whole, reusing every chunk whose input
     /// did not change.
+    ///
+    /// The commit is written into `commit` (one the renderer gave back,
+    /// emptied), and each chunk recorded again into a display the renderer
+    /// let go of: a repaint of what was painted before allocates nothing.
+    #[expect(clippy::too_many_arguments, reason = "a frame, its target, and the commit to write")]
     pub fn record(
         &mut self,
         frame: &Frame,
@@ -445,24 +778,105 @@ impl Painter {
         scale: f32,
         background: Color,
         resend: bool,
-    ) -> Commit {
+        commit: &mut Commit,
+    ) {
         self.frame = self.frame.saturating_add(1);
         self.stats = PaintStats::default();
         self.painted.clear();
+        commit.clear();
+        self.reclaim();
         let target = (size, scale, text.generation(), background);
         let log = frame.changes.since(&mut self.read);
         let same = self.target == Some(target) && self.placed.len() == frame.nodes.len();
         self.target = Some(target);
-        let commit = match log.filter(|_| same) {
-            Some(log) => self.record_changes(frame, log, text, size, scale).ok(),
-            None => None,
+        let in_place = match log {
+            Since::Logged(log) if same => self.record_changes(frame, log, text, size, scale, commit).is_ok(),
+            Since::Logged(_) | Since::Rebuilt | Since::FellBehind => false,
         };
-        let mut commit = commit.unwrap_or_else(|| self.record_all(frame, text, size, scale, background));
+        if !in_place {
+            self.record_all(frame, text, size, scale, background, commit);
+        }
         if resend {
-            commit = Commit::between(&Scene::default(), &self.scene);
+            commit.between(&Scene::default(), &self.scene);
         }
         self.stats.chunks = self.scene.chunks.len();
-        commit
+    }
+
+    /// A display to hold `want` items: one the renderer let go of
+    /// ([`Pool::take`]), emptied, else a new one of that room.
+    fn blank(&mut self, want: usize) -> Arc<Display> {
+        match self.ready.take(want) {
+            Some(mut d) => {
+                let m = Arc::get_mut(&mut d);
+                debug_assert!(m.is_some(), "the pool holds only displays nothing else shares");
+                if let Some(m) = m {
+                    m.renew();
+                }
+                d
+            }
+            None => Arc::new(Display::new(Vec::with_capacity(room_for(want)))),
+        }
+    }
+
+    /// Keep `display`, which a chunk no longer shows, to record into once
+    /// the renderer lets go of it.
+    fn retire(&mut self, display: Arc<Display>) {
+        self.retired.push(display);
+    }
+
+    /// Take back the displays the renderer let go of since the last record
+    /// (it drew what replaced them), emptied at once so what their items
+    /// held (an image) goes with them; those it still draws wait.
+    ///
+    /// A display keeps its room, so the chunk that takes it back records
+    /// into it without allocating ([`Pool`]); one with a large room is cut
+    /// to what it last held, and one no record took for [`AGE`] records is
+    /// let go, so the pool holds what recent repaints use, within
+    /// [`READY`] displays and [`READY_BYTES`], and [`LARGE`] large ones.
+    /// Whether one is kept does not hang on where it sits among those
+    /// retired: all those let go of are kept beside the small ones the
+    /// renderer still draws.
+    fn reclaim(&mut self) {
+        self.ready.age();
+        self.trim_recording();
+        let mut freed = std::mem::take(&mut self.freed);
+        freed.extend(self.retired.extract_if(.., |d| Arc::get_mut(d).is_some()));
+        let waiting = self.retired.iter().fold(0_usize, |n, d| {
+            let room = d.items.capacity();
+            if large(room) {
+                n
+            } else {
+                n.saturating_add(item_bytes(room))
+            }
+        });
+        for mut d in freed.drain(..) {
+            if let Some(m) = Arc::get_mut(&mut d) {
+                let held = m.items.len();
+                m.items.clear();
+                if large(m.items.capacity()) && m.items.capacity() > held.saturating_mul(2).saturating_add(SLACK) {
+                    m.items.shrink_to(held);
+                }
+                self.ready.keep(d, waiting);
+            }
+        }
+        self.freed = freed;
+    }
+
+    /// One record passed: the scratch a chunk records into, when its room
+    /// was large and past twice the most it held for [`AGE`] records, is
+    /// cut to that.
+    fn trim_recording(&mut self) {
+        let room = self.recording.capacity();
+        let peak = std::mem::take(&mut self.recording_peak);
+        if large(room) && room > peak.saturating_mul(2).saturating_add(SLACK) {
+            self.recording_wide = self.recording_wide.saturating_add(1);
+            if self.recording_wide >= AGE {
+                self.recording.shrink_to(peak);
+                self.recording_wide = 0;
+            }
+        } else {
+            self.recording_wide = 0;
+        }
     }
 
     /// The scene as last recorded.
@@ -479,7 +893,8 @@ impl Painter {
         size: (u32, u32),
         scale: f32,
         background: Color,
-    ) -> Commit {
+        commit: &mut Commit,
+    ) {
         let now = self.frame;
         let mut scene = Scene::new(size, scale, Some(background));
         let mut props = Properties::default();
@@ -508,7 +923,8 @@ impl Painter {
                 self.thumbs(
                     frame,
                     &thumbs,
-                    &mut scene,
+                    &mut scene.chunks,
+                    size,
                     &mut Writes {
                         props: &mut props,
                         undo: None,
@@ -562,7 +978,8 @@ impl Painter {
         self.thumbs(
             frame,
             &thumbs,
-            &mut scene,
+            &mut scene.chunks,
+            size,
             &mut Writes {
                 props: &mut props,
                 undo: None,
@@ -573,14 +990,21 @@ impl Painter {
         let (scrollers, hits, moving) = self.tables(frame);
         self.keep_compositing(scrollers, hits, moving);
         scene.compositing = self.compositing.clone();
-        // What left the frame lets go of its text and ids.
+        // What left the frame lets go of its text and ids, and its display
+        // is kept to record into.
+        let mut gone = std::mem::take(&mut self.gone);
         self.chunks.retain(|_, r| {
             let keep = r.seen == now;
             if !keep {
                 text.unpin(&r.pieces);
+                gone.push(Arc::clone(&r.display));
             }
             keep
         });
+        for d in gone.drain(..) {
+            self.retire(d);
+        }
+        self.gone = gone;
         self.transforms.sweep(now);
         self.clips.sweep(now);
         self.effects.sweep(now);
@@ -589,9 +1013,8 @@ impl Painter {
         props.effects.resize(self.effects.len(), EffectNode::default());
         scene.properties = props;
         self.schedule_blink(!self.blinkers.is_empty());
-        let commit = Commit::between(&self.scene, &scene);
+        commit.between(&self.scene, &scene);
         self.scene = scene;
-        commit
     }
 
     /// Record in place what `log` says changed since the last record: each
@@ -605,7 +1028,8 @@ impl Painter {
         text: &mut TextSystem,
         size: (u32, u32),
         scale: f32,
-    ) -> Result<Commit, Whole> {
+        commit: &mut Commit,
+    ) -> Result<(), Whole> {
         let generation = text.generation();
         let mut work = std::mem::take(&mut self.work);
         work.clear();
@@ -626,19 +1050,40 @@ impl Painter {
         }
         work.sort_unstable();
         work.dedup();
-        let mut undo: Vec<Undo> = Vec::new();
-        let mut props = std::mem::take(&mut self.scene.properties);
-        let result = self.rewrite(frame, &work, &mut props, &mut undo, text, generation, size, scale);
+        let mut undo = std::mem::take(&mut self.undo);
+        undo.clear();
+        let mut rewritten = std::mem::take(&mut self.rewritten);
+        rewritten.clear();
+        // Out while the nodes write it, an empty one (no roots: nothing
+        // allocated) in its place.
+        let mut props = std::mem::replace(
+            &mut self.scene.properties,
+            Properties {
+                transforms: Vec::new(),
+                clips: Vec::new(),
+                effects: Vec::new(),
+            },
+        );
+        let result = self.rewrite(
+            frame,
+            &work,
+            &mut props,
+            &mut undo,
+            &mut rewritten,
+            text,
+            generation,
+            size,
+            scale,
+        );
         self.scene.properties = props;
         self.work = work;
-        match result {
-            Ok((chunks, compositing)) => {
-                let mut changed = Vec::with_capacity(chunks.len());
-                for (at, chunk) in chunks {
+        let out = match result {
+            Ok(compositing) => {
+                for (at, chunk) in rewritten.drain(..) {
                     if let Some(slot) = self.scene.chunks.get_mut(at) {
                         *slot = chunk.clone();
                     }
-                    changed.push(chunk);
+                    commit.chunks.push(chunk);
                 }
                 let props = &mut self.scene.properties;
                 props.transforms.resize(
@@ -651,7 +1096,9 @@ impl Painter {
                 props
                     .effects
                     .resize(self.effects.len().max(props.effects.len()), EffectNode::default());
-                let delta = written(props, &undo);
+                let (t, c, e) = &mut self.ids;
+                written_ids(&undo, t, c, e);
+                commit.properties.written(props, (t, c, e));
                 let before = self.compositing.clone();
                 if compositing {
                     let (scrollers, hits, moving) = self.tables(frame);
@@ -659,13 +1106,15 @@ impl Painter {
                     self.scene.compositing = self.compositing.clone();
                 }
                 self.schedule_blink(!self.blinkers.is_empty());
-                Ok(Commit::changed(&self.scene, &before, changed, delta))
+                commit.tables(&self.scene, &before);
+                Ok(())
             }
             Err(whole) => {
                 // Put back what was written in place: the whole record
                 // compares with the scene as committed.
+                commit.chunks.clear();
                 let props = &mut self.scene.properties;
-                for u in undo.into_iter().rev() {
+                for u in undo.drain(..).rev() {
                     match u {
                         Undo::Transform(id, old) => restore(&mut props.transforms, id, old),
                         Undo::Clip(id, old) => restore(&mut props.clips, id, old),
@@ -674,7 +1123,12 @@ impl Painter {
                 }
                 Err(whole)
             }
-        }
+        };
+        rewritten.clear();
+        self.rewritten = rewritten;
+        undo.clear();
+        self.undo = undo;
+        out
     }
 
     /// Place and record the nodes of `work` (ascending) and the subtrees
@@ -687,14 +1141,99 @@ impl Painter {
         work: &[usize],
         props: &mut Properties,
         undo: &mut Vec<Undo>,
+        chunks: &mut Vec<(usize, Chunk)>,
         text: &mut TextSystem,
         generation: u64,
         size: (u32, u32),
         scale: f32,
-    ) -> Result<(Vec<(usize, Chunk)>, bool), Whole> {
-        let mut chunks: Vec<(usize, Chunk)> = Vec::new();
+    ) -> Result<bool, Whole> {
+        let mut thumbs = std::mem::take(&mut self.thumb_work);
+        thumbs.clear();
+        let result = self
+            .rewrite_nodes(
+                frame,
+                work,
+                props,
+                undo,
+                chunks,
+                &mut thumbs,
+                text,
+                generation,
+                size,
+                scale,
+            )
+            .and_then(|compositing| {
+                self.rewrite_thumbs(frame, &thumbs, props, undo, chunks, size, scale)?;
+                Ok(compositing)
+            });
+        self.thumb_work = thumbs;
+        result
+    }
+
+    /// The thumbs of the scroll containers `rewrite` visited, at their
+    /// places. Sized as the frame: a thumb's region is clipped to it.
+    #[expect(clippy::too_many_arguments, reason = "what a record reads")]
+    fn rewrite_thumbs(
+        &mut self,
+        frame: &Frame,
+        thumbs: &[usize],
+        props: &mut Properties,
+        undo: &mut Vec<Undo>,
+        chunks: &mut Vec<(usize, Chunk)>,
+        size: (u32, u32),
+        scale: f32,
+    ) -> Result<(), Whole> {
+        if thumbs.is_empty() {
+            return Ok(());
+        }
+        let mut recorded = std::mem::take(&mut self.thumb_chunks);
+        recorded.clear();
+        self.thumbs(
+            frame,
+            thumbs,
+            &mut recorded,
+            size,
+            &mut Writes {
+                props,
+                undo: Some(undo),
+            },
+            scale,
+            false,
+        );
+        let mut out = Ok(());
+        for (&i, chunk) in thumbs.iter().zip(recorded.drain(..)) {
+            let Some(c) = self.thumb_of.get(i).copied().flatten() else {
+                out = Err(Whole);
+                break;
+            };
+            let kept = self.scene.chunks.get(c);
+            if kept.is_none_or(|k| k.state != chunk.state || !Arc::ptr_eq(&k.display, &chunk.display)) {
+                chunks.push((c, chunk));
+            }
+        }
+        recorded.clear();
+        self.thumb_chunks = recorded;
+        out
+    }
+
+    /// The nodes `rewrite` visits: their chunks into `chunks`, the scroll
+    /// containers among them into `thumbs`; whether the compositor's tables
+    /// changed.
+    #[expect(clippy::too_many_arguments, reason = "what a record reads")]
+    fn rewrite_nodes(
+        &mut self,
+        frame: &Frame,
+        work: &[usize],
+        props: &mut Properties,
+        undo: &mut Vec<Undo>,
+        chunks: &mut Vec<(usize, Chunk)>,
+        thumbs: &mut Vec<usize>,
+        text: &mut TextSystem,
+        generation: u64,
+        size: (u32, u32),
+        scale: f32,
+    ) -> Result<bool, Whole> {
         let mut compositing = false;
-        let mut thumbs: Vec<usize> = Vec::new();
         let mut next = work.iter().copied().peekable();
         // Nodes before this index are visited one after another (a subtree
         // whose property state moved).
@@ -755,7 +1294,7 @@ impl Painter {
             if let Some(c) = self.overlay_of.get(i).copied().flatten() {
                 let chunk = Chunk {
                     id: ChunkId(key(&node.path, Role::Overlay)),
-                    state: p.state(),
+                    state: p.over_state(),
                     display: self.chunk(node, Role::Overlay, p.snap, scale, generation, text),
                 };
                 let kept = self.scene.chunks.get(c);
@@ -780,33 +1319,7 @@ impl Painter {
                 _ => return Err(Whole),
             }
         }
-        // The thumbs of the scroll containers visited, at their places.
-        // Sized as the frame: a thumb's region is clipped to it.
-        let mut scene = Scene {
-            size,
-            ..Scene::default()
-        };
-        self.thumbs(
-            frame,
-            &thumbs,
-            &mut scene,
-            &mut Writes {
-                props,
-                undo: Some(undo),
-            },
-            scale,
-            false,
-        );
-        for (&i, chunk) in thumbs.iter().zip(scene.chunks) {
-            let Some(c) = self.thumb_of.get(i).copied().flatten() else {
-                return Err(Whole);
-            };
-            let kept = self.scene.chunks.get(c);
-            if kept.is_none_or(|k| k.state != chunk.state || !Arc::ptr_eq(&k.display, &chunk.display)) {
-                chunks.push((c, chunk));
-            }
-        }
-        Ok((chunks, compositing))
+        Ok(compositing)
     }
 
     /// Whether node `i`'s box the compositor hit-tests changed.
@@ -815,9 +1328,12 @@ impl Painter {
         takes.then(|| hit_box(node)) != self.hit_rect.get(i).copied().flatten()
     }
 
-    /// Whether `node`'s caret shows otherwise than its chunk recorded it.
+    /// Whether `node`'s caret shows otherwise than its overlay chunk, the
+    /// one that draws it, recorded it. (Its box chunk draws none of the
+    /// content and keeps through a blink, so what it holds of the caret is
+    /// as old as its own last recording, not the caret drawn.)
     fn caret_changed(&self, node: &FrameNode) -> bool {
-        let id = ChunkId(key(&node.path, Role::Chunk));
+        let id = ChunkId(key(&node.path, Role::Overlay));
         self.chunks
             .get(&id)
             .is_some_and(|r| matches!(&r.input, Input::Node { caret, .. } if *caret != caret_on(node)))
@@ -829,18 +1345,66 @@ impl Painter {
         let mut scrollers: Vec<ScrollNode> = Vec::new();
         let mut hits: Vec<Hit> = Vec::new();
         let mut moving: Vec<MovingNode> = Vec::new();
+        let was = std::mem::take(&mut self.scroll_instances);
         // The scroll container each node is in, itself when it is one.
         let mut scroller_of: Vec<Option<u32>> = Vec::with_capacity(frame.nodes.len());
+        // Whether a wheel handler is on the node or on an ancestor below
+        // its scroll container (the container itself excluded).
+        let mut wheel_below: Vec<bool> = Vec::with_capacity(frame.nodes.len());
+        // The component instance whose output each node is in (the nearest
+        // marked root above it, itself included): the node's identity, with
+        // its path, which a wheel the UI is handed names.
+        let mut instance_of: Vec<Option<crate::reactive::OwnerId>> = Vec::with_capacity(frame.nodes.len());
         self.hit_rect.clear();
+        // Below the top modal layer the wheel scrolls nothing (ADR-0024):
+        // a window-sized hit in no scroll container, under that layer.
+        let floor = crate::layer::Stack::of(frame).floor;
         for (i, node) in frame.nodes.iter().enumerate() {
+            if i == floor && floor > 0 {
+                hits.push(Hit {
+                    rect: frame.viewport,
+                    shape: crate::shape::Shape::default(),
+                    slop: crate::style::Edges::all(0.0),
+                    transform: 0,
+                    clip: 0,
+                    scroller: None,
+                    wheel: false,
+                    target: crate::compositor::HitTarget {
+                        key: NodeKey(0),
+                        owner: None,
+                    },
+                    below_modal: false,
+                });
+            }
             let p = self.placed.get(i).copied().unwrap_or_default();
             let around = node.parent.and_then(|q| scroller_of.get(q).copied().flatten());
+            let handles = frame.behaviour(i).is_some_and(|b| b.handlers.wheel.is_some());
+            let instance = frame
+                .behaviour(i)
+                .and_then(|b| b.handlers.instance)
+                .or_else(|| node.parent.and_then(|q| instance_of.get(q).copied().flatten()));
+            instance_of.push(instance);
+            // A parent that scrolls ends the run: what is above it is its own.
+            let inherited = node.parent.is_some_and(|q| {
+                frame.nodes.get(q).is_some_and(|n| n.scroll.is_none()) && wheel_below.get(q).copied().unwrap_or(false)
+            });
+            wheel_below.push(node.scroll.is_none() && (handles || inherited));
             let within = match node.scroll {
                 Some(sc) => {
                     let index = u32::try_from(scrollers.len()).ok();
                     let key = NodeKey::of(&node.path);
+                    // Its identity as the UI names it (`interact::owner_of`).
+                    let owner = instance.or_else(|| frame.behaviour(i).and_then(|b| b.handlers.owner));
+                    let identity = (key, owner);
+                    let instance = was.get(&identity).copied().unwrap_or_else(|| {
+                        self.next_scroll = self.next_scroll.wrapping_add(1);
+                        self.next_scroll
+                    });
+                    self.scroll_instances.insert(identity, instance);
                     scrollers.push(ScrollNode {
                         key,
+                        owner,
+                        instance,
                         content: p.content,
                         offset: sc.offset,
                         applied: sc.applied,
@@ -849,6 +1413,9 @@ impl Painter {
                         generation: sc.generation,
                         thumb: self.thumb_nodes.get(&key).copied(),
                         parent: around,
+                        wheel: handles,
+                        wheel_above: inherited,
+                        below_modal: i < floor,
                     });
                     index
                 }
@@ -858,11 +1425,20 @@ impl Painter {
             let takes = frame.behaviour(i).is_some_and(|b| !b.pass_through) && !node.look.invisible;
             self.hit_rect.push(takes.then(|| hit_box(node)));
             if takes {
+                let (rect, shape, slop) = hit_box(node);
                 hits.push(Hit {
-                    rect: hit_box(node),
+                    rect,
+                    shape,
+                    slop,
                     transform: p.transform,
                     clip: p.clip,
                     scroller: within,
+                    wheel: wheel_below.last().copied().unwrap_or(false),
+                    target: crate::compositor::HitTarget {
+                        key: NodeKey::of(&node.path),
+                        owner: instance.or_else(|| frame.behaviour(i).and_then(|b| b.handlers.owner)),
+                    },
+                    below_modal: i < floor,
                 });
             }
             if let Some(m) = &node.moving {
@@ -901,7 +1477,8 @@ impl Painter {
     }
 
     /// The chunks kept and the bytes they hold: each chunk's record, its
-    /// items and its pieces' ids (the memory report's paint owner).
+    /// items and its pieces' ids, and the displays kept to record into
+    /// again (the memory report's paint owner).
     #[must_use]
     pub fn held(&self) -> (usize, u64) {
         let size = |n: usize, each: usize| u64::try_from(n.saturating_mul(each)).unwrap_or(u64::MAX);
@@ -910,6 +1487,14 @@ impl Painter {
             n.saturating_add(size(r.display.items.capacity(), std::mem::size_of::<Item>()))
                 .saturating_add(size(r.pieces.capacity(), std::mem::size_of::<u64>()))
         });
+        // The displays kept to record into again, and those waiting for the
+        // renderer to let go of them.
+        let bytes = bytes.saturating_add(u64::try_from(self.ready.held()).unwrap_or(u64::MAX));
+        let bytes = self.retired.iter().fold(bytes, |n, d| {
+            n.saturating_add(size(d.items.capacity(), std::mem::size_of::<Item>()))
+        });
+        // The scratch a chunk of unknown size records into.
+        let bytes = bytes.saturating_add(size(self.recording.capacity(), std::mem::size_of::<Item>()));
         (self.chunks.len(), bytes)
     }
 
@@ -958,11 +1543,22 @@ impl Painter {
         } else {
             up.content
         };
+        // The clip of the node that clips it: that node's own padding box
+        // and corners, within the clip it lies in itself (one tree of
+        // clips, ADR-0016: the shaders multiply each one's coverage, so a
+        // rounded clip inside another keeps both one's corners; the clip
+        // layout intersected, `node.clip`, only culls).
         let clip = match (node.clipper, node.clip) {
-            (Some(c), Some(bounds)) => {
+            (Some(c), Some(_)) => {
                 let owner = frame.nodes.get(c);
                 let id = owner.map_or(0, |o| self.clips.id(key(&o.path, Role::Clip), now));
-                let space = self.placed.get(c).map_or(0, |o| o.transform);
+                let up = self.placed.get(c);
+                let space = up.map_or(0, |o| o.transform);
+                // One chain across transforms: each clip carries its own
+                // space ([`ClipNode::transform`]), so the clip a transformed
+                // group lies in is its clips' parent as any other is.
+                let parent = up.map_or(0, |o| o.clip);
+                let bounds = owner.map_or(Bounds::default(), crate::clip::clip_box);
                 w.clip(
                     id,
                     ClipNode {
@@ -972,6 +1568,7 @@ impl Painter {
                             curve: node.clip_curve,
                         },
                         transform: space,
+                        parent,
                     },
                 );
                 id
@@ -1000,7 +1597,6 @@ impl Painter {
                     mask: effects::mask_gradient(node),
                     transform,
                     transformed: matrix.is_some(),
-                    clip: if matrix.is_some() { clip } else { 0 },
                     region,
                 },
             );
@@ -1026,15 +1622,40 @@ impl Painter {
             }
             None => transform,
         };
+        // A text input clips its content (its text scrolled under its
+        // content transform, as a scroll container's children are) to its
+        // padding box, moving with it, within the clip of the container
+        // around it, which stays with that container ([`ClipNode::parent`]):
+        // as what is between them scrolls or moves, what comes into the
+        // container shows.
+        let field = if matches!(node.content, Content::Input { .. }) {
+            let b = node.bounds;
+            let radius = node.look.shape.used(b.width, b.height);
+            let (padding, radius) = border_inner(b, radius, node.look.border).unwrap_or((b, radius));
+            let id = self.clips.id(key(&node.path, Role::Clip), now);
+            w.clip(
+                id,
+                ClipNode {
+                    clip: Clip {
+                        bounds: padding,
+                        radius,
+                        curve: node.look.shape.curve(),
+                    },
+                    transform,
+                    parent: clip,
+                },
+            );
+            id
+        } else {
+            0
+        };
         Placed {
             transform,
             content,
             effect,
             clip,
+            field,
             snap: up.snap && matrix.is_none(),
-            // A transformed group applies the clip from outside it once
-            // transformed: what inside it that clip alone clips paints unclipped.
-            lifted: if matrix.is_some() { Some(clip) } else { up.lifted },
         }
     }
 
@@ -1054,7 +1675,14 @@ impl Painter {
         let id = ChunkId(key(&node.path, role));
         let caret = caret_on(node);
         // What it may record: what its clip shows, and a margin.
-        let visible = node.clip.map(|c| c.translated(-node.offset.0, -node.offset.1));
+        // A text input's content (its overlay chunk) lies under its scroll.
+        let scrolled = match (overlay, &node.content, node.scroll) {
+            (true, Content::Input { .. }, Some(s)) => s.applied,
+            _ => (0.0, 0.0),
+        };
+        let visible = node
+            .clip
+            .map(|c| c.translated(-node.offset.0 - scrolled.0, -node.offset.1 - scrolled.1));
         let moved = Moved::of(node);
         if let Some(r) = self.chunks.get_mut(&id)
             && let Input::Node {
@@ -1066,13 +1694,16 @@ impl Painter {
                 cull,
             } = &r.input
         {
+            // A text input's box chunk draws none of its content (its
+            // overlay chunk does): a keystroke or a blink keeps it.
+            let boxed = !overlay && matches!(node.content, Content::Input { .. });
             let same = was.space == node.space
                 && was.space_content == node.space_content
                 && *s == snap
-                && *c == caret
+                && (boxed || *c == caret)
                 && *k == scale
                 && *g == generation
-                && was.content == node.content
+                && (boxed || was.content == node.content)
                 && same_look(&was.look, &node.look);
             let within = match (cull, visible) {
                 (None, _) => true,
@@ -1103,11 +1734,43 @@ impl Painter {
             recorded: true,
         });
         let cull = visible.map(|v| v.outset(CULL_MARGIN));
-        let view = in_space(node);
-        let mut items = Vec::new();
-        drop(text.take_drawn());
+        // A chunk that held as many the last time it recorded (`steady`)
+        // records straight into a display with room for that (`Pool`);
+        // one new, or whose size changed, into scratch first, then moved
+        // into the display that fits what it recorded.
+        let last = self.chunks.get(&id).map(|r| (r.display.items.len(), r.steady));
+        let mut display = match last {
+            Some((held, true)) => Some(self.blank(held)),
+            _ => None,
+        };
+        let mut scratch = std::mem::take(&mut self.recording);
+        scratch.clear();
+        let shared = display.as_mut().is_some_and(|d| Arc::get_mut(d).is_none());
+        debug_assert!(!shared, "a display just taken is shared with nothing");
+        if shared {
+            display = None;
+        }
+        let direct = display.as_mut().and_then(Arc::get_mut);
+        let room = direct.as_ref().map(|d| d.items.capacity());
+        let items: &mut Vec<Item> = match direct {
+            Some(d) => &mut d.items,
+            None => &mut scratch,
+        };
+        // The node as recorded, written over what the chunk kept of it.
+        let mut fresh = None;
+        let view: &FrameNode = match self.chunks.get_mut(&id) {
+            Some(Retained {
+                input: Input::Node { node: kept, .. },
+                ..
+            }) => {
+                in_space_into(node, kept);
+                kept
+            }
+            _ => fresh.insert(Box::new(in_space(node))),
+        };
+        text.clear_drawn();
         let mut target = Target {
-            items: &mut items,
+            items,
             scale,
             size: (u32::MAX / 4, u32::MAX / 4),
             cull,
@@ -1115,33 +1778,86 @@ impl Painter {
         };
         if overlay {
             if !view.look.invisible {
-                record_overlay(&mut target, &view);
+                // A text input's content, under its own clip.
+                if matches!(view.content, Content::Input { .. }) {
+                    record_content(&mut target, view, text, caret);
+                }
+                record_overlay(&mut target, view);
             }
         } else {
-            record_node(&view, &mut target, text, cull, caret);
+            record_node(view, &mut target, text, cull, caret);
         }
-        let pieces = text.take_drawn();
-        text.pin(&pieces);
-        let display = Arc::new(Display::new(items));
-        let input = Input::Node {
-            node: Box::new(view),
-            snap,
-            caret,
-            scale,
-            text: generation,
-            cull,
+        let recorded = target.items.len();
+        // It stays steady while the display taken for what it held the
+        // last time holds what it recorded now, and the other way round
+        // (a chunk that grows and shrinks by turns records through scratch).
+        let grew = room.is_some_and(|room| target.items.capacity() != room);
+        let steady = !grew && last.is_none_or(|(held, _)| like(held, recorded));
+        let display = match display {
+            Some(d) => d,
+            None => {
+                self.recording_peak = self.recording_peak.max(recorded);
+                let mut d = self.blank(recorded);
+                let m = Arc::get_mut(&mut d);
+                debug_assert!(m.is_some(), "a display just taken is shared with nothing");
+                if let Some(m) = m {
+                    m.items.append(&mut scratch);
+                }
+                d
+            }
         };
-        if let Some(old) = self.chunks.insert(
-            id,
-            Retained {
-                input,
-                display: Arc::clone(&display),
-                pieces,
-                properties: moved,
-                seen: now,
-            },
-        ) {
-            text.unpin(&old.pieces);
+        self.recording = scratch;
+        text.pin_drawn();
+        let replaced = match (self.chunks.get_mut(&id), fresh) {
+            (Some(r), None) => {
+                if let Input::Node {
+                    snap: s,
+                    caret: c,
+                    scale: k,
+                    text: g,
+                    cull: was_cull,
+                    ..
+                } = &mut r.input
+                {
+                    (*s, *c, *k, *g, *was_cull) = (snap, caret, scale, generation, cull);
+                }
+                text.unpin(&r.pieces);
+                text.swap_drawn(&mut r.pieces);
+                r.properties = moved;
+                r.seen = now;
+                r.steady = steady;
+                Some(std::mem::replace(&mut r.display, Arc::clone(&display)))
+            }
+            (_, fresh) => {
+                let pieces = text.take_drawn();
+                let input = Input::Node {
+                    node: fresh.unwrap_or_else(|| Box::new(in_space(node))),
+                    snap,
+                    caret,
+                    scale,
+                    text: generation,
+                    cull,
+                };
+                self.chunks
+                    .insert(
+                        id,
+                        Retained {
+                            input,
+                            display: Arc::clone(&display),
+                            pieces,
+                            properties: moved,
+                            seen: now,
+                            steady,
+                        },
+                    )
+                    .map(|old| {
+                        text.unpin(&old.pieces);
+                        old.display
+                    })
+            }
+        };
+        if let Some(old) = replaced {
+            self.retire(old);
         }
         display
     }
@@ -1172,7 +1888,7 @@ impl Painter {
             }
             scene.chunks.push(Chunk {
                 id: ChunkId(key(&node.path, Role::Overlay)),
-                state: p.state(),
+                state: p.over_state(),
                 display,
             });
         }
@@ -1180,11 +1896,13 @@ impl Painter {
 
     /// The thumbs of `scrollers`, each a chunk under a transform its scroll
     /// offset moves: scrolling records nothing again.
+    #[expect(clippy::too_many_arguments, reason = "what a record reads")]
     fn thumbs(
         &mut self,
         frame: &Frame,
         scrollers: &[usize],
-        scene: &mut Scene,
+        out: &mut Vec<Chunk>,
+        size: (u32, u32),
         w: &mut Writes<'_>,
         scale: f32,
         whole: bool,
@@ -1231,7 +1949,7 @@ impl Painter {
                             ..node.bounds
                         },
                         scale,
-                        scene.size,
+                        size,
                     ),
                     ..EffectNode::default()
                 },
@@ -1269,12 +1987,15 @@ impl Painter {
                     width: 6.0,
                     height: thumb_h,
                 };
-                let display = Arc::new(Display::new(vec![Item::RoundedRect {
-                    bounds: thumb,
-                    radius: Corners::all(3.0),
-                    color: scroll.thumb,
-                }]));
-                self.chunks.insert(
+                let mut display = self.blank(1);
+                if let Some(d) = Arc::get_mut(&mut display) {
+                    d.items.push(Item::RoundedRect {
+                        bounds: thumb,
+                        radius: Corners::all(3.0),
+                        color: scroll.thumb,
+                    });
+                }
+                if let Some(old) = self.chunks.insert(
                     id,
                     Retained {
                         input: Input::Thumb {
@@ -1287,14 +2008,17 @@ impl Painter {
                         pieces: Vec::new(),
                         properties: Moved::of(node),
                         seen: now,
+                        steady: true,
                     },
-                );
+                ) {
+                    self.retire(old.display);
+                }
                 display
             };
             if whole && let Some(t) = self.thumb_of.get_mut(i) {
-                *t = Some(scene.chunks.len());
+                *t = Some(out.len());
             }
-            scene.chunks.push(Chunk {
+            out.push(Chunk {
                 id,
                 state: State {
                     transform,
@@ -1309,9 +2033,10 @@ impl Painter {
     /// The scene `frame` records into from nothing (the debug check that
     /// incremental paint equals cold): nothing it records stays pinned or
     /// scheduled.
+    #[cfg(debug_assertions)]
     pub(crate) fn cold(frame: &Frame, text: &mut TextSystem, size: (u32, u32), scale: f32, background: Color) -> Scene {
         let mut p = Self::default();
-        let _ = p.record(frame, text, size, scale, background, true);
+        p.record(frame, text, size, scale, background, true, &mut Commit::default());
         p.schedule_blink(false);
         for r in p.chunks.values() {
             text.unpin(&r.pieces);
@@ -1343,7 +2068,10 @@ fn record_node(node: &FrameNode, target: &mut Target<'_>, text: &mut TextSystem,
         return;
     }
     record_box(target, node, text);
-    record_content(target, node, text, caret);
+    // A text input's content is its overlay chunk's, clipped ([`Placed::field`]).
+    if !matches!(node.content, Content::Input { .. }) {
+        record_content(target, node, text, caret);
+    }
 }
 
 fn record_box(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSystem) {
@@ -1635,18 +2363,19 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
             ..
         } => {
             let area = &node.content_box;
-            let it = input_text(text, &edit.text, t, *area, *multiline, edit.caret);
+            // Under the field's scroll offset (its content transform) and
+            // clipped to it ([`Placed::field`]): laid out unscrolled.
+            let it = input_text(text, &edit.text, t, *area, *multiline, *focused, (0.0, 0.0));
             let (line_t, width, origin) = (it.t, it.width, it.origin);
             let caret = text.caret(&edit.text, &line_t, width, edit.caret);
             if *focused && edit.has_selection() {
                 let (from, to) = edit.selection();
-                for r in text.selection(&edit.text, &line_t, width, from, to) {
+                for r in text.selection(&*edit.text, &line_t, width, from, to) {
                     let b = Bounds {
                         x: origin.0 + r.x,
                         y: origin.1 + r.y,
                         ..r
-                    }
-                    .intersect(&area.outset(1.0));
+                    };
                     target.fill_rect(b, *selection_color);
                 }
             }
@@ -1656,32 +2385,37 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
                     placeholder.as_str(),
                     &ResolvedText {
                         color: *placeholder_color,
-                        ..line_t
+                        ..line_t.clone()
                     },
                     width,
                     origin,
                     1.0,
                 );
             } else {
-                text.draw(target, edit.text.as_str(), &line_t, width, origin, 1.0);
+                text.draw(target, &*edit.text, &line_t, width, origin, 1.0);
             }
             // What an input method is composing is underlined, as a
             // browser marks a composition, until it is committed.
             if let Some((from, to)) = *preedit {
-                for r in text.selection(&edit.text, &line_t, width, from, to) {
+                for r in text.selection(&*edit.text, &line_t, width, from, to) {
                     let b = Bounds {
                         x: origin.0 + r.x,
                         y: origin.1 + r.y + r.height - 1.0,
                         width: r.width,
                         height: 1.0,
-                    }
-                    .intersect(&area.outset(1.0));
+                    };
                     target.fill_rect(b, t.color);
                 }
             }
             if caret_shown {
                 let b = Bounds {
-                    x: (origin.0 + caret.x).min(area.right() - 1.0),
+                    // Kept in a box its text wraps or is aligned in (one
+                    // that scrolls holds its caret's pixel: `field_reach`).
+                    x: if width.is_some() {
+                        (origin.0 + caret.x).min(area.right() - 1.0)
+                    } else {
+                        origin.0 + caret.x
+                    },
                     y: origin.1 + caret.y,
                     width: 1.0,
                     height: caret.height,
@@ -1716,14 +2450,13 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
         p.effect_chain(id, 0)
             .map(|(_, e)| {
                 format!(
-                    "{} {:?} {:?} {} {:?} {:?} {:?}",
+                    "{} {:?} {:?} {} {:?} {:?}",
                     e.opacity,
                     e.filters,
                     e.mask,
                     e.transformed,
                     e.region,
                     transforms(p, e.transform),
-                    clip(p, e.clip)
                 )
             })
             .collect::<Vec<_>>()
@@ -1828,4 +2561,182 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
         }
     }
     None
+}
+
+#[cfg(test)]
+#[expect(clippy::arithmetic_side_effects, reason = "test rooms are far from overflowing")]
+mod tests {
+    use super::*;
+
+    fn display(room: usize) -> Arc<Display> {
+        Arc::new(Display::new(Vec::with_capacity(room)))
+    }
+
+    /// A display that held as many items as its room.
+    fn filled(room: usize) -> Arc<Display> {
+        let item = Item::RoundedRect {
+            bounds: Bounds::default(),
+            radius: Corners::all(0.0),
+            color: Color::BLACK,
+        };
+        Arc::new(Display::new(vec![item; room]))
+    }
+
+    /// Rooms past [`LARGE_BYTES`].
+    fn large_room() -> usize {
+        LARGE_BYTES / std::mem::size_of::<Item>() + 1
+    }
+
+    fn rooms(pool: &mut Pool, wants: &[usize]) -> Vec<Option<usize>> {
+        wants
+            .iter()
+            .map(|&w| pool.take(w).map(|d| d.items.capacity()))
+            .collect()
+    }
+
+    #[test]
+    fn a_display_is_taken_from_the_class_whose_least_room_holds_what_is_wanted() {
+        let mut pool = Pool::default();
+        for want in [3, 9, 1000, 0] {
+            pool.keep(display(room_for(want)), 0);
+        }
+        assert_eq!(pool.count, 4);
+        // A want of 2 takes from class 2 (rooms 2 to 3), which holds none:
+        // the display of room 4 is class 3's, for a want of 3 to 4.
+        assert_eq!(
+            rooms(&mut pool, &[2, 4, 16, 600, 0, 1]),
+            [None, Some(4), Some(16), Some(1024), Some(0), None]
+        );
+        assert_eq!((pool.count, pool.bytes), (0, 0));
+    }
+
+    #[test]
+    fn the_pool_keeps_room_for_its_working_set_and_lets_it_go_idle() {
+        // Records that each take a thousand displays: the thousand freed
+        // are kept, past READY; idle, the caps fall back and what waited
+        // goes.
+        let mut pool = Pool::default();
+        for _ in 0..3 {
+            for _ in 0..1000 {
+                pool.take(4);
+            }
+            for _ in 0..1000 {
+                pool.keep(display(4), 0);
+            }
+            pool.age();
+        }
+        assert!(pool.count >= 1000, "{} kept", pool.count);
+        for _ in 0..3 * AGE {
+            pool.age();
+        }
+        assert_eq!(pool.caps(), (READY, READY_BYTES));
+        assert_eq!(pool.count, 0);
+    }
+
+    #[test]
+    fn each_class_lets_go_of_what_waited_past_its_age() {
+        let mut pool = Pool::default();
+        pool.keep(display(8), 0);
+        pool.age();
+        pool.keep(display(8), 0);
+        pool.keep(display(large_room()), 0);
+        for _ in 1..AGE {
+            pool.age();
+        }
+        assert_eq!((pool.count, pool.large.len()), (2, 1));
+        pool.age();
+        assert_eq!(
+            (pool.count, pool.large.len()),
+            (1, 1),
+            "the older of class 4 goes first"
+        );
+        pool.age();
+        assert_eq!((pool.count, pool.large.len(), pool.held()), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_full_pool_lets_the_oldest_of_its_largest_class_give_way() {
+        let mut pool = Pool::default();
+        let big = room_for(large_room() / 4);
+        for _ in 0..64 {
+            pool.keep(display(big), 0);
+        }
+        let fit = pool.count;
+        assert!(fit < 64 && pool.bytes <= READY_BYTES, "{fit} kept");
+        // Beside displays waiting for the renderer that fill the rest.
+        let waiting = READY_BYTES - pool.bytes - item_bytes(4) + 1;
+        pool.keep(display(4), waiting);
+        assert_eq!(pool.count, fit, "one big gave way to the small one");
+        assert_eq!(rooms(&mut pool, &[3]), [Some(4)]);
+        // One no smaller than any kept is let go instead.
+        pool.keep(display(big), READY_BYTES);
+        assert_eq!(pool.count, fit - 1);
+    }
+
+    /// The large displays the renderer still draws stay out of the small
+    /// displays' bytes, and whether one let go of is kept does not hang on
+    /// where it sits among those retired.
+    #[test]
+    fn large_displays_are_kept_apart_from_the_small_ones() {
+        for held_first in [true, false] {
+            let mut painter = Painter::default();
+            let drawn = filled(large_room() * 8);
+            let small = display(16);
+            let freed_large = filled(large_room());
+            assert!(item_bytes(drawn.items.capacity()) > READY_BYTES);
+            let mut retired = vec![Arc::clone(&drawn), small, freed_large];
+            if !held_first {
+                retired.reverse();
+            }
+            painter.retired = retired;
+            painter.reclaim();
+            assert_eq!(painter.retired.len(), 1, "the drawn one waits");
+            assert_eq!((painter.ready.count, painter.ready.large.len()), (1, 1));
+            assert_eq!(painter.ready.bytes, item_bytes(16));
+            let held = painter.held().1;
+            let want = item_bytes(16) + item_bytes(large_room()) + item_bytes(drawn.items.capacity());
+            assert!(held >= u64::try_from(want).unwrap_or(u64::MAX), "held {held}");
+        }
+    }
+
+    #[test]
+    fn the_large_slots_keep_the_latest_large_displays() {
+        let mut pool = Pool::default();
+        for k in 1..=3 {
+            pool.keep(display(large_room() * k), 0);
+            pool.age();
+        }
+        assert_eq!(pool.large.len(), LARGE);
+        assert_eq!(
+            rooms(&mut pool, &[large_room()]),
+            [Some(large_room() * 2)],
+            "the oldest gave way"
+        );
+        assert_eq!(pool.held(), item_bytes(large_room() * 3));
+    }
+
+    /// The scratch a chunk of unknown size records into counts as held,
+    /// and a large room it no longer uses is let go after [`AGE`] records.
+    #[test]
+    fn a_large_scratch_left_unused_is_cut() {
+        let mut painter = Painter {
+            recording: Vec::with_capacity(large_room()),
+            ..Painter::default()
+        };
+        let before = painter.held().1;
+        assert!(before >= u64::try_from(item_bytes(large_room())).unwrap_or(u64::MAX));
+        for _ in 1..AGE {
+            painter.recording_peak = 1;
+            painter.reclaim();
+        }
+        assert_eq!(painter.recording.capacity(), large_room());
+        // Used to the full once: it counts again from there.
+        painter.recording_peak = large_room();
+        painter.reclaim();
+        for _ in 0..AGE {
+            painter.reclaim();
+        }
+        assert!(painter.recording.capacity() < large_room());
+        assert!(painter.held().1 < before);
+    }
 }

@@ -33,8 +33,8 @@ struct ChunkItem {
 
 @group(0) @binding(0) var<uniform> chunk_globals: ChunkGlobals;
 @group(0) @binding(1) var<uniform> chunk_item: ChunkItem;
-// Four vec4s per clip: rect, radii, the map from the window into the
-// clip's space (a, b, c, d), (e, f, its scale, its corners' curve). Clip 0 is none.
+// Clip entries (`PCLIP` in `common.wgsl`), read in the target's space.
+// Clip 0 is none.
 @group(0) @binding(2) var<storage, read> chunk_clips: array<vec4<f32>>;
 
 // Texture pixel `p` as a clip-space position in the pass.
@@ -48,12 +48,17 @@ fn chunk_local(frag: vec2<f32>) -> vec2<f32> {
     return frag + chunk_globals.origin - chunk_item.origin;
 }
 
+// Clip entry `id` and the rest of its chain, their coverages multiplied.
 fn chunk_clip_coverage(id: u32, p: vec2<f32>) -> f32 {
-    if (id == 0u) {
-        return 1.0;
+    var cov = 1.0;
+    var e = id;
+    let n = arrayLength(&chunk_clips) / PCLIP;
+    for (var d = 0u; d < n && e != 0u; d = d + 1u) {
+        let at = e * PCLIP;
+        cov = cov * clip_entry_cov(chunk_clips[at], chunk_clips[at + 1u], chunk_clips[at + 2u], chunk_clips[at + 3u], p);
+        e = bitcast<u32>(chunk_clips[at + 4u].x);
     }
-    let at = id * 4u;
-    return clip_entry_cov(chunk_clips[at], chunk_clips[at + 1u], chunk_clips[at + 2u], chunk_clips[at + 3u], p);
+    return cov;
 }
 
 // What a fragment at `frag` keeps of its colour: the clip and the fade.

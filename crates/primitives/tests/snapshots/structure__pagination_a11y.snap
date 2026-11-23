@@ -1,0 +1,31 @@
+---
+source: crates/primitives/tests/structure.rs
+assertion_line: 613
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      Navigation
+        Button "First Page" disabled
+          Label "First" disabled
+        Button "Previous Page" disabled
+          Label "Prev" disabled
+        Button "Page 1" current=Page
+          Label "1"
+        Button "Page 2"
+          Label "2"
+        Button "Page 3"
+          Label "3"
+        Button "Page 4"
+          Label "4"
+        Button "Page 5"
+          Label "5"
+        GenericContainer
+          Label "…"
+        Button "Page 10"
+          Label "10"
+        Button "Next Page"
+          Label "Next"
+        Button "Last Page"
+          Label "Last"

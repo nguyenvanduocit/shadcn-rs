@@ -18,6 +18,16 @@ itself.
   its merit reason: a worse result, added latency, unsafety, incorrectness.
   Aim at what other toolkits consider out of reach: lists of millions of
   items, charts of millions of points, zoomable canvases, all at display rate.
+- **Be the first to solve it.** Everything that exists carries old limits:
+  web compatibility, a small team, or owning only one layer of the stack (an
+  OS compositor that cannot see what an app draws, a layout engine that
+  cannot see who read what, a renderer that cannot see the next frame). We
+  own the whole stack, from signal to pixel, and have AI and abundant
+  resources. Treat an open problem in the field (input-to-photon latency,
+  deterministic replay, provable incrementality, typography beyond the
+  browser, colour and HDR, energy, apps that AI agents can operate) as ours
+  to solve first, not as a known limit to accept. Start from what only we
+  know or own.
 - **Measurement verifies, it does not gate.** Bench, stress and devtools
   (ADR-0008, ADR-0010) prove a design delivers and catch regressions. They are
   not a precondition for building the right thing.
@@ -33,9 +43,12 @@ itself.
 - **No hot reload.** It is not a goal; nothing is designed around it.
 - **Decisions are recorded.** A changed standing decision gets a new ADR that
   supersedes the old one (`docs/adr/README.md`).
-- **Read the sources.** Reference implementations live in `references/`. Read
-  the matching one before designing, and match its guarantees or write down
-  why we differ.
+- **Read the sources for their problems.** Reference implementations live in
+  `references/`; their issue trackers and forks show where they broke. Read
+  the matching ones before designing, to learn the failure modes, the
+  evidence and the numbers. Their fix is one data point shaped by their
+  limits, not the recommendation: design our own answer from what only we
+  know, match their guarantees or exceed them, and write down why we differ.
 
 ## Target architecture
 

@@ -40,7 +40,7 @@ pub fn render() -> Render {
     // One checkbox state per checkbox on the page, made once.
     let b: [Signal<bool>; 10] = std::array::from_fn(|i| Signal::new(matches!(i, 0 | 1 | 6)));
     let compute = Signal::labeled("compute", Some("kubernetes".to_owned()));
-    let price = Signal::labeled("price", vec![200.0_f32, 800.0]);
+    let price = Signal::labeled("price", vec![200.0_f64, 800.0]);
     Box::new(move || {
         let months = ["01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12"];
         let years = ["2024", "2025", "2026", "2027", "2028", "2029"];

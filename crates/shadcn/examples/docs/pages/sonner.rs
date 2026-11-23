@@ -13,7 +13,7 @@ use crate::{Render, Shot, demo, motion_frames, page};
 fn event_created() -> Toast {
     Toast::new(ToastKind::Default, "Event has been created")
         .description("Sunday, December 03, 2023 at 9:00 AM")
-        .action("Undo", || {})
+        .action("Undo", |()| {})
 }
 
 pub fn render() -> Render {

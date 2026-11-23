@@ -7,6 +7,7 @@ pub mod app;
 mod cache;
 pub mod canvas;
 pub mod chunk;
+mod clip;
 pub mod clipboard;
 pub mod clock;
 pub mod color;
@@ -17,17 +18,23 @@ pub mod devtools;
 pub mod edit;
 mod effects;
 pub mod element;
+#[doc(hidden)]
+pub mod engine;
+pub mod environment;
 pub mod events;
 pub mod figure;
 pub mod focus;
 pub mod geometry;
+pub mod gesture;
 pub mod gpu;
 pub mod heap;
+pub mod holder;
 pub mod icon;
 pub mod image;
 pub mod inspect;
 pub mod instructions;
 pub mod interact;
+pub mod layer;
 pub mod layout;
 pub mod list;
 pub mod mailbox;
@@ -49,35 +56,41 @@ pub mod sum_tree;
 mod svg;
 pub mod testing;
 pub mod text;
-pub mod time_input;
 pub mod value;
 pub mod window;
 
+pub use access::NodeRef;
 pub use app::{DebugTools, RunOptions, Scenario, ScenarioError, offscreen, run, snapshot};
 pub use color::Color;
 pub use component::{
-    Bind, Callback, ComponentElement, Ctx, Model, Priority, Root, Shared, Slot, UseModel, after_layout, component,
-    idle, on_mounted, on_unmounted, on_updated, provide, use_context, use_model, with_priority,
+    Bind, Callback, ComponentElement, Ctx, Derive, Model, Owner, Priority, Root, Shared, Slot, UseModel, after_layout,
+    component, idle, on_mounted, on_unmounted, on_updated, provide, use_context, use_model, with_priority,
 };
 pub use edit::{Preedit, TextEdit, TextField};
 pub use element::{
-    Deferred, Div, Drawn, Element, ElementKey, Figures, IconElement, Image, InputMode, InputType, IntoElement,
-    Positioning, Role, Semantics, Side, SideAlign, Span, Text, TextInput, Toggled, View, deferred, div, drawing,
-    figures, icon, image, key_of, span, text, text_bound, text_input,
+    Announce, AriaCurrent, AutoComplete, Deferred, Div, Drawn, Element, ElementKey, Figures, HasPopup, IconElement,
+    Image, InputMode, InputType, IntoElement, Live, Positioning, Relations, Role, Semantics, Side, SideAlign, Span,
+    Text, TextInput, Toggled, ValueRange, View, deferred, div, drawing, figures, icon, image, key_of, span, text,
+    text_bound, text_input,
 };
 pub use events::{
-    ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey, PointerEvent, WheelEvent,
+    CaptureGroup, ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey, PointerEvent,
+    PointerId, TouchEvent, TouchPhase, WheelEvent,
 };
 pub use figure::{Cap, Dash, Draw, Figure, FillRule, Join, Path, PathBuilder, PathStyle, Stroke};
-pub use focus::FocusHandle;
+pub use focus::{AutoFocus, FocusHandle, FocusScope, Modality};
 pub use geometry::Bounds;
+pub use holder::{Holder, Keyed, Registration, Registry, while_mounted};
 pub use icon::{Icon, SvgIcon};
 pub use image::{ImageSource, Pixels, PixelsError, demultiply};
 pub use interact::Interaction;
+pub use layer::{
+    Dismiss, DismissPolicy, DismissReason, Layer, LayerHandle, PointerButton, PointerKind, PointerOutside,
+};
 pub use list::{ListState, virtual_list};
 pub use mailbox::{Sender, mailbox};
 pub use members::Members;
-pub use motion::{Animation, Easing, Motion, Properties, Slide};
+pub use motion::{Animation, Easing, Motion, Properties, Slide, Stage};
 pub use place::Place;
 pub use placement::Placement;
 pub use reactive::{
@@ -92,7 +105,6 @@ pub use style::{
     StopColor, Stops, Style, TextAlign, TextStyle, Track, Tracks, WrapStyle, pct, px,
 };
 pub use styled::{Fluent, Styled};
-pub use time_input::{TimeInput, time_input};
 
 /// The traits a component file needs in scope, and the values its setters take.
 pub mod prelude {

@@ -1,0 +1,11 @@
+---
+source: crates/primitives/tests/form_controls.rs
+assertion_line: 1500
+expression: tree
+---
+Window "w"
+  RadioGroup "Plan" required Vertical
+    RadioButton True
+      Label "x"
+    RadioButton False disabled
+      Label "y" disabled

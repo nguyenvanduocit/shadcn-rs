@@ -192,3 +192,66 @@ fn a_hover_redraws_its_chunk_and_its_shadow_alone() {
         r.drawn.damage
     );
 }
+
+/// A list that grows to many rows of different sizes (every fifth casts
+/// eight shadows) and shrinks back, again and again: the displays its rows
+/// leave are kept to record into, by room, within the pool's bounds, so
+/// what paint holds after each shrink is the same from the second cycle on.
+#[test]
+fn paint_holds_the_same_across_grow_and_shrink_cycles() {
+    let n = Signal::new(400_usize);
+    let mut s = Scenario::measuring(
+        move || {
+            div()
+                .display(Display::Flex)
+                .flex_direction(FlexDirection::Column)
+                .children((0..n.get()).map(|i| {
+                    let row = div()
+                        .height(4.0)
+                        .background(if i % 2 == 0 { Color::hex(0xf4f4f5) } else { Color::WHITE })
+                        .child(text(format!("{i}")));
+                    if i % 5 == 0 {
+                        let cast = Shadow {
+                            x: 0.0,
+                            y: 1.0,
+                            blur: 2.0,
+                            spread: 0.0,
+                            color: Color::BLACK,
+                        };
+                        row.shadow(gui::style::Shadows::repeat(8, cast))
+                    } else {
+                        row
+                    }
+                }))
+                .into_element()
+        },
+        300,
+        2000,
+        1.0,
+    )
+    .expect("a scenario");
+    let paint = |s: &Scenario| {
+        s.owners()
+            .into_iter()
+            .find(|o| o.name == "paint")
+            .map_or(u64::MAX, |o| o.bytes)
+    };
+    let mut held = Vec::new();
+    for cycle in 0..6 {
+        for (rows, step) in [(400, "grow"), (20, "shrink")] {
+            s.act(step, || n.set(rows));
+            s.settle().expect("a frame");
+            s.settle().expect("a frame");
+        }
+        held.push(paint(&s));
+        assert!(
+            held.last().is_some_and(|&b| b < (4 << 20)),
+            "cycle {cycle}: paint holds {held:?}"
+        );
+    }
+    let steady = held.get(1).copied().unwrap_or_default();
+    assert!(
+        held.iter().skip(1).all(|&b| b == steady),
+        "paint holds the same after each shrink from the second cycle: {held:?}"
+    );
+}

@@ -1,0 +1,16 @@
+---
+source: crates/primitives/tests/form_controls.rs
+expression: tree
+---
+Window "w"
+  GenericContainer
+    Group
+      Button "Decrease"
+      SpinButton "3" (Number field) value=3 in 0..=10
+        TextRun "3"
+      Button "Increase"
+    Group
+      Button "Decrease"
+      SpinButton "3" (Number field) value=3 in ..=
+        TextRun "3"
+      Button "Increase"

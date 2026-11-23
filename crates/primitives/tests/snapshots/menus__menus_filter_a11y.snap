@@ -1,0 +1,21 @@
+---
+source: crates/primitives/tests/menus.rs
+expression: dump(&tree)
+---
+Window "w"
+  GenericContainer hidden
+    Button expanded=true haspopup=Menu controls=Menu
+      Label "Open"
+  Menu Vertical labelled-by=Button
+    SearchInput ""
+      TextRun ""
+    MenuItem
+      Label "Apple"
+    MenuItem
+      Label "Banana"
+    MenuItem disabled
+      Label "Cherry" disabled
+    MenuItem
+      Label "Date"
+    MenuItem
+      Label "Elder"

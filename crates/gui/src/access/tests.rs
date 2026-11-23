@@ -93,7 +93,7 @@ fn a_screen_reader_reads_names_roles_and_focus_and_can_press_and_type() {
 // ── A1: only what changed ────────────────────────────────────────────────────
 
 /// A label and `items` clickable rows under one parent.
-fn page(label: Signal<String>, items: Signal<usize>) -> impl FnMut() -> Element {
+fn page(label: Signal<String>, items: Signal<usize>) -> impl Fn() -> Element {
     move || {
         div()
             .display(Display::Flex)
@@ -212,7 +212,7 @@ fn incremental_updates_keep_accesskits_contract_and_equal_the_whole_tree() {
     let items = Signal::labeled("items", 3_usize);
     let field = TextField::new("type here");
     let f = field;
-    let mut page = page(label, items);
+    let page = page(label, items);
     let mut s = Scenario::measuring(
         move || {
             div()
@@ -576,4 +576,474 @@ fn a_scroll_sends_the_container_alone() {
     assert_eq!(t.as_coeffs()[5], -45.0);
     tree.update_and_process_changes(u, &mut Quiet);
     assert_eq!(held(&tree), by_id(&full(&mut s)));
+}
+
+#[test]
+fn what_an_unavailable_node_holds_is_read_as_disabled_and_keeps_its_focus_and_clicks() {
+    let off = Signal::labeled("unavailable", false);
+    let mut s = Scenario::measuring(
+        move || {
+            div()
+                .role(Role::Group)
+                .aria_label("Group")
+                .unavailable(off.get())
+                .child(
+                    div()
+                        .role(Role::Button)
+                        .aria_label("Inner")
+                        .focusable()
+                        .on_click(|_| {})
+                        .child(div().role(Role::Image).aria_label("Glyph")),
+                )
+                .into_element()
+        },
+        200,
+        100,
+        1.0,
+    )
+    .unwrap();
+    s.check_cold(true);
+    let find = |u: &TreeUpdate, role: Role| {
+        u.nodes
+            .iter()
+            .find(|(_, n)| n.role() == role)
+            .map(|(_, n)| n.clone())
+            .unwrap_or_else(|| panic!("a {role:?} node in {:?}", u.nodes))
+    };
+    let first = update(&mut s);
+    assert!(!find(&first, Role::Group).is_disabled());
+    assert!(!find(&first, Role::Button).is_disabled());
+
+    s.act("unavailable", || off.set(true));
+    let now = update(&mut s);
+    let (group, button, glyph) = (
+        find(&now, Role::Group),
+        find(&now, Role::Button),
+        find(&now, Role::Image),
+    );
+    assert!(group.is_disabled(), "the unavailable node is read as disabled");
+    assert!(
+        button.is_disabled(),
+        "and what it holds, as Chrome reads aria-disabled's descendants"
+    );
+    assert!(glyph.is_disabled(), "all the way down");
+    assert!(button.supports_action(Action::Focus), "it keeps its focus");
+    assert!(button.supports_action(Action::Click), "and its own click");
+    let whole = by_id(&full(&mut s));
+    for (id, n) in &now.nodes {
+        assert_eq!(whole.get(id), Some(n), "the update equals the tree read whole");
+    }
+
+    s.act("available", || off.set(false));
+    let back = update(&mut s);
+    assert!(!find(&back, Role::Button).is_disabled(), "available again, it is not");
+    assert!(!find(&back, Role::Image).is_disabled());
+}
+
+#[test]
+fn a_word_back_from_the_end_of_a_full_run_is_its_last_word() {
+    // 256 characters on one line: AccessKit counts a run's positions in a
+    // `u8`, so a run holds at most 255, its end (255) still one. From the
+    // text's end a screen reader's word back is "bc", at 254.
+    let content = format!("{}bc", "a ".repeat(127));
+    let field = TextField::new(content.as_str());
+    let f = field;
+    let mut s = Scenario::measuring(
+        move || div().child(text_input(&f).width(4000.0)).into_element(),
+        4100,
+        100,
+        1.0,
+    )
+    .unwrap();
+    s.settle().unwrap();
+    let u = full(&mut s);
+    let ((input_id, _), runs) = input_and_runs(&u, Role::TextInput);
+    for (_, r) in &runs {
+        assert!(
+            r.character_lengths().len() <= 255,
+            "a run of {}",
+            r.character_lengths().len()
+        );
+    }
+    let tree = Tree::new(u, true);
+    let state = tree.state();
+    let node = state.node_by_tree_local_id(input_id, TreeId::ROOT).unwrap();
+    let back = node.document_end().backward_to_word_start();
+    assert_eq!(back.to_global_usv_index(), 254, "the last word's start");
+}
+
+#[test]
+fn a_clamped_fields_runs_keep_its_lines_and_agree_with_its_hits() {
+    // A multiline field clamped to two lines, not being edited: its runs
+    // are linked line by line, two lines in all (what the clamp hides is
+    // read on the second, zero wide at the ellipsis), and a point over the
+    // ellipsis is the text's end for a screen reader as for the pointer.
+    let field = TextField::new("one two three four five six seven eight nine ten eleven twelve");
+    let f = field;
+    let mut s = Scenario::measuring(
+        move || {
+            div()
+                .child(text_input(&f).width(120.0).multiline().height(80.0).line_clamp(2))
+                .into_element()
+        },
+        300,
+        200,
+        1.0,
+    )
+    .unwrap();
+    s.settle().unwrap();
+    let u = full(&mut s);
+    let ((input_id, _), runs) = input_and_runs(&u, Role::MultilineTextInput);
+    let starts = runs.iter().filter(|(_, n)| n.previous_on_line().is_none()).count();
+    assert_eq!(starts, 2, "two lines: {runs:?}");
+    for (i, (id, n)) in runs.iter().enumerate() {
+        if let Some(before) = n.previous_on_line() {
+            assert_eq!(before, runs[i - 1].0);
+            assert_eq!(runs[i - 1].1.next_on_line(), Some(*id));
+        }
+    }
+    // The hidden text's runs sit at the ellipsis's start.
+    let last = runs.last().unwrap().1.bounds().unwrap();
+    let (x, y) = (last.x0 + 2.0, (last.y0 + last.y1) / 2.0);
+    let tree = Tree::new(u, true);
+    let state = tree.state();
+    let node = state.node_by_tree_local_id(input_id, TreeId::ROOT).unwrap();
+    assert!(
+        node.text_position_at_point(accesskit::Point::new(x, y))
+            .is_document_end()
+    );
+    let frame = s.pipeline().frame();
+    let n = frame
+        .nodes
+        .iter()
+        .find(|n| matches!(n.content, Content::Input { .. }))
+        .unwrap();
+    let Content::Input {
+        edit,
+        text: t,
+        multiline,
+        ..
+    } = &n.content
+    else {
+        unreachable!()
+    };
+    let mut ts = TextSystem::new();
+    let it = crate::layout::input_text(
+        &mut ts,
+        &edit.text,
+        t,
+        n.content_box,
+        *multiline,
+        false,
+        n.scroll.map_or((0.0, 0.0), |s| s.applied),
+    );
+    let at = ts.hit(
+        &edit.text,
+        &it.t,
+        it.width,
+        crate::convert::f64_to_f32(x) - it.origin.0,
+        crate::convert::f64_to_f32(y) - it.origin.1,
+    );
+    assert_eq!(at, edit.text.len(), "the pointer finds the end there too");
+}
+
+#[test]
+fn a_point_over_a_clamped_fields_ellipsis_is_its_end_in_either_direction() {
+    // A field clamped to one line, not being edited, right to left (its
+    // ellipsis left of its first run) and left to right: a screen reader's
+    // point over the ellipsis is the text's end, as the pointer's hit is.
+    for (content, direction) in [
+        (
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd} \u{5e2}\u{5d5}\u{5dc}\u{5dd} \u{5d6}\u{5d4} \u{5d8}\u{5e7}\u{5e1}\u{5d8} \u{5d0}\u{5e8}\u{5d5}\u{5da} \u{5de}\u{5d0}\u{5d5}\u{5d3}",
+            Direction::Rtl,
+        ),
+        ("one two three four five six seven eight", Direction::Ltr),
+    ] {
+        let field = TextField::new(content);
+        let f = field;
+        let mut s = Scenario::measuring(
+            move || {
+                div()
+                    .child(
+                        text_input(&f)
+                            .width(120.0)
+                            .multiline()
+                            .height(80.0)
+                            .line_clamp(1)
+                            .direction(direction),
+                    )
+                    .into_element()
+            },
+            300,
+            200,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        let frame = s.pipeline().frame();
+        let n = frame
+            .nodes
+            .iter()
+            .find(|n| matches!(n.content, Content::Input { .. }))
+            .unwrap()
+            .clone();
+        let Content::Input {
+            edit,
+            text: t,
+            multiline,
+            ..
+        } = &n.content
+        else {
+            unreachable!()
+        };
+        let mut ts = TextSystem::new();
+        let it = crate::layout::input_text(
+            &mut ts,
+            &edit.text,
+            t,
+            n.content_box,
+            *multiline,
+            false,
+            n.scroll.map_or((0.0, 0.0), |s| s.applied),
+        );
+        // The kept text ends by the ellipsis, which is on its end side.
+        let edge = ts.caret(&edit.text, &it.t, it.width, edit.text.len());
+        let x = if direction == Direction::Rtl {
+            edge.x - 3.0
+        } else {
+            edge.x + 3.0
+        };
+        let y = edge.y + edge.height / 2.0;
+        assert_eq!(
+            ts.hit(&edit.text, &it.t, it.width, x, y),
+            edit.text.len(),
+            "{direction:?}: the pointer finds the end"
+        );
+        let u = full(&mut s);
+        let ((input_id, _), _) = input_and_runs(&u, Role::MultilineTextInput);
+        let tree = Tree::new(u, true);
+        let state = tree.state();
+        let node = state.node_by_tree_local_id(input_id, TreeId::ROOT).unwrap();
+        let point = accesskit::Point::new(f64::from(x + it.origin.0), f64::from(y + it.origin.1));
+        assert!(
+            node.text_position_at_point(point).is_document_end(),
+            "{direction:?}: a screen reader finds the end"
+        );
+    }
+}
+
+#[test]
+fn a_point_over_a_truncated_fields_ellipsis_is_its_end_in_either_direction() {
+    // A field truncated, not being edited: its one line is one word, one
+    // run of one direction, which the cut splits into what shows and what
+    // is hidden (read at the ellipsis, right to left as left to right): a
+    // screen reader's point over the ellipsis is the text's end, as the
+    // pointer's hit is.
+    for (content, direction) in [
+        (
+            "\u{5e9}\u{5dc}\u{5d5}\u{5dd}\u{5e2}\u{5d5}\u{5dc}\u{5dd}\u{5d6}\u{5d4}\u{5d8}\u{5e7}\u{5e1}\u{5d8}\u{5d0}\u{5e8}\u{5d5}\u{5da}\u{5de}\u{5d0}\u{5d5}\u{5d3}\u{5e9}\u{5dc}\u{5d5}\u{5dd}",
+            Direction::Rtl,
+        ),
+        ("onetwothreefourfivesixseveneightnine", Direction::Ltr),
+    ] {
+        let field = TextField::new(content);
+        let f = field;
+        let mut s = Scenario::measuring(
+            move || {
+                div()
+                    .child(
+                        text_input(&f)
+                            .width(120.0)
+                            .multiline()
+                            .height(80.0)
+                            .truncate(true)
+                            .direction(direction),
+                    )
+                    .into_element()
+            },
+            300,
+            200,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        let frame = s.pipeline().frame();
+        let n = frame
+            .nodes
+            .iter()
+            .find(|n| matches!(n.content, Content::Input { .. }))
+            .unwrap()
+            .clone();
+        let Content::Input {
+            edit,
+            text: t,
+            multiline,
+            ..
+        } = &n.content
+        else {
+            unreachable!()
+        };
+        let mut ts = TextSystem::new();
+        let it = crate::layout::input_text(
+            &mut ts,
+            &edit.text,
+            t,
+            n.content_box,
+            *multiline,
+            false,
+            n.scroll.map_or((0.0, 0.0), |s| s.applied),
+        );
+        // The kept text ends by the ellipsis, which is on its end side.
+        let edge = ts.caret(&edit.text, &it.t, it.width, edit.text.len());
+        let x = if direction == Direction::Rtl {
+            edge.x - 3.0
+        } else {
+            edge.x + 3.0
+        };
+        let y = edge.y + edge.height / 2.0;
+        assert_eq!(
+            ts.hit(&edit.text, &it.t, it.width, x, y),
+            edit.text.len(),
+            "{direction:?}: the pointer finds the end"
+        );
+        let u = full(&mut s);
+        let ((input_id, _), _) = input_and_runs(&u, Role::MultilineTextInput);
+        let tree = Tree::new(u, true);
+        let state = tree.state();
+        let node = state.node_by_tree_local_id(input_id, TreeId::ROOT).unwrap();
+        let point = accesskit::Point::new(f64::from(x + it.origin.0), f64::from(y + it.origin.1));
+        assert!(
+            node.text_position_at_point(point).is_document_end(),
+            "{direction:?}: a screen reader finds the end"
+        );
+    }
+}
+
+#[test]
+fn an_arrow_in_a_ten_thousand_line_textarea_builds_no_runs() {
+    // The caret moves over the runs sent: the field is sent again with its
+    // selection, and none of its runs is built again, its text unchanged.
+    use crate::events::{Modifiers, NamedKey};
+    let doc: String = (0..10_000).map(|n| format!("line {n}\n")).collect();
+    let field = TextField::new(doc);
+    let mut s = field_scenario(&field, true);
+    s.act("focus", || field.focus.focus());
+    field.edit.update(|e| e.place(0, false));
+    let first = update(&mut s);
+    let built = s.pipeline().access_stats().runs_built;
+    assert!(built >= 10_000, "its runs built once: {built}");
+    let ((_, input), runs) = input_and_runs(&first, Role::MultilineTextInput);
+    assert_eq!(input.text_selection().unwrap().focus.node, runs[0].0);
+    s.press(NamedKey::ArrowDown, Modifiers::default());
+    let moved = update(&mut s);
+    assert_eq!(s.pipeline().access_stats().runs_built, 0, "an arrow built runs");
+    let (_, input) = moved
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role() == Role::MultilineTextInput)
+        .expect("the field sent again");
+    assert_eq!(
+        input.text_selection().unwrap().focus,
+        TextPosition {
+            node: runs[1].0,
+            character_index: 0
+        },
+        "its caret on the second line, over the runs sent"
+    );
+    assert!(
+        moved.nodes.iter().all(|(_, n)| n.role() != Role::TextRun),
+        "no run sent again"
+    );
+}
+
+#[test]
+fn a_scrolled_textarea_keeps_its_runs_and_a_point_finds_the_line_shown_there() {
+    // Its runs are in its content's space, as laid out unscrolled; the
+    // node's transform carries the scroll. Scrolled by the wheel, it is
+    // sent again alone, no run built or moved, and a point a screen reader
+    // asks about finds the line the pointer finds there.
+    let doc: String = (0..200).map(|n| format!("line {n}\n")).collect();
+    let field = TextField::new(doc.clone());
+    let mut s = field_scenario(&field, true);
+    let _ = update(&mut s);
+    let (_, before) = input_and_runs(&full(&mut s), Role::MultilineTextInput);
+    s.hover(40.0, 40.0);
+    s.settle().unwrap();
+    s.wheel(20.0);
+    let scrolled = update(&mut s);
+    let frame = s.pipeline().frame();
+    let n = frame
+        .nodes
+        .iter()
+        .find(|n| matches!(n.content, Content::Input { .. }))
+        .unwrap()
+        .clone();
+    let sc = n.scroll.expect("it scrolls");
+    assert!(sc.offset.1 > 0.0, "scrolled: {:?}", sc.offset);
+    let offset = sc.applied;
+    assert_eq!(s.pipeline().access_stats().runs_built, 0, "a scroll built runs");
+    assert!(
+        scrolled.nodes.iter().all(|(_, n)| n.role() != Role::TextRun),
+        "a run sent again"
+    );
+    let after = full(&mut s);
+    let ((input_id, _), runs) = input_and_runs(&after, Role::MultilineTextInput);
+    let bounds = |r: &[(NodeId, Node)]| r.iter().map(|(_, n)| n.bounds()).collect::<Vec<_>>();
+    assert_eq!(bounds(&runs), bounds(&before), "its runs stay where they are");
+    // Ten pixels into its box, in the window.
+    let (x, y) = (n.content_box.x + 5.0, n.content_box.y + 10.0);
+    let tree = Tree::new(after, true);
+    let state = tree.state();
+    let node = state.node_by_tree_local_id(input_id, TreeId::ROOT).unwrap();
+    let local = node.transform().inverse() * accesskit::Point::new(f64::from(x), f64::from(y));
+    let read = node.text_position_at_point(local).to_global_usv_index();
+    let Content::Input { edit, text: t, .. } = &n.content else {
+        unreachable!()
+    };
+    let mut ts = TextSystem::new();
+    let it = crate::layout::input_text(&mut ts, &edit.text, t, n.content_box, true, false, offset);
+    let hit = ts.hit(&edit.text, &it.t, it.width, x - it.origin.0, y - it.origin.1);
+    let line = |at: usize| doc[..at].matches('\n').count();
+    assert!(line(hit) > 0, "the scroll took the first line up");
+    assert_eq!(line(read), line(hit), "a screen reader finds the line the pointer does");
+}
+
+#[test]
+fn a_clamped_textarea_of_a_hundred_thousand_lines_resized_compares_each_run_once() {
+    // Each width the field is laid out at changes its runs' boxes: each
+    // run is compared with the one sent at its index alone, never with
+    // every run sent before.
+    let mut doc = "word ".repeat(2_000);
+    doc.push('\n');
+    for n in 1..100_000 {
+        doc.push_str(&format!("line {n}\n"));
+    }
+    let field = TextField::new(&doc);
+    let width = Signal::labeled("width", 200.0_f32);
+    let (f, w) = (field, width);
+    let mut s = Scenario::measuring(
+        move || {
+            div()
+                .child(text_input(&f).width(w.get()).multiline().height(80.0).line_clamp(3))
+                .into_element()
+        },
+        400,
+        200,
+        1.0,
+    )
+    .unwrap();
+    s.settle().unwrap();
+    let _ = update(&mut s);
+    for px in [230.0, 260.0, 290.0] {
+        s.act("resize", || width.set(px));
+        let u = update(&mut s);
+        let stats = s.pipeline().access_stats();
+        assert!(!u.nodes.is_empty(), "at {px}px its runs moved");
+        assert!(
+            stats.compared > 100_000 && stats.compared <= stats.nodes,
+            "at {px}px: {} runs compared of {} nodes",
+            stats.compared,
+            stats.nodes
+        );
+    }
 }

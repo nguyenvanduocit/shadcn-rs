@@ -1,0 +1,18 @@
+---
+source: crates/primitives/tests/structure.rs
+assertion_line: 471
+expression: a11y(&s)
+---
+Window "w"
+  GenericContainer
+    GenericContainer
+      GenericContainer
+        TabList Horizontal
+          Tab "One" selected controls=TabPanel
+            Label "One"
+          Tab "Two" unselected disabled
+            Label "Two" disabled
+          Tab "Three" unselected
+            Label "Three"
+        TabPanel labelled-by=One
+          Label "Panel one"

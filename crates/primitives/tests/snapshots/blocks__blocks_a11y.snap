@@ -1,0 +1,18 @@
+---
+source: crates/primitives/tests/blocks.rs
+expression: dumped
+---
+Window "w"
+  GenericContainer
+    Label
+      Label "Accept"
+    CheckBox labelled-by=Label
+    Splitter Vertical
+    Button
+      GenericContainer
+        Label "Close"
+    Toolbar
+      Button
+        Label "Bold"
+      Button disabled
+        Label "Italic" disabled
