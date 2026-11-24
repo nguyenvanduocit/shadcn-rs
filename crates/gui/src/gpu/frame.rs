@@ -308,7 +308,7 @@ fn transform_entry(t: &crate::scene::TransformNode, s: f32) -> [f32; 2] {
 }
 
 /// Vec4s a clip entry takes (`PCLIP` in `common.wgsl`).
-const PCLIP_VEC4S: u32 = 5;
+pub(super) const PCLIP_VEC4S: u32 = 5;
 
 /// A text-through mask to draw: into chunk `chunk`'s mask `k`.
 pub(super) struct MaskJob {
@@ -2809,7 +2809,7 @@ impl GpuRenderer {
                     label: Some("gui paths"),
                     layout: &self.layouts.path,
                     entries: &[
-                        globals(16),
+                        globals(super::contract::TARGET_GLOBALS),
                         buffer(1, &p.jobs.buffer),
                         buffer(2, &p.draws.buffer),
                         buffer(3, &p.tiles.buffer),
@@ -2871,7 +2871,7 @@ impl GpuRenderer {
                     label: Some("gui curve text"),
                     layout: &self.layouts.slug,
                     entries: &[
-                        globals(16),
+                        globals(super::contract::TARGET_GLOBALS),
                         buffer(1, &self.slug_instances.buffer),
                         buffer(2, &self.slugs.blobs.buffer),
                         buffer(3, &self.pclips.buffer),

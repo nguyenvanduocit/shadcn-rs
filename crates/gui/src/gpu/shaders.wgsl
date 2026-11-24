@@ -66,27 +66,9 @@ struct Globals {
 // An image or a layer, for the primitives that need one.
 @group(1) @binding(0) var extra: texture_2d<f32>;
 
-const KIND_SOLID: u32 = 0u;
-const KIND_SHADOW: u32 = 1u;
-const KIND_GRADIENT: u32 = 2u;
-const KIND_MONO: u32 = 3u;
-const KIND_COLOR: u32 = 4u;
-const KIND_IMAGE: u32 = 5u;
-const KIND_MASK: u32 = 6u;
-const KIND_LAYER: u32 = 7u;
-const KIND_TEXT_THROUGH: u32 = 8u;
-const KIND_LCD: u32 = 9u;
-// What lies below, read back into `extra` (`gpu/read.rs`).
-const KIND_READ: u32 = 10u;
-const READ_BACKDROP: u32 = 0u;
-const READ_DARKEN: u32 = 1u;
-const READ_LIGHTEN: u32 = 2u;
-
-const F_RADII: u32 = 256u;
-const F_INNER: u32 = 512u;
-// A solid record's corners curve as `superellipse(k)`, its last word `k`
-// (a shadow's and an image's too).
-const F_CURVE: u32 = 1024u;
+// `KIND_*` (a record's kind, the head word's low byte), `READ_*` and `F_*`
+// (a record's flags) are prepended by `gpu::module` from the Rust side
+// (`gpu/contract.rs`), so they cannot differ from what `record.rs` writes.
 
 fn word(at: u32) -> u32 {
     return records[at];

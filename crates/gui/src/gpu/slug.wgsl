@@ -54,11 +54,10 @@ struct Globals {
 @group(0) @binding(3) var<storage, read> clips: array<vec4<f32>>;
 @group(0) @binding(4) var gamma_table: texture_2d<f32>;
 
-const SLUG: u32 = 5u;
-// Curve pixels per em (`text::CURVE_EM`).
-const CURVE_EM: f32 = 1024.0;
-const UNITS: f32 = 16.0;
-const INV_UNITS: f32 = 1.0 / 16.0;
+// `SLUG` (`gpu::slug::SLUG`), `CURVE_EM` (`text::CURVE_EM`, curve pixels per
+// em) and `UNITS` (quantization steps per curve pixel) are prepended from Rust
+// (`gpu/contract.rs`).
+const INV_UNITS: f32 = 1.0 / UNITS;
 
 struct SlugVarying {
     @builtin(position) position: vec4<f32>,

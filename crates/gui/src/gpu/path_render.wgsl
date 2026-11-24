@@ -29,10 +29,7 @@ struct Globals {
 // Clip 0 is none.
 @group(0) @binding(7) var<storage, read> clips: array<vec4<f32>>;
 
-const TILE: f32 = 16.0;
-const JOB: u32 = 32u;
-const DRAW: u32 = 32u;
-const F_EVEN_ODD: u32 = 2u;
+// `TILE`, `JOB`, `DRAW` and `F_EVEN_ODD` come from `gpu/path.rs` (`gpu/contract.rs`).
 
 fn jf(job: u32, i: u32) -> f32 {
     return bitcast<f32>(jobs[job * JOB + i]);

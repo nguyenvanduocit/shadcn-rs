@@ -39,6 +39,7 @@ mod atlas;
 mod chunks;
 mod clips;
 mod cold;
+pub(crate) mod contract;
 mod damage;
 mod frame;
 pub(crate) mod path;
@@ -83,8 +84,7 @@ const MAX_LCD_PPEM: f32 = 48.0;
 /// The largest text kept as bitmaps in the atlas; larger is drawn as
 /// curves (glifo's cap, ADR-0016).
 const MAX_ATLAS_PPEM: f32 = 128.0;
-/// Bytes of globals a pass reads (`Globals` in `shaders.wgsl`).
-const GLOBALS: u64 = 64;
+use self::contract::GLOBALS;
 
 /// Why the GPU renderer could not start.
 #[derive(Debug)]
@@ -931,132 +931,16 @@ impl GpuRenderer {
                 wake();
             }
         });
-        let texture_entry = |binding: u32, dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: dimension,
-                multisampled: false,
-            },
-            count: None,
-        };
-        let storage = |binding: u32, visibility: wgpu::ShaderStages, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let globals_entry = |size: u64| wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Uniform,
-                has_dynamic_offset: true,
-                min_binding_size: wgpu::BufferSize::new(size),
-            },
-            count: None,
-        };
-        let vf = wgpu::ShaderStages::VERTEX_FRAGMENT;
-        let d2 = wgpu::TextureViewDimension::D2;
-        let array = wgpu::TextureViewDimension::D2Array;
-        let layout = |label: &str, entries: &[wgpu::BindGroupLayoutEntry]| {
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some(label),
-                entries,
-            })
-        };
+        // The bindings are tables (`contract.rs`): the shaders are checked
+        // against the same ones.
         let layouts = Layouts {
-            quad: layout(
-                "gui quads",
-                &[
-                    globals_entry(GLOBALS),
-                    storage(1, vf, true),
-                    storage(2, vf, true),
-                    storage(3, vf, true),
-                    texture_entry(4, array),
-                    texture_entry(5, array),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 6,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    texture_entry(7, d2),
-                ],
-            ),
-            extra: layout("gui extra", &[texture_entry(0, d2)]),
-            path: layout(
-                "gui paths",
-                &[
-                    globals_entry(16),
-                    storage(1, vf, true),
-                    storage(2, vf, true),
-                    storage(3, vf, true),
-                    storage(4, vf, true),
-                    storage(5, vf, true),
-                    storage(6, vf, true),
-                    storage(7, vf, true),
-                ],
-            ),
-            compute: {
-                let c = wgpu::ShaderStages::COMPUTE;
-                layout(
-                    "gui path passes",
-                    &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: c,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: wgpu::BufferSize::new(32),
-                            },
-                            count: None,
-                        },
-                        storage(1, c, true),
-                        storage(2, c, true),
-                        storage(3, c, true),
-                        storage(4, c, false),
-                        storage(5, c, false),
-                        storage(6, c, false),
-                        storage(7, c, false),
-                        storage(8, c, false),
-                        storage(9, c, false),
-                    ],
-                )
-            },
-            slug: layout(
-                "gui curve text",
-                &[
-                    globals_entry(16),
-                    storage(1, vf, true),
-                    storage(2, vf, true),
-                    storage(3, vf, true),
-                    texture_entry(4, d2),
-                ],
-            ),
-            blit: layout("gui canvas", &[texture_entry(0, d2)]),
-            read: layout(
-                "gui read",
-                &[
-                    texture_entry(0, d2),
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: true,
-                            min_binding_size: wgpu::BufferSize::new(32),
-                        },
-                        count: None,
-                    },
-                ],
-            ),
+            quad: contract::layout(&device, "gui quads", contract::QUADS),
+            extra: contract::layout(&device, "gui extra", contract::EXTRA),
+            path: contract::layout(&device, "gui paths", contract::PATHS),
+            compute: contract::layout(&device, "gui path passes", contract::PASSES),
+            slug: contract::layout(&device, "gui curve text", contract::CURVE_TEXT_BINDS),
+            blit: contract::layout(&device, "gui canvas", contract::CANVAS),
+            read: contract::layout(&device, "gui read", contract::READ_BACK),
         };
         let pipeline_layout = |label: &str, groups: &[Option<&wgpu::BindGroupLayout>]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1071,44 +955,18 @@ impl GpuRenderer {
         let slug_layout = pipeline_layout("gui curve text", &[Some(&layouts.slug)]);
         let blit_layout = pipeline_layout("gui canvas", &[Some(&layouts.blit)]);
         let read_layout = pipeline_layout("gui read", &[Some(&layouts.read)]);
-        let common = include_str!("common.wgsl");
-        let stops = include_str!("stops.wgsl");
-        let quad_module = module(
-            &device,
-            "gui quads",
-            &[common, include_str!("shaders.wgsl")],
-            &[("fs_main", "Varying", "shade")],
-            dual_source,
-        );
-        let path_module = module(
-            &device,
-            "gui paths",
-            &[common, stops, include_str!("path_render.wgsl")],
-            &[("fs_path", "PathVarying", "shade_path")],
-            dual_source,
-        );
-        let slug_module = module(
-            &device,
-            "gui curve text",
-            &[common, include_str!("slug.wgsl")],
-            &[
-                ("fs_slug", "SlugVarying", "shade_slug_banded"),
-                ("fs_slug_full", "SlugVarying", "shade_slug_full"),
-            ],
-            dual_source,
-        );
-        let blit_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gui canvas"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("blit.wgsl").into()),
-        });
-        let read_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gui read"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("read.wgsl").into()),
-        });
-        let compute_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gui path passes"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("path_compute.wgsl").into()),
-        });
+        let module = |label: &str, source: String| {
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(label),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            })
+        };
+        let quad_module = module("gui quads", contract::quads(dual_source));
+        let path_module = module("gui paths", contract::paths(dual_source));
+        let slug_module = module("gui curve text", contract::curve_text(dual_source));
+        let blit_module = module("gui canvas", contract::BLIT_WGSL.to_owned());
+        let read_module = module("gui read", contract::READ_WGSL.to_owned());
+        let compute_module = module("gui path passes", contract::passes());
         let alpha = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
@@ -1955,50 +1813,6 @@ impl Renderer for GpuRenderer {
     fn capture(&mut self, scene: &Scene, overlay: Option<&Scene>, text: &mut Glyphs) -> Option<Pixels> {
         self.capture_scene(scene, overlay, text)
     }
-}
-
-/// A shader module of `parts` (concatenated), with a fragment entry point
-/// for each of `entries` (name, input type, shading function): with
-/// dual-source blending, whose second output is what of each channel of
-/// the target is kept (ADR-0019), or without.
-fn module(
-    device: &wgpu::Device,
-    label: &str,
-    parts: &[&str],
-    entries: &[(&str, &str, &str)],
-    dual_source: bool,
-) -> wgpu::ShaderModule {
-    let mut source = String::new();
-    if dual_source {
-        source.push_str("enable dual_source_blending;\n");
-    }
-    for p in parts {
-        source.push_str(p);
-        source.push('\n');
-    }
-    if dual_source {
-        source.push_str(
-            "struct DualOut {\n    @location(0) @blend_src(0) color: vec4<f32>,\n    \
-             @location(0) @blend_src(1) mask: vec4<f32>,\n}\n",
-        );
-    }
-    for (name, input, shade) in entries {
-        if dual_source {
-            source.push_str(&format!(
-                "@fragment\nfn {name}(input: {input}) -> DualOut {{\n    let s = {shade}(input);\n    \
-                 return DualOut(s.color, s.mask);\n}}\n"
-            ));
-        } else {
-            source.push_str(&format!(
-                "@fragment\nfn {name}(input: {input}) -> @location(0) vec4<f32> {{\n    \
-                 return {shade}(input).color;\n}}\n"
-            ));
-        }
-    }
-    device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some(label),
-        source: wgpu::ShaderSource::Wgsl(source.into()),
-    })
 }
 
 /// How an adapter is chosen, for `surface` when there is one: the one that

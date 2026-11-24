@@ -213,7 +213,7 @@ impl PipelineBuilder<'_> {
     ) -> DrawId {
         let full = format!(
             "{}\n{}\n{}",
-            include_str!("../gpu/common.wgsl"),
+            crate::gpu::contract::common(),
             include_str!("chunk.wgsl"),
             source
         );

@@ -62,6 +62,19 @@ fn gang_wgsl(parts: &[&str], gang: u32, first: u32) -> String {
     s
 }
 
+/// The page pass's bindings for gangs of `gang` pages: the pages'
+/// parameters, the bounds, the partials (written), then the pages and their
+/// floors; two uniforms before them (`gang_wgsl`).
+fn page_binds(gang: u32) -> Vec<BindKind> {
+    use BindKind::{Storage, StorageWrite, Uniform};
+    let mut binds = vec![Uniform, Uniform, Storage, Storage, StorageWrite];
+    binds.extend(std::iter::repeat_n(
+        Storage,
+        usize::try_from(gang.saturating_mul(2)).unwrap_or(2),
+    ));
+    binds
+}
+
 /// Bindings of the page pass before its pages.
 const GANG_FIRST: u32 = 5;
 /// The most pages a gang binds.
@@ -90,16 +103,11 @@ impl M4Pipes {
             .max_buffers_and_acceleration_structures_per_shader_stage
             .saturating_sub(5);
         let gang = (storage.min(buffers) / 2).clamp(1, MAX_GANG);
-        let mut binds = vec![Uniform, Uniform, Storage, Storage, StorageWrite];
-        binds.extend(std::iter::repeat_n(
-            Storage,
-            usize::try_from(gang.saturating_mul(2)).unwrap_or(2),
-        ));
         let page = ctx.compute(
             "gui m4 page",
             &gang_wgsl(&[common, include_str!("m4_page.wgsl")], gang, GANG_FIRST),
             "page_pass",
-            &binds,
+            &page_binds(gang),
         );
         let merge = ctx.compute(
             "gui m4 merge",
@@ -403,5 +411,62 @@ impl M4State {
     /// The compact points' capacity: what a mark draws instances up to.
     pub(crate) fn capacity(&self) -> u32 {
         self.n.saturating_mul(4)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gpu::contract::reflect::{Kind, Number, reflect};
+
+    /// The page pass's shader for every gang size it can be built with
+    /// (V3): naga validates each, and its bindings, struct sizes and
+    /// constants are the ones declared here.
+    #[test]
+    fn page_pass_agrees_with_rust_for_every_gang() {
+        let common = include_str!("m4_common.wgsl");
+        for gang in 1..=MAX_GANG {
+            let label = format!("m4 page, gang {gang}");
+            let source = gang_wgsl(&[common, include_str!("m4_page.wgsl")], gang, GANG_FIRST);
+            let r = reflect(&label, &source);
+            let binds = page_binds(gang);
+            assert_eq!(r.bindings.len(), binds.len(), "{label}: bindings");
+            for (i, bind) in binds.iter().enumerate() {
+                let at = u32::try_from(i).unwrap();
+                let found = r
+                    .bindings
+                    .get(&(0, at))
+                    .unwrap_or_else(|| panic!("{label}: Rust binds {at}, the shader declares none"));
+                let same = match (bind, found.kind) {
+                    (BindKind::Uniform, Kind::Uniform { .. }) => true,
+                    (BindKind::Storage, Kind::Storage { read_only }) => read_only,
+                    (BindKind::StorageWrite, Kind::Storage { read_only }) => !read_only,
+                    _ => false,
+                };
+                assert!(
+                    same,
+                    "{label}: binding {at} (`{}`): Rust {bind:?}, shader {:?}",
+                    found.name, found.kind
+                );
+                assert_eq!(
+                    found.written_by.is_empty(),
+                    !matches!(bind, BindKind::StorageWrite),
+                    "{label}: binding {at} written"
+                );
+            }
+            assert_eq!(
+                r.struct_sizes.get("PageP").copied(),
+                u32::try_from(PAGE_P).ok(),
+                "{label}: PageP bytes"
+            );
+            assert_eq!(r.struct_sizes.get("Gang").copied(), Some(16), "{label}: Gang bytes");
+            for (name, words) in [("PARTIAL", PARTIAL), ("COLUMN", COLUMN)] {
+                assert_eq!(
+                    r.constants.get(name).copied(),
+                    u32::try_from(words).ok().map(Number::U32),
+                    "{label}: {name} words"
+                );
+            }
+        }
     }
 }

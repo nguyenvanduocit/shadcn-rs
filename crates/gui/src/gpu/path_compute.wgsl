@@ -33,37 +33,17 @@
 // coordinates, so `count` and `write` always agree, and a point two lines
 // share is computed once, by one thread, so the tiles' windings close.
 
-const TILE: f32 = 16.0;
+// From `gpu/path.rs` (`gpu/contract.rs`): `TILE`; the words of a job (`JOB`),
+// a curve item (`ITEM`), a resident curve (`CURVE`) and a curve item's
+// scratch (head+, head-, tail+, tail- (device), start and end (local), first
+// and last direction (local), flags: `HEAD`); a job's flags (`F_STROKE`,
+// `F_EVEN_ODD`, `CAP_SHIFT`, `JOIN_SHIFT`), a curve item's (`C_*`), the caps
+// (`CAP_*`) and joins (`JOIN_*`).
 const FIX: f32 = 256.0;
 const TILE_FIX: i32 = 4096;
 const PIECE: f32 = 64.0;
 const NONE: u32 = 0xffffffffu;
 const NO_EDGE: f32 = -1.0e30;
-
-// Job words (see `gpu::path::Job`).
-const JOB: u32 = 32u;
-// Curve item words.
-const ITEM: u32 = 8u;
-// Curve words (resident).
-const CURVE: u32 = 16u;
-// Scratch per curve item: head+, head-, tail+, tail- (device), start and end
-// (local), first and last direction (local), flags.
-const HEAD: u32 = 20u;
-
-const F_STROKE: u32 = 1u;
-const F_EVEN_ODD: u32 = 2u;
-
-const C_START_CAP: u32 = 1u;
-const C_END_CAP: u32 = 2u;
-const C_JOIN_IN: u32 = 4u;
-const C_DOT: u32 = 8u;
-
-const CAP_BUTT: u32 = 0u;
-const CAP_ROUND: u32 = 1u;
-const CAP_SQUARE: u32 = 2u;
-const JOIN_MITER: u32 = 0u;
-const JOIN_ROUND: u32 = 1u;
-const JOIN_BEVEL: u32 = 2u;
 
 struct Params {
     n_points: u32,
@@ -297,7 +277,7 @@ fn connect(out: ptr<function, Out>, p: vec2<f32>, n0: vec2<f32>, n1: vec2<f32>, 
         emit(out, c, a_to);
         return;
     }
-    var join = (ju(job, 16u) >> 6u) & 3u;
+    var join = (ju(job, 16u) >> JOIN_SHIFT) & 3u;
     if (round_only) {
         join = JOIN_ROUND;
     }
@@ -503,7 +483,7 @@ fn joins(@builtin(global_invocation_id) gid: vec3<u32>) {
     var out = Out(job, work[item * ITEM + 2u] + work[item * ITEM + 4u], 0u, work[item * ITEM + 5u]);
     let flags = cu(curve, 9u);
     let h = jf(job, 17u);
-    let cap = (ju(job, 16u) >> 4u) & 3u;
+    let cap = (ju(job, 16u) >> CAP_SHIFT) & 3u;
     let p = head(item, 4u);
     let u = head(item, 6u);
     if ((flags & C_DOT) != 0u) {

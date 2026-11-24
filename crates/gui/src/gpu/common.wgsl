@@ -137,7 +137,7 @@ fn curved_sdf(p: vec2<f32>, rect: vec4<f32>, radii: vec4<f32>, k: f32) -> f32 {
 // corners' curve), then (the next clip of its effective chain, 0, 0, 0).
 // Each shader walks an entry's chain to its end (0); a chain is an
 // ancestor list, so the walk ends, and the table's length bounds it.
-const PCLIP: u32 = 5u;
+// (`PCLIP` itself is prepended from Rust: `gpu/contract.rs`.)
 
 // Point `p` through an entry's map (a, b, c, d) and (e, f).
 fn entry_point(m: vec4<f32>, t: vec4<f32>, p: vec2<f32>) -> vec2<f32> {

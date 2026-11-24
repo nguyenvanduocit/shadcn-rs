@@ -36,7 +36,7 @@ pub(super) const MOST_SIGMA: f32 = 4.0;
 /// The most halvings: a 32× smaller copy.
 const MOST_LEVELS: u32 = 5;
 /// Bytes of one pass's parameters (a `Step` in `read.wgsl`).
-const STEP: u64 = 32;
+pub(super) const STEP: u64 = 32;
 
 /// One read of a frame: the target's pixels `rect` covers (window,
 /// physical), and the blur they get.

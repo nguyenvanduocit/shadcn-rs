@@ -51,6 +51,18 @@ pub(crate) const C_START_CAP: u32 = 1;
 pub(crate) const C_END_CAP: u32 = 2;
 pub(crate) const C_JOIN_IN: u32 = 4;
 pub(crate) const C_DOT: u32 = 8;
+/// A job's flags word (word 16): stroked, filled even-odd, then the cap and
+/// the join in two bits each.
+pub(crate) const F_STROKE: u32 = 1;
+pub(crate) const F_EVEN_ODD: u32 = 2;
+pub(crate) const CAP_SHIFT: u32 = 4;
+pub(crate) const JOIN_SHIFT: u32 = 6;
+pub(crate) const CAP_BUTT: u32 = 0;
+pub(crate) const CAP_ROUND: u32 = 1;
+pub(crate) const CAP_SQUARE: u32 = 2;
+pub(crate) const JOIN_MITER: u32 = 0;
+pub(crate) const JOIN_ROUND: u32 = 1;
+pub(crate) const JOIN_BEVEL: u32 = 2;
 const NONE: u32 = u32::MAX;
 
 /// A curve as the CPU bounds it.
@@ -497,7 +509,12 @@ impl Paths {
             state: Scratch::new(device, "gui path state", storage, 64 * 4),
             work: Scratch::new(device, "gui path work", storage, 4096),
             scratch: Scratch::new(device, "gui path scratch", storage, 4096),
-            params: Scratch::new(device, "gui path params", wgpu::BufferUsages::UNIFORM, 32),
+            params: Scratch::new(
+                device,
+                "gui path params",
+                wgpu::BufferUsages::UNIFORM,
+                super::contract::PASS_PARAMS,
+            ),
             job_words: Vec::new(),
             draw_words: Vec::new(),
             draws_dirty: Vec::new(),
@@ -789,11 +806,15 @@ impl Paths {
         let tiles_r = keep(&mut self.tiles, old.as_ref().map(|j| j.tiles), tiles);
         let inst_r = keep(&mut self.instances, old.as_ref().map(|j| j.instances), tiles);
         let entries_r = keep(&mut self.entries, old.as_ref().map(|j| j.entries), entries);
-        let flags = u32::from(stroke.is_some())
-            | (u32::from(key.fill_rule == FillRule::EvenOdd) << 1)
-            | stroke
-                .as_ref()
-                .map_or(0, |p| (cap_word(p.cap) << 4) | (join_word(p.join) << 6));
+        let flags = if stroke.is_some() { F_STROKE } else { 0 }
+            | if key.fill_rule == FillRule::EvenOdd {
+                F_EVEN_ODD
+            } else {
+                0
+            }
+            | stroke.as_ref().map_or(0, |p| {
+                (cap_word(p.cap) << CAP_SHIFT) | (join_word(p.join) << JOIN_SHIFT)
+            });
         if let Some(w) = words_at::<JOB>(&mut self.job_words, slot) {
             w.fill(0);
             for (d, v) in w.iter_mut().zip(m) {
@@ -1179,14 +1200,14 @@ fn stroke_from_words(w: &[u32]) -> StrokeParams {
     let flags = w.get(16).copied().unwrap_or(0);
     StrokeParams {
         half: f(17),
-        cap: match (flags >> 4) & 3 {
-            1 => Cap::Round,
-            2 => Cap::Square,
+        cap: match (flags >> CAP_SHIFT) & 3 {
+            CAP_ROUND => Cap::Round,
+            CAP_SQUARE => Cap::Square,
             _ => Cap::Butt,
         },
-        join: match (flags >> 6) & 3 {
-            1 => Join::Round,
-            2 => Join::Bevel,
+        join: match (flags >> JOIN_SHIFT) & 3 {
+            JOIN_ROUND => Join::Round,
+            JOIN_BEVEL => Join::Bevel,
             _ => Join::Miter,
         },
         miter_limit: f(18),
@@ -1199,17 +1220,17 @@ fn stroke_from_words(w: &[u32]) -> StrokeParams {
 
 pub(crate) fn cap_word(c: Cap) -> u32 {
     match c {
-        Cap::Butt => 0,
-        Cap::Round => 1,
-        Cap::Square => 2,
+        Cap::Butt => CAP_BUTT,
+        Cap::Round => CAP_ROUND,
+        Cap::Square => CAP_SQUARE,
     }
 }
 
 pub(crate) fn join_word(j: Join) -> u32 {
     match j {
-        Join::Miter => 0,
-        Join::Round => 1,
-        Join::Bevel => 2,
+        Join::Miter => JOIN_MITER,
+        Join::Round => JOIN_ROUND,
+        Join::Bevel => JOIN_BEVEL,
     }
 }
 
