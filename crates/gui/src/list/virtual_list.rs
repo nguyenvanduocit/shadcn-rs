@@ -216,8 +216,6 @@ struct Inner {
     /// renders, so a scroller that hides it as it scrolls itself (an
     /// effect on its own state) builds the list again.
     no_scrollbar: Signal<bool>,
-    /// Rows measured and their total height, for the estimate.
-    measured: Cell<(u64, f64)>,
     /// Where on the thumb a drag took hold, from its top.
     grab: Cell<f32>,
     /// The thumb's top and height in the viewport; `None` when all rows fit.
@@ -319,7 +317,6 @@ impl ListState {
             fit: Cell::new(None),
             height: detached(|| Signal::labeled("virtual list height", None)),
             no_scrollbar: detached(|| Signal::labeled("virtual list no scrollbar", false)),
-            measured: Cell::new((0, 0.0)),
             grab: Cell::new(0.0),
             thumb: detached(|| Signal::labeled("virtual list thumb", None)),
             thumb_shown: detached(|| Signal::labeled("virtual list thumb shown", false)),
@@ -417,8 +414,6 @@ impl ListState {
                 return;
             }
         }
-        let (n, sum) = self.0.measured.get();
-        self.0.measured.set((n, sum + f64::from(delta)));
         self.moved();
     }
 
@@ -762,6 +757,39 @@ impl ListState {
         self.moved();
     }
 
+    /// The rows were reordered or filtered (a sort, a new
+    /// [`View`](super::View)): it holds `rows` rows now, and the row at each
+    /// old position `p` is at `to(p)` (`None`: left out;
+    /// [`View::moved_to`](super::View::moved_to) gives it). The heights
+    /// measured follow their rows, the rows new to it take the estimate,
+    /// and the anchor and the focused row follow theirs (a row left out
+    /// leaves the anchor at its old index, its top). O(m log m) for the
+    /// `m` rows measured, whatever the rows.
+    pub fn reorder(&self, rows: u64, to: impl Fn(u64) -> Option<u64>) {
+        self.0.extents.borrow_mut().reorder(rows, &to);
+        let a = self.0.anchor.get();
+        let anchor = match to(a.row).filter(|&r| r < rows) {
+            Some(row) => Anchor { row, ..a },
+            None => Anchor {
+                row: a.row.min(rows.saturating_sub(1)),
+                key: None,
+                offset: 0.0,
+            },
+        };
+        self.0.anchor.set(anchor);
+        let focus = self.0.focus_row.get();
+        self.0
+            .focus_row
+            .set(focus.and_then(|(r, k)| to(r).filter(|&r| r < rows).map(|r| (r, k))));
+        // The rows built, and those pinned, were found by position: the
+        // window is decided anew.
+        self.0.window.set(Window::default());
+        self.0.keys.borrow_mut().clear();
+        self.0.pins.borrow_mut().clear();
+        self.0.pins_before.set(0);
+        self.moved();
+    }
+
     fn bump(&self) {
         self.0.version.update(|v| *v = v.wrapping_add(1));
     }
@@ -888,9 +916,7 @@ impl ListState {
         inner.top.set(l.bounds.y);
         if old_width > 0.0 && old_width != width {
             // Heights measured at another width: estimates again.
-            let estimate = inner.extents.borrow().estimate();
-            inner.extents.borrow_mut().reset(estimate);
-            inner.measured.set((0, 0.0));
+            inner.extents.borrow_mut().reset();
         }
         let w = inner.window.get();
         let built = usize::try_from(w.last.saturating_sub(w.first)).unwrap_or(usize::MAX);
@@ -923,20 +949,11 @@ impl ListState {
             return true;
         }
         {
+            // The rows not built take the mean of those measured, which the
+            // heights keep themselves ([`ExtentTree::estimate`]).
             let mut ext = inner.extents.borrow_mut();
-            let (mut n, mut sum) = inner.measured.get();
             for (row, c) in (w.first..w.last).zip(children) {
-                let fresh = !ext.is_measured(row);
                 ext.set(row, units(c.bounds.height));
-                if fresh {
-                    n = n.saturating_add(1);
-                    sum += f64::from(c.bounds.height);
-                }
-            }
-            inner.measured.set((n, sum));
-            if n > 0 {
-                let mean = crate::convert::f64_to_f32(sum / crate::convert::u64_to_f64(n));
-                ext.set_estimate(units(mean));
             }
         }
         // The anchor: the row at the viewport's top, unless one asked for is
@@ -2150,17 +2167,109 @@ mod tests {
         let state = ListState::new(30.0);
         let _s = scenario(&state);
         assert!(state.is_measured(3));
-        let (h, extent) = (state.row_height(3), state.extent());
+        let far = ROWS - 10;
+        let (h, extent, mean) = (state.row_height(3), state.extent(), state.row_height(far));
         state.adjust_row_height(3, 32.0);
         assert_eq!(state.row_height(3), h + 32.0);
-        assert_eq!(state.extent(), extent + 32.0);
+        // A measured height moved, so did the mean the rows not built take.
+        assert!(state.row_height(far) > mean);
         state.adjust_row_height(3, -32.0);
         assert_eq!(state.row_height(3), h);
+        assert_eq!(state.extent(), extent, "back where it was, the mean too");
         // A row not measured keeps its estimate.
-        let far = ROWS - 10;
         let estimate = state.row_height(far);
         state.adjust_row_height(far, 32.0);
         assert_eq!(state.row_height(far), estimate);
+    }
+
+    /// Rows measured once and laid out again at another height: the
+    /// estimate the rows not yet built take is the mean of the heights the
+    /// rows measured have now, not of the ones they had when first seen.
+    #[test]
+    fn the_estimate_follows_measured_rows_that_change_height() {
+        let state = ListState::new(24.0);
+        let height = Signal::new(24.0_f32);
+        let st = state.clone();
+        let mut s = Scenario::measuring(
+            move || {
+                let h = height.get();
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            1_000,
+                            |i| i,
+                            move |i| div().height(h).child(text(format!("row {i}"))).into_element(),
+                        )
+                        .height(300.0),
+                    )
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        assert_eq!(state.row_height(999), 24.0);
+        s.act("every row twice as tall", || height.set(48.0));
+        s.settle().unwrap();
+        assert!(state.is_measured(0) && state.row_height(0) == 48.0);
+        assert_eq!(state.row_height(999), 48.0, "the rows not built take the new mean");
+    }
+
+    /// Frontiers 7.3 item 5: rows measured, then the data reordered so they
+    /// lie far from the viewport. Their heights went with them: a row off
+    /// screen has its own height, not the one measured at its new index.
+    #[test]
+    fn heights_measured_follow_their_rows_through_a_sort() {
+        let state = ListState::new(30.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..200).collect());
+        let tall = |id: u64| if id.is_multiple_of(2) { 40.0 } else { 24.0 };
+        let st = state.clone();
+        let mut s = Scenario::measuring(
+            move || {
+                let v = Rc::new(ids.get());
+                let (k, r) = (Rc::clone(&v), Rc::clone(&v));
+                let at = move |v: &[u64], i: u64| usize::try_from(i).ok().and_then(|i| v.get(i)).copied().unwrap_or(0);
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            200,
+                            move |i| at(&k, i),
+                            move |i| {
+                                let id = at(&r, i);
+                                div().height(tall(id)).child(text(format!("row {id}"))).into_element()
+                            },
+                        )
+                        .height(300.0),
+                    )
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap();
+        s.settle().unwrap();
+        let measured: Vec<u64> = (0..200).filter(|&p| state.is_measured(p)).collect();
+        assert!(measured.len() > 4 && measured.len() < 60, "{measured:?}");
+        // Rotated by an odd count: each row's new neighbour has the other height.
+        let to = |p: u64| Some((p + 101) % 200);
+        s.act("rotate the data, back to the top", || {
+            ids.update(|v| v.rotate_right(101));
+            state.reorder(200, to);
+            state.scroll_to_row(0);
+        });
+        s.settle().unwrap();
+        for &p in &measured {
+            let q = to(p).unwrap();
+            assert!(state.is_measured(q), "row {p} measured, now at {q}");
+            assert_eq!(state.row_height(q), tall(p), "row {p}'s height, now at {q}");
+        }
     }
 
     #[test]

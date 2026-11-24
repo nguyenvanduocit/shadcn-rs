@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
-use gui::list::{Columns, ListState, Selection, View, Width, virtual_list};
+use gui::list::{Columns, ListState, Selection, View, Views, Width, virtual_list};
 use gui::prelude::*;
 use gui::testing::{RandomTree, Rng, Topology};
 use gui::{Computed, Div, Effect, Element, Signal, TextField, Track, batch, component, div, key_of, mailbox, text};
@@ -590,7 +590,10 @@ fn big_table() -> Render {
     let sorting = Signal::labeled("sorting", false);
     let list = ListState::new(37.0);
     let to_top = list.clone();
-    let deliver = mailbox(move |v: View| {
+    let views = Views::new(move |v: View| {
+        // The heights measured follow their rows to where the new view shows them.
+        let old = view.get_untracked();
+        to_top.reorder(u64::try_from(v.len()).unwrap_or(0), |p| old.moved_to(&v, p));
         view.set(v);
         sorting.set(false);
         to_top.scroll_to_row(0);
@@ -618,12 +621,7 @@ fn big_table() -> Render {
                 }
             }
         });
-        View::spawn(
-            data.snapshot(),
-            move |p: &Pay| !only || p.status == failed,
-            order,
-            deliver.clone(),
-        );
+        views.spawn(data.snapshot(), move |p: &Pay| !only || p.status == failed, order);
     });
     Box::new(move || {
         let t = theme();

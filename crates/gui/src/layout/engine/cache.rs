@@ -25,18 +25,27 @@ use taffy::{
 /// grid inside a flex row is probed at more widths than that in one pass.
 pub const MEASURE_SLOTS: usize = 16;
 
-/// One axis of a key: a known dimension, else the available space.
-fn axis_key(known: Option<f32>, available: AvailableSpace) -> u32 {
-    match (known, available) {
-        (Some(v), _) => v.to_bits(),
-        (None, AvailableSpace::Definite(v)) => (-v).to_bits() ^ 0x0040_0000,
-        (None, AvailableSpace::MinContent) => f32::NEG_INFINITY.to_bits(),
-        (None, AvailableSpace::MaxContent) => f32::INFINITY.to_bits(),
-    }
+/// What one axis of a key holds: a known dimension, else which available
+/// space. Kept beside the size's bits, not folded into them, so no two
+/// inputs share a key whatever their bits (a known `1.5` and an available
+/// `-1.0` once did, folded into one `u32`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Known,
+    Definite,
+    MinContent,
+    MaxContent,
 }
 
-fn parent_key(v: Option<f32>) -> u32 {
-    v.map_or(f32::INFINITY.to_bits(), f32::to_bits)
+/// One axis of a key: its kind, and the size's exact bits (0 for min- and
+/// max-content).
+fn axis_key(known: Option<f32>, available: AvailableSpace) -> (Kind, u32) {
+    match (known, available) {
+        (Some(v), _) => (Kind::Known, v.to_bits()),
+        (None, AvailableSpace::Definite(v)) => (Kind::Definite, v.to_bits()),
+        (None, AvailableSpace::MinContent) => (Kind::MinContent, 0),
+        (None, AvailableSpace::MaxContent) => (Kind::MaxContent, 0),
+    }
 }
 
 /// Which of a node's inputs its answers read, beyond what the key always
@@ -66,36 +75,40 @@ impl Reads {
     }
 }
 
-/// What an entry was computed from.
+/// What an entry was computed from. Kinds and presence sit apart from the
+/// bits they qualify, so the key stays 24 bytes (it is in every entry).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key {
     space: [u32; 2],
+    kind: [Kind; 2],
+    /// The parent size's bits, 0 where it has none ([`Key::has_parent`]).
     parent: [u32; 2],
+    has_parent: [bool; 2],
     /// Whether each known dimension is definite (normalized to `true` where none is known).
     definite: [bool; 2],
-    /// Whether the height was known (else `space` holds the available height).
-    known_height: bool,
     /// 1 horizontal, 2 vertical, 3 both.
     axis: u8,
     /// A size probe (else a final layout).
     probe: bool,
 }
 
+const _: () = assert!(size_of::<Key>() == 24, "a key is in every cache entry");
+
 impl Key {
     fn of(input: &LayoutInput) -> Self {
         let k = input.known_dimensions;
         let a = input.available_space;
+        let (w, h) = (axis_key(k.width, a.width), axis_key(k.height, a.height));
+        let p = input.parent_size;
         Self {
-            space: [axis_key(k.width, a.width), axis_key(k.height, a.height)],
-            parent: [
-                parent_key(input.parent_size.width),
-                parent_key(input.parent_size.height),
-            ],
+            space: [w.1, h.1],
+            kind: [w.0, h.0],
+            parent: [p.width.map_or(0, f32::to_bits), p.height.map_or(0, f32::to_bits)],
+            has_parent: [p.width.is_some(), p.height.is_some()],
             definite: [
                 input.known_dimensions_are_definite.width || k.width.is_none(),
                 input.known_dimensions_are_definite.height || k.height.is_none(),
             ],
-            known_height: k.height.is_some(),
             axis: match input.axis {
                 RequestedAxis::Horizontal => 1,
                 RequestedAxis::Vertical => 2,
@@ -109,9 +122,12 @@ impl Key {
     /// node whose answers read what `reads` says; `free`: this entry's
     /// answer was found not to read the available height.
     fn answers(&self, want: &Self, reads: Reads, free: bool) -> bool {
-        let width = self.space[0] == want.space[0]
+        let space = |i: usize| self.space.get(i) == want.space.get(i) && self.kind.get(i) == want.kind.get(i);
+        let parent =
+            |i: usize| self.parent.get(i) == want.parent.get(i) && self.has_parent.get(i) == want.has_parent.get(i);
+        let width = space(0)
             && self.definite[0] == want.definite[0]
-            && (!reads.parent.width || self.parent[0] == want.parent[0])
+            && (!reads.parent.width || parent(0))
             && (self.axis == 3 || self.axis == want.axis);
         if !width {
             return false;
@@ -121,12 +137,13 @@ impl Key {
         if want.probe && want.axis == 1 && !reads.width_reads_height {
             return true;
         }
-        let space = if (free || !reads.available_height) && !self.known_height && !want.known_height {
+        let height = if (free || !reads.available_height) && self.kind[1] != Kind::Known && want.kind[1] != Kind::Known
+        {
             true
         } else {
-            self.space[1] == want.space[1] && self.known_height == want.known_height
+            space(1)
         };
-        space && self.definite[1] == want.definite[1] && (!reads.parent.height || self.parent[1] == want.parent[1])
+        height && self.definite[1] == want.definite[1] && (!reads.parent.height || parent(1))
     }
 }
 
@@ -627,6 +644,43 @@ mod tests {
         assert_eq!(c.take_check().map(|a| a.len()), Some(1));
         c.store(&input, &out(1.0), false, false);
         assert!(c.get(&input, NONE).is_some(), "laid out again, it is placed");
+    }
+
+    #[test]
+    fn a_known_size_and_an_available_space_never_share_a_key() {
+        // Frontiers 6.1: a known width `1.5` and an available `Definite(-1.0)`
+        // once folded to the same `u32`; Taffy's block intrinsic sizing can
+        // probe a child at a negative available width.
+        let available = |width: AvailableSpace, parent: Option<f32>| LayoutInput {
+            known_dimensions: Size {
+                width: None,
+                height: None,
+            },
+            available_space: Size {
+                width,
+                height: AvailableSpace::MaxContent,
+            },
+            ..measure(0.0, parent)
+        };
+        let mut c = NodeCache::default();
+        c.store(&measure(1.5, None), &out(1.0), false, false);
+        assert!(c.get(&measure(1.5, None), BOTH).is_some());
+        assert!(c.get(&available(AvailableSpace::Definite(-1.0), None), BOTH).is_none());
+        // And every kind against every other, at the bits that once met.
+        let kinds = [-1.0_f32, 1.5, f32::INFINITY, f32::NEG_INFINITY]
+            .into_iter()
+            .flat_map(|v| [measure(v, None), available(AvailableSpace::Definite(v), None)])
+            .chain([
+                available(AvailableSpace::MinContent, None),
+                available(AvailableSpace::MaxContent, None),
+                available(AvailableSpace::MaxContent, Some(f32::INFINITY)),
+            ])
+            .collect::<Vec<_>>();
+        for (i, a) in kinds.iter().enumerate() {
+            for (j, b) in kinds.iter().enumerate() {
+                assert_eq!(Key::of(a) == Key::of(b), i == j, "{a:?} against {b:?}");
+            }
+        }
     }
 
     #[test]

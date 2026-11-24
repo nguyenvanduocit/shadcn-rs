@@ -2,25 +2,35 @@
 //!
 //! A [`View`] is a permutation: the data rows a sort and a filter keep, in
 //! their order. It is built off the UI thread from a [`Snapshot`] (shared,
-//! not copied) and delivered through a [`mailbox`](crate::mailbox), so
-//! sorting a million rows never holds a frame. A [`Selection`] is kept in
-//! data rows, as ranges, with an "all except" mode, so it survives a sort
-//! or a filter unchanged and moves with the data when rows are spliced.
+//! not copied) by [`Views`], which delivers only the view the latest
+//! request asked for, so sorting a million rows never holds a frame. A
+//! [`Selection`] is kept in data rows, as ranges, with an "all except"
+//! mode, so it survives a sort or a filter unchanged and moves with the
+//! data when rows are spliced.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::mailbox::Sender;
+use crate::mailbox::{Sender, mailbox};
 use crate::reactive::Snapshot;
 
 /// How two rows of data compare, for a sort.
 pub type Order<T> = dyn Fn(&T, &T) -> Ordering;
 
+/// Where no position is: a data row the view leaves out.
+const LEFT_OUT: u32 = u32::MAX;
+
 /// The data rows a list shows, in the order it shows them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct View {
     rows: Arc<Vec<u32>>,
+    /// Each data row's position in `rows` ([`LEFT_OUT`]: filtered out),
+    /// built with it off the UI thread: what a list's heights follow
+    /// across a sort ([`crate::list::ListState::reorder`]).
+    positions: Arc<Vec<u32>>,
     /// The data's version it was built from.
     version: u64,
 }
@@ -29,8 +39,10 @@ impl View {
     /// Every row of `len`, in data order.
     #[must_use]
     pub fn identity(len: u32) -> Self {
+        let rows = Arc::new((0..len).collect());
         Self {
-            rows: Arc::new((0..len).collect()),
+            positions: Arc::clone(&rows),
+            rows,
             version: 0,
         }
     }
@@ -47,25 +59,18 @@ impl View {
         if let Some(cmp) = order {
             kept.sort_by(|a, b| cmp(a.1, b.1));
         }
+        let rows: Vec<u32> = kept.into_iter().map(|(i, _)| i).collect();
+        let mut positions = vec![LEFT_OUT; items.len()];
+        for (row, at) in rows.iter().zip(0_u32..) {
+            if let Some(p) = usize::try_from(*row).ok().and_then(|r| positions.get_mut(r)) {
+                *p = at;
+            }
+        }
         Self {
-            rows: Arc::new(kept.into_iter().map(|(i, _)| i).collect()),
+            rows: Arc::new(rows),
+            positions: Arc::new(positions),
             version: items.version(),
         }
-    }
-
-    /// Build a view on a thread of its own and send it to `to` (a mailbox
-    /// whose handler stores it in a signal the list reads).
-    pub fn spawn<T, K, O>(items: Snapshot<T>, keep: K, order: Option<O>, to: Sender<Self>)
-    where
-        T: Clone + Send + Sync + 'static,
-        K: Fn(&T) -> bool + Send + 'static,
-        O: Fn(&T, &T) -> Ordering + Send + 'static,
-        Snapshot<T>: Send,
-    {
-        std::thread::spawn(move || {
-            let view = Self::build(&items, keep, order.as_ref().map(|o| -> &Order<T> { o }));
-            to.send(view);
-        });
     }
 
     /// Rows shown.
@@ -85,10 +90,73 @@ impl View {
         self.rows.get(position).copied()
     }
 
-    /// The data's version the view was built from (a newer view replaces an older one).
+    /// Where data row `row` is shown; `None` when the view leaves it out.
+    #[must_use]
+    pub fn position(&self, row: u32) -> Option<usize> {
+        let at = *self.positions.get(usize::try_from(row).ok()?)?;
+        (at != LEFT_OUT).then(|| usize::try_from(at).ok()).flatten()
+    }
+
+    /// Where the row this view shows at `position` is shown in `to` (the
+    /// same data row); `None` when `to` leaves it out: what a list given
+    /// `to` in place of this view passes [`crate::list::ListState::reorder`].
+    #[must_use]
+    pub fn moved_to(&self, to: &Self, position: u64) -> Option<u64> {
+        let row = self.row(usize::try_from(position).ok()?)?;
+        to.position(row).and_then(|p| u64::try_from(p).ok())
+    }
+
+    /// The data's version the view was built from.
     #[must_use]
     pub fn version(&self) -> u64 {
         self.version
+    }
+}
+
+/// Builds views off the UI thread and hands its handler only the one the
+/// latest request asked for: each request supersedes the ones before it,
+/// so two sorts of one snapshot that finish in the other order (the
+/// threads race) never leave the older on screen. A snapshot's version
+/// cannot tell them apart; the order they were asked in does. Clones share
+/// it.
+#[derive(Clone)]
+pub struct Views {
+    /// The latest request's number.
+    asked: Rc<Cell<u64>>,
+    to: Sender<(u64, View)>,
+}
+
+impl Views {
+    /// Views handed to `on_view` on the UI thread (a handler that stores it
+    /// in a signal the list reads), each the latest one asked for. Made in
+    /// a scope, it closes with it ([`mailbox`]).
+    pub fn new(mut on_view: impl FnMut(View) + 'static) -> Self {
+        let asked = Rc::new(Cell::new(0));
+        let latest = Rc::clone(&asked);
+        let to = mailbox(move |(request, view): (u64, View)| {
+            if request == latest.get() {
+                on_view(view);
+            }
+        });
+        Self { asked, to }
+    }
+
+    /// Build the view of `items` that `keep` and `order` give ([`View::build`])
+    /// on a thread of its own, superseding every request before it.
+    pub fn spawn<T, K, O>(&self, items: Snapshot<T>, keep: K, order: Option<O>)
+    where
+        T: Clone + Send + Sync + 'static,
+        K: Fn(&T) -> bool + Send + 'static,
+        O: Fn(&T, &T) -> Ordering + Send + 'static,
+        Snapshot<T>: Send,
+    {
+        let request = self.asked.get().wrapping_add(1);
+        self.asked.set(request);
+        let to = self.to.clone();
+        std::thread::spawn(move || {
+            let view = View::build(&items, keep, order.as_ref().map(|o| -> &Order<T> { o }));
+            to.send((request, view));
+        });
     }
 }
 
@@ -274,6 +342,64 @@ mod tests {
         let shown: Vec<u32> = (0..v.len()).filter_map(|p| v.row(p)).collect();
         // 1 (row 3), 3 (row 1), 5 (row 0), 9 (row 4).
         assert_eq!(shown, vec![3, 1, 0, 4]);
+        c.dispose();
+    }
+
+    /// Frontiers 4.1: two sorts of one snapshot, the first asked finishing
+    /// last. Only the latest request's view reaches the handler.
+    #[test]
+    fn of_two_sorts_of_one_snapshot_the_later_asked_wins_whichever_ends_first() {
+        use std::cell::RefCell;
+        use std::sync::atomic::{AtomicBool, Ordering as Atomic};
+
+        let c = Collection::new([2_u32, 3, 1]);
+        let shown = Rc::new(RefCell::new(Vec::new()));
+        let into = Rc::clone(&shown);
+        let views = Views::new(move |v: View| {
+            into.borrow_mut()
+                .push((0..v.len()).filter_map(|p| v.row(p)).collect::<Vec<_>>())
+        });
+        let gate = Arc::new(AtomicBool::new(false));
+        let held = Arc::clone(&gate);
+        // Ascending, asked first, held until the descending one arrived.
+        views.spawn(
+            c.snapshot(),
+            move |_: &u32| {
+                while !held.load(Atomic::SeqCst) {
+                    std::thread::yield_now();
+                }
+                true
+            },
+            Some(|a: &u32, b: &u32| a.cmp(b)),
+        );
+        views.spawn(c.snapshot(), |_: &u32| true, Some(|a: &u32, b: &u32| b.cmp(a)));
+        let arrive = || {
+            for _ in 0..10_000 {
+                if crate::mailbox::deliver() {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            panic!("no view arrived");
+        };
+        arrive();
+        gate.store(true, Atomic::SeqCst);
+        arrive();
+        // 3 (row 1), 2 (row 0), 1 (row 2): the descending view, alone.
+        assert_eq!(*shown.borrow(), [vec![1, 0, 2]]);
+        c.dispose();
+    }
+
+    #[test]
+    fn a_view_knows_where_each_data_row_went() {
+        let c = Collection::new([5_u32, 3, 8, 1]);
+        let all = View::identity(4);
+        let odd = View::build(&c.snapshot(), |v| v % 2 == 1, Some(&|a: &u32, b: &u32| a.cmp(b)));
+        // Odd ascending: 1 (row 3), 3 (row 1), 5 (row 0); 8 (row 2) left out.
+        assert_eq!(odd.position(3), Some(0));
+        assert_eq!(odd.position(2), None);
+        let moved: Vec<Option<u64>> = (0..4).map(|p| all.moved_to(&odd, p)).collect();
+        assert_eq!(moved, [Some(2), Some(1), None, Some(0)]);
         c.dispose();
     }
 
