@@ -271,30 +271,31 @@ impl Window {
                 _ => Taken::None,
             },
             #[cfg(test)]
-            Surface::Virtual(v) => match {
+            Surface::Virtual(v) => {
                 std::thread::sleep(v.acquire_takes);
-                v.faults.pop_front()
-            } {
-                Some(Fault::Outdated) => Taken::Outdated,
-                Some(Fault::Lost) => Taken::Lost,
-                Some(Fault::Timeout) => Taken::None,
-                Some(Fault::Occluded) => Taken::Occluded,
-                None if v.strict && v.window != (self.config.width, self.config.height) => Taken::Outdated,
-                None => Taken::Frame(Frame::Virtual(device.create_texture(&wgpu::TextureDescriptor {
-                    label: Some("gui virtual surface"),
-                    size: wgpu::Extent3d {
-                        width: self.config.width,
-                        height: self.config.height,
-                        depth_or_array_layers: 1,
-                    },
-                    mip_level_count: 1,
-                    sample_count: 1,
-                    dimension: wgpu::TextureDimension::D2,
-                    format: self.config.format,
-                    usage: self.config.usage,
-                    view_formats: &[],
-                }))),
-            },
+                let fault = v.faults.pop_front();
+                match fault {
+                    Some(Fault::Outdated) => Taken::Outdated,
+                    Some(Fault::Lost) => Taken::Lost,
+                    Some(Fault::Timeout) => Taken::None,
+                    Some(Fault::Occluded) => Taken::Occluded,
+                    None if v.strict && v.window != (self.config.width, self.config.height) => Taken::Outdated,
+                    None => Taken::Frame(Frame::Virtual(device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("gui virtual surface"),
+                        size: wgpu::Extent3d {
+                            width: self.config.width,
+                            height: self.config.height,
+                            depth_or_array_layers: 1,
+                        },
+                        mip_level_count: 1,
+                        sample_count: 1,
+                        dimension: wgpu::TextureDimension::D2,
+                        format: self.config.format,
+                        usage: self.config.usage,
+                        view_formats: &[],
+                    }))),
+                }
+            }
         };
         #[cfg(not(test))]
         let _ = device;
