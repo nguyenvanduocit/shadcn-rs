@@ -12,6 +12,7 @@
 use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::ops::Range;
+use std::panic::AssertUnwindSafe;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as Atomic};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -86,7 +87,7 @@ impl View {
             }
         }
         if let Some(cmp) = order {
-            kept = sort_until(kept, cmp, stale)?;
+            kept = sort_until(kept, &|a: &(u32, &T), b: &(u32, &T)| cmp(a.1, b.1), stale)?;
         }
         let mut rows = Vec::with_capacity(kept.len());
         let mut ids = Vec::with_capacity(kept.len());
@@ -97,11 +98,8 @@ impl View {
             rows.push(i);
             ids.push(id(t));
         }
-        let mut by_id: Vec<(u64, u32)> = ids.iter().copied().zip(0_u32..).collect();
-        if stale() {
-            return None;
-        }
-        by_id.sort_unstable();
+        let by_id: Vec<(u64, u32)> = ids.iter().copied().zip(0_u32..).collect();
+        let by_id = sort_until(by_id, &|a: &(u64, u32), b: &(u64, u32)| a.cmp(b), stale)?;
         Some(Self {
             rows: Arc::new(rows),
             ids: Arc::new(ids),
@@ -161,16 +159,12 @@ impl View {
 
 /// `kept` sorted stably by `cmp`: chunks sorted, then merged pass by pass,
 /// given up (`None`) at the first chunk boundary where `stale` says so.
-fn sort_until<'a, T>(
-    mut kept: Vec<(u32, &'a T)>,
-    cmp: &Order<T>,
-    stale: &dyn Fn() -> bool,
-) -> Option<Vec<(u32, &'a T)>> {
+fn sort_until<E: Copy>(mut kept: Vec<E>, cmp: &dyn Fn(&E, &E) -> Ordering, stale: &dyn Fn() -> bool) -> Option<Vec<E>> {
     for chunk in kept.chunks_mut(CHUNK) {
         if stale() {
             return None;
         }
-        chunk.sort_by(|a, b| cmp(a.1, b.1));
+        chunk.sort_by(cmp);
     }
     let mut out = Vec::with_capacity(kept.len());
     let mut width = CHUNK;
@@ -188,11 +182,11 @@ fn sort_until<'a, T>(
 
 /// `left` and `right`, each sorted, merged onto `out` (equal rows: the
 /// left's first, so the sort stays stable); `None` once `stale`.
-fn merge_until<'a, T>(
-    left: &[(u32, &'a T)],
-    right: &[(u32, &'a T)],
-    cmp: &Order<T>,
-    out: &mut Vec<(u32, &'a T)>,
+fn merge_until<E: Copy>(
+    left: &[E],
+    right: &[E],
+    cmp: &dyn Fn(&E, &E) -> Ordering,
+    out: &mut Vec<E>,
     stale: &dyn Fn() -> bool,
 ) -> Option<()> {
     let (mut l, mut r) = (left.iter().peekable(), right.iter().peekable());
@@ -201,7 +195,7 @@ fn merge_until<'a, T>(
             return None;
         }
         let right_first = match (l.peek(), r.peek()) {
-            (Some(a), Some(b)) => cmp(b.1, a.1) == Ordering::Less,
+            (Some(a), Some(b)) => cmp(b, a) == Ordering::Less,
             (Some(_), None) => false,
             (None, Some(_)) => true,
             (None, None) => return Some(()),
@@ -214,11 +208,27 @@ fn merge_until<'a, T>(
 /// A build asked for: run with a test of whether it is still wanted.
 type Job = Box<dyn FnOnce(&dyn Fn() -> bool) -> Option<Built> + Send>;
 
+/// How to ask for a request's build again: given the view shown, the
+/// heights lent, whether they are laid out as that view says, and the
+/// request's number.
+type Recipe = Rc<dyn Fn(View, Heights, bool, u64) -> Job>;
+
 /// What a build sends back: the view, and the list's heights reordered for it.
 struct Built {
     request: u64,
     view: View,
     heights: Heights,
+}
+
+/// What the worker sends the UI thread.
+enum Outcome {
+    Built(Built),
+    /// A closure the request gave (its `id`, `keep` or `order`) panicked:
+    /// the request is dropped, the worker serves the next.
+    Failed {
+        request: u64,
+        message: String,
+    },
 }
 
 /// What the UI thread and the worker share.
@@ -250,14 +260,49 @@ impl Shared {
 struct Inner {
     /// The latest request's number.
     asked: Cell<u64>,
+    /// How to ask for the latest request again (its heights came back
+    /// refused: rows moved while it was built).
+    recipe: RefCell<Option<Recipe>>,
     shared: Arc<Shared>,
     /// The view shown: what the next one is reordered from.
     shown: RefCell<View>,
+    /// The list's shape when `shown` was last true of its rows: a list
+    /// changed since (spliced by its owner) is not laid out as `shown`
+    /// says, so its heights cannot follow ids and are dropped.
+    shown_shape: Cell<u64>,
+    /// Why the latest request failed, if it did.
+    failed: RefCell<Option<String>>,
     list: ListState,
+}
+
+impl Inner {
+    /// The heights replaced or refused, to the worker to drop.
+    fn dispose(&self, heights: Heights) {
+        self.shared.slot().trash.push(heights);
+        self.shared.wake.notify_one();
+    }
+
+    /// Ask for the build `recipe` makes, superseding every request before it.
+    fn ask(&self, recipe: &Recipe) {
+        let request = self.asked.get().wrapping_add(1);
+        self.asked.set(request);
+        self.shared.latest.store(request, Atomic::Release);
+        let old = self.shown.borrow().clone();
+        let mappable = self.list.shape() == self.shown_shape.get();
+        let job = recipe(old, self.list.lend_heights(), mappable, request);
+        let superseded = self.shared.slot().job.replace((request, job));
+        self.shared.wake.notify_one();
+        // Its view is not built yet and its heights are the list's, shared:
+        // dropping it here is a few counts.
+        drop(superseded);
+    }
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        // The running build stops at its next chunk; the loan ends.
+        self.shared.latest.fetch_add(1, Atomic::AcqRel);
+        self.list.end_loan();
         let mut slot = self.shared.slot();
         slot.closed = true;
         slot.job = None;
@@ -299,28 +344,54 @@ impl Views {
         });
         let inner = Rc::new(Inner {
             asked: Cell::new(0),
+            recipe: RefCell::new(None),
             shared: Arc::clone(&shared),
             shown: RefCell::new(shown),
+            shown_shape: Cell::new(list.shape()),
+            failed: RefCell::new(None),
             list: list.clone(),
         });
         let weak = Rc::downgrade(&inner);
-        let to = mailbox(move |built: Built| {
+        let to = mailbox(move |outcome: Outcome| {
             let Some(inner) = weak.upgrade() else {
                 return;
             };
+            let built = match outcome {
+                Outcome::Built(built) => built,
+                Outcome::Failed { request, message } => {
+                    if request == inner.asked.get() {
+                        inner.list.end_loan();
+                        *inner.failed.borrow_mut() = Some(message);
+                    }
+                    return;
+                }
+            };
             if built.request != inner.asked.get() {
+                inner.dispose(built.heights);
                 return;
             }
-            let old = inner.shown.replace(built.view.clone());
-            let new = &built.view;
+            let new = built.view;
             let rows = u64::try_from(new.len()).unwrap_or(u64::MAX);
-            if let Some(replaced) = inner.list.reorder_with(built.heights, rows, |p| old.moved_to(new, p)) {
-                // The heights replaced go to the worker to drop.
-                inner.shared.slot().trash.push(replaced);
-                inner.shared.wake.notify_one();
+            let old = inner.shown.borrow().clone();
+            match inner.list.reorder_with(built.heights, rows, |p| old.moved_to(&new, p)) {
+                Ok(replaced) => {
+                    inner.dispose(replaced);
+                    *inner.shown.borrow_mut() = new.clone();
+                    inner.shown_shape.set(inner.list.shape());
+                    inner.failed.borrow_mut().take();
+                    drop(old);
+                    on_view(new);
+                }
+                Err(refused) => {
+                    // Rows moved while it was built: built again on a
+                    // fresh loan, never moved by places that no longer hold.
+                    inner.dispose(refused);
+                    let recipe = inner.recipe.borrow().clone();
+                    if let Some(recipe) = recipe {
+                        inner.ask(&recipe);
+                    }
+                }
             }
-            drop(old);
-            on_view(built.view);
         });
         std::thread::spawn(move || work(&shared, &to));
         Self(inner)
@@ -331,28 +402,40 @@ impl Views {
     pub fn spawn<T, I, K, O>(&self, items: Snapshot<T>, id: I, keep: K, order: Option<O>)
     where
         T: Clone + Send + Sync + 'static,
-        I: Fn(&T) -> u64 + Send + 'static,
-        K: Fn(&T) -> bool + Send + 'static,
-        O: Fn(&T, &T) -> Ordering + Send + 'static,
+        I: Fn(&T) -> u64 + Send + Sync + 'static,
+        K: Fn(&T) -> bool + Send + Sync + 'static,
+        O: Fn(&T, &T) -> Ordering + Send + Sync + 'static,
         Snapshot<T>: Send,
     {
-        let inner = &self.0;
-        let request = inner.asked.get().wrapping_add(1);
-        inner.asked.set(request);
-        inner.shared.latest.store(request, Atomic::Release);
-        let old = inner.shown.borrow().clone();
-        let mut heights = inner.list.lend_heights();
-        let job: Job = Box::new(move |stale| {
-            let order = order.as_ref().map(|o| -> &Order<T> { o });
-            let view = View::build_until(&items, &id, &keep, order, stale)?;
-            let rows = u64::try_from(view.len()).unwrap_or(u64::MAX);
-            heights.reorder(rows, |p| old.moved_to(&view, p));
-            (!stale()).then_some(Built { request, view, heights })
+        let (id, keep, order) = (Arc::new(id), Arc::new(keep), order.map(Arc::new));
+        let recipe: Recipe = Rc::new(move |old: View, mut heights: Heights, mappable: bool, request: u64| {
+            let (items, id, keep, order) = (items.clone(), Arc::clone(&id), Arc::clone(&keep), order.clone());
+            let job: Job = Box::new(move |stale| {
+                let order = order.as_deref().map(|o| -> &Order<T> { o });
+                let view = View::build_until(&items, &*id, &*keep, order, stale)?;
+                let rows = u64::try_from(view.len()).unwrap_or(u64::MAX);
+                if mappable {
+                    if !heights.reorder_until(rows, |p| old.moved_to(&view, p), stale) {
+                        return None;
+                    }
+                } else {
+                    // The list is not laid out as the view shown says: its
+                    // heights cannot follow ids, so none is kept.
+                    heights.forget(rows);
+                }
+                (!stale()).then_some(Built { request, view, heights })
+            });
+            job
         });
-        let superseded = inner.shared.slot().job.replace((request, job));
-        inner.shared.wake.notify_one();
-        // Shared snapshots only: dropping them here is a few counts.
-        drop(superseded);
+        self.0.recipe.replace(Some(Rc::clone(&recipe)));
+        self.0.ask(&recipe);
+    }
+
+    /// Why the latest request failed (a closure it gave panicked), until a
+    /// view is delivered.
+    #[must_use]
+    pub fn failure(&self) -> Option<String> {
+        self.0.failed.borrow().clone()
     }
 
     /// Builds that ran to the end (the rest stopped, superseded).
@@ -363,7 +446,7 @@ impl Views {
 }
 
 /// The worker: the build waiting, if still the latest, then the next.
-fn work(shared: &Shared, to: &Sender<Built>) {
+fn work(shared: &Shared, to: &Sender<Outcome>) {
     let mut spare: Vec<Heights> = Vec::with_capacity(2);
     loop {
         let (request, job) = {
@@ -387,10 +470,24 @@ fn work(shared: &Shared, to: &Sender<Built>) {
             }
         };
         let stale = || shared.latest.load(Atomic::Acquire) != request;
-        if let Some(built) = job(&stale) {
-            shared.finished.fetch_add(1, Atomic::AcqRel);
-            if !stale() {
-                to.send(built);
+        // A closure the request gave may panic: that request goes, the
+        // worker stays (its state is the slot, behind a lock that shrugs
+        // off poisoning, and the build's own values, dropped with it).
+        match std::panic::catch_unwind(AssertUnwindSafe(|| job(&stale))) {
+            Ok(Some(built)) => {
+                shared.finished.fetch_add(1, Atomic::AcqRel);
+                if !stale() {
+                    to.send(Outcome::Built(built));
+                }
+            }
+            Ok(None) => {}
+            Err(panic) => {
+                let message = panic
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_owned())
+                    .or_else(|| panic.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "a closure of the request panicked".to_owned());
+                to.send(Outcome::Failed { request, message });
             }
         }
     }
@@ -594,23 +691,43 @@ mod tests {
         panic!("no view arrived");
     }
 
-    /// Views delivering to a vector of what each shows (data rows), and
-    /// the gate the first build waits at.
-    fn views_into(len: u32) -> (Views, Rc<RefCell<Vec<Vec<u32>>>>) {
+    /// Views for `list` delivering to a vector of what each shows (data rows).
+    fn views_into(list: &ListState, len: u32) -> (Views, Rc<RefCell<Vec<Vec<u32>>>>) {
         let shown = Rc::new(RefCell::new(Vec::new()));
         let into = Rc::clone(&shown);
-        let views = Views::new(&ListState::new(24.0), View::identity(len), move |v: View| {
+        let views = Views::new(list, View::identity(len), move |v: View| {
             into.borrow_mut()
                 .push((0..v.len()).filter_map(|p| v.row(p)).collect::<Vec<_>>());
         });
         (views, shown)
     }
 
+    /// Where a build is held: it says it got there, and waits to be let go.
+    #[derive(Default)]
+    struct Gate {
+        entered: std::sync::atomic::AtomicBool,
+        open: std::sync::atomic::AtomicBool,
+    }
+
+    impl Gate {
+        /// Until a build is held here.
+        fn wait_entered(&self) {
+            while !self.entered.load(Atomic::SeqCst) {
+                std::thread::yield_now();
+            }
+        }
+
+        fn open(&self) {
+            self.open.store(true, Atomic::SeqCst);
+        }
+    }
+
     /// A `keep` that holds its build at `gate` until it opens.
-    fn held(gate: &Arc<std::sync::atomic::AtomicBool>) -> impl Fn(&u32) -> bool + Send + 'static {
+    fn held(gate: &Arc<Gate>) -> impl Fn(&u32) -> bool + Send + Sync + 'static {
         let gate = Arc::clone(gate);
         move |_: &u32| {
-            while !gate.load(Atomic::SeqCst) {
+            gate.entered.store(true, Atomic::SeqCst);
+            while !gate.open.load(Atomic::SeqCst) {
                 std::thread::yield_now();
             }
             true
@@ -623,12 +740,13 @@ mod tests {
     #[test]
     fn of_two_sorts_of_one_snapshot_the_later_asked_wins_whichever_ends_first() {
         let c = Collection::new([2_u32, 3, 1]);
-        let (views, shown) = views_into(3);
-        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (views, shown) = views_into(&ListState::new(24.0), 3);
+        let gate = Arc::new(Gate::default());
         let id = |v: &u32| u64::from(*v);
         views.spawn(c.snapshot(), id, held(&gate), Some(|a: &u32, b: &u32| a.cmp(b)));
+        gate.wait_entered();
         views.spawn(c.snapshot(), id, |_: &u32| true, Some(|a: &u32, b: &u32| b.cmp(a)));
-        gate.store(true, Atomic::SeqCst);
+        gate.open();
         arrive();
         // 3 (row 1), 2 (row 0), 1 (row 2): the descending view, alone.
         assert_eq!(*shown.borrow(), [vec![1, 0, 2]]);
@@ -642,18 +760,123 @@ mod tests {
     #[test]
     fn superseded_sorts_stop_and_only_the_latest_is_built() {
         let c = Collection::new((0..100_000_u32).rev());
-        let (views, shown) = views_into(100_000);
-        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (views, shown) = views_into(&ListState::new(24.0), 100_000);
+        let gate = Arc::new(Gate::default());
         let id = |v: &u32| u64::from(*v);
         views.spawn(c.snapshot(), id, held(&gate), Some(|a: &u32, b: &u32| a.cmp(b)));
+        // The first build is running, held in its `keep`, when the rest come.
+        gate.wait_entered();
         for _ in 0..20 {
             views.spawn(c.snapshot(), id, |_: &u32| true, Some(|a: &u32, b: &u32| a.cmp(b)));
         }
         views.spawn(c.snapshot(), id, |v: &u32| *v < 3, Some(|a: &u32, b: &u32| b.cmp(a)));
-        gate.store(true, Atomic::SeqCst);
+        gate.open();
         arrive();
         assert_eq!(*shown.borrow(), [vec![99_997, 99_998, 99_999]], "the latest, alone");
         assert_eq!(views.finished(), 1, "every other build stopped or never ran");
+        c.dispose();
+    }
+
+    /// Codex and Sonnet (M15 review 2): every stage of a build stops once
+    /// it is no longer wanted, the id index's sort too: a sort given up
+    /// after its first chunk compares within that chunk only.
+    #[test]
+    fn a_sort_no_longer_wanted_stops_after_a_chunk() {
+        let ids: Vec<(u64, u32)> = (0..100_000_u32).rev().map(|i| (u64::from(i), i)).collect();
+        let asked = Cell::new(0_u64);
+        let compared = Cell::new(0_u64);
+        let stale = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        let cmp = |a: &(u64, u32), b: &(u64, u32)| {
+            compared.set(compared.get() + 1);
+            a.cmp(b)
+        };
+        assert!(sort_until(ids, &cmp, &stale).is_none());
+        assert!(compared.get() < 400_000, "{} comparisons", compared.get());
+    }
+
+    /// Sonnet and Codex (M15 review 2): the views dropped while a build
+    /// runs. The build stops at its next chunk (its ids are never asked
+    /// for), and the list's loan ends, so nothing is noted for it.
+    #[test]
+    fn dropping_the_views_stops_the_running_build_and_ends_the_loan() {
+        let c = Collection::new((0..100_000_u32).rev());
+        let list = ListState::new(24.0);
+        let (views, _) = views_into(&list, 100_000);
+        let gate = Arc::new(Gate::default());
+        let asked_ids = Arc::new(AtomicU64::new(0));
+        let counted = Arc::clone(&asked_ids);
+        let id = move |v: &u32| {
+            counted.fetch_add(1, Atomic::SeqCst);
+            u64::from(*v)
+        };
+        views.spawn(c.snapshot(), id, held(&gate), Some(|a: &u32, b: &u32| a.cmp(b)));
+        gate.wait_entered();
+        assert!(list.is_lent());
+        let shared = Arc::clone(&views.0.shared);
+        drop(views);
+        assert!(!list.is_lent(), "the loan ended");
+        gate.open();
+        // The worker holds the other count until it ends.
+        for _ in 0..10_000 {
+            if Arc::strong_count(&shared) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(Arc::strong_count(&shared), 1, "the worker ended");
+        assert_eq!(shared.finished.load(Atomic::SeqCst), 0, "the build stopped");
+        assert_eq!(asked_ids.load(Atomic::SeqCst), 0, "before its ids");
+        c.dispose();
+    }
+
+    /// Sonnet (M15 review 2): a request whose `order` panics is dropped and
+    /// said to have failed; the worker serves the next.
+    #[test]
+    fn a_panicking_order_fails_its_request_and_the_worker_serves_the_next() {
+        let c = Collection::new([2_u32, 3, 1]);
+        let (views, shown) = views_into(&ListState::new(24.0), 3);
+        let id = |v: &u32| u64::from(*v);
+        views.spawn(
+            c.snapshot(),
+            id,
+            |_: &u32| true,
+            Some(|_: &u32, _: &u32| -> Ordering { panic!("no order today") }),
+        );
+        arrive();
+        assert_eq!(views.failure().as_deref(), Some("no order today"));
+        assert!(shown.borrow().is_empty());
+        views.spawn(c.snapshot(), id, |_: &u32| true, Some(|a: &u32, b: &u32| a.cmp(b)));
+        arrive();
+        assert_eq!(*shown.borrow(), [vec![2, 0, 1]]);
+        assert_eq!(views.failure(), None);
+        c.dispose();
+    }
+
+    /// Codex (M15 review 2): the list spliced by its owner while a sort is
+    /// built. The result is refused and the sort asked again on a fresh
+    /// loan; the list is no longer laid out as the view shown says, so no
+    /// height is moved by it.
+    #[test]
+    fn a_sort_refused_after_a_splice_is_built_again() {
+        let c = Collection::new([2_u32, 3, 1]);
+        let list = ListState::new(24.0);
+        let (views, shown) = views_into(&list, 3);
+        let gate = Arc::new(Gate::default());
+        let id = |v: &u32| u64::from(*v);
+        views.spawn(c.snapshot(), id, held(&gate), Some(|a: &u32, b: &u32| a.cmp(b)));
+        gate.wait_entered();
+        list.splice(0, 0, 3);
+        gate.open();
+        arrive();
+        assert!(shown.borrow().is_empty(), "refused");
+        assert!(list.is_lent(), "asked again");
+        arrive();
+        assert_eq!(*shown.borrow(), [vec![2, 0, 1]]);
+        assert_eq!(views.finished(), 2);
+        assert!(!list.is_measured(0) && !list.is_measured(2));
         c.dispose();
     }
 

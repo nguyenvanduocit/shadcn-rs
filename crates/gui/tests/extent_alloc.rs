@@ -10,12 +10,20 @@ use gui::list::{ExtentTree, ListState};
 #[global_allocator]
 static HEAP: gui::heap::Counting = gui::heap::COUNTING;
 
+/// The tests here run one at a time: one reads the process's heap.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 fn allocations() -> u64 {
     gui::heap::thread().map_or(0, |h| h.allocations)
 }
 
 #[test]
 fn a_row_measured_that_moves_the_estimate_costs_no_pass_over_the_runs() {
+    let _one = serial();
     // Ten thousand measured rows apart from each other: twenty thousand runs.
     let mut t = ExtentTree::new(1_000_000, units(30.0));
     for k in 0..10_000_u64 {
@@ -42,9 +50,35 @@ fn measured_list() -> ListState {
     for r in 0..MILLION {
         ext.set(r, units(if r % 2 == 0 { 20.0 } else { 21.0 }));
     }
-    assert!(list.reorder_with(lent, MILLION, Some).is_some());
+    assert!(list.reorder_with(lent, MILLION, Some).is_ok());
     assert_eq!(list.runs(), 1_000_000);
     list
+}
+
+/// Codex (M15 review 2): heights lent, then a row spliced while the worker
+/// reordered them. The million-run result is refused and handed back: the
+/// UI thread neither rebuilds its own heights nor frees the result.
+#[test]
+fn a_refused_million_run_result_costs_the_ui_thread_nothing() {
+    let _one = serial();
+    let list = measured_list();
+    let reverse = |p: u64| Some(MILLION - 1 - p);
+    let mut lent = list.lend_heights();
+    list.splice(500_000, 1, 1);
+    // The worker's part.
+    lent.reorder(MILLION, reverse);
+    let held = gui::heap::now().map_or(0, |h| h.live);
+    let before = allocations();
+    let refused = list.reorder_with(lent, MILLION, reverse);
+    let spent = allocations() - before;
+    let freed = held.saturating_sub(gui::heap::now().map_or(0, |h| h.live));
+    let Err(refused) = refused else {
+        panic!("taken though a row moved since the loan");
+    };
+    assert!(spent <= 4, "{spent} allocations on the UI thread");
+    assert!(freed < 4 << 20, "{freed} bytes freed (other tests' frees count too)");
+    assert_eq!(list.row_height(0), 20.0, "the list's own heights, as they were");
+    std::thread::spawn(move || drop(refused)).join().unwrap();
 }
 
 /// Codex (M15 review 1): a sort of a million measured rows, its heights
@@ -52,6 +86,7 @@ fn measured_list() -> ListState {
 /// (almost) nothing, warm: the work is the worker's.
 #[test]
 fn a_sort_of_a_million_measured_rows_allocates_nothing_on_the_ui_thread() {
+    let _one = serial();
     let list = measured_list();
     let reverse = |p: u64| Some(MILLION - 1 - p);
     let mut spent = Vec::new();
@@ -63,7 +98,7 @@ fn a_sort_of_a_million_measured_rows_allocates_nothing_on_the_ui_thread() {
         let before = allocations();
         let replaced = list.reorder_with(lent, MILLION, reverse);
         spent.push(allocations() - before);
-        assert!(replaced.is_some());
+        assert!(replaced.is_ok());
         // Dropped elsewhere (the worker), as `Views` does.
         std::thread::spawn(move || drop(replaced)).join().unwrap();
     }
@@ -75,6 +110,7 @@ fn a_sort_of_a_million_measured_rows_allocates_nothing_on_the_ui_thread() {
 /// the bench: run it with `--release --nocapture`).
 #[test]
 fn the_worker_reorders_a_million_measured_rows() {
+    let _one = serial();
     let list = measured_list();
     let mut lent = list.lend_heights();
     let at = std::time::Instant::now();

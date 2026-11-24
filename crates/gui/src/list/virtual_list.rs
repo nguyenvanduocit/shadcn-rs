@@ -138,9 +138,11 @@ struct Plan {
 
 /// A list's heights lent to be reordered off the UI thread
 /// ([`ListState::lend_heights`]): `Send`, a snapshot sharing the list's.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Heights {
     extents: ExtentTree,
+    /// Which loan it is: only the latest is taken back.
+    loan: u64,
     /// Which row was where when lent.
     shape: u64,
 }
@@ -151,6 +153,23 @@ impl Heights {
     /// rows measured: work for the thread that sorts.
     pub fn reorder(&mut self, rows: u64, to: impl Fn(u64) -> Option<u64>) {
         self.extents.reorder(rows, to);
+    }
+
+    /// [`Self::reorder`], given up (`false`, the heights as they were) once
+    /// `stale` says it is no longer wanted: asked every few thousand rows.
+    pub(crate) fn reorder_until(
+        &mut self,
+        rows: u64,
+        to: impl Fn(u64) -> Option<u64>,
+        stale: &dyn Fn() -> bool,
+    ) -> bool {
+        self.extents.reorder_until(rows, to, stale)
+    }
+
+    /// `rows` rows, none measured, at the estimate they have: the heights
+    /// for rows whose old places are not known.
+    pub(crate) fn forget(&mut self, rows: u64) {
+        self.extents = ExtentTree::new(rows, self.extents.estimate());
     }
 
     #[must_use]
@@ -216,10 +235,13 @@ struct Inner {
     /// or removed at the end, a reorder, a reset): heights lent before one
     /// no longer match ([`ListState::reorder_with`]).
     shape: Cell<u64>,
-    /// The shape the heights were lent at, while lent ([`ListState::lend_heights`]).
-    lent: Cell<Option<u64>>,
-    /// The rows measured since, and at what height: what the heights lent
-    /// lack. Kept, cleared, for the next loan.
+    /// The live loan of the heights, if any ([`ListState::lend_heights`]):
+    /// its id and the shape it was made at. A newer loan voids it.
+    lent: Cell<Option<(u64, u64)>>,
+    /// Loans made: the next one's id.
+    loans: Cell<u64>,
+    /// The rows measured since the live loan, and at what height: what its
+    /// heights lack. Kept, cleared, for the next loan.
     since_lent: RefCell<Vec<(u64, u32)>>,
     anchor: Cell<Anchor>,
     /// The scroll asked for, the viewport not showing it yet: the anchor is
@@ -341,6 +363,7 @@ impl ListState {
             extents: RefCell::new(ExtentTree::new(0, units(estimate))),
             shape: Cell::new(0),
             lent: Cell::new(None),
+            loans: Cell::new(0),
             since_lent: RefCell::default(),
             anchor: Cell::default(),
             request: Cell::new(None),
@@ -471,38 +494,72 @@ impl ListState {
         self.0.shape.set(self.0.shape.get().wrapping_add(1));
     }
 
+    /// Which rows are where, as a count bumped by each change to it: what
+    /// [`Views`](super::Views) checks its view still describes.
+    pub(crate) fn shape(&self) -> u64 {
+        self.0.shape.get()
+    }
+
     /// Lend the heights to be reordered off the UI thread ([`Heights::reorder`],
     /// as [`Views`](super::Views) does with each sort), in O(1): a snapshot,
-    /// shared, not copied. The rows measured from now on are noted, so
-    /// [`Self::reorder_with`] adds them to what comes back. A loan replaces
-    /// the one before.
+    /// shared, not copied. The rows measured from now on are noted for this
+    /// loan, so [`Self::reorder_with`] adds them to what comes back. A loan
+    /// voids the one before: only the latest is taken back.
     #[must_use]
     pub fn lend_heights(&self) -> Heights {
         let shape = self.0.shape.get();
-        self.0.lent.set(Some(shape));
+        let loan = self.0.loans.get().wrapping_add(1);
+        self.0.loans.set(loan);
+        self.0.lent.set(Some((loan, shape)));
         self.0.since_lent.borrow_mut().clear();
         Heights {
             extents: self.0.extents.borrow().clone(),
+            loan,
             shape,
         }
+    }
+
+    /// Whether a loan of the heights is live.
+    #[cfg(test)]
+    pub(crate) fn is_lent(&self) -> bool {
+        self.0.lent.get().is_some()
+    }
+
+    /// End the live loan, if any: nothing is noted for it any more, and
+    /// what it lent is not taken back.
+    pub(crate) fn end_loan(&self) {
+        self.0.lent.set(None);
+        let mut since = self.0.since_lent.borrow_mut();
+        since.clear();
+        since.shrink_to_fit();
     }
 
     /// [`Self::reorder`] with the heights already reordered off the UI
     /// thread (`heights`, lent by [`Self::lend_heights`] and given
     /// [`Heights::reorder`] with the same `rows` and `to`): they are put in
     /// place in O(1) and the rows measured since the loan added (O(those
-    /// rows)), allocating nothing once warm. The heights replaced come back
-    /// to be dropped off the UI thread. When which row is where changed
-    /// since the loan (a splice, a later loan), the heights lent are stale:
-    /// the list reorders its own in place, and `None` comes back.
-    pub fn reorder_with(&self, heights: Heights, rows: u64, to: impl Fn(u64) -> Option<u64>) -> Option<Heights> {
-        let current = self.0.lent.take() == Some(heights.shape)
-            && self.0.shape.get() == heights.shape
-            && heights.extents.len() == rows;
-        if !current {
-            self.reorder(rows, to);
-            return None;
+    /// rows)), allocating nothing once warm; the heights replaced come back
+    /// (`Ok`) to be dropped off the UI thread.
+    ///
+    /// Taken back only from the live loan, and only while no row moved
+    /// since it was made (no splice, no rows removed at the end, no reset,
+    /// no reorder): else nothing changes, the loan ends, and `heights` come
+    /// back (`Err`), to be dropped off the UI thread too. Heights are never
+    /// moved by positions that no longer hold; the caller asks again.
+    pub fn reorder_with(
+        &self,
+        heights: Heights,
+        rows: u64,
+        to: impl Fn(u64) -> Option<u64>,
+    ) -> Result<Heights, Heights> {
+        let live = self.0.lent.get() == Some((heights.loan, heights.shape));
+        if !live || self.0.shape.get() != heights.shape || heights.extents.len() != rows {
+            if live {
+                self.end_loan();
+            }
+            return Err(heights);
         }
+        self.0.lent.set(None);
         let old = self.0.extents.replace(heights.extents);
         {
             let mut ext = self.0.extents.borrow_mut();
@@ -514,8 +571,9 @@ impl ListState {
         }
         self.reshaped();
         self.follow_reorder(rows, &to);
-        Some(Heights {
+        Ok(Heights {
             extents: old,
+            loan: heights.loan,
             shape: heights.shape,
         })
     }
@@ -903,9 +961,10 @@ impl ListState {
         self.0.pins.borrow_mut().clear();
         self.0.pins_before.set(0);
         // The rows around the anchor may be estimates: it holds, as a row
-        // scrolled to does, until the viewport shows it measured.
+        // scrolled to does, until the viewport shows it measured, aligned
+        // as a scroll still pending asked (its bottom, say).
         if !self.wants_end() {
-            self.ask(None);
+            self.ask(self.0.request.get().and_then(|r| r.bottom));
         }
         self.moved();
     }
@@ -1216,9 +1275,13 @@ impl ListState {
 
     /// Match the heights to `rows` rows: rows added or removed at the end.
     fn sync_len(&self, rows: u64) {
-        if self.len() != rows {
+        let len = self.len();
+        if len != rows {
             resize(&mut self.0.extents.borrow_mut(), rows);
-            self.reshaped();
+            // Rows added at the end move none; rows removed there go.
+            if rows < len {
+                self.reshaped();
+            }
         }
     }
 
@@ -2422,16 +2485,57 @@ mod tests {
         let before = crate::sum_tree::visits();
         let replaced = state.reorder_with(lent, n, reverse);
         let seen = crate::sum_tree::visits() - before;
-        assert!(replaced.is_some(), "put in place, the old heights handed back");
+        assert!(replaced.is_ok(), "put in place, the old heights handed back");
         assert!(seen < 2_000, "{seen} entries looked at");
         assert_eq!(state.row_height(n - 1 - 4), 30.0, "measured since the loan");
         assert_eq!(state.row_height(n - 1 - 5), 21.0);
-        // Lent before a splice: stale, reordered in place instead.
+    }
+
+    /// Three rows measured A 10, B 20, C 30; one of them sorted into C, B
+    /// is still being built when its owner splices A out: B and C keep
+    /// their heights, the result is refused, not moved by places that no
+    /// longer hold (Codex, M15 review 2).
+    #[test]
+    fn heights_lent_before_a_splice_are_refused_and_rows_keep_theirs() {
+        let state = ListState::new(30.0);
+        {
+            let mut ext = state.0.extents.borrow_mut();
+            *ext = ExtentTree::new(3, units(30.0));
+            for (row, h) in [(0, 10.0), (1, 20.0), (2, 30.0)] {
+                ext.set(row, units(h));
+            }
+        }
+        // [A, B, C] sorted to [C, B]: A left out.
+        let to = |p: u64| match p {
+            1 => Some(1),
+            2 => Some(0),
+            _ => None,
+        };
         let mut lent = state.lend_heights();
-        state.splice(0, 1, 1);
-        lent.reorder(n, reverse);
-        assert!(state.reorder_with(lent, n, reverse).is_none());
-        assert_eq!(state.row_height(0), 20.0, "row 99 999, back at the top");
+        state.splice(0, 1, 0);
+        lent.reorder(2, to);
+        assert!(state.reorder_with(lent, 2, to).is_err(), "refused");
+        assert_eq!((state.row_height(0), state.row_height(1)), (20.0, 30.0), "B, C");
+    }
+
+    /// Loan A, a row measured 20 then 30, loan B, then A comes back: A is
+    /// void, so the 30 measured since stays (Codex, M15 review 2).
+    #[test]
+    fn a_loan_voided_by_a_newer_one_is_not_taken_back() {
+        let state = ListState::new(30.0);
+        {
+            let mut ext = state.0.extents.borrow_mut();
+            *ext = ExtentTree::new(10, units(30.0));
+            ext.set(0, units(20.0));
+        }
+        let mut a = state.lend_heights();
+        state.adjust_row_height(0, 10.0);
+        let b = state.lend_heights();
+        a.reorder(10, Some);
+        assert!(state.reorder_with(a, 10, Some).is_err(), "A is void");
+        assert_eq!(state.row_height(0), 30.0);
+        assert!(state.reorder_with(b, 10, Some).is_ok(), "B is live");
+        assert_eq!(state.row_height(0), 30.0, "noted for B, kept");
     }
 
     /// A list of the rows `ids` holds, keyed and labelled by id, `tall(id)`
@@ -2513,6 +2617,32 @@ mod tests {
         s.settle().unwrap();
         assert_eq!(state.anchor().row, 810);
         assert_eq!(top_of(&s, 10), Some(-5.0), "the reader's row where it was");
+    }
+
+    /// Codex (M15 review 2): a row below the viewport brought into view
+    /// (its bottom at the viewport's), and the data sorted before the
+    /// layout: the row is found at its new index and its bottom is still
+    /// the viewport's.
+    #[test]
+    fn a_reorder_keeps_the_alignment_of_a_pending_scroll() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..1_000).collect());
+        let mut s = by_id(&state, ids, |_| 24.0, None);
+        s.settle().unwrap();
+        let to = |p: u64| {
+            Some(match p {
+                40 => 60,
+                60 => 40,
+                p => p,
+            })
+        };
+        s.act("row 40 into view, then sorted to 60", || {
+            state.scroll_into_view(40);
+            ids.update(|v| v.swap(40, 60));
+            state.reorder(1_000, to);
+        });
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, 40), Some(300.0 - 24.0), "its bottom at the viewport's");
     }
 
     /// Codex (M15 review 1): focus moved to a row and the data sorted in

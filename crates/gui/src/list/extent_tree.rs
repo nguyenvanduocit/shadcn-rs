@@ -13,6 +13,9 @@
 
 use crate::sum_tree::{Item, SumTree, Summary};
 
+/// Rows a reorder looks at between two asks of whether it is still wanted.
+pub const CHECK: u64 = 1 << 14;
+
 /// Units a pixel holds.
 pub const UNITS: f32 = 64.0;
 
@@ -342,18 +345,40 @@ impl ExtentTree {
     /// no old one went to are unmeasured. O(m log m + runs) for `m` rows
     /// measured, whatever the rows.
     pub fn reorder(&mut self, rows: u64, to: impl Fn(u64) -> Option<u64>) {
+        self.reorder_until(rows, to, &|| false);
+    }
+
+    /// [`Self::reorder`], given up once `stale` says it is no longer
+    /// wanted, asked every [`CHECK`] rows looked at: `false`, the tree as
+    /// it was.
+    pub fn reorder_until(&mut self, rows: u64, to: impl Fn(u64) -> Option<u64>, stale: &dyn Fn() -> bool) -> bool {
         let estimate = self.estimate();
         let mut moved: Vec<(u64, u32)> = Vec::new();
         let mut at = 0_u64;
+        let mut seen = 0_u64;
         for run in self.runs.iter() {
             let end = at.saturating_add(run.rows);
             if run.measured {
-                moved.extend((at..end).filter_map(|p| to(p).filter(|&q| q < rows).map(|q| (q, run.height))));
+                for p in at..end {
+                    if seen.is_multiple_of(CHECK) && stale() {
+                        return false;
+                    }
+                    seen = seen.saturating_add(1);
+                    if let Some(q) = to(p).filter(|&q| q < rows) {
+                        moved.push((q, run.height));
+                    }
+                }
             }
             at = end;
         }
+        if stale() {
+            return false;
+        }
         moved.sort_unstable_by_key(|&(q, _)| q);
         moved.dedup_by_key(|&mut (q, _)| q);
+        if stale() {
+            return false;
+        }
         let mut built: Vec<Run> = Vec::new();
         let mut push = |run: Run| {
             if run.rows == 0 {
@@ -369,7 +394,10 @@ impl ExtentTree {
             built.push(run);
         };
         let mut next = 0_u64;
-        for (q, height) in moved {
+        for ((q, height), n) in moved.into_iter().zip(0_u64..) {
+            if n.is_multiple_of(CHECK) && stale() {
+                return false;
+            }
             push(Run::unmeasured(q.saturating_sub(next)));
             push(Run {
                 rows: 1,
@@ -382,6 +410,7 @@ impl ExtentTree {
         self.runs = built.into_iter().collect();
         // None measured is left: the rows keep the estimate they had.
         self.initial = estimate;
+        true
     }
 
     /// Whether the tree keeps its invariants: no empty run, no two adjacent
@@ -586,6 +615,33 @@ mod tests {
             "{seen} entries looked at for one row of {} runs",
             t.runs()
         );
+    }
+
+    /// Codex (M15 review 2): a reorder no longer wanted stops within a
+    /// chunk of rows, the tree as it was.
+    #[test]
+    fn a_reorder_no_longer_wanted_stops_and_changes_nothing() {
+        let mut t = ExtentTree::new(100_000, units(30.0));
+        for r in 0..100_000 {
+            t.set(r, units(if r % 2 == 0 { 20.0 } else { 21.0 }));
+        }
+        let asked = std::cell::Cell::new(0_u64);
+        let looked = std::cell::Cell::new(0_u64);
+        let stale = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 1
+        };
+        let done = t.reorder_until(
+            100_000,
+            |p| {
+                looked.set(looked.get() + 1);
+                Some(99_999 - p)
+            },
+            &stale,
+        );
+        assert!(!done);
+        assert!(looked.get() <= CHECK, "{} rows looked at", looked.get());
+        assert_eq!(t.height(0), Some(units(20.0)), "as it was");
     }
 
     /// Frontiers 7.3 (Codex): the mean counted a row once, at its first
