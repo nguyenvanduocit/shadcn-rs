@@ -199,7 +199,9 @@ pub(crate) struct RenderThread {
     to_ui: Box<dyn Fn(FromRender) + Send>,
     /// What the platform thread stamps input with.
     presented: Arc<Mutex<Arc<Presented>>>,
-    vsync: Vsync,
+    /// The output the window is on, in its mode: its vsync and every
+    /// vblank a frame was drawn or granted for, made afresh as one.
+    timing: Timing,
     pace: Pace,
     /// The UI asked for a main frame and has none.
     wants: bool,
@@ -221,9 +223,6 @@ pub(crate) struct RenderThread {
     /// The size the window was last told to be, not yet configured: only
     /// the last of a drag's resizes configures the surface.
     resize_to: Option<(u32, u32)>,
-    /// The vblank a main frame granted while the thread slept is for: the
-    /// frame drawn next is drawn for it too, whatever its acquire took.
-    granted_for: Option<Instant>,
     /// Wayland: the frame callback came since the last present, and when.
     called_back: bool,
     callback_at: Option<Instant>,
@@ -232,18 +231,6 @@ pub(crate) struct RenderThread {
     applied: Option<u64>,
     /// The ticker's last vblank.
     ticked: Option<Instant>,
-    /// The vsync ticks of the output the window is on, where its OS has a
-    /// source for them (ADR-0029): wanted while frames are drawn, not while
-    /// the thread sleeps, so a window at rest wakes nothing at a vblank.
-    ticks: Option<gui_display::Ticks>,
-    /// The vblank the last frame that presented, or took a texture, was
-    /// drawn for: no later frame is drawn for it or an earlier one.
-    reserved: Option<Instant>,
-    /// The vblank the last frame was drawn for, when it presented nothing
-    /// and took no texture: drawn for again only for something new before
-    /// its deadline (a wheel, a commit), else the next frame is drawn for
-    /// the vblank after it, not again and again for the same.
-    blank: Option<Instant>,
     /// Wayland: frames in a row that presented nothing ([`WAYLAND_PROBE`]),
     /// and whether the last present answered the callback before it within
     /// its refresh, not a probe (the next callback then comes one refresh
@@ -265,6 +252,106 @@ pub(crate) struct RenderThread {
     awaiting_full: bool,
     /// When it recovered from a panic, the last few times.
     recoveries: VecDeque<Instant>,
+}
+
+/// What the render thread times its frames by on the output the window is
+/// on, in that output's current mode: the vsync fitted to it, its ticks,
+/// and every vblank a frame was drawn or granted for. All of it is of one
+/// output and one mode, so all of it is made afresh together when either
+/// changes ([`Timing::reset`]): no deadline, phase or reserved vblank of
+/// the last carries over to be aimed at on another grid.
+///
+/// A frame aims, waits and then writes what it was drawn for, and an
+/// `Output` or `Interval` handled while it waits makes the timing afresh
+/// under it. So what a frame aimed is of an [`Timing::epoch`]: a grant, a
+/// reserved or blank vblank written of another epoch than the timing's is
+/// dropped here, and the frame aims again ([`RenderThread::frame`]).
+struct Timing {
+    /// Counts the times the timing was made afresh.
+    epoch: u64,
+    vsync: Vsync,
+    /// The vsync ticks of the output, where its OS has a source for them
+    /// (ADR-0029): wanted while frames are drawn, not while the thread
+    /// sleeps, so a window at rest wakes nothing at a vblank.
+    ticks: Option<gui_display::Ticks>,
+    /// The output's mode the ticks taken must be of: one taken before the
+    /// change is of the last grid ([`gui_display::Tick::generation`]).
+    generation: u64,
+    /// The vblank the last frame that presented, or took a texture, was
+    /// drawn for: no later frame is drawn for it or an earlier one.
+    reserved: Option<Instant>,
+    /// The vblank the last frame was drawn for, when it presented nothing
+    /// and took no texture: drawn for again only for something new before
+    /// its deadline (a wheel, a commit), else the next frame is drawn for
+    /// the vblank after it, not again and again for the same.
+    blank: Option<Instant>,
+    /// The vblank a main frame granted while the thread slept is for: the
+    /// frame drawn next is drawn for it too, whatever its acquire took.
+    granted_for: Option<Instant>,
+}
+
+impl Timing {
+    /// Timing afresh against `vsync`, with the output's `ticks`, of the
+    /// mode they are in now.
+    fn of(vsync: Vsync, ticks: Option<gui_display::Ticks>) -> Self {
+        Self {
+            epoch: 0,
+            vsync,
+            generation: ticks.as_ref().map_or(0, gui_display::Ticks::generation),
+            ticks,
+            reserved: None,
+            blank: None,
+            granted_for: None,
+        }
+    }
+
+    /// The output's refresh is now `interval` (its mode changed, or the
+    /// platform first reports it): everything is made afresh but its ticks,
+    /// which are of the new mode from now on.
+    fn remode(&mut self, interval: Duration) {
+        // `Vsync::set_interval`'s rule, for all the timing.
+        if self.vsync.reported() != Some(interval) {
+            let ticks = self.ticks.take();
+            self.reset(Vsync::reporting(interval), ticks);
+        }
+    }
+
+    /// Made afresh against `vsync` and `ticks`, in a new epoch: whatever a
+    /// frame aimed before is of the last.
+    fn reset(&mut self, vsync: Vsync, ticks: Option<gui_display::Ticks>) {
+        let epoch = self.epoch.wrapping_add(1);
+        *self = Self {
+            epoch,
+            ..Self::of(vsync, ticks)
+        };
+    }
+
+    /// Whether what was aimed in `epoch` is of the timing as it is now.
+    fn holds(&self, epoch: u64) -> bool {
+        self.epoch == epoch
+    }
+
+    /// The frame next drawn is for `present`, granted to the UI in `epoch`.
+    fn grant_for(&mut self, epoch: u64, present: Instant) {
+        if self.holds(epoch) {
+            self.granted_for = Some(present);
+        }
+    }
+
+    /// A frame aimed in `epoch` presented, or took a texture, for `present`.
+    fn reserve(&mut self, epoch: u64, present: Instant) {
+        if self.holds(epoch) {
+            self.reserved = Some(present);
+            self.blank = None;
+        }
+    }
+
+    /// A frame aimed in `epoch` was drawn for `present` to no effect.
+    fn drew_blank(&mut self, epoch: u64, present: Instant) {
+        if self.holds(epoch) {
+            self.blank = Some(present);
+        }
+    }
 }
 
 /// How many frames the draw cost is the worst of.
@@ -304,7 +391,7 @@ impl RenderThread {
             rx,
             to_ui,
             presented,
-            vsync: Vsync::new(interval),
+            timing: Timing::of(Vsync::new(interval), None),
             pace,
             wants: false,
             owed: None,
@@ -314,15 +401,11 @@ impl RenderThread {
             visible: true,
             occluded_until: None,
             resize_to: None,
-            granted_for: None,
             called_back: true,
             callback_at: None,
             log,
             applied: None,
             ticked: None,
-            ticks: None,
-            reserved: None,
-            blank: None,
             unpresented: 0,
             chained: false,
             granted: None,
@@ -429,7 +512,7 @@ impl RenderThread {
         }
         let asleep = !self.busy() || !self.visible || !self.called_back || occluded.is_some();
         if asleep {
-            if let Some(ticks) = &self.ticks {
+            if let Some(ticks) = &self.timing.ticks {
                 ticks.run(false);
             }
             let msg = match occluded {
@@ -469,10 +552,12 @@ impl RenderThread {
     /// stopped is taken once and then outlived by the acquires
     /// ([`Vsync::acquired`]) until the source, started again, ticks.
     fn take_tick(&mut self) {
-        if let Some(ticks) = &self.ticks {
+        let t = &mut self.timing;
+        if let Some(ticks) = &t.ticks {
             ticks.run(true);
-            if let Some(tick) = ticks.latest() {
-                self.vsync.ticked(&tick);
+            // A tick of the mode before the last change is of another grid.
+            if let Some(tick) = ticks.latest().filter(|k| k.generation == t.generation) {
+                t.vsync.ticked(&tick);
             }
         }
     }
@@ -482,10 +567,11 @@ impl RenderThread {
     /// keeps however long its acquire takes ([`Self::granted_for`]).
     fn grant_now(&mut self) {
         let now = Instant::now();
+        let epoch = self.timing.epoch;
         let present = match &self.pace {
             Pace::Surface { .. } => {
                 let p = self.aim(now);
-                self.granted_for = Some(p);
+                self.timing.grant_for(epoch, p);
                 p
             }
             Pace::Ticker(i) => {
@@ -494,7 +580,7 @@ impl RenderThread {
             }
         };
         let deadline = present.checked_sub(self.margin()).filter(|d| *d > now).unwrap_or(now);
-        self.grant(present, deadline);
+        self.grant(epoch, present, deadline);
     }
 
     /// Whether there is a frame to draw. A lost device is a reason of its
@@ -600,15 +686,14 @@ impl RenderThread {
                 self.occluded_until = None;
                 self.dirty = true;
             }
-            ToRender::Interval(i) => self.vsync.set_interval(i),
+            ToRender::Interval(i) => self.timing.remode(i),
             ToRender::Output { interval, ticks } => {
-                self.vsync.moved(interval);
-                self.ticks = ticks;
+                self.timing.reset(Vsync::reporting(interval), ticks);
             }
             ToRender::FrameCallback(at) => {
                 self.called_back = true;
                 self.callback_at = Some(at);
-                self.vsync.called_back(at, std::mem::take(&mut self.chained));
+                self.timing.vsync.called_back(at, std::mem::take(&mut self.chained));
             }
             ToRender::Capture(overlay, reply) => {
                 let pixels = self
@@ -686,7 +771,7 @@ impl RenderThread {
     /// cost and a little, at least [`DRAW_MARGIN`], at most half the interval.
     fn margin(&self) -> Duration {
         let worst = self.costs.iter().max().copied().unwrap_or_default();
-        let interval = self.vsync.interval();
+        let interval = self.timing.vsync.interval();
         worst.saturating_add(DRAW_SLACK).clamp(
             DRAW_MARGIN,
             interval.checked_div(2).unwrap_or_default().max(DRAW_MARGIN),
@@ -701,11 +786,30 @@ impl RenderThread {
     /// main frame is granted for what this gives too, so it samples its
     /// motion for the vblank its commit is drawn for.
     fn aim(&self, at: Instant) -> Instant {
-        let present = self.vsync.present_time(at, PRESENT_MARGIN);
-        match self.reserved {
-            Some(r) if present <= r => self.vsync.next_after(r),
+        let present = self.timing.vsync.present_time(at, PRESENT_MARGIN);
+        match self.timing.reserved {
+            Some(r) if present <= r => self.timing.vsync.next_after(r),
             _ => present,
         }
+    }
+
+    /// When the commit of a frame begun at `vblank` and presented at
+    /// `present` is wanted by: the time kept to draw before `present`.
+    fn deadline(&self, present: Instant, vblank: Instant) -> Instant {
+        present
+            .checked_sub(self.margin())
+            .filter(|d| *d > vblank)
+            .unwrap_or(vblank)
+    }
+
+    /// A frame begun at `vblank`, aimed again on timing made afresh while
+    /// it waited: the epoch it is aimed in now, its present and deadline.
+    fn reaim(&self, vblank: Instant) -> (u64, Instant, Instant) {
+        let present = match &self.pace {
+            Pace::Surface { .. } => self.aim(vblank),
+            Pace::Ticker(i) => vblank.checked_add(*i).unwrap_or(vblank),
+        };
+        (self.timing.epoch, present, self.deadline(present, vblank))
     }
 
     /// Take in what comes until `deadline`, or until something new to
@@ -734,18 +838,23 @@ impl RenderThread {
         }
     }
 
-    /// Hand the UI a main frame presented at `present`, its commit wanted by `deadline`.
-    fn grant(&mut self, present: Instant, deadline: Instant) {
+    /// Hand the UI a main frame presented at `present`, its commit wanted
+    /// by `deadline`, both aimed in `epoch`: none when the timing was made
+    /// afresh since ([`Timing::holds`]).
+    fn grant(&mut self, epoch: u64, present: Instant, deadline: Instant) {
+        if !self.timing.holds(epoch) {
+            return;
+        }
         self.sequence = self.sequence.saturating_add(1);
         let token = MainFrame {
             sequence: self.sequence,
             present_at: clock::seconds(present),
             deadline,
-            interval: self.vsync.interval(),
+            interval: self.timing.vsync.interval(),
             scroll: self.compositor.begin_main_frame(
                 self.sequence,
                 clock::seconds(Instant::now()),
-                super::horizon(self.ui_worst(), self.vsync.interval()),
+                super::horizon(self.ui_worst(), self.timing.vsync.interval()),
             ),
         };
         self.wants = false;
@@ -767,14 +876,14 @@ impl RenderThread {
         // Wanted before the acquire blocks, so a source that stopped while
         // the thread slept is started meanwhile; read after it, for the
         // tick of the vblank the acquire waited for.
-        if let Some(ticks) = &self.ticks {
+        if let Some(ticks) = &self.timing.ticks {
             ticks.run(true);
         }
         let (vblank, waited) = self.wait_vsync();
         let woke = Instant::now();
         self.take_tick();
         if let Some(waited) = waited {
-            self.vsync.acquired(vblank, waited);
+            self.timing.vsync.acquired(vblank, waited);
         }
         let surface = matches!(self.pace, Pace::Surface { .. });
         // The window cannot be shown: nothing is drawn, and nothing more
@@ -785,11 +894,17 @@ impl RenderThread {
             return true;
         }
         let acquired = surface && waited.is_some();
+        // What the frame aims below is of the timing as it is now.
+        let mut epoch = self.timing.epoch;
         // A main frame granted while the thread slept is for a vblank: the
         // frame is drawn for that one, so the UI's motion and the
         // compositor's sample the same time.
-        let reserved = self.reserved;
-        let granted = self.granted_for.take().filter(|g| reserved.is_none_or(|r| *g > r));
+        let reserved = self.timing.reserved;
+        let granted = self
+            .timing
+            .granted_for
+            .take()
+            .filter(|g| reserved.is_none_or(|r| *g > r));
         let mut present = match (&self.pace, granted) {
             (Pace::Surface { .. }, Some(g)) => g,
             // The texture taken at a vblank shows at the next one.
@@ -802,13 +917,13 @@ impl RenderThread {
         // nothing are not drawn again and again for the same vblank.
         if surface
             && granted.is_none()
-            && let Some(b) = self.blank.filter(|b| present <= *b)
+            && let Some(b) = self.timing.blank.filter(|b| present <= *b)
         {
             let by = b.checked_sub(self.margin()).unwrap_or(b);
             match self.news_until(by) {
                 None => return false,
                 Some(true) => present = b,
-                Some(false) => present = self.vsync.next_after(b),
+                Some(false) => present = self.timing.vsync.next_after(b),
             }
         }
         // Wayland: a frame that would present nothing presents anyway now
@@ -821,18 +936,19 @@ impl RenderThread {
         if probe {
             self.gpu.expose();
         }
-        let deadline = present
-            .checked_sub(self.margin())
-            .filter(|d| *d > vblank)
-            .unwrap_or(vblank);
+        let mut deadline = self.deadline(present, vblank);
         // What arrived while waiting (a commit, the wheel).
         while let Ok(msg) = self.rx.try_recv() {
             if !self.handle(msg) {
                 return false;
             }
         }
+        // The output or its mode changed meanwhile: aimed again, afresh.
+        if !self.timing.holds(epoch) {
+            (epoch, present, deadline) = self.reaim(vblank);
+        }
         if self.wants && self.owed.is_none() {
-            self.grant(present, deadline);
+            self.grant(epoch, present, deadline);
         }
         // Wait for the commit owed until the deadline, then draw without it;
         // a main frame asked for meanwhile is granted at once for this
@@ -852,8 +968,11 @@ impl RenderThread {
                     if !self.handle(msg) {
                         return false;
                     }
+                    if !self.timing.holds(epoch) {
+                        (epoch, present, deadline) = self.reaim(vblank);
+                    }
                     if self.wants && self.owed.is_none() && self.applied.is_none() {
-                        self.grant(present, deadline);
+                        self.grant(epoch, present, deadline);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => break,
@@ -898,18 +1017,17 @@ impl RenderThread {
                 && self.called_back
                 && self
                     .callback_at
-                    .is_some_and(|c| now.saturating_duration_since(c) < self.vsync.interval());
+                    .is_some_and(|c| now.saturating_duration_since(c) < self.timing.vsync.interval());
             self.called_back = false;
         }
         // The vblank this frame was drawn for is taken when it presented or
         // holds a texture taken for it; drawn to no effect, a later frame
         // may still be drawn for it.
         if presented_now || acquired {
-            self.reserved = Some(present);
-            self.blank = None;
+            self.timing.reserve(epoch, present);
             self.unpresented = 0;
         } else if surface {
-            self.blank = Some(present);
+            self.timing.drew_blank(epoch, present);
             self.unpresented = self.unpresented.saturating_add(1);
         }
         let submitted = Instant::now();
@@ -1016,7 +1134,174 @@ mod tests {
         for _ in 0..4 {
             assert!(thread.frame());
         }
-        assert_eq!(thread.vsync.phase(), None, "no phase fitted to timer wakes");
+        assert_eq!(thread.timing.vsync.phase(), None, "no phase fitted to timer wakes");
+    }
+
+    /// Scripted displays with one output of `interval` and handle `native`,
+    /// and a subscription to its ticks.
+    fn display(native: u32, interval: Duration) -> (gui_display::Displays, gui_display::Script, gui_display::Ticks) {
+        let (mut displays, os) = gui_display::Displays::scripted(|| {});
+        let mut output = gui_display::Script::output(native, "display");
+        output.refresh.interval = interval;
+        os.plug(output);
+        displays.poll();
+        let id = displays.outputs().first().map(|o| o.id).unwrap();
+        let ticks = displays.ticks(id).unwrap();
+        (displays, os, ticks)
+    }
+
+    #[test]
+    fn moved_from_60_to_120_hz_the_next_frame_aims_at_a_120_hz_vblank() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let hz60 = Duration::from_nanos(16_666_667);
+        let hz120 = Duration::from_nanos(8_333_333);
+        let (mut thread, log, _tx) = on_surface(gpu, hz60);
+        // On the 60 Hz display: a phase, and vblanks ahead that frames were
+        // drawn and granted for.
+        let now = Instant::now();
+        thread.timing.vsync.acquired(now, Duration::from_millis(2));
+        let old = now + hz60 * 3;
+        thread.timing.reserved = Some(old);
+        thread.timing.blank = Some(old);
+        thread.timing.granted_for = Some(old + hz60);
+
+        // Moved onto the 120 Hz display, which ticks.
+        let (_displays, os, ticks) = display(2, hz120);
+        assert!(thread.handle(ToRender::Output {
+            interval: hz120,
+            ticks: Some(ticks),
+        }));
+        let vblank = Instant::now() + Duration::from_millis(4);
+        os.tick(2, gui_display::Stamp::Predicted(vblank), Some(hz120));
+        assert!(thread.frame());
+        let present = log.lock().unwrap().last().map(|f| f.present_at).unwrap();
+        assert!(
+            present < old,
+            "no vblank of the old display is aimed at: {present:?}, {old:?}"
+        );
+        let steps = present.duration_since(vblank).as_secs_f64() / hz120.as_secs_f64();
+        assert!(
+            (steps - steps.round()).abs() < 1e-3,
+            "a vblank of the 120 Hz grid: {steps} intervals after its tick"
+        );
+    }
+
+    #[test]
+    fn moved_to_120_hz_while_a_frame_waits_nothing_aimed_at_60_hz_is_granted_or_kept() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let hz60 = Duration::from_nanos(16_666_667);
+        let hz120 = Duration::from_nanos(8_333_333);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (to_ui, from_render) = std::sync::mpsc::channel();
+        let mut thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(move |m| {
+                if let FromRender::Begin(frame) = m {
+                    to_ui.send(frame.deadline).ok();
+                }
+            }),
+            Arc::new(Mutex::new(Arc::new(Presented::default()))),
+            hz60,
+            Pace::Surface { callbacks: None },
+            None,
+        );
+        // On the 60 Hz display, a vblank ahead a frame was drawn for: the
+        // next frame aims past it.
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        let old = Instant::now() + hz60 * 3;
+        thread.timing.reserved = Some(old);
+        // Come while the frame aims, handled after it did: a main frame
+        // asked for, and the window moved onto a 120 Hz display.
+        tx.send(ToRender::NeedsFrame).unwrap();
+        tx.send(ToRender::Output {
+            interval: hz120,
+            ticks: None,
+        })
+        .unwrap();
+        assert!(thread.frame());
+        let deadline = from_render.try_recv().expect("a main frame granted");
+        assert!(
+            deadline < old.checked_sub(hz120).unwrap(),
+            "no main frame granted for a 60 Hz vblank aimed before the change"
+        );
+        for kept in [thread.timing.reserved, thread.timing.blank].into_iter().flatten() {
+            assert!(kept < old, "no 60 Hz vblank written into the 120 Hz timing");
+        }
+    }
+
+    #[test]
+    fn moved_to_120_hz_while_a_frame_waits_for_its_commit_it_is_drawn_for_a_120_hz_vblank() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let hz60 = Duration::from_nanos(16_666_667);
+        let hz120 = Duration::from_nanos(8_333_333);
+        let (mut thread, log, tx) = on_surface(gpu, hz60);
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        let old = Instant::now() + hz60 * 3;
+        thread.timing.reserved = Some(old);
+        // The main frame is granted for a 60 Hz vblank past `old`; the
+        // window moves while the frame waits for its commit.
+        tx.send(ToRender::NeedsFrame).unwrap();
+        let mover = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            tx.send(ToRender::Output {
+                interval: hz120,
+                ticks: None,
+            })
+            .ok();
+            tx
+        });
+        assert!(thread.frame());
+        let _tx = mover.join().unwrap();
+        let present = log.lock().unwrap().last().map(|f| f.present_at).unwrap();
+        assert!(present < old, "drawn for a vblank of the 120 Hz timing, aimed again");
+        for kept in [thread.timing.reserved, thread.timing.blank].into_iter().flatten() {
+            assert!(kept < old, "no 60 Hz vblank written into the 120 Hz timing");
+        }
+    }
+
+    #[test]
+    fn after_a_mode_change_a_tick_of_the_old_mode_is_not_the_phase() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let hz60 = Duration::from_nanos(16_666_667);
+        let hz120 = Duration::from_nanos(8_333_333);
+        let (mut thread, _, _tx) = on_surface(gpu, hz60);
+        let (mut displays, os, ticks) = display(1, hz60);
+        assert!(thread.handle(ToRender::Output {
+            interval: hz60,
+            ticks: Some(ticks),
+        }));
+        // The last tick of the 60 Hz mode, then the mode changes: the
+        // platform thread polls and tells the render thread.
+        os.tick(
+            1,
+            gui_display::Stamp::Predicted(Instant::now() + Duration::from_millis(5)),
+            Some(hz60),
+        );
+        os.change(1, |d| d.refresh.interval = hz120);
+        assert!(!displays.poll().is_empty());
+        assert!(thread.handle(ToRender::Interval(hz120)));
+        assert!(thread.frame());
+        assert_eq!(thread.timing.vsync.phase(), None, "the 60 Hz tick is of another grid");
+        assert_eq!(thread.timing.vsync.interval(), hz120);
+        // The first tick of the new mode is the phase.
+        let vblank = Instant::now() + Duration::from_millis(3);
+        os.tick(1, gui_display::Stamp::Predicted(vblank), Some(hz120));
+        assert!(thread.frame());
+        assert_eq!(thread.timing.vsync.phase(), Some(vblank));
     }
 
     #[test]
@@ -1040,14 +1325,14 @@ mod tests {
         let ticks = displays.ticks(id).unwrap();
 
         // Fitted to the last display, then told of this one.
-        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
         let interval = Duration::from_millis(8);
         assert!(thread.handle(ToRender::Output {
             interval,
             ticks: Some(ticks),
         }));
         assert_eq!(
-            (thread.vsync.interval(), thread.vsync.phase()),
+            (thread.timing.vsync.interval(), thread.timing.vsync.phase()),
             (interval, None),
             "nothing fitted holds"
         );
@@ -1056,11 +1341,11 @@ mod tests {
         // next frame (whose acquire fails here: no window).
         os.tick(1, gui_display::Stamp::Synthesized(Instant::now()), None);
         assert!(thread.frame());
-        assert_eq!(thread.vsync.phase(), None);
+        assert_eq!(thread.timing.vsync.phase(), None);
         let vblank = Instant::now() + Duration::from_millis(3);
         os.tick(1, gui_display::Stamp::Predicted(vblank), None);
         assert!(thread.frame());
-        assert_eq!(thread.vsync.phase(), Some(vblank));
+        assert_eq!(thread.timing.vsync.phase(), Some(vblank));
 
         // Nothing to draw: the thread sleeps, and no longer wants ticks.
         // After the idle time the source asks to be stopped, and is.
@@ -1100,7 +1385,7 @@ mod tests {
         let (mut thread, log, _tx) = on_surface(gpu, interval);
         // A phase fitted, as acquires that waited give it: a frame begun
         // at its deadline is then within the same vblank's margin.
-        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
         for _ in 0..6 {
             assert!(thread.frame());
         }
@@ -1124,7 +1409,7 @@ mod tests {
         for _ in 0..3 {
             assert!(thread.frame());
         }
-        assert!(thread.blank.is_some(), "the last frame presented nothing");
+        assert!(thread.timing.blank.is_some(), "the last frame presented nothing");
     }
 
     #[test]
@@ -1137,14 +1422,14 @@ mod tests {
         };
         let interval = Duration::from_millis(50);
         let (mut thread, log, tx) = on_surface(gpu, interval);
-        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
         to_a_blank_frame(&mut thread);
         // The frame of nothing drew early for the next vblank, which is
         // still a long way off.
-        thread.vsync = Vsync::new(interval);
-        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        thread.timing.vsync = Vsync::new(interval);
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
         let blank = Some(thread.aim(Instant::now()));
-        thread.blank = blank;
+        thread.timing.blank = blank;
         // Taken in by the thread's own turn, before its frame.
         tx.send(ToRender::Expose).ok();
         assert!(thread.step());
@@ -1164,14 +1449,14 @@ mod tests {
             return;
         };
         let (mut thread, _, _tx) = on_surface(gpu, Duration::from_millis(50));
-        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        thread.timing.vsync.acquired(Instant::now(), Duration::from_millis(2));
         assert!(thread.frame());
-        let reserved = thread.reserved.expect("the frame presented");
+        let reserved = thread.timing.reserved.expect("the frame presented");
         // Asked while T's present waits for it, in time for T otherwise.
         let early = reserved.checked_sub(Duration::from_millis(20)).unwrap_or(reserved);
         assert_eq!(
             thread.aim(early),
-            thread.vsync.next_after(reserved),
+            thread.timing.vsync.next_after(reserved),
             "granted for T + 1"
         );
     }
@@ -1189,7 +1474,7 @@ mod tests {
         assert_eq!(thread.gpu.presents(), 0, "no texture, at the start or when drawing");
         assert!(thread.retry && thread.busy(), "still owed: the thread stays awake");
         assert!(!thread.dirty, "a retry is no news");
-        let failed = thread.blank.expect("the frame presented nothing");
+        let failed = thread.timing.blank.expect("the frame presented nothing");
         assert!(thread.step());
         assert_eq!(thread.gpu.presents(), 1, "the next wake presents it");
         assert!(!thread.retry);
@@ -1311,7 +1596,7 @@ mod tests {
         });
         tx.send(ToRender::NeedsFrame).ok();
         assert!(thread.step(), "granted at once");
-        assert_eq!(thread.vsync.phase(), None);
+        assert_eq!(thread.timing.vsync.phase(), None);
         tx.send(ToRender::Expose).ok();
         assert!(thread.step());
         let at = granted.lock().unwrap_or_else(PoisonError::into_inner).first().copied();
@@ -1432,7 +1717,7 @@ mod tests {
             assert!(thread.handle(ToRender::FrameCallback(Instant::now())));
             std::thread::sleep(refresh.saturating_mul(2));
         }
-        assert_eq!(thread.vsync.interval(), refresh, "key repeats are no refresh");
+        assert_eq!(thread.timing.vsync.interval(), refresh, "key repeats are no refresh");
     }
 
     #[test]
@@ -1449,7 +1734,7 @@ mod tests {
                 assert!(thread.handle(ToRender::FrameCallback(Instant::now())));
             }
         }
-        assert_eq!(thread.vsync.interval(), fast, "probes are no refresh");
+        assert_eq!(thread.timing.vsync.interval(), fast, "probes are no refresh");
     }
 
     #[test]
@@ -1476,7 +1761,7 @@ mod tests {
             std::thread::sleep(due.saturating_duration_since(Instant::now()));
             assert!(thread.handle(ToRender::FrameCallback(due)));
         }
-        let fitted = thread.vsync.interval();
+        let fitted = thread.timing.vsync.interval();
         assert!(
             fitted.abs_diff(refresh) < Duration::from_micros(500),
             "the refresh: {fitted:?}"

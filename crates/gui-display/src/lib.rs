@@ -39,7 +39,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 pub use gamut::Gamut;
-use raw_window_handle::HasDisplayHandle;
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use ticks::{Feed, Link, Settle, Source, Wake};
 pub use ticks::{IDLE, Stamp, Tick, Ticks};
 
@@ -195,11 +195,24 @@ impl std::error::Error for Error {}
 
 /// One windowing system's way to its displays.
 trait Backend {
-    /// Every connected output as the OS describes it now.
-    fn probe(&mut self) -> Vec<Description>;
+    /// Every connected output as the OS describes it now. An error when
+    /// any part of that could not be read: a partial answer would read as
+    /// outputs pulled out, so the poll keeps what it knew and asks again.
+    fn probe(&mut self) -> Result<Vec<Description>, Error>;
     /// A vsync source for the output with this native handle, stopped,
     /// writing into `feed`.
     fn source(&mut self, output: &Description, feed: Feed) -> Result<Box<dyn Source>, Error>;
+    /// Bring what runs back to what is wanted, where the OS refused a
+    /// stop before (macOS: a display link nobody reads that still runs).
+    /// Called at every poll.
+    fn tidy(&mut self) {}
+    /// Whether the OS tells of every change ([`Notice::changed`]). A
+    /// backend that cannot listen (X11 with no notification connection)
+    /// says not, and every poll reads the outputs afresh: a poll the
+    /// window's events ask for is then how a change is seen.
+    fn notifies(&self) -> bool {
+        true
+    }
 }
 
 /// The flag an OS notification sets, and the owner's wake.
@@ -232,7 +245,14 @@ pub struct Displays {
     subscriptions: Vec<Subscription>,
     /// Owned by its thread: AppKit's screens, and the vsync sources.
     not_send: PhantomData<*const ()>,
+    /// The window [`Self::connect`] was given, kept alive while the
+    /// backend may use the toolkit's display connection it holds (X11).
+    /// Declared last: dropped after the backend.
+    _owner: Option<Owner>,
 }
+
+/// What keeps a toolkit's window alive.
+type Owner = Arc<dyn std::any::Any + Send + Sync>;
 
 impl std::fmt::Debug for Displays {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -243,26 +263,42 @@ impl std::fmt::Debug for Displays {
 }
 
 impl Displays {
-    /// The displays of the windowing system `display` is of (a window or an
-    /// event loop of any toolkit). `wake` is called, on any thread, when
-    /// [`Self::poll`] has something to do; it should have the owner's
-    /// thread call it, and do nothing else.
+    /// The displays of the windowing system `window` is of. On X11 they
+    /// are read through the toolkit's own connection, on the screen the
+    /// window is on; `window` is kept alive for as long as these displays
+    /// are, which keeps that connection open (raw-window-handle's contract:
+    /// a handle is valid while what gave it lives).
+    ///
+    /// `wake` is called, on any thread, when [`Self::poll`] has something
+    /// to do. It should have the owner's thread call it, and do nothing
+    /// else; it **must not block**: it may run on the OS's vsync thread,
+    /// whose next vblank waits for it. It is never called under a lock of
+    /// this crate's, so a wake that takes a lock of the caller's cannot
+    /// close a cycle with one of ours, but it can still delay a vblank.
     ///
     /// # Errors
     /// [`Error::Unsupported`] where this crate does not read the displays
-    /// yet, [`Error::NotMainThread`] on macOS off the main thread, and
+    /// (Wayland, Windows, macOS before 11, an X server without RandR 1.3),
+    /// [`Error::NotMainThread`] on macOS off the main thread, and
     /// [`Error::Os`] when the OS refuses the connection.
-    pub fn connect(display: &impl HasDisplayHandle, wake: impl Fn() + Send + Sync + 'static) -> Result<Self, Error> {
+    pub fn connect<W>(window: &Arc<W>, wake: impl Fn() + Send + Sync + 'static) -> Result<Self, Error>
+    where
+        W: HasDisplayHandle + HasWindowHandle + Send + Sync + 'static,
+    {
         let notice = Notice {
             dirty: Arc::new(AtomicBool::new(true)),
             wake: Arc::new(wake),
         };
-        let handle = display.display_handle().map_err(|e| Error::Os(e.to_string()))?.as_raw();
-        let backend = system(handle, &notice)?;
-        Ok(Self::with(backend, notice))
+        let display = window.display_handle().map_err(|e| Error::Os(e.to_string()))?.as_raw();
+        // A toolkit may give no window handle (an event loop, a test); the
+        // backend then takes the display's default screen.
+        let surface = window.window_handle().ok().map(|w| w.as_raw());
+        let backend = system(display, surface, &notice)?;
+        let owner: Owner = Arc::<W>::clone(window);
+        Ok(Self::with(backend, notice, Some(owner)))
     }
 
-    fn with(backend: Box<dyn Backend>, notice: Notice) -> Self {
+    fn with(backend: Box<dyn Backend>, notice: Notice, owner: Option<Owner>) -> Self {
         let mut displays = Self {
             backend,
             outputs: Vec::new(),
@@ -270,6 +306,7 @@ impl Displays {
             notice,
             subscriptions: Vec::new(),
             not_send: PhantomData,
+            _owner: owner,
         };
         // What is connected at the start is known, not news.
         displays.poll();
@@ -290,7 +327,7 @@ impl Displays {
             state: Arc::clone(&state),
             notice: notice.clone(),
         };
-        (Self::with(Box::new(ScriptedBackend(state)), notice), script)
+        (Self::with(Box::new(ScriptedBackend(state)), notice, None), script)
     }
 
     /// The outputs as of the last poll.
@@ -316,31 +353,45 @@ impl Displays {
     /// nothing happened.
     pub fn poll(&mut self) -> Vec<Event> {
         let mut events = Vec::new();
-        if self.notice.dirty.swap(false, Ordering::SeqCst) {
-            let probed = self.backend.probe();
-            events = reconcile(&mut self.outputs, probed, &mut self.next);
+        // Not `||`'s short cut: the flag is cleared either way.
+        let told = self.notice.dirty.swap(false, Ordering::SeqCst);
+        if told || !self.backend.notifies() {
+            match self.backend.probe() {
+                Ok(probed) => events = reconcile(&mut self.outputs, probed, &mut self.next),
+                // What could not be read changes nothing: the outputs stay
+                // as last read whole, and the next poll reads them again.
+                Err(_) => self.notice.dirty.store(true, Ordering::SeqCst),
+            }
             for e in &events {
-                // A changed handle is another display link, another CRTC:
-                // the old source ticks for nothing this output is on.
-                let gone = match e {
-                    Event::Removed(o) => Some(o.id),
-                    Event::Changed { output, was } if output.native != was.native => Some(output.id),
-                    _ => None,
-                };
-                if let Some(id) = gone {
-                    for s in self.subscriptions.iter().filter(|s| s.link.output() == id) {
-                        s.link.end();
+                match e {
+                    // A changed handle is another display link, another
+                    // CRTC: the old source ticks for nothing this output is on.
+                    Event::Removed(o) => self.end(o.id),
+                    Event::Changed { output, was } if output.native != was.native => self.end(output.id),
+                    // Another interval: its ticks are of the next
+                    // generation, and a timer ticks at the new interval.
+                    // (A consumer told the new interval takes only those.)
+                    Event::Changed { output, was } if output.refresh.interval != was.refresh.interval => {
+                        for s in self.subscriptions.iter().filter(|s| s.link.output() == output.id) {
+                            s.link.remode(output.refresh.interval);
+                        }
                     }
+                    _ => {}
                 }
             }
         }
         let now = Instant::now();
         self.subscriptions.retain_mut(|s| match s.link.settle(now) {
             Settle::Keep => true,
-            Settle::Start => {
-                s.source.start();
-                true
-            }
+            // A source that would not start again ends its subscription:
+            // the reader sees it ended, and a new one tries afresh.
+            Settle::Start => match s.source.start() {
+                Ok(()) => true,
+                Err(_) => {
+                    s.link.end();
+                    false
+                }
+            },
             Settle::Stop => {
                 s.source.stop();
                 true
@@ -350,38 +401,52 @@ impl Displays {
                 false
             }
         });
+        self.backend.tidy();
         events
+    }
+
+    /// End the subscriptions to `output`.
+    fn end(&self, output: OutputId) {
+        for s in self.subscriptions.iter().filter(|s| s.link.output() == output) {
+            s.link.end();
+        }
     }
 
     /// Subscribe to the vsync of `output`: its source is started now.
     ///
     /// # Errors
     /// [`Error::NoSuchOutput`], or [`Error::Unsupported`] where the OS has
-    /// no vsync source this crate reads (X11), or [`Error::Os`].
+    /// no vsync source this crate reads (X11), or [`Error::Os`], also when
+    /// the source would not start: nothing is kept of it then, and a later
+    /// call tries again.
     pub fn ticks(&mut self, output: OutputId) -> Result<Ticks, Error> {
         let described = self.output(output).ok_or(Error::NoSuchOutput)?.description.clone();
-        let (ticks, link) = ticks::subscription(output, Arc::clone(&self.notice.wake));
-        let mut source = self.backend.source(&described, link.feed())?;
-        if link.settle(Instant::now()) == Settle::Start {
-            source.start();
-        }
-        self.subscriptions.push(Subscription { link, source });
-        Ok(ticks)
+        let (ticks, link) = ticks::subscription(output, described.refresh.interval, Arc::clone(&self.notice.wake));
+        let source = self.backend.source(&described, link.feed())?;
+        self.subscribe(ticks, link, source)
     }
 
     /// Ticks from a timer at the nominal refresh of `output`, each a
     /// [`Stamp::Synthesized`]: for a caller that wants one cadence whether
-    /// the OS has a vsync source or not. They carry no phase.
+    /// the OS has a vsync source or not. They carry no phase, and follow
+    /// the output's mode as the polls read it.
     ///
     /// # Errors
     /// [`Error::NoSuchOutput`], or [`Error::Os`] when no thread can start.
     pub fn synthesized(&mut self, output: OutputId) -> Result<Ticks, Error> {
         let interval = self.output(output).ok_or(Error::NoSuchOutput)?.refresh.interval;
-        let (ticks, link) = ticks::subscription(output, Arc::clone(&self.notice.wake));
-        let mut source: Box<dyn Source> =
-            Box::new(ticks::Timer::spawn(link.feed(), interval).map_err(|e| Error::Os(e.to_string()))?);
-        if link.settle(Instant::now()) == Settle::Start {
-            source.start();
+        let (ticks, link) = ticks::subscription(output, interval, Arc::clone(&self.notice.wake));
+        let source = Box::new(ticks::Timer::spawn(link.feed()).map_err(|e| Error::Os(e.to_string()))?);
+        self.subscribe(ticks, link, source)
+    }
+
+    /// Start a new subscription's source and keep it; on an error, drop it.
+    fn subscribe(&mut self, ticks: Ticks, link: Link, mut source: Box<dyn Source>) -> Result<Ticks, Error> {
+        if link.settle(Instant::now()) == Settle::Start
+            && let Err(e) = source.start()
+        {
+            link.end();
+            return Err(e);
         }
         self.subscriptions.push(Subscription { link, source });
         Ok(ticks)
@@ -397,28 +462,59 @@ impl Drop for Displays {
     }
 }
 
-/// The backend for the windowing system behind `handle`.
+/// The backend for the windowing system behind `display`, and the window
+/// `surface` when the toolkit gave one.
 #[cfg(target_os = "macos")]
-fn system(handle: raw_window_handle::RawDisplayHandle, notice: &Notice) -> Result<Box<dyn Backend>, Error> {
-    match handle {
+fn system(
+    display: raw_window_handle::RawDisplayHandle,
+    _: Option<raw_window_handle::RawWindowHandle>,
+    notice: &Notice,
+) -> Result<Box<dyn Backend>, Error> {
+    match display {
         raw_window_handle::RawDisplayHandle::AppKit(_) => Ok(Box::new(macos::MacOs::new(notice.clone())?)),
         _ => Err(Error::Unsupported("this windowing system")),
     }
 }
 
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
-fn system(handle: raw_window_handle::RawDisplayHandle, notice: &Notice) -> Result<Box<dyn Backend>, Error> {
+fn system(
+    display: raw_window_handle::RawDisplayHandle,
+    surface: Option<raw_window_handle::RawWindowHandle>,
+    notice: &Notice,
+) -> Result<Box<dyn Backend>, Error> {
     use raw_window_handle::RawDisplayHandle;
-    match handle {
-        RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => Ok(Box::new(x11::X11::new(notice.clone())?)),
+    match display {
+        RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_) => {
+            Ok(Box::new(x11::X11::new(display, surface, notice.clone())?))
+        }
         RawDisplayHandle::Wayland(_) => Err(Error::Unsupported("Wayland")),
         _ => Err(Error::Unsupported("this windowing system")),
     }
 }
 
 #[cfg(not(any(target_os = "macos", all(unix, not(target_os = "android")))))]
-fn system(_: raw_window_handle::RawDisplayHandle, _: &Notice) -> Result<Box<dyn Backend>, Error> {
+fn system(
+    _: raw_window_handle::RawDisplayHandle,
+    _: Option<raw_window_handle::RawWindowHandle>,
+    _: &Notice,
+) -> Result<Box<dyn Backend>, Error> {
     Err(Error::Unsupported("this windowing system"))
+}
+
+/// How many native vsync sources (macOS display links) this process has
+/// made. They are never released (ADR-0029): one per physical display for
+/// the life of the process, however many readers and connections come and
+/// go, and this lets a check prove it. Zero where there are none.
+#[must_use]
+pub fn native_links_made() -> usize {
+    #[cfg(target_os = "macos")]
+    {
+        macos::links_made()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
 }
 
 /// Bring `known` to what was `probed`, and say what changed. An output is
@@ -489,25 +585,49 @@ struct Scripted {
     outputs: Vec<Description>,
     /// Each source made: its output's native handle, its feed, whether it runs.
     sources: Vec<(u32, Feed, Arc<AtomicBool>)>,
+    /// How many of the next probes fail.
+    probes_failing: usize,
+    /// How many of the next source starts fail.
+    starts_failing: usize,
+    /// The OS tells of nothing (X11 with no notification connection).
+    silent: bool,
 }
 
 struct ScriptedBackend(Arc<Mutex<Scripted>>);
 
-struct ScriptedSource(Arc<AtomicBool>);
+struct ScriptedSource {
+    state: Arc<Mutex<Scripted>>,
+    running: Arc<AtomicBool>,
+}
 
 impl Source for ScriptedSource {
-    fn start(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+    fn start(&mut self) -> Result<(), Error> {
+        let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(left) = s.starts_failing.checked_sub(1) {
+            s.starts_failing = left;
+            return Err(Error::Os("a scripted start failed".to_owned()));
+        }
+        self.running.store(true, Ordering::SeqCst);
+        Ok(())
     }
 
     fn stop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
+        self.running.store(false, Ordering::SeqCst);
     }
 }
 
 impl Backend for ScriptedBackend {
-    fn probe(&mut self) -> Vec<Description> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).outputs.clone()
+    fn probe(&mut self) -> Result<Vec<Description>, Error> {
+        let mut s = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(left) = s.probes_failing.checked_sub(1) {
+            s.probes_failing = left;
+            return Err(Error::Os("a scripted probe failed".to_owned()));
+        }
+        Ok(s.outputs.clone())
+    }
+
+    fn notifies(&self) -> bool {
+        !self.0.lock().unwrap_or_else(PoisonError::into_inner).silent
     }
 
     fn source(&mut self, output: &Description, feed: Feed) -> Result<Box<dyn Source>, Error> {
@@ -517,7 +637,10 @@ impl Backend for ScriptedBackend {
             .unwrap_or_else(PoisonError::into_inner)
             .sources
             .push((output.native, feed, Arc::clone(&running)));
-        Ok(Box::new(ScriptedSource(running)))
+        Ok(Box::new(ScriptedSource {
+            state: Arc::clone(&self.0),
+            running,
+        }))
     }
 }
 
@@ -558,9 +681,31 @@ impl Script {
         }
     }
 
+    /// Change the outputs. The test's closure runs under no lock of the
+    /// script's (it may read the script), on a copy put back after it. A
+    /// silent OS ([`Self::silence`]) tells nobody.
     fn edit(&self, f: impl FnOnce(&mut Vec<Description>)) {
-        f(&mut self.state.lock().unwrap_or_else(PoisonError::into_inner).outputs);
-        self.notice.changed();
+        let mut outputs = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .outputs
+            .clone();
+        f(&mut outputs);
+        let silent = {
+            let mut s = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            s.outputs = outputs;
+            s.silent
+        };
+        if !silent {
+            self.notice.changed();
+        }
+    }
+
+    /// From now on the OS tells of no change, as X11 with no notification
+    /// connection: the outputs change unannounced.
+    pub fn silence(&self) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).silent = true;
     }
 
     /// Plug an output in, as the OS would tell of it.
@@ -594,9 +739,22 @@ impl Script {
             .filter(|(n, _, running)| *n == native && running.load(Ordering::SeqCst))
             .map(|(_, feed, _)| feed.clone())
             .collect();
+        // The script's lock is released: a wake may run.
         for feed in feeds {
-            feed.tick(target, interval);
+            feed.tick_now(target, interval).send();
         }
+    }
+
+    /// The next `n` source starts fail, as an OS may refuse one.
+    pub fn fail_starts(&self, n: usize) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).starts_failing = n;
+    }
+
+    /// The next `n` reads of the outputs fail part way, as a request to
+    /// the X server may; the OS is said to have changed, so the owner polls.
+    pub fn fail_probes(&self, n: usize) {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner).probes_failing = n;
+        self.notice.changed();
     }
 
     /// How many sources for the output with this handle run now.
@@ -818,5 +976,136 @@ mod tests {
         assert!(matches!(t.target, Stamp::Synthesized(_)));
         assert_eq!(t.target.of_the_display(), None);
         assert_eq!(t.interval, Some(Duration::from_millis(4)));
+    }
+
+    #[test]
+    fn synthesized_ticks_follow_the_outputs_mode() {
+        let (mut displays, script, _) = scripted();
+        let mut fast = Script::output(1, "built-in");
+        fast.refresh.interval = Duration::from_millis(4);
+        script.plug(fast);
+        displays.poll();
+        let id = displays.by_native(1).unwrap().id;
+        let ticks = displays.synthesized(id).unwrap();
+        let first = ticks.wait(0, Duration::from_secs(5)).unwrap();
+        assert_eq!((first.interval, first.generation), (Some(Duration::from_millis(4)), 0));
+        // The mode changes again and again, each time while the timer
+        // sleeps toward a tick of the old one: the poll reports it, and the
+        // first tick after the poll is of the new mode, at its interval.
+        for round in 1..=6_u64 {
+            let interval = Duration::from_millis(if round % 2 == 1 { 6 } else { 4 });
+            script.change(1, |d| d.refresh.interval = interval);
+            assert!(!displays.poll().is_empty());
+            assert_eq!(ticks.generation(), round);
+            let after = ticks.latest().map_or(0, |t| t.sequence);
+            let t = ticks.wait(after, Duration::from_secs(5)).unwrap();
+            assert_eq!(
+                (t.generation, t.interval),
+                (round, Some(interval)),
+                "the first tick after the change, round {round}"
+            );
+            let next = ticks.wait(t.sequence, Duration::from_secs(5)).unwrap();
+            assert!(
+                next.target.at().duration_since(t.target.at()) >= interval,
+                "ticks the new interval apart"
+            );
+        }
+    }
+
+    #[test]
+    fn with_no_notifications_every_poll_reads_the_outputs() {
+        let (mut displays, script, woken) = scripted();
+        script.plug(Script::output(1, "built-in"));
+        displays.poll();
+        script.silence();
+        let before = woken.load(Ordering::SeqCst);
+        // A mode change nobody is told of; the window's next event polls.
+        script.change(1, |d| d.refresh.interval = Duration::from_millis(8));
+        assert_eq!(woken.load(Ordering::SeqCst), before, "no notification");
+        let events = displays.poll();
+        assert!(matches!(events.as_slice(), [Event::Changed { .. }]), "{events:?}");
+        // And the next change too: the flag is never what gates it.
+        script.unplug(1);
+        assert!(matches!(displays.poll().as_slice(), [Event::Removed(_)]));
+        assert_eq!(displays.poll(), vec![]);
+    }
+
+    #[test]
+    fn a_scripted_change_runs_its_closure_under_no_lock_of_the_scripts() {
+        let (mut displays, script, _) = scripted();
+        script.plug(Script::output(1, "built-in"));
+        displays.poll();
+        let id = displays.by_native(1).unwrap().id;
+        let _ticks = displays.ticks(id).unwrap();
+        let (done, finished) = std::sync::mpsc::channel();
+        let theirs = script;
+        std::thread::spawn(move || {
+            let reader = theirs.clone();
+            theirs.change(1, |d| d.name = format!("running {}", reader.running(1)));
+            done.send(()).ok();
+        });
+        assert!(
+            finished.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the closure waited for the script's own lock"
+        );
+        displays.poll();
+        assert_eq!(displays.output(id).map(|o| o.name.as_str()), Some("running 1"));
+    }
+
+    #[test]
+    fn a_source_that_fails_to_start_is_not_kept_and_a_later_reader_starts_it() {
+        let (mut displays, script, _) = scripted();
+        script.plug(Script::output(1, "built-in"));
+        displays.poll();
+        let id = displays.by_native(1).unwrap().id;
+        script.fail_starts(1);
+        assert!(matches!(displays.ticks(id), Err(Error::Os(_))));
+        assert_eq!(script.running(1), 0);
+        displays.poll();
+        assert!(displays.subscriptions.is_empty(), "nothing kept of it");
+        let ticks = displays.ticks(id).unwrap();
+        assert_eq!(script.running(1), 1, "the next reader starts it");
+
+        // Stopped while unwanted, then wanted again and refused: the
+        // reader sees its ticks end, and a new one starts afresh.
+        ticks.run(false);
+        displays.subscriptions.iter().for_each(|s| {
+            s.link
+                .unwanted_since(Instant::now().checked_sub(IDLE + Duration::from_millis(1)).unwrap());
+        });
+        displays.poll();
+        assert_eq!(script.running(1), 0);
+        script.fail_starts(1);
+        ticks.run(true);
+        displays.poll();
+        assert!(ticks.ended());
+        assert!(displays.subscriptions.is_empty());
+        let again = displays.ticks(id).unwrap();
+        assert!(!again.ended());
+        assert_eq!(script.running(1), 1);
+    }
+
+    #[test]
+    fn a_probe_that_fails_keeps_the_outputs_and_is_tried_again() {
+        let (mut displays, script, _) = scripted();
+        script.plug(Script::output(1, "built-in"));
+        displays.poll();
+        let id = displays.by_native(1).unwrap().id;
+        let ticks = displays.ticks(id).unwrap();
+        // The OS changed a mode, and the read of it fails part way.
+        script.fail_probes(1);
+        for d in &mut script.state.lock().unwrap().outputs {
+            d.refresh.interval = Duration::from_millis(8);
+        }
+        assert_eq!(displays.poll(), vec![], "no output is pulled out by a failed read");
+        assert_eq!(displays.output(id).map(|o| o.native), Some(1));
+        assert!(!ticks.ended());
+        // Nothing told of anything since; the next poll reads again.
+        let events = displays.poll();
+        assert!(
+            matches!(events.as_slice(), [Event::Changed { output, .. }] if output.refresh.interval == Duration::from_millis(8)),
+            "{events:?}"
+        );
+        assert_eq!(displays.poll(), vec![], "and then not again");
     }
 }

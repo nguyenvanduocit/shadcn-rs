@@ -808,12 +808,21 @@ struct Told {
 /// under another handle, the render thread gets that output's vsync ticks
 /// (where its OS has a source) and starts its fit afresh. Elsewhere
 /// (Wayland) the toolkit's rate is all there is.
+///
+/// The displays are polled first, so what the OS said and was not taken in
+/// yet (a monitor winit already reports, before the displays' own wake is
+/// handled) is known before anything is told: the render thread is told
+/// of the output once, not of winit's rate and then of the output.
 fn follow(
-    displays: Option<&mut gui_display::Displays>,
+    mut displays: Option<&mut gui_display::Displays>,
     native: Option<u32>,
     reported: Option<Duration>,
     told: &mut Told,
 ) -> Option<ToRender> {
+    if let Some(d) = displays.as_deref_mut() {
+        // The events need no reading: the outputs are read below as they are now.
+        d.poll();
+    }
     let output = displays
         .as_ref()
         .zip(native)
@@ -839,6 +848,24 @@ fn follow(
 
 /// The OS's handle of the monitor `window` is on, as `gui_display` names
 /// outputs: macOS's display id, X11's CRTC.
+/// A user event the displays answer: their wake (`UserEvent::Display`) is
+/// `follow` on what the window reports (`window`, read only then, `None`
+/// with no window), its news for the render thread. What came, went or
+/// changed is read off the displays as they are now (`follow` polls them,
+/// which also starts or stops a vsync source), and only what the render
+/// thread was not told is sent. Any other event is handed back.
+fn on_display(
+    event: UserEvent,
+    displays: Option<&mut gui_display::Displays>,
+    window: impl FnOnce() -> Option<(Option<u32>, Option<Duration>)>,
+    told: &mut Told,
+) -> Result<Option<ToRender>, UserEvent> {
+    match event {
+        UserEvent::Display => Ok(window().and_then(|(native, reported)| follow(displays, native, reported, told))),
+        other => Err(other),
+    }
+}
+
 fn native_of(window: &Window) -> Option<u32> {
     #[cfg(target_os = "macos")]
     {
@@ -1136,7 +1163,7 @@ impl ApplicationHandler<UserEvent> for Platform {
         // poll them. Where they are not (Wayland), winit's rate and the
         // frame callbacks stand, as before.
         let wake = self.proxy.clone();
-        self.displays = gui_display::Displays::connect(&*window, move || {
+        self.displays = gui_display::Displays::connect(&window, move || {
             wake.send_event(UserEvent::Display).ok();
         })
         .ok();
@@ -1209,6 +1236,20 @@ impl ApplicationHandler<UserEvent> for Platform {
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        let window = || {
+            self.state
+                .as_ref()
+                .map(|s| (native_of(&s.window), interval_of(&s.window)))
+        };
+        let event = match on_display(event, self.displays.as_mut(), window, &mut self.told) {
+            Ok(news) => {
+                if let (Some(news), Some(s)) = (news, &self.state) {
+                    s.threads.to_render.send(news).ok();
+                }
+                return;
+            }
+            Err(other) => other,
+        };
         match event {
             UserEvent::Access(event) => {
                 let Some(s) = &self.state else { return };
@@ -1227,13 +1268,8 @@ impl ApplicationHandler<UserEvent> for Platform {
                     }
                 }
             }
-            // What came, went or changed is read off the displays as they
-            // are now; a poll with no news started or stopped a source.
-            UserEvent::Display => {
-                if self.displays.as_mut().is_some_and(|d| !d.poll().is_empty()) {
-                    self.follow_display();
-                }
-            }
+            // Taken in above.
+            UserEvent::Display => {}
             UserEvent::Ui(ToPlatform::Cursor(c)) => {
                 if let Some(s) = &self.state {
                     s.window.set_cursor(c);
@@ -1515,6 +1551,89 @@ mod tests {
             "output"
         );
         assert_eq!(told.output.map(|(_, native)| native), Some(1));
+    }
+
+    /// The displays' wake is a `UserEvent::Display` for the event loop,
+    /// which `user_event` hands to `on_display`: a change the OS told of,
+    /// with no window event and no poll yet, reaches the render thread
+    /// through that event alone.
+    #[test]
+    fn the_displays_wake_alone_tells_the_render_thread_of_a_change() {
+        use super::{ToRender, Told, UserEvent, on_display};
+        use std::time::Duration;
+        let hz120 = Duration::from_nanos(8_333_333);
+        let winit = Some(Duration::from_micros(16_694));
+        // The event loop's proxy, as `connect`'s wake sends to it.
+        let (proxy, events) = std::sync::mpsc::channel();
+        let (mut displays, os) = gui_display::Displays::scripted(move || {
+            proxy.send(UserEvent::Display).ok();
+        });
+        let mut told = Told::default();
+        let dispatch = |displays: &mut gui_display::Displays, told: &mut Told| {
+            let mut news = Vec::new();
+            while let Ok(event) = events.try_recv() {
+                news.push(
+                    on_display(event, Some(&mut *displays), || Some((Some(1), winit)), told)
+                        .ok()
+                        .flatten(),
+                );
+            }
+            news
+        };
+        os.plug(gui_display::Script::output(1, "built-in"));
+        // Kept, as the render thread keeps the output's ticks it was sent.
+        let first = dispatch(&mut displays, &mut told);
+        assert!(matches!(first.as_slice(), [Some(ToRender::Output { .. })]));
+        // The OS changes the mode; its wake is all the platform thread gets.
+        os.change(1, |d| d.refresh.interval = hz120);
+        let news = dispatch(&mut displays, &mut told);
+        assert!(
+            matches!(news.as_slice(), [Some(ToRender::Interval(i))] if *i == hz120),
+            "the wake's event reads the change and tells it: {} news",
+            news.len()
+        );
+        assert!(dispatch(&mut displays, &mut told).is_empty(), "nothing more woke it");
+        // Any other event is not the displays'.
+        assert!(
+            on_display(
+                UserEvent::Ui(super::ToPlatform::Quit(String::new())),
+                Some(&mut displays),
+                || Some((Some(1), winit)),
+                &mut told
+            )
+            .is_err()
+        );
+    }
+
+    /// winit may report a monitor the displays have not polled yet (their
+    /// wake not handled): the render thread is told of that output once,
+    /// not of winit's rate first and of the output after, each a reset.
+    #[test]
+    fn a_monitor_winit_reports_before_the_displays_poll_resets_the_vsync_once() {
+        use super::{ToRender, Told, follow};
+        use std::time::Duration;
+        let (mut displays, os) = gui_display::Displays::scripted(|| {});
+        os.plug(gui_display::Script::output(1, "built-in"));
+        let mut told = Told::default();
+        let winit = Some(Duration::from_micros(16_694));
+        assert!(follow(Some(&mut displays), Some(1), winit, &mut told).is_some());
+        // Plugged and the window moved onto it; the displays not polled since.
+        let mut fast = gui_display::Script::output(3, "external");
+        fast.refresh.interval = Duration::from_nanos(8_333_333);
+        os.plug(fast);
+        let mut resets = 0;
+        for _ in 0..3 {
+            match follow(Some(&mut displays), Some(3), winit, &mut told) {
+                Some(ToRender::Output { interval, ticks }) => {
+                    assert_eq!(interval, Duration::from_nanos(8_333_333));
+                    assert!(ticks.is_some());
+                    resets += 1;
+                }
+                Some(_) => resets += 1,
+                None => {}
+            }
+        }
+        assert_eq!(resets, 1, "told once, of the output");
     }
 
     /// A handler that writes down each input and the frame shown as it came.

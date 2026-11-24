@@ -47,15 +47,20 @@ raw-window-handle = "0.6"
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 block2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSEnumerator", "NSGeometry", "NSNotification", "NSObject", "NSOperation", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSDictionary", "NSEnumerator", "NSGeometry", "NSNotification", "NSObject", "NSOperation", "NSString", "NSValue"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSColorSpace", "NSGraphics", "NSResponder", "NSScreen", "objc2-core-foundation", "objc2-core-graphics"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes", "CFUUID"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGDirectDisplay"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVDisplayLink", "CVHostTime", "CVReturn", "objc2-core-graphics"] }
 
-# X11: RandR over a connection of our own, in safe Rust.
+# X11: RandR through the toolkit's own connection (adopted through XCB, which
+# x11rb loads at run time as winit does; Xlib's display gives its XCB
+# connection through libX11-xcb, which x11-dl loads), and a connection of our
+# own, in safe Rust, that only hears RandR's notifications. Both crates and
+# these features are winit's already.
 [target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
-x11rb = { version = "0.13", features = ["randr"] }
+x11rb = { version = "0.13", features = ["randr", "allow-unsafe-code", "dl-libxcb"] }
+x11-dl = "2.21"
 
 [[test]]
 name = "live"

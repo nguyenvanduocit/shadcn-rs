@@ -29,25 +29,33 @@ fn run() -> Result<String, String> {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use gui_display::{Displays, IDLE, Stamp};
-    use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle};
+    use gui_display::{Displays, IDLE, Stamp, native_links_made};
+    use raw_window_handle::{DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, WindowHandle};
 
+    /// AppKit with no window: the displays need none on macOS.
     struct AppKit;
     impl HasDisplayHandle for AppKit {
         fn display_handle(&self) -> Result<DisplayHandle<'_>, HandleError> {
             Ok(DisplayHandle::appkit())
         }
     }
+    impl HasWindowHandle for AppKit {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
     fn check(ok: bool, what: impl FnOnce() -> String) -> Result<(), String> {
         if ok { Ok(()) } else { Err(what()) }
     }
 
+    let app = Arc::new(AppKit);
     let woken = Arc::new(AtomicUsize::new(0));
     let theirs = Arc::clone(&woken);
-    let mut displays = Displays::connect(&AppKit, move || {
+    let mut displays = Displays::connect(&app, move || {
         theirs.fetch_add(1, Ordering::SeqCst);
     })
     .map_err(|e| e.to_string())?;
+    check(native_links_made() == 0, || "a link made before any reader".to_owned())?;
     let outputs = displays.outputs().to_vec();
     if outputs.is_empty() {
         return Ok("skipped (no display attached)".to_owned());
@@ -90,6 +98,7 @@ fn run() -> Result<String, String> {
     }
     check(displays.poll().is_empty(), || "a second poll found news".to_owned())?;
     let mut ids: Vec<_> = outputs.iter().map(|o| o.id).collect();
+    ids.sort();
     ids.dedup();
     check(ids.len() == outputs.len(), || "two outputs share an id".to_owned())?;
 
@@ -174,6 +183,9 @@ fn run() -> Result<String, String> {
     check(second.wait(0, Duration::from_secs(3)).is_some(), || {
         "a second reader gets no tick".to_owned()
     })?;
+    check(native_links_made() == 1, || {
+        format!("two readers of one display made {} links", native_links_made())
+    })?;
     drop(ticks);
     displays.poll();
     let at = second.latest().map_or(0, |t| t.sequence);
@@ -190,8 +202,32 @@ fn run() -> Result<String, String> {
     drop(third);
     displays.poll();
     drop(displays);
+
+    // Connected again and again, as an app that opens and closes windows:
+    // each connection's reader ticks through the one link the process
+    // made for the display, never a new one.
+    let key = output.key;
+    for round in 1..=3 {
+        let mut displays = Displays::connect(&app, || {}).map_err(|e| e.to_string())?;
+        let id = displays
+            .outputs()
+            .iter()
+            .find(|o| o.key == key)
+            .map(|o| o.id)
+            .ok_or("the display is gone")?;
+        let ticks = displays.ticks(id).map_err(|e| e.to_string())?;
+        check(ticks.wait(0, Duration::from_secs(3)).is_some(), || {
+            format!("connection {round}: no tick")
+        })?;
+        drop(ticks);
+        displays.poll();
+        drop(displays);
+        check(native_links_made() == 1, || {
+            format!("after {round} reconnections, {} links made", native_links_made())
+        })?;
+    }
     Ok(format!(
-        "{} output(s), display link ticking and stopping",
+        "{} output(s), display link ticking and stopping, one link made for the display",
         outputs.len()
     ))
 }

@@ -1,10 +1,14 @@
 //! Vsync ticks: what an output's vsync source last said, held where any
 //! thread can read it or wait for the next.
 //!
-//! The OS calls back on a thread of its own, at display priority. Nothing
-//! of the caller's runs there: the callback converts the OS's time, stores
-//! one [`Tick`] under a short lock and wakes whoever waits. A reader takes
-//! the latest ([`Ticks::latest`]) or blocks for the next ([`Ticks::wait`]).
+//! The OS calls back on a thread of its own, at display priority. The
+//! callback converts the OS's time, stores one [`Tick`] under a short lock
+//! and wakes whoever waits. A reader takes the latest ([`Ticks::latest`])
+//! or blocks for the next ([`Ticks::wait`]). The one piece of the caller's
+//! code that can run there is the owner's wake, and only when a source
+//! asks to be stopped; it is never called under a lock of this crate's
+//! ([`Asked`]), so a wake that blocks on a lock of the caller's cannot
+//! close a cycle with one of ours.
 //!
 //! Starting and stopping the OS source belongs to the thread that owns the
 //! [`crate::Displays`]. A reader says only whether it wants ticks
@@ -15,7 +19,7 @@
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use crate::OutputId;
+use crate::{Error, OutputId};
 
 /// A moment on the display's timeline, with how it is known. The three are
 /// kept apart by type so that a consumer chooses what each may drive: a
@@ -67,6 +71,11 @@ pub struct Tick {
     pub target: Stamp,
     /// The refresh interval the source reported with it, when it did.
     pub interval: Option<Duration>,
+    /// The output's mode it was taken in: it counts the changes of the
+    /// output's refresh this subscription saw ([`Ticks::generation`]). A
+    /// consumer that reset its timing for a new mode takes only ticks of
+    /// that mode, not one that came before the change.
+    pub generation: u64,
 }
 
 /// How long a source nobody wants keeps running before it is stopped: a
@@ -81,6 +90,10 @@ pub(crate) type Wake = Arc<dyn Fn() + Send + Sync>;
 struct State {
     latest: Option<Tick>,
     sequence: u64,
+    /// The output's nominal interval, as of the owner's last poll.
+    interval: Duration,
+    /// How many times the owner saw that change ([`Tick::generation`]).
+    generation: u64,
     /// A reader wants ticks.
     wanted: bool,
     /// Since when nobody does.
@@ -113,15 +126,44 @@ impl Shared {
 #[derive(Clone)]
 pub(crate) struct Feed(Arc<Shared>);
 
+/// The owner's wake, owed by a source that asked to be stopped, and not
+/// sent yet. It is sent by whoever holds it once that one holds no lock of
+/// this crate's: the wake is the caller's code, which may block on a lock
+/// of the caller's that its own thread holds while it stops a source,
+/// which takes ours.
+#[must_use = "a source asked to be stopped: send the wake once no lock is held"]
+pub(crate) struct Asked(Option<Wake>);
+
+impl Asked {
+    /// Call the owner's wake, if it is owed.
+    pub(crate) fn send(self) {
+        if let Some(wake) = self.0 {
+            wake();
+        }
+    }
+
+    /// Whether a wake is owed (what a callback that may not allocate at
+    /// every vblank keeps).
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn owed(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
 impl Feed {
-    /// A vsync: `target`, with the interval the source reported.
-    pub(crate) fn tick(&self, target: Stamp, interval: Option<Duration>) {
+    /// A vsync: `target`, with the interval the source reported, read in
+    /// mode `generation` ([`Self::mode`], read before the time was). A time
+    /// read before the owner moved the output to another mode is of the
+    /// old grid, and is dropped. What it returns is sent by the caller once
+    /// it holds no lock ([`Asked`]).
+    pub(crate) fn tick(&self, target: Stamp, interval: Option<Duration>, generation: u64) -> Asked {
         let now = Instant::now();
         let ask = {
             let mut s = self.0.lock();
-            // A callback already on its way when the source was stopped.
-            if !s.started || s.ended {
-                return;
+            // A callback already on its way when the source was stopped, or
+            // a time read in the mode before the last change.
+            if !s.started || s.ended || generation != s.generation {
+                return Asked(None);
             }
             s.sequence = s.sequence.saturating_add(1);
             s.latest = Some(Tick {
@@ -130,6 +172,7 @@ impl Feed {
                 seen: now,
                 target,
                 interval,
+                generation: s.generation,
             });
             let idle = !s.wanted
                 && s.unwanted_since
@@ -139,10 +182,22 @@ impl Feed {
             ask
         };
         self.0.ticked.notify_all();
-        // Outside the lock: the owner's wake is the caller's code.
-        if ask {
-            (self.0.wake)();
-        }
+        Asked(ask.then(|| Arc::clone(&self.0.wake)))
+    }
+
+    /// The output's nominal interval and its mode's generation as of the
+    /// owner's last poll, read together: a source reads this before it
+    /// reads or makes a time, and ticks with the generation it read.
+    pub(crate) fn mode(&self) -> (Duration, u64) {
+        let s = self.0.lock();
+        (s.interval, s.generation)
+    }
+
+    /// A vsync whose time is known now, in the mode current now (a
+    /// scripted source's).
+    pub(crate) fn tick_now(&self, target: Stamp, interval: Option<Duration>) -> Asked {
+        let (_, generation) = self.mode();
+        self.tick(target, interval, generation)
     }
 }
 
@@ -194,10 +249,27 @@ impl Link {
         }
     }
 
-    /// The output is gone.
+    /// The output is gone, or its source failed: no more ticks will come.
     pub(crate) fn end(&self) {
         self.0.lock().ended = true;
         self.0.ticked.notify_all();
+    }
+
+    /// The output's refresh changed to `interval` (a poll reported it):
+    /// ticks from now on are of the next generation, and a timer source
+    /// ticks at the new interval.
+    pub(crate) fn remode(&self, interval: Duration) {
+        let mut s = self.0.lock();
+        s.interval = interval;
+        s.generation = s.generation.saturating_add(1);
+    }
+
+    /// Make the reader look unwanted since `at` (tests of the idle stop).
+    #[cfg(test)]
+    pub(crate) fn unwanted_since(&self, at: Instant) {
+        let mut s = self.0.lock();
+        s.wanted = false;
+        s.unwanted_since = Some(at);
     }
 }
 
@@ -213,13 +285,16 @@ impl std::fmt::Debug for Ticks {
     }
 }
 
-/// A subscription and its owner's side, wanted from the start.
-pub(crate) fn subscription(output: OutputId, wake: Wake) -> (Ticks, Link) {
+/// A subscription to an output refreshing every `interval`, and its
+/// owner's side, wanted from the start.
+pub(crate) fn subscription(output: OutputId, interval: Duration, wake: Wake) -> (Ticks, Link) {
     let shared = Arc::new(Shared {
         output,
         state: Mutex::new(State {
             latest: None,
             sequence: 0,
+            interval,
+            generation: 0,
             wanted: true,
             unwanted_since: None,
             started: false,
@@ -290,10 +365,18 @@ impl Ticks {
         }
     }
 
-    /// Whether the output is gone: no more ticks will come.
+    /// Whether the output is gone, or its source failed to start: no more
+    /// ticks will come. A new subscription tries the source again.
     #[must_use]
     pub fn ended(&self) -> bool {
         self.0.lock().ended
+    }
+
+    /// The output's mode as of the owner's last poll: what the ticks of
+    /// that mode carry ([`Tick::generation`]).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.0.lock().generation
     }
 }
 
@@ -306,22 +389,27 @@ impl Drop for Ticks {
 
 /// A vsync source, owned by the thread that owns the displays.
 pub(crate) trait Source {
-    fn start(&mut self);
+    /// Start it. On an error nothing of it runs and nothing is counted: a
+    /// later start tries afresh.
+    fn start(&mut self) -> Result<(), Error>;
+    /// Stop it: its feed gets no more ticks once this returns. A backend
+    /// whose OS refuses the stop keeps what the OS says is running, and
+    /// tries again ([`crate::Backend::tidy`]).
     fn stop(&mut self);
 }
 
-/// A source with no display behind it: a thread that ticks every `interval`
-/// with [`Stamp::Synthesized`] times. For an output whose OS gives no vsync,
-/// and for tests.
+/// A source with no display behind it: a thread that ticks with
+/// [`Stamp::Synthesized`] times at the output's nominal interval, read
+/// afresh before each tick ([`Link::remode`]). For an output whose OS gives
+/// no vsync, and for tests.
 pub(crate) struct Timer {
     running: Arc<(Mutex<Option<bool>>, Condvar)>,
 }
 
 impl Timer {
-    pub(crate) fn spawn(feed: Feed, interval: Duration) -> std::io::Result<Self> {
+    pub(crate) fn spawn(feed: Feed) -> std::io::Result<Self> {
         let running = Arc::new((Mutex::new(Some(false)), Condvar::new()));
         let theirs = Arc::clone(&running);
-        let interval = interval.max(Duration::from_millis(1));
         std::thread::Builder::new()
             .name("gui-display timer".to_owned())
             .spawn(move || {
@@ -338,6 +426,11 @@ impl Timer {
                             }
                         }
                     }
+                    // The interval and its mode, read together before the
+                    // time is made: a tick made from an interval the owner
+                    // has since replaced carries the old mode, and is dropped.
+                    let (interval, generation) = feed.mode();
+                    let interval = interval.max(Duration::from_millis(1));
                     let now = Instant::now();
                     // Behind by more than an interval (it was stopped, or late): start from now.
                     next = match next.checked_add(interval) {
@@ -345,7 +438,8 @@ impl Timer {
                         _ => now.checked_add(interval).unwrap_or(now),
                     };
                     std::thread::sleep(next.saturating_duration_since(now));
-                    feed.tick(Stamp::Synthesized(next), Some(interval));
+                    // This thread holds no lock here.
+                    feed.tick(Stamp::Synthesized(next), Some(interval), generation).send();
                 }
             })?;
         Ok(Self { running })
@@ -359,8 +453,9 @@ impl Timer {
 }
 
 impl Source for Timer {
-    fn start(&mut self) {
+    fn start(&mut self) -> Result<(), Error> {
         self.set(Some(true));
+        Ok(())
     }
 
     fn stop(&mut self) {
@@ -393,20 +488,32 @@ mod tests {
         OutputId(7)
     }
 
+    /// A subscription to a 60 Hz output.
+    fn sub(wake: Wake) -> (Ticks, Link) {
+        subscription(output(), Duration::from_nanos(16_666_667), wake)
+    }
+
     #[test]
     fn a_tick_is_read_with_its_basis_and_counted() {
         let (wake, _) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         assert_eq!(link.settle(Instant::now()), Settle::Start);
         assert_eq!(ticks.latest(), None);
         let at = Instant::now();
-        link.feed().tick(Stamp::Predicted(at), Some(Duration::from_millis(8)));
-        link.feed().tick(Stamp::Presented(at), None);
+        link.feed()
+            .tick_now(Stamp::Predicted(at), Some(Duration::from_millis(8)))
+            .send();
+        link.feed().tick_now(Stamp::Presented(at), None).send();
         let t = ticks.latest().unwrap();
         assert_eq!(
-            (t.output, t.sequence, t.target, t.interval),
-            (output(), 2, Stamp::Presented(at), None)
+            (t.output, t.sequence, t.target, t.interval, t.generation),
+            (output(), 2, Stamp::Presented(at), None, 0)
         );
+        // The output's mode changed: later ticks are of the next one.
+        link.remode(Duration::from_millis(8));
+        assert_eq!(ticks.generation(), 1);
+        link.feed().tick_now(Stamp::Predicted(at), None).send();
+        assert_eq!(ticks.latest().map(|t| t.generation), Some(1));
         assert_eq!(Stamp::Synthesized(at).of_the_display(), None);
         assert_eq!(Stamp::Predicted(at).of_the_display(), Some(at));
     }
@@ -414,22 +521,39 @@ mod tests {
     #[test]
     fn a_tick_from_a_stopped_source_is_dropped() {
         let (wake, _) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         // Not started yet: a callback cannot have come from it.
-        link.feed().tick(Stamp::Predicted(Instant::now()), None);
+        link.feed().tick_now(Stamp::Predicted(Instant::now()), None).send();
         assert_eq!(ticks.latest(), None);
+    }
+
+    #[test]
+    fn a_time_read_before_a_mode_change_is_dropped() {
+        let (wake, _) = counted();
+        let (ticks, link) = sub(wake);
+        assert_eq!(link.settle(Instant::now()), Settle::Start);
+        let feed = link.feed();
+        // A source reads the mode, then its time; meanwhile the owner polls
+        // and moves the output to another mode.
+        let (_, read) = feed.mode();
+        link.remode(Duration::from_millis(8));
+        feed.tick(Stamp::Predicted(Instant::now()), None, read).send();
+        assert_eq!(ticks.latest(), None, "a time of the old grid is no tick");
+        let (_, read) = feed.mode();
+        feed.tick(Stamp::Predicted(Instant::now()), None, read).send();
+        assert_eq!(ticks.latest().map(|t| t.generation), Some(1));
     }
 
     #[test]
     fn wait_returns_the_next_tick_or_none_in_time() {
         let (wake, _) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         assert_eq!(link.settle(Instant::now()), Settle::Start);
         assert_eq!(ticks.wait(0, Duration::from_millis(5)), None);
         let feed = link.feed();
         let t = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            feed.tick(Stamp::Predicted(Instant::now()), None);
+            feed.tick_now(Stamp::Predicted(Instant::now()), None).send();
         });
         let got = ticks.wait(0, Duration::from_secs(5)).unwrap();
         assert_eq!(got.sequence, 1);
@@ -444,7 +568,7 @@ mod tests {
     #[test]
     fn an_unwanted_source_stops_only_after_the_idle_time_and_starts_when_wanted() {
         let (wake, woken) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         let start = Instant::now();
         assert_eq!(link.settle(start), Settle::Start);
         ticks.run(false);
@@ -466,13 +590,15 @@ mod tests {
     #[test]
     fn the_callback_asks_the_owner_once_to_stop_an_idle_source() {
         let (wake, woken) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (_ticks, link) = sub(wake);
         assert_eq!(link.settle(Instant::now()), Settle::Start);
-        ticks.run(false);
-        link.0.lock().unwanted_since = Instant::now().checked_sub(IDLE + Duration::from_millis(1));
+        link.unwanted_since(Instant::now().checked_sub(IDLE + Duration::from_millis(1)).unwrap());
         let feed = link.feed();
-        feed.tick(Stamp::Predicted(Instant::now()), None);
-        feed.tick(Stamp::Predicted(Instant::now()), None);
+        let asked = feed.tick_now(Stamp::Predicted(Instant::now()), None);
+        assert_eq!(woken.load(Ordering::SeqCst), 0, "not woken from inside the tick");
+        assert!(asked.owed());
+        asked.send();
+        assert!(!feed.tick_now(Stamp::Predicted(Instant::now()), None).owed());
         assert_eq!(woken.load(Ordering::SeqCst), 1, "asked once, not at every vblank");
         assert_eq!(link.settle(Instant::now()), Settle::Stop);
     }
@@ -480,7 +606,7 @@ mod tests {
     #[test]
     fn dropping_the_reader_closes_the_source() {
         let (wake, woken) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         assert_eq!(link.settle(Instant::now()), Settle::Start);
         drop(ticks);
         assert_eq!(woken.load(Ordering::SeqCst), 1);
@@ -490,7 +616,7 @@ mod tests {
     #[test]
     fn an_ended_output_wakes_its_waiter_with_nothing() {
         let (wake, _) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         assert_eq!(link.settle(Instant::now()), Settle::Start);
         link.end();
         assert!(ticks.ended());
@@ -501,11 +627,12 @@ mod tests {
     #[test]
     fn a_timer_ticks_synthesized_times_at_its_interval_and_stops() {
         let (wake, _) = counted();
-        let (ticks, link) = subscription(output(), wake);
+        let (ticks, link) = sub(wake);
         let interval = Duration::from_millis(4);
-        let mut timer = Timer::spawn(link.feed(), interval).unwrap();
+        link.remode(interval);
+        let mut timer = Timer::spawn(link.feed()).unwrap();
         assert_eq!(link.settle(Instant::now()), Settle::Start);
-        timer.start();
+        timer.start().unwrap();
         let a = ticks.wait(0, Duration::from_secs(5)).unwrap();
         let b = ticks.wait(a.sequence, Duration::from_secs(5)).unwrap();
         assert!(matches!(a.target, Stamp::Synthesized(_)));

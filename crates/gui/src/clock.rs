@@ -373,8 +373,7 @@ impl Vsync {
     /// on another): the fit starts afresh, and callbacks are bounded by it.
     pub fn set_interval(&mut self, interval: Duration) {
         if self.reported != Some(interval) {
-            *self = Self::new(interval);
-            self.reported = Some(self.interval);
+            *self = Self::reporting(interval);
         }
     }
 
@@ -382,8 +381,22 @@ impl Vsync {
     /// be another than before even at the same rate: nothing fitted to the
     /// last one holds.
     pub fn moved(&mut self, interval: Duration) {
-        *self = Self::new(interval);
-        self.reported = Some(self.interval);
+        *self = Self::reporting(interval);
+    }
+
+    /// A display the platform reports refreshing every `interval`, with
+    /// nothing fitted yet.
+    #[must_use]
+    pub fn reporting(interval: Duration) -> Self {
+        let mut v = Self::new(interval);
+        v.reported = Some(v.interval);
+        v
+    }
+
+    /// The refresh the platform reported for the display, if it did.
+    #[must_use]
+    pub fn reported(&self) -> Option<Duration> {
+        self.reported
     }
 
     /// The display's own vsync source ticked (ADR-0029). A time the display
