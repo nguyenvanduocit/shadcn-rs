@@ -13,6 +13,9 @@ workspace = true
 [dependencies]
 # The per-thread slots engine state is stored in (crate::engine).
 gui-tls = { path = "../gui-tls" }
+# The OS display boundary (ADR-0029): outputs, their refresh, colour and
+# headroom, and vsync ticks. The one crate that holds `unsafe`; gui forbids it.
+gui-display = { path = "../gui-display" }
 # What a screen reader is told about each frame (AccessKit), and its adapter
 # to the platform's accessibility API through the winit window.
 accesskit = "0.25"
@@ -88,6 +91,9 @@ fontique = { version = "0.13", features = ["fontconfig-dlopen"] }
 
 
 [dev-dependencies]
+# The assembled shaders parsed and validated against the Rust side (V3,
+# `gpu/contract/`). The version wgpu 30 builds, so no second copy is compiled.
+naga = { version = "=30.0.2", default-features = false, features = ["wgsl-in"] }
 # The tree a platform adapter keeps, to check that incremental updates keep
 # AccessKit's contract and equal the whole tree (ADR-0021).
 accesskit_consumer = "0.39"

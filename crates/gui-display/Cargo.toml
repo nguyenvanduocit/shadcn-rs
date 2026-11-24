@@ -1,0 +1,62 @@
+[package]
+name = "gui-display"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "The OS display boundary (ADR-0029): outputs, their refresh, colour and headroom, and vsync ticks, behind a safe API. The one crate of the workspace that may hold `unsafe`."
+
+# This crate does not take the workspace's lints, because the workspace forbids
+# `unsafe` and a `forbid` cannot be lifted at a site. It repeats every one of them
+# and changes one: `unsafe_code` is `deny`, lifted only by `#[expect(unsafe_code,
+# reason = "...")]` on the one function that holds a site. On top of them, every
+# `unsafe` block states its `// SAFETY:` and holds one unsafe operation
+# (ADR-0029). `tests/sites.rs` pins the list of sites.
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unused_must_use = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+as_conversions = "deny"
+let_underscore_must_use = "deny"
+mem_forget = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+redundant_clone = "deny"
+
+[dependencies]
+# Which windowing system the window's display is, as its toolkit hands it over.
+raw-window-handle = "0.6"
+
+# macOS: AppKit's screens (geometry, refresh range, colour space, EDR headroom),
+# Core Graphics' display modes and Core Video's display link, through objc2's
+# generated bindings, which check every message's signature.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "NSArray", "NSData", "NSEnumerator", "NSGeometry", "NSNotification", "NSObject", "NSOperation", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSColorSpace", "NSGraphics", "NSResponder", "NSScreen", "objc2-core-foundation", "objc2-core-graphics"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes", "CFUUID"] }
+objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGDirectDisplay"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVDisplayLink", "CVHostTime", "CVReturn", "objc2-core-graphics"] }
+
+# X11: RandR over a connection of our own, in safe Rust.
+[target.'cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))'.dependencies]
+x11rb = { version = "0.13", features = ["randr"] }
+
+[[test]]
+name = "live"
+harness = false

@@ -287,6 +287,10 @@ pub fn next_deadline() -> Option<Instant> {
 /// callbacks are samples too, and their gaps the interval
 /// ([`Vsync::called_back`]). Elsewhere the interval is the refresh rate of
 /// the monitor the window is on, read again when it may be on another.
+///
+/// Where the OS has a vsync source of its own (ADR-0029: macOS's display
+/// link), its ticks are the phase ([`Vsync::ticked`]) and blocked acquires
+/// are not fitted while they come.
 #[derive(Clone, Debug)]
 pub struct Vsync {
     interval: Duration,
@@ -300,7 +304,15 @@ pub struct Vsync {
     gaps: std::collections::VecDeque<Duration>,
     /// The refresh the platform reported for the monitor, if it did.
     reported: Option<Duration>,
+    /// The display's last tick taken ([`Vsync::ticked`]): its output, its
+    /// number, and when its source saw it.
+    told: Option<(gui_display::OutputId, u64, Instant)>,
 }
+
+/// How long after a display tick blocked acquires stay out of the phase:
+/// past it the display's source has stopped (the window was at rest) or
+/// its output is gone, and the acquires are the phase again.
+const TICK_FRESH: Duration = Duration::from_secs(1);
 
 /// How many callback gaps the interval is the shortest of.
 const CALLBACK_GAPS: usize = 8;
@@ -334,6 +346,7 @@ impl Vsync {
             called: None,
             gaps: std::collections::VecDeque::new(),
             reported: None,
+            told: None,
         }
     }
 
@@ -365,9 +378,53 @@ impl Vsync {
         }
     }
 
+    /// The window is on a display refreshing every `interval`, which may
+    /// be another than before even at the same rate: nothing fitted to the
+    /// last one holds.
+    pub fn moved(&mut self, interval: Duration) {
+        *self = Self::new(interval);
+        self.reported = Some(self.interval);
+    }
+
+    /// The display's own vsync source ticked (ADR-0029). A time the display
+    /// is behind, predicted or presented, is a vblank: it is the phase, and
+    /// what was fitted to acquires is dropped. A synthesized time is a
+    /// timer's and sets nothing, so no timer wake can enter the phase
+    /// through here. The interval it reports is taken when it is off by
+    /// more than [`CALLBACK_TOLERANCE`], within what the monitor reports as
+    /// a callback's is. The same tick given twice counts once.
+    pub fn ticked(&mut self, tick: &gui_display::Tick) {
+        let Some(at) = tick.target.of_the_display() else { return };
+        if self
+            .told
+            .is_some_and(|(output, number, _)| output == tick.output && number == tick.sequence)
+        {
+            return;
+        }
+        if let Some(i) = tick.interval.filter(|i| CALLBACK_GAPS_IN.contains(i))
+            && (i.as_secs_f64() / self.interval.as_secs_f64() - 1.0).abs() > CALLBACK_TOLERANCE
+            && self
+                .reported
+                .is_none_or(|r| i >= r.mul_f64(1.0 - CALLBACK_TOLERANCE) && i <= r.mul_f64(CALLBACK_SLOWEST))
+        {
+            self.interval = i;
+        }
+        self.samples.clear();
+        self.phase = Some(at);
+        self.told = Some((tick.output, tick.sequence, tick.seen));
+    }
+
     /// An acquire returned at `at` after waiting `waited`.
     pub fn acquired(&mut self, at: Instant, waited: Duration) {
         if waited < VSYNC_BLOCKED {
+            return;
+        }
+        // The display says its own phase: an acquire's return is a worse
+        // sample of it (it comes when the compositor frees a drawable).
+        if self
+            .told
+            .is_some_and(|(_, _, seen)| at.saturating_duration_since(seen) < TICK_FRESH)
+        {
             return;
         }
         self.samples.push_back(at);
@@ -476,17 +533,21 @@ impl Vsync {
             return after.checked_add(self.interval).unwrap_or(after);
         };
         let i = self.interval.as_secs_f64();
-        let ahead = if after >= phase {
+        let next = if after >= phase {
             let n = (after.duration_since(phase).as_secs_f64() / i).floor() + 1.0;
-            n * i
+            phase.checked_add(Duration::from_secs_f64(n * i))
         } else {
+            // The phase is ahead (a display's forecast of a coming vblank,
+            // ADR-0029): the vblanks between are whole intervals before it.
             let back = phase.duration_since(after).as_secs_f64();
-            back - (back / i).floor() * i
-        };
-        let next = phase
-            .checked_add(Duration::from_secs_f64(ahead.max(0.0)))
-            .or_else(|| phase.checked_sub(Duration::from_secs_f64(-ahead)))
-            .unwrap_or(after);
+            let whole = (back / i).floor();
+            if whole < 1.0 {
+                Some(phase)
+            } else {
+                phase.checked_sub(Duration::from_secs_f64(whole * i))
+            }
+        }
+        .unwrap_or(after);
         if next <= after {
             next.checked_add(self.interval).unwrap_or(next)
         } else {
@@ -571,5 +632,89 @@ mod tests {
             v.called_back(t0.checked_add(refresh.saturating_mul(2 * n)).unwrap_or(t0), n > 0);
         }
         assert_eq!(v.interval(), refresh, "bounded by the monitor's rate");
+    }
+
+    /// A scripted display with one output, a subscription to its ticks,
+    /// and what plays its OS.
+    fn display() -> (gui_display::Displays, gui_display::Script, gui_display::Ticks) {
+        let (mut displays, script) = gui_display::Displays::scripted(|| {});
+        script.plug(gui_display::Script::output(1, "built-in"));
+        displays.poll();
+        let id = displays.outputs().first().map(|o| o.id).unwrap();
+        let ticks = displays.ticks(id).unwrap();
+        (displays, script, ticks)
+    }
+
+    #[test]
+    fn a_display_tick_is_the_phase_and_a_synthesized_one_never_is() {
+        let (_displays, script, ticks) = display();
+        let hz60 = Duration::from_nanos(16_666_667);
+        let mut v = Vsync::new(hz60);
+        let now = Instant::now();
+        // A timer's time: the right rate, no phase.
+        script.tick(1, gui_display::Stamp::Synthesized(now), Some(hz60));
+        v.ticked(&ticks.latest().unwrap());
+        assert_eq!(v.phase(), None, "a timer's wake is no vblank");
+        // The display's forecast of a vblank, 5 ms from now.
+        let vblank = now + Duration::from_millis(5);
+        script.tick(1, gui_display::Stamp::Predicted(vblank), Some(hz60));
+        let tick = ticks.latest().unwrap();
+        v.ticked(&tick);
+        assert_eq!(v.phase(), Some(vblank));
+        assert_eq!(v.next_after(now), vblank);
+        assert_eq!(v.next_after(vblank), vblank + hz60);
+        // What presentation feedback measured is one too.
+        script.tick(1, gui_display::Stamp::Presented(vblank + hz60), None);
+        v.ticked(&ticks.latest().unwrap());
+        assert_eq!(v.phase(), Some(vblank + hz60));
+    }
+
+    #[test]
+    fn while_the_display_ticks_blocked_acquires_do_not_move_the_phase() {
+        let (_displays, script, ticks) = display();
+        let hz60 = Duration::from_nanos(16_666_667);
+        let mut v = Vsync::new(hz60);
+        let now = Instant::now();
+        // Acquires fitted a phase before the first tick came.
+        v.acquired(now, Duration::from_millis(2));
+        assert_eq!(v.phase(), Some(now));
+        let vblank = now + Duration::from_millis(5);
+        script.tick(1, gui_display::Stamp::Predicted(vblank), None);
+        let tick = ticks.latest().unwrap();
+        v.ticked(&tick);
+        // An acquire that returned 3 ms off the display's phase.
+        v.acquired(tick.seen + Duration::from_millis(8), Duration::from_millis(2));
+        assert_eq!(v.phase(), Some(vblank), "the display's own phase stands");
+        // The same tick read again at the next frame changes nothing.
+        v.ticked(&tick);
+        assert_eq!(v.phase(), Some(vblank));
+        // The source stopped (the window was at rest): after a second the
+        // acquires are the phase again, alone.
+        let later = tick.seen + TICK_FRESH + Duration::from_millis(3);
+        v.acquired(later, Duration::from_millis(2));
+        assert_eq!(v.phase(), Some(later));
+    }
+
+    #[test]
+    fn a_tick_sets_the_interval_within_what_the_monitor_reports() {
+        let (_displays, script, ticks) = display();
+        let hz60 = Duration::from_nanos(16_666_667);
+        let hz120 = Duration::from_nanos(8_333_333);
+        let now = Instant::now();
+        // Nothing reported: the display link's own period is taken.
+        let mut v = Vsync::new(hz60);
+        script.tick(1, gui_display::Stamp::Predicted(now), Some(hz120));
+        v.ticked(&ticks.latest().unwrap());
+        assert_eq!(v.interval(), hz120);
+        // Reported at 60 Hz: a tick claiming twice the rate is not it.
+        let mut v = Vsync::new(hz60);
+        v.set_interval(hz60);
+        script.tick(1, gui_display::Stamp::Predicted(now), Some(hz120));
+        v.ticked(&ticks.latest().unwrap());
+        assert_eq!(v.interval(), hz60);
+        // Moved to another display at the same rate: nothing fitted holds.
+        assert!(v.phase().is_some());
+        v.moved(hz60);
+        assert_eq!(v.phase(), None);
     }
 }

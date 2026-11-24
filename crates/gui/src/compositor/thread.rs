@@ -62,6 +62,13 @@ pub(crate) enum ToRender {
     Expose,
     /// The display refreshes this often.
     Interval(Duration),
+    /// The window is on another output (ADR-0029), refreshing this often,
+    /// with its vsync ticks where its OS has a source for them: nothing
+    /// fitted to the last output holds.
+    Output {
+        interval: Duration,
+        ticks: Option<gui_display::Ticks>,
+    },
     /// The compositor's frame callback came (Wayland), at the time given:
     /// the next frame may be drawn. Callbacks come at the output's refresh,
     /// so they time its vsync ([`Vsync::called_back`]).
@@ -225,6 +232,10 @@ pub(crate) struct RenderThread {
     applied: Option<u64>,
     /// The ticker's last vblank.
     ticked: Option<Instant>,
+    /// The vsync ticks of the output the window is on, where its OS has a
+    /// source for them (ADR-0029): wanted while frames are drawn, not while
+    /// the thread sleeps, so a window at rest wakes nothing at a vblank.
+    ticks: Option<gui_display::Ticks>,
     /// The vblank the last frame that presented, or took a texture, was
     /// drawn for: no later frame is drawn for it or an earlier one.
     reserved: Option<Instant>,
@@ -309,6 +320,7 @@ impl RenderThread {
             log,
             applied: None,
             ticked: None,
+            ticks: None,
             reserved: None,
             blank: None,
             unpresented: 0,
@@ -417,6 +429,9 @@ impl RenderThread {
         }
         let asleep = !self.busy() || !self.visible || !self.called_back || occluded.is_some();
         if asleep {
+            if let Some(ticks) = &self.ticks {
+                ticks.run(false);
+            }
             let msg = match occluded {
                 Some(t) => match self.rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
                     Ok(msg) => Some(msg),
@@ -442,10 +457,24 @@ impl RenderThread {
         // Input woke everything up: the UI starts its frame now, not
         // at the next vblank (cc's `BeginMainFrame` on demand).
         if asleep && self.wants && self.owed.is_none() && self.visible {
+            self.take_tick();
             self.grant_now();
         }
         let hidden = self.occluded_until.is_some();
         !(self.busy() && self.visible && self.called_back && !hidden) || self.frame()
+    }
+
+    /// Want the display's ticks (a frame is about to be timed) and take the
+    /// last one as the vsync's phase. A tick from before the source last
+    /// stopped is taken once and then outlived by the acquires
+    /// ([`Vsync::acquired`]) until the source, started again, ticks.
+    fn take_tick(&mut self) {
+        if let Some(ticks) = &self.ticks {
+            ticks.run(true);
+            if let Some(tick) = ticks.latest() {
+                self.vsync.ticked(&tick);
+            }
+        }
     }
 
     /// Grant the UI a main frame now, the thread having slept: for the
@@ -572,6 +601,10 @@ impl RenderThread {
                 self.dirty = true;
             }
             ToRender::Interval(i) => self.vsync.set_interval(i),
+            ToRender::Output { interval, ticks } => {
+                self.vsync.moved(interval);
+                self.ticks = ticks;
+            }
             ToRender::FrameCallback(at) => {
                 self.called_back = true;
                 self.callback_at = Some(at);
@@ -731,8 +764,15 @@ impl RenderThread {
         if let Some(size) = self.resize_to.take() {
             self.gpu.resize(size);
         }
+        // Wanted before the acquire blocks, so a source that stopped while
+        // the thread slept is started meanwhile; read after it, for the
+        // tick of the vblank the acquire waited for.
+        if let Some(ticks) = &self.ticks {
+            ticks.run(true);
+        }
         let (vblank, waited) = self.wait_vsync();
         let woke = Instant::now();
+        self.take_tick();
         if let Some(waited) = waited {
             self.vsync.acquired(vblank, waited);
         }
@@ -977,6 +1017,73 @@ mod tests {
             assert!(thread.frame());
         }
         assert_eq!(thread.vsync.phase(), None, "no phase fitted to timer wakes");
+    }
+
+    #[test]
+    fn an_outputs_ticks_are_the_phase_of_its_frames_and_unwanted_while_the_thread_sleeps() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, tx) = on_surface(gpu, Duration::from_millis(4));
+        // Scripted displays play the OS (ADR-0029); `woken` counts the
+        // times their owner is asked to poll.
+        let woken = Arc::new(AtomicUsize::new(0));
+        let theirs = Arc::clone(&woken);
+        let (mut displays, os) = gui_display::Displays::scripted(move || {
+            theirs.fetch_add(1, Ordering::SeqCst);
+        });
+        os.plug(gui_display::Script::output(1, "built-in"));
+        displays.poll();
+        let id = displays.outputs().first().map(|o| o.id).unwrap();
+        let ticks = displays.ticks(id).unwrap();
+
+        // Fitted to the last display, then told of this one.
+        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        let interval = Duration::from_millis(8);
+        assert!(thread.handle(ToRender::Output {
+            interval,
+            ticks: Some(ticks),
+        }));
+        assert_eq!(
+            (thread.vsync.interval(), thread.vsync.phase()),
+            (interval, None),
+            "nothing fitted holds"
+        );
+
+        // A timer's tick is no phase; the display's forecast is, at the
+        // next frame (whose acquire fails here: no window).
+        os.tick(1, gui_display::Stamp::Synthesized(Instant::now()), None);
+        assert!(thread.frame());
+        assert_eq!(thread.vsync.phase(), None);
+        let vblank = Instant::now() + Duration::from_millis(3);
+        os.tick(1, gui_display::Stamp::Predicted(vblank), None);
+        assert!(thread.frame());
+        assert_eq!(thread.vsync.phase(), Some(vblank));
+
+        // Nothing to draw: the thread sleeps, and no longer wants ticks.
+        // After the idle time the source asks to be stopped, and is.
+        thread.dirty = false;
+        thread.retry = false;
+        tx.send(ToRender::Wake).unwrap();
+        assert!(thread.step());
+        std::thread::sleep(gui_display::IDLE + Duration::from_millis(30));
+        let before = woken.load(Ordering::SeqCst);
+        os.tick(1, gui_display::Stamp::Predicted(Instant::now()), None);
+        assert_eq!(
+            woken.load(Ordering::SeqCst),
+            before + 1,
+            "an idle source asks its owner to stop it"
+        );
+        displays.poll();
+        assert_eq!(os.running(1), 0, "a window at rest wakes nothing at a vblank");
+
+        // A frame is drawn again: the ticks are wanted, and started.
+        assert!(thread.frame());
+        assert_eq!(woken.load(Ordering::SeqCst), before + 2);
+        displays.poll();
+        assert_eq!(os.running(1), 1);
     }
 
     #[test]

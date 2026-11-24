@@ -80,7 +80,8 @@ row when a milestone lands.
 | Fork frame (ADR-0028): `ForkMap`, its undo log, the cold check | partial | `ForkMap` exists in every build (`gui/src/engine.rs`); its undo log and the cold check (`GUI_COLD_CHECK`, read in `app.rs`, `gpu/mod.rs`, `compositor/mod.rs`) are debug builds only |
 | Fork in release, typed outbox, sampled check | not yet | M13 F2-F4 |
 | Verification: allocation budgets, seeded tests, bench, devtools (ADR-0010, 0023) | built | `gui/tests/`, `gui/src/testing.rs`, `.github/workflows/ci.yml` |
-| OS display boundary crate, MCP/intent surface | not yet | decided 2026-11-23; no crate or code, see the plan |
+| OS display boundary crate (ADR-0029, proposed) | partial | `crates/gui-display`: macOS (outputs, refresh range, gamut, headroom, display-link ticks) tested live; X11 compiles, never run; no Wayland or Windows backend, no presented times; `gui` uses the interval and ticks, not colour or headroom |
+| MCP/intent surface | not yet | decided 2026-11-23; no crate or code, see the plan |
 
 ## Target architecture
 

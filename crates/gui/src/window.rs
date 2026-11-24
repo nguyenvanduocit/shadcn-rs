@@ -199,6 +199,9 @@ pub(crate) enum ToPlatform {
 pub(crate) enum UserEvent {
     Access(accesskit_winit::Event),
     Ui(ToPlatform),
+    /// The displays have something to take in (ADR-0029): an output came,
+    /// went or changed, or a vsync source is to be started or stopped.
+    Display,
 }
 
 impl From<accesskit_winit::Event> for UserEvent {
@@ -670,8 +673,11 @@ struct Platform {
     /// `GUI_DECORATIONS` chose who draws them.
     forced: Option<bool>,
     focused: bool,
-    /// The display interval the render thread was last told.
-    interval: Option<Duration>,
+    /// The OS's displays (ADR-0029), where it reads them: made with the
+    /// window, on this thread, which owns them.
+    displays: Option<gui_display::Displays>,
+    /// What the render thread was last told of the window's display.
+    told: Told,
 }
 
 /// Open a window titled `title` and run the handler `start` makes, on the
@@ -699,7 +705,8 @@ pub fn run(title: &str, start: impl FnOnce() -> Box<dyn WindowHandler> + Send + 
         chrome: Chrome::default(),
         forced: forced_decorations(),
         focused: true,
-        interval: None,
+        displays: None,
+        told: Told::default(),
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     // The platform thread stamps input and feeds the render thread
@@ -782,14 +789,72 @@ fn display_may_change(event: &WindowEvent) -> bool {
     )
 }
 
-/// The interval to tell the render thread, the display's being `now` and
-/// `told` what it was told last: only one it was not told, as telling it
-/// any resets its fitted vsync.
-fn retold(told: &mut Option<Duration>, now: Duration) -> Option<Duration> {
-    (*told != Some(now)).then(|| {
-        *told = Some(now);
-        now
-    })
+/// What the render thread was last told of the display the window is on:
+/// the output (and the OS handle it had, which names its vsync source),
+/// and its interval.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Told {
+    output: Option<(gui_display::OutputId, u32)>,
+    interval: Option<Duration>,
+}
+
+/// What to tell the render thread of the window's display, and only what
+/// it was not told (telling it an interval again resets its fitted vsync,
+/// and each `Moved` of a drag asks). The window is on the monitor with the
+/// OS handle `native`, for which the toolkit reports `reported`.
+///
+/// Where the OS's displays are read (ADR-0029) the output is theirs: its
+/// interval is the current mode's, and on another output, or the same one
+/// under another handle, the render thread gets that output's vsync ticks
+/// (where its OS has a source) and starts its fit afresh. Elsewhere
+/// (Wayland) the toolkit's rate is all there is.
+fn follow(
+    displays: Option<&mut gui_display::Displays>,
+    native: Option<u32>,
+    reported: Option<Duration>,
+    told: &mut Told,
+) -> Option<ToRender> {
+    let output = displays
+        .as_ref()
+        .zip(native)
+        .and_then(|(d, n)| d.by_native(n))
+        .map(|o| (o.id, o.native, o.refresh.interval));
+    let now = Told {
+        output: output.map(|(id, native, _)| (id, native)),
+        interval: output.map(|(.., interval)| interval).or(reported).or(told.interval),
+    };
+    let interval = now.interval?;
+    let was = std::mem::replace(told, now);
+    if now.output != was.output {
+        // No source for this output's vsync (X11), or none could be made:
+        // the acquires are fitted, as on any display before ADR-0029.
+        let ticks = displays.zip(now.output).and_then(|(d, (id, _))| d.ticks(id).ok());
+        Some(ToRender::Output { interval, ticks })
+    } else if now.interval != was.interval {
+        Some(ToRender::Interval(interval))
+    } else {
+        None
+    }
+}
+
+/// The OS's handle of the monitor `window` is on, as `gui_display` names
+/// outputs: macOS's display id, X11's CRTC.
+fn native_of(window: &Window) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::MonitorHandleExtMacOS;
+        window.current_monitor().map(|m| m.native_id())
+    }
+    #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
+    {
+        use winit::platform::x11::MonitorHandleExtX11;
+        window.current_monitor().map(|m| m.native_id())
+    }
+    // No displays are read here yet (ADR-0029): no handle names one.
+    #[cfg(not(any(target_os = "macos", all(unix, not(target_os = "android")))))]
+    {
+        window.current_monitor().and(None)
+    }
 }
 
 /// The display interval of the monitor `window` is on, when the platform
@@ -960,12 +1025,18 @@ impl Platform {
         s.threads.to_ui.send(ToUi::Resized(size, self.scale())).ok();
     }
 
-    /// Tell the render thread how often the display the window is on now
-    /// refreshes, when that changed.
+    /// Tell the render thread which display the window is on now and how
+    /// often it refreshes, when that changed.
     fn follow_display(&mut self) {
         let Some(s) = &self.state else { return };
-        if let Some(i) = interval_of(&s.window).and_then(|now| retold(&mut self.interval, now)) {
-            s.threads.to_render.send(ToRender::Interval(i)).ok();
+        let news = follow(
+            self.displays.as_mut(),
+            native_of(&s.window),
+            interval_of(&s.window),
+            &mut self.told,
+        );
+        if let Some(news) = news {
+            s.threads.to_render.send(news).ok();
         }
     }
 
@@ -1061,6 +1132,14 @@ impl ApplicationHandler<UserEvent> for Platform {
         };
         window.set_visible(true);
         self.recorder = record_input(&window);
+        // The OS's displays, where they are read: the wake has this thread
+        // poll them. Where they are not (Wayland), winit's rate and the
+        // frame callbacks stand, as before.
+        let wake = self.proxy.clone();
+        self.displays = gui_display::Displays::connect(&*window, move || {
+            wake.send_event(UserEvent::Display).ok();
+        })
+        .ok();
         self.state = Some(WindowState {
             window,
             access,
@@ -1146,6 +1225,13 @@ impl ApplicationHandler<UserEvent> for Platform {
                         self.listening = false;
                         to_ui.send(ToUi::Access(AccessEvent::Deactivated)).ok();
                     }
+                }
+            }
+            // What came, went or changed is read off the displays as they
+            // are now; a poll with no news started or stopped a source.
+            UserEvent::Display => {
+                if self.displays.as_mut().is_some_and(|d| !d.poll().is_empty()) {
+                    self.follow_display();
                 }
             }
             UserEvent::Ui(ToPlatform::Cursor(c)) => {
@@ -1316,13 +1402,119 @@ mod tests {
     fn the_render_thread_is_told_the_display_interval_only_when_it_changed() {
         // Each `Moved` of a drag reads the display again; telling the
         // render thread the same interval would reset its fitted vsync.
+        // No displays read (Wayland): the toolkit's rate is all there is.
+        use super::{ToRender, Told, follow};
         let hz60 = std::time::Duration::from_micros(16_667);
         let hz120 = std::time::Duration::from_micros(8_333);
-        let mut told = Some(hz60);
-        assert_eq!(super::retold(&mut told, hz60), None);
-        assert_eq!(super::retold(&mut told, hz120), Some(hz120));
-        assert_eq!(super::retold(&mut told, hz120), None);
-        assert_eq!(told, Some(hz120));
+        let mut told = Told::default();
+        assert!(matches!(follow(None, None, Some(hz60), &mut told), Some(ToRender::Interval(i)) if i == hz60));
+        assert!(follow(None, None, Some(hz60), &mut told).is_none());
+        assert!(matches!(follow(None, None, Some(hz120), &mut told), Some(ToRender::Interval(i)) if i == hz120));
+        assert!(follow(None, None, Some(hz120), &mut told).is_none());
+        assert!(
+            follow(None, None, None, &mut told).is_none(),
+            "a rate not reported is not a change"
+        );
+        assert_eq!(told.interval, Some(hz120));
+    }
+
+    /// From what the OS says to what the render thread times its frames by
+    /// (ADR-0029): scripted displays play the OS; `follow` is what the
+    /// platform thread runs on each of its events; the render thread takes
+    /// the message as it does a window's.
+    #[test]
+    fn an_os_display_event_reaches_the_render_threads_vsync() {
+        use super::{ToRender, Told, follow};
+        use std::time::Duration;
+        let hz60 = Duration::from_nanos(16_666_667);
+        let hz120 = Duration::from_nanos(8_333_333);
+        let woken = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let theirs = std::sync::Arc::clone(&woken);
+        let (mut displays, os) = gui_display::Displays::scripted(move || {
+            theirs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let fast = {
+            let mut d = gui_display::Script::output(2, "external");
+            d.refresh.interval = hz120;
+            d
+        };
+        os.plug(gui_display::Script::output(1, "built-in"));
+        os.plug(fast);
+        displays.poll();
+        let mut told = Told::default();
+        let mut vsync = crate::clock::Vsync::new(Duration::from_millis(10));
+        let mut ticks = None;
+        let mut take = |news: Option<ToRender>, vsync: &mut crate::clock::Vsync| match news {
+            Some(ToRender::Output { interval, ticks: t }) => {
+                vsync.moved(interval);
+                ticks = t;
+                "output"
+            }
+            Some(ToRender::Interval(i)) => {
+                vsync.set_interval(i);
+                "interval"
+            }
+            Some(_) => "other",
+            None => "nothing",
+        };
+        // The window opens on the built-in display: winit says 59.9 Hz, the
+        // OS's own mode is what is taken.
+        let winit = Some(Duration::from_micros(16_694));
+        assert_eq!(
+            take(follow(Some(&mut displays), Some(1), winit, &mut told), &mut vsync),
+            "output"
+        );
+        assert_eq!(vsync.interval(), hz60);
+        assert_eq!(os.running(1), 1, "its vsync source is started");
+        assert_eq!(
+            take(follow(Some(&mut displays), Some(1), winit, &mut told), &mut vsync),
+            "nothing"
+        );
+
+        // Dragged onto the external one (a `Moved`): its interval, its ticks.
+        assert_eq!(
+            take(follow(Some(&mut displays), Some(2), winit, &mut told), &mut vsync),
+            "output"
+        );
+        assert_eq!(vsync.interval(), hz120);
+        displays.poll();
+        assert_eq!(
+            (os.running(1), os.running(2)),
+            (0, 1),
+            "the old output's source is closed"
+        );
+
+        // The OS changes that display's mode with no window event at all:
+        // the wake has the platform thread poll, and the interval follows.
+        let before = woken.load(std::sync::atomic::Ordering::SeqCst);
+        os.change(2, |d| d.refresh.interval = hz60);
+        assert!(woken.load(std::sync::atomic::Ordering::SeqCst) > before);
+        assert!(!displays.poll().is_empty());
+        assert_eq!(
+            take(follow(Some(&mut displays), Some(2), winit, &mut told), &mut vsync),
+            "interval"
+        );
+        assert_eq!(vsync.interval(), hz60);
+
+        // The same panel under another OS handle (a GPU switch): its old
+        // source is dead, so the render thread gets the new one.
+        os.change(2, |d| d.native = 7);
+        displays.poll();
+        assert_eq!(
+            take(follow(Some(&mut displays), Some(7), winit, &mut told), &mut vsync),
+            "output"
+        );
+        displays.poll();
+        assert_eq!((os.running(2), os.running(7)), (0, 1));
+
+        // Pulled out: the OS moves the window to the display that stays.
+        os.unplug(7);
+        displays.poll();
+        assert_eq!(
+            take(follow(Some(&mut displays), Some(1), winit, &mut told), &mut vsync),
+            "output"
+        );
+        assert_eq!(told.output.map(|(_, native)| native), Some(1));
     }
 
     /// A handler that writes down each input and the frame shown as it came.
