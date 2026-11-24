@@ -1,6 +1,6 @@
 # 0020. `gui` snaps to pixels only under translation and scale
 
-Status: accepted, 2026-11-21; built 2026-11-21 (M5a, P10; M5b, P1 and P5, see "As built"); a scroller has no layer (see "As built"), and the render thread snaps the scroll offsets it moves as paint does (M5c, P6, ADR-0015). Supersedes the snapping clause of ADR-0006 ("snaps box edges, clips,
+Status: accepted, 2026-11-21. Transformed clip snapping has an open M15 defect documented in [ADR-0031](0031-path-coverage-is-the-area-of-the-filled-and-clipped-region.md); built 2026-11-21 (M5a, P10; M5b, P1 and P5, see "As built"); a scroller has no layer (see "As built"), and the render thread snaps the scroll offsets it moves as paint does (M5c, P6, ADR-0015). Supersedes the snapping clause of ADR-0006 ("snaps box edges, clips,
 images and shapes to device pixels at paint", `Bounds::snapped`, applied to every box whatever its transform); keeps
 its fractional layout, 1/64 px text measures and baseline rule.
 

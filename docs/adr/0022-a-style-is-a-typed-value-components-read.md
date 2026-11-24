@@ -1,6 +1,6 @@
 # 0022. A style is a typed value that components read
 
-Status: accepted, 2026-11-21; not yet built (M10). Supersedes, in part, the inherited text properties of ADR-0001
+Status: accepted, 2026-11-21; partly built (M10 waves A–C; S8 and S9 remain). Supersedes, in part, the inherited text properties of ADR-0001
 (what a span honours), ADR-0003 (`Ink::Current` against the inherited `ResolvedText`) and ADR-0005 (`tabular_nums`):
 text, icons and `currentColor` read `ContentStyle` instead.
 

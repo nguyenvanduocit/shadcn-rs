@@ -1,6 +1,6 @@
 # 0028. A frame can fork in release
 
-Status: accepted, 2026-11-24; not yet built (M13, F1–F4). The direction was chosen by the user on 2026-11-23
+Status: accepted, 2026-11-24; F1 registry implemented; block-boundary rollback and Select alignment under verification ([M13](../plan-2026-11-21.md#m13-frame-rẽ-nhánh-trong-bản-release)), F2–F4 not yet (M13). The direction was chosen by the user on 2026-11-23
 (`docs/research-2026-11-23-frontiers.md` §13, item 1: "ta cần điều tốt nhất", the full option in its final shape). The
 details below were decided under the user's delegation of 2026-11-24 ("làm toàn bộ đi, chỉ dừng khi xong hết") by the
 agents doing the work. Three review rounds by two model families failed. Nearly every finding of the third was about
