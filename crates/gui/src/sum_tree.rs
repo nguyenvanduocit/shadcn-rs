@@ -13,6 +13,29 @@
 use std::fmt;
 use std::sync::Arc;
 
+#[cfg(test)]
+crate::engine::engine_local! {
+    /// Entries (items, children) the tree looked at on this thread: what a
+    /// test reads to tell O(log n) from a pass over every item, allocating
+    /// or not. Only in tests.
+    [Shared("a test's count of work done, read as a difference; no frame reads it")]
+    static VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Note `n` entries looked at ([`visits`]); nothing outside tests.
+#[inline]
+fn visit(n: usize) {
+    #[cfg(test)]
+    VISITS.with(|v| v.set(v.get().saturating_add(u64::try_from(n).unwrap_or(u64::MAX))));
+    let _ = n;
+}
+
+/// Entries the trees looked at on this thread so far.
+#[cfg(test)]
+pub(crate) fn visits() -> u64 {
+    VISITS.with(std::cell::Cell::get)
+}
+
 /// Most items in a leaf, children in an inner node.
 const MAX: usize = 32;
 /// Fewest, for every node but the root.
@@ -61,6 +84,7 @@ enum Node<T: Item> {
 
 impl<T: Item> Node<T> {
     fn leaf(items: Vec<T>) -> Self {
+        visit(items.len());
         let mut totals = Totals::default();
         for item in &items {
             totals.add(&Totals {
@@ -72,6 +96,7 @@ impl<T: Item> Node<T> {
     }
 
     fn inner(children: Vec<Arc<Self>>) -> Self {
+        visit(children.len());
         let mut totals = Totals::default();
         for child in &children {
             totals.add(child.totals());
@@ -114,6 +139,7 @@ impl<T: Item> Node<T> {
     fn child_of(children: &[Arc<Self>], mut i: usize) -> (usize, usize) {
         let last = children.len().saturating_sub(1);
         for (c, child) in children.iter().enumerate() {
+            visit(1);
             let len = child.len();
             if i < len || c == last {
                 return (c, i);
@@ -438,6 +464,7 @@ impl<T: Item> SumTree<T> {
             match node {
                 Node::Leaf { items, .. } => {
                     for item in items {
+                        visit(1);
                         let mut next = before.clone();
                         next.add(&Totals {
                             count: 1,
@@ -453,6 +480,7 @@ impl<T: Item> SumTree<T> {
                 Node::Inner { children, .. } => {
                     let mut chosen = None;
                     for child in children {
+                        visit(1);
                         let mut next = before.clone();
                         next.add(child.totals());
                         if !past(&next) {
@@ -532,6 +560,7 @@ impl<'a, T: Item> Iterator for Iter<'a, T> {
     fn next(&mut self) -> Option<&'a T> {
         loop {
             if let Some(item) = self.leaf.next() {
+                visit(1);
                 return Some(item);
             }
             // Down the next subtree to its first leaf.

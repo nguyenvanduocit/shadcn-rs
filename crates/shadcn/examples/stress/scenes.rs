@@ -572,6 +572,8 @@ fn list_of(count: u64) -> Render {
 /// One row of the million: what is sorted and filtered on.
 #[derive(Clone, Copy)]
 struct Pay {
+    /// The payment's own id: its heights follow it across sorts.
+    id: u32,
     amount: u32,
     status: u8,
 }
@@ -582,6 +584,7 @@ fn big_table() -> Render {
     let data = gui::Collection::new((0..BIG_ROWS).map(|i| {
         let (_, _, amount, status) = payment(usize::try_from(i).unwrap_or(0));
         Pay {
+            id: i,
             amount,
             status: u8::try_from(STATUSES.iter().position(|s| *s == status).unwrap_or(0)).unwrap_or(0),
         }
@@ -590,10 +593,8 @@ fn big_table() -> Render {
     let sorting = Signal::labeled("sorting", false);
     let list = ListState::new(37.0);
     let to_top = list.clone();
-    let views = Views::new(move |v: View| {
-        // The heights measured follow their rows to where the new view shows them.
-        let old = view.get_untracked();
-        to_top.reorder(u64::try_from(v.len()).unwrap_or(0), |p| old.moved_to(&v, p));
+    // The heights measured follow their rows to where each view shows them.
+    let views = Views::new(&list, View::identity(BIG_ROWS), move |v: View| {
         view.set(v);
         sorting.set(false);
         to_top.scroll_to_row(0);
@@ -621,7 +622,12 @@ fn big_table() -> Render {
                 }
             }
         });
-        views.spawn(data.snapshot(), move |p: &Pay| !only || p.status == failed, order);
+        views.spawn(
+            data.snapshot(),
+            |p: &Pay| u64::from(p.id),
+            move |p: &Pay| !only || p.status == failed,
+            order,
+        );
     });
     Box::new(move || {
         let t = theme();

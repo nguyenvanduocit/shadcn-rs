@@ -38,7 +38,9 @@ enum Kind {
 }
 
 /// One axis of a key: its kind, and the size's exact bits (0 for min- and
-/// max-content).
+/// max-content). Bits, not values: `-0.0` and `0.0`, or two NaNs of other
+/// payloads, are different keys, so such a pair only misses (a node laid
+/// out again), never answers for the other.
 fn axis_key(known: Option<f32>, available: AvailableSpace) -> (Kind, u32) {
     match (known, available) {
         (Some(v), _) => (Kind::Known, v.to_bits()),

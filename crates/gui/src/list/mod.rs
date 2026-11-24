@@ -11,4 +11,4 @@ pub mod virtual_list;
 pub use columns::{Columns, Width};
 pub use extent_tree::ExtentTree;
 pub use view::{Selection, View, Views};
-pub use virtual_list::{Anchor, ListLayout, ListState, RowLayout, virtual_list, virtual_list_in};
+pub use virtual_list::{Anchor, Heights, ListLayout, ListState, RowLayout, virtual_list, virtual_list_in};

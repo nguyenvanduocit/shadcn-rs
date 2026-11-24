@@ -136,6 +136,35 @@ struct Plan {
     rev: u64,
 }
 
+/// A list's heights lent to be reordered off the UI thread
+/// ([`ListState::lend_heights`]): `Send`, a snapshot sharing the list's.
+#[derive(Clone, Debug)]
+pub struct Heights {
+    extents: ExtentTree,
+    /// Which row was where when lent.
+    shape: u64,
+}
+
+impl Heights {
+    /// The heights, as [`ListState::reorder`] moves them: `rows` rows now,
+    /// the row at each old position `p` at `to(p)`. O(m log m) for the `m`
+    /// rows measured: work for the thread that sorts.
+    pub fn reorder(&mut self, rows: u64, to: impl Fn(u64) -> Option<u64>) {
+        self.extents.reorder(rows, to);
+    }
+
+    #[must_use]
+    pub fn extents(&self) -> &ExtentTree {
+        &self.extents
+    }
+
+    /// The heights to change before they come back (a measurement the
+    /// worker knows of); what [`ListState::reorder_with`] puts in place.
+    pub fn extents_mut(&mut self) -> &mut ExtentTree {
+        &mut self.extents
+    }
+}
+
 /// Heights `ext` matched to `rows` rows: rows added or removed at the end.
 fn resize(ext: &mut ExtentTree, rows: u64) {
     let len = ext.len();
@@ -183,6 +212,15 @@ struct Inner {
     /// Bumped when the window moves: the list renders again.
     version: Signal<u64>,
     extents: RefCell<ExtentTree>,
+    /// Bumped by every change to which row is where (a splice, rows added
+    /// or removed at the end, a reorder, a reset): heights lent before one
+    /// no longer match ([`ListState::reorder_with`]).
+    shape: Cell<u64>,
+    /// The shape the heights were lent at, while lent ([`ListState::lend_heights`]).
+    lent: Cell<Option<u64>>,
+    /// The rows measured since, and at what height: what the heights lent
+    /// lack. Kept, cleared, for the next loan.
+    since_lent: RefCell<Vec<(u64, u32)>>,
     anchor: Cell<Anchor>,
     /// The scroll asked for, the viewport not showing it yet: the anchor is
     /// held through the layouts that measure the rows around it. One slot:
@@ -301,6 +339,9 @@ impl ListState {
         let inner = Rc::new(Inner {
             version: detached(|| Signal::labeled("virtual list", 0)),
             extents: RefCell::new(ExtentTree::new(0, units(estimate))),
+            shape: Cell::new(0),
+            lent: Cell::new(None),
+            since_lent: RefCell::default(),
             anchor: Cell::default(),
             request: Cell::new(None),
             requests: Cell::new(0),
@@ -413,8 +454,70 @@ impl ListState {
             if !ext.set(row, next) {
                 return;
             }
+            self.note_measured(row, next);
         }
         self.moved();
+    }
+
+    /// `row` was measured at `height` (units): heights lent lack it.
+    fn note_measured(&self, row: u64, height: u32) {
+        if self.0.lent.get().is_some() {
+            self.0.since_lent.borrow_mut().push((row, height));
+        }
+    }
+
+    /// Which row is where changed: heights lent no longer match.
+    fn reshaped(&self) {
+        self.0.shape.set(self.0.shape.get().wrapping_add(1));
+    }
+
+    /// Lend the heights to be reordered off the UI thread ([`Heights::reorder`],
+    /// as [`Views`](super::Views) does with each sort), in O(1): a snapshot,
+    /// shared, not copied. The rows measured from now on are noted, so
+    /// [`Self::reorder_with`] adds them to what comes back. A loan replaces
+    /// the one before.
+    #[must_use]
+    pub fn lend_heights(&self) -> Heights {
+        let shape = self.0.shape.get();
+        self.0.lent.set(Some(shape));
+        self.0.since_lent.borrow_mut().clear();
+        Heights {
+            extents: self.0.extents.borrow().clone(),
+            shape,
+        }
+    }
+
+    /// [`Self::reorder`] with the heights already reordered off the UI
+    /// thread (`heights`, lent by [`Self::lend_heights`] and given
+    /// [`Heights::reorder`] with the same `rows` and `to`): they are put in
+    /// place in O(1) and the rows measured since the loan added (O(those
+    /// rows)), allocating nothing once warm. The heights replaced come back
+    /// to be dropped off the UI thread. When which row is where changed
+    /// since the loan (a splice, a later loan), the heights lent are stale:
+    /// the list reorders its own in place, and `None` comes back.
+    pub fn reorder_with(&self, heights: Heights, rows: u64, to: impl Fn(u64) -> Option<u64>) -> Option<Heights> {
+        let current = self.0.lent.take() == Some(heights.shape)
+            && self.0.shape.get() == heights.shape
+            && heights.extents.len() == rows;
+        if !current {
+            self.reorder(rows, to);
+            return None;
+        }
+        let old = self.0.extents.replace(heights.extents);
+        {
+            let mut ext = self.0.extents.borrow_mut();
+            for (row, height) in self.0.since_lent.borrow_mut().drain(..) {
+                if let Some(at) = to(row).filter(|&r| r < rows) {
+                    ext.set(at, height);
+                }
+            }
+        }
+        self.reshaped();
+        self.follow_reorder(rows, &to);
+        Some(Heights {
+            extents: old,
+            shape: heights.shape,
+        })
     }
 
     /// Whether `row`'s height was measured.
@@ -741,6 +844,7 @@ impl ListState {
     /// yet measured); the anchor keeps its row.
     pub fn splice(&self, at: u64, removed: u64, inserted: u64) {
         self.0.extents.borrow_mut().splice(at, removed, inserted);
+        self.reshaped();
         let mut a = self.0.anchor.get();
         if a.row >= at.saturating_add(removed) {
             a.row = a.row.saturating_sub(removed).saturating_add(inserted);
@@ -767,6 +871,18 @@ impl ListState {
     /// `m` rows measured, whatever the rows.
     pub fn reorder(&self, rows: u64, to: impl Fn(u64) -> Option<u64>) {
         self.0.extents.borrow_mut().reorder(rows, &to);
+        self.reshaped();
+        self.follow_reorder(rows, &to);
+    }
+
+    /// The anchor, the focused row and the window after the rows moved
+    /// (`to`, as [`Self::reorder`] takes it); the heights moved already.
+    fn follow_reorder(&self, rows: u64, to: &dyn Fn(u64) -> Option<u64>) {
+        // What holds focus now (moved this turn or not), found by its key
+        // among the rows built while they are still known by position.
+        let focus = self
+            .noted_focus(self.0.window.get(), &[])
+            .or_else(|| self.0.focus_row.get());
         let a = self.0.anchor.get();
         let anchor = match to(a.row).filter(|&r| r < rows) {
             Some(row) => Anchor { row, ..a },
@@ -777,7 +893,6 @@ impl ListState {
             },
         };
         self.0.anchor.set(anchor);
-        let focus = self.0.focus_row.get();
         self.0
             .focus_row
             .set(focus.and_then(|(r, k)| to(r).filter(|&r| r < rows).map(|r| (r, k))));
@@ -787,6 +902,11 @@ impl ListState {
         self.0.keys.borrow_mut().clear();
         self.0.pins.borrow_mut().clear();
         self.0.pins_before.set(0);
+        // The rows around the anchor may be estimates: it holds, as a row
+        // scrolled to does, until the viewport shows it measured.
+        if !self.wants_end() {
+            self.ask(None);
+        }
         self.moved();
     }
 
@@ -917,6 +1037,7 @@ impl ListState {
         if old_width > 0.0 && old_width != width {
             // Heights measured at another width: estimates again.
             inner.extents.borrow_mut().reset();
+            self.reshaped();
         }
         let w = inner.window.get();
         let built = usize::try_from(w.last.saturating_sub(w.first)).unwrap_or(usize::MAX);
@@ -953,7 +1074,10 @@ impl ListState {
             // heights keep themselves ([`ExtentTree::estimate`]).
             let mut ext = inner.extents.borrow_mut();
             for (row, c) in (w.first..w.last).zip(children) {
-                ext.set(row, units(c.bounds.height));
+                let height = units(c.bounds.height);
+                if ext.set(row, height) {
+                    self.note_measured(row, height);
+                }
             }
         }
         // The anchor: the row at the viewport's top, unless one asked for is
@@ -1092,7 +1216,10 @@ impl ListState {
 
     /// Match the heights to `rows` rows: rows added or removed at the end.
     fn sync_len(&self, rows: u64) {
-        resize(&mut self.0.extents.borrow_mut(), rows);
+        if self.len() != rows {
+            resize(&mut self.0.extents.borrow_mut(), rows);
+            self.reshaped();
+        }
     }
 
     /// What a render builds from the state as it stands and the data it is
@@ -2270,6 +2397,152 @@ mod tests {
             assert!(state.is_measured(q), "row {p} measured, now at {q}");
             assert_eq!(state.row_height(q), tall(p), "row {p}'s height, now at {q}");
         }
+    }
+
+    /// Codex (M15 review 1): a sort applied on the UI thread costs what
+    /// changed since the heights were lent, not the rows measured: the
+    /// heights reordered off the thread go in place, and the rows measured
+    /// meanwhile are added to them.
+    #[test]
+    fn heights_reordered_off_the_ui_thread_go_in_place_with_what_was_measured_since() {
+        let state = ListState::new(30.0);
+        let n = 100_000_u64;
+        {
+            let mut ext = state.0.extents.borrow_mut();
+            *ext = ExtentTree::new(n, units(30.0));
+            for r in 0..n {
+                ext.set(r, units(if r.is_multiple_of(2) { 20.0 } else { 21.0 }));
+            }
+        }
+        let reverse = move |p: u64| Some(n - 1 - p);
+        let mut lent = state.lend_heights();
+        state.adjust_row_height(4, 10.0);
+        // The worker's part.
+        lent.reorder(n, reverse);
+        let before = crate::sum_tree::visits();
+        let replaced = state.reorder_with(lent, n, reverse);
+        let seen = crate::sum_tree::visits() - before;
+        assert!(replaced.is_some(), "put in place, the old heights handed back");
+        assert!(seen < 2_000, "{seen} entries looked at");
+        assert_eq!(state.row_height(n - 1 - 4), 30.0, "measured since the loan");
+        assert_eq!(state.row_height(n - 1 - 5), 21.0);
+        // Lent before a splice: stale, reordered in place instead.
+        let mut lent = state.lend_heights();
+        state.splice(0, 1, 1);
+        lent.reorder(n, reverse);
+        assert!(state.reorder_with(lent, n, reverse).is_none());
+        assert_eq!(state.row_height(0), 20.0, "row 99 999, back at the top");
+    }
+
+    /// A list of the rows `ids` holds, keyed and labelled by id, `tall(id)`
+    /// pixels each, in a 300 px viewport; the row `focus` names tracks its handle.
+    fn by_id(
+        state: &ListState,
+        ids: Signal<Vec<u64>>,
+        tall: fn(u64) -> f32,
+        focus: Option<(u64, crate::FocusHandle)>,
+    ) -> Scenario {
+        let st = state.clone();
+        Scenario::measuring(
+            move || {
+                let v = Rc::new(ids.get());
+                let (k, r) = (Rc::clone(&v), Rc::clone(&v));
+                let at = move |v: &[u64], i: u64| usize::try_from(i).ok().and_then(|i| v.get(i)).copied().unwrap_or(0);
+                div()
+                    .width(300.0)
+                    .child(
+                        virtual_list(
+                            &st,
+                            u64::try_from(v.len()).unwrap_or(0),
+                            move |i| at(&k, i),
+                            move |i| {
+                                let id = at(&r, i);
+                                let d = div().height(tall(id)).child(text(format!("row {id}")));
+                                match focus {
+                                    Some((f, h)) if f == id => d.track_focus(h),
+                                    _ => d,
+                                }
+                                .into_element()
+                            },
+                        )
+                        .height(300.0),
+                    )
+                    .into_element()
+            },
+            300,
+            300,
+            1.0,
+        )
+        .unwrap()
+    }
+
+    /// Codex (M15 review 1): the reader's row sorted deep behind rows never
+    /// measured, estimated 24 px, that lay out at 48: the anchor holds at
+    /// its offset through the layouts that measure them, as a row scrolled
+    /// to does, and no row above it is taken for the anchor.
+    #[test]
+    fn the_readers_row_sorted_behind_taller_rows_stays_at_its_offset() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..1_000).collect());
+        let mut s = by_id(&state, ids, |id| if id < 50 { 24.0 } else { 48.0 }, None);
+        s.settle().unwrap();
+        s.act("row 10, 5 px above the top", || {
+            state.scroll_to(Anchor {
+                row: 10,
+                key: None,
+                offset: 5.0,
+            });
+        });
+        s.settle().unwrap();
+        assert_eq!(top_of(&s, 10), Some(-5.0));
+        // Ids 50..850 first, then 0..50: id 10 goes to 810, behind 800
+        // rows that lay out twice as tall as the estimate.
+        let to = |p: u64| {
+            Some(if p < 50 {
+                p + 800
+            } else if p < 850 {
+                p - 50
+            } else {
+                p
+            })
+        };
+        s.act("sort", || {
+            ids.update(|v| v[..850].rotate_left(50));
+            state.reorder(1_000, to);
+        });
+        s.settle().unwrap();
+        assert_eq!(state.anchor().row, 810);
+        assert_eq!(top_of(&s, 10), Some(-5.0), "the reader's row where it was");
+    }
+
+    /// Codex (M15 review 1): focus moved to a row and the data sorted in
+    /// the same turn, the row going far from the window: the row is found
+    /// from what holds focus now, not from the last layout, and is kept
+    /// built and focused.
+    #[test]
+    fn a_row_focused_then_sorted_away_in_the_same_turn_keeps_focus() {
+        let state = ListState::new(24.0);
+        let ids: Signal<Vec<u64>> = Signal::new((0..1_000).collect());
+        let h = crate::FocusHandle::new();
+        let mut s = by_id(&state, ids, |_| 24.0, Some((3, h)));
+        s.settle().unwrap();
+        // Rows 3 and 900 trade places; the reader's row (0) stays.
+        let to = |p: u64| {
+            Some(match p {
+                3 => 900,
+                900 => 3,
+                p => p,
+            })
+        };
+        s.act("focus row 3 and sort it away", || {
+            h.focus();
+            ids.update(|v| v.swap(3, 900));
+            state.reorder(1_000, to);
+        });
+        s.settle().unwrap();
+        assert_eq!(top(&s), 0, "the window stayed at the top");
+        assert_eq!(crate::focus::focused(), Some(h.id()), "row 3 keeps focus");
+        assert_eq!(state.focused_row(), Some(900), "kept built at its new index");
     }
 
     #[test]

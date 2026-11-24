@@ -564,6 +564,30 @@ mod tests {
         assert_eq!(t.extent(), 100 * u64::from(units(12.0)));
     }
 
+    /// Frontiers 7.3 item 1: a row measured on the scroll path, moving the
+    /// estimate, looks at O(log n) runs, allocating or not (the allocation
+    /// count is `tests/extent_alloc.rs`).
+    #[test]
+    fn a_row_measured_that_moves_the_estimate_visits_no_pass_over_the_runs() {
+        let mut t = ExtentTree::new(1_000_000, units(30.0));
+        for k in 0..10_000_u64 {
+            t.set(k * 2, units(if k % 2 == 0 { 20.0 } else { 21.0 }));
+        }
+        assert!(t.runs() >= 20_000);
+        let estimate = t.estimate();
+        let before = crate::sum_tree::visits();
+        t.set(500_001, units(400.0));
+        let top = t.offset_of(700_000);
+        let _ = (t.row_at(top), t.height(999_999), t.extent());
+        let seen = crate::sum_tree::visits() - before;
+        assert_ne!(t.estimate(), estimate, "the row moved the estimate");
+        assert!(
+            seen < 2_000,
+            "{seen} entries looked at for one row of {} runs",
+            t.runs()
+        );
+    }
+
     /// Frontiers 7.3 (Codex): the mean counted a row once, at its first
     /// height; a row measured again at another moves it.
     #[test]
