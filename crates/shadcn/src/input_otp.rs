@@ -209,12 +209,21 @@ pub(crate) fn otp_slot_state(d: Div, t: &Colors, active: impl Fn() -> bool + Clo
 }
 
 /// The blinking caret an empty slot shows while `active` holds
-/// (`animate-caret-blink`).
+/// (`animate-caret-blink`) and the window has the keyboard focus, as a
+/// text input's: none in an inactive window, so nothing is drawn for it,
+/// and blinking afresh (until [`gui::Animation::caret_blink`] ends) when
+/// the window has it again.
 pub(crate) fn fake_caret(t: &Colors, active: impl Fn() -> bool + 'static) -> Div {
     div()
         .position(Position::Absolute)
         .inset(0.0)
-        .display(move || if active() { Display::Flex } else { Display::None })
+        .display(move || {
+            if active() && gui::interact::window_active() {
+                Display::Flex
+            } else {
+                Display::None
+            }
+        })
         .align_items(Align::Center)
         .justify_content(Justify::Center)
         .pass_through()

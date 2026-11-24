@@ -108,6 +108,19 @@ Option 4.
 - **No submit when clean.** A frame with nothing dirty, no animation and no damage submits nothing.
 - **Present.** `desired_maximum_frame_latency: 1` with `AutoVsync`; Metal then holds two drawables, the least
   `CAMetalLayer` allows (`references/wgpu/wgpu-types/src/surface.rs:856-866`).
+- **Present only what changed (M15).** The canvas is blitted, and the frame presented, only when what the window
+  shows changes:
+  - the frame has damage;
+  - an overlay's content changed (a content generation set by the compositor, not its presence), or an overlay was
+    hidden (presented once);
+  - the display does not show the canvas: the surface was configured, exposed, or shown again, or a present was
+    owed because its texture could not be taken.
+
+  A frame that changes nothing, an animation holding still included, presents nothing. One exception: on Wayland,
+  after 8 frames in a row that present nothing, one presents unchanged, to ask for the frame callback that tells a
+  hidden window apart (ADR-0015, as built, "Wayland", `WAYLAND_PROBE`). One drawable is held while
+  idle: the texture taken at a frame's start, to wait for the vblank, is kept for the next frame that presents.
+  It is never handed back, since Vulkan cannot hand one back (ADR-0015, as built).
 - **The scene is immutable data.** A commit carries chunk updates, property updates, started and cancelled animations
   and damage; the render thread of ADR-0015 owns the trees, chunks and atlases and applies it.
 

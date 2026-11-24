@@ -59,6 +59,9 @@ Option 2. Paint is split in two, as GPUI splits it.
   driver (Mesa's lavapipe), which wgpu paints on through the same code. Rasters made once and then cached on the
   GPU are still made by the CPU: glyphs (swash), icons (resvg), shapes (tiny-skia), decoded images. GPUI makes its
   glyphs the same way.
+- **The adapter uses least power** (`gpu::adapter_options`, M15). A machine with two GPUs draws the UI on the
+  integrated one (`PowerPreference::LowPower`), as a UI's load wants. `WGPU_POWER_PREF` (wgpu's own variable:
+  `high`, `low`, `none`) overrides it, for a window and headless alike.
 - **`unsafe` stays forbidden.** wgpu's safe API is enough; instance data is written as bytes, without `bytemuck`.
 
 ## Consequences

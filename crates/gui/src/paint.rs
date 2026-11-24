@@ -40,6 +40,54 @@ use crate::text::{Paragraph, Target, TextSystem, physical, physical_pos};
 /// The caret shows for this long, then hides for as long.
 const BLINK: f32 = 0.53;
 
+/// How long a caret blinks, in seconds, after it was last focused, moved
+/// or typed at: then it stays shown, and nothing wakes to draw it (GTK's
+/// `gtk-cursor-blink-timeout`, 10 s, restarted by each interaction). A
+/// caret that blinks for as long as it has focus (Blink's `FrameCaret`,
+/// VS Code, Flutter) keeps an idle window drawing twice a second forever.
+/// A component's own caret blinks by it too ([`crate::Animation::caret_blink`]).
+pub(crate) const CARET_BLINK_TIMEOUT: f32 = 10.0;
+
+/// When the focused inputs' carets began to blink, and whether the window
+/// has the keyboard focus: a caret blinks only in the active window, and
+/// shows in none other (Blink's `FrameSelection::FocusedOrActiveStateChanged`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct CaretClock {
+    since: f32,
+    active: bool,
+}
+
+impl CaretClock {
+    /// Whether a focused caret shows at `t`: from `since`, shown for
+    /// [`BLINK`], hidden for as long, and so on, until it stays shown.
+    fn shows(self, t: f32) -> bool {
+        let e = t - self.since;
+        self.active && (e < 0.0 || e >= CARET_BLINK_TIMEOUT || (e / BLINK).floor().rem_euclid(2.0) < 1.0)
+    }
+
+    /// How long after `t` a focused caret next shows or hides; none while
+    /// it stays as it is (blinked out, or in an inactive window).
+    fn next_change(self, t: f32) -> Option<f32> {
+        let e = (t - self.since).max(0.0);
+        if !self.active || e >= CARET_BLINK_TIMEOUT {
+            return None;
+        }
+        let next = (e / BLINK).floor().mul_add(BLINK, BLINK).min(CARET_BLINK_TIMEOUT);
+        Some(next - e)
+    }
+}
+
+/// The carets of the focused inputs: when they began to blink, what each
+/// input showed then (its text's revision, caret and selection), by its
+/// overlay chunk's id, and the window's activation then. A change of any
+/// restarts the blink, shown.
+#[derive(Clone, Debug, Default)]
+struct Caret {
+    clock: CaretClock,
+    marks: Vec<(u64, crate::edit::ShownMark)>,
+    activation: u64,
+}
+
 /// How far past its clip a chunk records (Chromium's
 /// `kPixelDistanceToRecord`): a scroll within it records nothing again.
 const CULL_MARGIN: f32 = 4000.0;
@@ -49,6 +97,11 @@ const CULL_MARGIN: f32 = 4000.0;
 #[derive(Default)]
 pub struct Painter {
     blink: Option<clock::TimerId>,
+    caret: Caret,
+    /// The window has not the keyboard focus ([`Painter::set_window_active`]),
+    /// and how many times it gained it.
+    window_inactive: bool,
+    activations: u64,
     chunks: foldhash::HashMap<ChunkId, Retained>,
     transforms: Ids,
     clips: Ids,
@@ -594,13 +647,41 @@ fn bare_in_space(node: &FrameNode) -> FrameNode {
     }
 }
 
-/// Whether the caret of a text input shows now.
-fn caret_on(node: &FrameNode) -> bool {
+/// Whether the caret of a text input shows now, its blink as `caret` says.
+fn caret_on(node: &FrameNode, caret: CaretClock) -> bool {
     match &node.content {
-        Content::Input { focused, mode, .. } => {
-            *focused && !mode.read_only && (clock::frame_time() / BLINK).floor().rem_euclid(2.0) < 1.0
-        }
+        Content::Input { focused, mode, .. } => *focused && !mode.read_only && caret.shows(clock::frame_time()),
         _ => false,
+    }
+}
+
+/// The window's background: the root's own colour when it paints the whole
+/// window opaque (the page's colour, dark in a dark scheme), else
+/// `fallback`. The canvas is cleared to it, and so is what a resize shows
+/// beyond the last frame until the UI lays out at the new size.
+#[must_use]
+pub fn window_background(frame: &Frame, size: (u32, u32), scale: f32, fallback: Color) -> Color {
+    let Some(root) = frame.nodes.first() else {
+        return fallback;
+    };
+    let (w, h) = (
+        crate::convert::u32_to_f32(size.0) / scale.max(1e-3),
+        crate::convert::u32_to_f32(size.1) / scale.max(1e-3),
+    );
+    let b = root.bounds;
+    let covers = b.x <= 0.0 && b.y <= 0.0 && b.x + b.width >= w - 0.5 && b.y + b.height >= h - 0.5;
+    match root.look.background {
+        Some(c) if covers && c.a >= 1.0 && root.look.opacity >= 1.0 && !root.look.invisible => c,
+        _ => fallback,
+    }
+}
+
+/// What restarts a focused input's blink when it changes: what it shows,
+/// by its overlay chunk's id (the chunk that draws its caret).
+fn caret_mark(node: &FrameNode) -> Option<(u64, crate::edit::ShownMark)> {
+    match &node.content {
+        Content::Input { edit, .. } => Some((key(&node.path, Role::Overlay), edit.mark())),
+        _ => None,
     }
 }
 
@@ -911,7 +992,18 @@ impl Painter {
         let mut over: Vec<(usize, Placed)> = Vec::new();
         self.region.clear();
         self.region.resize(n, false);
+        // The focused inputs first: their carets' blink is known before
+        // their chunks are recorded.
         self.blinkers.clear();
+        self.blinkers.extend(
+            frame
+                .nodes
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| is_blinker(n))
+                .map(|(i, _)| i),
+        );
+        self.follow_caret(frame);
         self.thumb_nodes.clear();
         let mut thumbs: Vec<usize> = Vec::new();
         let generation = text.generation();
@@ -953,9 +1045,6 @@ impl Painter {
                 size,
             );
             self.placed.push(p);
-            if is_blinker(node) {
-                self.blinkers.push(i);
-            }
             if has_thumb(node) {
                 thumbs.push(i);
             }
@@ -1012,7 +1101,7 @@ impl Painter {
         props.clips.resize(self.clips.len(), ClipNode::default());
         props.effects.resize(self.effects.len(), EffectNode::default());
         scene.properties = props;
-        self.schedule_blink(!self.blinkers.is_empty());
+        self.schedule_blink();
         commit.between(&self.scene, &scene);
         self.scene = scene;
     }
@@ -1031,6 +1120,9 @@ impl Painter {
         commit: &mut Commit,
     ) -> Result<(), Whole> {
         let generation = text.generation();
+        // The blink as of this frame, before any caret is recorded (focus
+        // that moved records it all again, and follows it there).
+        self.follow_caret(frame);
         let mut work = std::mem::take(&mut self.work);
         work.clear();
         for c in log {
@@ -1105,7 +1197,7 @@ impl Painter {
                     self.keep_compositing(scrollers, hits, moving);
                     self.scene.compositing = self.compositing.clone();
                 }
-                self.schedule_blink(!self.blinkers.is_empty());
+                self.schedule_blink();
                 commit.tables(&self.scene, &before);
                 Ok(())
             }
@@ -1334,9 +1426,9 @@ impl Painter {
     /// as old as its own last recording, not the caret drawn.)
     fn caret_changed(&self, node: &FrameNode) -> bool {
         let id = ChunkId(key(&node.path, Role::Overlay));
-        self.chunks
-            .get(&id)
-            .is_some_and(|r| matches!(&r.input, Input::Node { caret, .. } if *caret != caret_on(node)))
+        self.chunks.get(&id).is_some_and(
+            |r| matches!(&r.input, Input::Node { caret, .. } if *caret != caret_on(node, self.caret.clock)),
+        )
     }
 
     /// The compositor's tables of the whole frame: scroll containers (with
@@ -1673,7 +1765,7 @@ impl Painter {
         let now = self.frame;
         let overlay = matches!(role, Role::Overlay);
         let id = ChunkId(key(&node.path, role));
-        let caret = caret_on(node);
+        let caret = caret_on(node, self.caret.clock);
         // What it may record: what its clip shows, and a margin.
         // A text input's content (its overlay chunk) lies under its scroll.
         let scrolled = match (overlay, &node.content, node.scroll) {
@@ -2033,24 +2125,83 @@ impl Painter {
     /// The scene `frame` records into from nothing (the debug check that
     /// incremental paint equals cold): nothing it records stays pinned or
     /// scheduled.
+    /// Its carets blink as this painter's do, from when they began.
     #[cfg(debug_assertions)]
-    pub(crate) fn cold(frame: &Frame, text: &mut TextSystem, size: (u32, u32), scale: f32, background: Color) -> Scene {
-        let mut p = Self::default();
+    pub(crate) fn cold(
+        &self,
+        frame: &Frame,
+        text: &mut TextSystem,
+        size: (u32, u32),
+        scale: f32,
+        background: Color,
+    ) -> Scene {
+        let mut p = Self {
+            caret: self.caret.clone(),
+            window_inactive: self.window_inactive,
+            activations: self.activations,
+            ..Self::default()
+        };
         p.record(frame, text, size, scale, background, true, &mut Commit::default());
-        p.schedule_blink(false);
+        p.cancel_blink();
         for r in p.chunks.values() {
             text.unpin(&r.pieces);
         }
         std::mem::take(&mut p.scene)
     }
 
-    fn schedule_blink(&mut self, blinking: bool) {
+    /// Whether the window has the keyboard focus: a caret shows and blinks
+    /// only while it has, read at the next record.
+    pub fn set_window_active(&mut self, active: bool) {
+        if active && self.window_inactive {
+            self.activations = self.activations.wrapping_add(1);
+        }
+        self.window_inactive = !active;
+    }
+
+    /// Restart the blink, shown, when the window gained or lost the focus
+    /// (both, between two records, included) or a focused input's text,
+    /// caret or selection changed since the last record (focus moved to
+    /// another input included).
+    fn follow_caret(&mut self, frame: &Frame) {
+        let active = !self.window_inactive;
+        let marks = &self.caret.marks;
+        let same = active == self.caret.clock.active
+            && self.activations == self.caret.activation
+            && marks.len() == self.blinkers.len()
+            && self
+                .blinkers
+                .iter()
+                .zip(marks)
+                .all(|(&b, mark)| frame.nodes.get(b).and_then(caret_mark).as_ref() == Some(mark));
+        if same {
+            return;
+        }
+        self.caret.clock = CaretClock {
+            since: clock::frame_time(),
+            active,
+        };
+        self.caret.activation = self.activations;
+        self.caret.marks.clear();
+        for &b in &self.blinkers {
+            if let Some(mark) = frame.nodes.get(b).and_then(caret_mark) {
+                self.caret.marks.push(mark);
+            }
+        }
+    }
+
+    fn cancel_blink(&mut self) {
         if let Some(t) = self.blink.take() {
             clock::cancel(t);
         }
-        if blinking {
-            let t = clock::frame_time();
-            let next = (t / BLINK).floor().mul_add(BLINK, BLINK) - t;
+    }
+
+    /// Wake for the next time a focused caret shows or hides, if it will.
+    fn schedule_blink(&mut self) {
+        self.cancel_blink();
+        if self.blinkers.is_empty() {
+            return;
+        }
+        if let Some(next) = self.caret.clock.next_change(clock::frame_time()) {
             self.blink = Some(clock::after(Duration::from_secs_f32(next.max(0.01)), || {}));
         }
     }
@@ -2567,6 +2718,107 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
 #[expect(clippy::arithmetic_side_effects, reason = "test rooms are far from overflowing")]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caret_blinks_from_its_last_change_until_it_has_been_idle_a_while() {
+        let c = CaretClock {
+            since: 100.0,
+            active: true,
+        };
+        assert!(c.shows(100.0) && c.shows(100.5), "shown at once, for a blink");
+        assert!(!c.shows(100.6), "then hidden");
+        assert_eq!(c.next_change(100.0), Some(BLINK));
+        // 10.2 s on is in a hidden half (the 20th), past the timeout: shown,
+        // and nothing more to wake for.
+        assert!(c.shows(110.2));
+        assert_eq!(c.next_change(110.2), None);
+        // The last wake is the timeout itself, in a half that would hide.
+        let late = 100.0 + CARET_BLINK_TIMEOUT - 0.1;
+        assert!((c.next_change(late).unwrap() - 0.1).abs() < 1e-3);
+        // An inactive window shows no caret, and wakes for none.
+        let inactive = CaretClock { active: false, ..c };
+        assert!(!inactive.shows(100.0));
+        assert_eq!(inactive.next_change(100.0), None);
+    }
+
+    #[test]
+    fn a_focused_caret_stops_blinking_once_idle_and_blinks_again_when_typed_at() {
+        use crate::div;
+        use crate::prelude::*;
+        let field = crate::TextField::new("");
+        let mut s = crate::app::Scenario::measuring(
+            move || {
+                div()
+                    .padding(10.0)
+                    .child(crate::text_input(&field).width(120.0))
+                    .into_element()
+            },
+            200,
+            60,
+            1.0,
+        )
+        .expect("a scenario");
+        // Its frames recorded cold blink as the live ones do.
+        s.check_cold(true);
+        s.settle().unwrap();
+        s.click(40.0, 20.0);
+        s.settle().unwrap();
+        let blinks = || clock::next_deadline().is_some();
+        assert!(blinks(), "focused: the caret blinks");
+        s.at(5.0);
+        s.settle().unwrap();
+        assert!(blinks(), "still blinking 5 s on");
+        s.at(30.0);
+        s.settle().unwrap();
+        assert!(!blinks(), "idle past the timeout: shown, and nothing wakes for it");
+        s.type_text("a");
+        s.settle().unwrap();
+        assert!(blinks(), "typed at: it blinks again");
+        s.at(31.0);
+        s.settle().unwrap();
+        s.set_window_active(false);
+        s.settle().unwrap();
+        assert!(!blinks(), "the window lost focus: no caret, nothing wakes");
+        s.set_window_active(true);
+        s.settle().unwrap();
+        assert!(blinks(), "back: it blinks again");
+        s.at(60.0);
+        s.settle().unwrap();
+        assert!(!blinks(), "idle again");
+        // Away and back between two frames: it blinks again all the same.
+        s.set_window_active(false);
+        s.set_window_active(true);
+        s.settle().unwrap();
+        assert!(blinks(), "refocused between two frames: it blinks again");
+    }
+
+    #[test]
+    fn the_window_background_is_the_roots_when_it_fills_the_window() {
+        // A dark page: what a resize shows past the last frame is dark too.
+        use crate::div;
+        use crate::prelude::*;
+        let dark = Color::hex(0x09090b);
+        // The root takes the window; a dark box inside a root of no colour
+        // is not the window's.
+        let root = |own: bool| {
+            move || {
+                if own {
+                    div().size(pct(100.0)).background(dark).into_element()
+                } else {
+                    div()
+                        .child(div().width(50.0).height(20.0).background(dark))
+                        .into_element()
+                }
+            }
+        };
+        for (own, want) in [(true, dark), (false, Color::WHITE)] {
+            let mut s = crate::app::Scenario::measuring(root(own), 200, 100, 2.0).expect("a scenario");
+            s.check_cold(true);
+            s.settle().unwrap();
+            s.frame("shown").expect("a frame");
+            assert_eq!(s.parts().0.background, Some(want), "the root's own colour: {own}");
+        }
+    }
 
     fn display(room: usize) -> Arc<Display> {
         Arc::new(Display::new(Vec::with_capacity(room)))

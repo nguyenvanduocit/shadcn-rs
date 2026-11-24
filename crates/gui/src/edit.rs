@@ -92,7 +92,24 @@ struct Source {
     masked: bool,
 }
 
+/// What a [`Shown`] is, told by revisions, not by its text: the same mark
+/// is the same text, caret and selection, and keeps no text alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShownMark {
+    source: Source,
+    caret: usize,
+    anchor: usize,
+}
+
 impl Shown {
+    pub(crate) fn mark(&self) -> ShownMark {
+        ShownMark {
+            source: self.source,
+            caret: self.caret,
+            anchor: self.anchor,
+        }
+    }
+
     /// The selected byte range, ordered.
     #[must_use]
     pub fn selection(&self) -> (usize, usize) {

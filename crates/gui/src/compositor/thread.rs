@@ -50,14 +50,22 @@ pub(crate) enum ToRender {
         ended: bool,
         shown: Arc<Presented>,
     },
-    /// The window's surface is this many physical pixels now.
+    /// The window is this many physical pixels now: its surface is
+    /// configured to it at once, and shows the last frame at its own size
+    /// until the UI commits one laid out at the new size.
     Resize((u32, u32)),
-    /// The window is shown or hidden (occluded, minimized): hidden, nothing is drawn.
+    /// The window is shown or hidden (occluded, minimized): hidden, nothing
+    /// is drawn; shown again, the next frame is presented.
     Visible(bool),
+    /// The OS asks for what the window shows again (it was exposed): the
+    /// next frame presents it.
+    Expose,
     /// The display refreshes this often.
     Interval(Duration),
-    /// The compositor's frame callback came (Wayland): the next frame may be drawn.
-    FrameCallback,
+    /// The compositor's frame callback came (Wayland), at the time given:
+    /// the next frame may be drawn. Callbacks come at the output's refresh,
+    /// so they time its vsync ([`Vsync::called_back`]).
+    FrameCallback(Instant),
     /// Read the last frame back, `overlay` over it.
     Capture(Option<Scene>, Sender<Option<Pixels>>),
     /// Fault injection (tests, the stress check): lose the GPU device as a
@@ -131,16 +139,50 @@ pub struct FrameStat {
 
 /// How the render thread waits for a vblank.
 pub(crate) enum Pace {
-    /// A window's surface: the acquire blocks until a texture is free.
+    /// A window's surface: the acquire blocks until the frame presented
+    /// last is shown, at a vblank. A frame begun with a texture held (the
+    /// last one presented nothing) has nothing to wait for, and is paced
+    /// by the vsync as fitted.
     Surface {
-        /// Wayland: wait for the compositor's frame callback before acquiring,
-        /// which stops drawing while the surface is hidden.
-        callbacks: bool,
-        window: Arc<winit::window::Window>,
+        /// Wayland: the window whose compositor's frame callback is waited
+        /// for after each present, which stops drawing while it is hidden.
+        callbacks: Option<Arc<dyn FrameCallbacks>>,
     },
     /// No display: a clock ticking at the given interval (tests, stress).
     Ticker(Duration),
 }
+
+/// A Wayland window's frame callbacks: one is asked for with each present,
+/// and the compositor answers it at its output's next repaint, or never
+/// while the window is hidden.
+pub(crate) trait FrameCallbacks: Send + Sync {
+    /// Ask for one with the present about to be made.
+    fn before_present(&self);
+    /// Have the callback delivered (as `RedrawRequested`) when it comes.
+    fn after_present(&self);
+}
+
+impl FrameCallbacks for winit::window::Window {
+    fn before_present(&self) {
+        self.pre_present_notify();
+    }
+
+    fn after_present(&self) {
+        self.request_redraw();
+    }
+}
+
+/// How many frames in a row may present nothing on Wayland before one
+/// presents anyway: a frame callback is asked for only with a present
+/// (winit commits no surface without one), and a hidden window is known
+/// only by its callback not coming. A window animating with nothing
+/// changing (a hold) thus asks the compositor every few frames, and stops
+/// drawing, asleep until its callback, once hidden.
+const WAYLAND_PROBE: u32 = 8;
+
+/// How long an occluded window waits before its surface is asked again,
+/// with no event saying it can be shown.
+const OCCLUDED_PROBE: Duration = Duration::from_secs(1);
 
 /// The render thread's state.
 pub(crate) struct RenderThread {
@@ -157,16 +199,46 @@ pub(crate) struct RenderThread {
     /// The main frame granted and not yet answered, and by when.
     owed: Option<(u64, Instant)>,
     sequence: u64,
-    /// A commit was applied and not yet drawn.
+    /// Something came that is not drawn yet (a commit, a scroll, an
+    /// overlay, an expose): news, which a frame drawn for a vblank already
+    /// tried may still be drawn for.
     dirty: bool,
+    /// A present was owed and its texture could not be taken: retried at
+    /// the next vblank, no news.
+    retry: bool,
     visible: bool,
-    /// Wayland: the frame callback came since the last present.
+    /// The surface said the window cannot be shown (wgpu's `Occluded`):
+    /// nothing is tried until it is shown or exposed, or this time comes
+    /// (a slow probe, which is no frame).
+    occluded_until: Option<Instant>,
+    /// The size the window was last told to be, not yet configured: only
+    /// the last of a drag's resizes configures the surface.
+    resize_to: Option<(u32, u32)>,
+    /// The vblank a main frame granted while the thread slept is for: the
+    /// frame drawn next is drawn for it too, whatever its acquire took.
+    granted_for: Option<Instant>,
+    /// Wayland: the frame callback came since the last present, and when.
     called_back: bool,
+    callback_at: Option<Instant>,
     log: Option<Arc<Mutex<Vec<FrameStat>>>>,
     /// The commit applied in the frame being drawn.
     applied: Option<u64>,
     /// The ticker's last vblank.
     ticked: Option<Instant>,
+    /// The vblank the last frame that presented, or took a texture, was
+    /// drawn for: no later frame is drawn for it or an earlier one.
+    reserved: Option<Instant>,
+    /// The vblank the last frame was drawn for, when it presented nothing
+    /// and took no texture: drawn for again only for something new before
+    /// its deadline (a wheel, a commit), else the next frame is drawn for
+    /// the vblank after it, not again and again for the same.
+    blank: Option<Instant>,
+    /// Wayland: frames in a row that presented nothing ([`WAYLAND_PROBE`]),
+    /// and whether the last present answered the callback before it within
+    /// its refresh, not a probe (the next callback then comes one refresh
+    /// after that one: a sample of the interval).
+    unpresented: u32,
+    chained: bool,
     /// When the main frame owed was granted, and how long the UI took to
     /// answer the last one.
     granted: Option<Instant>,
@@ -227,11 +299,20 @@ impl RenderThread {
             owed: None,
             sequence: 0,
             dirty: false,
+            retry: false,
             visible: true,
+            occluded_until: None,
+            resize_to: None,
+            granted_for: None,
             called_back: true,
+            callback_at: None,
             log,
             applied: None,
             ticked: None,
+            reserved: None,
+            blank: None,
+            unpresented: 0,
+            chained: false,
             granted: None,
             ui_took: None,
             answered: None,
@@ -292,6 +373,7 @@ impl RenderThread {
         self.granted = None;
         self.applied = None;
         self.dirty = false;
+        self.retry = false;
         self.awaiting_full = true;
         // A main frame for the full commit.
         self.wants = true;
@@ -320,43 +402,70 @@ impl RenderThread {
 
     /// The thread's loop, until told to quit or the UI thread goes away.
     fn serve(&mut self) {
-        loop {
-            // Sleep on the channel unless something is to be drawn.
-            let asleep = !self.busy() || !self.visible || !self.called_back;
-            if asleep {
-                match self.rx.recv() {
-                    Ok(msg) => {
-                        if !self.handle(msg) {
-                            return;
-                        }
-                    }
-                    Err(_) => return,
-                }
-            }
-            while let Ok(msg) = self.rx.try_recv() {
-                if !self.handle(msg) {
-                    return;
-                }
-            }
-            // Input woke everything up: the UI starts its frame now, not
-            // at the next vblank (cc's `BeginMainFrame` on demand).
-            if asleep && self.wants && self.owed.is_none() && self.visible {
-                let now = Instant::now();
-                let present = match &self.pace {
-                    // A drawable is free: drawn as soon as the commit comes.
-                    Pace::Surface { .. } => self.vsync.present_time(now, PRESENT_MARGIN),
-                    Pace::Ticker(i) => {
-                        let tick = self.next_tick(*i, now);
-                        tick.checked_add(*i).unwrap_or(tick)
-                    }
-                };
-                let deadline = present.checked_sub(self.margin()).filter(|d| *d > now).unwrap_or(now);
-                self.grant(present, deadline);
-            }
-            if self.busy() && self.visible && self.called_back && !self.frame() {
-                return;
+        while self.step() {}
+    }
+
+    /// One turn of [`Self::serve`]: sleep until there is something to
+    /// draw, take in what came, and draw a frame if one is due; `false` to
+    /// quit.
+    fn step(&mut self) -> bool {
+        // Sleep on the channel unless something is to be drawn; an
+        // occluded window until its slow probe.
+        let occluded = self.occluded_until.filter(|t| *t > Instant::now());
+        if occluded.is_none() {
+            self.occluded_until = None;
+        }
+        let asleep = !self.busy() || !self.visible || !self.called_back || occluded.is_some();
+        if asleep {
+            let msg = match occluded {
+                Some(t) => match self.rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
+                    Ok(msg) => Some(msg),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => return false,
+                },
+                None => match self.rx.recv() {
+                    Ok(msg) => Some(msg),
+                    Err(_) => return false,
+                },
+            };
+            if let Some(msg) = msg
+                && !self.handle(msg)
+            {
+                return false;
             }
         }
+        while let Ok(msg) = self.rx.try_recv() {
+            if !self.handle(msg) {
+                return false;
+            }
+        }
+        // Input woke everything up: the UI starts its frame now, not
+        // at the next vblank (cc's `BeginMainFrame` on demand).
+        if asleep && self.wants && self.owed.is_none() && self.visible {
+            self.grant_now();
+        }
+        let hidden = self.occluded_until.is_some();
+        !(self.busy() && self.visible && self.called_back && !hidden) || self.frame()
+    }
+
+    /// Grant the UI a main frame now, the thread having slept: for the
+    /// vblank the next frame is drawn for ([`Self::aim`]), which that frame
+    /// keeps however long its acquire takes ([`Self::granted_for`]).
+    fn grant_now(&mut self) {
+        let now = Instant::now();
+        let present = match &self.pace {
+            Pace::Surface { .. } => {
+                let p = self.aim(now);
+                self.granted_for = Some(p);
+                p
+            }
+            Pace::Ticker(i) => {
+                let tick = self.next_tick(*i, now);
+                tick.checked_add(*i).unwrap_or(tick)
+            }
+        };
+        let deadline = present.checked_sub(self.margin()).filter(|d| *d > now).unwrap_or(now);
+        self.grant(present, deadline);
     }
 
     /// Whether there is a frame to draw. A lost device is a reason of its
@@ -368,6 +477,7 @@ impl RenderThread {
     fn busy(&self) -> bool {
         let now = clock::seconds(Instant::now());
         self.dirty
+            || self.retry
             || self.gpu.lost()
             || (self.wants && self.owed.is_none())
             || self.compositor.animating(now)
@@ -441,16 +551,32 @@ impl RenderThread {
                     self.wants = true;
                 }
             }
+            // Configured by the next frame, with only the last of those
+            // that came meanwhile.
             ToRender::Resize(size) => {
-                self.gpu.resize(size);
+                self.resize_to = Some(size);
+                self.occluded_until = None;
                 self.dirty = true;
             }
             ToRender::Visible(v) => {
+                if v && !self.visible {
+                    self.gpu.expose();
+                    self.occluded_until = None;
+                }
                 self.visible = v;
                 self.dirty |= v;
             }
+            ToRender::Expose => {
+                self.gpu.expose();
+                self.occluded_until = None;
+                self.dirty = true;
+            }
             ToRender::Interval(i) => self.vsync.set_interval(i),
-            ToRender::FrameCallback => self.called_back = true,
+            ToRender::FrameCallback(at) => {
+                self.called_back = true;
+                self.callback_at = Some(at);
+                self.vsync.called_back(at, std::mem::take(&mut self.chained));
+            }
             ToRender::Capture(overlay, reply) => {
                 let pixels = self
                     .ensure_device()
@@ -476,20 +602,20 @@ impl RenderThread {
         true
     }
 
-    /// Wait for the next vblank: when it was, and how long that took.
-    fn wait_vsync(&mut self) -> (Instant, Duration) {
+    /// Wait for the next vblank where there is one to wait for: when the
+    /// frame begins, and how long the display held it there, when that is
+    /// a sample of the vsync. Only a texture acquired, or a tick, is: a
+    /// frame begun with a texture held, or whose acquire failed (a minimized
+    /// window), waited for nothing, and its deadline paces it
+    /// ([`Self::frame`]).
+    fn wait_vsync(&mut self) -> (Instant, Option<Duration>) {
         match &self.pace {
             Pace::Surface { .. } => {
-                let asked = Instant::now();
-                match self.gpu.acquire() {
-                    Some(waited) => (Instant::now(), waited),
-                    None => {
-                        // No texture (a minimized window): wait as the display would.
-                        let next = self.vsync.next_after(asked);
-                        std::thread::sleep(next.saturating_duration_since(Instant::now()));
-                        (Instant::now(), asked.elapsed())
-                    }
+                if self.gpu.holds_frame() {
+                    return (Instant::now(), None);
                 }
+                let waited = self.gpu.acquire();
+                (Instant::now(), waited)
             }
             Pace::Ticker(interval) => {
                 let interval = *interval;
@@ -497,7 +623,7 @@ impl RenderThread {
                 let next = self.next_tick(interval, now);
                 std::thread::sleep(next.saturating_duration_since(Instant::now()));
                 self.ticked = Some(next);
-                (next, next.saturating_duration_since(now))
+                (next, Some(next.saturating_duration_since(now)))
             }
         }
     }
@@ -534,6 +660,47 @@ impl RenderThread {
         )
     }
 
+    /// The vblank a frame begun at `at` on a window's surface is drawn
+    /// for: the first it can still make, but never one a frame that
+    /// presented or took a texture was drawn for. Only one present shows
+    /// at a vblank, and a frame begun while one waits for it (its acquire
+    /// then blocks until it shows) is shown at the vblank after. The UI's
+    /// main frame is granted for what this gives too, so it samples its
+    /// motion for the vblank its commit is drawn for.
+    fn aim(&self, at: Instant) -> Instant {
+        let present = self.vsync.present_time(at, PRESENT_MARGIN);
+        match self.reserved {
+            Some(r) if present <= r => self.vsync.next_after(r),
+            _ => present,
+        }
+    }
+
+    /// Take in what comes until `deadline`, or until something new to
+    /// draw came (a commit, a scroll, a main frame asked for): whether it
+    /// did (what came before, drained by [`Self::serve`], included), or
+    /// `None` when told to quit. A present retried ([`Self::retry`]) is no
+    /// news: it waits for the next vblank, not tried at once again and again.
+    fn news_until(&mut self, deadline: Instant) -> Option<bool> {
+        loop {
+            if self.dirty || (self.wants && self.owed.is_none()) {
+                return Some(true);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Some(false);
+            }
+            match self.rx.recv_timeout(deadline.saturating_duration_since(now)) {
+                Ok(msg) => {
+                    if !self.handle(msg) {
+                        return None;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => return Some(false),
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+
     /// Hand the UI a main frame presented at `present`, its commit wanted by `deadline`.
     fn grant(&mut self, present: Instant, deadline: Instant) {
         self.sequence = self.sequence.saturating_add(1);
@@ -561,14 +728,59 @@ impl RenderThread {
             return true;
         }
         let renewed = was_lost && !self.gpu.lost();
+        if let Some(size) = self.resize_to.take() {
+            self.gpu.resize(size);
+        }
         let (vblank, waited) = self.wait_vsync();
         let woke = Instant::now();
-        self.vsync.acquired(vblank, waited);
-        let present = match &self.pace {
+        if let Some(waited) = waited {
+            self.vsync.acquired(vblank, waited);
+        }
+        let surface = matches!(self.pace, Pace::Surface { .. });
+        // The window cannot be shown: nothing is drawn, and nothing more
+        // is tried until it is shown, exposed or resized, or a second
+        // passes. That try is no frame: nothing is counted for it.
+        if surface && self.gpu.occluded() {
+            self.occluded_until = woke.checked_add(OCCLUDED_PROBE);
+            return true;
+        }
+        let acquired = surface && waited.is_some();
+        // A main frame granted while the thread slept is for a vblank: the
+        // frame is drawn for that one, so the UI's motion and the
+        // compositor's sample the same time.
+        let reserved = self.reserved;
+        let granted = self.granted_for.take().filter(|g| reserved.is_none_or(|r| *g > r));
+        let mut present = match (&self.pace, granted) {
+            (Pace::Surface { .. }, Some(g)) => g,
             // The texture taken at a vblank shows at the next one.
-            Pace::Surface { .. } => self.vsync.present_time(vblank, PRESENT_MARGIN),
-            Pace::Ticker(i) => vblank.checked_add(*i).unwrap_or(vblank),
+            (Pace::Surface { .. }, None) => self.aim(vblank),
+            (Pace::Ticker(i), _) => vblank.checked_add(*i).unwrap_or(vblank),
         };
+        // A frame already drawn for this vblank, to no effect: drawn for it
+        // again only for something new before its deadline (a wheel may
+        // still make it), else for the next, so that frames that change
+        // nothing are not drawn again and again for the same vblank.
+        if surface
+            && granted.is_none()
+            && let Some(b) = self.blank.filter(|b| present <= *b)
+        {
+            let by = b.checked_sub(self.margin()).unwrap_or(b);
+            match self.news_until(by) {
+                None => return false,
+                Some(true) => present = b,
+                Some(false) => present = self.vsync.next_after(b),
+            }
+        }
+        // Wayland: a frame that would present nothing presents anyway now
+        // and then, to ask for a frame callback ([`WAYLAND_PROBE`]).
+        let callbacks = match &self.pace {
+            Pace::Surface { callbacks: Some(c) } => Some(Arc::clone(c)),
+            _ => None,
+        };
+        let probe = callbacks.is_some() && self.unpresented >= WAYLAND_PROBE;
+        if probe {
+            self.gpu.expose();
+        }
         let deadline = present
             .checked_sub(self.margin())
             .filter(|d| *d > vblank)
@@ -622,18 +834,44 @@ impl RenderThread {
         // A fling or a resampled gesture moved on: the UI takes it in, and
         // builds what it scrolls toward, with its next frame.
         self.wants |= self.compositor.scrolled();
-        if let Pace::Surface {
-            callbacks: true,
-            window,
-        } = &self.pace
-        {
-            window.pre_present_notify();
-            window.request_redraw();
-            self.called_back = false;
-        }
         let drew = self.applied.take();
         let drawn = self.gpu.drawn();
+        // Wayland: a frame callback answers a commit, so one is asked for
+        // only when this frame presents.
+        let presenting = self.gpu.presenting();
+        if let Some(c) = callbacks.as_ref().filter(|_| presenting) {
+            c.before_present();
+        }
+        let presents = self.gpu.presents();
         self.gpu.end_frame();
+        let presented_now = self.gpu.presents() != presents;
+        // Only a present made asks for a callback: one predicted and not
+        // made (its texture could not be taken) leaves the thread free to
+        // draw, not waiting for a callback that never comes.
+        if let Some(c) = callbacks.filter(|_| presented_now) {
+            c.after_present();
+            // The next callback comes a refresh after the last only when
+            // this present answers it within that refresh: not a probe,
+            // nor one made after the window idled (a key repeat's).
+            let now = Instant::now();
+            self.chained = !probe
+                && self.called_back
+                && self
+                    .callback_at
+                    .is_some_and(|c| now.saturating_duration_since(c) < self.vsync.interval());
+            self.called_back = false;
+        }
+        // The vblank this frame was drawn for is taken when it presented or
+        // holds a texture taken for it; drawn to no effect, a later frame
+        // may still be drawn for it.
+        if presented_now || acquired {
+            self.reserved = Some(present);
+            self.blank = None;
+            self.unpresented = 0;
+        } else if surface {
+            self.blank = Some(present);
+            self.unpresented = self.unpresented.saturating_add(1);
+        }
         let submitted = Instant::now();
         // What the frame cost after its deadline: waking late at the vblank
         // and drawing, or, drawn at the deadline, all from it to the submit
@@ -646,8 +884,13 @@ impl RenderThread {
         if self.costs.len() > COSTS {
             self.costs.pop_front();
         }
+        // What input is stamped with is what the window shows: a frame
+        // meant to present that could not leaves the last one there.
+        let owed = surface && self.gpu.owes_present();
         let presented = self.compositor.presented();
-        *self.presented.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&presented);
+        if !owed {
+            *self.presented.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&presented);
+        }
         if let Some(log) = &self.log {
             log.lock().unwrap_or_else(PoisonError::into_inner).push(FrameStat {
                 vsync: vblank,
@@ -668,7 +911,10 @@ impl RenderThread {
                 held: self.gpu.held(),
             })));
         }
+        // A presentation whose texture could not be taken is still owed:
+        // retried at the next vblank. All that came is drawn.
         self.dirty = false;
+        self.retry = owed;
         true
     }
 }
@@ -676,6 +922,7 @@ impl RenderThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::Fault;
 
     /// A render thread on a headless device, ticking every millisecond,
     /// and the sender of its channel; `None` without a GPU.
@@ -693,6 +940,440 @@ mod tests {
             None,
         );
         Some((thread, tx))
+    }
+
+    /// A render thread paced by a window's surface (`gpu`'s, if any),
+    /// refreshing every `interval`, logging its frames; and the sender of
+    /// its channel.
+    fn on_surface(
+        gpu: GpuRenderer,
+        interval: Duration,
+    ) -> (RenderThread, Arc<Mutex<Vec<FrameStat>>>, Sender<ToRender>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(|_| {}),
+            Arc::new(Mutex::new(Arc::new(Presented::default()))),
+            interval,
+            Pace::Surface { callbacks: None },
+            Some(Arc::clone(&log)),
+        );
+        (thread, log, tx)
+    }
+
+    #[test]
+    fn a_frame_whose_acquire_failed_is_no_vsync_sample() {
+        // No window: every acquire fails, as a minimized one's may. The
+        // frames wait for their deadlines, which is no vblank.
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, _tx) = on_surface(gpu, Duration::from_millis(4));
+        for _ in 0..4 {
+            assert!(thread.frame());
+        }
+        assert_eq!(thread.vsync.phase(), None, "no phase fitted to timer wakes");
+    }
+
+    #[test]
+    fn frames_that_change_nothing_present_nothing_and_are_drawn_for_later_vblanks() {
+        // The texture each frame takes at its start is kept when it changed
+        // nothing; the next frame waits for no vblank then, but is still
+        // drawn for a later one than the last, not again and again for the
+        // same in a loop.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let interval = Duration::from_millis(4);
+        let (mut thread, log, _tx) = on_surface(gpu, interval);
+        // A phase fitted, as acquires that waited give it: a frame begun
+        // at its deadline is then within the same vblank's margin.
+        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        for _ in 0..6 {
+            assert!(thread.frame());
+        }
+        assert_eq!(thread.gpu.presents(), 1, "the first frame, then nothing changed");
+        let frames = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        assert_eq!(frames.len(), 6);
+        for pair in frames.windows(2) {
+            let [a, b] = pair else { continue };
+            assert!(
+                b.present_at > a.present_at,
+                "each frame is drawn for a later vblank: {:?} then {:?}",
+                a.present_at,
+                b.present_at
+            );
+        }
+    }
+
+    /// Frames until one draws for a vblank to no effect: the first
+    /// presents, the next takes a texture, the one after holds it.
+    fn to_a_blank_frame(thread: &mut RenderThread) {
+        for _ in 0..3 {
+            assert!(thread.frame());
+        }
+        assert!(thread.blank.is_some(), "the last frame presented nothing");
+    }
+
+    #[test]
+    fn a_frame_that_presented_nothing_leaves_its_vblank_to_what_comes_next() {
+        // A frame drawn for a vblank to no effect does not take it: a wheel
+        // or a commit arriving before its deadline is drawn for it still.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let interval = Duration::from_millis(50);
+        let (mut thread, log, tx) = on_surface(gpu, interval);
+        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        to_a_blank_frame(&mut thread);
+        // The frame of nothing drew early for the next vblank, which is
+        // still a long way off.
+        thread.vsync = Vsync::new(interval);
+        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        let blank = Some(thread.aim(Instant::now()));
+        thread.blank = blank;
+        // Taken in by the thread's own turn, before its frame.
+        tx.send(ToRender::Expose).ok();
+        assert!(thread.step());
+        let frames = log.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        let last = frames.last().map(|f| f.present_at);
+        assert!(last <= blank, "drawn for the vblank left free: {last:?}, {blank:?}");
+        assert_eq!(thread.gpu.presents(), 2);
+    }
+
+    #[test]
+    fn a_main_frame_is_granted_for_the_vblank_its_frame_is_drawn_for() {
+        // Right after a frame that presented for vblank T, a frame begun
+        // now is drawn for T + 1, and so is a main frame granted now
+        // ([`RenderThread::aim`]), not T.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, _tx) = on_surface(gpu, Duration::from_millis(50));
+        thread.vsync.acquired(Instant::now(), Duration::from_millis(2));
+        assert!(thread.frame());
+        let reserved = thread.reserved.expect("the frame presented");
+        // Asked while T's present waits for it, in time for T otherwise.
+        let early = reserved.checked_sub(Duration::from_millis(20)).unwrap_or(reserved);
+        assert_eq!(
+            thread.aim(early),
+            thread.vsync.next_after(reserved),
+            "granted for T + 1"
+        );
+    }
+
+    #[test]
+    fn a_present_whose_texture_timed_out_is_drawn_again_at_the_next_wake() {
+        let Ok(mut gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        gpu.virtual_display().faults.extend([Fault::Timeout, Fault::Timeout]);
+        let (mut thread, log, tx) = on_surface(gpu, Duration::from_millis(20));
+        tx.send(ToRender::Expose).ok();
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 0, "no texture, at the start or when drawing");
+        assert!(thread.retry && thread.busy(), "still owed: the thread stays awake");
+        assert!(!thread.dirty, "a retry is no news");
+        let failed = thread.blank.expect("the frame presented nothing");
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 1, "the next wake presents it");
+        assert!(!thread.retry);
+        let last = log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last()
+            .map(|f| f.present_at);
+        assert!(
+            last.is_some_and(|l| l > failed),
+            "retried at the next vblank, not at once for the same"
+        );
+    }
+
+    #[test]
+    fn a_present_that_failed_leaves_input_stamped_with_what_the_window_shows() {
+        // A commit drawn and not presented (its texture could not be
+        // taken) is not what the window shows: input stays stamped with the
+        // frame that is, until the commit is presented.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, tx) = on_surface(gpu, Duration::from_millis(4));
+        let shown = Arc::clone(&thread.presented);
+        let commit = |sequence: u64, background: crate::color::Color| {
+            let mut c = Commit::default();
+            c.between(&Scene::default(), &Scene::new((64, 64), 1.0, Some(background)));
+            c.sequence = sequence;
+            c.full = true;
+            ToRender::Commit(Box::new(c), None)
+        };
+        let stamped = || shown.lock().unwrap_or_else(PoisonError::into_inner).commit;
+        tx.send(commit(1, crate::color::Color::WHITE)).ok();
+        assert!(thread.step());
+        assert_eq!(stamped(), 1);
+        thread
+            .gpu
+            .virtual_display()
+            .faults
+            .extend([Fault::Timeout, Fault::Timeout]);
+        tx.send(commit(2, crate::color::Color::BLACK)).ok();
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 1, "commit 2 drawn, not presented");
+        assert_eq!(stamped(), 1, "input lands in commit 1, which the window shows");
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 2);
+        assert_eq!(stamped(), 2, "presented: input lands in it");
+    }
+
+    #[test]
+    fn an_occluded_window_draws_nothing_until_shown_or_a_slow_probe() {
+        let Ok(mut gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        gpu.virtual_display().faults.push_back(Fault::Occluded);
+        let (mut thread, log, tx) = on_surface(gpu, Duration::from_millis(4));
+        tx.send(ToRender::Expose).ok();
+        assert!(thread.step());
+        assert!(thread.occluded_until.is_some(), "occluded: nothing more is tried");
+        let frames = || log.lock().unwrap_or_else(PoisonError::into_inner).len();
+        assert_eq!(frames(), 0, "the try is no frame");
+        // Shown again: drawn at once.
+        thread.gpu.virtual_display().faults.push_back(Fault::Occluded);
+        tx.send(ToRender::Visible(false)).ok();
+        tx.send(ToRender::Visible(true)).ok();
+        assert!(thread.step());
+        assert!(thread.occluded_until.is_some(), "occluded again");
+        // No event: asked again after a second, and drawn.
+        let asked = Instant::now();
+        assert!(thread.step(), "asleep until the probe");
+        assert!(thread.step(), "the probe's frame");
+        assert!(asked.elapsed() >= OCCLUDED_PROBE.mul_f32(0.9), "{:?}", asked.elapsed());
+        assert_eq!(thread.gpu.presents(), 1);
+        assert_eq!(frames(), 1);
+    }
+
+    #[test]
+    fn a_drags_resizes_configure_the_surface_once() {
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, tx) = on_surface(gpu, Duration::from_millis(4));
+        assert!(thread.frame());
+        let configured = thread.gpu.virtual_display().configures;
+        for size in [(70, 64), (80, 70), (96, 80)] {
+            thread.gpu.virtual_display().window = size;
+            tx.send(ToRender::Resize(size)).ok();
+        }
+        assert!(thread.step());
+        assert_eq!(
+            thread.gpu.virtual_display().configures - configured,
+            1,
+            "the last size only"
+        );
+        assert_eq!(thread.gpu.virtual_display().presented.last(), Some(&(96, 80)));
+    }
+
+    #[test]
+    fn a_main_frame_granted_while_asleep_is_for_the_vblank_its_frame_is_drawn_for() {
+        // No vsync fitted yet, and the frame's acquire takes a while: the
+        // frame is still drawn for the vblank the UI's frame was granted for.
+        let Ok(mut gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        gpu.virtual_display().acquire_takes = Duration::from_millis(15);
+        let granted = Arc::new(Mutex::new(Vec::new()));
+        let (mut thread, log, tx) = on_surface(gpu, Duration::from_millis(10));
+        let told = Arc::clone(&granted);
+        thread.to_ui = Box::new(move |m| {
+            if let FromRender::Begin(token) = m {
+                told.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(token.present_at);
+            }
+        });
+        tx.send(ToRender::NeedsFrame).ok();
+        assert!(thread.step(), "granted at once");
+        assert_eq!(thread.vsync.phase(), None);
+        tx.send(ToRender::Expose).ok();
+        assert!(thread.step());
+        let at = granted.lock().unwrap_or_else(PoisonError::into_inner).first().copied();
+        let drawn = log
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .map(|f| clock::seconds(f.present_at));
+        assert!(at.is_some() && at == drawn, "granted for {at:?}, drawn for {drawn:?}");
+    }
+
+    /// Frame callbacks asked for, as a Wayland window's.
+    #[derive(Default)]
+    struct Asked(std::sync::atomic::AtomicU32);
+
+    impl FrameCallbacks for Asked {
+        fn before_present(&self) {}
+        fn after_present(&self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn a_wayland_window_that_presents_nothing_still_asks_for_a_callback_now_and_then() {
+        // Frames that present nothing ask the compositor for nothing, and a
+        // hidden window would never be known as one: every few, one
+        // presents, and then the thread sleeps until its callback.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, _tx) = on_surface(gpu, Duration::from_millis(2));
+        let asked = Arc::new(Asked::default());
+        let callbacks: Arc<dyn FrameCallbacks> = {
+            let a: Arc<Asked> = Arc::clone(&asked);
+            a
+        };
+        thread.pace = Pace::Surface {
+            callbacks: Some(callbacks),
+        };
+        let count = || asked.0.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(thread.frame());
+        assert_eq!(count(), 1, "the first present asks for one");
+        assert!(!thread.called_back, "and the thread waits for it");
+        assert!(thread.handle(ToRender::FrameCallback(Instant::now())));
+        // One takes a texture, then frames of nothing, then the probe.
+        for _ in 0..WAYLAND_PROBE + 2 {
+            assert!(thread.frame());
+        }
+        assert_eq!(
+            thread.gpu.presents(),
+            2,
+            "one probe after {WAYLAND_PROBE} frames of nothing"
+        );
+        assert_eq!(count(), 2);
+        assert!(!thread.called_back, "asleep until the compositor answers");
+    }
+
+    /// A Wayland-paced render thread refreshing every `interval` as told
+    /// (no monitor rate reported), and the callbacks it asks for.
+    fn on_wayland(interval: Duration) -> Option<(RenderThread, Arc<Asked>, Sender<ToRender>)> {
+        let gpu = GpuRenderer::with_virtual_window((64, 64)).ok()?;
+        let (mut thread, _, tx) = on_surface(gpu, interval);
+        let asked = Arc::new(Asked::default());
+        let callbacks: Arc<dyn FrameCallbacks> = {
+            let a: Arc<Asked> = Arc::clone(&asked);
+            a
+        };
+        thread.pace = Pace::Surface {
+            callbacks: Some(callbacks),
+        };
+        Some((thread, asked, tx))
+    }
+
+    #[test]
+    fn a_wayland_present_predicted_and_not_made_leaves_the_thread_free_to_draw() {
+        // An overlay hidden is to present the frame without it; its texture
+        // cannot be taken: no present, so no callback comes, and the
+        // thread must not wait for one.
+        let Some((mut thread, asked, tx)) = on_wayland(Duration::from_millis(4)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        tx.send(ToRender::Overlay(Some(Scene::new((64, 64), 1.0, None)))).ok();
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 1);
+        assert!(thread.handle(ToRender::FrameCallback(Instant::now())));
+        thread
+            .gpu
+            .virtual_display()
+            .faults
+            .extend([Fault::Timeout, Fault::Timeout]);
+        tx.send(ToRender::Overlay(None)).ok();
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 1, "the texture could not be taken");
+        assert!(thread.called_back, "no present made: no callback waited for");
+        assert_eq!(asked.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(thread.step(), "drawn again");
+        assert_eq!(thread.gpu.presents(), 2);
+    }
+
+    #[test]
+    fn wayland_callbacks_after_key_repeats_do_not_set_the_refresh() {
+        // 60 Hz. A key repeating at a third of that presents every third
+        // refresh, long after the callback before: no refresh.
+        let refresh = Duration::from_millis(16);
+        let Some((mut thread, _, tx)) = on_wayland(refresh) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        for _ in 0..6 {
+            tx.send(ToRender::Expose).ok();
+            assert!(thread.step());
+            assert!(!thread.called_back);
+            // The compositor answers at its next refresh; the next key comes
+            // two refreshes later.
+            std::thread::sleep(refresh);
+            assert!(thread.handle(ToRender::FrameCallback(Instant::now())));
+            std::thread::sleep(refresh.saturating_mul(2));
+        }
+        assert_eq!(thread.vsync.interval(), refresh, "key repeats are no refresh");
+    }
+
+    #[test]
+    fn wayland_callbacks_after_probes_do_not_set_the_refresh() {
+        // Idle: only probes present, each answered at the next refresh.
+        let fast = Duration::from_millis(3);
+        let Some((mut thread, _, _tx)) = on_wayland(fast) else {
+            return;
+        };
+        for _ in 0..(WAYLAND_PROBE + 2) * 5 {
+            assert!(thread.frame());
+            if !thread.called_back {
+                std::thread::sleep(fast);
+                assert!(thread.handle(ToRender::FrameCallback(Instant::now())));
+            }
+        }
+        assert_eq!(thread.vsync.interval(), fast, "probes are no refresh");
+    }
+
+    #[test]
+    fn wayland_callbacks_a_present_answers_at_once_set_the_refresh() {
+        // Told 60 Hz on a faster output: a window presenting each refresh,
+        // at once after each callback, has the callbacks a refresh apart.
+        let Some((mut thread, _, tx)) = on_wayland(Duration::from_millis(16)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let refresh = Duration::from_millis(10);
+        let start = Instant::now();
+        for _ in 0..16 {
+            tx.send(ToRender::Expose).ok();
+            // Drawn at once: nothing is owed and nothing waits.
+            thread.applied = Some(0);
+            assert!(thread.step());
+            // The compositor answers at its first refresh after the present
+            // (on a loaded machine a frame may miss one: a gap of two).
+            let n = start.elapsed().as_nanos() / refresh.as_nanos() + 1;
+            let due = start
+                .checked_add(refresh.saturating_mul(u32::try_from(n).unwrap_or(u32::MAX)))
+                .unwrap_or(start);
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+            assert!(thread.handle(ToRender::FrameCallback(due)));
+        }
+        let fitted = thread.vsync.interval();
+        assert!(
+            fitted.abs_diff(refresh) < Duration::from_micros(500),
+            "the refresh: {fitted:?}"
+        );
     }
 
     #[test]

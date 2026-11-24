@@ -1550,16 +1550,13 @@ impl GpuRenderer {
             let tiles = self.tile_passes();
             passes.splice(0..0, tiles);
         }
-        let present = self.window.is_some() && (!rects.is_empty() || self.overlaid.1 || self.holds_frame());
+        // Presented only when what the window shows changes: damage, or a
+        // display that does not show the canvas. An overlay drawn, or gone,
+        // presents itself ([`Self::overlay_scene`], `end_frame`). A frame
+        // texture held for pacing is not a reason ([`super::Window`]).
+        let present = self.window.as_ref().is_some_and(|w| w.stale || !rects.is_empty());
         if present {
-            passes.push(PassPlan {
-                target: PassTarget::Blit,
-                to_canvas: IDENTITY,
-                origin: (0, 0),
-                size: (w, h),
-                clear: None,
-                parts: Vec::new(),
-            });
+            passes.push(self.blit_pass());
         }
         self.planned = Some(plan);
         if passes.is_empty() && self.masks.is_empty() {
@@ -1618,14 +1615,54 @@ impl GpuRenderer {
         }
     }
 
+    /// The pass that copies the canvas onto the window's frame texture:
+    /// pixel for pixel, at the canvas's own size. A surface of another
+    /// size (resized, the frame laid out at the new size not committed
+    /// yet) is cleared to the canvas's background first, and shows the
+    /// last frame in its corner over it.
+    /// Copy the canvas onto the window's frame, over an overlay gone.
+    pub(super) fn blit(&mut self) {
+        self.submit(&[self.blit_pass()], None);
+    }
+
+    fn blit_pass(&self) -> PassPlan {
+        let (size, background) = self.canvas.as_ref().map_or(((1, 1), None), |c| (c.size, c.background));
+        let other = self.window.as_ref().is_some_and(|w| w.size() != size);
+        PassPlan {
+            target: PassTarget::Blit,
+            to_canvas: IDENTITY,
+            origin: (0, 0),
+            size,
+            clear: other.then(|| {
+                let [r, g, b, a] = background.unwrap_or([255; 4]).map(|v| f64::from(v) / 255.0);
+                wgpu::Color {
+                    r: r * a,
+                    g: g * a,
+                    b: b * a,
+                    a,
+                }
+            }),
+            parts: Vec::new(),
+        }
+    }
+
     /// Paint `scene` over the window's frame as shown, this frame only.
-    pub(super) fn overlay_scene(&mut self, scene: &Scene, text: &mut Glyphs) {
+    /// With `generation`, what it shows is drawn again only when that
+    /// changed or the frame presents anyway: an overlay unchanged over a
+    /// frame that changed nothing presents nothing.
+    pub(super) fn overlay_scene(&mut self, scene: &Scene, generation: Option<u64>, text: &mut Glyphs) {
         let Some(size) = self.canvas.as_ref().map(|c| c.size) else {
             return;
         };
-        if self.window.is_none() {
+        let Some(blitted) = self.window.as_ref().map(|w| w.blitted) else {
+            return;
+        };
+        if generation.is_some() && generation == self.overlay_shown && !blitted && self.overlaid.1 {
+            // Still on screen as drawn.
+            self.overlaid.0 = true;
             return;
         }
+        self.overlay_shown = generation;
         self.prepare(scene, text, true);
         let viewport = PixelRect {
             x: 0,
@@ -1635,15 +1672,8 @@ impl GpuRenderer {
         };
         let ops = self.overlay_ops(scene, rect_of(viewport), text);
         let mut passes = self.mask_passes();
-        if !self.window.as_ref().is_some_and(|w| w.blitted) {
-            passes.push(PassPlan {
-                target: PassTarget::Blit,
-                to_canvas: IDENTITY,
-                origin: (0, 0),
-                size,
-                clear: None,
-                parts: Vec::new(),
-            });
+        if !blitted {
+            passes.push(self.blit_pass());
         }
         passes.push(PassPlan {
             target: PassTarget::Surface,
@@ -2520,19 +2550,42 @@ impl GpuRenderer {
             let mut rp = Some(begin(&mut encoder, load, part));
             if matches!(pass.target, PassTarget::Blit) {
                 if let (Some(c), Some(rp)) = (&self.canvas, rp.as_mut()) {
+                    // Pixel for pixel, the canvas's size at most: the
+                    // rest of a larger surface is the pass's clear.
+                    let (sw, sh) = self.window.as_ref().map_or(c.size, |w| w.size());
+                    rp.set_scissor_rect(0, 0, c.size.0.min(sw), c.size.1.min(sh));
                     rp.set_pipeline(&self.pipelines.blit);
                     rp.set_bind_group(0, &c.blit, &[]);
                     rp.draw(0..3, 0..1);
                 }
                 continue;
             }
+            // An overlay over a surface not the canvas's size (a resize the
+            // UI has not laid out yet) draws at the canvas's size, in the
+            // corner with the canvas blitted there, cut to the surface.
+            let mut drawn = pass.size;
+            let mut fitted = false;
+            if matches!(pass.target, PassTarget::Surface)
+                && let Some(s) = self.window.as_ref().map(|w| w.size())
+                && s != pass.size
+                && let Some(rp) = rp.as_mut()
+            {
+                fitted = true;
+                drawn = (pass.size.0.min(s.0), pass.size.1.min(s.1));
+                let (w, h) = (
+                    crate::convert::u32_to_f32(pass.size.0),
+                    crate::convert::u32_to_f32(pass.size.1),
+                );
+                rp.set_viewport(0.0, 0.0, w, h, 0.0, 1.0);
+                rp.set_scissor_rect(0, 0, drawn.0, drawn.1);
+            }
             let offset = pass_offset(i);
             for (scissor, ops) in &pass.parts {
                 let mut clipped = None;
                 if let Some(r) = scissor {
                     let (w, h) = (
-                        i32::try_from(pass.size.0).unwrap_or(i32::MAX),
-                        i32::try_from(pass.size.1).unwrap_or(i32::MAX),
+                        i32::try_from(drawn.0).unwrap_or(i32::MAX),
+                        i32::try_from(drawn.1).unwrap_or(i32::MAX),
                     );
                     let (x0, y0) = (r.x0.clamp(0, w), r.y0.clamp(0, h));
                     let (x1, y1) = (r.x1.clamp(x0, w), r.y1.clamp(y0, h));
@@ -2566,6 +2619,14 @@ impl GpuRenderer {
                         }
                         part = part.saturating_add(1);
                         let mut again = begin(&mut encoder, wgpu::LoadOp::Load, part);
+                        if fitted {
+                            let (w, h) = (
+                                crate::convert::u32_to_f32(pass.size.0),
+                                crate::convert::u32_to_f32(pass.size.1),
+                            );
+                            again.set_viewport(0.0, 0.0, w, h, 0.0, 1.0);
+                            again.set_scissor_rect(0, 0, drawn.0, drawn.1);
+                        }
                         if let Some((x, y, w, h)) = clipped {
                             again.set_scissor_rect(x, y, w, h);
                         }
@@ -2649,7 +2710,14 @@ impl GpuRenderer {
         if passes.iter().any(|p| matches!(p.target, PassTarget::Blit))
             && let Some(w) = self.window.as_mut()
         {
-            w.blitted = true;
+            if surface.is_some() {
+                w.blitted = true;
+            } else {
+                // Meant to present and got no texture: what the canvas
+                // holds is owed to the window, and the next frame presents
+                // it, damage or not.
+                w.stale = true;
+            }
         }
         self.drawn.submitted = true;
         self.drawn.uploaded = self.drawn.uploaded.saturating_add(bytes);

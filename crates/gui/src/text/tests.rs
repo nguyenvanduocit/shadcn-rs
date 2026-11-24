@@ -4860,7 +4860,7 @@ fn a_fields_text_scrolled_into_its_container_shows_as_it_comes_in() {
     .unwrap();
     s.settle().unwrap();
     let mut ts = TextSystem::new();
-    let scene = crate::paint::Painter::cold(s.last(), &mut ts, (300, 300), 1.0, Color::WHITE);
+    let scene = crate::paint::Painter::default().cold(s.last(), &mut ts, (300, 300), 1.0, Color::WHITE);
     let mut props = scene.properties;
     // The field's own clip: the one within another.
     let id = (1..props.clips.len())

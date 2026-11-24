@@ -452,9 +452,13 @@ impl Animation {
     }
 
     /// `animate-caret-blink`: shown at 0%, 70% and 100%, hidden at 20% and
-    /// 50%, 1.25s `ease-out`, forever.
+    /// 50%, 1.25s `ease-out`, for as long as a caret blinks
+    /// ([`crate::paint::CARET_BLINK_TIMEOUT`]) and then shown: CSS's
+    /// `infinite` would keep an idle window drawing every frame of it
+    /// forever. A caret that moves is a new one, and blinks again.
     #[must_use]
     pub fn caret_blink() -> Self {
+        const PERIOD: f32 = 1.25;
         let at = |at, opacity| Keyframe {
             at,
             pose: Pose {
@@ -464,10 +468,10 @@ impl Animation {
         };
         Self::new(
             vec![at(0.0, 1.0), at(0.2, 0.0), at(0.5, 0.0), at(0.7, 1.0), at(1.0, 1.0)],
-            1.25,
+            PERIOD,
             Easing::EASE_OUT,
         )
-        .infinite()
+        .iterations((crate::paint::CARET_BLINK_TIMEOUT / PERIOD).ceil())
     }
 
     /// How long and how it runs on a node styled `style`.
@@ -1796,6 +1800,38 @@ fn inert(el: &mut Element) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_caret_blink_ends_once_a_caret_has_blinked_long_enough() {
+        // `input-otp`'s caret: the compositor runs it, so while it runs the
+        // render thread draws every vblank. It stops, and with it the
+        // drawing, as a text input's caret does.
+        use crate::prelude::*;
+        let mut s = crate::app::Scenario::measuring(
+            || {
+                crate::div()
+                    .width(1.0)
+                    .height(16.0)
+                    .background(crate::Color::BLACK)
+                    .animation(Animation::caret_blink())
+                    .into_element()
+            },
+            40,
+            40,
+            1.0,
+        )
+        .expect("a scenario");
+        s.play_motion();
+        s.settle().unwrap();
+        assert!(s.compositor().animating(1.0), "it blinks");
+        let end = s.pipeline_mut().motion().settles_at();
+        assert!(
+            end.is_some_and(|t| (t - crate::paint::CARET_BLINK_TIMEOUT).abs() < 0.01),
+            "it ends as a text input's caret stops: {end:?}"
+        );
+        s.rest(std::time::Duration::from_secs(20)).unwrap();
+        assert!(!s.compositor().animating(20.0), "ended: nothing to draw");
+    }
 
     #[test]
     fn keyframes_ease_each_segment_and_fill_open_ends_with_the_own_value() {

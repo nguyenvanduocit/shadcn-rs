@@ -281,9 +281,12 @@ pub fn next_deadline() -> Option<Instant> {
 /// provisional source, with no `unsafe`): the moment a blocked
 /// `get_current_texture` returns is a vblank, and what is drawn after it
 /// shows at the next one. The phase is fitted to the last blocked acquires
-/// (outliers past a quarter interval dropped); the interval is the
-/// monitor's refresh rate. When winit or wgpu give a frame event or
-/// presentation feedback, only this changes.
+/// (outliers past a quarter interval dropped), and to nothing else: a
+/// frame that took no texture, or whose acquire failed, woke on a timer,
+/// which is no vblank. On Wayland, where an acquire need not block, frame
+/// callbacks are samples too, and their gaps the interval
+/// ([`Vsync::called_back`]). Elsewhere the interval is the refresh rate of
+/// the monitor the window is on, read again when it may be on another.
 #[derive(Clone, Debug)]
 pub struct Vsync {
     interval: Duration,
@@ -291,7 +294,29 @@ pub struct Vsync {
     samples: std::collections::VecDeque<Instant>,
     /// A vblank, as fitted.
     phase: Option<Instant>,
+    /// Wayland: the last frame callback, and the gaps between the last
+    /// few that came a refresh apart ([`Vsync::called_back`]).
+    called: Option<Instant>,
+    gaps: std::collections::VecDeque<Duration>,
+    /// The refresh the platform reported for the monitor, if it did.
+    reported: Option<Duration>,
 }
+
+/// How many callback gaps the interval is the shortest of.
+const CALLBACK_GAPS: usize = 8;
+/// How many it takes first: one gap may span a refresh the compositor
+/// skipped.
+const CALLBACK_GAPS_LEAST: usize = 3;
+/// The gaps taken for a refresh: 10 Hz to 500 Hz.
+const CALLBACK_GAPS_IN: std::ops::RangeInclusive<Duration> = Duration::from_millis(2)..=Duration::from_millis(100);
+/// How far off the interval may be before the callbacks set it.
+const CALLBACK_TOLERANCE: f64 = 0.03;
+/// How many gaps must agree on a refresh, and within how much.
+const CALLBACK_AGREE: usize = 2;
+const CALLBACK_JITTER: f64 = 0.1;
+/// The slowest refresh the callbacks may show against the monitor's own
+/// (some compositors slow an output; none halves it for one window).
+const CALLBACK_SLOWEST: f64 = 1.5;
 
 /// How many blocked acquires the phase is fitted to.
 const VSYNC_SAMPLES: usize = 16;
@@ -306,6 +331,9 @@ impl Vsync {
             interval: interval.max(Duration::from_millis(1)),
             samples: std::collections::VecDeque::new(),
             phase: None,
+            called: None,
+            gaps: std::collections::VecDeque::new(),
+            reported: None,
         }
     }
 
@@ -322,10 +350,18 @@ impl Vsync {
         self.interval
     }
 
-    /// The display refreshes every `interval` now (another monitor).
+    /// A vblank, as fitted to the acquires; none before the first.
+    #[must_use]
+    pub fn phase(&self) -> Option<Instant> {
+        self.phase
+    }
+
+    /// The platform reports the monitor refreshing every `interval` (it is
+    /// on another): the fit starts afresh, and callbacks are bounded by it.
     pub fn set_interval(&mut self, interval: Duration) {
-        if interval != self.interval {
+        if self.reported != Some(interval) {
             *self = Self::new(interval);
+            self.reported = Some(self.interval);
         }
     }
 
@@ -339,6 +375,67 @@ impl Vsync {
             self.samples.pop_front();
         }
         self.fit();
+    }
+
+    /// A Wayland frame callback came at `at`: the compositor repainted its
+    /// output, a vblank as the window sees it, and a sample of the phase.
+    /// `chained` when the window presented in the refresh before (from the
+    /// callback before this one): the gap between the two is then the
+    /// output's refresh, and the shortest of the last few such gaps sets
+    /// the interval when it is off by more than [`CALLBACK_TOLERANCE`]
+    /// (Wayland tells no window its output's refresh rate otherwise).
+    pub fn called_back(&mut self, at: Instant, chained: bool) {
+        if chained
+            && let Some(last) = self.called
+            && let Some(gap) = at.checked_duration_since(last)
+            && CALLBACK_GAPS_IN.contains(&gap)
+        {
+            self.gaps.push_back(gap);
+            if self.gaps.len() > CALLBACK_GAPS {
+                self.gaps.pop_front();
+            }
+            if let Some(refresh) = self.refresh()
+                && (refresh.as_secs_f64() / self.interval.as_secs_f64() - 1.0).abs() > CALLBACK_TOLERANCE
+            {
+                self.interval = refresh;
+                self.fit();
+            }
+        }
+        self.called = Some(at);
+        self.called = Some(at);
+        self.samples.push_back(at);
+        if self.samples.len() > VSYNC_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.fit();
+    }
+
+    /// The refresh the callback gaps show: the shortest gap at least
+    /// [`CALLBACK_AGREE`] gaps agree with (within [`CALLBACK_JITTER`]), so a
+    /// callback late then one early is no shorter refresh, their mean; and
+    /// within what the monitor reports, when it does: never faster, and
+    /// never as slow as half its rate (a cadence of presents, not of the
+    /// output). None before [`CALLBACK_GAPS_LEAST`] gaps.
+    fn refresh(&self) -> Option<Duration> {
+        if self.gaps.len() < CALLBACK_GAPS_LEAST {
+            return None;
+        }
+        let mut gaps: Vec<f64> = self.gaps.iter().map(Duration::as_secs_f64).collect();
+        gaps.sort_by(f64::total_cmp);
+        let fitted = gaps.iter().find_map(|&g| {
+            let near: Vec<f64> = gaps
+                .iter()
+                .copied()
+                .filter(|&o| o >= g && o <= g * (1.0 + CALLBACK_JITTER))
+                .collect();
+            (near.len() >= CALLBACK_AGREE)
+                .then(|| near.iter().sum::<f64>() / f64::from(u32::try_from(near.len()).unwrap_or(1)))
+        })?;
+        let fitted = Duration::from_secs_f64(fitted);
+        match self.reported {
+            Some(r) if fitted < r.mul_f64(1.0 - CALLBACK_TOLERANCE) || fitted > r.mul_f64(CALLBACK_SLOWEST) => None,
+            _ => Some(fitted),
+        }
     }
 
     /// Fit the phase: each sample's offset from the newest, folded into
@@ -431,5 +528,48 @@ mod tests {
         assert!(advance_to(Duration::from_millis(3200)));
         assert_eq!(*seen.borrow(), [1.0, 2.0, -2.5, 3.0]);
         assert!((frame_time() - 3.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn wayland_frame_callbacks_a_refresh_apart_set_the_interval_and_the_phase() {
+        // Told 60 Hz, on a 144 Hz output: callbacks that came a refresh
+        // apart give the interval; one after the window presented nothing
+        // for a while (not chained) gives none.
+        let mut v = Vsync::new(Duration::from_micros(16_667));
+        let refresh = Duration::from_micros(6_944);
+        let t0 = Instant::now();
+        let at = |n: u32| t0.checked_add(refresh.saturating_mul(n)).unwrap_or(t0);
+        let told = Duration::from_micros(16_667);
+        v.called_back(at(0), false);
+        assert!(v.phase().is_some(), "a callback is a vblank");
+        // A refresh the compositor skipped: two apart.
+        v.called_back(at(2), true);
+        v.called_back(at(3), true);
+        assert_eq!(v.interval(), told, "too few gaps yet");
+        v.called_back(at(9), false);
+        assert_eq!(v.interval(), told, "not chained: no gap");
+        v.called_back(at(10), true);
+        assert_eq!(v.interval(), refresh, "the shortest of the gaps");
+    }
+
+    #[test]
+    fn a_callback_late_then_early_is_no_faster_refresh_nor_beyond_what_the_monitor_reports() {
+        let refresh = Duration::from_micros(16_667);
+        let mut v = Vsync::new(refresh);
+        let t0 = Instant::now();
+        let after = |ms: f64| t0.checked_add(Duration::from_secs_f64(ms / 1000.0)).unwrap_or(t0);
+        // 16.7 ms apart, but one callback 3 ms late: gaps 19.7 then 13.7.
+        for (i, ms) in [0.0, 16.667, 36.333, 50.0, 66.667].into_iter().enumerate() {
+            v.called_back(after(ms), i > 0);
+        }
+        assert_eq!(v.interval(), refresh, "the late one's short gap is jitter");
+        // Reported at 60 Hz: callbacks 33 ms apart (a cadence of presents)
+        // do not halve it.
+        let mut v = Vsync::new(Duration::from_millis(10));
+        v.set_interval(refresh);
+        for n in 0..6_u32 {
+            v.called_back(t0.checked_add(refresh.saturating_mul(2 * n)).unwrap_or(t0), n > 0);
+        }
+        assert_eq!(v.interval(), refresh, "bounded by the monitor's rate");
     }
 }

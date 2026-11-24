@@ -37,7 +37,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowAttributes, WindowId};
 
 use crate::clock;
 use crate::compositor::input_log::{self, Recorder, Routed, Router};
-use crate::compositor::thread::{Feedback, FrameStat, FromRender, Pace, RenderThread, ToRender};
+use crate::compositor::thread::{Feedback, FrameCallbacks, FrameStat, FromRender, Pace, RenderThread, ToRender};
 use crate::compositor::{Commit, Compose, Compositor, MainFrame, Presented};
 use crate::convert::{f64_to_f32, u32_to_f32};
 use crate::events::{ImeEvent, KeyEvent, Modifiers, TouchEvent};
@@ -670,6 +670,8 @@ struct Platform {
     /// `GUI_DECORATIONS` chose who draws them.
     forced: Option<bool>,
     focused: bool,
+    /// The display interval the render thread was last told.
+    interval: Option<Duration>,
 }
 
 /// Open a window titled `title` and run the handler `start` makes, on the
@@ -697,6 +699,7 @@ pub fn run(title: &str, start: impl FnOnce() -> Box<dyn WindowHandler> + Send + 
         chrome: Chrome::default(),
         forced: forced_decorations(),
         focused: true,
+        interval: None,
     };
     event_loop.set_control_flow(ControlFlow::Wait);
     // The platform thread stamps input and feeds the render thread
@@ -764,13 +767,36 @@ fn is_wayland(window: &Window) -> bool {
         .is_ok_and(|h| matches!(h.as_raw(), RawWindowHandle::Wayland(_)))
 }
 
-/// The display interval of the monitor `window` is on (60 Hz when unknown).
-fn interval_of(window: &Window) -> Duration {
-    let mhz = window
-        .current_monitor()
-        .and_then(|m| m.refresh_rate_millihertz())
-        .unwrap_or(60_000);
-    clock::Vsync::from_millihertz(mhz).interval()
+/// Whether the window may be on another display after `event`: moved
+/// (onto another screen of the same scale, which neither resizes nor
+/// rescales it), resized or rescaled (onto one of another scale), or shown
+/// again. Wayland sends no `Moved`; its window learns its output only from
+/// a rescale there.
+fn display_may_change(event: &WindowEvent) -> bool {
+    matches!(
+        event,
+        WindowEvent::Moved(_)
+            | WindowEvent::Resized(_)
+            | WindowEvent::ScaleFactorChanged { .. }
+            | WindowEvent::Occluded(false)
+    )
+}
+
+/// The interval to tell the render thread, the display's being `now` and
+/// `told` what it was told last: only one it was not told, as telling it
+/// any resets its fitted vsync.
+fn retold(told: &mut Option<Duration>, now: Duration) -> Option<Duration> {
+    (*told != Some(now)).then(|| {
+        *told = Some(now);
+        now
+    })
+}
+
+/// The display interval of the monitor `window` is on, when the platform
+/// reports it.
+fn interval_of(window: &Window) -> Option<Duration> {
+    let mhz = window.current_monitor().and_then(|m| m.refresh_rate_millihertz())?;
+    Some(clock::Vsync::from_millihertz(mhz).interval())
 }
 
 /// The input log `GUI_RECORD_INPUT` names, started for `window` (ADR-0015:
@@ -922,16 +948,25 @@ impl Platform {
         event_loop.exit();
     }
 
+    /// The window's size or scale changed: the render thread configures
+    /// its surface to the size at once (a swapchain not the window's size
+    /// is out of date on Vulkan), showing the last frame at its own size
+    /// until the UI commits one laid out at the new size and scale.
     fn resized(&self) {
         let Some(s) = &self.state else { return };
         let size = s.window.inner_size();
         let size = (size.width, size.height);
         s.threads.to_render.send(ToRender::Resize(size)).ok();
-        s.threads
-            .to_render
-            .send(ToRender::Interval(interval_of(&s.window)))
-            .ok();
         s.threads.to_ui.send(ToUi::Resized(size, self.scale())).ok();
+    }
+
+    /// Tell the render thread how often the display the window is on now
+    /// refreshes, when that changed.
+    fn follow_display(&mut self) {
+        let Some(s) = &self.state else { return };
+        if let Some(i) = interval_of(&s.window).and_then(|now| retold(&mut self.interval, now)) {
+            s.threads.to_render.send(ToRender::Interval(i)).ok();
+        }
     }
 
     /// Tell the platform's input method where it may type: on while an
@@ -997,14 +1032,19 @@ impl ApplicationHandler<UserEvent> for Platform {
         };
         let access = accesskit_winit::Adapter::with_event_loop_proxy(event_loop, &window, self.proxy.clone());
         let proxy = self.proxy.clone();
-        let pace = Pace::Surface {
-            callbacks: is_wayland(&window),
-            window: Arc::clone(&window),
+        let callbacks: Option<Arc<dyn FrameCallbacks>> = if is_wayland(&window) {
+            let w: Arc<Window> = Arc::clone(&window);
+            Some(w)
+        } else {
+            None
         };
+        let pace = Pace::Surface { callbacks };
+        // 60 Hz until the platform says (Wayland's frame callbacks then fit it).
+        let reported = interval_of(&window);
         let threads = match spawn(
             gpu,
             pace,
-            interval_of(&window),
+            reported.unwrap_or(Duration::from_micros(16_667)),
             self.title.clone(),
             start,
             Box::new(move |m| {
@@ -1026,6 +1066,8 @@ impl ApplicationHandler<UserEvent> for Platform {
             access,
             threads,
         });
+        // The monitor's own rate, as reported: what bounds the fit.
+        self.follow_display();
         // Sent before the size, so the first frame is laid out with them.
         self.chrome.client = client;
         self.follow_chrome();
@@ -1037,6 +1079,9 @@ impl ApplicationHandler<UserEvent> for Platform {
             state.access.process_event(&state.window, &event);
         }
         let scale = self.scale();
+        if display_may_change(&event) {
+            self.follow_display();
+        }
         match event {
             WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::Focused(focused) => {
@@ -1063,10 +1108,17 @@ impl ApplicationHandler<UserEvent> for Platform {
                 self.follow_chrome();
                 self.resized();
             }
-            // Wayland's frame callback: the render thread may draw again.
+            // On Wayland, the frame callback asked for after a present: the
+            // render thread may draw again. Elsewhere the OS asks for what
+            // the window shows (it was exposed): the next frame presents it.
             WindowEvent::RedrawRequested => {
                 if let Some(s) = &self.state {
-                    s.threads.to_render.send(ToRender::FrameCallback).ok();
+                    let m = if is_wayland(&s.window) {
+                        ToRender::FrameCallback(Instant::now())
+                    } else {
+                        ToRender::Expose
+                    };
+                    s.threads.to_render.send(m).ok();
                 }
             }
             event => {
@@ -1154,7 +1206,6 @@ impl Offscreen {
             Some(Arc::clone(&log)),
         )
         .map_err(|e| e.to_string())?;
-        threads.to_render.send(ToRender::Resize(size)).ok();
         threads.to_ui.send(ToUi::Resized(size, scale)).ok();
         Ok(Self {
             threads,
@@ -1249,6 +1300,30 @@ impl Drop for Offscreen {
 #[cfg(test)]
 mod tests {
     use super::PointerResampler;
+
+    #[test]
+    fn a_moved_window_reads_its_display_again() {
+        // Onto a screen of the same scale and another refresh rate: no
+        // resize, no rescale, and the render thread's interval must follow.
+        let moved = winit::event::WindowEvent::Moved(winit::dpi::PhysicalPosition::new(1920, 0));
+        assert!(super::display_may_change(&moved));
+        assert!(super::display_may_change(&winit::event::WindowEvent::Occluded(false)));
+        assert!(!super::display_may_change(&winit::event::WindowEvent::Occluded(true)));
+        assert!(!super::display_may_change(&winit::event::WindowEvent::Focused(true)));
+    }
+
+    #[test]
+    fn the_render_thread_is_told_the_display_interval_only_when_it_changed() {
+        // Each `Moved` of a drag reads the display again; telling the
+        // render thread the same interval would reset its fitted vsync.
+        let hz60 = std::time::Duration::from_micros(16_667);
+        let hz120 = std::time::Duration::from_micros(8_333);
+        let mut told = Some(hz60);
+        assert_eq!(super::retold(&mut told, hz60), None);
+        assert_eq!(super::retold(&mut told, hz120), Some(hz120));
+        assert_eq!(super::retold(&mut told, hz120), None);
+        assert_eq!(told, Some(hz120));
+    }
 
     /// A handler that writes down each input and the frame shown as it came.
     struct Seen(Vec<String>);

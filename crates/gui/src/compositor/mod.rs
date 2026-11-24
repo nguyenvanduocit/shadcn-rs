@@ -629,8 +629,10 @@ pub struct Compositor {
     index: foldhash::HashMap<ChunkId, usize>,
     scrolls: Scrolls,
     glyphs: Glyphs,
-    /// Drawn over every frame until replaced (the debug overlay, the HUD).
+    /// Drawn over every frame until replaced (the debug overlay, the HUD),
+    /// and its content's generation ([`Self::set_overlay`]).
     overlay: Option<Scene>,
+    overlay_generation: u64,
     /// The last commit applied, and the time it was laid out at.
     commit: u64,
     committed_at: f32,
@@ -671,6 +673,7 @@ impl Compositor {
             scrolls: Scrolls::default(),
             glyphs,
             overlay: None,
+            overlay_generation: 0,
             commit: 0,
             committed_at: 0.0,
             shown: Scene::default(),
@@ -791,8 +794,18 @@ impl Compositor {
         commit.clear();
     }
 
-    /// Replace what is drawn over every frame.
+    /// Replace what is drawn over every frame. The UI sends it with each
+    /// commit, made again or not: its content generation moves only when
+    /// what it shows does, so an overlay unchanged is not drawn again.
     pub fn set_overlay(&mut self, overlay: Option<Scene>) {
+        let same = match (&self.overlay, &overlay) {
+            (Some(a), Some(b)) => same_overlay(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.overlay_generation = self.overlay_generation.wrapping_add(1);
+        }
         self.overlay = overlay;
     }
 
@@ -1043,7 +1056,7 @@ impl Compositor {
         gpu.render(&self.shown, &self.changed, &mut self.glyphs);
         self.changed.clear();
         if let Some(o) = &self.overlay {
-            gpu.overlay(o, &mut self.glyphs);
+            gpu.overlay_as_of(o, self.overlay_generation, &mut self.glyphs);
         }
     }
 
@@ -1232,6 +1245,21 @@ pub fn horizon(ui: std::time::Duration, interval: std::time::Duration) -> std::t
 }
 
 /// Whether a table the UI sends whole differs (the same `Arc` never does).
+/// Whether two overlays show the same: their chunks, drawn at the root
+/// state, paint the same items in order (the same displays, or displays
+/// recorded again alike).
+fn same_overlay(a: &Scene, b: &Scene) -> bool {
+    a.size == b.size
+        && a.scale.to_bits() == b.scale.to_bits()
+        && a.background == b.background
+        && a.chunks.len() == b.chunks.len()
+        && a.chunks.iter().zip(&b.chunks).all(|(x, y)| {
+            x.id == y.id
+                && x.state == y.state
+                && (Arc::ptr_eq(&x.display, &y.display) || x.display.items == y.display.items)
+        })
+}
+
 fn replaced<T: PartialEq>(old: &Arc<[T]>, new: &Arc<[T]>) -> bool {
     !Arc::ptr_eq(old, new) && old != new
 }

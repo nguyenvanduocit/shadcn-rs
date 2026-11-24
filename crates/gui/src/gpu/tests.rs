@@ -695,6 +695,274 @@ fn an_unchanged_scene_submits_nothing() {
     gpu.end_frame();
 }
 
+/// The render thread takes a window texture at each frame's start to wait
+/// for the vblank: a frame that changes nothing still presents nothing,
+/// and keeps the texture for the next that does. A display that was
+/// exposed is shown the canvas again, changed or not.
+#[test]
+fn a_frame_that_changes_nothing_presents_nothing_though_it_holds_a_texture() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    let mut text = Glyphs::for_os();
+    let a = solid(rect(10.0, 10.0, 20.0, 20.0), Color::BLACK);
+    let scene = chunks((64, 64), &[(1, State::default(), &a)]);
+    let frame = |gpu: &mut GpuRenderer, scene: &Scene, text: &mut Glyphs| {
+        assert!(gpu.acquire().is_some(), "a texture, as at a frame's start");
+        gpu.render(scene, &Changed::all(), text);
+        gpu.end_frame();
+        gpu.presents()
+    };
+    assert_eq!(frame(&mut gpu, &scene, &mut text), 1, "the first frame is presented");
+    for _ in 0..3 {
+        assert_eq!(
+            frame(&mut gpu, &scene, &mut text),
+            1,
+            "nothing changed: nothing presented"
+        );
+        assert!(
+            gpu.holds_frame(),
+            "the texture is kept for the next frame that presents"
+        );
+    }
+    gpu.expose();
+    assert_eq!(frame(&mut gpu, &scene, &mut text), 2, "exposed: shown the canvas again");
+    assert_eq!(frame(&mut gpu, &scene, &mut text), 2);
+    let b = solid(rect(10.0, 10.0, 20.0, 20.0), Color::hex(0x2563eb));
+    let changed = chunks((64, 64), &[(1, State::default(), &b)]);
+    assert_eq!(frame(&mut gpu, &changed, &mut text), 3, "damage is presented");
+    assert!(!gpu.holds_frame());
+}
+
+/// A window dragged larger is configured to its new size at once, as
+/// Vulkan on X11 and Win32 wants (a swapchain not the window's size is out
+/// of date there), and the last frame keeps being presented, at its own
+/// size in the corner, until the UI commits one laid out at the new size.
+#[test]
+fn a_window_dragged_larger_is_configured_once_and_presents_before_the_ui_commits() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    gpu.virtual_display().strict = true;
+    let mut text = Glyphs::for_os();
+    let a = solid(rect(10.0, 10.0, 20.0, 20.0), Color::BLACK);
+    let old = chunks((64, 64), &[(1, State::default(), &a)]);
+    let frame = |gpu: &mut GpuRenderer, scene: &Scene, text: &mut Glyphs| {
+        gpu.acquire();
+        gpu.render(scene, &Changed::all(), text);
+        gpu.end_frame();
+    };
+    frame(&mut gpu, &old, &mut text);
+    let configured = gpu.virtual_display().configures;
+    for size in [(80, 72), (96, 80), (128, 96)] {
+        gpu.virtual_display().window = size;
+        gpu.resize(size);
+        // No commit at the new size yet: the old scene again.
+        frame(&mut gpu, &old, &mut text);
+        assert_eq!(gpu.virtual_display().presented.last(), Some(&size), "presented at once");
+    }
+    let shown = gpu.virtual_display().presented.len();
+    frame(&mut gpu, &old, &mut text);
+    assert_eq!(gpu.virtual_display().presented.len(), shown, "and only once");
+    assert_eq!(
+        gpu.virtual_display().configures - configured,
+        3,
+        "configured once a size"
+    );
+    // The UI's frame at the new size presents with no configure.
+    frame(&mut gpu, &chunks((128, 96), &[(1, State::default(), &a)]), &mut text);
+    assert_eq!(gpu.virtual_display().presented.len(), shown + 1);
+    assert_eq!(gpu.virtual_display().configures - configured, 3);
+}
+
+/// The last frame, at its own size in the corner of a window resized: red
+/// where it drew, the window's background (the root's: dark) where a
+/// larger window shows nothing of it, cut where a smaller one ends.
+#[test]
+fn a_resized_window_shows_the_last_frame_in_its_corner_over_the_roots_background() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 48)).expect("a GPU (CI paints on lavapipe)");
+    let mut text = Glyphs::for_os();
+    let dark = Color::hex(0x09090b);
+    let red = Color::hex(0xff0000);
+    let a = solid(rect(0.0, 0.0, 64.0, 48.0), dark);
+    let b = solid(rect(40.0, 30.0, 24.0, 18.0), red);
+    let mut scene = chunks((64, 48), &[(1, State::default(), &a), (2, State::default(), &b)]);
+    scene.background = Some(dark);
+    let frame = |gpu: &mut GpuRenderer, text: &mut Glyphs| {
+        gpu.acquire();
+        gpu.render(&scene, &Changed::all(), text);
+        gpu.end_frame();
+        gpu.read_shown().expect("a frame shown")
+    };
+    frame(&mut gpu, &mut text);
+    let dark_px = [9, 9, 11, 255];
+    gpu.virtual_display().window = (100, 70);
+    gpu.resize((100, 70));
+    let grown = frame(&mut gpu, &mut text);
+    assert_eq!((grown.width(), grown.height()), (100, 70));
+    assert_eq!(at(&grown, 50, 40), [255, 0, 0, 255], "the last frame, in the corner");
+    assert_eq!(
+        at(&grown, 90, 60),
+        dark_px,
+        "beyond it, the root's background, not white"
+    );
+    assert_eq!(at(&grown, 10, 60), dark_px);
+    gpu.virtual_display().window = (48, 36);
+    gpu.resize((48, 36));
+    let shrunk = frame(&mut gpu, &mut text);
+    assert_eq!((shrunk.width(), shrunk.height()), (48, 36));
+    assert_eq!(
+        at(&shrunk, 45, 33),
+        [255, 0, 0, 255],
+        "the corner of the last frame, cut"
+    );
+    assert_eq!(at(&shrunk, 10, 10), dark_px);
+}
+
+/// An overlay over a window resized before the UI laid out at its size is
+/// drawn at the frame's size, in the corner with it: not stretched to the
+/// window's.
+#[test]
+fn an_overlay_over_a_resized_window_stays_with_the_frame_in_its_corner() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    let mut text = Glyphs::for_os();
+    let a = solid(rect(0.0, 0.0, 64.0, 64.0), Color::WHITE);
+    let scene = chunks((64, 64), &[(1, State::default(), &a)]);
+    let o = solid(rect(20.0, 20.0, 10.0, 10.0), Color::hex(0x0000ff));
+    let overlay = chunks((64, 64), &[(9, State::default(), &o)]);
+    gpu.virtual_display().window = (128, 128);
+    gpu.resize((128, 128));
+    gpu.acquire();
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.overlay_as_of(&overlay, 1, &mut text);
+    gpu.end_frame();
+    let shown = gpu.read_shown().expect("a frame shown");
+    assert_eq!(
+        at(&shown, 25, 25),
+        [0, 0, 255, 255],
+        "where the overlay is over the frame"
+    );
+    assert_eq!(
+        at(&shown, 50, 50),
+        [255, 255, 255, 255],
+        "not stretched over the window"
+    );
+}
+
+/// A frame meant to present whose texture could not be taken (the acquire
+/// timed out, at the frame's start and again when drawing) leaves the
+/// presentation owed: the next frame presents, though nothing changed.
+#[test]
+fn a_present_whose_texture_timed_out_is_owed_to_the_next_frame() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    let mut text = Glyphs::for_os();
+    let a = solid(rect(10.0, 10.0, 20.0, 20.0), Color::BLACK);
+    let b = solid(rect(10.0, 10.0, 20.0, 20.0), Color::hex(0x2563eb));
+    let (first, changed) = (
+        chunks((64, 64), &[(1, State::default(), &a)]),
+        chunks((64, 64), &[(1, State::default(), &b)]),
+    );
+    assert!(gpu.acquire().is_some());
+    gpu.render(&first, &Changed::all(), &mut text);
+    gpu.end_frame();
+    assert_eq!(gpu.presents(), 1);
+    assert!(!gpu.owes_present(), "the window shows the canvas");
+    gpu.virtual_display().faults.extend([Fault::Timeout, Fault::Timeout]);
+    assert_eq!(gpu.acquire(), None, "timed out at the frame's start");
+    gpu.render(&changed, &Changed::all(), &mut text);
+    gpu.end_frame();
+    assert_eq!(gpu.presents(), 1, "no texture: nothing presented");
+    assert!(gpu.owes_present(), "the change is owed to the window");
+    assert!(gpu.acquire().is_some());
+    gpu.render(&changed, &Changed::all(), &mut text);
+    gpu.end_frame();
+    assert_eq!(
+        gpu.presents(),
+        2,
+        "the next frame presents it, though nothing changed since"
+    );
+    assert!(!gpu.owes_present());
+}
+
+/// An out-of-date surface is configured again; a lost one is made again
+/// (from its window) and configured: either way the frame gets its texture.
+#[test]
+fn an_outdated_surface_is_configured_again_and_a_lost_one_made_again() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    let configured = gpu.virtual_display().configures;
+    gpu.virtual_display().faults.push_back(Fault::Outdated);
+    assert!(gpu.acquire().is_some(), "outdated: configured and taken again");
+    assert_eq!(gpu.virtual_display().configures - configured, 1);
+    assert_eq!(gpu.virtual_display().remade, 0, "an outdated surface is not made again");
+    let mut text = Glyphs::for_os();
+    let a = solid(rect(10.0, 10.0, 20.0, 20.0), Color::BLACK);
+    gpu.render(
+        &chunks((64, 64), &[(1, State::default(), &a)]),
+        &Changed::all(),
+        &mut text,
+    );
+    gpu.end_frame();
+    gpu.virtual_display().faults.push_back(Fault::Lost);
+    assert!(gpu.acquire().is_some(), "lost: made again and taken");
+    assert_eq!(gpu.virtual_display().remade, 1);
+    assert_eq!(gpu.virtual_display().configures - configured, 2);
+}
+
+/// The vsync is timed by the acquire that gave the texture only: an
+/// out-of-date surface configured slowly before it is no vblank waited for.
+#[test]
+fn the_wait_measured_is_the_acquire_that_gave_the_texture_not_the_configure_before_it() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    let v = gpu.virtual_display();
+    v.configure_takes = std::time::Duration::from_millis(20);
+    v.faults.push_back(Fault::Outdated);
+    let waited = gpu.acquire().expect("a texture after the configure");
+    assert!(
+        waited < std::time::Duration::from_millis(5),
+        "the configure is not a wait for the display: {waited:?}"
+    );
+}
+
+/// An overlay unchanged over frames that change nothing (an animation
+/// holding still) presents nothing; one that changed presents, and so does
+/// one hidden, once.
+#[test]
+fn an_unchanged_overlay_over_an_unchanged_frame_presents_nothing() {
+    let mut gpu = GpuRenderer::with_virtual_window((64, 64)).expect("a GPU (CI paints on lavapipe)");
+    let mut text = Glyphs::for_os();
+    let a = solid(rect(10.0, 10.0, 20.0, 20.0), Color::BLACK);
+    let scene = chunks((64, 64), &[(1, State::default(), &a)]);
+    let o = solid(rect(30.0, 30.0, 10.0, 10.0), Color::hex(0x2563eb));
+    let overlay = chunks((64, 64), &[(9, State::default(), &o)]);
+    let frame = |gpu: &mut GpuRenderer, generation: Option<u64>, text: &mut Glyphs| {
+        gpu.acquire();
+        gpu.render(&scene, &Changed::all(), text);
+        if let Some(g) = generation {
+            gpu.overlay_as_of(&overlay, g, text);
+        }
+        gpu.end_frame();
+        gpu.presents()
+    };
+    assert_eq!(frame(&mut gpu, Some(1), &mut text), 1);
+    for _ in 0..3 {
+        assert_eq!(
+            frame(&mut gpu, Some(1), &mut text),
+            1,
+            "the same overlay: nothing presented"
+        );
+    }
+    assert_eq!(frame(&mut gpu, Some(2), &mut text), 2, "another overlay is presented");
+    assert_eq!(frame(&mut gpu, None, &mut text), 3, "hidden: presented once");
+    assert_eq!(frame(&mut gpu, None, &mut text), 3);
+}
+
+/// A machine with two GPUs draws the UI on the one that uses least power,
+/// unless `WGPU_POWER_PREF` says otherwise.
+#[test]
+fn the_adapter_asked_for_uses_least_power() {
+    if std::env::var_os("WGPU_POWER_PREF").is_some() {
+        eprintln!("WGPU_POWER_PREF is set: skipped");
+        return;
+    }
+    assert_eq!(adapter_options(None).power_preference, wgpu::PowerPreference::LowPower);
+}
+
 /// Golden damage: a chunk recorded again redraws its rectangle, its
 /// anti-aliased edge included, and nothing else; a moved one its old and
 /// new places; the canvas then is what a whole redraw gives.

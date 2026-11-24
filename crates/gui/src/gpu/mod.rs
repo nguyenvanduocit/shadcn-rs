@@ -22,7 +22,8 @@
 //! - the frame, in a canvas texture: a frame redraws only what changed
 //!   ([`damage`]), scissored, over what the canvas holds, and is copied to
 //!   the window's surface by one triangle. A frame with nothing changed
-//!   submits nothing;
+//!   submits and presents nothing, even with a frame texture taken to wait
+//!   for the vblank ([`Window`]);
 //! - effect layers: an effect gets a layer of its own only when it needs one
 //!   (a filter, a mask, a fade over primitives that overlap, a transform of
 //!   what cannot be drawn transformed); else its opacity is multiplied into
@@ -120,12 +121,257 @@ impl Default for GpuOptions {
 }
 
 /// A window's surface and the frame being drawn into it.
+///
+/// A frame texture is presented only when the frame copied the canvas onto
+/// it ([`Window::blitted`]): when its damage was not empty, an overlay came
+/// or went, or the display does not show the canvas ([`Window::stale`]).
+/// One taken for a frame that changed nothing (the render thread takes one
+/// at each frame's start to wait for the vblank) is kept for the next frame
+/// that does: never presented unchanged, and never handed back, which
+/// Vulkan cannot do (wgpu's discard leaves the image acquired).
 struct Window {
-    surface: wgpu::Surface<'static>,
+    surface: Surface,
     config: wgpu::SurfaceConfiguration,
-    frame: Option<wgpu::SurfaceTexture>,
+    frame: Option<Frame>,
     /// The canvas was copied onto this frame's texture.
     blitted: bool,
+    /// What the display shows is not the canvas as last presented: the
+    /// surface was configured (made, resized, made again for a new device,
+    /// out of date) or shown again after it was hidden. The next frame
+    /// presents the canvas, damage or not.
+    stale: bool,
+    /// The last ask for a texture said the window cannot be shown.
+    occluded: bool,
+    /// Frames presented since the renderer was made.
+    presents: u64,
+}
+
+/// Where a window's frames go.
+enum Surface {
+    /// The OS's, and the window it was made for: a surface lost is made
+    /// again from it.
+    Os {
+        surface: wgpu::Surface<'static>,
+        window: Arc<winit::window::Window>,
+    },
+    /// A display with no OS behind it (tests).
+    #[cfg(test)]
+    Virtual(Virtual),
+}
+
+/// What taking a surface's next texture gave.
+enum Taken {
+    Frame(Frame),
+    /// Configured otherwise than the window now is: configure it again.
+    Outdated,
+    /// Gone (the OS let go of it): make it again.
+    Lost,
+    /// The window cannot be shown (minimized, covered): none until it can.
+    Occluded,
+    /// None now (a timeout).
+    None,
+}
+
+/// A display with no OS behind it, for tests: a window of a size, the
+/// textures it hands out, the faults it is told to give, and what was done
+/// to it.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct Virtual {
+    /// The window's size, as the OS has it.
+    pub window: (u32, u32),
+    /// As Vulkan on X11 and Win32: a texture only while configured to the
+    /// window's size, else out of date.
+    pub strict: bool,
+    /// What the next takes give before a texture, one each.
+    pub faults: std::collections::VecDeque<Fault>,
+    /// How long a configure takes, and an ask for a texture.
+    pub configure_takes: std::time::Duration,
+    pub acquire_takes: std::time::Duration,
+    pub configures: u32,
+    /// Times it was made again after it was lost.
+    pub remade: u32,
+    /// The size of each frame presented.
+    pub presented: Vec<(u32, u32)>,
+    /// The last frame presented, to read back.
+    pub shown: Option<wgpu::Texture>,
+}
+
+/// A fault a [`Virtual`] display gives instead of a texture.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Fault {
+    Outdated,
+    Lost,
+    Timeout,
+    Occluded,
+}
+
+/// A frame texture taken from a [`Surface`].
+enum Frame {
+    Os(wgpu::SurfaceTexture),
+    #[cfg(test)]
+    Virtual(wgpu::Texture),
+}
+
+impl Frame {
+    fn texture(&self) -> &wgpu::Texture {
+        match self {
+            Self::Os(t) => &t.texture,
+            #[cfg(test)]
+            Self::Virtual(t) => t,
+        }
+    }
+}
+
+impl Window {
+    /// Configure the surface as `config` says: a texture held is dropped
+    /// first, and the display shows nothing of the canvas until the next
+    /// present.
+    fn configure(&mut self, device: &wgpu::Device) {
+        self.frame = None;
+        self.blitted = false;
+        self.stale = true;
+        match &mut self.surface {
+            Surface::Os { surface, .. } => surface.configure(device, &self.config),
+            #[cfg(test)]
+            Surface::Virtual(v) => {
+                std::thread::sleep(v.configure_takes);
+                v.configures = v.configures.saturating_add(1);
+            }
+        }
+    }
+
+    /// The surface's size, as configured.
+    fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// Configure it to `size` physical pixels, when it is not already.
+    fn resize(&mut self, device: &wgpu::Device, size: (u32, u32)) {
+        let size = (size.0.max(1), size.1.max(1));
+        if self.size() != size {
+            self.config.width = size.0;
+            self.config.height = size.1;
+            self.configure(device);
+        }
+    }
+
+    /// Ask the surface for its next texture once, and how long that took.
+    fn try_take(&mut self, device: &wgpu::Device) -> (Taken, std::time::Duration) {
+        let asked = std::time::Instant::now();
+        let taken = match &mut self.surface {
+            Surface::Os { surface, .. } => match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                    Taken::Frame(Frame::Os(t))
+                }
+                wgpu::CurrentSurfaceTexture::Outdated => Taken::Outdated,
+                wgpu::CurrentSurfaceTexture::Lost => Taken::Lost,
+                wgpu::CurrentSurfaceTexture::Occluded => Taken::Occluded,
+                _ => Taken::None,
+            },
+            #[cfg(test)]
+            Surface::Virtual(v) => match {
+                std::thread::sleep(v.acquire_takes);
+                v.faults.pop_front()
+            } {
+                Some(Fault::Outdated) => Taken::Outdated,
+                Some(Fault::Lost) => Taken::Lost,
+                Some(Fault::Timeout) => Taken::None,
+                Some(Fault::Occluded) => Taken::Occluded,
+                None if v.strict && v.window != (self.config.width, self.config.height) => Taken::Outdated,
+                None => Taken::Frame(Frame::Virtual(device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("gui virtual surface"),
+                    size: wgpu::Extent3d {
+                        width: self.config.width,
+                        height: self.config.height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: self.config.format,
+                    usage: self.config.usage,
+                    view_formats: &[],
+                }))),
+            },
+        };
+        #[cfg(not(test))]
+        let _ = device;
+        (taken, asked.elapsed())
+    }
+
+    /// The surface's next texture, waiting for one if none is free, and how
+    /// long the ask that gave it waited (not what recovering took first):
+    /// an out-of-date surface is configured again, a lost one made again.
+    fn take(&mut self, device: &wgpu::Device) -> Option<(Frame, std::time::Duration)> {
+        let mut recovered = false;
+        loop {
+            match self.try_take(device) {
+                (Taken::Frame(f), waited) => {
+                    self.occluded = false;
+                    return Some((f, waited));
+                }
+                (Taken::Occluded, _) => {
+                    self.occluded = true;
+                    return None;
+                }
+                (Taken::Outdated, _) if !recovered => self.configure(device),
+                (Taken::Lost, _) if !recovered => {
+                    if !self.remake() {
+                        return None;
+                    }
+                    self.configure(device);
+                }
+                _ => return None,
+            }
+            recovered = true;
+        }
+    }
+
+    /// Make the surface again for its window, after the OS let go of it;
+    /// whether it was.
+    fn remake(&mut self) -> bool {
+        match &mut self.surface {
+            Surface::Os { surface, window } => match instance().create_surface(Arc::clone(window)) {
+                Ok(fresh) => {
+                    self.frame = None;
+                    *surface = fresh;
+                    true
+                }
+                Err(e) => {
+                    eprintln!("the window's surface was lost and cannot be made again: {e}");
+                    false
+                }
+            },
+            #[cfg(test)]
+            Surface::Virtual(v) => {
+                v.remade = v.remade.saturating_add(1);
+                true
+            }
+        }
+    }
+
+    /// Present the frame held, when the canvas was copied onto it.
+    fn present(&mut self, queue: &wgpu::Queue) {
+        if !self.blitted {
+            return;
+        }
+        let Some(frame) = self.frame.take() else { return };
+        self.blitted = false;
+        self.stale = false;
+        self.presents = self.presents.saturating_add(1);
+        match frame {
+            Frame::Os(t) => queue.present(t),
+            #[cfg(test)]
+            Frame::Virtual(t) => {
+                if let Surface::Virtual(v) = &mut self.surface {
+                    v.presented.push((t.width(), t.height()));
+                    v.shown = Some(t);
+                }
+            }
+        }
+    }
 }
 
 /// The frame as drawn, kept across frames: only damage is drawn into it.
@@ -432,6 +678,9 @@ pub struct GpuRenderer {
     drawn: Drawn,
     /// An overlay was drawn over this frame, and over the last.
     overlaid: (bool, bool),
+    /// The content generation of the overlay last drawn over the window
+    /// ([`Self::overlay_as_of`]).
+    overlay_shown: Option<u64>,
     frame: u64,
 }
 
@@ -459,15 +708,10 @@ impl GpuRenderer {
         let instance = instance();
         let size = window.inner_size();
         let surface = instance
-            .create_surface(window)
+            .create_surface(Arc::clone(&window))
             .map_err(|e| GpuError(format!("surface: {e}")))?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            ..Default::default()
-        }))
-        .map_err(|e| GpuError(format!("adapter: {e}")))?;
+        let adapter = pollster::block_on(instance.request_adapter(&adapter_options(Some(&surface))))
+            .map_err(|e| GpuError(format!("adapter: {e}")))?;
         let caps = surface.get_capabilities(&adapter);
         // Blending happens in the sRGB-encoded values, as browsers blend:
         // never an sRGB view, which would blend in linear light.
@@ -497,14 +741,67 @@ impl GpuRenderer {
             view_formats: vec![],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
-        surface.configure(&renderer.device, &config);
-        renderer.window = Some(Window {
-            surface,
+        let mut window = Window {
+            surface: Surface::Os { surface, window },
             config,
             frame: None,
             blitted: false,
-        });
+            stale: true,
+            occluded: false,
+            presents: 0,
+        };
+        window.configure(&renderer.device);
+        renderer.window = Some(window);
         Ok(renderer)
+    }
+
+    /// A headless renderer with a window whose display has no OS behind it
+    /// (tests): its frames are presented as a window's are.
+    #[cfg(test)]
+    pub(crate) fn with_virtual_window(size: (u32, u32)) -> Result<Self, GpuError> {
+        let mut renderer = Self::headless()?;
+        let mut window = Window {
+            surface: Surface::Virtual(Virtual {
+                window: size,
+                ..Virtual::default()
+            }),
+            config: wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                format: renderer.format,
+                width: size.0.max(1),
+                height: size.1.max(1),
+                present_mode: wgpu::PresentMode::AutoVsync,
+                desired_maximum_frame_latency: 1,
+                alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+                view_formats: vec![],
+                color_space: wgpu::SurfaceColorSpace::Auto,
+            },
+            frame: None,
+            blitted: false,
+            stale: true,
+            occluded: false,
+            presents: 0,
+        };
+        window.configure(&renderer.device);
+        renderer.window = Some(window);
+        Ok(renderer)
+    }
+
+    /// Its virtual window's display (tests), to set faults on and read
+    /// what was done to it.
+    #[cfg(test)]
+    pub(crate) fn virtual_display(&mut self) -> &mut Virtual {
+        match self.window.as_mut().map(|w| &mut w.surface) {
+            Some(Surface::Virtual(v)) => v,
+            _ => panic!("no virtual window"),
+        }
+    }
+
+    /// What its virtual window shows: the last frame presented, read back.
+    #[cfg(test)]
+    pub(crate) fn read_shown(&mut self) -> Option<Pixels> {
+        let t = self.virtual_display().shown.clone()?;
+        self.read_back(&t, (t.width(), t.height()))
     }
 
     /// A renderer with no window: it draws into its canvas, and
@@ -524,7 +821,7 @@ impl GpuRenderer {
     /// As [`Self::headless`].
     pub fn headless_with(options: GpuOptions) -> Result<Self, GpuError> {
         let instance = instance();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        let adapter = pollster::block_on(instance.request_adapter(&adapter_options(None)))
             .map_err(|e| GpuError(format!("adapter: {e}")))?;
         Self::with_adapter(
             &instance,
@@ -573,12 +870,12 @@ impl GpuRenderer {
     /// When no adapter or device answers yet (the GPU is still resetting);
     /// it is left as it was, to try again.
     pub fn rebuild(&mut self) -> Result<(), GpuError> {
-        let compatible = self.window.as_ref().map(|w| &w.surface);
-        let adapter = pollster::block_on(self.instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: compatible,
-            ..Default::default()
-        }))
-        .map_err(|e| GpuError(format!("adapter: {e}")))?;
+        let compatible = match self.window.as_ref().map(|w| &w.surface) {
+            Some(Surface::Os { surface, .. }) => Some(surface),
+            _ => None,
+        };
+        let adapter = pollster::block_on(self.instance.request_adapter(&adapter_options(compatible)))
+            .map_err(|e| GpuError(format!("adapter: {e}")))?;
         let mut fresh = Self::with_adapter(
             &self.instance,
             &adapter,
@@ -588,9 +885,7 @@ impl GpuRenderer {
         )?;
         if let Some(mut w) = self.window.take() {
             // A texture of the lost device is never presented.
-            w.frame = None;
-            w.blitted = false;
-            w.surface.configure(&fresh.device, &w.config);
+            w.configure(&fresh.device);
             fresh.window = Some(w);
         }
         fresh.frame = self.frame;
@@ -1069,6 +1364,7 @@ impl GpuRenderer {
             rasters: 0,
             drawn: Drawn::default(),
             overlaid: (false, false),
+            overlay_shown: None,
             device,
             queue,
             format,
@@ -1087,56 +1383,90 @@ impl GpuRenderer {
         })
     }
 
-    /// Make the window's surface `size` physical pixels.
+    /// The window is `size` physical pixels now: its surface is configured
+    /// to it at once, as Vulkan on X11 and Win32 requires (a swapchain the
+    /// window's size, or none). Until the UI commits a frame laid out at
+    /// the new size and scale, the last one is shown at its own size, in
+    /// the corner, the rest the root's background (the blit's pass):
+    /// never stretched, never a scene drawn at one scale into another.
     pub fn resize(&mut self, size: (u32, u32)) {
-        let Some(w) = self.window.as_mut() else { return };
-        let size = (size.0.max(1), size.1.max(1));
-        if (w.config.width, w.config.height) != size {
-            w.frame = None;
-            w.blitted = false;
-            w.config.width = size.0;
-            w.config.height = size.1;
-            w.surface.configure(&self.device, &w.config);
+        if let Some(w) = self.window.as_mut() {
+            w.resize(&self.device, size);
         }
+    }
+
+    /// Paint the overlay `scene`, whose content is `generation` (a new
+    /// one each time what it shows changes), over the window's frame: drawn
+    /// again only when its content changed or the frame presents anyway.
+    pub fn overlay_as_of(&mut self, scene: &Scene, generation: u64, text: &mut Glyphs) {
+        self.overlay_scene(scene, Some(generation), text);
+    }
+
+    /// The window was shown again after it was hidden: the next frame
+    /// presents the canvas, changed or not.
+    pub fn expose(&mut self) {
+        if let Some(w) = self.window.as_mut() {
+            w.stale = true;
+        }
+    }
+
+    /// Whether the window does not show the canvas as it is: a frame
+    /// meant to present could not (no texture), or the surface was
+    /// configured or exposed since. The next frame presents.
+    pub(crate) fn owes_present(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.stale)
+    }
+
+    /// Whether the window's surface said, at the last ask for a texture,
+    /// that it cannot be shown (wgpu's `Occluded`: minimized, covered).
+    pub(crate) fn occluded(&self) -> bool {
+        self.window.as_ref().is_some_and(|w| w.occluded)
+    }
+
+    /// Frames presented to the window since the renderer was made.
+    #[must_use]
+    pub fn presents(&self) -> u64 {
+        self.window.as_ref().map_or(0, |w| w.presents)
     }
 
     /// Take the window's next frame texture now, waiting for the display
     /// if it has none free (ADR-0015: the render thread's vsync); how long
-    /// it waited, or `None` with no window or no texture. The frame is
-    /// presented when it ends, drawn into or not.
+    /// it waited, or `None` with no window or no texture. It is presented
+    /// at the end of the first frame that changes what the window shows,
+    /// and held until then ([`Window`]).
     pub fn acquire(&mut self) -> Option<std::time::Duration> {
         let before = self.waited;
         self.window_view()?;
         Some(self.waited.saturating_sub(before))
     }
 
-    /// Whether a window frame texture is held for this frame.
-    fn holds_frame(&self) -> bool {
+    /// Whether a window frame texture is held: taken, and not presented
+    /// yet. Nothing presented is waiting for the display then, so taking
+    /// another would not wait for a vblank.
+    pub(crate) fn holds_frame(&self) -> bool {
         self.window.as_ref().is_some_and(|w| w.frame.is_some())
     }
 
-    /// The window's frame texture, taken from the surface when first asked for in a frame.
+    /// Whether the frame drawn is presented when it ends: the canvas was
+    /// copied onto the texture held, or is to be over an overlay gone.
+    pub(crate) fn presenting(&self) -> bool {
+        let gone = self.overlaid.1 && !self.overlaid.0 && self.canvas.is_some();
+        self.window
+            .as_ref()
+            .is_some_and(|w| (w.blitted && w.frame.is_some()) || gone)
+    }
+
+    /// The window's frame texture, taken from the surface when first asked for.
     fn window_view(&mut self) -> Option<wgpu::TextureView> {
         let w = self.window.as_mut()?;
         if w.frame.is_none() {
-            let asked = std::time::Instant::now();
-            let texture = match w.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                    w.surface.configure(&self.device, &w.config);
-                    match w.surface.get_current_texture() {
-                        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => t,
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            };
-            w.frame = Some(texture);
+            let (frame, waited) = w.take(&self.device)?;
+            w.frame = Some(frame);
             w.blitted = false;
-            self.waited = self.waited.saturating_add(asked.elapsed());
+            self.waited = self.waited.saturating_add(waited);
         }
         let frame = w.frame.as_ref()?;
-        Some(frame.texture.create_view(&wgpu::TextureViewDescriptor::default()))
+        Some(frame.texture().create_view(&wgpu::TextureViewDescriptor::default()))
     }
 
     /// The canvas, `size` and cleared to `background`: made anew (and so
@@ -1535,15 +1865,17 @@ impl Renderer for GpuRenderer {
     }
 
     fn overlay(&mut self, scene: &Scene, text: &mut Glyphs) {
-        self.overlay_scene(scene, text);
+        self.overlay_scene(scene, None, text);
     }
 
     fn end_frame(&mut self) {
-        if let Some(w) = self.window.as_mut()
-            && let Some(frame) = w.frame.take()
-        {
-            w.blitted = false;
-            self.queue.present(frame);
+        // The overlay shown last frame is gone: the canvas covers it again.
+        let gone = self.overlaid.1 && !self.overlaid.0;
+        if gone && self.canvas.is_some() && self.window.as_ref().is_some_and(|w| !w.blitted) {
+            self.blit();
+        }
+        if let Some(w) = self.window.as_mut() {
+            w.present(&self.queue);
         }
         self.images.end_frame();
         self.paths.end_frame();
@@ -1666,6 +1998,19 @@ fn module(
         label: Some(label),
         source: wgpu::ShaderSource::Wgsl(source.into()),
     })
+}
+
+/// How an adapter is chosen, for `surface` when there is one: the one that
+/// uses least power (the integrated GPU of a machine with two), as browsers
+/// draw their UI, unless `WGPU_POWER_PREF` says otherwise. Left to `None`,
+/// wgpu takes the first adapter that qualifies, which may be the discrete
+/// GPU: powered up, and kept up, for a UI that needs none of it.
+fn adapter_options<'a>(surface: Option<&'a wgpu::Surface<'static>>) -> wgpu::RequestAdapterOptions<'a, 'static> {
+    wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::LowPower),
+        compatible_surface: surface,
+        ..wgpu::RequestAdapterOptions::default()
+    }
 }
 
 /// Metal, Vulkan and DX12 only (`WGPU_BACKEND` may narrow them): no OpenGL.

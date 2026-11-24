@@ -218,6 +218,14 @@ impl Pipeline {
         f();
     }
 
+    /// The window gains (`true`) or loses the keyboard focus: what reads
+    /// it ([`crate::interact::window_active`]) and the carets, which show
+    /// and blink only in the active window, follow at the next frame.
+    pub(crate) fn set_window_active(&mut self, active: bool) {
+        self.painter.set_window_active(active);
+        crate::interact::set_window_active(active);
+    }
+
     pub fn toggle_overlay(&mut self) {
         self.overlay = !self.overlay;
     }
@@ -560,7 +568,8 @@ impl Pipeline {
         );
         let ((), recorded) = heap::measure(|| {
             reactive::in_phase(reactive::Phase::Paint, false, || {
-                paint.track(|| painter.record(frame, text, size, scale, Color::WHITE, full, &mut commit));
+                let background = crate::paint::window_background(frame, size, scale, Color::WHITE);
+                paint.track(|| painter.record(frame, text, size, scale, background, full, &mut commit));
             });
         });
         let shaped = self.text.take_shaped();
@@ -715,7 +724,8 @@ impl Pipeline {
                 &mut self.text,
                 Some(&self.tree),
             );
-            let scene = crate::paint::Painter::cold(&cold, &mut self.text, size, scale, Color::WHITE);
+            let background = crate::paint::window_background(&cold, size, scale, Color::WHITE);
+            let scene = self.painter.cold(&cold, &mut self.text, size, scale, background);
             let live = self.tree.frame();
             (
                 inspect::diff(&live.nodes, &cold.nodes),
@@ -1177,7 +1187,7 @@ impl WindowHandler for Live {
     }
 
     fn chrome(&mut self, chrome: Chrome) -> bool {
-        crate::interact::set_window_active(chrome.active);
+        self.pipeline.set_window_active(chrome.active);
         self.chrome.set(chrome);
         true
     }
@@ -1684,7 +1694,7 @@ impl Scenario {
     /// The window gains (`true`) or loses the keyboard focus, as the
     /// platform's focus event says ([`crate::interact::window_active`]).
     pub fn set_window_active(&mut self, active: bool) {
-        crate::interact::set_window_active(active);
+        self.pipeline.set_window_active(active);
     }
 
     /// Move the pointer to `(x, y)`.

@@ -222,8 +222,69 @@ compositing tables), `interact.rs` (`shift_of`, `hit_shifted`, `apply_scroll`), 
   immediate deadline), this showed 18 of 20 clicks within the goal against 12–16, and no more missed ticks. When input wakes everything up,
   the token is granted at once, not at the next vblank. The deadline is
   `present − margin`, where the margin is the worst draw cost of the last 32 frames (waking late included) plus
-  1 ms, between 3 ms and half an interval. When nothing moves the render thread sleeps on its channel. On Wayland it
-  draws again only after the frame callback (`pre_present_notify`, `request_redraw`, `RedrawRequested`).
+  1 ms, between 3 ms and half an interval. When nothing moves the render thread sleeps on its channel.
+
+  **When it waits for a vblank, and when for a deadline (M15).**
+
+  - A frame begins with a texture taken (`GpuRenderer::acquire`). The acquire blocks only while the last present waits
+    for its vblank. That block is the vblank wait, and its length is the vsync sample.
+  - A frame that changes nothing presents nothing. It keeps (holds) the texture it took, because Vulkan cannot hand
+    one back (wgpu's discard leaves the image acquired). The next frame then takes no texture, waits for no vblank,
+    and is paced only by its deadline.
+  - Each frame is drawn for a vblank (`RenderThread::aim`): the first it can make, never one a frame that presented
+    or took a texture was drawn for (`reserved`). A main frame granted while the thread slept is granted for the same
+    vblank the frame will be drawn for, by the same rule. It is not granted for T while the frame draws for T + 1.
+  - A frame that presented nothing and took no texture reserves nothing (`blank`). The next frame is drawn for that
+    vblank again only if something new comes before its deadline (a wheel, a commit, a main frame asked for).
+    Otherwise it is drawn for the vblank after. So idle frames are not drawn again and again for one vblank.
+  - Only the ask that gave the texture is timed. Configuring an out-of-date surface (or making a lost one again)
+    before it is not a vblank. Neither is a frame whose acquire failed, which woke on a timer.
+
+  **Pending presentation.** A frame meant to present whose texture could not be taken leaves the presentation owed:
+  - the timeout came at the start and again when drawing (`Window::stale`, `GpuRenderer::owes_present`);
+  - the thread keeps it as `retry`, apart from `dirty` (what came and is not drawn yet). The next frame presents the
+    canvas, damage or not;
+  - a retry is not news (`news_until`): that frame waits for the next vblank, so a window whose acquires keep failing
+    does not spin. A commit or wheel that came before a frame's deadline is news, whether the frame's own wait or the
+    thread's turn (`serve`) took it in;
+  - input stays stamped with the frame the window shows: the `Presented` snapshot is published only when the frame
+    left nothing owed.
+
+  An out-of-date surface is configured again. A lost one is made again from its window, then configured. A surface
+  that says the window cannot be shown (wgpu's `Occluded`: minimized, covered) is not a timeout. Nothing more is tried
+  until the window is shown, exposed or resized, or a second passes (`OCCLUDED_PROBE`). That try is no frame: nothing
+  is logged or counted for it. Resizes that come together configure the surface once, at the last size.
+
+  A main frame granted while the thread slept is for the vblank `aim` gives then. The frame drawn next keeps that
+  vblank (`granted_for`) however long its acquire takes, so the UI's motion and the compositor's sample one time,
+  phase fitted or not.
+
+  **Wayland.**
+  - A frame callback is asked for with each present (`pre_present_notify` before it, `request_redraw` after). A present
+    predicted and not made (its texture could not be taken) waits for no callback.
+  - The thread draws again only once it comes (`RedrawRequested`, `ToRender::FrameCallback(at)`).
+  - Each callback is a vsync sample. A gap between two callbacks samples the refresh only when the window presented
+    right after the first one, within the same refresh (`chained`). A present after the window idled (every third
+    refresh for a key repeat) or a probe present samples nothing, so the interval never locks onto a present cadence.
+  - With at least 3 gaps, the refresh is the shortest gap that another agrees with (within 10%), averaged with it: one
+    callback late then one early is jitter, not a faster refresh. It sets the interval when it is off by more than 3%.
+  - When winit reports the monitor's rate, the fit is bounded by it: never faster, never more than 1.5 times slower.
+    Otherwise the interval starts at 60 Hz, and the callbacks alone set it.
+  - winit commits no surface without a present, so a window whose frames present nothing would ask for no callback,
+    and a hidden window would never be known as one. After 8 frames in a row that present nothing, one presents
+    anyway (`WAYLAND_PROBE`). The thread then sleeps until its callback: on a hidden window, until it is shown.
+  - The probe's cost: an idle window that still animates to no effect (a held animation) presents one unchanged frame
+    every 9 vblanks, about 7 a second at 60 Hz: one blit of the canvas and one compositor repaint each. A window with
+    nothing to draw sleeps and probes nothing.
+
+  **Not testable headless.** Real Wayland frame callbacks, and a compositor withholding them from a hidden window,
+  are tested only through a fake `FrameCallbacks`. Not tested at all:
+  - real swapchain extents under Vulkan on X11 and Win32 (the virtual surface's strict mode stands in);
+  - Metal drawables and their one-second acquire timeout;
+  - the refresh rate read again after a `Moved` onto another monitor.
+
+  **Input snapshot.** Input is stamped with the frame on screen as it came (`Presented`, swapped by the render thread
+  after each frame). The UI routes a click by the frame the user saw, not the one being drawn.
 
 **Commit.**
 
@@ -324,7 +385,19 @@ compositing tables), `interact.rs` (`shift_of`, `hit_shifted`, `apply_scroll`), 
 - `clock::Vsync`:
   - blocked acquires (longer than 0.5 ms) are vblanks;
   - the phase is fitted to the last 16, dropping those more than a quarter interval from their median;
-  - the interval comes from `refresh_rate_millihertz`.
+  - the interval comes from `refresh_rate_millihertz`, read again after `Moved`, `Resized`, `ScaleFactorChanged`
+    and `Occluded(false)`, and sent to the render thread only when it changed (sending it resets the fit). On
+    Wayland it also comes from frame-callback gaps.
+- A window resized has its surface configured to the new size at once (`ToRender::Resize`): a swapchain not the
+  window's size is out of date on Vulkan. Until the UI commits a frame laid out at the new size and scale, the last
+  frame is shown at its own size in the corner, and the rest is cleared to the root's background (the root's own
+  colour when it paints the whole window opaque, `paint::window_background`, else white). An overlay is drawn at the
+  frame's size there too, in the same corner. It is never
+  stretched, and no scene is drawn at one scale into another.
+- A focused caret blinks for 10 s from its last change (`paint::CARET_BLINK_TIMEOUT`, GTK's
+  `gtk-cursor-blink-timeout`), then stays shown, and nothing wakes for it. It shows and blinks only in the active
+  window (Blink's `FocusedOrActiveStateChanged`). The window gaining focus again, even between two frames, restarts
+  it. `input-otp`'s caret (a compositor animation) ends after the same 10 s and shows only in the active window.
 - Drags are resampled on the UI thread (`window::PointerResampler`):
   - one move a frame, at `present − 5 ms`;
   - interpolated, or extrapolated at most `min(8 ms, half the gap)`;
