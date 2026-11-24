@@ -12,11 +12,13 @@ use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
 use gui::{Color, provide, use_context};
-use irosashi::{CodeToTokensOptions, Highlighter};
+use irosashi::{CodeToTokensOptions, Highlighter, HighlighterBuilder};
 
 use super::{CodeBlockLine, CodeBlockLineVariant};
 
 mod ansi;
+#[cfg(test)]
+mod tests;
 
 /// One token of a highlighted line: its text and its colour in each theme.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -110,12 +112,45 @@ struct State {
 fn highlighting() -> Highlighting {
     use_context::<Highlighting>().unwrap_or_else(|| {
         let h = Highlighting(Rc::new(State {
-            highlighter: Highlighter::new().ok(),
+            highlighter: build_highlighter(),
             kept: RefCell::new(HashMap::new()),
         }));
         provide(h.clone());
         h
     })
+}
+
+/// The grammars and themes the code block uses, as irosashi's files (vendored in `assets/irosashi/`, see its
+/// PROVENANCE.md). irosashi's own bundle (257 grammars, 65 themes, 8.6 MB) is not taken.
+///
+/// The rule: the code block colours shadcn-vue's languages plus Rust, and the grammars those embed or take injected
+/// (`html` embeds `css` and `javascript`, `vue` its template and directives, `markdown-vue` a Vue fence in Markdown,
+/// `es-tag-*` tagged templates), and nothing else. shadcn-vue's own highlighter ships exactly these languages, so
+/// `scss` inside Vue or a `c` fence in Markdown is uncoloured there too, and here.
+mod assets {
+    macro_rules! files {
+        ($dir:literal: $($name:literal),+ $(,)?) => {
+            &[$(($name, include_bytes!(concat!("../../assets/irosashi/", $dir, "/", $name, ".json")))),+]
+        };
+    }
+
+    pub(super) const GRAMMARS: &[(&str, &[u8])] = files!("grammars":
+        "css", "diff", "es-tag-css", "es-tag-html", "es-tag-sql", "html", "html-derivative", "javascript", "json",
+        "jsx", "markdown", "markdown-vue", "python", "rust", "shellscript", "sql", "tsx", "typescript", "vue",
+        "vue-directives", "vue-interpolations", "yaml");
+    pub(super) const THEMES: &[(&str, &[u8])] = files!("themes": "github-dark", "github-light");
+}
+
+/// A highlighter over exactly the grammars and themes in `assets`, none of irosashi's bundle.
+fn build_highlighter() -> Option<Highlighter> {
+    let highlighter = HighlighterBuilder::without_bundled_assets().build().ok()?;
+    for (name, json) in assets::GRAMMARS {
+        highlighter.load_language(name, *json).ok()?;
+    }
+    for (name, json) in assets::THEMES {
+        highlighter.load_theme(name, *json).ok()?;
+    }
+    Some(highlighter)
 }
 
 /// `code`'s lines as tokens in `language`, or `None` for a language the code

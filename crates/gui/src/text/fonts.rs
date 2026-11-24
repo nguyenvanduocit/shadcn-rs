@@ -15,7 +15,8 @@ use super::color_glyph;
 use super::raster::{self, Affine, Outline};
 use super::settings::{Subpixel, TextSettings};
 
-const INTER: &[u8] = include_bytes!("../../assets/Inter.ttf");
+// A `static`, not a `const`: a `const` is copied into the binary at each use, and Inter is used in two places.
+static INTER: &[u8] = include_bytes!("../../assets/Inter.ttf");
 const GEIST_MONO: &[u8] = include_bytes!("../../assets/GeistMono.ttf");
 
 /// The family names the embedded faces are registered under: names of

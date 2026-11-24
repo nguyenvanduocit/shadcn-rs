@@ -50,6 +50,38 @@ itself.
   limits, not the recommendation: design our own answer from what only we
   know, match their guarantees or exceed them, and write down why we differ.
 
+## Architecture status
+
+The sections below describe the target. This table says what exists today
+(checked against the code on 2026-11-24). **Built** = in the code and tested;
+**partial** = some of it is; **not yet** = does not exist. Do not rely on a
+part marked partial or not yet without checking the code first, and update the
+row when a milestone lands.
+
+| Part | Status | Evidence, or what delivers it |
+|---|---|---|
+| Reactive core (ADR-0012) | built | `gui/src/reactive/`, `sum_tree.rs` |
+| Render-and-diff components, scheduler (ADR-0013) | built, being replaced | `gui/src/component.rs`; K8 (M11) deletes it |
+| Run-once components: `show`, `each`, `dynamic_view`, `NodeId` (ADR-0026) | not yet | M11 K4a-K4f; nothing of it in `gui/src` |
+| Typed contexts and parts | not yet | M11 K6; `use_context` and `shadcn/src/part.rs` are the old form |
+| Bindings (values or closures on setters) | partial | `gui/src/layout/binding.rs`; K1, K2 rework, K4b covers the a11y setters |
+| Retained layout, `CacheTree`, parallel islands, virtual lists (ADR-0014) | built | `gui/src/layout/engine/mod.rs`, `gui/src/list/` |
+| Typed one-pass layout (ADR-0027) | not yet | M12 L1-L3; the ADR is not written |
+| Paint, property trees, retained chunks, GPU atlases, GPU paths and data chunks (ADR-0016-0018) | built | `gui/src/paint.rs`, `scene.rs`, `gpu/`, `chunk/`, `canvas/` |
+| Three threads, presentation time (ADR-0015) | built | `gui/src/compositor/thread.rs`, `clock.rs` |
+| Text: Parley, skrifa, Slug (ADR-0019) | built | `gui/Cargo.toml`, `gui/src/text/`, `gpu/slug.rs` |
+| Accessibility deltas (ADR-0021) | built | `gui/src/access.rs`; screen reader checks open |
+| Layer stack, focus scopes (ADR-0024) | built | `gui/src/layer.rs`, `focus.rs` |
+| `primitives` behaviour (ADR-0025) | partial | `crates/primitives`; S6b groups 3–6 and 8 have open findings or no review, rewritten per family at M11 K7 |
+| `gui` style engine: `Interaction`, `Shape`, OKLCH, `ContentStyle` (ADR-0022 S1-S5) | built | `gui/src/interact.rs`, `shape.rs`, `color.rs`, `style.rs` |
+| `Theme`, `Design`, `VEGA` | partial | `shadcn/src/theme/`, `design/vega.rs`; verdict vega is 64/100 until S9 |
+| Seven more style consts | not yet | M10 S11 |
+| `shadcn` components read `Design` through defaults; no `Color` constructor in components (lint) | not yet | M10 S8, per component family after M11 K4a-K4f, K6 and M12 L1-L3, alongside that family's K7; K8 follows the last family; `shadcn/clippy.toml` has no such ban, components still hold their values |
+| Fork frame (ADR-0028): `ForkMap`, its undo log, the cold check | partial | `ForkMap` exists in every build (`gui/src/engine.rs`); its undo log and the cold check (`GUI_COLD_CHECK`, read in `app.rs`, `gpu/mod.rs`, `compositor/mod.rs`) are debug builds only |
+| Fork in release, typed outbox, sampled check | not yet | M13 F2-F4 |
+| Verification: allocation budgets, seeded tests, bench, devtools (ADR-0010, 0023) | built | `gui/tests/`, `gui/src/testing.rs`, `.github/workflows/ci.yml` |
+| OS display boundary crate, MCP/intent surface | not yet | decided 2026-11-23; no crate or code, see the plan |
+
 ## Target architecture
 
 The unit of "only redo what changed" is a node and a phase: a signal read while
@@ -86,22 +118,29 @@ Algorithm of alien-signals as Vue 3.6 adopted it (`references/vue-minor/packages
 
 ### Components and scheduling
 
-- A component runs `setup` once per instance and returns its render. Identity
-  is position + key + component type. Its `Scope` owns its signals, effects,
-  watches and timers, and lifecycle hooks run from it.
-- Render is tracked per instance. A parent re-render skips a child whose props
-  are equal (`Props: PartialEq`; `Shared<T>` compares by pointer; `Callback<T>`
-  is a latest-value cell, never called during render; slots run inside the
-  child's own render).
-- Fine-grained bindings: any style or content setter also takes a closure
+Today's component model is render-and-diff (ADR-0013): `setup` once per
+instance, a tracked render, a parent re-render that skips children with equal
+props, and a scheduler by depth with `Input`/`Animation`/`Idle` priority
+(`crates/gui/src/component.rs`). It is being replaced by run-once (ADR-0026,
+M11): a component runs once and builds retained nodes, values change through
+bindings, and structure changes only at `show`, `each` and `dynamic_view`.
+Read `docs/adr/0026-a-component-runs-once.md` for the design; do not write new
+code against render, `Part` or `on_updated` unless the task is in the old path.
+
+Today, in the old model: identity is position + key + component type, and
+the scheduler's queue is keyed by `Input`/`Animation`/`Idle` priority. Both go
+with run-once: a keyed row keeps its scope and `NodeId`s when it moves, and
+structure commits without priority lanes.
+
+What holds in both models:
+
+- A component's `Scope` owns its signals, effects, watches and timers.
+- Fine-grained bindings: a setter takes a value or a closure
   (`impl Fn() -> T`), bound straight to the retained node and its phase (Vue
-  Vapor, Floem, Leptos). A static value and a reactive one are the same
-  property with one owner.
-- `Model<T>` for two-way binding; `provide`/`inject` scoped to the tree;
-  collections register in `setup`, never during render; render is pure.
-- The scheduler orders dirty work by tree depth (parent first), runs pre and
-  post flushes around commit, keeps input-driven updates synchronous, and has
-  its queue keyed by priority from the start.
+  Vapor, Floem, Leptos). Not every setter does yet (for example
+  `Div::placeholder` takes `Into<String>`); K4b covers the rest.
+- `Model<T>` for two-way binding; `provide`/`use_context` scoped to the tree.
+- Input-driven updates stay synchronous.
 
 ### Layout (`crates/gui/src/layout/`, `crates/gui/src/list/`)
 

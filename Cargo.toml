@@ -44,3 +44,11 @@ debug = false
 # Line tables keep a profiler's samples readable at a fraction of full debug info's size.
 [profile.release]
 debug = "line-tables-only"
+
+# What a shipped app builds with (`cargo build --profile dist`): release with whole-program optimisation, one codegen unit
+# and no symbols or debug info. `release` stays as it is, since the bench and the verdict measure it.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+strip = true

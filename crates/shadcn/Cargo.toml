@@ -18,8 +18,9 @@ primitives = { path = "../primitives" }
 # `today(getLocalTimeZone())`. The IANA database is bundled, so a zone names
 # the same days on every machine, as the browser's own ICU copy does.
 jiff = { version = "0.2", features = ["tzdb-bundle-always"] }
-# Shiki's tokens and GitHub themes for code blocks, in Rust (ADR-0002).
-irosashi = "0.3.1"
+# Shiki's tokens and GitHub themes for code blocks, in Rust (ADR-0002). Without its embedded bundle (257 grammars and
+# 65 themes, 8.6 MB): the files the code block uses are vendored under `assets/irosashi/` (see its PROVENANCE.md).
+irosashi = { version = "0.3.1", default-features = false }
 # Diagnosis only (ADR-0023): `--features dhat-heap` makes the examples
 # profile the heap with dhat instead of counting it.
 dhat = { version = "0.3", optional = true }
