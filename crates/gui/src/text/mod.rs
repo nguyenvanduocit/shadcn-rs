@@ -25,9 +25,10 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use parley::{
-    Affinity, Alignment, AlignmentOptions, BaseDirection, Cursor as ParleyCursor, FontFamily as ParleyFamily,
-    FontFeature, FontStyle, FontVariation, FontWeight, InlineBox, InlineBoxKind, Layout, LineHeight, OverflowWrap,
-    PositionedLayoutItem, Selection, StyleProperty, VerticalAlign,
+    Affinity, Alignment, AlignmentOptions, BaseDirection, BreakLines, BreakReason, BreakerState,
+    Cursor as ParleyCursor, FontFamily as ParleyFamily, FontFeature, FontStyle, FontVariation, FontWeight, InlineBox,
+    InlineBoxKind, Layout, LineHeight, LineMetrics, OverflowWrap, PositionedLayoutItem, Selection, StyleProperty,
+    VerticalAlign, YieldData,
 };
 
 pub use self::access::TextRun;
@@ -1047,30 +1048,32 @@ impl TextSystem {
                 };
             }
         } else if let Some(w) = width {
-            let settled = s.settled.iter().find(|(b, _)| *b == how).map(|(_, f)| *f);
-            let fit = match settled {
-                Some(fit) => fit,
-                None => {
-                    let fit = match how.wrap_style {
-                        WrapStyle::Auto => Fit::whole(w),
-                        WrapStyle::Pretty => pretty(&mut s.layout, &s.content, w, how.lines, &mut self.lines_broken),
-                        WrapStyle::Balance => balance(&mut s.layout, w, how.lines, &mut self.lines_broken),
-                    };
-                    if s.settled.len() >= 8 {
-                        s.settled.clear();
-                    }
-                    s.settled.push((how, fit));
-                    fit
-                }
-            };
             // Up to the most lines it asks for (Parley breaks line by
             // line): a clamped document's first line wrapping into
             // thousands breaks only the lines shown. Every line is aligned
-            // in the box, narrowed ones too: no shift.
+            // in the box, narrowed ones too: no shift. Each way of
+            // settling leaves the lines broken as it settled them.
             let most = how
                 .lines
                 .map_or(usize::MAX, |m| usize::try_from(m).unwrap_or(usize::MAX));
-            break_fit(&mut s.layout, w, fit, most);
+            let settled = s.settled.iter().find(|(b, _)| *b == how).map(|(_, f)| *f);
+            if let Some(fit) = settled {
+                break_fit(&mut s.layout, w, fit, most);
+            } else {
+                let size = f32::from_bits(s.key.base.size);
+                let fit = match how.wrap_style {
+                    WrapStyle::Auto => {
+                        break_fit(&mut s.layout, w, Fit::WHOLE, most);
+                        Fit::WHOLE
+                    }
+                    WrapStyle::Pretty => pretty(&mut s.layout, w, size, most, &mut self.lines_broken),
+                    WrapStyle::Balance => balance(&mut s.layout, w, most, &mut self.lines_broken),
+                };
+                if s.settled.len() >= 8 {
+                    s.settled.clear();
+                }
+                s.settled.push((how, fit));
+            }
         }
         rows(&s.layout, &s.key, &mut s.rows);
         s.broken = Some(how);
@@ -3861,42 +3864,55 @@ fn lines_upto(layout: &mut Layout<u32>, width: f32, fit: Fit, cap: usize, broken
     n
 }
 
-/// Where a wrapped piece's lines break: those from line `from` on at most
-/// `at` wide, those before it at the box's width. `pretty` narrows a
-/// paragraph's last lines only, and `balance` all of them.
+/// Most lines a [`Fit`] narrows: the most Chromium balances (pretty
+/// re-breaks fewer, [`PRETTY_MAX_LINES`]).
+const FIT_LINES: usize = BALANCE_MAX_LINES;
+
+/// Where a wrapped piece's lines break: `len` lines from line `from` on,
+/// each at most its `widths` wide; the others at the box's width. Line
+/// widths, not offsets, so that Parley's own breaker lands on the breaks
+/// chosen: a line as wide as the text it was chosen to hold (and a hair
+/// more) holds that text and not the next word. `pretty` narrows a
+/// paragraph's last lines, `balance` all of a short one's.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Fit {
     from: usize,
-    at: f32,
+    len: usize,
+    widths: [f32; FIT_LINES],
 }
 
 impl Fit {
-    /// Every line at the box's width `width`, as text wraps by default.
-    const fn whole(width: f32) -> Self {
-        Self { from: 0, at: width }
+    /// Every line at the box's width, as text wraps by default.
+    const WHOLE: Self = Self {
+        from: 0,
+        len: 0,
+        widths: [0.0; FIT_LINES],
+    };
+
+    /// The most line `line` may hold in a box `width` wide.
+    fn line_width(&self, line: usize, width: f32) -> f32 {
+        line.checked_sub(self.from)
+            .filter(|k| *k < self.len)
+            .and_then(|k| self.widths.get(k))
+            .map_or(width, |w| w.min(width))
     }
 }
 
+/// How much wider than the text it was chosen to hold a narrowed line is
+/// let be: Parley sums advances in another order than [`pretty`] does, and
+/// no word or space is this narrow.
+const FIT_SLACK: f32 = 1.0 / LAYOUT_UNITS;
+
 /// Break `layout`'s lines in a box `width` wide as `fit` says, line by
-/// line and up to `most` of them: what follows is never broken. A
-/// narrowed line is still aligned in the whole box, as Blink places the
-/// lines its `ScoreLineBreaker` chose. How many lines it broke.
+/// line and up to `most` of them: what follows is never broken. How many
+/// lines it broke.
 fn break_fit(layout: &mut Layout<u32>, width: f32, fit: Fit, most: usize) -> usize {
     let mut lines = layout.break_lines();
     lines.state_mut().set_layout_max_advance(width);
     let mut n = 0_usize;
     while n < most {
-        let narrowed = n >= fit.from && fit.at < width;
-        lines
-            .state_mut()
-            .set_line_max_advance(if narrowed { fit.at } else { width });
-        // Only a line break yields: its boxes are in flow, and it has no
-        // height to exceed.
-        if lines.break_next().is_none() {
+        if break_line(&mut lines, width, fit.line_width(n, width)).is_none() {
             break;
-        }
-        if narrowed {
-            lines.set_prior_line_width(width);
         }
         n = n.saturating_add(1);
     }
@@ -3904,88 +3920,287 @@ fn break_fit(layout: &mut Layout<u32>, width: f32, fit: Fit, most: usize) -> usi
     n
 }
 
-/// Where `layout`'s last lines break so the last is not one short word
-/// alone, as Chromium's `text-wrap: pretty` (`ScoreLineBreaker`) re-breaks
-/// them: its last [`PRETTY_MAX_LINES`] lines (all of a shorter paragraph)
-/// at the narrowest width that keeps their count and sends a word down,
-/// the lines before them wrapping as they would. Only when the greedy last
-/// line is one word shorter than a third of the box (Blink's
-/// `ShouldOptimize`), and only a paragraph whose lines are all shown
-/// (`shown`: a clamp's, else all): a clamp that hides its last line leaves
-/// its lines as they wrap, its hidden ones never broken.
-fn pretty(layout: &mut Layout<u32>, content: &str, width: f32, shown: Option<u32>, broken: &mut u64) -> Fit {
-    let whole = Fit::whole(width);
-    let cap = shown.map_or(usize::MAX, |s| usize::try_from(s).unwrap_or(usize::MAX));
-    let count = lines_upto(layout, width, whole, cap, broken);
-    if !(2..=cap).contains(&count) || !orphan(layout, content) || !last_short(layout, width) {
-        return whole;
+/// Break one line of `lines` at most `at` wide in a box `width` wide: a
+/// narrowed line is still aligned in the whole box, as Blink places the
+/// lines its `ScoreLineBreaker` chose. The line's metrics and why it
+/// broke, if there was one.
+fn break_line(lines: &mut BreakLines<'_, u32>, width: f32, at: f32) -> Option<(LineMetrics, BreakReason)> {
+    lines.state_mut().set_line_max_advance(at);
+    // Only a line break yields: its boxes are in flow, and it has no
+    // height to exceed.
+    let line = match lines.break_next()? {
+        YieldData::LineBreak(data) => (data.metrics, data.reason),
+        YieldData::MaxHeightExceeded(_) | YieldData::InlineBoxBreak(_) => (LineMetrics::default(), BreakReason::None),
+    };
+    if at < width {
+        // Parley's alignment width for the line (doc-hidden, hence the
+        // exact pin of parley in Cargo.toml).
+        lines.set_prior_line_width(width);
+    }
+    Some(line)
+}
+
+/// The width of the text a line holds: its advance without the space that
+/// hangs at its end.
+fn content(m: &LineMetrics) -> f32 {
+    m.advance - m.hanging_advance
+}
+
+/// Break `lines` greedily in a box `width` wide from `start` (a state
+/// saved at a line's start) to the end; how many lines it broke.
+fn greedy_from(lines: &mut BreakLines<'_, u32>, width: f32, start: BreakerState) -> usize {
+    lines.revert_to(start);
+    let mut n = 0_usize;
+    while break_line(lines, width, width).is_some() {
+        n = n.saturating_add(1);
+    }
+    n
+}
+
+/// Where `layout`'s last lines break, as Chromium's `text-wrap: pretty`
+/// (`ScoreLineBreaker`, a port of minikin's `OptimalLineBreaker`) re-breaks
+/// them, `layout` left broken so.
+///
+/// Its lines break greedily once, the breaker's state kept at the start of
+/// each of the last [`PRETTY_MAX_LINES`]: Blink's window of lines slides to
+/// the paragraph's end, so the lines before it are greedy's. Only when
+/// greedy's last line is one segment (no break opportunity inside) shorter
+/// than a third of the box (Blink's `ShouldOptimize`), and only a paragraph
+/// whose lines are all shown (`most`: a clamp's): a clamp that hides its
+/// last line leaves its lines as they wrap, the hidden ones never broken.
+/// The window's break opportunities are Parley's own, found by breaking
+/// it again with no room at all (a segment a line); the breaks are scored
+/// as Blink scores them ([`best_breaks`]) and realised as line widths
+/// ([`Fit`]). The work past greedy's one pass is bounded by the window.
+fn pretty(layout: &mut Layout<u32>, width: f32, size: f32, most: usize, broken: &mut u64) -> Fit {
+    let mut lines = layout.break_lines();
+    lines.state_mut().set_layout_max_advance(width);
+    let mut starts: [BreakerState; PRETTY_MAX_LINES] = Default::default();
+    let mut last = LineMetrics::default();
+    let mut count = 0_usize;
+    // The last line greedy cut inside a word (an emergency break).
+    let mut cut = None;
+    while !lines.is_done() {
+        if count < most
+            && let Some(slot) = starts.get_mut(count % PRETTY_MAX_LINES)
+        {
+            slot.clone_from(lines.state());
+        }
+        let Some((line, reason)) = break_line(&mut lines, width, width) else {
+            break;
+        };
+        if count == most {
+            // A line past the clamp's: the clamp hides the last line.
+            *broken = broken.saturating_add(1);
+            lines.revert();
+            lines.finish();
+            return Fit::WHOLE;
+        }
+        if reason == BreakReason::Emergency {
+            cut = Some(count);
+        }
+        last = line;
+        count = count.saturating_add(1);
     }
     let from = count.saturating_sub(PRETTY_MAX_LINES);
-    let fit = |at| Fit { from, at };
-    // Find the widest width that sends a word down to the last line.
-    let (mut wide, mut narrow) = (width, 0.0_f32);
-    while wide - narrow > 1.0 / LAYOUT_UNITS {
-        let mid = (wide + narrow) / 2.0;
-        if lines_upto(layout, width, fit(mid), count, broken) == count && orphan(layout, content) {
-            wide = mid;
-        } else {
-            narrow = mid;
+    // A word cut in the window: Blink scores no such break, greedy's stay.
+    if count < 2 || content(&last) * 3.0 >= width || cut.is_some_and(|c| c >= from) {
+        lines.finish();
+        return Fit::WHOLE;
+    }
+    let Some(start) = starts.get_mut(from % PRETTY_MAX_LINES).map(std::mem::take) else {
+        lines.finish();
+        return Fit::WHOLE;
+    };
+    let window = count.saturating_sub(from);
+    // The window's segments: what lies between its break opportunities,
+    // each with the space that hangs at its end. With no room at all the
+    // breaker takes every opportunity, and cuts a word between its
+    // graphemes too where it may (an emergency break): those pieces are
+    // summed back into their word.
+    lines.revert_to(start.clone());
+    let mut segments = Vec::new();
+    let mut piece = 0.0_f32;
+    let mut probed = 0_u64;
+    loop {
+        lines.state_mut().set_line_max_advance(0.0);
+        let Some(YieldData::LineBreak(d)) = lines.break_next() else {
+            break;
+        };
+        probed = probed.saturating_add(1);
+        piece += d.metrics.advance;
+        if d.reason != BreakReason::Emergency {
+            segments.push((piece, d.metrics.hanging_advance));
+            piece = 0.0;
         }
     }
-    if lines_upto(layout, width, fit(narrow), count, broken) != count || orphan(layout, content) {
-        return whole;
+    *broken = broken.saturating_add(probed);
+    // Greedy's last line one segment: as wide as the last segment's text.
+    let alone = segments
+        .last()
+        .is_some_and(|&(advance, hang)| (advance - hang - content(&last)).abs() <= FIT_SLACK);
+    let chosen = if alone {
+        best_breaks(&segments, width, size)
+    } else {
+        None
+    };
+    if let Some((len, widths)) = chosen.filter(|(len, _)| *len == window) {
+        lines.revert_to(start.clone());
+        let fit = Fit { from, len, widths };
+        let mut realised = true;
+        for (k, want) in widths.iter().take(len).enumerate() {
+            let line = break_line(&mut lines, width, fit.line_width(from.saturating_add(k), width));
+            if line.is_none_or(|(m, _)| (content(&m) + FIT_SLACK - want).abs() > FIT_SLACK) {
+                realised = false;
+                break;
+            }
+        }
+        let ends = realised && break_line(&mut lines, width, width).is_none();
+        *broken = broken.saturating_add(u64::try_from(len).unwrap_or(u64::MAX));
+        if ends {
+            lines.finish();
+            return fit;
+        }
     }
-    fit(narrow)
+    let n = greedy_from(&mut lines, width, start);
+    *broken = broken.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+    lines.finish();
+    Fit::WHOLE
+}
+
+/// Blink's penalty on breaking before a paragraph's last segment
+/// (`kOrphansPenalty`).
+const ORPHAN_PENALTY: f32 = 10_000.0;
+
+/// The score of a line wider than its box (`kScoreOverfull`).
+const OVERFULL: f32 = 1e12;
+
+/// The best breaks of `segments` (each its advance and the space hanging
+/// at its end) into lines of a box `width` wide, for text `size` px, as
+/// Blink's `ScoreLineBreaker::Optimize` scores them for `text-wrap:
+/// pretty`: the square of each line's room but the last's, a line penalty
+/// of four times width × size, a penalty on leaving the last segment alone,
+/// none on a hyphen (there are none yet). How many lines, and the width
+/// each line is let have ([`Fit`]); none when there are fewer than three
+/// opportunities (Blink keeps greedy's) or more lines than a fit holds.
+fn best_breaks(segments: &[(f32, f32)], width: f32, size: f32) -> Option<(usize, [f32; FIT_LINES])> {
+    let m = segments.len();
+    // Candidates 0..=m: the window's start, the opportunity after each
+    // segment but the last, and its end. Where the next line starts after
+    // each (`pos_no_break`), and where the line ends before it if broken
+    // there (`pos_if_break`).
+    if m < 4 {
+        return None;
+    }
+    let mut no_break = Vec::with_capacity(m.saturating_add(1));
+    let mut if_break = Vec::with_capacity(m.saturating_add(1));
+    no_break.push(0.0_f32);
+    if_break.push(0.0_f32);
+    let mut x = 0.0_f32;
+    for &(advance, hang) in segments {
+        x += advance;
+        no_break.push(x);
+        if_break.push(x - hang);
+    }
+    let penalty = |i: usize| if i.saturating_add(1) == m { ORPHAN_PENALTY } else { 0.0 };
+    let line_penalty = 4.0 * width * size;
+    let room = width + FIT_SLACK;
+    // Per candidate: its best score, the candidate its line starts at, and
+    // how many lines lead to it.
+    let mut scores: Vec<(f32, usize, usize)> = Vec::with_capacity(m.saturating_add(1));
+    scores.push((0.0, 0, 0));
+    let mut active = 0_usize;
+    for end in 1..=m {
+        let last = end == m;
+        let (mut best, mut best_start) = (f32::MAX, 0_usize);
+        let start_edge = if_break.get(end).copied().unwrap_or(x) - room;
+        let mut best_hope = 0.0_f32;
+        // Starts before `active` are overfull for every later end; it moves
+        // past one found overfull here for the next end only, as Blink's.
+        let first = active;
+        for start in first..end {
+            let Some(&(start_score, _, _)) = scores.get(start) else {
+                continue;
+            };
+            if start_score + best_hope >= best {
+                continue;
+            }
+            let delta = no_break.get(start).copied().unwrap_or(0.0) - start_edge;
+            let (width_score, extra) = if delta < 0.0 {
+                (OVERFULL, 0.0)
+            } else if last {
+                (0.0, 4.0 * penalty(start))
+            } else {
+                (delta * delta, 0.0)
+            };
+            if delta < 0.0 {
+                active = start.saturating_add(1);
+            } else {
+                best_hope = width_score;
+            }
+            let score = start_score + width_score + extra;
+            if score <= best {
+                best = score;
+                best_start = start;
+            }
+        }
+        let lines = scores.get(best_start).map_or(0, |s| s.2).saturating_add(1);
+        scores.push((best + penalty(end) + line_penalty, best_start, lines));
+    }
+    let len = scores.last().map_or(0, |s| s.2);
+    if len > FIT_LINES {
+        return None;
+    }
+    let mut widths = [0.0_f32; FIT_LINES];
+    let (mut end, mut k) = (m, len);
+    while end > 0 && k > 0 {
+        let start = scores.get(end).map_or(0, |s| s.1);
+        k = k.saturating_sub(1);
+        let line = if_break.get(end).copied().unwrap_or(x) - no_break.get(start).copied().unwrap_or(0.0);
+        if let Some(w) = widths.get_mut(k) {
+            *w = line + FIT_SLACK;
+        }
+        end = start;
+    }
+    Some((len, widths))
 }
 
 /// Most lines `text-wrap: pretty` re-breaks: a paragraph's last four, as
 /// Chromium's (`kMaxLinesForOptimal`).
 const PRETTY_MAX_LINES: usize = 4;
 
-/// Whether the last line of `layout` is shorter than a third of `width`,
-/// Blink's measure of a last line worth re-breaking for.
-fn last_short(layout: &Layout<u32>, width: f32) -> bool {
-    layout.lines().next_back().is_some_and(|line| {
-        let m = line.metrics();
-        (m.advance - m.hanging_advance) * 3.0 < width
-    })
-}
-
-/// Whether the last line of `layout` holds a single word.
-fn orphan(layout: &Layout<u32>, content: &str) -> bool {
-    layout.lines().next_back().is_some_and(|line| {
-        content
-            .get(line.text_range())
-            .map_or(0, |s| s.split_whitespace().count())
-            < 2
-    })
-}
-
 /// Most lines Chromium balances; longer text wraps as usual.
 const BALANCE_MAX_LINES: usize = 6;
 
 /// The least width that keeps the line count `layout` has at `width`, as
-/// Chromium balances (`text-wrap: balance`): only a paragraph of at most
-/// [`BALANCE_MAX_LINES`] lines, all of them shown (`shown`: a clamp's,
-/// else all); a longer one, or one a clamp cuts, is never broken whole.
-fn balance(layout: &mut Layout<u32>, width: f32, shown: Option<u32>, broken: &mut u64) -> Fit {
-    let cap = shown.map_or(BALANCE_MAX_LINES, |s| {
-        BALANCE_MAX_LINES.min(usize::try_from(s).unwrap_or(usize::MAX))
-    });
-    let count = lines_upto(layout, width, Fit::whole(width), cap, broken);
+/// Chromium balances (`text-wrap: balance`), `layout` left broken so (up to
+/// `most` lines, a clamp's): only a paragraph of at most
+/// [`BALANCE_MAX_LINES`] lines, all of them shown; a longer one, or one a
+/// clamp cuts, is never broken whole to learn it. Each balanced line is
+/// aligned in the whole box ([`break_line`]).
+fn balance(layout: &mut Layout<u32>, width: f32, most: usize, broken: &mut u64) -> Fit {
+    let cap = BALANCE_MAX_LINES.min(most);
+    let count = lines_upto(layout, width, Fit::WHOLE, cap, broken);
     if !(2..=cap).contains(&count) {
-        return Fit::whole(width);
+        break_fit(layout, width, Fit::WHOLE, most);
+        return Fit::WHOLE;
     }
+    let all = |at: f32| Fit {
+        from: 0,
+        len: count,
+        widths: [at; FIT_LINES],
+    };
     let (mut fits, mut wraps) = (width, 0.0_f32);
     while fits - wraps > 1.0 / LAYOUT_UNITS {
         let mid = (fits + wraps) / 2.0;
-        if lines_upto(layout, width, Fit::whole(mid), count, broken) == count {
+        if lines_upto(layout, width, all(mid), count, broken) == count {
             fits = mid;
         } else {
             wraps = mid;
         }
     }
-    Fit::whole(fits)
+    break_fit(layout, width, all(fits), most);
+    all(fits)
 }
 
 /// Where a frame's primitives are recorded: the scene's items, its scale

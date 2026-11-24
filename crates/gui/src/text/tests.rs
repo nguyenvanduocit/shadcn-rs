@@ -290,8 +290,199 @@ fn pretty_leaves_a_last_word_wider_than_a_third_of_the_box() {
     assert!(orphan_line(s), "its last word left alone");
 }
 
+/// Whether the last line of `s` holds a single word.
 fn orphan_line(s: &Shaped) -> bool {
-    orphan(&s.layout, &s.content)
+    s.layout.lines().next_back().is_some_and(|line| {
+        s.content
+            .get(line.text_range())
+            .map_or(0, |t| t.split_whitespace().count())
+            < 2
+    })
+}
+
+/// Whether the last line of `layout` is shorter than a third of `width`.
+fn last_short(layout: &Layout<u32>, width: f32) -> bool {
+    layout
+        .lines()
+        .next_back()
+        .is_some_and(|line| content(line.metrics()) * 3.0 < width)
+}
+
+/// How many words each line of `s` holds.
+fn words_per_line(s: &Shaped) -> Vec<usize> {
+    s.layout
+        .lines()
+        .map(|l| {
+            s.content
+                .get(l.text_range())
+                .map_or(0, |t| t.split_whitespace().count())
+        })
+        .collect()
+}
+
+/// Geist Mono at 16px, wrapping as `wrap_style` says, and the advance of
+/// one of its characters.
+fn mono(ts: &mut TextSystem, wrap_style: WrapStyle) -> (ResolvedText, f32) {
+    let t = ResolvedText {
+        family: FontFamily::GEIST_MONO,
+        wrap_style,
+        ..style(16.0, 24.0, 400)
+    };
+    let advance = ts.measure("abcdefghij", &t, None).0 / 10.0;
+    (t, advance)
+}
+
+/// `s` broken as `t` asks at `width`.
+fn broken_piece<'a>(ts: &'a mut TextSystem, text: &str, t: &ResolvedText, width: f32) -> &'a Shaped {
+    let p = ts.pieces(Paragraph::from(text), t);
+    ts.break_piece(p[0].hash, Breaking::of(t, Some(width)));
+    &ts.shaped[&p[0].hash]
+}
+
+#[test]
+fn pretty_scores_break_points_where_no_one_width_fits() {
+    // Nine six-character words and a two-character one in a box 20.5
+    // characters wide: greedy breaks them 3/3/3/1. No single width for the
+    // last four lines sends a word down without adding a line, but Blink's
+    // score picks 3/3/2/2, each line inside the box.
+    let mut ts = TextSystem::new();
+    let text = format!("{} ab", ["abcdef"; 9].join(" "));
+    let (auto, a) = mono(&mut ts, WrapStyle::Auto);
+    let w = 20.5 * a;
+    assert_eq!(words_per_line(broken_piece(&mut ts, &text, &auto, w)), [3, 3, 3, 1]);
+    let (pretty, _) = mono(&mut ts, WrapStyle::Pretty);
+    let s = broken_piece(&mut ts, &text, &pretty, w);
+    assert_eq!(words_per_line(s), [3, 3, 2, 2]);
+    for line in s.layout.lines() {
+        assert!(content(line.metrics()) <= w, "inside the box");
+    }
+}
+
+#[test]
+fn pretty_breaks_a_long_paragraph_once_and_its_window_again() {
+    // Ten thousand lines ending in an orphan: greedy's one pass, and work
+    // bounded by the four-line window to re-break its end; not a pass over
+    // the whole paragraph for each step of a search.
+    const LINES: usize = 10_000;
+    let mut ts = TextSystem::new();
+    let text = format!("{} ab", vec!["abcdef"; 3 * (LINES - 1)].join(" "));
+    let (pretty, a) = mono(&mut ts, WrapStyle::Pretty);
+    let w = 20.5 * a;
+    let p = ts.pieces(Paragraph::from(text.as_str()), &pretty);
+    let before = ts.lines_broken;
+    ts.break_piece(p[0].hash, Breaking::of(&pretty, Some(w)));
+    let broken = ts.lines_broken - before;
+    let s = &ts.shaped[&p[0].hash];
+    assert_eq!(s.layout.len(), LINES, "as many lines");
+    assert!(!orphan_line(s), "no orphan");
+    let words = words_per_line(s);
+    assert!(
+        words[..LINES - 2].iter().all(|n| *n == 3),
+        "greedy's lines before the window"
+    );
+    assert_eq!(words[LINES - 2..], [2, 2]);
+    // The paragraph's lines once, then the window probed (a line per
+    // grapheme at most: 4 lines of at most 21 characters) and its four
+    // lines broken again.
+    let most = u64::try_from(LINES).unwrap_or(u64::MAX) + 4 * 21 + 4;
+    assert!(broken <= most, "{broken} lines broken for {LINES}");
+}
+
+#[test]
+fn pretty_leaves_a_clamped_paragraph_whose_last_line_is_hidden() {
+    // Pretty only when every line is shown: a clamp that hides the last
+    // line leaves the lines as they wrap; one that shows them all does not.
+    let mut ts = TextSystem::new();
+    let text = format!("{} ab", ["abcdef"; 9].join(" "));
+    let (pretty, a) = mono(&mut ts, WrapStyle::Pretty);
+    let w = 20.5 * a;
+    for (clamp, want) in [(3, vec![3, 3, 3]), (4, vec![3, 3, 2, 2]), (9, vec![3, 3, 2, 2])] {
+        let t = ResolvedText {
+            line_clamp: Some(clamp),
+            ..pretty.clone()
+        };
+        let p = ts.pieces(Paragraph::from(text.as_str()), &t);
+        let mut how = Breaking::of(&t, Some(w));
+        how.lines = Some(u32::from(clamp));
+        ts.break_piece(p[0].hash, how);
+        assert_eq!(words_per_line(&ts.shaped[&p[0].hash]), want, "clamped to {clamp}");
+    }
+}
+
+#[test]
+fn balanced_lines_are_aligned_in_the_whole_box() {
+    // Balance narrows every line; each is still centred in the box, as
+    // Blink places them.
+    let mut ts = TextSystem::new();
+    let t = ResolvedText {
+        wrap_style: WrapStyle::Balance,
+        align: TextAlign::Center,
+        ..ResolvedText::root(Color::BLACK)
+    };
+    let w = 300.0;
+    let s = broken_piece(&mut ts, "Balanced lines are about as wide as each other", &t, w);
+    assert_eq!(s.layout.len(), 2);
+    for line in s.layout.lines() {
+        let m = line.metrics();
+        let mid = m.offset + m.inline_min_coord + content(m) / 2.0 + s.shift;
+        assert!((mid - w / 2.0).abs() < 0.01, "centred: {mid} in {w}");
+    }
+}
+
+#[test]
+fn a_narrowed_rtl_line_is_painted_hit_and_selected_where_it_is() {
+    // Right to left, pretty: the re-broken lines start at the box's right
+    // edge; their glyphs, carets, hits and selection boxes agree.
+    let mut ts = TextSystem::new();
+    let auto = ResolvedText {
+        direction: Direction::Rtl,
+        ..style(16.0, 24.0, 400)
+    };
+    let pretty = ResolvedText {
+        wrap_style: WrapStyle::Pretty,
+        ..auto.clone()
+    };
+    let text = "שלום עולם זה טקסט ארוך מאוד שלא נכנס בשורה אחת ולכן הוא נשבר לכמה שורות עד המילה האחרונה שלו";
+    let mut seen = None;
+    for w in (120_u16..400).step_by(3) {
+        let w = f32::from(w);
+        let s = broken_piece(&mut ts, text, &auto, w);
+        if s.layout.len() >= 2 && orphan_line(s) && last_short(&s.layout, w) {
+            seen = Some(w);
+            break;
+        }
+    }
+    let w = seen.expect("a width at which the paragraph ends in an orphan");
+    let s = broken_piece(&mut ts, text, &pretty, w);
+    assert!(!orphan_line(s), "pretty leaves no word alone at {w}px");
+    let ranges: Vec<_> = s.layout.lines().map(|l| l.text_range()).collect();
+    let rows: Vec<_> = s.rows.iter().map(|r| (r.top, r.height)).collect();
+    let glyphs = glyphs_of(&drawn(&mut ts, Paragraph::from(text), &pretty, Some(w)));
+    for (range, (top, height)) in ranges.iter().zip(rows) {
+        let boxes = ts.selection(text, &pretty, Some(w), range.start, range.end);
+        let (l, r) = boxes
+            .iter()
+            .filter(|b| b.y < top + height / 2.0 && b.y + b.height > top + height / 2.0)
+            .fold((f32::MAX, f32::MIN), |(l, r), b| (l.min(b.x), r.max(b.x + b.width)));
+        assert!(
+            (r - w).abs() < 1.0,
+            "the line starts at the box's right edge: {r} in {w}"
+        );
+        // Its glyphs lie within its selection.
+        let on_line = glyphs.iter().filter(|g| {
+            let y = f32::from(i16::try_from(g.2).unwrap_or(i16::MAX));
+            y > top && y <= top + height
+        });
+        for g in on_line {
+            let x = f32::from(i16::try_from(g.1).unwrap_or(i16::MAX));
+            assert!(x >= l - 1.0 && x <= r + 1.0, "glyph at {x} in {l}..{r}");
+        }
+        // Its start's caret at its right, and a hit there finds its start.
+        let caret = ts.caret(text, &pretty, Some(w), range.start);
+        assert!((caret.x - r).abs() < 1.0, "caret {} at {r}", caret.x);
+        let hit = ts.hit(text, &pretty, Some(w), r - 0.5, top + height / 2.0);
+        assert_eq!(hit, range.start, "a hit at its right edge");
+    }
 }
 
 #[test]

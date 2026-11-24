@@ -60,7 +60,11 @@ pollster = "0.4"
 # are read with skrifa and rasterised by `gui` itself.
 # Fast hashing for the glyph and shape caches (keys are ours, not attacker-chosen).
 foldhash = "0.2"
-parley = { version = "0.13", features = ["complex-scripts"] }
+# Pinned exactly: `text-wrap` pretty and balance rely on the line breaker's
+# doc-hidden `BreakLines::set_prior_line_width` (a narrowed line aligned in
+# the whole box) and on reverting it to a saved `BreakerState`; a patch
+# release may change either. Re-check text::tests when raising it.
+parley = { version = "=0.13.0", features = ["complex-scripts"] }
 # The grapheme clusters and words of text a clamp hides, read to a screen
 # reader without shaping it: Parley's own analysis, so they are the words
 # its shaped text has.
