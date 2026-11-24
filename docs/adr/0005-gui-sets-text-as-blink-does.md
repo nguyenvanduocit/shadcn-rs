@@ -36,23 +36,36 @@ Option 3, in `crates/gui/src/text.rs`:
   of its glyphs use) rounded, the half-leading floored. Drawing puts each baseline on a whole device pixel.
 - `WrapStyle::{Auto, Balance, Pretty}` replaces the `balance` flag (`text_pretty()`, `text_balance()`); pretty re-breaks
   a paragraph's last four lines (all of a shorter one; `PRETTY_MAX_LINES = 4`, Blink's `kMaxLinesForOptimal`) as Blink's
-  `ScoreLineBreaker` does, the lines before them greedy's:
+  `ScoreLineBreaker` does, the lines before them greedy's. A forced break inside a piece (U+2028) ends a paragraph as the
+  piece's end does: each is scored alone, as Blink scores each:
   - **When:** greedy's last line is one segment (no break opportunity inside) shorter than a third of the box
     (`ShouldOptimize`), the window has no word cut by an emergency break, it holds at least three opportunities, and every
-    line is shown (a clamp that hides the last line leaves the lines as they wrap).
+    line of the paragraph is shown (a clamp that hides its last line leaves its lines as they wrap).
+  - **One rule for spaces:** every width compared leaves out the spaces that hang at a line's end, as Blink's do: the
+    last line's (Parley does not hang them on a paragraph's last line, so they are taken from its probed segment), each
+    segment's, and each realised line's. Parley reports a trailing space as hanging only at the paragraph's bidi level
+    (it does not apply UAX #9 L1, which Blink does), so left-to-right words in a right-to-left paragraph measure their
+    spaces; their lines then do not land where scored and stay greedy's (a difference from Blink, safe).
   - **Window DP** (`best_breaks`, Blink's `ComputeScores`): each non-last line scores the square of its room, the last line
     none; a line wider than the box (plus Blink's 1/64 px epsilon) scores 1e12; every line adds a line penalty of 4 × box
     width × font size; breaking before the last segment adds 10 000 (`kOrphansPenalty`), four times that when it starts
     the last line; Blink's `best_hope` pruning and its `<=` tie-break are kept. A result with another line count than
-    greedy's falls back to greedy, as in Blink.
+    greedy's falls back to greedy, as in Blink. Each end is scored only against the starts within one line of it (two
+    pointers over the prefix widths; a start further back is overfull for every later end), keeping the nearest when
+    none is in reach (a segment wider than the box, which Blink scores overfull too).
   - **Opportunities** are Parley's own: the window is broken again with no room at all, so the breaker takes each one;
     the pieces it cuts a word into (emergency breaks) are summed back into the word.
-  - **Realised as widths** (`Fit`: the window's first line and up to six per-line widths, copyable): each chosen line's
-    max advance is its text's width plus 1/64 px, so Parley's greedy breaker lands exactly there; a line that does not
-    falls back to greedy.
+  - **A cap on the window's segments: 256** (`PRETTY_MAX_SEGMENTS`; the probe stops after 1 024 lines). Blink has none:
+    its candidate list only keeps 128 inline (`LineBreakCandidate::kInlineCapacity`), so its work grows with the square
+    of a line's opportunities (four lines of thousands of CJK characters). Past the cap the window stays greedy's: a
+    difference from Blink, only for windows of more than 256 opportunities.
+  - **Realised as widths** (`Fit`: the narrowed lines by index, each with its width, kept per breaking and read in
+    place, so a frame that breaks nothing allocates nothing): each chosen line's max advance is its text's width plus
+    1/64 px, so Parley's greedy breaker lands exactly there; a window whose lines do not falls back to greedy.
   - **Work:** one greedy pass that keeps the breaker's state at the start of each of the last four lines
-    (`BreakerState`, `BreakLines::revert_to`), then the window alone (its probe and its re-break); the greedy result is
-    the final layout when pretty does not apply.
+    (`BreakerState`, `BreakLines::revert_to`); at each paragraph's end its last line is probed (the trigger), then, when
+    it triggers, the window alone (its probe and its re-break), greedy going on from the paragraph's end; the greedy
+    result is the final layout where pretty does not apply.
   - **Balance** keeps its binary search on one width for all of a paragraph of at most six lines, realised through the
     same per-line widths; balanced and narrowed lines alike are now aligned in the whole box
     (`BreakLines::set_prior_line_width`), as Blink places them, not in the narrowed width shifted.

@@ -301,6 +301,12 @@ fn orphan_line(s: &Shaped) -> bool {
 }
 
 /// Whether the last line of `layout` is shorter than a third of `width`.
+/// The width of the text a line holds: its advance without the space that
+/// hangs at its end.
+fn content(m: &LineMetrics) -> f32 {
+    m.advance - m.hanging_advance
+}
+
 fn last_short(layout: &Layout<u32>, width: f32) -> bool {
     layout
         .lines()
@@ -424,9 +430,122 @@ fn balanced_lines_are_aligned_in_the_whole_box() {
     assert_eq!(s.layout.len(), 2);
     for line in s.layout.lines() {
         let m = line.metrics();
-        let mid = m.offset + m.inline_min_coord + content(m) / 2.0 + s.shift;
+        let mid = m.offset + m.inline_min_coord + content(m) / 2.0;
         assert!((mid - w / 2.0).abs() < 0.01, "centred: {mid} in {w}");
     }
+}
+
+#[test]
+fn pretty_narrowed_lines_are_centred_and_end_aligned_in_the_whole_box() {
+    // The 3/3/2/2 window, centred and end aligned, left to right and right
+    // to left: each line's text sits where its alignment puts it in the
+    // box, not in the narrowed width.
+    // Right to left in Hebrew: Parley hangs a line's trailing space only at
+    // the paragraph's bidi level (no UAX #9 L1), so Latin words in a
+    // right-to-left paragraph keep greedy's lines.
+    let mut ts = TextSystem::new();
+    let latin = format!("{} ab", ["abcdef"; 9].join(" "));
+    let hebrew = "שלום עולם זה טקסט ארוך מאוד שלא נכנס בשורה אחת ולכן הוא נשבר לכמה שורות עד המילה האחרונה שלו";
+    let (pretty, a) = mono(&mut ts, WrapStyle::Pretty);
+    let rtl_pretty = ResolvedText {
+        direction: Direction::Rtl,
+        wrap_style: WrapStyle::Pretty,
+        ..style(16.0, 24.0, 400)
+    };
+    let auto = ResolvedText {
+        wrap_style: WrapStyle::Auto,
+        ..rtl_pretty.clone()
+    };
+    let hebrew_w = (120_u16..400)
+        .step_by(3)
+        .map(f32::from)
+        .find(|w| {
+            let s = broken_piece(&mut ts, hebrew, &auto, *w);
+            s.layout.len() >= 2 && orphan_line(s) && last_short(&s.layout, *w)
+        })
+        .expect("a width at which the Hebrew paragraph ends in an orphan");
+    for (base, text, w) in [(&pretty, latin.as_str(), 20.5 * a), (&rtl_pretty, hebrew, hebrew_w)] {
+        let direction = base.direction;
+        for align in [TextAlign::Center, TextAlign::End] {
+            let t = ResolvedText { align, ..base.clone() };
+            let s = broken_piece(&mut ts, text, &t, w);
+            assert!(!orphan_line(s), "{direction:?} {align:?}: re-broken");
+            for line in s.layout.lines() {
+                let m = line.metrics();
+                // Right to left, the space at a line's end hangs at its left.
+                let rtl = direction == Direction::Rtl;
+                let left = m.offset + m.inline_min_coord + if rtl { m.hanging_advance } else { 0.0 };
+                let right = left + content(m);
+                let (got, want) = match (align, rtl) {
+                    (TextAlign::Center, _) => ((left + right) / 2.0, w / 2.0),
+                    (_, false) => (right, w),
+                    (_, true) => (left, 0.0),
+                };
+                assert!((got - want).abs() < 0.01, "{direction:?} {align:?}: {got} for {want}");
+            }
+        }
+    }
+}
+
+#[test]
+fn pretty_scores_each_paragraph_a_forced_break_ends() {
+    // A forced break inside a piece (U+2028) ends a paragraph as Blink
+    // scores it: the first loses its orphan though the piece's last lines
+    // have none.
+    let mut ts = TextSystem::new();
+    let nine = ["abcdef"; 9].join(" ");
+    let text = format!("{nine} ab\u{2028}{nine}");
+    let (pretty, a) = mono(&mut ts, WrapStyle::Pretty);
+    let s = broken_piece(&mut ts, &text, &pretty, 20.5 * a);
+    assert_eq!(words_per_line(s), [3, 3, 2, 2, 3, 3, 3]);
+}
+
+#[test]
+fn pretty_hangs_a_trailing_space_in_every_width_it_compares() {
+    // The 3/3/3/1 paragraph with a space at its end: the space hangs, as
+    // Blink's widths leave it out, and the paragraph re-breaks as without.
+    let mut ts = TextSystem::new();
+    let text = format!("{} ab ", ["abcdef"; 9].join(" "));
+    let (pretty, a) = mono(&mut ts, WrapStyle::Pretty);
+    let s = broken_piece(&mut ts, &text, &pretty, 20.5 * a);
+    assert_eq!(words_per_line(s), [3, 3, 2, 2]);
+}
+
+#[test]
+fn pretty_scores_a_window_of_thousands_of_opportunities_in_bounded_work() {
+    // 12,001 CJK characters, 4,000 a line, the last alone: every character
+    // is a break opportunity. The window holds more segments than are
+    // scored, so its lines stay greedy's, and no start is scored.
+    let mut ts = TextSystem::new();
+    let t = ResolvedText {
+        wrap_style: WrapStyle::Pretty,
+        ..style(16.0, 24.0, 400)
+    };
+    let one = ts.measure("一", &t, None).0;
+    let text = "一".repeat(12_001);
+    let w = 4_000.0 * one + one / 2.0;
+    let (lines, visits) = (ts.lines_broken, ts.scores_visited);
+    let s = broken_piece(&mut ts, &text, &t, w);
+    let per_line: Vec<usize> = s.layout.lines().map(|l| l.text_range().len() / "一".len()).collect();
+    assert_eq!(per_line, [4_000, 4_000, 4_000, 1], "greedy's");
+    assert_eq!(ts.scores_visited - visits, 0, "nothing scored");
+    // Past greedy's four: its last line probed, the window probed to one
+    // segment past the cap, and its four lines broken again.
+    let extra = ts.lines_broken - lines - 4;
+    let most = u64::try_from(1 + PRETTY_MAX_SEGMENTS + 1 + 4).unwrap_or(u64::MAX);
+    assert!(extra <= most, "{extra} lines past greedy's");
+}
+
+#[test]
+fn best_breaks_scores_each_end_against_one_line_of_starts() {
+    // As many segments as a window scores, ten a line: each end is scored
+    // against the starts within a line of it, not every start before it.
+    let segments = vec![(10.0_f32, 1.0_f32); PRETTY_MAX_SEGMENTS];
+    let mut visits = 0;
+    let widths = best_breaks(&segments, 99.5, 16.0, &mut visits).expect("scored");
+    assert!(widths.iter().all(|w| *w <= 99.5 + 2.0 * FIT_SLACK), "{widths:?}");
+    let bound = u64::try_from(PRETTY_MAX_SEGMENTS * 11).unwrap_or(u64::MAX);
+    assert!(visits <= bound, "{visits} starts scored");
 }
 
 #[test]
