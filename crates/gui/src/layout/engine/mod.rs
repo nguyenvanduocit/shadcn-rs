@@ -204,6 +204,22 @@ pub trait Measure: Send {
         MeasureReads::ALL
     }
 
+    /// [`Measure::measure`] in two spaces at once, `[max, min]`: what a flex
+    /// row asks of an item for its base size (max-content) and its automatic
+    /// minimum (min-content). Both answers must equal what two `measure`
+    /// calls give, bit for bit; a leaf overrides this when the two share
+    /// work. Alongside the answers: the measure passes it took, 1 when it
+    /// shared (counted in [`Stats::measures`]), 2 when it measured twice.
+    fn measure_pair(
+        &self,
+        cx: &mut Self::Cx,
+        known: Size<Option<f32>>,
+        max: Size<AvailableSpace>,
+        min: Size<AvailableSpace>,
+    ) -> ([Measured; 2], u64) {
+        ([self.measure(cx, known, max), self.measure(cx, known, min)], 2)
+    }
+
     /// A replaced element (an image): a size its aspect ratio decides is
     /// not made larger by its content.
     fn replaced(&self) -> bool {
@@ -344,11 +360,93 @@ pub struct Stats {
     pub jobs: u64,
     /// What the pool threads' measuring contexts did ([`Worker::take_work`]).
     pub work: u64,
+    /// What parents asked their children, by kind: every ask, the cache's
+    /// answers included.
+    pub asked: Asks,
+    /// The asks no cache answered (an algorithm ran), by kind; the root's
+    /// own run counts too, as a final placement.
+    pub ran: Asks,
+}
+
+/// A count to each kind of question a parent puts to a child.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Asks {
+    /// A size probe with an axis at its min-content.
+    pub min_content: u64,
+    /// A size probe with an axis at its max-content (none at min-content).
+    pub max_content: u64,
+    /// A size probe in definite space.
+    pub definite: u64,
+    /// A final layout, which places the child's own children.
+    pub placement: u64,
+}
+
+impl Asks {
+    /// The kind of `input`.
+    #[cfg(any(test, debug_assertions))]
+    fn of(input: &LayoutInput) -> Kind {
+        let space = [input.available_space.width, input.available_space.height];
+        if input.run_mode == RunMode::PerformLayout {
+            Kind::Placement
+        } else if space.contains(&AvailableSpace::MinContent) {
+            Kind::MinContent
+        } else if space.contains(&AvailableSpace::MaxContent) {
+            Kind::MaxContent
+        } else {
+            Kind::Definite
+        }
+    }
+
+    /// Count one ask of `input`; a hidden layout (it measures nothing and
+    /// keeps nothing) is no ask. Counted in debug and test builds only: in a
+    /// release build the counts stay zero and the question costs nothing
+    /// (the counters are a measure for L0 and the tests; nothing in release
+    /// reads them).
+    fn count(&mut self, input: &LayoutInput) {
+        #[cfg(any(test, debug_assertions))]
+        if input.run_mode != RunMode::PerformHiddenLayout {
+            let n = match Self::of(input) {
+                Kind::MinContent => &mut self.min_content,
+                Kind::MaxContent => &mut self.max_content,
+                Kind::Definite => &mut self.definite,
+                Kind::Placement => &mut self.placement,
+            };
+            *n = n.saturating_add(1);
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        let _ = (&self, input);
+    }
+
+    /// All the kinds.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.min_content
+            .saturating_add(self.max_content)
+            .saturating_add(self.definite)
+            .saturating_add(self.placement)
+    }
+
+    fn add(&mut self, o: Self) {
+        self.min_content = self.min_content.saturating_add(o.min_content);
+        self.max_content = self.max_content.saturating_add(o.max_content);
+        self.definite = self.definite.saturating_add(o.definite);
+        self.placement = self.placement.saturating_add(o.placement);
+    }
+}
+
+#[cfg(any(test, debug_assertions))]
+enum Kind {
+    MinContent,
+    MaxContent,
+    Definite,
+    Placement,
 }
 
 impl Stats {
     /// Add `o`'s counts to these.
     pub fn add(&mut self, o: Self) {
+        self.asked.add(o.asked);
+        self.ran.add(o.ran);
         self.calls = self.calls.saturating_add(o.calls);
         self.misses = self.misses.saturating_add(o.misses);
         self.measures = self.measures.saturating_add(o.measures);
@@ -1029,6 +1127,7 @@ fn run<S: NodeStyle, L: Measure>(
     block: Option<&mut BlockContext<'_>>,
 ) -> LayoutOutput {
     view.stats.misses = view.stats.misses.saturating_add(1);
+    view.stats.ran.count(&input);
     view.node.free_answer = false;
     let placements = view.stats.placements;
     if input.run_mode == RunMode::PerformLayout {
@@ -1193,6 +1292,44 @@ impl<S: NodeStyle, L: Measure> View<'_, S, L> {
         )
     }
 
+    /// Child `child` is about to be asked `max` and then `min`, two size
+    /// probes in one axis's max- and min-content: when it is a leaf that
+    /// reads only its width, and holds neither answer, it is measured once
+    /// for both ([`Measure::measure_pair`]) and the two probes find the
+    /// answers kept ([`cache::NodeCache::keep_measured`]).
+    fn prime_pair(&mut self, child: usize, max: &LayoutInput, min: &LayoutInput) {
+        let View { node, cx, stats, .. } = self;
+        let Some(c) = node.children.get_mut(child) else {
+            return;
+        };
+        let Some(leaf) = c.leaf.as_ref() else {
+            return;
+        };
+        let style = c.style.view();
+        let width = |i: &LayoutInput| (i.known_dimensions.width.is_none()).then_some(i.available_space.width);
+        if !c.children.is_empty()
+            || !leaf.reads().width_alone
+            || c.style.display() == Display::None
+            || sizing::ratio_of(&style).is_some()
+            || width(max) != Some(AvailableSpace::MaxContent)
+            || width(min) != Some(AvailableSpace::MinContent)
+        {
+            return;
+        }
+        let reads = c.reads();
+        if c.cache.has(max, reads)
+            || c.cache.has(min, reads)
+            || c.cache.measured(AvailableSpace::MaxContent).is_some()
+            || c.cache.measured(AvailableSpace::MinContent).is_some()
+        {
+            return;
+        }
+        let ([a, b], passes) = leaf.measure_pair(cx, max.known_dimensions, max.available_space, min.available_space);
+        stats.measures = stats.measures.saturating_add(passes);
+        c.cache.keep_measured(AvailableSpace::MaxContent, a);
+        c.cache.keep_measured(AvailableSpace::MinContent, b);
+    }
+
     fn child_layout(&mut self, id: NodeId, input: LayoutInput, block: Option<&mut BlockContext<'_>>) -> LayoutOutput {
         let raw = u64::from(id);
         if raw == SELF {
@@ -1221,6 +1358,7 @@ impl<S: NodeStyle, L: Measure> View<'_, S, L> {
         let Ok(i) = usize::try_from(raw) else {
             return LayoutOutput::HIDDEN;
         };
+        self.stats.asked.count(&input);
         let baseline = self.node.style.baseline();
         let run = self.node.run;
         let Some(c) = self.node.children.get_mut(i) else {

@@ -1740,3 +1740,403 @@ fn a_hidden_inline_is_no_focus_and_no_action_target() {
         );
     }
 }
+
+/// The trees L0 counts child asks over: what a parent asks its children,
+/// by kind (`Stats::asked`, `Stats::ran`).
+mod asks {
+    use super::*;
+    use taffy::{AvailableSpace, Size};
+
+    /// A row of text leaves, each sized by its content.
+    fn text_row() -> Element {
+        div()
+            .display(Display::Flex)
+            .gap(4.0)
+            .children((0..8).map(|i| text(format!("{} {i}", WORDS[i % 8]))))
+            .into_element()
+    }
+
+    /// Flex in flex: rows of cells that grow and wrap.
+    fn nested_flex() -> Element {
+        div()
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .gap(4.0)
+            .children((0..4).map(|r| {
+                div().display(Display::Flex).gap(4.0).children((0..4).map(move |c| {
+                    div()
+                        .display(Display::Flex)
+                        .flex_grow(1.0)
+                        .padding(4.0)
+                        .child(text(format!("{} {r}.{c} words", WORDS[(r + c) % 8])))
+                }))
+            }))
+            .into_element()
+    }
+
+    /// A grid of cards, each a column of a title and a body.
+    fn card_grid() -> Element {
+        div()
+            .display(Display::Grid)
+            .grid_columns(Tracks::repeat(3, Track::Fr(1.0)))
+            .gap(8.0)
+            .children((0..6).map(|i| {
+                div()
+                    .display(Display::Flex)
+                    .flex_direction(FlexDirection::Column)
+                    .padding(8.0)
+                    .child(text(format!("Card {i}")))
+                    .child(text("a body that wraps over a few lines of the card"))
+            }))
+            .into_element()
+    }
+
+    /// The window of a virtual list: a scroll box of fixed-height rows,
+    /// each a flex row of an icon, a label and a trailing note.
+    fn list_window() -> Element {
+        div()
+            .overflow_y(Overflow::Scroll)
+            .height(120.0)
+            .display(Display::Flex)
+            .flex_direction(FlexDirection::Column)
+            .children((0..12).map(|i| {
+                div()
+                    .display(Display::Flex)
+                    .gap(4.0)
+                    .height(24.0)
+                    .child(div().width(16.0).height(16.0))
+                    .child(text(format!("row {i} label")).flex_grow(1.0))
+                    .child(text("note"))
+            }))
+            .into_element()
+    }
+
+    /// A row too narrow for its text: the leaves wrap at their min-content.
+    fn wrapping_row() -> Element {
+        div()
+            .display(Display::Flex)
+            .width(150.0)
+            .gap(4.0)
+            .children((0..4).map(|i| text(format!("{} several words that wrap {i}", WORDS[i % 8]))))
+            .into_element()
+    }
+
+    fn trees() -> [(&'static str, Element); 5] {
+        [
+            ("text row", text_row()),
+            ("nested flex", nested_flex()),
+            ("card grid", card_grid()),
+            ("list window", list_window()),
+            ("wrapping row", wrapping_row()),
+        ]
+    }
+
+    fn laid(el: &Element) -> (Stats, Vec<(u32, u32, u32, u32)>) {
+        let mut tree = LayoutTree::new();
+        let mut ts = TextSystem::new();
+        tree.layout(el, 400.0, 300.0, &UiState::default(), &mut Motion::default(), &mut ts);
+        (tree.stats(), exact(tree.frame()))
+    }
+
+    fn kinds(a: Asks) -> [u64; 4] {
+        [a.min_content, a.max_content, a.definite, a.placement]
+    }
+
+    /// What a parent asks its children, and the leaf measures that
+    /// answered, for each tree: a flex row measures a text leaf once for
+    /// its base size and its automatic minimum together. Before, the
+    /// measures were 24, 48, 12, 72 and 12 (the asks are the same: the
+    /// second finds its answer kept).
+    #[test]
+    fn a_flex_row_measures_a_text_leaf_once_for_its_base_size_and_its_minimum() {
+        // [asked, ran] as [min, max, definite, placement], then measures.
+        let want: [(&str, [u64; 4], [u64; 4], u64); 5] = [
+            ("text row", [8, 8, 0, 8], [8, 8, 0, 9], 16),
+            ("nested flex", [212, 164, 0, 36], [52, 84, 0, 37], 32),
+            ("card grid", [54, 30, 0, 18], [18, 6, 0, 19], 12),
+            ("list window", [132, 24, 0, 48], [96, 0, 0, 49], 48),
+            ("wrapping row", [4, 4, 0, 4], [4, 4, 0, 5], 8),
+        ];
+        for ((name, el), (n, asked, ran, measures)) in trees().into_iter().zip(want) {
+            let (s, _) = laid(&el);
+            assert_eq!(name, n);
+            assert_eq!(
+                (kinds(s.asked), kinds(s.ran), s.measures),
+                (asked, ran, measures),
+                "{name}: asked, ran, measures"
+            );
+        }
+    }
+
+    /// The boxes of every tree, to the bit, as they were before a leaf
+    /// measured its minimum with its base size.
+    #[test]
+    fn the_boxes_are_the_same_to_the_bit() {
+        let want: [(&str, u64); 5] = [
+            ("text row", 17_048_616_598_677_835_447),
+            ("nested flex", 7_265_697_887_972_996_053),
+            ("card grid", 16_836_433_504_534_575_509),
+            ("list window", 13_040_370_934_046_842_613),
+            ("wrapping row", 7_065_004_713_279_509_305),
+        ];
+        let got = trees().map(|(name, el)| {
+            let (_, rects) = laid(&el);
+            let hash = rects
+                .iter()
+                .flat_map(|r| [r.0, r.1, r.2, r.3])
+                .fold(0xcbf2_9ce4_8422_2325_u64, |h, v| {
+                    (h ^ u64::from(v)).wrapping_mul(0x0100_0000_01b3)
+                });
+            (name, hash)
+        });
+        assert_eq!(got, want);
+    }
+
+    /// Every run of an algorithm is an ask, the root's own aside: the
+    /// requests a paragraph puts to the elements in its lines are counted
+    /// as a parent's are.
+    #[test]
+    fn a_paragraphs_requests_to_its_inline_children_are_asks() {
+        let el = div()
+            .display(Display::Flex)
+            .child(
+                text("some words ")
+                    .child(div().width(12.0).height(30.0).child(text("x")))
+                    .span(" and more"),
+            )
+            .into_element();
+        let (s, _) = laid(&el);
+        assert!(s.asked.total() > 0, "the paragraph's child was asked");
+        assert!(s.ran.total() <= s.asked.total() + 1, "{s:?}");
+        for (name, el) in trees() {
+            let (s, _) = laid(&el);
+            assert!(s.ran.total() <= s.asked.total() + 1, "{name}: {s:?}");
+        }
+    }
+
+    fn plain() -> ResolvedText {
+        ResolvedText::root(Color::BLACK)
+    }
+
+    fn text_leaf(content: &str, t: ResolvedText, runs: Vec<Run>) -> Leaf {
+        Leaf::Text {
+            content: content.into(),
+            text: t,
+            runs: runs.into(),
+            objects: Vec::new(),
+        }
+    }
+
+    fn input_leaf(content: &str, multiline: bool) -> Leaf {
+        Leaf::Input {
+            content: content.into(),
+            text: plain(),
+            multiline,
+        }
+    }
+
+    /// What `measure_pair` answers, each with its own text system, and what
+    /// two `measure` calls answer: sizes and baselines, to the bit.
+    fn same_pair(name: &str, leaf: &Leaf) {
+        use super::engine::Measure;
+        for known in [
+            Size {
+                width: None,
+                height: None,
+            },
+            Size {
+                width: None,
+                height: Some(21.0),
+            },
+        ] {
+            for cross in [
+                AvailableSpace::MaxContent,
+                AvailableSpace::MinContent,
+                AvailableSpace::Definite(50.0),
+            ] {
+                let max = Size {
+                    width: AvailableSpace::MaxContent,
+                    height: cross,
+                };
+                let min = Size {
+                    width: AvailableSpace::MinContent,
+                    height: cross,
+                };
+                let ([a, b], passes) = leaf.measure_pair(&mut TextSystem::new(), known, max, min);
+                let (c, d) = (
+                    leaf.measure(&mut TextSystem::new(), known, max),
+                    leaf.measure(&mut TextSystem::new(), known, min),
+                );
+                assert_eq!(
+                    format!("{a:?}{b:?}"),
+                    format!("{c:?}{d:?}"),
+                    "{name} {known:?} {cross:?}"
+                );
+                let bits = |m: super::engine::Measured| (m.size.width.to_bits(), m.size.height.to_bits());
+                assert_eq!((bits(a), bits(b)), (bits(c), bits(d)), "{name}: size bits");
+                let shares = matches!(leaf, Leaf::Text { .. });
+                assert_eq!(passes, if shares { 1 } else { 2 }, "{name}: passes");
+            }
+        }
+    }
+
+    #[test]
+    fn a_pair_measure_is_two_measures_to_the_bit() {
+        const LONG: &str = "Several words that wrap, and one unbrokenAndVeryLongWordIndeed, then more words after it";
+        let bold = ResolvedText {
+            weight: 700,
+            size: 22.0,
+            ..plain()
+        };
+        let styled = vec![
+            Run {
+                range: 8..14,
+                text: bold,
+                background: Some(Color::BLACK),
+                radius: 2.0,
+                padding: Edges {
+                    top: 3.0,
+                    right: 4.0,
+                    bottom: 5.0,
+                    left: 6.0,
+                },
+            },
+            Run {
+                range: 20..25,
+                text: ResolvedText {
+                    italic: true,
+                    ..plain()
+                },
+                background: None,
+                radius: 0.0,
+                padding: Edges::default(),
+            },
+        ];
+        let leaves = [
+            ("plain", text_leaf(LONG, plain(), vec![])),
+            ("one word", text_leaf("word", plain(), vec![])),
+            ("empty", text_leaf("", plain(), vec![])),
+            ("styled runs", text_leaf(LONG, plain(), styled)),
+            (
+                "font fallback",
+                text_leaf("日本語のテキスト mixed 😀 emoji and العربية", plain(), vec![]),
+            ),
+            (
+                "nowrap",
+                text_leaf(
+                    LONG,
+                    ResolvedText {
+                        nowrap: true,
+                        ..plain()
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "truncate",
+                text_leaf(
+                    LONG,
+                    ResolvedText {
+                        truncate: true,
+                        nowrap: true,
+                        ..plain()
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "line clamp",
+                text_leaf(
+                    LONG,
+                    ResolvedText {
+                        line_clamp: Some(2),
+                        ..plain()
+                    },
+                    vec![],
+                ),
+            ),
+            (
+                "centered",
+                text_leaf(
+                    LONG,
+                    ResolvedText {
+                        align: TextAlign::Center,
+                        ..plain()
+                    },
+                    vec![],
+                ),
+            ),
+            ("input", input_leaf("typed text in a field", false)),
+            (
+                "textarea",
+                input_leaf("typed text in a field that wraps over lines", true),
+            ),
+            ("empty textarea", input_leaf("", true)),
+        ];
+        for (name, leaf) in &leaves {
+            same_pair(name, leaf);
+        }
+    }
+
+    /// Text and width change between two layouts of one retained tree: the
+    /// boxes are a fresh tree's, to the bit.
+    #[test]
+    fn a_retained_row_laid_again_after_its_text_and_width_change_is_a_fresh_one() {
+        let row = |words: &str, width: f32| {
+            div()
+                .display(Display::Flex)
+                .width(width)
+                .gap(4.0)
+                .children((0..3).map(|i| text(format!("{words} {i}"))))
+                .into_element()
+        };
+        let mut tree = LayoutTree::new();
+        let mut ts = TextSystem::new();
+        let state = UiState::default();
+        for (words, width) in [
+            ("a few words", 400.0),
+            ("a few more words that wrap", 400.0),
+            ("a few more words that wrap", 120.0),
+            ("short", 120.0),
+            ("short", 300.0),
+        ] {
+            let el = row(words, width);
+            tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
+            let (_, fresh) = laid(&el);
+            assert_eq!(exact(tree.frame()), fresh, "{words:?} at {width}");
+        }
+    }
+
+    /// A leaf that was a block's child (only placed, in its inherent sizing
+    /// mode) becomes a flex row's: the row's first probe finds the sizing
+    /// mode changed and clears what the leaf cached, but not what its pair
+    /// measure kept, so the leaf is measured once for both probes, not twice
+    /// (12 measures, not 8, without it).
+    #[test]
+    fn a_pair_measure_kept_survives_a_change_of_sizing_mode() {
+        let el = |row: bool| {
+            div()
+                .display(if row { Display::Flex } else { Display::Block })
+                .width(400.0)
+                .children((0..4).map(|i| text(format!("word {i} and more"))))
+                .into_element()
+        };
+        let mut tree = LayoutTree::new();
+        let mut ts = TextSystem::new();
+        let state = UiState::default();
+        tree.layout(&el(false), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
+        tree.layout(&el(true), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
+        let (stats, moved) = (tree.stats(), exact(tree.frame()));
+        let (fresh_stats, fresh) = laid(&el(true));
+        assert_eq!(moved, fresh, "the boxes of a fresh tree");
+        // Four leaves: one pair measure each for the two probes, and one
+        // for the final layout, at most as many as a fresh tree's.
+        assert!(
+            stats.measures <= fresh_stats.measures,
+            "{} measures, a fresh tree's {}",
+            stats.measures,
+            fresh_stats.measures
+        );
+        assert_eq!(stats.measures, 4 * 2, "{stats:?}");
+    }
+}

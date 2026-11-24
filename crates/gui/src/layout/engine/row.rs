@@ -260,24 +260,30 @@ fn measure<S: NodeStyle, L: Measure>(
     available: Size<AvailableSpace>,
     axis: RequestedAxis,
 ) -> Size<f32> {
-    view.child_layout(
-        id(child),
-        LayoutInput {
-            known_dimensions: known,
-            known_dimensions_are_definite: Size {
-                width: true,
-                height: true,
-            },
-            parent_size: parent,
-            available_space: available,
-            sizing_mode: SizingMode::ContentSize,
-            axis,
-            run_mode: RunMode::ComputeSize,
-            vertical_margins_are_collapsible: Line::FALSE,
+    view.child_layout(id(child), probe(known, parent, available, axis), None)
+        .size
+}
+
+/// The size probe [`measure`] asks.
+fn probe(
+    known: Size<Option<f32>>,
+    parent: Size<Option<f32>>,
+    available: Size<AvailableSpace>,
+    axis: RequestedAxis,
+) -> LayoutInput {
+    LayoutInput {
+        known_dimensions: known,
+        known_dimensions_are_definite: Size {
+            width: true,
+            height: true,
         },
-        None,
-    )
-    .size
+        parent_size: parent,
+        available_space: available,
+        sizing_mode: SizingMode::ContentSize,
+        axis,
+        run_mode: RunMode::ComputeSize,
+        vertical_margins_are_collapsible: Line::FALSE,
+    }
 }
 
 /// Lay `view`'s node out as a flex row for `inputs`, as
@@ -628,6 +634,12 @@ fn flex_base_size<S: NodeStyle, L: Measure>(
         }
         ckd
     };
+    let automatic = if item.overflow.x.is_scroll_container() {
+        Some(0.0)
+    } else {
+        None
+    };
+    let wants_min_content = item.min_size.width.or(automatic).is_none();
     item.flex_basis = 'basis: {
         if !item.basis_is_content
             && let Some(basis) = item.styled_basis.or(item.size.width.filter(|_| item.basis_is_auto))
@@ -643,6 +655,19 @@ fn flex_base_size<S: NodeStyle, L: Measure>(
             },
             height: cross_available,
         };
+        // The automatic minimum below asks the same child for its
+        // min-content: a leaf is measured once for both.
+        if space.width == AvailableSpace::MaxContent && wants_min_content {
+            let min_space = Size {
+                width: AvailableSpace::MinContent,
+                height: cross_available,
+            };
+            view.prime_pair(
+                item.child,
+                &probe(known, child_parent_size, space, RequestedAxis::Horizontal),
+                &probe(known, child_parent_size, min_space, RequestedAxis::Horizontal),
+            );
+        }
         measure(
             view,
             item.child,
@@ -657,11 +682,6 @@ fn flex_base_size<S: NodeStyle, L: Measure>(
     item.flex_basis = item.flex_basis.max(padding_border_sum);
     item.inner_flex_basis = item.flex_basis - padding_border_sum;
     let padding_border_axes_sums = rect_add(item.padding, item.border).sum_axes().map(Some);
-    let automatic = if item.overflow.x.is_scroll_container() {
-        Some(0.0)
-    } else {
-        None
-    };
     item.resolved_minimum_main_size = match item.min_size.width.or(automatic) {
         Some(min) => min,
         None => {

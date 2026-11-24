@@ -348,7 +348,12 @@ impl NodeCache {
         let mode = mode_of(input);
         if mode != self.mode {
             let had = !self.is_empty();
+            // What its leaf measured does not depend on the sizing mode
+            // (the same content, the same width): the answers a parent's
+            // pair measure kept stand.
+            let measures = self.measures;
             self.clear();
+            self.measures = measures;
             self.lost = had;
             self.mode = mode;
         }

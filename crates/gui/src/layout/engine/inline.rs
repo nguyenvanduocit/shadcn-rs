@@ -300,6 +300,7 @@ fn lay<S: NodeStyle, L: Measure>(
     stats: &mut Stats,
 ) -> LayoutOutput {
     c.tight = false;
+    stats.asked.count(&input);
     if input.run_mode == RunMode::PerformLayout {
         c.input = Some(input);
         c.placed_in = run;

@@ -32,7 +32,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 pub use boxstyle::{BoxStyle, Len};
-pub use engine::{Schedule, Stats};
+pub use engine::{Asks, Schedule, Stats};
 pub use leaf::{ImageMeasure, Leaf};
 
 pub(crate) use changes::{Changed, Changes, ReadAt, Since};

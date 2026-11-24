@@ -263,6 +263,49 @@ impl Measure for Leaf {
         self.measure_inline(text, known, available, &[])
     }
 
+    /// A text leaf's max-content and min-content answers from one
+    /// paragraph: the wrapped min-content answer needs the unwrapped
+    /// width, which is the max-content answer's own.
+    fn measure_pair(
+        &self,
+        text: &mut TextSystem,
+        known: Size<Option<f32>>,
+        max: Size<AvailableSpace>,
+        min: Size<AvailableSpace>,
+    ) -> ([Measured; 2], u64) {
+        let twice = |text: &mut TextSystem| ([self.measure(text, known, max), self.measure(text, known, min)], 2);
+        let Self::Text {
+            content,
+            text: t,
+            runs,
+            objects,
+        } = self
+        else {
+            return twice(text);
+        };
+        if known.width.is_some() || max.width != AvailableSpace::MaxContent || min.width != AvailableSpace::MinContent {
+            return twice(text);
+        }
+        let boxes: Vec<InlineSlot> = slots(objects, &[]).collect();
+        let p = Paragraph {
+            content,
+            runs,
+            boxes: &boxes,
+        };
+        // As `measure_inline` with no width: one line, as wide as it is.
+        let free = text.metrics(p, t, None);
+        let at_max = measured(free.width, free.height, free);
+        // As `measure_inline` at the min-content width.
+        let given = text.min_content(p, t);
+        let m = text.metrics(p, t, wrap_width(t, given));
+        let w = if m.height > t.line_height && !t.nowrap && free.width > given {
+            given
+        } else {
+            m.width
+        };
+        ([at_max, measured(w, m.height, m)], 1)
+    }
+
     fn measure_inline(
         &self,
         text: &mut TextSystem,
