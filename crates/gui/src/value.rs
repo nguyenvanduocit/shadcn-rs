@@ -8,6 +8,12 @@
 //! property belongs to (a colour repaints, a padding lays out). The
 //! instance that built the node does not render again.
 //!
+//! The common reads are sources rather than closures ([`source`]): a flag
+//! of an [`crate::Interaction`] (`.background(i.hover(rest, lit))`), a
+//! signal (`.opacity(open.map(|o| if *o { 1.0 } else { 0.0 }))`), a
+//! [`Group`] of signals (shadcn's theme). A source's mount needs no
+//! tracker: it registers with what it reads, which wakes it alone.
+//!
 //! A property has one owner: the last setter that wrote it, fixed or
 //! bound. A write is known by the [`Field`]s of the [`Style`] it writes,
 //! not by the setter's name: a later write of every field an earlier
@@ -26,7 +32,13 @@ use std::sync::Arc;
 
 use smallvec::SmallVec;
 
+use crate::reactive::Signal;
 use crate::style::Style;
+
+pub mod source;
+
+use source::{Closure, Read, Via};
+pub use source::{Group, Grouped, Mapped, Toggle};
 
 /// What a setter was given: a value, or a closure that gives one.
 pub enum Value<T> {
@@ -60,9 +72,24 @@ pub trait IntoValue<T, M> {
     {
         match self.into_value() {
             Value::Fixed(v) => Setting(Given::Fixed(v)),
-            Value::Bound(f) if !keep => Setting(Given::Fixed(f())),
-            Value::Bound(f) => Setting(Given::Bound(Rc::new(BoundWrite::new(move || f(), write)))),
+            Value::Bound(f) => setting(Closure(move || f()), write, keep),
         }
+    }
+}
+
+/// What a setter keeps of `read`: with `keep`, a definition of it and
+/// `write`; without (no node keeps it), what it gives now, tracked by
+/// whatever runs.
+fn setting<R, W>(read: R, write: W, keep: bool) -> Setting<R::Out>
+where
+    R: Read,
+    R::Out: Clone + PartialEq + 'static,
+    W: Fn(&mut Style, R::Out) + Copy + 'static,
+{
+    if keep {
+        Setting(Given::Bound(Rc::new(BoundWrite::new(read, write))))
+    } else {
+        Setting(Given::Fixed(read.get()))
     }
 }
 
@@ -93,6 +120,10 @@ pub mod marker {
     pub struct Via<S>(PhantomData<S>);
     /// A closure giving a value that [`super::Convert`]s.
     pub struct BoundVia<S>(PhantomData<S>);
+    /// A source ([`super::source`]) giving the property's own type.
+    pub struct Source;
+    /// A source giving a value that [`super::Convert`]s.
+    pub struct SourceVia<S>(PhantomData<S>);
 }
 
 impl<T> IntoValue<T, marker::Fixed> for T {
@@ -115,10 +146,7 @@ impl<T, F: Fn() -> T + 'static> IntoValue<T, marker::Bound> for F {
         T: Clone + PartialEq + 'static,
         W: Fn(&mut Style, T) + Copy + 'static,
     {
-        if !keep {
-            return Setting(Given::Fixed(self()));
-        }
-        Setting(Given::Bound(Rc::new(BoundWrite::new(self, write))))
+        setting(Closure(self), write, keep)
     }
 }
 
@@ -142,10 +170,139 @@ impl<T, S: Convert<T>, F: Fn() -> S + 'static> IntoValue<T, marker::BoundVia<S>>
         T: Clone + PartialEq + 'static,
         W: Fn(&mut Style, T) + Copy + 'static,
     {
-        if !keep {
-            return Setting(Given::Fixed(self().convert()));
+        setting(Closure(move || self().convert()), write, keep)
+    }
+}
+
+/// The [`IntoValue`] impls of a source, of the property's own type and of
+/// one that converts to it: a setter keeps it as a source; a prop that
+/// takes a value or a closure ([`IntoValue::into_value`]) reads it as a
+/// closure does, tracked.
+macro_rules! source_values {
+    ($([$($g:tt)*] $ty:ty => $gives:ty;)*) => {
+        $(
+            impl<$($g)*> IntoValue<$gives, marker::Source> for $ty
+            where
+                $ty: Read<Out = $gives>,
+            {
+                fn into_value(self) -> Value<$gives> {
+                    Value::Bound(Rc::new(move || self.get()))
+                }
+
+                fn into_setting<W>(self, write: W, keep: bool) -> Setting<$gives>
+                where
+                    $gives: Clone + PartialEq + 'static,
+                    W: Fn(&mut Style, $gives) + Copy + 'static,
+                {
+                    setting(self, write, keep)
+                }
+            }
+
+            impl<$($g)*, Target: 'static> IntoValue<Target, marker::SourceVia<$gives>> for $ty
+            where
+                $ty: Read<Out = $gives>,
+                $gives: Convert<Target>,
+            {
+                fn into_value(self) -> Value<Target> {
+                    let read = Via::new(self);
+                    Value::Bound(Rc::new(move || read.get()))
+                }
+
+                fn into_setting<W>(self, write: W, keep: bool) -> Setting<Target>
+                where
+                    Target: Clone + PartialEq + 'static,
+                    W: Fn(&mut Style, Target) + Copy + 'static,
+                {
+                    setting(Via::new(self), write, keep)
+                }
+            }
+        )*
+    };
+}
+
+source_values! {
+    [T: Clone + 'static] Toggle<T> => T;
+    [S: 'static, T: 'static, F: Fn(&S) -> T + 'static] Mapped<S, F> => T;
+    [G: 'static, T: 'static, F: Fn(&G) -> T + 'static] Grouped<G, F> => T;
+}
+
+/// A signal given to a setter is read as `signal.map(T::clone)`.
+impl<T: Clone + 'static> IntoValue<T, marker::Source> for Signal<T> {
+    fn into_value(self) -> Value<T> {
+        Value::Bound(Rc::new(move || self.get()))
+    }
+
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
+    where
+        T: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, T) + Copy + 'static,
+    {
+        setting(self.map(T::clone), write, keep)
+    }
+}
+
+/// A value known where it is given, or a source of one: what a provider
+/// returns when only some of what it gives follows a signal (a corner that
+/// follows the theme's radius; a fixed one registers nowhere).
+#[derive(Clone, Debug)]
+pub enum FixedOr<T, S> {
+    Fixed(T),
+    Source(S),
+}
+
+impl<T, S: IntoValue<T, marker::Source>> IntoValue<T, marker::Source> for FixedOr<T, S> {
+    fn into_value(self) -> Value<T> {
+        match self {
+            Self::Fixed(v) => Value::Fixed(v),
+            Self::Source(s) => s.into_value(),
         }
-        Setting(Given::Bound(Rc::new(BoundWrite::new(move || self().convert(), write))))
+    }
+
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
+    where
+        T: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, T) + Copy + 'static,
+    {
+        match self {
+            Self::Fixed(v) => Setting(Given::Fixed(v)),
+            Self::Source(s) => s.into_setting(write, keep),
+        }
+    }
+}
+
+impl<T: Convert<Target>, S: IntoValue<Target, marker::SourceVia<T>>, Target> IntoValue<Target, marker::SourceVia<T>>
+    for FixedOr<T, S>
+{
+    fn into_value(self) -> Value<Target> {
+        match self {
+            Self::Fixed(v) => Value::Fixed(v.convert()),
+            Self::Source(s) => s.into_value(),
+        }
+    }
+
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<Target>
+    where
+        Target: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, Target) + Copy + 'static,
+    {
+        match self {
+            Self::Fixed(v) => Setting(Given::Fixed(v.convert())),
+            Self::Source(s) => s.into_setting(write, keep),
+        }
+    }
+}
+
+impl<S: Clone + Convert<T> + 'static, T: 'static> IntoValue<T, marker::SourceVia<S>> for Signal<S> {
+    fn into_value(self) -> Value<T> {
+        Value::Bound(Rc::new(move || self.get().convert()))
+    }
+
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
+    where
+        T: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, T) + Copy + 'static,
+    {
+        setting(Via::new(self.map(S::clone)), write, keep)
     }
 }
 
@@ -599,44 +756,61 @@ enum Run {
     Bound(Rc<dyn Bound>),
 }
 
-/// A bound setter, as the element keeps it: its closure and the write of
-/// what the closure gives, one allocation behind one pointer, shared by
-/// every clone of the element and every node it is mounted on. It holds
-/// no state: what one mount last gave is that mount's ([`Mounted`]), so a
-/// node never sees another's value and a cold build (the cold check, a
-/// fork) runs it without touching a live node's.
+/// A bound setter, as the element keeps it: what it reads (a closure, or
+/// a source: [`source`]) and the write of what that gives, one allocation
+/// behind one pointer, shared by every clone of the element and every
+/// node it is mounted on. It holds no state: what one mount last gave is
+/// that mount's ([`Mounted`]), so a node never sees another's value and a
+/// cold build (the cold check, a fork) runs it without touching a live
+/// node's.
 ///
-/// Where the types go: a setter keeps the closure's type `F` and the
-/// setter's write `W` up to [`IntoValue::into_setting`], which makes the
+/// Where the types go: a setter keeps the type of what it was given and
+/// the setter's write `W` up to [`IntoValue::into_setting`], which makes the
 /// [`BoundWrite`] and erases it here, once per definition. A mount
-/// ([`Bound::mount`]) makes a [`Mount`] typed by the same `F`, `W` and `T`,
-/// erased once more behind [`Mounted`]: running the closure, comparing
-/// what it gave with what that mount last gave, and writing it are static
-/// calls inside one dynamic one, with no downcast.
+/// ([`Bound::mount`]) makes a [`Mount`] typed by the same read and write,
+/// erased once more behind [`Mounted`]: reading, comparing what it gave
+/// with what that mount last gave, and writing it are static calls inside
+/// one dynamic one, with no downcast.
 pub(crate) trait Bound: Any {
     /// A mount of it on one node: the typed cell of what it last gave
     /// there, empty until its first run.
     fn mount(self: Rc<Self>) -> Box<dyn Mounted>;
-    /// Run the closure and write what it gives, keeping nothing (a bare
-    /// [`Style`], a span, a write replayed without its mount).
+    /// Read and write what it gives, keeping nothing, tracked by whatever
+    /// runs (a bare [`Style`], a span, a write replayed without its mount).
     fn apply(&self, style: &mut Style);
 }
 
-/// One mount of a [`Bound`] on one node: the definition and what its
-/// closure last gave there, typed. Owned by that node's binding state
-/// (`layout::binding::BoundRun`), next to the node's tracker of it.
+/// One mount of a [`Bound`] on one node: the definition and what it last
+/// gave there, typed, and for a source its registration. Owned by that
+/// node's binding state (`layout::binding::BoundRun`), which holds the
+/// tracker a closure runs under; a source needs none.
 pub(crate) trait Mounted {
     /// Whether it is a mount of `def`.
     fn is(&self, def: &Rc<dyn Bound>) -> bool;
     /// Mount `def` here in place of its own definition, when it is of the
-    /// same closure and write (the same setter given the same closure
-    /// again, by an element built anew): what it last gave stays, to be
-    /// compared with what `def`'s closure gives. False when `def` is of
-    /// another type.
+    /// same read and write (the same setter given the same closure again,
+    /// by an element built anew): what it last gave stays, to be compared
+    /// with what `def` gives, and a source's registration stays while it
+    /// reads the same source. False when `def` is of another type.
     fn rebind(&mut self, def: &Rc<dyn Bound>) -> bool;
-    /// Run the closure, tracked by whatever is running, keeping what it
-    /// gave; whether that differs from what it last gave (true on the first
-    /// run). Allocates nothing past what the closure does.
+    /// Whether it runs under a tracker of its own (a closure, or the one
+    /// mount of a signal), which says when it must run again. Another
+    /// source registers with what it reads.
+    fn tracked(&self) -> bool;
+    /// It is about to run: a source registers with what it reads, to wake
+    /// `mark` (its node's), and its wake is taken. Before [`Self::tracked`]
+    /// is asked: registering decides whether a signal's mount reads it
+    /// alone, tracked.
+    fn prepare(&mut self, mark: &crate::reactive::Mark);
+    /// A source's mount: whether it must run (it never ran, or what it
+    /// reads woke it since). Never for a closure: its tracker says so.
+    fn due(&self) -> bool;
+    /// Read, keeping what it gave; whether that differs from what it last
+    /// gave (true on the first run), once [`Self::prepare`]d. A closure
+    /// runs tracked by whatever is running (its tracker), as does the one
+    /// mount of a signal; another source reads untracked. Allocates
+    /// nothing past what the closure does, and in steady state nothing for
+    /// a source.
     ///
     /// The cutoff is `PartialEq`, as a signal's is: a value equal to the
     /// last is not written, and the node's style as last replayed stands.
@@ -647,52 +821,56 @@ pub(crate) trait Mounted {
     fn eval(&mut self) -> bool;
     /// Write what it last gave; false, writing nothing, before its first run.
     fn write(&self, style: &mut Style) -> bool;
+    /// A source's registration, taken out: its node is hidden, and its
+    /// parent waits in its place.
+    fn take_wait(&mut self) -> Option<source::Wait>;
 }
 
-/// A bound setter's closure `F` and the setter's write `W` of what it
-/// gives, `T`.
-struct BoundWrite<F, W, T> {
-    f: F,
+/// What a bound setter reads, `R`, and the setter's write `W` of what it
+/// gives.
+struct BoundWrite<R, W> {
+    read: R,
     write: W,
-    gives: std::marker::PhantomData<fn() -> T>,
 }
 
-impl<F, W, T> BoundWrite<F, W, T> {
-    fn new(f: F, write: W) -> Self {
-        Self {
-            f,
-            write,
-            gives: std::marker::PhantomData,
-        }
+impl<R: Read, W> BoundWrite<R, W> {
+    const fn new(read: R, write: W) -> Self {
+        Self { read, write }
     }
 }
 
-impl<F, W, T> Bound for BoundWrite<F, W, T>
+impl<R, W> Bound for BoundWrite<R, W>
 where
-    F: Fn() -> T + 'static,
-    W: Fn(&mut Style, T) + Copy + 'static,
-    T: Clone + PartialEq + 'static,
+    R: Read,
+    R::Out: Clone + PartialEq + 'static,
+    W: Fn(&mut Style, R::Out) + Copy + 'static,
 {
     fn mount(self: Rc<Self>) -> Box<dyn Mounted> {
-        Box::new(Mount { def: self, last: None })
+        Box::new(Mount {
+            def: self,
+            last: None,
+            wait: None,
+        })
     }
 
     fn apply(&self, style: &mut Style) {
-        (self.write)(style, (self.f)());
+        (self.write)(style, self.read.get());
     }
 }
 
-/// [`Mounted`] for a [`BoundWrite`]: the typed comparison cell.
-struct Mount<F, W, T> {
-    def: Rc<BoundWrite<F, W, T>>,
-    last: Option<T>,
+/// [`Mounted`] for a [`BoundWrite`]: the typed comparison cell, and a
+/// source's registration.
+struct Mount<R: Read, W> {
+    def: Rc<BoundWrite<R, W>>,
+    last: Option<R::Out>,
+    wait: Option<source::Wait>,
 }
 
-impl<F, W, T> Mounted for Mount<F, W, T>
+impl<R, W> Mounted for Mount<R, W>
 where
-    F: Fn() -> T + 'static,
-    W: Fn(&mut Style, T) + Copy + 'static,
-    T: Clone + PartialEq + 'static,
+    R: Read,
+    R::Out: Clone + PartialEq + 'static,
+    W: Fn(&mut Style, R::Out) + Copy + 'static,
 {
     fn is(&self, def: &Rc<dyn Bound>) -> bool {
         std::ptr::addr_eq(Rc::as_ptr(&self.def), Rc::as_ptr(def))
@@ -700,7 +878,7 @@ where
 
     fn rebind(&mut self, def: &Rc<dyn Bound>) -> bool {
         let any: Rc<dyn Any> = Rc::<dyn Bound>::clone(def);
-        match any.downcast::<BoundWrite<F, W, T>>() {
+        match any.downcast::<BoundWrite<R, W>>() {
             Ok(def) => {
                 self.def = def;
                 true
@@ -709,13 +887,30 @@ where
         }
     }
 
+    fn tracked(&self) -> bool {
+        R::TRACKED || self.wait.as_ref().is_some_and(source::Wait::is_solo)
+    }
+
+    fn prepare(&mut self, mark: &crate::reactive::Mark) {
+        source::watch(&self.def.read, mark, &mut self.wait);
+    }
+
+    fn due(&self) -> bool {
+        source::due(self.tracked(), self.wait.as_ref())
+    }
+
     fn eval(&mut self) -> bool {
-        let v = (self.def.f)();
+        let solo = self.wait.as_ref().is_some_and(source::Wait::is_solo);
+        let v = self.def.read.peek(solo);
         if self.last.as_ref() == Some(&v) {
             return false;
         }
         self.last = Some(v);
         true
+    }
+
+    fn take_wait(&mut self) -> Option<source::Wait> {
+        self.wait.take()
     }
 
     fn write(&self, style: &mut Style) -> bool {
@@ -736,6 +931,13 @@ impl Op {
             Run::Bound(b) => Some(b),
             Run::Write(_) => None,
         }
+    }
+
+    /// Whether it is a parent's restyle: the one write that may read
+    /// signals as it replays (a fixed write writes a value; a bound one,
+    /// what its mount last gave).
+    pub(crate) fn restyles(&self) -> bool {
+        self.kind == Kind::Restyle
     }
 
     /// Run it over `style`: a bound one runs its closure.

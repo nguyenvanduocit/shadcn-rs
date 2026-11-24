@@ -1,6 +1,7 @@
 //! The focus ring every focusable shadcn control shows:
 //! `focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]`.
 
+use gui::interact::Flag;
 use gui::prelude::*;
 use gui::{Color, Style};
 
@@ -41,10 +42,16 @@ pub trait StateLook: Styled {
             .ring(move || if again() { glow } else { off })
     }
 
-    /// [`focus_ring`] while `i` shows focus.
+    /// [`focus_ring`] while `i` shows focus, read through a source (no tracker per binding).
     #[must_use]
-    fn focus_ring_on(self, i: Interaction, t: &Colors) -> Self {
-        self.ring_while(move || i.focus_visible(), &focus_ring(Style::default(), t))
+    fn focus_ring_on(mut self, i: Interaction, t: &Colors) -> Self {
+        let ring = focus_ring(Style::default(), t);
+        let (border, off) = {
+            let s = self.style_mut();
+            (s.border_color, s.ring)
+        };
+        self.border_color(i.when(Flag::FocusVisible, border, ring.border_color))
+            .ring(i.when(Flag::FocusVisible, off, ring.ring))
     }
 
     /// The background `color` while `on` holds (`move || i.hovered()`).
@@ -65,14 +72,14 @@ pub trait StateLook: Styled {
     #[must_use]
     fn dim_disabled(mut self, i: Interaction, opacity: f32) -> Self {
         let base = self.style_mut().opacity;
-        self.opacity(move || if i.disabled() { opacity } else { base })
+        self.opacity(i.when(Flag::Disabled, base, opacity))
     }
 
     /// The not-allowed cursor while `i` is disabled (`disabled:cursor-not-allowed`).
     #[must_use]
     fn cursor_disabled(mut self, i: Interaction) -> Self {
         let base = self.style_mut().cursor;
-        self.cursor(move || if i.disabled() { Some(Cursor::NotAllowed) } else { base })
+        self.cursor(i.when(Flag::Disabled, base, Some(Cursor::NotAllowed)))
     }
 }
 

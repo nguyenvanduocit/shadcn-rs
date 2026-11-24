@@ -136,6 +136,11 @@ impl<T: 'static> Signal<T> {
         })
     }
 
+    /// Its slot and generation: which signal it is, as a map keys it.
+    pub(crate) const fn key(&self) -> (usize, u32) {
+        (self.id.index, self.id.generation)
+    }
+
     /// Whether its scope still lives.
     #[must_use]
     pub fn is_alive(&self) -> bool {

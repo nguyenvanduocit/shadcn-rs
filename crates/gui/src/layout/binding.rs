@@ -100,40 +100,45 @@ impl Drop for Tracker {
 /// A node's bound style (ADR-0022): each bound setter's closure runs under
 /// a tracker of its own, so a signal one of them read changing runs that
 /// one again and replays the others from what they last gave (a binding
-/// that reads `focus_visible` does not run on hover). The style is the
-/// fixed style with every write replayed over it in the order it was set;
-/// it is kept, keyed by the writes and the fixed style they replay over (a
-/// node restyled through [`Element::style_mut`](crate::element::Element::style_mut) shares its writes with the
-/// node it was cloned from), until one of them or a closure's value changes.
+/// that reads `focus_visible` does not run on hover); a source
+/// ([`crate::value::source`]) runs when what it reads wakes it, with no
+/// tracker. The style is the fixed style with every write replayed over it
+/// in the order it was set; it is kept, keyed by the writes and the fixed
+/// style they replay over (a node restyled through [`Element::style_mut`](crate::element::Element::style_mut)
+/// shares its writes with the node it was cloned from), until one of them
+/// or a bound value changes.
 pub(super) struct StyleBinding {
-    /// The mark its trackers share: node `u` needs its resolve.
+    /// The mark its trackers and sources share: node `u` needs its resolve.
     mark: crate::reactive::Mark,
-    /// One per write, for those that are bound: what its closure read, and
-    /// what it gave.
+    /// One per write, for those that are bound: what it read, and what it
+    /// gave.
     runs: Vec<Option<BoundRun>>,
-    /// What the replay itself read (a parent's restyle may read signals).
-    replay: BoundRun,
+    /// What the replay itself read: made only while a parent's restyle
+    /// replays (the one write that may read signals).
+    replay: Option<crate::reactive::RenderNode>,
     /// The writes, the fixed style and the style replayed, as last resolved.
     memo: Option<(Rc<Vec<crate::value::Op>>, Style, Style)>,
 }
 
-/// One bound setter mounted on one node: its tracker, and the mount
-/// ([`Mounted`]) that holds what its closure last gave on this node, typed.
-/// What one node's binding gave is never another's, and a cold build's
-/// (its own tree, its own runs) never the live node's.
+/// One bound setter mounted on one node: the mount ([`Mounted`]) that
+/// holds what it last gave on this node, typed, and the tracker its
+/// closure runs under; a source's mount registers with what it reads and
+/// holds no tracker. What one node's binding gave is never another's, and
+/// a cold build's (its own tree, its own runs) never the live node's.
+#[derive(Default)]
 pub(super) struct BoundRun {
-    pub(super) node: crate::reactive::RenderNode,
+    /// Made at a closure's first run; none for a source.
+    pub(super) node: Option<crate::reactive::RenderNode>,
     /// `None` before its first run, once its write is no longer bound, and
     /// after its closure panicked (it runs anew at the next resolve).
     mounted: Option<Box<dyn Mounted>>,
 }
 
 impl BoundRun {
-    pub(super) fn new(mark: &crate::reactive::Mark) -> Self {
-        Self {
-            node: tracker(mark),
-            mounted: None,
-        }
+    /// Whether it must run: its closure's tracker was marked, or its
+    /// source woke it.
+    fn due(&self) -> bool {
+        self.node.is_some_and(crate::reactive::RenderNode::is_marked) || self.mounted.as_ref().is_some_and(|m| m.due())
     }
 
     /// Mount `def` here; whether its closure must run (mounted anew, or
@@ -153,22 +158,40 @@ impl BoundRun {
         true
     }
 
-    /// Run its closure under its tracker; whether it gave something else.
-    /// Taken out while it runs: a panic leaves no half-run mount behind.
-    fn eval(&mut self) -> bool {
+    /// Run it, registered with what it reads to wake `mark`: a closure (or
+    /// the one mount of a signal) under its tracker, made now if it has
+    /// none, another source untracked; whether it gave
+    /// something else. Taken out while it runs: a panic leaves no half-run
+    /// mount behind.
+    fn eval(&mut self, mark: &crate::reactive::Mark) -> bool {
         let Some(mut m) = self.mounted.take() else {
             return false;
         };
-        let changed = self.node.track(|| m.eval());
+        m.prepare(mark);
+        let changed = if m.tracked() {
+            let node = *self.node.get_or_insert_with(|| tracker(mark));
+            node.track(|| m.eval())
+        } else {
+            // A source in place of a closure: what the closure read wakes
+            // nothing.
+            if let Some(node) = self.node.take() {
+                node.dispose();
+            }
+            crate::reactive::untracked(|| m.eval())
+        };
         self.mounted = Some(m);
         changed
     }
 
-    /// No longer bound: it reads nothing and keeps no definition alive
-    /// (nor what a closure that panicked read before it did).
+    /// No longer bound: it reads nothing, waits on nothing and keeps no
+    /// definition alive (nor what a closure that panicked read before it
+    /// did).
     fn unbind(&mut self) {
-        if self.mounted.take().is_some() || self.node.has_deps() {
-            self.node.track(|| ());
+        self.mounted = None;
+        if let Some(node) = self.node
+            && node.has_deps()
+        {
+            node.track(|| ());
         }
     }
 }
@@ -177,7 +200,9 @@ impl Drop for BoundRun {
     fn drop(&mut self) {
         // Even while unwinding (its closure panicked): a tracker left
         // subscribed would mark a node gone; disposing is safe then.
-        self.node.dispose();
+        if let Some(node) = self.node {
+            node.dispose();
+        }
     }
 }
 
@@ -204,10 +229,9 @@ pub(super) fn resolve_mark(marks: &Marks, u: u32) -> crate::reactive::Mark {
 
 impl StyleBinding {
     pub(super) fn new(marks: &Marks, u: u32) -> Self {
-        let mark = resolve_mark(marks, u);
         Self {
-            replay: BoundRun::new(&mark),
-            mark,
+            mark: resolve_mark(marks, u),
+            replay: None,
             runs: Vec::new(),
             memo: None,
         }
@@ -215,11 +239,18 @@ impl StyleBinding {
 
     /// Every tracker it holds.
     pub(super) fn nodes(&self) -> impl Iterator<Item = crate::reactive::RenderNode> + '_ {
-        self.runs
-            .iter()
-            .flatten()
-            .map(|r| r.node)
-            .chain(std::iter::once(self.replay.node))
+        self.runs.iter().flatten().filter_map(|r| r.node).chain(self.replay)
+    }
+
+    /// Its sources' registrations, taken out into `into`: its node is
+    /// hidden, and they wake its parent in its place.
+    pub(super) fn take_waits(&mut self, into: &mut Vec<crate::value::source::Wait>) {
+        into.extend(
+            self.runs
+                .iter_mut()
+                .flatten()
+                .filter_map(|r| r.mounted.as_mut().and_then(|m| m.take_wait())),
+        );
     }
 
     /// `base` with `ops` replayed over it: the closures whose reads changed,
@@ -239,13 +270,13 @@ impl StyleBinding {
         for (k, run) in self.runs.iter_mut().enumerate() {
             match ops.get(k).and_then(crate::value::Op::bound) {
                 Some(def) => {
-                    let run = run.get_or_insert_with(|| BoundRun::new(&self.mark));
+                    let run = run.get_or_insert_with(BoundRun::default);
                     // The same writes as last resolved, fully: each run
                     // holds a mount of its write's definition already.
                     let fresh = !(same_ops && run.mounted.is_some()) && run.bind(def);
-                    if fresh || run.node.is_marked() {
+                    if fresh || run.due() {
                         crate::component::count_binding();
-                        changed |= run.eval();
+                        changed |= run.eval(&self.mark);
                     }
                 }
                 // Past the writes, or of a write no longer bound.
@@ -257,7 +288,7 @@ impl StyleBinding {
             }
         }
         if !changed
-            && !self.replay.node.is_marked()
+            && !self.replay.is_some_and(crate::reactive::RenderNode::is_marked)
             && let Some((_, b, out)) = &memo
             && b == base
         {
@@ -266,7 +297,7 @@ impl StyleBinding {
             return out;
         }
         let runs = &self.runs;
-        let out = self.replay.node.track(|| {
+        let replay = || {
             let mut s = base.clone();
             for (k, op) in ops.iter().enumerate() {
                 let wrote = op.bound().is_some()
@@ -280,7 +311,18 @@ impl StyleBinding {
                 }
             }
             s
-        });
+        };
+        // Only a parent's restyle reads as it replays: a fixed write writes
+        // a value, a bound one what its mount gave above.
+        let out = if ops.iter().any(crate::value::Op::restyles) {
+            let node = *self.replay.get_or_insert_with(|| tracker(&self.mark));
+            node.track(replay)
+        } else {
+            if let Some(node) = self.replay.take() {
+                node.dispose();
+            }
+            crate::reactive::untracked(replay)
+        };
         match &mut memo {
             Some((o, b, v)) => {
                 if !Rc::ptr_eq(o, ops) {
@@ -293,6 +335,15 @@ impl StyleBinding {
         }
         self.memo = memo;
         out
+    }
+}
+
+impl Drop for StyleBinding {
+    fn drop(&mut self) {
+        // Even while unwinding (a restyle panicked), as a run's tracker.
+        if let Some(node) = self.replay.take() {
+            node.dispose();
+        }
     }
 }
 

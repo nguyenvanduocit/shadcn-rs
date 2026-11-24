@@ -213,26 +213,28 @@ fn icon_padding_x(size: ButtonSize) -> Option<f32> {
 
 fn styled(d: Div, i: Interaction, variant: ButtonVariant, t: &Colors) -> Div {
     let t = *t;
-    let on = move || i.hovered();
+    // Hover reads the node's flag through a source: no tracker per binding.
     let d = match variant {
         ButtonVariant::Default => d
-            .background(move || if on() { t.primary.opacity(0.9) } else { t.primary })
+            .background(i.hover(t.primary, t.primary.opacity(0.9)))
             .text_color(t.primary_foreground),
         ButtonVariant::Destructive => d
-            .background(move || match (on(), t.dark) {
-                (true, _) => t.destructive.opacity(0.9),
-                (false, true) => t.destructive.opacity(0.6),
-                (false, false) => t.destructive,
-            })
+            .background(i.hover(
+                if t.dark {
+                    t.destructive.opacity(0.6)
+                } else {
+                    t.destructive
+                },
+                t.destructive.opacity(0.9),
+            ))
             .text_color(gui::Color::WHITE),
         ButtonVariant::Outline => d
             .border(1.0)
             .when(t.dark, |d| d.border_color(t.input))
-            .background(move || match (on(), t.dark) {
-                (true, true) => t.input.opacity(0.5),
-                (true, false) => t.accent,
-                (false, true) => t.input.opacity(0.3),
-                (false, false) => t.background,
+            .background(if t.dark {
+                i.hover(t.input.opacity(0.3), t.input.opacity(0.5))
+            } else {
+                i.hover(t.background, t.accent)
             })
             .shadow(Shadow {
                 x: 0.0,
@@ -241,15 +243,18 @@ fn styled(d: Div, i: Interaction, variant: ButtonVariant, t: &Colors) -> Div {
                 spread: 0.0,
                 color: Color::BLACK.opacity(0.05),
             })
-            .text_color(move || on().then_some(t.accent_foreground)),
+            .text_color(i.hover(None, Some(t.accent_foreground))),
         ButtonVariant::Secondary => d
-            .background(move || if on() { t.secondary.opacity(0.8) } else { t.secondary })
+            .background(i.hover(t.secondary, t.secondary.opacity(0.8)))
             .text_color(t.secondary_foreground),
         // No base colour: a ghost button takes its parent's, as shadcn's does.
         ButtonVariant::Ghost => d
-            .background(move || on().then(|| if t.dark { t.accent.opacity(0.5) } else { t.accent }))
-            .text_color(move || on().then_some(t.accent_foreground)),
-        ButtonVariant::Link => d.text_color(t.primary).underline_offset(4.0).underline(on),
+            .background(i.hover(None, Some(if t.dark { t.accent.opacity(0.5) } else { t.accent })))
+            .text_color(i.hover(None, Some(t.accent_foreground))),
+        ButtonVariant::Link => d
+            .text_color(t.primary)
+            .underline_offset(4.0)
+            .underline(i.hover(false, true)),
     };
     let ring = if variant == ButtonVariant::Destructive {
         destructive_ring(gui::Style::default(), &t)

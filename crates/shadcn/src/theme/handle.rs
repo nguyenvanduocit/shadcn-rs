@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use gui::color::Oklch;
 use gui::style::{FontFamily, Shadows};
+use gui::value::{FixedOr, Group, Grouped};
 use gui::{
     Color, ComponentElement, Computed, Element, IntoElement, Signal, Slot, component, detached, provide, use_context,
 };
@@ -71,8 +72,9 @@ pub(crate) struct Override<T: 'static> {
     pub(crate) child: Slot<Element>,
 }
 
-/// The groups of a theme in scope.
-#[derive(Clone, Copy)]
+/// The groups of a theme in scope: computeds a closure reads, and over them the [`Group`]s a setter's mount
+/// registers with ([`ThemeHandle::bind_ink`]), one tracker each for every node that reads it.
+#[derive(Clone)]
 struct Groups {
     root: Signal<Theme>,
     whole: Whole<Theme>,
@@ -86,6 +88,12 @@ struct Groups {
     shadows: Computed<ShadowScale>,
     menu: Computed<Menu>,
     icons: Computed<IconSet>,
+    /// The scheme and its palette as read: what an ink resolves against.
+    inks: Group<(Scheme, Palette)>,
+    /// `--radius`: what a corner that follows it resolves against.
+    corners: Group<f32>,
+    /// The shadow scale.
+    layers: Group<ShadowScale>,
 }
 
 impl Groups {
@@ -93,21 +101,31 @@ impl Groups {
         let palettes = Computed::new(move || whole.with(|t| t.colors));
         let menu = Computed::new(move || whole.with(|t| t.menu));
         let accent = Computed::new(move || menu.with(|m| m.accent));
+        let scheme = Computed::new(move || whole.with(|t| t.scheme));
+        let read = Computed::new(move || match accent.get() {
+            MenuAccent::Subtle => palettes.get(),
+            MenuAccent::Bold => palettes.with(|p| p.bold()),
+        });
+        let radius = Computed::new(move || whole.with(|t| t.radius));
+        let shadows = Computed::new(move || whole.with(|t| t.shadows.clone()));
         Self {
             root,
             whole,
-            scheme: Computed::new(move || whole.with(|t| t.scheme)),
+            scheme,
             palettes,
-            read: Computed::new(move || match accent.get() {
-                MenuAccent::Subtle => palettes.get(),
-                MenuAccent::Bold => palettes.with(|p| p.bold()),
-            }),
-            radius: Computed::new(move || whole.with(|t| t.radius)),
+            read,
+            radius,
             fonts: Computed::new(move || whole.with(|t| t.fonts)),
             type_scale: Computed::new(move || whole.with(|t| t.type_scale)),
-            shadows: Computed::new(move || whole.with(|t| t.shadows.clone())),
+            shadows,
             menu,
             icons: Computed::new(move || whole.with(|t| t.icons)),
+            inks: Group::new(move || {
+                let s = scheme.get();
+                (s, read.with(|p| *p.get(s)))
+            }),
+            corners: Group::new(move || radius.get()),
+            layers: Group::new(move || shadows.get()),
         }
     }
 }
@@ -134,25 +152,26 @@ impl ThemeHandle {
         Self(Signal::new(Groups::new(root, Whole::Derived(whole))))
     }
 
-    fn groups(self) -> Groups {
-        self.0.with_untracked(|g| *g)
+    /// What `f` takes of the groups (one field, not the whole), untracked.
+    fn groups<R>(self, f: impl FnOnce(&Groups) -> R) -> R {
+        self.0.with_untracked(f)
     }
 
     /// The whole theme in scope (subscribing to all of it).
     #[must_use]
     pub fn get(self) -> Theme {
-        self.groups().whole.with(Theme::clone)
+        self.groups(|g| g.whole).with(Theme::clone)
     }
 
     /// Write the app's theme. Each group stops at equality cutoff, so only what changed reruns; a subtree's override
     /// applies again on top.
     pub fn set(self, theme: Theme) {
-        self.groups().root.set(theme);
+        self.groups(|g| g.root).set(theme);
     }
 
     /// Change the app's theme in place: `theme.update(|t| t.scheme = t.scheme.toggled())`.
     pub fn update(self, f: impl FnOnce(&mut Theme)) {
-        let root = self.groups().root;
+        let root = self.groups(|g| g.root);
         let mut theme = root.get_untracked();
         f(&mut theme);
         root.set(theme);
@@ -160,68 +179,68 @@ impl ThemeHandle {
 
     #[must_use]
     pub fn scheme(self) -> Scheme {
-        self.groups().scheme.get()
+        self.groups(|g| g.scheme).get()
     }
 
     /// The palettes as the theme writes them.
     #[must_use]
     pub fn palettes(self) -> Palettes {
-        self.groups().palettes.get()
+        self.groups(|g| g.palettes).get()
     }
 
     /// The palette of the scheme in scope, as read (the menu accent applied).
     #[must_use]
     pub fn palette(self) -> Palette {
-        let g = self.groups();
-        let scheme = g.scheme.get();
-        g.read.with(|p| *p.get(scheme))
+        let (scheme, read) = self.groups(|g| (g.scheme, g.read));
+        let scheme = scheme.get();
+        read.with(|p| *p.get(scheme))
     }
 
     /// `--radius`, in logical pixels.
     #[must_use]
     pub fn radius(self) -> f32 {
-        self.groups().radius.get()
+        self.groups(|g| g.radius).get()
     }
 
     #[must_use]
     pub fn fonts(self) -> Fonts {
-        self.groups().fonts.get()
+        self.groups(|g| g.fonts).get()
     }
 
     #[must_use]
     pub fn type_scale(self) -> TypeScale {
-        self.groups().type_scale.get()
+        self.groups(|g| g.type_scale).get()
     }
 
     #[must_use]
     pub fn shadows(self) -> ShadowScale {
-        self.groups().shadows.get()
+        self.groups(|g| g.shadows).get()
     }
 
     #[must_use]
     pub fn menu(self) -> Menu {
-        self.groups().menu.get()
+        self.groups(|g| g.menu).get()
     }
 
     #[must_use]
     pub fn icons(self) -> IconSet {
-        self.groups().icons.get()
+        self.groups(|g| g.icons).get()
     }
 
     /// `tone` in the scheme in scope, kept in OKLCH; [`super::Ink::Content`] is `content`.
     #[must_use]
     pub fn oklch_on(self, tone: Tone, content: Oklch) -> Oklch {
-        let g = self.groups();
-        let scheme = g.scheme.get();
-        g.read.with(|p| tone.get(scheme).resolve(p.get(scheme), content))
+        let (scheme, read) = self.groups(|g| (g.scheme, g.read));
+        let scheme = scheme.get();
+        read.with(|p| tone.get(scheme).resolve(p.get(scheme), content))
     }
 
     /// `tone` in the scheme in scope, kept in OKLCH, with the palette's `foreground` as the content colour.
     #[must_use]
     pub fn oklch(self, tone: Tone) -> Oklch {
-        let g = self.groups();
-        let scheme = g.scheme.get();
-        g.read.with(|p| {
+        let (scheme, read) = self.groups(|g| (g.scheme, g.read));
+        let scheme = scheme.get();
+        read.with(|p| {
             let palette = p.get(scheme);
             tone.get(scheme).resolve(palette, palette.foreground)
         })
@@ -245,16 +264,51 @@ impl ThemeHandle {
         self.ink(Tone::role(role))
     }
 
+    /// [`Self::ink`] as a setter's value (`.background(theme.bind_ink(tone))`): each node it is mounted on
+    /// registers with the theme's colour group, with no tracker of its own, and runs again only when the scheme
+    /// or the palette changes. A closure that reads the theme (`move || theme.ink(tone)`) still works, under a
+    /// tracker of its own.
+    #[must_use]
+    #[track_caller]
+    pub fn bind_ink(self, tone: Tone) -> Grouped<(Scheme, Palette), impl Fn(&(Scheme, Palette)) -> Color + Clone> {
+        self.groups(|g| g.inks.clone())
+            .map(move |(scheme, palette)| Color::from(tone.get(*scheme).resolve(palette, palette.foreground)))
+    }
+
+    /// [`Self::corner`] as a setter's value: a corner that follows the theme's radius registers with its radius
+    /// group; another is a plain value, registering nowhere.
+    #[must_use]
+    #[track_caller]
+    pub fn bind_corner(self, corner: Corner) -> FixedOr<f32, Grouped<f32, impl Fn(&f32) -> f32 + Clone>> {
+        if let Corner::None | Corner::Px(_) | Corner::Full = corner {
+            return FixedOr::Fixed(corner_of(corner, 0.0));
+        }
+        FixedOr::Source(
+            self.groups(|g| g.corners.clone())
+                .map(move |&radius| corner_of(corner, radius)),
+        )
+    }
+
+    /// [`Self::shadow`] as a setter's value: registers with the theme's shadow group; [`ShadowStep::None`] is a
+    /// plain value, registering nowhere.
+    #[must_use]
+    #[track_caller]
+    pub fn bind_shadow(
+        self,
+        step: ShadowStep,
+    ) -> FixedOr<Shadows, Grouped<ShadowScale, impl Fn(&ShadowScale) -> Shadows + Clone>> {
+        if step == ShadowStep::None {
+            return FixedOr::Fixed(Shadows::new());
+        }
+        FixedOr::Source(self.groups(|g| g.layers.clone()).map(move |scale| scale.get(step)))
+    }
+
     /// The radius `corner` draws, in logical pixels. Only a corner that follows the theme's radius reads it.
     #[must_use]
     pub fn corner(self, corner: Corner) -> f32 {
         match corner {
-            Corner::None => 0.0,
-            Corner::Px(px) => px,
-            Corner::Full => FULL,
-            Corner::Step(s) => s.of(self.radius()),
-            Corner::Plus(s, px) => (s.of(self.radius()) + px).max(0.0),
-            Corner::Capped(s, px) => s.of(self.radius()).min(px),
+            Corner::None | Corner::Px(_) | Corner::Full => corner_of(corner, 0.0),
+            Corner::Step(_) | Corner::Plus(..) | Corner::Capped(..) => corner_of(corner, self.radius()),
         }
     }
 
@@ -309,7 +363,7 @@ impl ThemeHandle {
         if step == ShadowStep::None {
             return Shadows::new();
         }
-        self.groups().shadows.with(|s| s.get(step))
+        self.groups(|g| g.shadows).with(|s| s.get(step))
     }
 
     /// The painted palette of the scheme in scope and whether it is dark: what render reads today ([`super::theme`]).
@@ -320,6 +374,18 @@ impl ThemeHandle {
             dark: scheme.is_dark(),
             palette: self.palette().painted(),
         }
+    }
+}
+
+/// The radius `corner` draws against the theme's `--radius` of `radius`.
+fn corner_of(corner: Corner, radius: f32) -> f32 {
+    match corner {
+        Corner::None => 0.0,
+        Corner::Px(px) => px,
+        Corner::Full => FULL,
+        Corner::Step(s) => s.of(radius),
+        Corner::Plus(s, px) => (s.of(radius) + px).max(0.0),
+        Corner::Capped(s, px) => s.of(radius).min(px),
     }
 }
 
@@ -391,7 +457,7 @@ pub fn with_theme(edit: impl Fn(&mut Theme) + 'static, child: impl IntoElement) 
                 (edit.0)(&mut t);
                 t
             });
-            provide(ThemeHandle::derived(outer.groups().root, whole));
+            provide(ThemeHandle::derived(outer.groups(|g| g.root), whole));
             move || props.with(|p| p.child.0.clone())
         },
     )

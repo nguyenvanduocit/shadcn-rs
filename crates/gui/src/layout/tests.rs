@@ -1,4 +1,4 @@
-use super::binding::{BoundRun, Tracked, resolve_mark};
+use super::binding::Tracked;
 use super::*;
 use crate::element::{IntoElement, Side, SideAlign, Text, deferred, div, key_of, span, text};
 use crate::focus::FocusHandle;
@@ -403,10 +403,13 @@ fn trackers_dropped_while_unwinding_leave_the_graph() {
     let before = crate::reactive::graph();
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut tracked: Tracked<dyn Fn() -> u32, u32> = Tracked::new(&marks, 0);
-        let run = BoundRun::new(&resolve_mark(&marks, 0));
         let f: Rc<dyn Fn() -> u32> = Rc::new(move || read.get());
         let _ = tracked.get(&f, || f());
-        let _ = run.node.track(|| read.get());
+        let mut d = div().width(move || f32::from(u16::try_from(read.get()).unwrap_or(0)));
+        let (style, bindings) = d.style_and_bindings();
+        let ops = Rc::clone(bindings.and_then(|b| b.ops()).expect("bound"));
+        let mut sb = binding::StyleBinding::new(&marks, 0);
+        let _ = sb.get(&ops, style);
         std::panic::panic_any("a binding panicked");
     }));
     assert!(unwound.is_err());
@@ -415,6 +418,62 @@ fn trackers_dropped_while_unwinding_leave_the_graph() {
     assert_eq!(after.subscriptions, before.subscriptions, "and their reads with them");
     read.set(2);
     assert!(marks.borrow().is_empty(), "a write marks no node");
+}
+
+/// A parent resolved again over children hidden by a source keeps the
+/// mark its hidden children's registrations wake, and their list: the
+/// same mark, the same buffer, each time.
+#[test]
+fn a_parent_keeps_the_mark_and_list_of_its_hidden_sources() {
+    let (tick, shown) = (
+        crate::reactive::Signal::new(0.0_f32),
+        crate::reactive::Signal::new(false),
+    );
+    let hidden = |name: &'static str| {
+        div()
+            .named(name)
+            .size(10.0)
+            .display(shown.map(|on| if *on { Display::Block } else { Display::None }))
+    };
+    let root = div()
+        .width(move || 100.0 + tick.get())
+        .child(hidden("one"))
+        .child(hidden("two"))
+        .into_element();
+    let mut tree = LayoutTree::new();
+    let kept = |tree: &mut LayoutTree, k: f32| {
+        tick.set(k);
+        let mut ts = TextSystem::new();
+        tree.layout(
+            &root,
+            400.0,
+            300.0,
+            &UiState::default(),
+            &mut Motion::default(),
+            &mut ts,
+        );
+        tree.extras.iter().flatten().find_map(|e| {
+            e.hidden_mark.as_ref().map(|m| {
+                (
+                    Rc::as_ptr(m).cast::<()>(),
+                    e.hidden_waits.as_ptr(),
+                    e.hidden_waits.len(),
+                )
+            })
+        })
+    };
+    let first = kept(&mut tree, 1.0);
+    assert!(
+        first.is_some_and(|(_, _, n)| n == 2),
+        "two registrations wake the parent: {first:?}"
+    );
+    for k in 2..6_u8 {
+        assert_eq!(
+            kept(&mut tree, f32::from(k)),
+            first,
+            "resolve {k}: the same mark and list"
+        );
+    }
 }
 
 /// Lay `root` out on `tree`, live; the widths of the nodes named `names`.

@@ -238,6 +238,13 @@ struct Extra {
     /// What its children that took no space (`display: none`) read to
     /// decide so: a change resolves this node again, which builds them.
     hidden: Option<crate::reactive::RenderNode>,
+    /// The same for what its hidden children's sources read
+    /// ([`crate::value::source`]): their registrations, waking this node
+    /// through `hidden_mark`, made once. Those of its last resolve go once
+    /// its children are built again (and registered again), so that what
+    /// they hold (a signal's hub) is kept, not made anew.
+    hidden_waits: Vec<crate::value::source::Wait>,
+    hidden_mark: Option<crate::reactive::Mark>,
     /// Its [`Interaction`](crate::Interaction) flags, made once and bound
     /// to the handle its element gives (ADR-0022): a render that makes a
     /// new handle makes no signal.

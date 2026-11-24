@@ -152,6 +152,8 @@ impl LayoutTree {
             measures: false,
             fresh_behaviour: true,
             hidden: None,
+            hidden_waits: Vec::new(),
+            hidden_mark: None,
             interaction: crate::interact::NodeInteraction::default(),
         }));
         self.by_path.insert(path, u);
@@ -245,6 +247,7 @@ impl LayoutTree {
             // Its hidden children are built again below, and say again what they read.
             h.track(|| ());
         }
+        let stale = ex.hidden_waits.len();
         let path = ex.path.clone();
         let mine = ex.mine.clone();
         self.put_extra(u, ex);
@@ -259,6 +262,13 @@ impl LayoutTree {
                 (gone, engine::Change::None)
             }
         };
+        // Its hidden children registered again as they were built: the
+        // registrations of the last build go.
+        if stale > 0
+            && let Some(ex) = self.extra_mut(u)
+        {
+            ex.hidden_waits.drain(..stale.min(ex.hidden_waits.len()));
+        }
         let objects = self.lay_objects(node, el);
         self.sum_below(node);
         Some(node.settle(r.style_changed, r.leaf_changed || structure || objects, children))
@@ -331,6 +341,30 @@ impl LayoutTree {
                 for r in reads {
                     hidden.take_deps(r);
                 }
+            }
+        }
+        // Its sources' registrations wake the parent in its place.
+        // Into the parent's list, by its mark: both kept from the last time.
+        if parent != NO_SLOT
+            && let Some(mut waits) = self.extra_mut(parent).map(|p| std::mem::take(&mut p.hidden_waits))
+        {
+            let from = waits.len();
+            if let Some(b) = self.extra_mut(node.user).and_then(|e| e.style_binding.as_mut()) {
+                b.take_waits(&mut waits);
+            }
+            let marks = Rc::clone(&self.marks);
+            if let Some(p) = self.extra_mut(parent) {
+                if let Some(moved) = waits.get(from..)
+                    && !moved.is_empty()
+                {
+                    let mark = p
+                        .hidden_mark
+                        .get_or_insert_with(|| super::binding::resolve_mark(&marks, parent));
+                    for w in moved {
+                        w.repoint(mark);
+                    }
+                }
+                p.hidden_waits = waits;
             }
         }
         self.release(node);

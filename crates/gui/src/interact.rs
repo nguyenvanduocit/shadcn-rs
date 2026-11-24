@@ -61,7 +61,10 @@ pub struct Interaction(u64);
 /// A node's flags, one signal per flag, made by the layout tree once per
 /// node that is given an [`Interaction`] and disposed with the node: what
 /// hit testing and focus write, and what the handles bound to it read.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A closure reads a flag's signal under its own tracker; a source
+/// ([`Interaction::hover`]) registers with the handle ([`HandleSources`]),
+/// which a write of a flag wakes, for that flag alone, through `bound`.
+#[derive(Clone)]
 pub(crate) struct NodeFlags {
     hovered: Signal<bool>,
     pressed: Signal<bool>,
@@ -69,6 +72,96 @@ pub(crate) struct NodeFlags {
     focus_visible: Signal<bool>,
     focus_within: Signal<bool>,
     disabled: Signal<bool>,
+    /// The handle bound to them, shared by every copy.
+    bound: std::rc::Rc<std::cell::Cell<Option<Interaction>>>,
+}
+
+impl PartialEq for NodeFlags {
+    fn eq(&self, other: &Self) -> bool {
+        self.hovered == other.hovered && std::rc::Rc::ptr_eq(&self.bound, &other.bound)
+    }
+}
+
+/// The sources reading one handle ([`Interaction::hover`]): their list,
+/// made by the first, gone with the last, whatever node the handle is
+/// bound to. A write of a flag of the node it is bound to wakes it for
+/// that flag; binding it to a node, or unbinding it, wakes all of it.
+pub(crate) struct HandleSources {
+    pub(crate) handle: Interaction,
+    pub(crate) waiters: std::rc::Rc<crate::value::source::Waiters>,
+}
+
+impl Drop for HandleSources {
+    fn drop(&mut self) {
+        // The thread may be ending (its handles with it); borrowed, the
+        // entry stays dead, and the next reader replaces it.
+        HANDLES
+            .try_with(|h| {
+                if let Ok(mut h) = h.try_borrow_mut()
+                    && h.sources.get(&self.handle.0).is_some_and(|s| s.strong_count() == 0)
+                {
+                    h.sources.remove(&self.handle.0);
+                }
+            })
+            .ok();
+    }
+}
+
+/// Wake the sources of `handle` registered for any of `mask` (none in a
+/// cold frame: what it writes is undone).
+fn wake_sources(handle: Interaction, mask: u8) {
+    if mask == 0 || crate::value::source::cold() {
+        return;
+    }
+    let list = HANDLES
+        .try_with(|h| {
+            h.try_borrow()
+                .ok()
+                .and_then(|h| h.sources.get(&handle.0).and_then(std::rc::Weak::upgrade))
+        })
+        .ok()
+        .flatten();
+    if let Some(s) = list {
+        s.waiters.wake(mask);
+    }
+}
+
+impl std::fmt::Debug for NodeFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("NodeFlags").field(&self.hovered).finish()
+    }
+}
+
+/// One of an [`Interaction`]'s flags, as a source names it
+/// ([`Interaction::when`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Flag {
+    /// [`Interaction::hovered`].
+    Hovered,
+    /// [`Interaction::pressed`].
+    Pressed,
+    /// [`Interaction::focused`].
+    Focused,
+    /// [`Interaction::focus_visible`].
+    FocusVisible,
+    /// [`Interaction::focus_within`].
+    FocusWithin,
+    /// [`Interaction::disabled`].
+    Disabled,
+}
+
+impl Flag {
+    /// Its bit in a wake's mask.
+    pub(crate) const fn bit(self) -> u8 {
+        match self {
+            Self::Hovered => 1,
+            Self::Pressed => 1 << 1,
+            Self::Focused => 1 << 2,
+            Self::FocusVisible => 1 << 3,
+            Self::FocusWithin => 1 << 4,
+            Self::Disabled => 1 << 5,
+        }
+    }
 }
 
 /// What the handles of this thread are bound to. A cold frame forks it by
@@ -84,6 +177,9 @@ struct Handles {
     early: crate::engine::ForkMap<u64, u64>,
     reads: u64,
     bind: Option<Signal<u64>>,
+    /// The sources reading each handle, live mounts' alone (a cold build
+    /// registers nowhere): not forked.
+    sources: std::collections::HashMap<u64, std::rc::Weak<HandleSources>>,
     /// The scalars as they were when a cold frame began.
     #[cfg(debug_assertions)]
     was: Option<(u64, u64, Option<Signal<u64>>)>,
@@ -323,10 +419,51 @@ impl Interaction {
     /// The flags it is bound to; unbound, `None`, and a reader outside a
     /// render subscribed to its binding.
     fn flags(self) -> Option<NodeFlags> {
-        let (flags, bind) = HANDLES.with(|h| {
+        let (flags, bind) = self.lookup();
+        if let Some(bind) = bind
+            && bind.is_alive()
+        {
+            let _subscribe = bind.get();
+        }
+        flags
+    }
+
+    /// `flag` as it is now, untracked (a source's mount, woken through
+    /// [`Self::sources`], not by its binding): one lookup.
+    pub(crate) fn peek(self, flag: Flag) -> bool {
+        let signal = HANDLES.with(|h| h.borrow().bound.get(&self.0).map(|f| f.signal(flag)));
+        signal.is_some_and(|s| s.is_alive() && s.get_untracked())
+    }
+
+    /// `flag`, tracked (a source read as a closure is).
+    pub(crate) fn flag(self, flag: Flag) -> bool {
+        self.flags().is_some_and(|f| read(f.signal(flag)))
+    }
+
+    /// Where a source of it registers, bound or not: its list, made now
+    /// if no source reads it yet.
+    pub(crate) fn sources(self) -> std::rc::Rc<HandleSources> {
+        HANDLES.with(|h| {
+            let mut h = h.borrow_mut();
+            if let Some(s) = h.sources.get(&self.0).and_then(std::rc::Weak::upgrade) {
+                return s;
+            }
+            let s = std::rc::Rc::new(HandleSources {
+                handle: self,
+                waiters: std::rc::Rc::default(),
+            });
+            h.sources.insert(self.0, std::rc::Rc::downgrade(&s));
+            s
+        })
+    }
+
+    /// The flags it is bound to, and, unbound and read outside a render,
+    /// what is written when it is bound (it is recorded as read early).
+    fn lookup(self) -> (Option<NodeFlags>, Option<Signal<u64>>) {
+        HANDLES.with(|h| {
             let mut h = h.borrow_mut();
             if let Some(f) = h.bound.get(&self.0) {
-                return (Some(*f), None);
+                return (Some(f.clone()), None);
             }
             if crate::reactive::phase() == crate::reactive::Phase::Render {
                 return (None, None);
@@ -347,13 +484,7 @@ impl Interaction {
                 .bind
                 .get_or_insert_with(|| crate::reactive::detached(|| Signal::new(0_u64)));
             (None, Some(bind))
-        });
-        if let Some(bind) = bind
-            && bind.is_alive()
-        {
-            let _subscribe = bind.get();
-        }
-        flags
+        })
     }
 
     /// The pointer is over the node or one of its descendants, and the node
@@ -413,37 +544,54 @@ impl NodeInteraction {
     /// Bind `handle` to the node's flags, made now if the node has none;
     /// the flags.
     pub(crate) fn bind(&mut self, handle: Interaction) -> NodeFlags {
-        let flags = *self.flags.get_or_insert_with(|| {
-            crate::reactive::detached(|| NodeFlags {
-                hovered: Signal::new(false),
-                pressed: Signal::new(false),
-                focused: Signal::new(false),
-                focus_visible: Signal::new(false),
-                focus_within: Signal::new(false),
-                disabled: Signal::new(false),
+        let flags = self
+            .flags
+            .get_or_insert_with(|| {
+                crate::reactive::detached(|| NodeFlags {
+                    hovered: Signal::new(false),
+                    pressed: Signal::new(false),
+                    focused: Signal::new(false),
+                    focus_visible: Signal::new(false),
+                    focus_within: Signal::new(false),
+                    disabled: Signal::new(false),
+                    bound: std::rc::Rc::default(),
+                })
             })
-        });
+            .clone();
         if self.bound != Some(handle) {
             self.unbind();
             self.bound = Some(handle);
+            let cold = crate::value::source::cold();
+            if !cold {
+                flags.bound.set(Some(handle));
+            }
             let bumped = HANDLES.with(|h| {
                 let mut h = h.borrow_mut();
-                h.bound.insert(handle.0, flags);
+                // The node it named before (given to two, it names the
+                // last) writes it no more.
+                if let Some(was) = h.bound.insert(handle.0, flags.clone())
+                    && was != flags
+                    && !cold
+                {
+                    was.bound.set(None);
+                }
                 h.early.remove(&handle.0).map(|_| h.bind)
             });
-            // Who read it before it was bound reads it again.
+            // Who read it before it was bound reads it again (a closure,
+            // through the signal); its sources read the node it names now.
             if let Some(Some(bind)) = bumped
                 && bind.is_alive()
             {
                 bind.update(|n| *n = n.wrapping_add(1));
             }
+            wake_sources(handle, crate::value::source::EVERY);
         }
         flags
     }
 
     /// The node's flags, if it was ever given a handle.
     pub(crate) fn flags(&self) -> Option<NodeFlags> {
-        self.flags
+        self.flags.clone()
     }
 
     /// The node was given no handle: its flags go.
@@ -456,19 +604,28 @@ impl NodeInteraction {
 
     /// Unbind the handle it holds, if it is still bound to these flags.
     fn unbind(&mut self) {
-        let (Some(handle), Some(flags)) = (self.bound.take(), self.flags) else {
+        let (Some(handle), Some(flags)) = (self.bound.take(), &self.flags) else {
             return;
         };
         // The thread may be ending (its handles with it).
-        HANDLES
+        let unbound = HANDLES
             .try_with(|h| {
                 if let Ok(mut h) = h.try_borrow_mut()
-                    && h.bound.get(&handle.0) == Some(&flags)
+                    && h.bound.get(&handle.0) == Some(flags)
                 {
                     h.bound.remove(&handle.0);
+                    return true;
                 }
+                false
             })
-            .ok();
+            .unwrap_or(false);
+        if unbound {
+            if !crate::value::source::cold() {
+                flags.bound.set(None);
+            }
+            // Its sources read every flag off now.
+            wake_sources(handle, crate::value::source::EVERY);
+        }
     }
 }
 
@@ -481,34 +638,61 @@ impl Drop for NodeInteraction {
 impl NodeFlags {
     /// Write the flags that differ from `flags` (the layout tree, building
     /// the node).
-    pub(crate) fn write(self, flags: Flags) {
-        crate::reactive::batch(|| {
-            put(self.hovered, flags.hovered);
-            put(self.pressed, flags.pressed);
-            put(self.focused, flags.focused);
-            put(self.focus_visible, flags.focus_visible);
-            put(self.focus_within, flags.focus_within);
-            put(self.disabled, flags.disabled);
+    pub(crate) fn write(&self, flags: Flags) {
+        let changed = crate::reactive::batch(|| {
+            self.put(Flag::Hovered, flags.hovered)
+                | self.put(Flag::Pressed, flags.pressed)
+                | self.put(Flag::Focused, flags.focused)
+                | self.put(Flag::FocusVisible, flags.focus_visible)
+                | self.put(Flag::FocusWithin, flags.focus_within)
+                | self.put(Flag::Disabled, flags.disabled)
         });
+        self.wake(changed);
     }
 
     /// Hit testing: the pointer came over the node or left it.
-    pub(crate) fn set_hovered(self, on: bool) {
-        put(self.hovered, on);
+    pub(crate) fn set_hovered(&self, on: bool) {
+        self.wake(self.put(Flag::Hovered, on));
     }
 
     /// Hit testing: the button went down on the node or came up.
-    pub(crate) fn set_pressed(self, on: bool) {
-        put(self.pressed, on);
+    pub(crate) fn set_pressed(&self, on: bool) {
+        self.wake(self.put(Flag::Pressed, on));
     }
 
     /// Focus moved, or came to show or hide.
-    pub(crate) fn set_focus(self, focused: bool, visible: bool, within: bool) {
-        crate::reactive::batch(|| {
-            put(self.focused, focused);
-            put(self.focus_visible, visible);
-            put(self.focus_within, within);
+    pub(crate) fn set_focus(&self, focused: bool, visible: bool, within: bool) {
+        let changed = crate::reactive::batch(|| {
+            self.put(Flag::Focused, focused)
+                | self.put(Flag::FocusVisible, visible)
+                | self.put(Flag::FocusWithin, within)
         });
+        self.wake(changed);
+    }
+
+    /// The signal of `flag`.
+    const fn signal(&self, flag: Flag) -> Signal<bool> {
+        match flag {
+            Flag::Hovered => self.hovered,
+            Flag::Pressed => self.pressed,
+            Flag::Focused => self.focused,
+            Flag::FocusVisible => self.focus_visible,
+            Flag::FocusWithin => self.focus_within,
+            Flag::Disabled => self.disabled,
+        }
+    }
+
+    /// Write `on` to `flag`; its bit when that changed it, else 0.
+    fn put(&self, flag: Flag, on: bool) -> u8 {
+        if put(self.signal(flag), on) { flag.bit() } else { 0 }
+    }
+
+    /// The sources of the handle bound to them registered for any of
+    /// `changed` run again.
+    fn wake(&self, changed: u8) {
+        if let Some(handle) = self.bound.get() {
+            wake_sources(handle, changed);
+        }
     }
 
     /// Out of the graph (its node went); safe from a `Drop`.
@@ -526,11 +710,14 @@ impl NodeFlags {
     }
 }
 
-/// Write `on` to `flag` if it holds something else and still lives.
-fn put(flag: Signal<bool>, on: bool) {
-    if flag.is_alive() && flag.get_untracked() != on {
+/// Write `on` to `flag` if it holds something else and still lives;
+/// whether it wrote.
+fn put(flag: Signal<bool>, on: bool) -> bool {
+    let differs = flag.is_alive() && flag.get_untracked() != on;
+    if differs {
         flag.set(on);
     }
+    differs
 }
 
 /// The value of each of an [`Interaction`]'s flags.
@@ -1471,7 +1658,7 @@ impl InputState {
             let (Some(b), Some(node)) = (frame.behaviour(i), frame.nodes.get(i)) else {
                 return;
             };
-            let Some(it) = b.interaction else { return };
+            let Some(it) = &b.interaction else { return };
             let (focused, visible, within) = focus_flags(
                 &node.path,
                 node.layer,
@@ -1543,7 +1730,7 @@ impl InputState {
         });
         each_change_sorted(&was, &self.chain, |i, on| {
             if let Some(b) = frame.behaviour(i)
-                && let Some(it) = b.interaction
+                && let Some(it) = &b.interaction
             {
                 it.set_pressed(on && !b.disabled);
             }
@@ -1631,7 +1818,7 @@ impl InputState {
             // The flags first, then the handlers, which may read them.
             each_change(&was, &self.chain, |i, on| {
                 if let Some(b) = frame.behaviour(i)
-                    && let Some(it) = b.interaction
+                    && let Some(it) = &b.interaction
                 {
                     it.set_hovered(on && !b.disabled);
                 }
@@ -1733,7 +1920,7 @@ impl InputState {
             frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
         });
         each_change(&was, &[], |i, _| {
-            if let Some(it) = frame.behaviour(i).and_then(|b| b.interaction) {
+            if let Some(it) = frame.behaviour(i).and_then(|b| b.interaction.as_ref()) {
                 it.set_hovered(false);
             }
         });
