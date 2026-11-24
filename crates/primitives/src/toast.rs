@@ -56,7 +56,6 @@
 //!   event itself as the node comes with its name, so it is read in the
 //!   frame the toast shows (recorded in ADR-0025).
 
-use std::cell::Cell;
 use std::time::Duration;
 
 use gui::clock::{self, TimerId};
@@ -352,7 +351,7 @@ pub struct Toaster<T: 'static> {
     next: Signal<u64>,
     swiping: Signal<Option<Swiping>>,
     /// A swipe just ended: the click it makes presses nothing.
-    swallow: Signal<Cell<bool>>,
+    swallow: Signal<bool>,
 }
 
 impl<T: 'static> Clone for Toaster<T> {
@@ -390,7 +389,7 @@ impl<T: Clone + 'static> Toaster<T> {
             options: Signal::new(options),
             next: Signal::new(1),
             swiping: Signal::labeled("toast swiping", None),
-            swallow: Signal::new(Cell::new(false)),
+            swallow: Signal::labeled("toast swallow", false),
         };
         let region = t.region;
         // Watched from the first frame: a node's flags read while setup
@@ -734,7 +733,7 @@ impl<T: Clone + 'static> Toaster<T> {
     fn drag(self, id: ToastId, e: &DragEvent) {
         match e.phase {
             DragPhase::Start => {
-                self.swallow.with_untracked(|s| s.set(false));
+                self.swallow.set(false);
                 let way = self.options.with_untracked(|o| o.swipe);
                 let swipe = ToastSwipe::new(way, (e.x, e.y), e.kind == PointerKind::Touch);
                 self.swiping.set(Some(Swiping {
@@ -762,7 +761,7 @@ impl<T: Clone + 'static> Toaster<T> {
                 };
                 self.swiping.set(None);
                 if s.offset.is_some() {
-                    self.swallow.with_untracked(|c| c.set(true));
+                    self.swallow.set(true);
                 }
                 if s.swipe.release() {
                     let veto = self.options.with_untracked(|o| o.veto_swipe.clone());
@@ -798,7 +797,8 @@ impl<T: Clone + 'static> Toaster<T> {
     fn closing(self, d: Div, id: ToastId, act: gui::Callback<()>) -> Div {
         d.focusable().on_click(move |_| {
             // The click a swipe ends with presses nothing.
-            if self.swallow.with_untracked(|s| s.replace(false)) {
+            if self.swallow.get_untracked() {
+                self.swallow.set(false);
                 return;
             }
             act.call(());

@@ -13,6 +13,7 @@
 //! finds the slot is no longer its own and leaves it be.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::fmt;
 use std::rc::Rc;
 
@@ -658,9 +659,57 @@ impl<T: 'static> Registry<T> {
 /// on screen), or, for an owner that knows when its keys leave, until it
 /// lets go of them ([`Self::retain`]).
 pub struct Keyed<K: 'static, V: 'static> {
-    map: Signal<std::cell::RefCell<std::collections::HashMap<K, (V, u32)>>>,
+    /// Its memo in [`MEMOS`], and which life of that slot it is.
+    slot: usize,
+    generation: u32,
+    ty: std::marker::PhantomData<fn() -> (K, V)>,
+}
+
+/// What a [`Keyed`] remembers: not reactive state, since nothing reads it
+/// tracked (an answer for a key never changes while it is kept).
+struct Memo<K, V> {
+    map: HashMap<K, (V, u32)>,
     /// Map operations so far: the measure of the work, for tests.
-    work: Signal<Cell<u64>>,
+    work: u64,
+}
+
+/// The memos of every [`Keyed`] on the thread, by slot, each held by its
+/// scope's life: freed as the scope that made it ends. A memo is shared
+/// with a cold frame, which only reads it: every write of a memo is
+/// skipped in a cold frame, and a [`Keyed`] made there has no memo.
+#[derive(Default)]
+struct Memos {
+    slots: Vec<(u32, Option<Rc<dyn std::any::Any>>)>,
+    free: Vec<usize>,
+}
+
+crate::engine::engine_local! {
+    [Shared("every write of a memo is skipped in a cold frame, which reads the live memo")]
+    static MEMOS: std::cell::RefCell<Memos> = std::cell::RefCell::new(Memos::default());
+}
+
+impl Memos {
+    fn put(&mut self, memo: Rc<dyn std::any::Any>) -> (usize, u32) {
+        if let Some(i) = self.free.pop()
+            && let Some(s) = self.slots.get_mut(i)
+        {
+            s.1 = Some(memo);
+            return (i, s.0);
+        }
+        let i = self.slots.len();
+        self.slots.push((0, Some(memo)));
+        (i, 0)
+    }
+
+    fn release(&mut self, i: usize, generation: u32) {
+        if let Some(s) = self.slots.get_mut(i)
+            && s.0 == generation
+            && s.1.take().is_some()
+        {
+            s.0 = s.0.wrapping_add(1);
+            self.free.push(i);
+        }
+    }
 }
 
 impl<K: 'static, V: 'static> Clone for Keyed<K, V> {
@@ -682,20 +731,48 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// is).
     #[must_use]
     #[track_caller]
-    #[expect(
-        clippy::new_without_default,
-        reason = "made where its owner is, as a signal: no default one"
-    )]
+    #[expect(clippy::new_without_default, reason = "made where its owner is: no default one")]
     pub fn new() -> Self {
+        let dead = Self {
+            slot: usize::MAX,
+            generation: 0,
+            ty: std::marker::PhantomData,
+        };
+        // A cold frame's is thrown away with it, and a live memo is never
+        // written there: it has none, and asks as one that is gone.
+        if crate::component::is_cold_render() {
+            return dead;
+        }
+        let memo: Rc<dyn std::any::Any> = Rc::new(std::cell::RefCell::new(Memo::<K, V> {
+            map: HashMap::new(),
+            work: 0,
+        }));
+        let (slot, generation) = MEMOS.with(|m| m.borrow_mut().put(memo));
+        if crate::reactive::has_owner() {
+            on_cleanup(move || MEMOS.with(|m| m.borrow_mut().release(slot, generation)));
+        }
         Self {
-            map: Signal::new(std::cell::RefCell::new(std::collections::HashMap::new())),
-            work: Signal::new(Cell::new(0)),
+            slot,
+            generation,
+            ty: std::marker::PhantomData,
         }
     }
 
-    fn count(self) {
-        if self.work.is_alive() {
-            self.work.with_untracked(|w| w.set(w.get().saturating_add(1)));
+    /// Its memo, while its scope lives.
+    fn memo(self) -> Option<Rc<std::cell::RefCell<Memo<K, V>>>> {
+        let any = MEMOS.with(|m| {
+            let m = m.borrow();
+            let (generation, memo) = m.slots.get(self.slot)?;
+            (*generation == self.generation).then(|| memo.clone()).flatten()
+        })?;
+        any.downcast::<std::cell::RefCell<Memo<K, V>>>().ok()
+    }
+
+    /// Count `n` operations: never from a cold frame, which reads.
+    fn count(memo: &std::cell::RefCell<Memo<K, V>>, n: u64) {
+        if !crate::component::is_cold_render() {
+            let mut m = memo.borrow_mut();
+            m.work = m.work.saturating_add(n);
         }
     }
 
@@ -705,16 +782,18 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// the live frame gave. A cold frame keeps none it issues: what it
     /// made is thrown away with it.
     pub fn get(self, key: &K, issue: impl FnOnce() -> V) -> V {
-        if !self.map.is_alive() {
+        let Some(memo) = self.memo() else {
             return issue();
-        }
-        self.count();
-        self.map.with_untracked(|m| {
-            let kept = m.borrow().get(key).map(|(v, _)| *v);
+        };
+        // One batch: what `issue` triggers runs once the identity is kept,
+        // so an effect asking for the same key finds it and issues none.
+        crate::reactive::batch(|| {
+            Self::count(&memo, 1);
+            let kept = memo.borrow().map.get(key).map(|(v, _)| *v);
             kept.unwrap_or_else(|| {
                 let v = issue();
                 if !crate::component::is_cold_render() {
-                    m.borrow_mut().insert(key.clone(), (v, 0));
+                    memo.borrow_mut().map.insert(key.clone(), (v, 0));
                 }
                 v
             })
@@ -724,11 +803,10 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// The identity issued to `key` while it is kept, if any: asks for
     /// none, keeps none.
     pub fn peek(self, key: &K) -> Option<V> {
-        if !self.map.is_alive() {
-            return None;
-        }
-        self.count();
-        self.map.with_untracked(|m| m.borrow().get(key).map(|(v, _)| *v))
+        let memo = self.memo()?;
+        Self::count(&memo, 1);
+        let held = memo.borrow();
+        held.map.get(key).map(|(v, _)| *v)
     }
 
     /// [`Self::get`], and `key` held by the calling scope until it ends (in
@@ -752,46 +830,54 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// One holder more (`1`) or fewer (`-1`) of `key`, issued `v`: kept
     /// while it has one.
     fn add(self, key: &K, v: V, by: i8) {
-        if !self.map.is_alive() {
+        let Some(memo) = self.memo() else {
+            return;
+        };
+        // A cold frame never holds or lets go.
+        if crate::component::is_cold_render() {
             return;
         }
-        self.count();
-        self.map.with_untracked(|m| {
-            let mut m = m.borrow_mut();
-            if by > 0 {
-                let e = m.entry(key.clone()).or_insert((v, 0));
-                e.1 = e.1.saturating_add(1);
-            } else if let Some(e) = m.get_mut(key) {
-                e.1 = e.1.saturating_sub(1);
-                if e.1 == 0 {
-                    m.remove(key);
-                }
+        Self::count(&memo, 1);
+        let mut memo = memo.borrow_mut();
+        let m = &mut memo.map;
+        if by > 0 {
+            let e = m.entry(key.clone()).or_insert((v, 0));
+            e.1 = e.1.saturating_add(1);
+        } else if let Some(e) = m.get_mut(key) {
+            e.1 = e.1.saturating_sub(1);
+            if e.1 == 0 {
+                m.remove(key);
             }
-        });
+        }
     }
 
     /// Let go of each key `keep` refuses: asked for again, it is issued a
     /// new identity. `keep` must not ask this map.
     pub fn retain(self, mut keep: impl FnMut(&K, &V) -> bool) {
-        if self.map.is_alive() {
-            self.map.with_untracked(|m| {
-                let mut m = m.borrow_mut();
-                let n = u64::try_from(m.len()).unwrap_or(u64::MAX);
-                if self.work.is_alive() {
-                    self.work.with_untracked(|w| w.set(w.get().saturating_add(n)));
-                }
-                m.retain(|k, (v, _)| keep(k, v));
-            });
+        let Some(memo) = self.memo() else {
+            return;
+        };
+        // A cold frame lets go of none of the live frame's.
+        if crate::component::is_cold_render() {
+            return;
         }
+        // `keep` runs with nothing borrowed (it may trigger what reads this
+        // map); what it refused is taken out after.
+        crate::reactive::batch(|| {
+            let held: Vec<(K, V)> = memo.borrow().map.iter().map(|(k, (v, _))| (k.clone(), *v)).collect();
+            Self::count(&memo, u64::try_from(held.len()).unwrap_or(u64::MAX));
+            let refused: Vec<K> = held.into_iter().filter(|(k, v)| !keep(k, v)).map(|(k, _)| k).collect();
+            let mut memo = memo.borrow_mut();
+            for k in &refused {
+                memo.map.remove(k);
+            }
+        });
     }
 
     /// How many keys it holds an identity for.
     #[must_use]
     pub fn len(self) -> usize {
-        if !self.map.is_alive() {
-            return 0;
-        }
-        self.map.with_untracked(|m| m.borrow().len())
+        self.memo().map_or(0, |m| m.borrow().map.len())
     }
 
     /// Whether it holds none.
@@ -803,10 +889,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// The map operations done so far: the measure of its work.
     #[must_use]
     pub fn work(self) -> u64 {
-        if !self.work.is_alive() {
-            return 0;
-        }
-        self.work.with_untracked(Cell::get)
+        self.memo().map_or(0, |m| m.borrow().work)
     }
 }
 
@@ -838,6 +921,122 @@ mod tests {
         scope.dispose();
         drop(cold);
         assert_eq!(count.get(), 1, "neither ran");
+    }
+
+    /// A cold frame reads a live memo and changes none of it: peeking or
+    /// asking counts no work, `retain` lets go of nothing, a key it asks
+    /// for that is not kept is issued but not kept, and a `Keyed` made
+    /// there has no memo.
+    #[test]
+    fn a_cold_frame_reads_a_keyed_memo_and_never_writes_it() {
+        let owner = Scope::new();
+        let keyed: Keyed<&'static str, u32> = owner.run(Keyed::new);
+        assert_eq!(keyed.get(&"a", || 1), 1);
+        let work = keyed.work();
+        let cold = crate::engine::ColdFrame::begin();
+        assert_eq!(keyed.peek(&"a"), Some(1), "it reads the live memo");
+        assert_eq!(keyed.get(&"b", || 2), 2, "a miss is issued...");
+        keyed.retain(|_, _| false);
+        let made: Keyed<&'static str, u32> = Scope::new().run(Keyed::new);
+        assert_eq!(made.get(&"x", || 7), 7);
+        assert_eq!(made.len(), 0, "a Keyed made in a cold frame keeps none");
+        drop(cold);
+        assert_eq!(keyed.work(), work, "no work counted from the cold frame");
+        assert_eq!(keyed.peek(&"a"), Some(1), "a cold retain let go of nothing");
+        assert_eq!(keyed.peek(&"b"), None, "...and not kept");
+        owner.dispose();
+    }
+
+    /// `get` runs `issue` and keeps its result in one batch: an effect that
+    /// `issue` wakes and that asks for the same key finds the identity kept
+    /// and issues none of its own.
+    #[test]
+    fn what_issue_wakes_finds_the_identity_kept() {
+        let owner = Scope::new();
+        let keyed: Keyed<&'static str, u32> = owner.run(Keyed::new);
+        let poke = Signal::new(0_u32);
+        let issued = Rc::new(Cell::new(0_u32));
+        let seen = Rc::new(Cell::new(0_u32));
+        let (i, s) = (Rc::clone(&issued), Rc::clone(&seen));
+        owner.run(|| {
+            Effect::new(move || {
+                if poke.get() > 0 {
+                    let i = Rc::clone(&i);
+                    s.set(keyed.get(&"k", move || {
+                        i.set(i.get() + 1);
+                        99
+                    }));
+                }
+            });
+        });
+        let i = Rc::clone(&issued);
+        let v = keyed.get(&"k", move || {
+            i.set(i.get() + 1);
+            poke.set(1);
+            5
+        });
+        assert_eq!(v, 5);
+        assert_eq!(seen.get(), 5, "the effect found the identity the caller issued");
+        assert_eq!(issued.get(), 1, "one was issued");
+        owner.dispose();
+    }
+
+    /// A `retain` predicate that wakes what reads the map does not run
+    /// with the map borrowed.
+    #[test]
+    fn a_retain_that_wakes_a_reader_of_the_map_does_not_panic() {
+        let owner = Scope::new();
+        let keyed: Keyed<u32, u32> = owner.run(Keyed::new);
+        for k in 0..3 {
+            keyed.get(&k, || k * 10);
+        }
+        let poke = Signal::new(0_u32);
+        let lens = Rc::new(Cell::new(usize::MAX));
+        let l = Rc::clone(&lens);
+        owner.run(|| {
+            Effect::new(move || {
+                poke.get();
+                l.set(keyed.len());
+            });
+        });
+        keyed.retain(|k, _| {
+            poke.set(poke.get_untracked() + 1);
+            *k != 1
+        });
+        assert_eq!(keyed.len(), 2);
+        assert_eq!(lens.get(), 2, "the reader ran once the map was changed");
+        owner.dispose();
+    }
+
+    /// A keyed issuer is asked in a render and keeps what it issues there:
+    /// its memo is not reactive state, so a render that asks writes no
+    /// signal (which a render must not) and asking again gives the same.
+    #[test]
+    fn a_keyed_issuer_asked_in_a_render_keeps_what_it_issued() {
+        let owner = Scope::new();
+        let keyed: Keyed<&'static str, u32> = owner.run(Keyed::new);
+        let issued = Rc::new(Cell::new(0_u32));
+        let ask = |key: &'static str| {
+            let issued = Rc::clone(&issued);
+            let mut got = 0;
+            crate::reactive::rendering("ask", || {
+                got = keyed.get(&key, || {
+                    issued.set(issued.get() + 1);
+                    issued.get() * 10
+                });
+            });
+            got
+        };
+        assert_eq!(ask("a"), 10);
+        assert_eq!(ask("a"), 10, "the same while kept");
+        assert_eq!(ask("b"), 20);
+        assert_eq!(keyed.len(), 2);
+        assert_eq!(keyed.peek(&"a"), Some(10));
+        keyed.retain(|k, _| *k != "a");
+        assert_eq!(keyed.peek(&"a"), None, "let go");
+        assert_eq!(ask("a"), 30, "asked for again after it left: a new one");
+        assert!(keyed.work() > 0, "its operations are counted");
+        owner.dispose();
     }
 
     /// A registry is given an entry as a part mounts and loses only that

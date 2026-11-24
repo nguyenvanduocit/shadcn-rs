@@ -49,7 +49,7 @@ impl CalendarDate {
     /// `today(getLocalTimeZone())` is the day in the browser's.
     #[must_use]
     pub fn today() -> Self {
-        Self::in_zone(SystemTime::now(), &jiff::tz::TimeZone::system())
+        Self::in_zone(gui::clock::wall_time(), &jiff::tz::TimeZone::system())
     }
 
     /// The day `instant` falls on in the IANA time zone `zone` ("UTC",
@@ -338,6 +338,30 @@ mod zone_tests {
         CalendarDate::new(year, month, day)
     }
 
+    /// `today()` reads `gui::clock`'s wall time: under a script (a
+    /// Scenario's clock) with no day set it is the script's fixed day, the
+    /// same every run, and a scripted three days later is three days on.
+    /// (Read from the system's clock, it would be the day the test runs.)
+    #[test]
+    fn today_is_the_scripts_fixed_day_and_moves_with_the_scripted_clock() {
+        let zone = jiff::tz::TimeZone::system();
+        gui::clock::script(Duration::ZERO);
+        let fixed = CalendarDate::in_zone(gui::clock::script_epoch(), &zone);
+        assert_eq!(CalendarDate::today(), fixed);
+        gui::clock::advance_to(Duration::from_secs(3 * 86_400));
+        assert_eq!(fixed.days_until(CalendarDate::today()), 3);
+    }
+
+    /// A day a test sets is the day `today()` names.
+    #[test]
+    fn today_is_the_day_a_test_sets() {
+        let zone = jiff::tz::TimeZone::system();
+        gui::clock::script(Duration::ZERO);
+        let at = utc(1_795_204_800);
+        gui::clock::set_wall_time(at);
+        assert_eq!(CalendarDate::today(), CalendarDate::in_zone(at, &zone));
+    }
+
     #[test]
     fn an_instant_falls_on_its_zones_day() {
         // 2026-11-20T20:00:00Z: still the 20th in London, already the 21st in Saigon.
@@ -363,7 +387,7 @@ mod zone_tests {
             return;
         }
         let today_in = |zone: &str| {
-            let before = CalendarDate::at(SystemTime::now(), zone);
+            let before = CalendarDate::at(gui::clock::wall_time(), zone);
             let out = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -375,7 +399,7 @@ mod zone_tests {
                 .env("TZ", zone)
                 .output()
                 .unwrap();
-            let after = CalendarDate::at(SystemTime::now(), zone);
+            let after = CalendarDate::at(gui::clock::wall_time(), zone);
             let out = String::from_utf8_lossy(&out.stdout).into_owned();
             // The harness prints the test's name on the same line.
             let line = out

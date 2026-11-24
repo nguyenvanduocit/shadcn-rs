@@ -12,10 +12,30 @@
 //! from then on time moves only when the script moves it ([`advance_to`]),
 //! and the timers that fall due on the way run at their own times, in order,
 //! so a scripted run is the same every time.
+//!
+//! The calendar's time ([`wall_time`]: what day it is) is the clock's time
+//! from a wall epoch: the system's when the app starts (taken again at a
+//! frame boundary if the system's clock jumped, as a sleep or a time sync
+//! does), a fixed day ([`script_epoch`]) once a script takes the clock, or
+//! what a test sets ([`set_wall_time`]). It is read once per frame, like
+//! the frame's time, so the live frame and its cold check never disagree
+//! across midnight.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// The wall time a script starts the clock at: 2026-06-15T12:00:00Z.
+#[must_use]
+pub fn script_epoch() -> SystemTime {
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(1_781_524_800))
+        .unwrap_or(UNIX_EPOCH)
+}
+
+/// How far the system's clock may differ from the frame clock's reckoning
+/// before it is taken to have jumped (a sleep, a time sync).
+const WALL_JUMP: Duration = Duration::from_secs(1);
 
 struct Timer {
     /// When it runs, on the clock.
@@ -51,6 +71,10 @@ crate::engine::engine_local! {
     [Fork] static FRAME_TIME: Cell<Option<f32>> = const { Cell::new(None) };
     /// Where a script has set the clock, once one drives it.
     [Fork] static SCRIPTED: Cell<Option<Duration>> = const { Cell::new(None) };
+    /// The wall time at the clock's zero, once taken.
+    [Fork] static WALL_EPOCH: Cell<Option<SystemTime>> = const { Cell::new(None) };
+    /// The wall time of the frame being built, sampled as it began.
+    [Fork] static FRAME_WALL: Cell<Option<SystemTime>> = const { Cell::new(None) };
     [Fork] static WANTS_FRAME: Cell<bool> = const { Cell::new(false) };
     /// A cold frame's timers are its own; the live ones it can only see
     /// ([`Queue`]).
@@ -155,6 +179,44 @@ pub fn frame_time() -> f32 {
 /// seconds on the clock (a scripted clock's frames are at its time).
 pub fn begin_frame(at: f32) {
     FRAME_TIME.with(|f| f.set(Some(at)));
+    if !scripted() {
+        // The system's clock jumped (a sleep, a time sync): reckon from it.
+        let now = current();
+        let real = SystemTime::now();
+        let reckoned = wall_at(now);
+        let off = real.duration_since(reckoned).unwrap_or_else(|e| e.duration());
+        if off > WALL_JUMP {
+            WALL_EPOCH.with(|w| w.set(Some(real.checked_sub(now).unwrap_or(real))));
+        }
+    }
+    FRAME_WALL.with(|w| w.set(Some(wall_at(current()))));
+}
+
+/// The wall time when the clock reads `at`: the epoch, taken from the
+/// system's now the first time it is asked for.
+fn wall_at(at: Duration) -> SystemTime {
+    let epoch = WALL_EPOCH.with(Cell::get).unwrap_or_else(|| {
+        let real = SystemTime::now();
+        let epoch = real.checked_sub(current()).unwrap_or(real);
+        WALL_EPOCH.with(|w| w.set(Some(epoch)));
+        epoch
+    });
+    epoch.checked_add(at).unwrap_or(epoch)
+}
+
+/// What day and time it is, as a calendar shows it: the wall time of the
+/// frame being built (the same for the live frame and its cold check), or
+/// of now between frames. Read it, never the system's clock, so that a
+/// scripted run names the same day every time.
+#[must_use]
+pub fn wall_time() -> SystemTime {
+    FRAME_WALL.with(Cell::get).unwrap_or_else(|| wall_at(current()))
+}
+
+/// Set the wall time to `at`, now: the clock's time moves it on from here.
+pub fn set_wall_time(at: SystemTime) {
+    WALL_EPOCH.with(|w| w.set(Some(at.checked_sub(current()).unwrap_or(at))));
+    FRAME_WALL.with(|w| w.set(Some(at)));
 }
 
 /// Whether something read the clock since the last call; clears the flag.
@@ -167,6 +229,10 @@ pub fn take_frame_request() -> bool {
 /// have left.
 pub fn script(at: Duration) {
     let was = current();
+    // The wall time carries over as the clock is moved to `at`; the first
+    // script starts it at the fixed day.
+    let wall = if scripted() { wall_at(was) } else { script_epoch() };
+    WALL_EPOCH.with(|w| w.set(Some(wall.checked_sub(at).unwrap_or(wall))));
     TIMERS.with(|t| {
         for timer in t.borrow_mut().timers.iter_mut() {
             timer.due = at.saturating_add(timer.due.saturating_sub(was));
@@ -193,6 +259,7 @@ fn set_scripted(at: Duration) {
     SCRIPTED.with(|s| s.set(Some(at)));
     // What a timer's work reads as "now" (an animation it starts) is its own time.
     FRAME_TIME.with(|f| f.set(Some(at.as_secs_f32())));
+    FRAME_WALL.with(|w| w.set(Some(wall_at(at))));
 }
 
 /// Remove and return the earliest timer due by `by`.
@@ -729,5 +796,54 @@ mod tests {
         assert!(v.phase().is_some());
         v.moved(hz60);
         assert_eq!(v.phase(), None);
+    }
+
+    /// A script starts the wall time at the fixed day (the same every
+    /// run), the scripted clock moves it on, a test can set it, and moving
+    /// the script's start keeps the wall time where it was.
+    #[test]
+    fn a_script_starts_the_wall_time_at_a_fixed_day_and_moves_it_with_the_clock() {
+        script(Duration::ZERO);
+        assert_eq!(wall_time(), script_epoch());
+        advance_to(Duration::from_secs(3600));
+        assert_eq!(wall_time(), script_epoch() + Duration::from_secs(3600));
+        script(Duration::from_secs(10));
+        assert_eq!(
+            wall_time(),
+            script_epoch() + Duration::from_secs(3600),
+            "re-scripting keeps the wall time"
+        );
+        let at = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        set_wall_time(at);
+        assert_eq!(wall_time(), at);
+        advance_to(Duration::from_secs(70));
+        assert_eq!(wall_time(), at + Duration::from_secs(60));
+    }
+
+    /// The wall time is sampled as a frame begins: it does not move while
+    /// the frame is built, a cold build of the frame reads the same, and
+    /// the next frame samples again.
+    #[test]
+    fn the_wall_time_is_one_sample_per_frame_shared_by_the_cold_build() {
+        begin_frame(0.0);
+        let sampled = wall_time();
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(wall_time(), sampled, "fixed within the frame");
+        let cold = crate::engine::ColdFrame::begin();
+        assert_eq!(wall_time(), sampled, "the cold build reads the live frame's");
+        drop(cold);
+        begin_frame(0.03);
+        assert!(wall_time() > sampled, "the next frame samples again");
+    }
+
+    /// The system's clock jumping (a sleep, a time sync) is taken up at the
+    /// next frame boundary: the wall time follows it again.
+    #[test]
+    fn a_jump_of_the_system_clock_is_taken_up_at_a_frame_boundary() {
+        let day = Duration::from_secs(86_400);
+        set_wall_time(SystemTime::now() - day);
+        begin_frame(0.0);
+        let off = SystemTime::now().duration_since(wall_time()).unwrap_or_default();
+        assert!(off < Duration::from_secs(2), "re-synced to the system's: {off:?} off");
     }
 }

@@ -70,11 +70,6 @@
 //! cover a field.
 
 use std::cell::Cell;
-#[expect(
-    clippy::disallowed_types,
-    reason = "the drawer's own gesture, written by its own handlers"
-)]
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -695,6 +690,24 @@ gui::engine_local! {
     [Fork] static OPENED: Cell<u64> = Cell::new(1);
 }
 
+/// The swipe in `slot`, taken out: the slot holds none after.
+fn take_swipe(slot: Signal<Option<Swipe>>) -> Option<Swipe> {
+    let swipe = slot.get_untracked();
+    if swipe.is_some() {
+        slot.set(None);
+    }
+    swipe
+}
+
+/// The pointer at `at`, at `now`, on the swipe in `slot` (if any): the
+/// moved swipe replaces the one held.
+fn move_swipe(slot: Signal<Option<Swipe>>, at: (f32, f32), now: Duration) -> Option<SwipeMove> {
+    let mut swipe = slot.get_untracked()?;
+    let moved = swipe.moved(at, now);
+    slot.set(Some(swipe));
+    moved
+}
+
 /// The number of an opening, later than every one before it.
 fn next_opening() -> u64 {
     OPENED.with(|n| {
@@ -712,10 +725,6 @@ fn put(s: Signal<f32>, v: f32) {
 }
 
 /// A drawer's state: made once in its root's setup (`Copy`).
-#[expect(
-    clippy::disallowed_types,
-    reason = "the drawer's own gesture, written by its own handlers"
-)]
 pub struct Drawer<P: 'static> {
     open: UseModel<P, bool>,
     /// The caller's active snap point, when it keeps it.
@@ -726,9 +735,12 @@ pub struct Drawer<P: 'static> {
     linked: Linked,
     names: Names,
     trigger: FocusHandle,
-    swipe: Signal<RefCell<Option<Swipe>>>,
+    /// The swipe in progress on its content: a plain value, replaced on
+    /// every move. Nothing reads it tracked (`dragging`, `offset` and
+    /// `progress` are what the view follows).
+    swipe: Signal<Option<Swipe>>,
     /// The swipe of the area that opens it.
-    opening: Signal<RefCell<Option<Swipe>>>,
+    opening: Signal<Option<Swipe>>,
     dragging: Signal<bool>,
     offset: Signal<(f32, f32)>,
     progress: Signal<f32>,
@@ -773,10 +785,6 @@ impl<P: 'static> Drawer<P> {
     /// drawer's is nested in it; one under a [`DrawerProvider`] reports to it.
     #[must_use]
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the drawer's own gesture, written by its own handlers"
-    )]
     pub fn new(
         open: UseModel<P, bool>,
         snap: Option<UseModel<P, Option<SnapPoint>>>,
@@ -799,8 +807,8 @@ impl<P: 'static> Drawer<P> {
             linked: Linked::new(Points::Controls),
             names: Names::new(),
             trigger: FocusHandle::new(),
-            swipe: Signal::new(RefCell::new(None)),
-            opening: Signal::new(RefCell::new(None)),
+            swipe: Signal::labeled("drawer swipe", None),
+            opening: Signal::labeled("drawer opening swipe", None),
             dragging: Signal::labeled("drawer dragging", false),
             offset: Signal::labeled("drawer offset", (0.0, 0.0)),
             progress: Signal::labeled("drawer progress", 0.0),
@@ -886,8 +894,8 @@ impl<P: 'static> Drawer<P> {
         // The window losing focus ends a swipe where it is.
         gui::watch(gui::interact::window_active, move |&active, _| {
             if !active {
-                d.opening.with_untracked(|s| s.borrow_mut().take());
-                if let Some(swipe) = d.swipe.with_untracked(|s| s.borrow_mut().take()) {
+                take_swipe(d.opening);
+                if let Some(swipe) = take_swipe(d.swipe) {
                     d.finish(&swipe, Self::now());
                 }
             }
@@ -1120,7 +1128,7 @@ impl<P: 'static> Drawer<P> {
         self.dragging.set(false);
         self.offset.set((0.0, 0.0));
         self.progress.set(0.0);
-        self.swipe.with_untracked(|s| s.borrow_mut().take());
+        take_swipe(self.swipe);
     }
 
     fn settled(self, open: bool) {
@@ -1351,12 +1359,10 @@ impl<P: 'static> Drawer<P> {
                     gui::untracked(|| self.snap_offset_abs())
                 };
                 self.swipe
-                    .with_untracked(|s| *s.borrow_mut() = Some(Swipe::with_room(direction, size, room, (e.x, e.y))));
+                    .set(Some(Swipe::with_room(direction, size, room, (e.x, e.y))));
             }
             DragPhase::Move => {
-                let moved = self
-                    .swipe
-                    .with_untracked(|s| s.borrow_mut().as_mut().and_then(|s| s.moved((e.x, e.y), now)));
+                let moved = move_swipe(self.swipe, (e.x, e.y), now);
                 if let Some(m) = moved {
                     if !self.dragging.get_untracked() {
                         self.dragging.set(true);
@@ -1366,14 +1372,14 @@ impl<P: 'static> Drawer<P> {
                 }
             }
             DragPhase::End => {
-                if let Some(swipe) = self.swipe.with_untracked(|s| s.borrow_mut().take()) {
+                if let Some(swipe) = take_swipe(self.swipe) {
                     self.finish(&swipe, now);
                 }
             }
             // Cancelled (the content was disabled mid-swipe): it slides
             // back where it rests, neither closing nor snapping.
             DragPhase::Cancel => {
-                if self.swipe.with_untracked(|s| s.borrow().is_some()) {
+                if self.swipe.with_untracked(Option::is_some) {
                     self.rest();
                 }
             }
@@ -1446,15 +1452,13 @@ impl<P: 'static> Drawer<P> {
                 } else {
                     e.bounds.width
                 };
-                self.opening
-                    .with_untracked(|s| *s.borrow_mut() = Some(Swipe::new(way, size, (e.x, e.y))));
+                self.opening.set(Some(Swipe::new(way, size, (e.x, e.y))));
             }
             DragPhase::Move => {
-                self.opening
-                    .with_untracked(|s| s.borrow_mut().as_mut().and_then(|s| s.moved((e.x, e.y), now)));
+                move_swipe(self.opening, (e.x, e.y), now);
             }
             DragPhase::End => {
-                let swipe = self.opening.with_untracked(|s| s.borrow_mut().take());
+                let swipe = take_swipe(self.opening);
                 if let Some(swipe) = swipe
                     && swipe.release(now) == Release::Dismiss
                 {
@@ -1462,7 +1466,7 @@ impl<P: 'static> Drawer<P> {
                 }
             }
             DragPhase::Cancel => {
-                self.opening.with_untracked(|s| s.borrow_mut().take());
+                take_swipe(self.opening);
             }
         }
     }

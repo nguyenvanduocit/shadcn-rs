@@ -1498,6 +1498,38 @@ fn a_drawer_opens_from_its_swipe_area_and_the_window_losing_focus_ends_a_swipe()
     p.s.settle().expect("settled");
 }
 
+/// A regression guard for moving the drawer's swipes from a `RefCell` in a
+/// signal to plain `Option<Swipe>` signals (the old form had no bug this
+/// reproduces): the swipe of the area that opens a drawer is held while the
+/// pointer is down; the window losing focus drops it, so the release that
+/// follows opens nothing, and the swipe after it starts from its own press.
+#[test]
+fn the_window_losing_focus_drops_an_opening_swipe_and_the_next_starts_fresh() {
+    use gui::window::Input;
+    let mut p = drawer_page(Open::closed(), DrawerOptions::default);
+    let (x, y) = (400.0, 595.0);
+    p.s.send(Input::PointerMoved { x, y });
+    p.s.send(Input::MouseDown { x, y });
+    p.s.send(Input::PointerMoved { x, y: y - 80.0 });
+    p.s.settle().expect("settled");
+    assert!(!p.drawer.is_open(), "nothing opens before the release");
+    p.s.set_window_active(false);
+    p.s.settle().expect("settled");
+    p.s.send(Input::MouseUp { x, y: y - 80.0 });
+    p.s.set_window_active(true);
+    p.s.settle().expect("settled");
+    assert!(!p.drawer.is_open(), "the dropped swipe does not open it on release");
+    assert!(reasons(&p).is_empty(), "no change was asked for");
+    // A short swipe now is its own: 20 px slowly is not enough, and the
+    // 80 px one before leaves nothing behind that would make it enough.
+    p.s.drag((x, y), (x, y - 20.0));
+    p.s.settle().expect("settled");
+    assert!(!p.drawer.is_open(), "20 px is short of opening");
+    p.s.drag((x, y), (x, y - 80.0));
+    p.s.settle().expect("settled");
+    assert!(p.drawer.is_open(), "a whole swipe opens it");
+}
+
 #[test]
 fn a_drawer_is_settled_after_its_animations_and_gives_focus_to_the_node_named() {
     let settled: Rc<RefCell<Vec<bool>>> = Rc::default();
@@ -2035,6 +2067,92 @@ fn toasts_past_the_limit_are_inert_and_a_swipe_takes_one_away() {
         "past 50 px it goes; the old one is back within the limit"
     );
     assert!(!t.limited(ToastId(1)));
+}
+
+/// A toaster whose one toast is a single action button over its whole
+/// face (400..700 by 400..440), counting how often the action runs.
+fn toast_with_action() -> (Scenario, Toaster<&'static str>, Rc<Cell<u32>>) {
+    let got: Rc<Cell<Option<Toaster<&'static str>>>> = Rc::default();
+    let acted: Rc<Cell<u32>> = Rc::default();
+    let (g, a) = (Rc::clone(&got), Rc::clone(&acted));
+    let mut s = scenario(move || {
+        let (g, a) = (Rc::clone(&g), Rc::clone(&a));
+        component((), move |_| {
+            let t: Toaster<&'static str> = Toaster::new(ToasterOptions {
+                duration: None,
+                ..ToasterOptions::default()
+            });
+            g.set(Some(t));
+            let a = Rc::clone(&a);
+            move || {
+                let a = Rc::clone(&a);
+                let alt = primitives::toast::Spoken::new("Do it").expect("not blank");
+                div()
+                    .child(deferred(
+                        Positioning::Fill,
+                        div().size(pct(100.0)).pass_through().child(
+                            t.region(
+                                div()
+                                    .display(Display::Flex)
+                                    .width(300.0)
+                                    .margin_left(400.0)
+                                    .margin_top(400.0),
+                                "Notifications (F8)",
+                            )
+                            .children(t.with(|shown| {
+                                shown
+                                    .iter()
+                                    .map(|s| {
+                                        let a = Rc::clone(&a);
+                                        t.toast(div().key(s.id.0).height(40.0).width(300.0), s.id)
+                                            .child(t.action(div().width(300.0).height(40.0), s.id, &alt, move |()| {
+                                                a.set(a.get() + 1)
+                                            }))
+                                    })
+                                    .collect::<Vec<_>>()
+                            })),
+                        ),
+                    ))
+                    .into_element()
+            }
+        })
+        .into_element()
+    });
+    s.settle().expect("settled");
+    let t = got.get().expect("the toaster");
+    s.act("show", || {
+        t.show(ToastId(1), "Go", says("Go", Sensitivity::Background, None));
+    });
+    s.settle().expect("settled");
+    (s, t, acted)
+}
+
+/// A regression guard for moving the swallow latch from a `Cell` in a
+/// signal to a plain `bool` signal (it reproduces no bug): the click a
+/// swipe ends with presses nothing, and the click handler clears the latch
+/// as it swallows, so the next click is a click again.
+#[test]
+fn the_click_a_toast_swipe_ends_with_presses_nothing_once() {
+    let (mut s, t, acted) = toast_with_action();
+    // A swipe that slides back: the click it ends with presses nothing.
+    s.drag((450.0, 420.0), (480.0, 420.0));
+    s.settle().expect("settled");
+    assert_eq!(t.with(<[_]>::len), 1, "short of 50 px it slides back");
+    assert_eq!(acted.get(), 0, "the click the swipe ends with presses nothing");
+    // That was the one click it swallowed, and the handler cleared the
+    // latch as it did: the next click presses (a latch left set would
+    // swallow this one too).
+    click(&mut s, (500.0, 420.0));
+    assert_eq!(acted.get(), 1, "the latch was cleared by the click it swallowed");
+    assert_eq!(t.with(<[_]>::len), 0, "and the action closes the toast");
+}
+
+#[test]
+fn a_plain_click_on_a_toasts_action_presses_it() {
+    let (mut s, t, acted) = toast_with_action();
+    click(&mut s, (500.0, 420.0));
+    assert_eq!(acted.get(), 1);
+    assert_eq!(t.with(<[_]>::len), 0, "the action closes the toast");
 }
 
 #[test]
