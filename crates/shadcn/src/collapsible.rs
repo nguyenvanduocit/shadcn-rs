@@ -9,11 +9,11 @@
 //! the caller's boxes.
 
 use gui::prelude::*;
-use gui::{Bind, Div, Model, component, div, provide, use_context, use_model};
+use gui::{Bind, Div, Model, component, div, provide, use_model};
 use primitives::Availability;
 use primitives::collapsible::Collapsible;
 
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 
 /// What [`collapsible`] is given.
 #[derive(Clone, Debug, PartialEq, Default)]
@@ -34,8 +34,8 @@ impl CollapsibleContext {
     }
 
     /// The context of the collapsible this instance is in.
-    pub(crate) fn find() -> Option<Self> {
-        use_context::<Self>()
+    pub(crate) fn find<P: 'static>(props: gui::Signal<PartProps<P>>, part: &'static str) -> Option<Self> {
+        part_root(props, part, "collapsible")
     }
 }
 
@@ -98,18 +98,27 @@ impl Part<CollapsibleProps> {
 
 /// An unstyled pressable trigger that opens and closes its collapsible.
 #[must_use]
+#[track_caller]
 pub fn collapsible_trigger() -> Part<()> {
-    collapsible_trigger_as(div().named("collapsible-trigger").focusable())
+    Part::new((), div().named("collapsible-trigger").focusable(), |p| {
+        trigger_setup(p, "collapsible_trigger")
+    })
 }
 
 /// `control` (a button, a row) as the trigger (reka's `as-child`): pressing
 /// it opens and closes its collapsible.
 #[must_use]
+#[track_caller]
 pub fn collapsible_trigger_as(control: impl Into<Div>) -> Part<()> {
-    Part::new((), control.into(), |p| {
-        component(p, |cx| {
+    Part::new((), control.into(), |p| trigger_setup(p, "collapsible_trigger_as"))
+}
+
+/// The setup of a trigger whose public part is `part`.
+fn trigger_setup(p: PartProps<()>, part: &'static str) -> gui::ComponentElement {
+    {
+        component(p, move |cx| {
             let props = cx.props();
-            let ctx = primitives::context::use_root::<CollapsibleContext>("collapsible_trigger", "collapsible");
+            let ctx = CollapsibleContext::find(props, part);
             move || {
                 let control = props.with(|p| p.slot.0.clone());
                 match ctx {
@@ -118,17 +127,18 @@ pub fn collapsible_trigger_as(control: impl Into<Div>) -> Part<()> {
                 }
             }
         })
-    })
+    }
 }
 
 /// The content, shown while open (reka unmounts it otherwise); style and
 /// fill it as a `Div`.
 #[must_use]
+#[track_caller]
 pub fn collapsible_content() -> Part<()> {
     Part::new((), div().named("collapsible-content"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = primitives::context::use_root::<CollapsibleContext>("collapsible_content", "collapsible");
+            let ctx = CollapsibleContext::find(props, "collapsible_content");
             move || {
                 let content = props.with(|p| p.slot.0.clone());
                 match ctx {

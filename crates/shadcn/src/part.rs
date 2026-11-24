@@ -12,9 +12,13 @@
 //! through [`gui::use_model`]: the caller's model, a value it keeps, or the
 //! part's own from a default, as reka's `useVModel` does.
 
+use std::panic::Location;
+
 use gui::{
-    ComponentElement, Div, Element, ElementKey, Fluent, IntoElement, Slot, Style, Styled, TextField, UseModel, watch,
+    ComponentElement, Div, Element, ElementKey, Fluent, IntoElement, Signal, Slot, Style, Styled, TextField, UseModel,
+    watch,
 };
+use primitives::context::use_root_at;
 
 /// Called in setup: `field` and the text `value` (a part's `v-model`) stay
 /// one. An edit writes the text up; a text written from outside (a form's
@@ -38,6 +42,27 @@ pub struct PartProps<P> {
     /// The box the caller styled and filled (never equal: its parent's
     /// render makes it anew, so the part renders again with its parent).
     pub slot: Slot<Div>,
+    /// Where the caller's code made the part (a report of a missing root
+    /// names it).
+    pub at: &'static Location<'static>,
+}
+
+/// The state of the root `root` that the part `part`, whose props are
+/// `props`, sits in; called in its setup. Outside the root it is the
+/// reported error of [`use_root`], naming where the caller made the part.
+#[must_use]
+pub(crate) fn part_root<P: 'static, T: Clone + 'static>(
+    props: Signal<PartProps<P>>,
+    part: &'static str,
+    root: &'static str,
+) -> Option<T> {
+    use_root_at(part, root, part_at(props))
+}
+
+/// Where the caller's code made the part whose props are `props`.
+#[must_use]
+pub(crate) fn part_at<P: 'static>(props: Signal<PartProps<P>>) -> &'static Location<'static> {
+    props.with_untracked(|p| p.at)
 }
 
 impl<P> PartialEq for PartProps<P> {
@@ -54,19 +79,34 @@ pub struct Part<P: 'static> {
     root: Div,
     key: Option<ElementKey>,
     mount: fn(PartProps<P>) -> ComponentElement,
+    at: &'static Location<'static>,
 }
 
 impl<P: 'static> Part<P> {
     /// A part whose box starts as `root`, its instance made by `mount`
     /// (a call of [`gui::component`]).
+    ///
+    /// Its place for a report is where this is called from; a public
+    /// constructor that can report is `#[track_caller]`, so that place is
+    /// the caller's own code (or [`Part::made_at`] sets it).
     #[must_use]
+    #[track_caller]
     pub fn new(props: P, root: Div, mount: fn(PartProps<P>) -> ComponentElement) -> Self {
         Self {
             props,
             root,
             key: None,
             mount,
+            at: Location::caller(),
         }
+    }
+
+    /// Say where the caller's code made the part, when `new` runs later
+    /// than the caller's call (in a closure the constructor kept).
+    #[must_use]
+    pub fn made_at(mut self, at: &'static Location<'static>) -> Self {
+        self.at = at;
+        self
     }
 
     #[must_use]
@@ -139,6 +179,7 @@ impl<P: 'static> IntoElement for Part<P> {
         let el = (self.mount)(PartProps {
             props: self.props,
             slot: Slot(self.root),
+            at: self.at,
         });
         match self.key {
             Some(key) => el.key(key).into_element(),

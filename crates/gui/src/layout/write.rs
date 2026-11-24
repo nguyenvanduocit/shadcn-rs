@@ -26,6 +26,11 @@ impl LayoutTree {
     /// along the paths that lead to what changed, lay out what changed, and
     /// write the frame's nodes that changed (all of them when nodes came,
     /// went or moved).
+    ///
+    /// A pass that panics (a binding's closure, a measure) leaves the tree
+    /// empty, as new: what it held is dropped with every tracker in it, so
+    /// none stays subscribed, and the next pass builds the tree anew. Half
+    /// patched, the tree would hold nodes its root no longer reaches.
     pub fn layout(
         &mut self,
         root: &Element,
@@ -35,6 +40,63 @@ impl LayoutTree {
         motion: &mut Motion,
         text: &mut TextSystem,
     ) -> &Frame {
+        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.pass(root, width, height, state, motion, text);
+        }));
+        if let Err(panic) = pass {
+            self.forget(motion);
+            std::panic::resume_unwind(panic);
+        }
+        &self.frame
+    }
+
+    /// Drop every node it holds, and what it knows of them, as a new tree
+    /// holds none. Every node left the tree, as `motion` is told (an exit
+    /// starts, a stage is reported); one the next pass builds again enters
+    /// anew. Its layers keep the order they last opened in, carried as a
+    /// cold build carries the window's: the next pass opens them so.
+    fn forget(&mut self, motion: &mut Motion) {
+        let gone: Vec<NodePath> = motion.paths().cloned().chain(self.released.drain(..)).collect();
+        motion.left(&gone, &|_| false);
+        self.carried.clear();
+        self.carried.extend(self.layer_paths.drain(..));
+        self.root = None;
+        self.layers.clear();
+        self.extras.clear();
+        self.free.clear();
+        self.by_path.clear();
+        self.by_focus.clear();
+        self.by_field.clear();
+        self.mounting.clear();
+        self.joining.clear();
+        if let Ok(mut m) = self.marks.try_borrow_mut() {
+            m.clear();
+        }
+        if let Ok(mut m) = self.measured_due.try_borrow_mut() {
+            m.clear();
+        }
+        if let Ok(mut f) = self.fields.try_borrow_mut() {
+            f.clear();
+        }
+        self.focused = None;
+        self.focused_layer = 0;
+        self.motion_seen = 0;
+        self.frame = Frame::default();
+        self.seen = None;
+        self.structure = true;
+        self.size = (-1.0, -1.0);
+        leaf::end_pass();
+    }
+
+    fn pass(
+        &mut self,
+        root: &Element,
+        width: f32,
+        height: f32,
+        state: &UiState,
+        motion: &mut Motion,
+        text: &mut TextSystem,
+    ) {
         let viewport = Bounds {
             x: 0.0,
             y: 0.0,
@@ -230,7 +292,7 @@ impl LayoutTree {
             };
             // A layer that is new, or at another place in the order, or
             // whose nodes came or went, is written anew from its start on.
-            let moved_in_order = self.layer_paths.get(layer.saturating_sub(1)) != Some(&t.path);
+            let moved_in_order = self.layer_paths.get(layer.saturating_sub(1)).map(|(p, _)| p) != Some(&t.path);
             if write == Write::Changed && (std::mem::take(&mut self.structure) || moved_in_order || !had) {
                 write = Write::All;
                 let start = frame
@@ -305,7 +367,10 @@ impl LayoutTree {
                 .collect();
         }
         self.layer_paths.clear();
-        self.layer_paths.extend(self.layers.iter().map(|l| l.path.clone()));
+        self.layer_paths
+            .extend(self.layers.iter().map(|l| (l.path.clone(), l.opened)));
+        // What a cold build or a recovered pass carried is the layers' own now.
+        self.carried.clear();
         frame.changes.trim(frame.nodes.len());
         // What is shown now, before anything after layout (a list's
         // watcher, a hook) asks for focus.
@@ -318,7 +383,6 @@ impl LayoutTree {
         motion.left(&self.released, &|p| self.by_path.contains_key(p));
         self.released.clear();
         self.frame = frame;
-        &self.frame
     }
 
     /// Drop the frame's nodes from `start` on, keeping them as they were

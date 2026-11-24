@@ -572,8 +572,9 @@ pub struct LayoutTree {
     released: Vec<NodePath>,
     /// This pass added, removed or reordered a node: the frame is rebuilt.
     structure: bool,
-    /// The layers' paths, as the last pass placed them.
-    layer_paths: Vec<NodePath>,
+    /// The layers' paths, as the last pass placed them, each with when it
+    /// opened: what a pass that panics carries to the next.
+    layer_paths: Vec<(NodePath, u64)>,
     /// The member nodes ([`crate::Members`]) this pass patched or walked,
     /// in tree order: each joins its lists once placed, when shown.
     joining: Vec<u32>,

@@ -13,14 +13,12 @@
 use std::rc::Rc;
 
 use gui::prelude::*;
-use gui::{
-    Bind, Callback, FocusHandle, Icon, Model, Shadow, component, div, icon, provide, px, use_context, use_model,
-};
+use gui::{Bind, Callback, FocusHandle, Icon, Model, Shadow, component, div, icon, provide, px, use_model};
 use primitives::Availability;
 use primitives::direction::use_direction;
 use primitives::splitter::{Constraints, Panel, Splitter, SplitterOptions, Storage, Unit};
 
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 use crate::separator::Orientation;
 use crate::theme::theme;
 
@@ -189,6 +187,7 @@ pub struct ResizablePanelProps {
 
 /// Panel `index`: its share of the group is its size.
 #[must_use]
+#[track_caller]
 pub fn resizable_panel(index: usize) -> Part<ResizablePanelProps> {
     // `overflow: hidden` lets a flex item shrink below its content in CSS;
     // gui's `overflow_hidden` clips without that, so the zero minimum is stated.
@@ -209,7 +208,7 @@ pub fn resizable_panel(index: usize) -> Part<ResizablePanelProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = use_context::<ResizableContext>();
+            let ctx = part_root::<_, ResizableContext>(props, "resizable_panel", "resizable_panel_group");
             if let Some(ResizableContext(splitter)) = ctx {
                 let (index, constraints, id) =
                     props.with_untracked(|p| (p.props.index, p.props.constraints, p.props.id.clone()));
@@ -332,6 +331,7 @@ pub struct ResizableHandleProps {
 
 /// The handle after panel `index`; `with_handle` shows a grip on it.
 #[must_use]
+#[track_caller]
 pub fn resizable_handle(index: usize, with_handle: bool) -> Part<ResizableHandleProps> {
     let props = ResizableHandleProps {
         index,
@@ -341,7 +341,7 @@ pub fn resizable_handle(index: usize, with_handle: bool) -> Part<ResizableHandle
     Part::new(props, div().named("resizable-handle"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = use_context::<ResizableContext>();
+            let ctx = part_root::<_, ResizableContext>(props, "resizable_handle", "resizable_panel_group");
             let focus = FocusHandle::new();
             move || {
                 let Some(ResizableContext(splitter)) = ctx else {

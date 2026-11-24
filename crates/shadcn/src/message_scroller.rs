@@ -918,6 +918,8 @@ pub struct MessageScrollerViewportProps<T: 'static> {
     row: Row<T>,
     gap: f32,
     viewport: Rc<dyn Fn(Div) -> Div>,
+    /// Where the caller's code made it (a report of a missing provider names it).
+    at: &'static std::panic::Location<'static>,
 }
 
 impl<T: 'static> Clone for MessageScrollerViewportProps<T> {
@@ -928,6 +930,7 @@ impl<T: 'static> Clone for MessageScrollerViewportProps<T> {
             row: Rc::clone(&self.row),
             gap: self.gap,
             viewport: Rc::clone(&self.viewport),
+            at: self.at,
         }
     }
 }
@@ -947,6 +950,7 @@ impl<T: 'static> PartialEq for MessageScrollerViewportProps<T> {
 /// `message-scroller-item` row. The thread's gap is 32 px; change it with
 /// [`MessageScrollerViewport::gap`].
 #[must_use]
+#[track_caller]
 pub fn message_scroller_viewport<T: 'static>(
     items: impl Into<Rc<[T]>>,
     meta: impl for<'a> Fn(&'a T) -> (&'a str, bool) + 'static,
@@ -958,6 +962,7 @@ pub fn message_scroller_viewport<T: 'static>(
         row: Rc::new(row),
         gap: DEFAULT_GAP,
         viewport: Rc::new(|v| v),
+        at: std::panic::Location::caller(),
     })
 }
 
@@ -985,7 +990,11 @@ impl<T: 'static> IntoElement for MessageScrollerViewport<T> {
     fn into_element(self) -> Element {
         component(self.0, |cx| {
             let props = cx.props();
-            let scroller = use_message_scroller();
+            let scroller = primitives::context::use_root_at::<MessageScroller>(
+                "message_scroller_viewport",
+                "message_scroller_provider",
+                props.with_untracked(|p| p.at),
+            );
             if let Some(state) = &scroller {
                 watch_data(state, props);
             }
@@ -1096,15 +1105,20 @@ pub enum MessageScrollerDirection {
 /// there is more of the thread that way, jumping there. Vue centres it with
 /// `-translate-x-1/2`; here a full-width row that lets clicks through centres it.
 #[must_use]
+#[track_caller]
 pub fn message_scroller_button(direction: MessageScrollerDirection) -> ComponentElement {
-    component(direction, |cx| {
-        let direction = cx.props();
-        let scroller = use_message_scroller();
+    component((direction, std::panic::Location::caller()), |cx| {
+        let props = cx.props();
+        let scroller = primitives::context::use_root_at::<MessageScroller>(
+            "message_scroller_button",
+            "message_scroller_provider",
+            props.with_untracked(|p| p.1),
+        );
         move || {
             let Some(state) = scroller.clone() else {
                 return Element::Empty;
             };
-            scroll_button(state, direction.get()).into_element()
+            scroll_button(state, props.with(|p| p.0)).into_element()
         }
     })
 }

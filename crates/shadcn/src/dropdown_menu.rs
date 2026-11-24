@@ -41,7 +41,7 @@ use primitives::{Availability, Item};
 
 use crate::focus::StateLook;
 use crate::motion::popper;
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 use crate::theme::{Colors, theme};
 
 /// What an item looks like and whether it takes input.
@@ -210,6 +210,8 @@ pub struct MenuRootProps {
     /// A context menu's long press (reka's `pressOpenDelay`); none: the
     /// engine's 700 ms.
     press_open_delay: Option<std::time::Duration>,
+    /// Which public menu a submenu of it is made as (a report names it).
+    family: MenuFamily,
 }
 
 impl Default for MenuRootProps {
@@ -218,6 +220,7 @@ impl Default for MenuRootProps {
             open: Bind::default(),
             modal: MenuOptions::DEFAULT.modal,
             press_open_delay: None,
+            family: MenuFamily::Dropdown,
         }
     }
 }
@@ -292,8 +295,81 @@ impl OpenProps for MenuRootProps {
 }
 
 /// The nearest menu level, from a part's setup.
-pub(crate) fn menu_level() -> Option<Menu> {
-    use_context::<Menu>()
+///
+/// Outside a menu it is a reported error naming the public part of
+/// `family` that `kind` says (`"item"`: `dropdown_menu_item`, …) and the
+/// root that family needs, and `None`.
+pub(crate) fn menu_level<P: 'static>(
+    props: gui::Signal<PartProps<P>>,
+    family: MenuFamily,
+    kind: MenuKind,
+) -> Option<Menu> {
+    part_root(props, family.part(kind), family.root())
+}
+
+/// Which public part of a menu family a shared menu part is made as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuKind {
+    Content,
+    SubContent,
+    Item,
+    CheckboxItem,
+    RadioItem,
+    RadioGroup,
+    Sub,
+    SubTrigger,
+}
+
+/// Which public menu a shared menu part is made as: what a report of a
+/// missing root names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MenuFamily {
+    Dropdown,
+    Context,
+    Menubar,
+}
+
+impl MenuFamily {
+    /// The root its parts need.
+    fn root(self) -> &'static str {
+        match self {
+            Self::Dropdown => "dropdown_menu",
+            Self::Context => "context_menu",
+            Self::Menubar => "menubar_menu",
+        }
+    }
+
+    /// The public part `kind` of this family, as a static name (the
+    /// report's set is bounded by the call sites).
+    pub(crate) fn part(self, kind: MenuKind) -> &'static str {
+        use MenuKind as K;
+        match (self, kind) {
+            (Self::Dropdown, K::Content) => "dropdown_menu_content",
+            (Self::Dropdown, K::SubContent) => "dropdown_menu_sub_content",
+            (Self::Dropdown, K::Item) => "dropdown_menu_item",
+            (Self::Dropdown, K::CheckboxItem) => "dropdown_menu_checkbox_item",
+            (Self::Dropdown, K::RadioItem) => "dropdown_menu_radio_item",
+            (Self::Dropdown, K::RadioGroup) => "dropdown_menu_radio_group",
+            (Self::Dropdown, K::Sub) => "dropdown_menu_sub",
+            (Self::Dropdown, K::SubTrigger) => "dropdown_menu_sub_trigger",
+            (Self::Context, K::Content) => "context_menu_content",
+            (Self::Context, K::SubContent) => "context_menu_sub_content",
+            (Self::Context, K::Item) => "context_menu_item",
+            (Self::Context, K::CheckboxItem) => "context_menu_checkbox_item",
+            (Self::Context, K::RadioItem) => "context_menu_radio_item",
+            (Self::Context, K::RadioGroup) => "context_menu_radio_group",
+            (Self::Context, K::Sub) => "context_menu_sub",
+            (Self::Context, K::SubTrigger) => "context_menu_sub_trigger",
+            (Self::Menubar, K::Content) => "menubar_content",
+            (Self::Menubar, K::SubContent) => "menubar_sub_content",
+            (Self::Menubar, K::Item) => "menubar_item",
+            (Self::Menubar, K::CheckboxItem) => "menubar_checkbox_item",
+            (Self::Menubar, K::RadioItem) => "menubar_radio_item",
+            (Self::Menubar, K::RadioGroup) => "menubar_radio_group",
+            (Self::Menubar, K::Sub) => "menubar_sub",
+            (Self::Menubar, K::SubTrigger) => "menubar_sub_trigger",
+        }
+    }
 }
 
 /// Where a menu's content opens.
@@ -316,6 +392,7 @@ pub(crate) enum MenuPlace {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MenuContentProps {
     place: MenuPlace,
+    family: MenuFamily,
 }
 
 impl Part<MenuContentProps> {
@@ -342,11 +419,18 @@ impl Part<MenuContentProps> {
 
 /// A level's content on `root`: nothing while the level is closed; open,
 /// floating at `place`, the engine's content (keys, pointer, layer).
-pub(crate) fn menu_content(root: Div, place: MenuPlace) -> Part<MenuContentProps> {
-    Part::new(MenuContentProps { place }, root, |p| {
+#[track_caller]
+pub(crate) fn menu_content(root: Div, place: MenuPlace, family: MenuFamily) -> Part<MenuContentProps> {
+    Part::new(MenuContentProps { place, family }, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let level = menu_level();
+            let (place, family) = props.with_untracked(|p| (p.props.place, p.props.family));
+            let kind = if place == MenuPlace::Beside {
+                MenuKind::SubContent
+            } else {
+                MenuKind::Content
+            };
+            let level = menu_level(props, family, kind);
             let context = use_context::<ContextMenu>();
             move || {
                 let Some(menu) = level else {
@@ -425,6 +509,7 @@ pub struct MenuItemProps {
     id: String,
     item: MenuItem,
     on_select: Option<Callback<SelectEvent>>,
+    family: MenuFamily,
 }
 
 impl Part<MenuItemProps> {
@@ -438,16 +523,18 @@ impl Part<MenuItemProps> {
 }
 
 /// An item on `root`, highlighted by the pointer and the keys.
-pub(crate) fn menu_item(root: Div, id: &str, item: MenuItem) -> Part<MenuItemProps> {
+#[track_caller]
+pub(crate) fn menu_item(root: Div, id: &str, item: MenuItem, family: MenuFamily) -> Part<MenuItemProps> {
     let props = MenuItemProps {
         id: id.to_owned(),
         item,
         on_select: None,
+        family,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let level = menu_level();
+            let level = menu_level(props, props.with_untracked(|p| p.props.family), MenuKind::Item);
             let focus = FocusHandle::new();
             // The `on_select` passed last, when it is picked.
             let on_select = cx.event_opt(|p| p.props.on_select.as_ref());
@@ -474,6 +561,7 @@ pub struct MenuCheckboxItemProps {
     disabled: bool,
     checked: Bind<bool>,
     on_select: Option<Callback<SelectEvent>>,
+    family: MenuFamily,
 }
 
 impl Part<MenuCheckboxItemProps> {
@@ -512,17 +600,24 @@ impl Part<MenuCheckboxItemProps> {
 
 /// A checkbox item on `root` (its label already in it); picking it asks for
 /// the other value and closes the menu, unless its `on_select` keeps it open.
-pub(crate) fn menu_checkbox_item(root: Div, label: &str, disabled: bool) -> Part<MenuCheckboxItemProps> {
+#[track_caller]
+pub(crate) fn menu_checkbox_item(
+    root: Div,
+    label: &str,
+    disabled: bool,
+    family: MenuFamily,
+) -> Part<MenuCheckboxItemProps> {
     let props = MenuCheckboxItemProps {
         label: label.to_owned(),
         disabled,
         checked: Bind::default(),
         on_select: None,
+        family,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let level = menu_level();
+            let level = menu_level(props, props.with_untracked(|p| p.props.family), MenuKind::CheckboxItem);
             let checked = use_model(props, |p| &p.props.checked);
             let focus = FocusHandle::new();
             let on_select = cx.event_opt(|p| p.props.on_select.as_ref());
@@ -604,6 +699,7 @@ pub struct MenuRadioItemProps {
     value: String,
     disabled: bool,
     on_select: Option<Callback<SelectEvent>>,
+    family: MenuFamily,
 }
 
 impl Part<MenuRadioItemProps> {
@@ -618,18 +714,31 @@ impl Part<MenuRadioItemProps> {
 }
 
 /// A radio item on `root` (its label already in it), setting its group to `value`.
-pub(crate) fn menu_radio_item(root: Div, label: &str, value: &str, disabled: bool) -> Part<MenuRadioItemProps> {
+#[track_caller]
+pub(crate) fn menu_radio_item(
+    root: Div,
+    label: &str,
+    value: &str,
+    disabled: bool,
+    family: MenuFamily,
+) -> Part<MenuRadioItemProps> {
     let props = MenuRadioItemProps {
         label: label.to_owned(),
         value: value.to_owned(),
         disabled,
         on_select: None,
+        family,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let level = menu_level();
-            let group = use_context::<MenuRadio>();
+            let family = props.with_untracked(|p| p.props.family);
+            let level = menu_level(props, family, MenuKind::RadioItem);
+            let group = part_root::<_, MenuRadio>(
+                props,
+                family.part(MenuKind::RadioItem),
+                family.part(MenuKind::RadioGroup),
+            );
             let focus = FocusHandle::new();
             let on_select = cx.event_opt(|p| p.props.on_select.as_ref());
             move || {
@@ -669,11 +778,16 @@ pub(crate) fn menu_radio_item(root: Div, label: &str, value: &str, disabled: boo
 
 /// A submenu on `root`, a level of its own under the nearest one: it holds
 /// its sub trigger and its sub content.
-pub(crate) fn menu_sub(root: Div) -> Part<MenuRootProps> {
-    Part::new(MenuRootProps::default(), root, |p| {
+#[track_caller]
+pub(crate) fn menu_sub(root: Div, family: MenuFamily) -> Part<MenuRootProps> {
+    let props = MenuRootProps {
+        family,
+        ..MenuRootProps::default()
+    };
+    Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            if let Some(parent) = menu_level() {
+            if let Some(parent) = menu_level(props, props.with_untracked(|p| p.props.family), MenuKind::Sub) {
                 provide(parent.submenu(use_model(props, |p| p.props.open_bind())));
             }
             move || props.with(|p| p.slot.0.clone()).into_element()
@@ -686,20 +800,28 @@ pub(crate) fn menu_sub(root: Div) -> Part<MenuRootProps> {
 pub struct MenuSubTriggerProps {
     label: String,
     item: MenuItem,
+    family: MenuFamily,
 }
 
 /// A submenu's row on `root` (label and chevron already in it), in its
 /// parent level: lit while focused or open (`focus:bg-accent
 /// data-open:bg-accent`).
-pub(crate) fn menu_sub_trigger(root: Div, label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
+#[track_caller]
+pub(crate) fn menu_sub_trigger(
+    root: Div,
+    label: &str,
+    item: MenuItem,
+    family: MenuFamily,
+) -> Part<MenuSubTriggerProps> {
     let props = MenuSubTriggerProps {
         label: label.to_owned(),
         item,
+        family,
     };
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let sub = menu_level();
+            let sub = menu_level(props, props.with_untracked(|p| p.props.family), MenuKind::SubTrigger);
             move || {
                 let (label, item, root) = props.with(|p| (p.props.label.clone(), p.props.item, p.slot.0.clone()));
                 let Some(sub) = sub else {
@@ -739,11 +861,12 @@ pub fn dropdown_menu() -> Part<MenuRootProps> {
 /// Give `trigger` its children first: a [`Button`](crate::Button) decides
 /// its padding from them as it becomes the box.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into().named("dropdown-menu-trigger"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let menu = use_context::<DropdownMenu>();
+            let menu = part_root::<_, DropdownMenu>(props, "dropdown_menu_trigger", "dropdown_menu");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match menu {
@@ -761,6 +884,7 @@ pub fn dropdown_menu_trigger(trigger: impl Into<Div>) -> Part<()> {
 /// told otherwise, no taller than the room there. Add groups, items, labels
 /// and separators with `.child`.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
@@ -778,6 +902,7 @@ pub fn dropdown_menu_content() -> Part<MenuContentProps> {
             offset: 4.0,
             fit_height: true,
         },
+        MenuFamily::Dropdown,
     )
 }
 
@@ -799,14 +924,21 @@ pub fn dropdown_menu_radio_group() -> Part<MenuRadioGroupProps> {
 /// take `text-muted-foreground` from the caller, as shadcn's `[&_svg]` rule
 /// gives them.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_item(id: &str, item: MenuItem) -> Part<MenuItemProps> {
     let t = theme();
-    menu_item(menu_row_base(&t, item).named("dropdown-menu-item"), id, item)
+    menu_item(
+        menu_row_base(&t, item).named("dropdown-menu-item"),
+        id,
+        item,
+        MenuFamily::Dropdown,
+    )
 }
 
 /// A checkbox item labelled `label`, its own (`default_checked`) or bound to
 /// the caller's (`model`, `v-model`); picking it toggles.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheckboxItemProps> {
     let t = theme();
     let item = MenuItem {
@@ -821,11 +953,13 @@ pub fn dropdown_menu_checkbox_item(label: &str, disabled: bool) -> Part<MenuChec
             .child(label.to_owned()),
         label,
         disabled,
+        MenuFamily::Dropdown,
     )
 }
 
 /// A radio item setting its group's value to `value`.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_radio_item(label: &str, value: &str, disabled: bool) -> Part<MenuRadioItemProps> {
     let t = theme();
     let item = MenuItem {
@@ -841,6 +975,7 @@ pub fn dropdown_menu_radio_item(label: &str, value: &str, disabled: bool) -> Par
         label,
         value,
         disabled,
+        MenuFamily::Dropdown,
     )
 }
 
@@ -871,13 +1006,15 @@ pub fn dropdown_menu_shortcut(keys: &str) -> Text {
 /// A submenu (`DropdownMenuSub`): give it a [`dropdown_menu_sub_trigger`]
 /// and a [`dropdown_menu_sub_content`].
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_sub() -> Part<MenuRootProps> {
-    menu_sub(div().named("dropdown-menu-sub"))
+    menu_sub(div().named("dropdown-menu-sub"), MenuFamily::Dropdown)
 }
 
 /// The row opening its submenu, whose content opens on the inline end. Its
 /// chevron is muted, as the item's `[&_svg]` rule makes it.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
     let t = theme();
     menu_sub_trigger(
@@ -891,11 +1028,13 @@ pub fn dropdown_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTri
             ),
         label,
         item,
+        MenuFamily::Dropdown,
     )
 }
 
 /// A submenu's panel: as the content, with `shadow-lg` and `overflow-hidden`.
 #[must_use]
+#[track_caller]
 pub fn dropdown_menu_sub_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
@@ -907,5 +1046,6 @@ pub fn dropdown_menu_sub_content() -> Part<MenuContentProps> {
             Origin::Anchor,
         ),
         MenuPlace::Beside,
+        MenuFamily::Dropdown,
     )
 }

@@ -13,10 +13,10 @@
 use std::time::Duration;
 
 use gui::prelude::*;
-use gui::{Callback, component, div, image, provide, use_context};
+use gui::{Callback, component, div, image, provide};
 use primitives::avatar::{Avatar, Fallback, ImageLoad, Status};
 
-use crate::part::Part;
+use crate::part::{Part, part_root};
 use crate::theme::theme;
 
 /// What the parts below [`avatar`] read: its primitive.
@@ -54,6 +54,7 @@ pub struct AvatarImageProps {
 /// source (`Some(&source)`) or none converts; a load on its way is
 /// [`ImageLoad::Pending`].
 #[must_use]
+#[track_caller]
 pub fn avatar_image(load: impl Into<ImageLoad>) -> Part<AvatarImageProps> {
     let props = AvatarImageProps {
         load: load.into(),
@@ -63,7 +64,9 @@ pub fn avatar_image(load: impl Into<ImageLoad>) -> Part<AvatarImageProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let part = use_context::<AvatarContext>().map(|AvatarContext(avatar)| {
+            // Outside an avatar (reported) the picture shows if it is decoded:
+            // its look, without the status the avatar keeps.
+            let part = part_root::<_, AvatarContext>(props, "avatar_image", "avatar").map(|AvatarContext(avatar)| {
                 avatar.image(
                     move || props.with(|p| p.props.load.clone()),
                     move |status| {
@@ -107,6 +110,7 @@ pub struct AvatarFallbackProps {
 
 /// The `initials`, shown while the picture is not.
 #[must_use]
+#[track_caller]
 pub fn avatar_fallback(initials: impl Into<String>) -> Part<AvatarFallbackProps> {
     let t = theme();
     let root = div()
@@ -121,7 +125,9 @@ pub fn avatar_fallback(initials: impl Into<String>) -> Part<AvatarFallbackProps>
     Part::new(AvatarFallbackProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let avatar = use_context::<AvatarContext>().map(|AvatarContext(a)| a);
+            // Outside an avatar (reported) the fallback shows after its delay:
+            // its look, without the avatar's picture status.
+            let avatar = part_root::<_, AvatarContext>(props, "avatar_fallback", "avatar").map(|AvatarContext(a)| a);
             let fallback = Fallback::new(props.with_untracked(|p| p.props.delay), move || {
                 avatar.map_or(Status::Idle, Avatar::status)
             });

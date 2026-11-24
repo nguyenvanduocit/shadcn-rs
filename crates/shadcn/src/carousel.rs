@@ -21,15 +21,13 @@ use std::time::Duration;
 
 use gui::prelude::*;
 use gui::style::Calc;
-use gui::{
-    Bind, ComponentElement, Div, Easing, Icon, Length, Model, component, div, icon, provide, use_context, use_model,
-};
+use gui::{Bind, ComponentElement, Div, Easing, Icon, Length, Model, component, div, icon, provide, use_model};
 use primitives::Availability;
 use primitives::carousel::{Carousel, CarouselOptions, Motion, Pace, Rotation};
 use primitives::direction::use_direction;
 
 use crate::button::{ButtonSize, ButtonVariant, button};
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 use crate::separator::Orientation;
 
 /// How long a move to the next slide takes.
@@ -73,8 +71,8 @@ pub fn carousel_snaps(count: usize, basis: f32) -> usize {
 struct CarouselContext(Carousel<PartProps<CarouselProps>>);
 
 impl CarouselContext {
-    fn find() -> Option<Self> {
-        use_context::<Self>()
+    fn find<P: 'static>(props: gui::Signal<PartProps<P>>, part: &'static str) -> Option<Self> {
+        part_root(props, part, "carousel")
     }
 }
 
@@ -173,11 +171,12 @@ impl Part<CarouselProps> {
 /// The viewport and its track; style the track here (where shadcn's
 /// `CarouselContent` puts its class) and put its [`carousel_item`]s in.
 #[must_use]
+#[track_caller]
 pub fn carousel_content() -> Part<()> {
     Part::new((), div().named("carousel-track").display(Display::Flex), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = CarouselContext::find();
+            let ctx = CarouselContext::find(props, "carousel_content");
             move || {
                 let mut track = props.with(|p| p.slot.0.clone()).into_element();
                 let items = track.children_mut().map(std::mem::take).unwrap_or_default();
@@ -242,12 +241,13 @@ pub fn carousel_content() -> Part<()> {
 
 /// One slide, the carousel's basis of the track.
 #[must_use]
+#[track_caller]
 pub fn carousel_item() -> Part<()> {
     let root = div().named("carousel-item").min_width(0.0).flex_shrink(0.0);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = CarouselContext::find();
+            let ctx = CarouselContext::find(props, "carousel_item");
             let key = ctx.map(|CarouselContext(c)| c.slide_key());
             move || {
                 let mut item = props.with(|p| p.slot.0.clone());
@@ -292,24 +292,31 @@ fn arrow(orientation: Orientation, enabled: bool, glyph: Icon) -> Div {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CarouselArrowProps {
     next: bool,
+    /// Where the caller's code made it (a report of a missing carousel names it).
+    at: &'static std::panic::Location<'static>,
 }
 
 /// The button before the slides; disabled on the first snap.
 #[must_use]
+#[track_caller]
 pub fn carousel_previous() -> ComponentElement {
     carousel_arrow(false)
 }
 
 /// The button after the slides; disabled on the last snap.
 #[must_use]
+#[track_caller]
 pub fn carousel_next() -> ComponentElement {
     carousel_arrow(true)
 }
 
+#[track_caller]
 fn carousel_arrow(next: bool) -> ComponentElement {
-    component(CarouselArrowProps { next }, |cx| {
+    let at = std::panic::Location::caller();
+    component(CarouselArrowProps { next, at }, |cx| {
         let props = cx.props();
-        let ctx = CarouselContext::find();
+        let (part, at) = props.with_untracked(|p| (if p.next { "carousel_next" } else { "carousel_previous" }, p.at));
+        let ctx = primitives::context::use_root_at::<CarouselContext>(part, "carousel", at);
         move || {
             let next = props.with(|p| p.next);
             let Some(CarouselContext(carousel)) = ctx else {

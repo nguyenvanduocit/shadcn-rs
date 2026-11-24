@@ -139,6 +139,7 @@ pub fn trace_collapsible() -> Part<CollapsibleProps> {
 /// The step's `line` and a chevron that turns down while open; pressing it
 /// opens and closes the step. Red when the line's step failed (`failed`).
 #[must_use]
+#[track_caller]
 pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<()> {
     let t = theme();
     let control = div()
@@ -163,7 +164,7 @@ pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<(
     Part::new((), control, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = CollapsibleContext::find();
+            let ctx = CollapsibleContext::find(props, "trace_collapsible_trigger");
             move || {
                 let control = props.with(|p| p.slot.0.clone());
                 let Some(ctx) = ctx else {
@@ -187,6 +188,7 @@ pub fn trace_collapsible_trigger(failed: bool, line: impl IntoElement) -> Part<(
 /// goes in fills the ruled box; the box around it rolls down from no height
 /// as it opens and back up as it closes, 200ms (`animate-collapsible-*`).
 #[must_use]
+#[track_caller]
 pub fn trace_collapsible_content() -> Part<()> {
     let t = theme();
     let ruled = div()
@@ -204,8 +206,10 @@ pub fn trace_collapsible_content() -> Part<()> {
     Part::new((), ruled, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = CollapsibleContext::find();
+            let ctx = CollapsibleContext::find(props, "trace_collapsible_content");
             move || {
+                // Outside a collapsible (reported): its box, shown, as
+                // `collapsible_content` does: the look without the behaviour.
                 if !ctx.as_ref().is_none_or(CollapsibleContext::is_open) {
                     return Element::Empty;
                 }

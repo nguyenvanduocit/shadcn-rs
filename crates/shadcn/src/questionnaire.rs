@@ -16,14 +16,18 @@ use gui::prelude::*;
 use gui::style::Align;
 use gui::{
     Bind, Callback, ComponentElement, Div, Element, FocusHandle, Icon, KeyEvent, Model, NamedKey, Signal, Text,
-    TextField, UseModel, component, div, icon, provide, text, use_context, use_model,
+    TextField, UseModel, component, div, icon, provide, text, use_model,
 };
 use gui::{Color, Properties};
 
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::focus::{StateLook, destructive_ring};
 use crate::input::input;
-use crate::part::{Part, PartProps};
+use std::panic::Location;
+
+use primitives::context::use_root_at;
+
+use crate::part::{Part, PartProps, part_at};
 use crate::theme::theme;
 
 /// Which keys pick a choice.
@@ -643,8 +647,16 @@ impl Questionnaire {
 }
 
 /// The questionnaire around a part (Vue's `injectQuestionnaireContext`).
-fn use_questionnaire() -> Option<Questionnaire> {
-    use_context::<Questionnaire>()
+/// Called from the setup of the part `part`, made at `at` in the caller's
+/// code: outside a `questionnaire` it is a reported error and `None`.
+fn use_questionnaire(part: &'static str, at: &'static Location<'static>) -> Option<Questionnaire> {
+    use_root_at::<Questionnaire>(part, "questionnaire", at)
+}
+
+/// The question the part `part`, made at `at`, sits in: outside a
+/// `questionnaire_item` it is a reported error and `None`.
+fn use_item(part: &'static str, at: &'static Location<'static>) -> Option<ItemContext> {
+    use_root_at::<ItemContext>(part, "questionnaire_item", at)
 }
 
 /// The question a part sits in (Vue's item context): its name.
@@ -781,6 +793,7 @@ impl<S: 'static> PartialEq for QuestionnaireView<S> {
 
 /// "Question 2 of 3".
 #[must_use]
+#[track_caller]
 pub fn questionnaire_progress() -> Part<QuestionnaireView<QuestionnaireProgressState>> {
     questionnaire_progress_with(|s| text(format!("Question {} of {}", s.current, s.total)).into_element())
 }
@@ -788,6 +801,7 @@ pub fn questionnaire_progress() -> Part<QuestionnaireView<QuestionnaireProgressS
 /// The progress box around what `content` makes of the questionnaire's
 /// place (Vue's progress slot, with its `current` and `total`).
 #[must_use]
+#[track_caller]
 pub fn questionnaire_progress_with(
     content: impl Fn(QuestionnaireProgressState) -> Element + 'static,
 ) -> Part<QuestionnaireView<QuestionnaireProgressState>> {
@@ -804,7 +818,7 @@ pub fn questionnaire_progress_with(
     Part::new(QuestionnaireView(Rc::new(content)), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let q = use_questionnaire();
+            let q = use_questionnaire("questionnaire_progress", part_at(props));
             move || {
                 let state = q
                     .as_ref()
@@ -831,6 +845,7 @@ pub struct QuestionnaireItemProps {
 /// One question, shown while it is the open one (Vue hides the rest). Fill
 /// it with title, description, choices and error: they belong to it.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_item(name: &str) -> Part<QuestionnaireItemProps> {
     let root = div()
         .named("questionnaire-item")
@@ -843,7 +858,7 @@ pub fn questionnaire_item(name: &str) -> Part<QuestionnaireItemProps> {
             let props = cx.props();
             let name = props.with_untracked(|p| p.props.name.clone());
             provide(ItemContext(name));
-            let q = use_questionnaire();
+            let q = use_questionnaire("questionnaire_item", part_at(props));
             move || {
                 props.with(|p| {
                     let shown = q.as_ref().is_some_and(|q| {
@@ -902,6 +917,8 @@ pub struct QuestionnaireChoiceProps {
     value: String,
     label: Element,
     description: Option<String>,
+    /// Where the caller's code made it (a report of a missing root names it).
+    at: &'static Location<'static>,
 }
 
 impl PartialEq for QuestionnaireChoiceProps {
@@ -914,16 +931,19 @@ impl PartialEq for QuestionnaireChoiceProps {
 /// checkbox), its `label` with an optional muted second line, and its
 /// shortcut key.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_choice(value: &str, label: impl IntoElement, description: Option<&str>) -> ComponentElement {
     let props = QuestionnaireChoiceProps {
         value: value.to_owned(),
         label: label.into_element(),
         description: description.map(str::to_owned),
+        at: Location::caller(),
     };
     component(props, |cx| {
         let props = cx.props();
-        let q = use_questionnaire();
-        let item = use_context::<ItemContext>();
+        let at = props.with_untracked(|p| p.at);
+        let q = use_questionnaire("questionnaire_choice", at);
+        let item = use_item("questionnaire_choice", at);
         move || {
             let (Some(q), Some(ItemContext(name))) = (&q, &item) else {
                 return Element::Empty;
@@ -1079,16 +1099,22 @@ fn choice_description(description: &str) -> Text {
 }
 
 /// What [`questionnaire_input`] is given.
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct QuestionnaireInputProps {
     placeholder: Option<String>,
+    /// Where the caller's code made it (a report of a missing root names it).
+    at: &'static Location<'static>,
 }
 
 /// The text box for an answer of one's own, after the choices of an item
 /// declared [`QuestionnaireItem::with_input`].
 #[must_use]
+#[track_caller]
 pub fn questionnaire_input() -> QuestionnaireInput {
-    QuestionnaireInput(QuestionnaireInputProps::default())
+    QuestionnaireInput(QuestionnaireInputProps {
+        placeholder: None,
+        at: Location::caller(),
+    })
 }
 
 /// A [`questionnaire_input`] being built.
@@ -1106,8 +1132,9 @@ impl IntoElement for QuestionnaireInput {
     fn into_element(self) -> Element {
         component(self.0, |cx| {
             let props = cx.props();
-            let q = use_questionnaire();
-            let item = use_context::<ItemContext>();
+            let at = props.with_untracked(|p| p.at);
+            let q = use_questionnaire("questionnaire_input", at);
+            let item = use_item("questionnaire_input", at);
             move || {
                 let t = theme();
                 let (Some(q), Some(ItemContext(name))) = (&q, &item) else {
@@ -1145,22 +1172,26 @@ impl IntoElement for QuestionnaireInput {
 
 /// What is missing, shown once moving on was tried without an answer.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_error() -> ComponentElement {
-    error_part(None)
+    error_part("questionnaire_error", None, Location::caller())
 }
 
 /// The error with a message of one's own (Vue's error slot), shown while
 /// the question is invalid; an empty message keeps an empty line.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_error_with(message: impl Into<String>) -> ComponentElement {
-    error_part(Some(message.into()))
+    error_part("questionnaire_error_with", Some(message.into()), Location::caller())
 }
 
-fn error_part(message: Option<String>) -> ComponentElement {
-    component(message, |cx| {
-        let message = cx.props();
-        let q = use_questionnaire();
-        let item = use_context::<ItemContext>();
+/// The error part, made by the public constructor `part`.
+fn error_part(part: &'static str, message: Option<String>, at: &'static Location<'static>) -> ComponentElement {
+    component((part, message, at), |cx| {
+        let props = cx.props();
+        let (part, at) = props.with_untracked(|p| (p.0, p.2));
+        let q = use_questionnaire(part, at);
+        let item = use_item(part, at);
         move || {
             let (Some(q), Some(ItemContext(name))) = (&q, &item) else {
                 return Element::Empty;
@@ -1172,7 +1203,7 @@ fn error_part(message: Option<String>) -> ComponentElement {
                 return Element::Empty;
             }
             let required = q.items.get(i).is_some_and(|it| it.required);
-            let message = message.get().unwrap_or_else(|| {
+            let message = props.with(|p| p.1.clone()).unwrap_or_else(|| {
                 if required {
                     "Choose an answer to continue."
                 } else {
@@ -1212,6 +1243,18 @@ enum Nav {
     Submit,
 }
 
+impl Nav {
+    /// The public part that makes it.
+    fn part(self) -> &'static str {
+        match self {
+            Self::Previous => "questionnaire_previous",
+            Self::Skip => "questionnaire_skip",
+            Self::Next => "questionnaire_next",
+            Self::Submit => "questionnaire_submit",
+        }
+    }
+}
+
 /// When a navigation button is disabled: from the open question's status
 /// (the buttons' slot `status`).
 type DisabledWhen = gui::Derive<Option<QuestionnaireStatus>, bool>;
@@ -1223,6 +1266,8 @@ pub struct QuestionnaireNavProps {
     label: String,
     variant: ButtonVariant,
     disabled_when: Option<DisabledWhen>,
+    /// Where the caller's code made it (a report of a missing root names it).
+    at: &'static Location<'static>,
 }
 
 impl PartialEq for QuestionnaireNavProps {
@@ -1237,12 +1282,14 @@ impl PartialEq for QuestionnaireNavProps {
 pub struct QuestionnaireNav(QuestionnaireNavProps);
 
 impl QuestionnaireNav {
+    #[track_caller]
     fn new(nav: Nav, label: &str) -> Self {
         Self(QuestionnaireNavProps {
             nav,
             label: label.to_owned(),
             variant: ButtonVariant::Default,
             disabled_when: None,
+            at: Location::caller(),
         })
     }
 
@@ -1266,7 +1313,7 @@ impl IntoElement for QuestionnaireNav {
     fn into_element(self) -> Element {
         component(self.0, |cx| {
             let props = cx.props();
-            let q = use_questionnaire();
+            let q = use_questionnaire(props.with_untracked(|p| p.nav).part(), props.with_untracked(|p| p.at));
             move || {
                 let Some(q) = q.clone() else {
                     return Element::Empty;
@@ -1325,24 +1372,28 @@ fn nav_button(q: Questionnaire, p: &QuestionnaireNavProps) -> Option<Div> {
 
 /// Back one question; hidden on the first.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_previous(label: &str) -> QuestionnaireNav {
     QuestionnaireNav::new(Nav::Previous, label)
 }
 
 /// Skip this question; shown only on optional questions.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_skip(label: &str) -> QuestionnaireNav {
     QuestionnaireNav::new(Nav::Skip, label)
 }
 
 /// On to the next question; hidden on the last.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_next(label: &str) -> QuestionnaireNav {
     QuestionnaireNav::new(Nav::Next, label)
 }
 
 /// Submit every answer; shown only on the last question.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_submit(label: &str) -> QuestionnaireNav {
     QuestionnaireNav::new(Nav::Submit, label)
 }
@@ -1350,11 +1401,12 @@ pub fn questionnaire_submit(label: &str) -> QuestionnaireNav {
 /// `button` as the form's reset (`type="reset"`): back to the default
 /// answers and the opening question, then the questionnaire's `on_reset`.
 #[must_use]
+#[track_caller]
 pub fn questionnaire_reset(button: impl Into<Div>) -> Part<()> {
     Part::new((), button.into(), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let q = use_questionnaire();
+            let q = use_questionnaire("questionnaire_reset", part_at(props));
             move || {
                 let q = q.clone();
                 props

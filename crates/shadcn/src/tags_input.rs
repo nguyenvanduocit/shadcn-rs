@@ -12,7 +12,7 @@ use gui::Properties;
 use gui::prelude::*;
 use gui::{
     Bind, Color, Div, Element, Icon, KeyEvent, Model, Style, TextField, component, div, icon, provide, text,
-    text_input, use_context, use_model,
+    text_input, use_model,
 };
 
 use primitives::Availability;
@@ -21,7 +21,7 @@ pub use primitives::tags_input::Delimiter;
 use primitives::tags_input::{TagsConfig, TagsInput};
 
 use crate::focus::{StateLook, destructive_ring, focus_ring};
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 use crate::theme::theme;
 
 /// What [`tags_input`] is given.
@@ -215,6 +215,7 @@ impl Part<TagsInputProps> {
 /// keyboard selects it, it carries the ring (`data-[state=active]:ring-2
 /// ring-ring ring-offset-2`).
 #[must_use]
+#[track_caller]
 pub fn tags_input_item(tag: impl Into<String>) -> Part<String> {
     let t = theme();
     let root = div()
@@ -228,7 +229,7 @@ pub fn tags_input_item(tag: impl Into<String>) -> Part<String> {
     Part::new(tag.into(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = use_context::<TagsInputContext>();
+            let ctx = part_root::<_, TagsInputContext>(props, "tags_input_item", "tags_input");
             move || {
                 let (tag, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
                 let Some(ctx) = ctx else {
@@ -263,6 +264,7 @@ pub fn tags_input_item_text(tag: impl Into<String>) -> Div {
 
 /// The button that removes `tag`.
 #[must_use]
+#[track_caller]
 pub fn tags_input_item_delete(tag: impl Into<String>) -> Part<String> {
     let root = div()
         .named("tags-input-item-delete")
@@ -276,7 +278,7 @@ pub fn tags_input_item_delete(tag: impl Into<String>) -> Part<String> {
     Part::new(tag.into(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = use_context::<TagsInputContext>();
+            let ctx = part_root::<_, TagsInputContext>(props, "tags_input_item_delete", "tags_input");
             move || {
                 let (tag, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
                 match ctx.and_then(|c| c.index_of(&tag).map(|i| (c, i))) {
@@ -291,10 +293,12 @@ pub fn tags_input_item_delete(tag: impl Into<String>) -> Part<String> {
 
 /// The field new tags are typed into (`TagsInputInput`).
 #[must_use]
+#[track_caller]
 pub fn tags_input_input() -> TagsInputInput {
     TagsInputInput {
         placeholder: String::new(),
         keys: None,
+        at: std::panic::Location::caller(),
     }
 }
 
@@ -306,6 +310,8 @@ type KeyHandler = gui::Callback<KeyEvent, bool>;
 pub struct TagsInputInput {
     placeholder: String,
     keys: Option<KeyHandler>,
+    /// Where the caller's code made it (a report of a missing tags input names it).
+    at: &'static std::panic::Location<'static>,
 }
 
 impl TagsInputInput {
@@ -328,7 +334,11 @@ impl IntoElement for TagsInputInput {
     fn into_element(self) -> Element {
         component(self, |cx| {
             let props = cx.props();
-            let ctx = use_context::<TagsInputContext>();
+            let ctx = primitives::context::use_root_at::<TagsInputContext>(
+                "tags_input_input",
+                "tags_input",
+                props.with_untracked(|p| p.at),
+            );
             // The caller's keys as passed last (a handle: the field keeps
             // its handler while new ones are passed).
             let keys = cx.event_opt(|p: &TagsInputInput| p.keys.as_ref());

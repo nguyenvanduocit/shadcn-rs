@@ -2,6 +2,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::style::Style;
+use crate::value::{Bound, Mounted};
 
 use super::{Marks, need};
 
@@ -116,23 +117,66 @@ pub(super) struct StyleBinding {
     memo: Option<(Rc<Vec<crate::value::Op>>, Style, Style)>,
 }
 
-/// One closure's subscription and the value it last gave.
+/// One bound setter mounted on one node: its tracker, and the mount
+/// ([`Mounted`]) that holds what its closure last gave on this node, typed.
+/// What one node's binding gave is never another's, and a cold build's
+/// (its own tree, its own runs) never the live node's.
 pub(super) struct BoundRun {
     pub(super) node: crate::reactive::RenderNode,
-    slot: Option<Box<dyn std::any::Any>>,
+    /// `None` before its first run, once its write is no longer bound, and
+    /// after its closure panicked (it runs anew at the next resolve).
+    mounted: Option<Box<dyn Mounted>>,
 }
 
 impl BoundRun {
     pub(super) fn new(mark: &crate::reactive::Mark) -> Self {
         Self {
             node: tracker(mark),
-            slot: None,
+            mounted: None,
+        }
+    }
+
+    /// Mount `def` here; whether its closure must run (mounted anew, or
+    /// another closure of the same setter in place of the one that ran).
+    /// A mount of another type is made anew; one of the same keeps its
+    /// cell, so a node built again allocates nothing for it.
+    fn bind(&mut self, def: &Rc<dyn Bound>) -> bool {
+        if let Some(m) = &mut self.mounted {
+            if m.is(def) {
+                return false;
+            }
+            if m.rebind(def) {
+                return true;
+            }
+        }
+        self.mounted = Some(Rc::clone(def).mount());
+        true
+    }
+
+    /// Run its closure under its tracker; whether it gave something else.
+    /// Taken out while it runs: a panic leaves no half-run mount behind.
+    fn eval(&mut self) -> bool {
+        let Some(mut m) = self.mounted.take() else {
+            return false;
+        };
+        let changed = self.node.track(|| m.eval());
+        self.mounted = Some(m);
+        changed
+    }
+
+    /// No longer bound: it reads nothing and keeps no definition alive
+    /// (nor what a closure that panicked read before it did).
+    fn unbind(&mut self) {
+        if self.mounted.take().is_some() || self.node.has_deps() {
+            self.node.track(|| ());
         }
     }
 }
 
 impl Drop for BoundRun {
     fn drop(&mut self) {
+        // Even while unwinding (its closure panicked): a tracker left
+        // subscribed would mark a node gone; disposing is safe then.
         self.node.dispose();
     }
 }
@@ -178,59 +222,66 @@ impl StyleBinding {
             .chain(std::iter::once(self.replay.node))
     }
 
-    /// `base` with `ops` replayed over it: the closures whose reads changed
-    /// (all of them for other writes) run again, alone.
+    /// `base` with `ops` replayed over it: the closures whose reads changed,
+    /// or that are new on this node, run again, alone. A closure that
+    /// gave what it gave before changes nothing: with the writes and
+    /// `base` the same, the style kept stands.
     pub(super) fn get(&mut self, ops: &Rc<Vec<crate::value::Op>>, base: &Style) -> Style {
-        let same_ops = self.memo.as_ref().is_some_and(|(o, ..)| Rc::ptr_eq(o, ops));
-        if !same_ops {
-            // Trackers past the writes, or of a write no longer bound,
-            // keep reading nothing.
-            for (k, run) in self.runs.iter_mut().enumerate() {
-                if let Some(r) = run
-                    && ops.get(k).and_then(crate::value::Op::bound).is_none()
-                {
-                    r.node.track(|| ());
+        // Out while it runs: a closure that panics (a binding's, a
+        // restyle's) leaves none, and the next resolve binds and replays
+        // every write anew rather than trust what it half did.
+        let mut memo = self.memo.take();
+        let same_ops = memo.as_ref().is_some_and(|(o, ..)| Rc::ptr_eq(o, ops));
+        if self.runs.len() < ops.len() {
+            self.runs.resize_with(ops.len(), || None);
+        }
+        let mut changed = !same_ops;
+        for (k, run) in self.runs.iter_mut().enumerate() {
+            match ops.get(k).and_then(crate::value::Op::bound) {
+                Some(def) => {
+                    let run = run.get_or_insert_with(|| BoundRun::new(&self.mark));
+                    // The same writes as last resolved, fully: each run
+                    // holds a mount of its write's definition already.
+                    let fresh = !(same_ops && run.mounted.is_some()) && run.bind(def);
+                    if fresh || run.node.is_marked() {
+                        crate::component::count_binding();
+                        changed |= run.eval();
+                    }
+                }
+                // Past the writes, or of a write no longer bound.
+                None => {
+                    if let Some(run) = run {
+                        run.unbind();
+                    }
                 }
             }
         }
-        let mut ran = false;
-        for (k, op) in ops.iter().enumerate() {
-            let Some(b) = op.bound() else { continue };
-            if self.runs.len() <= k {
-                self.runs.resize_with(k.saturating_add(1), || None);
-            }
-            let Some(slot) = self.runs.get_mut(k) else { continue };
-            let run = slot.get_or_insert_with(|| BoundRun::new(&self.mark));
-            if !same_ops || run.node.is_marked() || run.slot.is_none() {
-                crate::component::count_binding();
-                let held = &mut run.slot;
-                run.node.track(|| b.eval(held));
-                ran = true;
-            }
-        }
-        if !ran
+        if !changed
             && !self.replay.node.is_marked()
-            && let Some((_, b, out)) = &self.memo
-            && same_ops
+            && let Some((_, b, out)) = &memo
             && b == base
         {
-            return out.clone();
+            let out = out.clone();
+            self.memo = memo;
+            return out;
         }
         let runs = &self.runs;
         let out = self.replay.node.track(|| {
             let mut s = base.clone();
             for (k, op) in ops.iter().enumerate() {
-                match (
-                    op.bound(),
-                    runs.get(k).and_then(Option::as_ref).and_then(|r| r.slot.as_deref()),
-                ) {
-                    (Some(b), Some(v)) => b.write(v, &mut s),
-                    _ => op.apply(&mut s),
+                let wrote = op.bound().is_some()
+                    && runs
+                        .get(k)
+                        .and_then(Option::as_ref)
+                        .and_then(|r| r.mounted.as_deref())
+                        .is_some_and(|m| m.write(&mut s));
+                if !wrote {
+                    op.apply(&mut s);
                 }
             }
             s
         });
-        match &mut self.memo {
+        match &mut memo {
             Some((o, b, v)) => {
                 if !Rc::ptr_eq(o, ops) {
                     *o = Rc::clone(ops);
@@ -238,8 +289,9 @@ impl StyleBinding {
                 b.clone_from(base);
                 v.clone_from(&out);
             }
-            None => self.memo = Some((Rc::clone(ops), base.clone(), out.clone())),
+            None => memo = Some((Rc::clone(ops), base.clone(), out.clone())),
         }
+        self.memo = memo;
         out
     }
 }

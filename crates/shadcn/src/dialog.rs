@@ -77,7 +77,7 @@ impl Modal {
     /// The nearest modal root's, from a part's setup; outside one it is a
     /// reported error naming `part`.
     #[track_caller]
-    pub(crate) fn find(part: &str) -> Option<Self> {
+    pub(crate) fn find(part: &'static str) -> Option<Self> {
         use_root::<Self>(part, "dialog")
     }
 

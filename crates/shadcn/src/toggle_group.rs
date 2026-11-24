@@ -13,8 +13,7 @@ use std::rc::Rc;
 use gui::Color;
 use gui::prelude::*;
 use gui::{
-    Bind, Callback, Div, Element, FocusHandle, Model, Signal, Slot, UseModel, component, div, provide, use_context,
-    use_model,
+    Bind, Callback, Div, Element, FocusHandle, Model, Signal, Slot, UseModel, component, div, provide, use_model,
 };
 pub use primitives::toggle_group::Pressing;
 use primitives::toggle_group::ToggleGroup;
@@ -211,6 +210,7 @@ impl<M: ToggleGroupModel> Part<ToggleGroupProps<M>> {
 /// The item `value` of the group around it; add its icon or label with
 /// `.child`.
 #[must_use]
+#[track_caller]
 pub fn toggle_group_item(value: impl Into<String>) -> ToggleGroupItem {
     ToggleGroupItem {
         value: value.into(),
@@ -218,6 +218,7 @@ pub fn toggle_group_item(value: impl Into<String>) -> ToggleGroupItem {
         children: Slot(Vec::new()),
         class: None,
         on_click: None,
+        at: std::panic::Location::caller(),
     }
 }
 
@@ -229,6 +230,8 @@ pub struct ToggleGroupItem {
     children: Slot<Vec<Element>>,
     class: Option<Class>,
     on_click: Option<Callback<()>>,
+    /// Where the caller's code made it (a report of a missing group names it).
+    at: &'static std::panic::Location<'static>,
 }
 
 impl ToggleGroupItem {
@@ -263,7 +266,11 @@ impl IntoElement for ToggleGroupItem {
     fn into_element(self) -> Element {
         component(self, |cx| {
             let props = cx.props();
-            let group = use_context::<ToggleGroupContext>();
+            let group = primitives::context::use_root_at::<ToggleGroupContext>(
+                "toggle_group_item",
+                "toggle_group",
+                props.with_untracked(|p| p.at),
+            );
             let focus = FocusHandle::new();
             // The `on_click` passed last, after each press.
             let on_click = cx.event_opt(|p| p.on_click.as_ref());

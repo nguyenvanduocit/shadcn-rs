@@ -23,7 +23,7 @@ use primitives::Availability;
 use primitives::navigation_menu::{Motion, NavOptions, NavigationMenu, NavigationMenuItem};
 
 use crate::focus::StateLook;
-use crate::part::Part;
+use crate::part::{Part, part_root};
 use crate::theme::{Colors, theme};
 
 /// How far a panel slides in when the pointer moves to it from another
@@ -130,6 +130,7 @@ pub struct NavigationMenuItemProps {
 /// against. Give it a [`navigation_menu_trigger`] and a
 /// [`navigation_menu_content`], or a link.
 #[must_use]
+#[track_caller]
 pub fn navigation_menu_item(value: &str) -> Part<NavigationMenuItemProps> {
     let props = NavigationMenuItemProps {
         value: value.to_owned(),
@@ -140,11 +141,12 @@ pub fn navigation_menu_item(value: &str) -> Part<NavigationMenuItemProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let item = use_context::<NavigationMenu>().map(|nav| {
-                    let item = NavigationMenuItem::new(nav, props.with_untracked(|p| p.props.value.clone()));
-                    provide(item);
-                    item
-                });
+                let item =
+                    part_root::<_, NavigationMenu>(props, "navigation_menu_item", "navigation_menu").map(|nav| {
+                        let item = NavigationMenuItem::new(nav, props.with_untracked(|p| p.props.value.clone()));
+                        provide(item);
+                        item
+                    });
                 move || {
                     let root = props.with(|p| p.slot.0.clone());
                     match item {
@@ -201,6 +203,7 @@ fn lit(mut d: Div, i: Interaction, t: &Colors, ring: Ring) -> Div {
 /// The item's trigger, labelled `label`, with a chevron turning over while
 /// its panel is open.
 #[must_use]
+#[track_caller]
 pub fn navigation_menu_trigger(label: &str) -> Part<()> {
     let root = div()
         .named("navigation-menu-trigger")
@@ -209,7 +212,7 @@ pub fn navigation_menu_trigger(label: &str) -> Part<()> {
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let item = use_context::<NavigationMenuItem>();
+            let item = part_root::<_, NavigationMenuItem>(props, "navigation_menu_trigger", "navigation_menu_item");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 let Some(item) = item else {
@@ -336,12 +339,13 @@ fn viewport_part(nav: NavigationMenu, panels: Panels) -> Element {
 /// below the item while it is open, or in the menu's viewport; add its
 /// links with `.child`.
 #[must_use]
+#[track_caller]
 pub fn navigation_menu_content() -> Part<()> {
     let root = div().named("navigation-menu-content").padding(8.0).padding_right(10.0);
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let item = use_context::<NavigationMenuItem>();
+            let item = part_root::<_, NavigationMenuItem>(props, "navigation_menu_content", "navigation_menu_item");
             if let Some(i) = item {
                 provide(Panel(i));
                 // A viewport draws it from its slot.

@@ -8,13 +8,13 @@
 //! [`context_menu_trigger`] area and the [`context_menu_content`].
 
 use gui::prelude::*;
-use gui::{Div, Icon, Text, component, div, icon, provide, use_context, use_model};
+use gui::{Div, Icon, Text, component, div, icon, provide, use_model};
 
 use primitives::Availability;
 use primitives::context_menu::ContextMenu;
 
 use crate::dropdown_menu::{
-    MenuCheckboxItemProps, MenuContentProps, MenuItem, MenuItemProps, MenuPlace, MenuRadioGroupProps,
+    MenuCheckboxItemProps, MenuContentProps, MenuFamily, MenuItem, MenuItemProps, MenuPlace, MenuRadioGroupProps,
     MenuRadioItemProps, MenuRootProps, MenuSubTriggerProps, menu_box, menu_checkbox_item, menu_content, menu_group,
     menu_item, menu_item_separator, menu_radio_group, menu_radio_item, menu_row_base, menu_shortcut, menu_sub,
     menu_sub_trigger,
@@ -22,7 +22,7 @@ use crate::dropdown_menu::{
 use gui::style::Origin;
 
 use crate::motion::popper;
-use crate::part::Part;
+use crate::part::{Part, part_root};
 use crate::theme::theme;
 
 /// The context menu's root (`ContextMenu`): give it a
@@ -53,11 +53,12 @@ pub fn context_menu() -> Part<MenuRootProps> {
 /// menu in, at the pointer (`ContextMenuTrigger as-child`); a primary press
 /// inside it closes the menu, as it is outside the content.
 #[must_use]
+#[track_caller]
 pub fn context_menu_trigger(area: Div) -> Part<()> {
     Part::new((), area.named("context-menu-trigger"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let menu = use_context::<ContextMenu>();
+            let menu = part_root::<_, ContextMenu>(props, "context_menu_trigger", "context_menu");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match menu {
@@ -73,6 +74,7 @@ pub fn context_menu_trigger(area: Div) -> Part<()> {
 /// The floating panel at the pointer: `bg-popover min-w-[8rem]
 /// overflow-y-auto rounded-md border p-1 shadow-md`; add items with `.child`.
 #[must_use]
+#[track_caller]
 pub fn context_menu_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
@@ -85,6 +87,7 @@ pub fn context_menu_content() -> Part<MenuContentProps> {
             Origin::CENTER,
         ),
         MenuPlace::Pointer,
+        MenuFamily::Context,
     )
 }
 
@@ -103,13 +106,20 @@ pub fn context_menu_radio_group() -> Part<MenuRadioGroupProps> {
 /// An item identified (and typed ahead) by `id`; add its icon, label and
 /// shortcut with `.child`, what picking it does with `.on_select`.
 #[must_use]
+#[track_caller]
 pub fn context_menu_item(id: &str, item: MenuItem) -> Part<MenuItemProps> {
     let t = theme();
-    menu_item(menu_row_base(&t, item).named("context-menu-item"), id, item)
+    menu_item(
+        menu_row_base(&t, item).named("context-menu-item"),
+        id,
+        item,
+        MenuFamily::Context,
+    )
 }
 
 /// A checkbox item labelled `label`; picking it toggles.
 #[must_use]
+#[track_caller]
 pub fn context_menu_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheckboxItemProps> {
     let t = theme();
     let item = MenuItem {
@@ -124,11 +134,13 @@ pub fn context_menu_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheck
             .child(label.to_owned()),
         label,
         disabled,
+        MenuFamily::Context,
     )
 }
 
 /// A radio item setting its group's value to `value`.
 #[must_use]
+#[track_caller]
 pub fn context_menu_radio_item(label: &str, value: &str, disabled: bool) -> Part<MenuRadioItemProps> {
     let t = theme();
     let item = MenuItem {
@@ -144,6 +156,7 @@ pub fn context_menu_radio_item(label: &str, value: &str, disabled: bool) -> Part
         label,
         value,
         disabled,
+        MenuFamily::Context,
     )
 }
 
@@ -176,13 +189,15 @@ pub fn context_menu_shortcut(keys: &str) -> Text {
 /// A submenu (`ContextMenuSub`): give it a [`context_menu_sub_trigger`] and
 /// a [`context_menu_sub_content`].
 #[must_use]
+#[track_caller]
 pub fn context_menu_sub() -> Part<MenuRootProps> {
-    menu_sub(div().named("context-menu-sub"))
+    menu_sub(div().named("context-menu-sub"), MenuFamily::Context)
 }
 
 /// The row opening its submenu (`data-[state=open]:bg-accent`, no gap,
 /// chevron in the text colour); the content opens on the inline end.
 #[must_use]
+#[track_caller]
 pub fn context_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
     let t = theme();
     menu_sub_trigger(
@@ -193,11 +208,13 @@ pub fn context_menu_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTrig
             .child(icon(Icon::ChevronRight).margin_left(Length::Auto)),
         label,
         item,
+        MenuFamily::Context,
     )
 }
 
 /// A submenu's panel: as the content, with `shadow-lg` and `overflow-hidden`.
 #[must_use]
+#[track_caller]
 pub fn context_menu_sub_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
@@ -209,5 +226,6 @@ pub fn context_menu_sub_content() -> Part<MenuContentProps> {
             Origin::CENTER,
         ),
         MenuPlace::Beside,
+        MenuFamily::Context,
     )
 }

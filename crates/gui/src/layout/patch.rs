@@ -1013,7 +1013,12 @@ impl LayoutTree {
                     .get_or_insert_with(|| Box::new(StyleBinding::new(&self.marks, u)))
                     .get(ops, base)
             }
-            None => common.style.clone(),
+            // Nothing bound any more: its trackers go, so what its old
+            // closures read resolves nothing (as a span's do).
+            None => {
+                ex.style_binding = None;
+                common.style.clone()
+            }
         };
         (style, focused)
     }

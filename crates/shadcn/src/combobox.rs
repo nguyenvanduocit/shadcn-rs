@@ -14,11 +14,10 @@ use std::rc::Rc;
 use gui::Color;
 use gui::prelude::*;
 use gui::{
-    Bind, Div, Element, Icon, Model, Positioning, Side, SideAlign, TextField, component, div, icon, provide,
-    use_context, use_model,
+    Bind, Div, Element, Icon, Model, Positioning, Side, SideAlign, TextField, component, div, icon, provide, use_model,
 };
 
-use crate::command::{CommandContext, CommandItem, CommandList, CommandSection, Names, command_input, command_list};
+use crate::command::{CommandContext, CommandItem, CommandList, CommandSection, Names, command_list};
 use gui::style::Origin;
 
 use primitives::combobox::{Combobox, ComboboxConfig};
@@ -26,7 +25,7 @@ use primitives::command::Command;
 use primitives::listbox::{Bound, Options};
 
 use crate::motion::popper;
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 use crate::select::SelectModel;
 use crate::theme::theme;
 
@@ -163,11 +162,12 @@ pub fn combobox<M: SelectModel>() -> Part<ComboboxProps<M>> {
 /// The trigger (usually an outline button): a click, Enter, Space,
 /// ArrowDown or ArrowUp opens the list below it, focus in its search.
 #[must_use]
+#[track_caller]
 pub fn combobox_trigger(trigger: impl Into<Div>) -> Part<()> {
     Part::new((), trigger.into().named("combobox-trigger"), |p| {
         component(p, |cx| {
             let props = cx.props();
-            let combobox = use_context::<ComboboxContext>();
+            let combobox = part_root::<_, ComboboxContext>(props, "combobox_trigger", "combobox");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 let Some(c) = combobox.clone() else {
@@ -206,6 +206,7 @@ impl Part<ComboboxListProps> {
 /// shadow-md`; Escape or a click outside closes it. Add the
 /// [`combobox_input`] and [`combobox_items`] with `.child`.
 #[must_use]
+#[track_caller]
 pub fn combobox_list() -> Part<ComboboxListProps> {
     let t = theme();
     let root = popper(div(), Origin::Anchor)
@@ -241,7 +242,7 @@ pub fn combobox_list() -> Part<ComboboxListProps> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let combobox = use_context::<ComboboxContext>();
+                let combobox = part_root::<_, ComboboxContext>(props, "combobox_list", "combobox");
                 move || {
                     let Some(c) = combobox.clone() else {
                         return Element::Empty;
@@ -270,8 +271,12 @@ pub fn combobox_list() -> Part<ComboboxListProps> {
 
 /// The search box, as a command's.
 #[must_use]
+#[track_caller]
 pub fn combobox_input(placeholder: &str) -> Part<String> {
-    command_input(placeholder).map_root(|d| d.named("combobox-input"))
+    crate::command::input_part(placeholder, |p| {
+        crate::command::input_setup(p, "combobox_input", "combobox")
+    })
+    .map_root(|d| d.named("combobox-input"))
 }
 
 const COMBOBOX_NAMES: Names = Names {
@@ -290,16 +295,20 @@ const COMBOBOX_NAMES: Names = Names {
 /// [`CommandItem::null`] one (a "Create …" row) clears the choice and closes
 /// it. Only the rows in view are built; `.footer(…)` adds sections below the
 /// viewport, always in view.
+#[track_caller]
 pub fn combobox_items(
     sections: impl Into<std::sync::Arc<Vec<CommandSection>>>,
     row: impl Fn(&CommandItem, Div) -> Div + 'static,
 ) -> CommandList {
-    command_list(sections, row).names(COMBOBOX_NAMES)
+    command_list(sections, row)
+        .names(COMBOBOX_NAMES)
+        .reported_as("combobox_items", "combobox")
 }
 
 /// `ml-auto`: a check, muted as the item's `[&_svg]` rule makes it, while
 /// `value` is chosen.
 #[must_use]
+#[track_caller]
 pub fn combobox_item_indicator(value: &str) -> Part<String> {
     let root = div()
         .named("combobox-item-indicator")
@@ -308,7 +317,7 @@ pub fn combobox_item_indicator(value: &str) -> Part<String> {
     Part::new(value.to_owned(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let combobox = use_context::<ComboboxContext>();
+            let combobox = part_root::<_, ComboboxContext>(props, "combobox_item_indicator", "combobox");
             move || {
                 let (value, root) = props.with(|p| (p.props.clone(), p.slot.0.clone()));
                 if !combobox.as_ref().is_some_and(|c| c.combobox.holds(&value)) {

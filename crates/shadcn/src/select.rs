@@ -34,7 +34,7 @@ use primitives::listbox::{Bound, Choice};
 use primitives::select::Select;
 
 use crate::dropdown_menu::{MenuItem, menu_row, menu_separator};
-use crate::part::{Part, PartProps};
+use crate::part::{Part, PartProps, part_root};
 use gui::style::Origin;
 
 use crate::focus::StateLook;
@@ -319,9 +319,11 @@ pub enum SelectSize {
 /// `<SelectValue placeholder>`: the chosen items' labels, joined by `, `, or
 /// `placeholder`.
 #[must_use]
+#[track_caller]
 pub fn select_value(placeholder: impl Into<String>) -> SelectValue {
     SelectValue {
         placeholder: placeholder.into(),
+        at: std::panic::Location::caller(),
     }
 }
 
@@ -329,13 +331,19 @@ pub fn select_value(placeholder: impl Into<String>) -> SelectValue {
 #[derive(Clone, Debug, PartialEq)]
 pub struct SelectValue {
     placeholder: String,
+    /// Where the caller's code made it (a report of a missing select names it).
+    at: &'static std::panic::Location<'static>,
 }
 
 impl IntoElement for SelectValue {
     fn into_element(self) -> Element {
         component(self, |cx| {
             let props = cx.props();
-            let select = use_context::<SelectContext>();
+            let select = primitives::context::use_root_at::<SelectContext>(
+                "select_value",
+                "select",
+                props.with_untracked(|p| p.at),
+            );
             move || {
                 let shown = select
                     .as_ref()
@@ -371,6 +379,7 @@ pub struct SelectContentProps {
 /// of sight, as reka keeps them, so the trigger knows their labels; they
 /// are the same instances open and closed.
 #[must_use]
+#[track_caller]
 pub fn select_content() -> Part<SelectContentProps> {
     let t = theme();
     let root = div()
@@ -404,7 +413,7 @@ pub fn select_content() -> Part<SelectContentProps> {
     Part::new(SelectContentProps::default(), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let select = use_context::<SelectContext>();
+            let select = part_root::<_, SelectContext>(props, "select_content", "select");
             provide(props.with_untracked(|p| p.props.position));
             move || {
                 let (position, root) = props.with(|p| (p.props.position, p.slot.0.clone()));
@@ -542,6 +551,7 @@ pub fn select_label(label: &str) -> Part<()> {
 /// `.child`); a chosen one carries a check on the right (`absolute right-2
 /// size-3.5`, muted as the `[&_svg]` rule makes it).
 #[must_use]
+#[track_caller]
 pub fn select_item(value: impl Into<String>, label: impl Into<String>) -> SelectItem {
     SelectItem {
         value: value.into(),
@@ -549,6 +559,7 @@ pub fn select_item(value: impl Into<String>, label: impl Into<String>) -> Select
         disabled: false,
         children: Slot(Vec::new()),
         class: None,
+        at: std::panic::Location::caller(),
     }
 }
 
@@ -560,6 +571,8 @@ pub struct SelectItem {
     disabled: bool,
     children: Slot<Vec<Element>>,
     class: Option<Class>,
+    /// Where the caller's code made it (a report of a missing select names it).
+    at: &'static std::panic::Location<'static>,
 }
 
 impl SelectItem {
@@ -587,7 +600,11 @@ impl IntoElement for SelectItem {
     fn into_element(self) -> Element {
         component(self, |cx| {
             let props = cx.props();
-            let select = use_context::<SelectContext>();
+            let select = primitives::context::use_root_at::<SelectContext>(
+                "select_item",
+                "select",
+                props.with_untracked(|p| p.at),
+            );
             let position = use_context::<SelectPosition>().unwrap_or_default();
             let focus = FocusHandle::new();
             if let Some(s) = select.clone() {

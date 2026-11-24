@@ -19,15 +19,14 @@ use std::sync::Arc;
 use gui::list::virtual_list_in;
 use gui::prelude::*;
 use gui::{
-    Bind, Callback, Div, Icon, Model, Slot, Text, TextField, component, div, icon, provide, text, text_input,
-    use_context, use_model,
+    Bind, Callback, Div, Icon, Model, Slot, Text, TextField, component, div, icon, provide, text, text_input, use_model,
 };
 
 use primitives::command::{Command, CommandList as ListModel, FlatRows, Row, options_of};
 pub use primitives::command::{CommandItem, CommandSection};
 
 use crate::focus::StateLook;
-use crate::part::Part;
+use crate::part::{Part, PartProps, part_root};
 use crate::theme::theme;
 
 /// What the rows of a list are named (`command-item`, `combobox-item`, …).
@@ -65,9 +64,24 @@ pub(crate) struct CommandContext {
 }
 
 impl CommandContext {
-    /// The nearest command's, from a part's setup.
-    pub(crate) fn find() -> Option<Self> {
-        use_context::<Self>()
+    /// The nearest command's, from the setup of the part `part` that needs
+    /// the root `root` (a combobox is a command inside): outside it, a
+    /// reported error and `None`.
+    pub(crate) fn find_in<P: 'static>(
+        props: gui::Signal<PartProps<P>>,
+        part: &'static str,
+        root: &'static str,
+    ) -> Option<Self> {
+        part_root(props, part, root)
+    }
+
+    /// The same, for a part that keeps its own place (made at `at`).
+    pub(crate) fn find_at(
+        part: &'static str,
+        root: &'static str,
+        at: &'static std::panic::Location<'static>,
+    ) -> Option<Self> {
+        primitives::context::use_root_at(part, root, at)
     }
 
     /// The highlighted value, untracked.
@@ -187,7 +201,15 @@ pub fn command() -> Part<CommandProps> {
 /// search icon and the input (`h-10 py-3 text-sm`, no outline), focused as
 /// it mounts (`auto-focus`).
 #[must_use]
+#[track_caller]
 pub fn command_input(placeholder: &str) -> Part<String> {
+    input_part(placeholder, |p| input_setup(p, "command_input", "command"))
+}
+
+/// The search box made as `mount` says (a command's, or a combobox's: each
+/// names its own part and root when it is outside one).
+#[track_caller]
+pub(crate) fn input_part(placeholder: &str, mount: fn(PartProps<String>) -> gui::ComponentElement) -> Part<String> {
     let t = theme();
     let root = div()
         .named("command-input-wrapper")
@@ -199,10 +221,15 @@ pub fn command_input(placeholder: &str) -> Part<String> {
         .border_color(t.border)
         .padding_x(12.0)
         .child(icon(Icon::Search).flex_shrink(0.0).opacity(0.5));
-    Part::new(placeholder.to_owned(), root, |p| {
-        component(p, |cx| {
+    Part::new(placeholder.to_owned(), root, mount)
+}
+
+/// The setup of a search box whose public part is `part`, in `root`.
+pub(crate) fn input_setup(p: PartProps<String>, part: &'static str, root: &'static str) -> gui::ComponentElement {
+    {
+        component(p, move |cx| {
             let props = cx.props();
-            let cmd = CommandContext::find();
+            let cmd = CommandContext::find_in(props, part, root);
             if let Some(c) = &cmd {
                 let focus = c.search.focus;
                 gui::on_mounted(move || focus.focus());
@@ -229,7 +256,7 @@ pub fn command_input(placeholder: &str) -> Part<String> {
                 root.child(cmd.cmd.field(input)).into_element()
             }
         })
-    })
+    }
 }
 
 /// What adds an item's icon, label and shortcut to its row.
@@ -242,17 +269,20 @@ type RowFn = Rc<dyn Fn(&CommandItem, Div) -> Div>;
 /// are built. Hold the sections in an `Rc` the caller keeps, so a list of a
 /// million items is filtered again only when the search changes, and off
 /// the UI thread (`primitives::command::FILTER_AT_ONCE`).
+#[track_caller]
 pub fn command_list(
     sections: impl Into<Arc<Vec<CommandSection>>>,
     row: impl Fn(&CommandItem, Div) -> Div + 'static,
 ) -> CommandList {
     CommandList {
+        at: std::panic::Location::caller(),
         sections: sections.into(),
         footer: Arc::new(Vec::new()),
         on_select: None,
         row: Slot(Rc::new(row)),
         max_h: Some(300.0),
         names: COMMAND_NAMES,
+        reported_as: ("command_list", "command"),
     }
 }
 
@@ -266,6 +296,11 @@ pub struct CommandList {
     row: Slot<RowFn>,
     max_h: Option<f32>,
     names: Names,
+    /// Where the caller's code made it (a report of a missing command names it).
+    at: &'static std::panic::Location<'static>,
+    /// The public part that made it and the root it needs (a combobox's
+    /// items are a command list).
+    reported_as: (&'static str, &'static str),
 }
 
 impl PartialEq for CommandList {
@@ -276,6 +311,12 @@ impl PartialEq for CommandList {
 }
 
 impl CommandList {
+    /// Name the public part that made it and the root it needs, for a report.
+    pub(crate) fn reported_as(mut self, part: &'static str, root: &'static str) -> Self {
+        self.reported_as = (part, root);
+        self
+    }
+
     /// Run `f` with the item picked (`@select`).
     pub fn on_select(mut self, f: impl Into<Callback<CommandItem>>) -> Self {
         self.on_select = Some(f.into());
@@ -315,7 +356,9 @@ impl IntoElement for CommandList {
     fn into_element(self) -> gui::Element {
         component(self, |cx| {
             let props = cx.props();
-            let Some(ctx) = CommandContext::find() else {
+            let at = props.with_untracked(|p| p.at);
+            let (part, root) = props.with_untracked(|p| p.reported_as);
+            let Some(ctx) = CommandContext::find_at(part, root, at) else {
                 let empty: Box<dyn Fn() -> gui::Element> = Box::new(|| gui::Element::Empty);
                 return empty;
             };
@@ -548,7 +591,7 @@ mod tests {
     fn probe() -> Part<()> {
         Part::new((), div(), |p| {
             component(p, |cx| {
-                FOUND.set(CommandContext::find().map(Rc::new));
+                FOUND.set(CommandContext::find_at("probe", "command", std::panic::Location::caller()).map(Rc::new));
                 let props = cx.props();
                 move || props.with(|p| p.slot.0.clone()).into_element()
             })

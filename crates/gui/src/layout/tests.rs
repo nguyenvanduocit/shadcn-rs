@@ -417,6 +417,379 @@ fn trackers_dropped_while_unwinding_leave_the_graph() {
     assert!(marks.borrow().is_empty(), "a write marks no node");
 }
 
+/// Lay `root` out on `tree`, live; the widths of the nodes named `names`.
+fn widths<const N: usize>(tree: &mut LayoutTree, root: &Element, names: [&str; N]) -> [f32; N] {
+    let mut ts = TextSystem::new();
+    let f = tree.layout(root, 400.0, 300.0, &UiState::default(), &mut Motion::default(), &mut ts);
+    names.map(|n| find(f, n).bounds.width)
+}
+
+/// Two nodes, one bound setter: one width closure cloned onto both.
+fn twins(w: crate::reactive::Signal<f32>) -> Element {
+    let bound = div().height(10.0).width(move || w.get());
+    div()
+        .child(bound.clone().named("a"))
+        .child(bound.named("b"))
+        .into_element()
+}
+
+/// One bound setter cloned onto two nodes: each node keeps what the
+/// closure gave there, so each gets its first write and every change
+/// after, whichever runs first.
+#[test]
+fn one_binding_on_two_nodes_writes_each_its_first_and_later_values() {
+    let w = crate::reactive::Signal::new(40.0_f32);
+    let root = twins(w);
+    let mut tree = LayoutTree::new();
+    assert_eq!(widths(&mut tree, &root, ["a", "b"]), [40.0, 40.0], "both first writes");
+    for v in [60.0, 80.0, 60.0] {
+        w.set(v);
+        assert_eq!(widths(&mut tree, &root, ["a", "b"]), [v, v], "both take {v}");
+    }
+}
+
+/// A cold build (the cold check, a fork: a tree of its own) runs the
+/// same bound setters the live tree mounted, and leaves what the live
+/// nodes last gave as it was: the live tree still sees the change.
+#[test]
+fn a_cold_build_of_the_same_bindings_leaves_the_live_ones_as_they_were() {
+    let w = crate::reactive::Signal::new(40.0_f32);
+    let root = twins(w);
+    let mut live = LayoutTree::new();
+    assert_eq!(widths(&mut live, &root, ["a", "b"]), [40.0, 40.0]);
+    w.set(70.0);
+    let mut ts = TextSystem::new();
+    let cold = layout(
+        &root,
+        400.0,
+        300.0,
+        &UiState::default(),
+        &mut Motion::default(),
+        &mut ts,
+    );
+    assert_eq!(find(&cold, "a").bounds.width, 70.0, "the cold build runs them");
+    assert_eq!(
+        widths(&mut live, &root, ["a", "b"]),
+        [70.0, 70.0],
+        "the live nodes write the change they had not seen"
+    );
+}
+
+/// A bound setter's or bound text's closure that panics in a cold build
+/// (its tree dropped while the panic unwinds) leaves no tracker in the
+/// graph and no read subscribed.
+#[test]
+fn a_binding_that_panics_leaves_no_tracker_subscribed() {
+    on_its_own_thread(a_binding_that_panics_leaves_no_tracker_subscribed_here);
+}
+
+fn a_binding_that_panics_leaves_no_tracker_subscribed_here() {
+    let read = crate::reactive::Signal::new(1_u32);
+    let style = move || -> Element {
+        div()
+            .width(move || {
+                if read.get() > 0 {
+                    std::panic::panic_any("a binding panicked");
+                }
+                10.0
+            })
+            .into_element()
+    };
+    let content = move || -> Element {
+        crate::element::text_bound(move || {
+            if read.get() > 0 {
+                std::panic::panic_any("a binding panicked");
+            }
+            String::new()
+        })
+        .into_element()
+    };
+    for root in [style(), content()] {
+        let before = crate::reactive::graph();
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| frame(root)));
+        assert!(unwound.is_err(), "the closure panicked");
+        let after = crate::reactive::graph();
+        assert_eq!(after.renders, before.renders, "its trackers left the graph");
+        assert_eq!(after.subscriptions, before.subscriptions, "and their reads with them");
+    }
+}
+
+/// A retained node whose only bound setter is replaced by a fixed value
+/// drops its trackers: a write to what the old closure read asks for no
+/// resolve.
+#[test]
+fn a_node_whose_last_binding_went_reads_nothing() {
+    let w = crate::reactive::Signal::new(40.0_f32);
+    let mut tree = LayoutTree::new();
+    let bound = div()
+        .child(div().named("a").height(10.0).width(move || w.get()))
+        .into_element();
+    assert_eq!(widths(&mut tree, &bound, ["a"]), [40.0]);
+    let fixed = div().child(div().named("a").height(10.0).width(50.0)).into_element();
+    assert_eq!(widths(&mut tree, &fixed, ["a"]), [50.0]);
+    w.set(60.0);
+    assert!(tree.marks.borrow().is_empty(), "the old closure's read marks nothing");
+}
+
+/// A closure that gives a constant, as a component built again gives it:
+/// the same closure type each time, another value.
+fn constant(x: f32) -> impl Fn() -> f32 {
+    move || x
+}
+
+/// Built again with another closure of the same setter, no signal
+/// written: the node's mount takes the new closure and runs it.
+#[test]
+fn a_binding_built_again_runs_its_new_closure() {
+    let mut tree = LayoutTree::new();
+    let built = |x| {
+        div()
+            .child(div().named("a").height(10.0).width(constant(x)))
+            .into_element()
+    };
+    assert_eq!(widths(&mut tree, &built(10.0), ["a"]), [10.0]);
+    assert_eq!(widths(&mut tree, &built(20.0), ["a"]), [20.0]);
+}
+
+/// A pass over a retained tree that panics in one node's binding leaves
+/// the tree as a new one: tried again on the same tree, it holds the
+/// trackers and reads a fresh tree holds, no more, and shows the values
+/// as they are now.
+#[test]
+fn a_pass_that_panics_leaves_the_tree_as_a_fresh_one() {
+    on_its_own_thread(|| {
+        let w = crate::reactive::Signal::new(10.0_f32);
+        let boom = crate::reactive::Signal::new(false);
+        let root = div()
+            .children(["a", "b", "c"].into_iter().enumerate().map(move |(i, n)| {
+                div().named(n).height(10.0).width(move || {
+                    if i == 1 && boom.get() {
+                        std::panic::panic_any("a binding panicked");
+                    }
+                    w.get() + i as f32
+                })
+            }))
+            .into_element();
+        let at_start = crate::reactive::graph();
+        let held = |g: crate::reactive::Graph| (g.renders - at_start.renders, g.subscriptions - at_start.subscriptions);
+        let (mut motion, mut ts) = (Motion::default(), TextSystem::new());
+        let names = |f: &Frame| ["a", "b", "c"].map(|n| find(f, n).bounds.width);
+        let fresh = {
+            let mut t = LayoutTree::new();
+            assert_eq!(names(lay(&mut t, &root, &mut motion, &mut ts)), [10.0, 11.0, 12.0]);
+            held(crate::reactive::graph())
+        };
+        let mut tree = LayoutTree::new();
+        assert_eq!(names(lay(&mut tree, &root, &mut motion, &mut ts)), [10.0, 11.0, 12.0]);
+        w.set(15.0);
+        boom.set(true);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lay(&mut tree, &root, &mut motion, &mut ts);
+        }));
+        assert!(unwound.is_err(), "the pass panicked");
+        boom.set(false);
+        w.set(20.0);
+        assert_eq!(names(lay(&mut tree, &root, &mut motion, &mut ts)), [20.0, 21.0, 22.0]);
+        assert_eq!(
+            held(crate::reactive::graph()),
+            fresh,
+            "trackers and reads as a fresh tree's"
+        );
+    });
+}
+
+/// Run `f` on a thread of its own: its own reactive graph, so what it
+/// counts is its own whatever ran on the test's thread before.
+fn on_its_own_thread(f: impl FnOnce() + Send + 'static) {
+    if let Err(panic) = std::thread::spawn(f).join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// Lay `root` out on `tree` with `motion` and `ts`, kept across passes as a
+/// window keeps them.
+fn lay<'t>(tree: &'t mut LayoutTree, root: &Element, motion: &mut Motion, ts: &mut TextSystem) -> &'t Frame {
+    tree.layout(root, 400.0, 300.0, &UiState::default(), motion, ts)
+}
+
+/// A node with a transition removed in a pass that panics: the motion
+/// kept across the panic and the retry holds no state for it after.
+#[test]
+fn a_pass_that_panics_leaves_motion_nothing_of_the_nodes_it_dropped() {
+    on_its_own_thread(|| {
+        let boom = crate::reactive::Signal::new(false);
+        let root = |moving: bool| {
+            let d = div().child(div().named("b").height(10.0).width(move || {
+                if boom.get() {
+                    std::panic::panic_any("a binding panicked");
+                }
+                10.0
+            }));
+            if moving {
+                d.child(
+                    div()
+                        .named("m")
+                        .size(10.0)
+                        .transition(Properties::BACKGROUND)
+                        .background(Color::BLACK),
+                )
+                .into_element()
+            } else {
+                d.into_element()
+            }
+        };
+        let (mut motion, mut ts) = (Motion::default(), TextSystem::new());
+        let mut tree = LayoutTree::new();
+        lay(&mut tree, &root(true), &mut motion, &mut ts);
+        assert_eq!(motion.paths().count(), 1, "the moving node has a state");
+        boom.set(true);
+        let gone = root(false);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lay(&mut tree, &gone, &mut motion, &mut ts);
+        }));
+        assert!(unwound.is_err(), "the pass panicked");
+        boom.set(false);
+        lay(&mut tree, &gone, &mut motion, &mut ts);
+        assert_eq!(motion.paths().count(), 0, "the node that went left no state behind");
+    });
+}
+
+/// Two sibling layers, B opened before A: after a pass that panics, the
+/// retry paints them in the order they opened, B under A, not in tree
+/// order.
+#[test]
+fn a_pass_that_panics_keeps_the_order_its_layers_opened_in() {
+    on_its_own_thread(|| {
+        let boom = crate::reactive::Signal::new(false);
+        let layer = |name: &'static str| {
+            deferred(
+                Positioning::Anchored {
+                    side: Side::Bottom,
+                    align: SideAlign::Start,
+                    offset: 0.0,
+                    match_width: false,
+                    fit_height: false,
+                },
+                div().named(name).width(20.0).height(20.0),
+            )
+        };
+        let root = move |a: bool| {
+            let holder = |open: bool, name| {
+                let d = div().width(40.0).height(20.0);
+                if open { d.child(layer(name)) } else { d }
+            };
+            div()
+                .width(move || {
+                    if boom.get() {
+                        std::panic::panic_any("a binding panicked");
+                    }
+                    200.0
+                })
+                .child(holder(a, "a"))
+                .child(holder(true, "b"))
+                .into_element()
+        };
+        let (mut motion, mut ts) = (Motion::default(), TextSystem::new());
+        let mut tree = LayoutTree::new();
+        let layers = |f: &Frame| (find(f, "a").layer, find(f, "b").layer);
+        lay(&mut tree, &root(false), &mut motion, &mut ts);
+        let both = root(true);
+        assert_eq!(
+            layers(lay(&mut tree, &both, &mut motion, &mut ts)),
+            (2, 1),
+            "B opened first"
+        );
+        boom.set(true);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lay(&mut tree, &both, &mut motion, &mut ts);
+        }));
+        assert!(unwound.is_err(), "the pass panicked");
+        boom.set(false);
+        assert_eq!(
+            layers(lay(&mut tree, &both, &mut motion, &mut ts)),
+            (2, 1),
+            "still B under A"
+        );
+    });
+}
+
+/// A closure that panicked after reading a signal, whose write is then
+/// no longer bound (the node keeps another binding): its tracker reads
+/// nothing, so a write to that signal asks for no resolve.
+#[test]
+fn a_binding_that_panicked_then_went_reads_nothing() {
+    on_its_own_thread(|| {
+        let marks: Marks = Rc::default();
+        let w = crate::reactive::Signal::new(10.0_f32);
+        let mut before = div().opacity(move || 0.5).width(move || -> f32 {
+            if w.get() > 0.0 {
+                std::panic::panic_any("a binding panicked");
+            }
+            0.0
+        });
+        let mut after = div().opacity(move || 0.5);
+        let ops = |d: &mut crate::element::Div| {
+            let (style, b) = d.style_and_bindings();
+            (style.clone(), Rc::clone(b.and_then(|b| b.ops()).expect("bound")))
+        };
+        let ((s1, o1), (s2, o2)) = (ops(&mut before), ops(&mut after));
+        let mut sb = binding::StyleBinding::new(&marks, 0);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&o1, &s1)));
+        assert!(unwound.is_err(), "the width's closure panicked");
+        sb.get(&o2, &s2);
+        marks.borrow_mut().clear();
+        w.set(20.0);
+        assert!(marks.borrow().is_empty(), "what the closure read marks nothing");
+    });
+}
+
+/// A bound setter's closure, or a restyle replayed after it, that
+/// panicked runs again at the next resolve, no signal written since: what
+/// it half did is not kept.
+#[test]
+fn a_binding_or_restyle_that_panicked_runs_again_at_the_next_resolve() {
+    use std::cell::Cell;
+    for restyle in [false, true] {
+        let marks: Marks = Rc::default();
+        let w = crate::reactive::Signal::new(10.0_f32);
+        let boom = Rc::new(Cell::new(false));
+        let (in_binding, in_restyle) = (Rc::clone(&boom), Rc::clone(&boom));
+        let mut d = div().width(move || {
+            if !restyle && in_binding.get() {
+                std::panic::panic_any("a binding panicked");
+            }
+            w.get()
+        });
+        let (style, bindings) = d.style_and_bindings();
+        let bindings = bindings.expect("a node keeps bindings");
+        if restyle {
+            assert!(bindings.restyle(Rc::new(move |s: Style| {
+                if in_restyle.get() {
+                    std::panic::panic_any("a restyle panicked");
+                }
+                s
+            })));
+        }
+        let ops = Rc::clone(bindings.ops().expect("bound"));
+        let resolved = || {
+            let mut s = style.clone();
+            bindings.apply_to(&mut s);
+            s
+        };
+        let mut sb = binding::StyleBinding::new(&marks, 0);
+        assert!(sb.get(&ops, style) == resolved());
+        w.set(20.0);
+        boom.set(true);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&ops, style)));
+        assert!(unwound.is_err(), "it panicked");
+        boom.set(false);
+        assert!(
+            sb.get(&ops, style) == resolved(),
+            "the width as it is now (restyle: {restyle})"
+        );
+    }
+}
+
 #[test]
 fn flex_row_places_children_side_by_side_with_gap() {
     let f = frame(

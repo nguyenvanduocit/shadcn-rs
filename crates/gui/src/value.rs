@@ -39,6 +39,40 @@ pub enum Value<T> {
 /// compiler infers it, and no caller names it.
 pub trait IntoValue<T, M> {
     fn into_value(self) -> Value<T>;
+
+    /// What a style setter keeps of it: the value, or the closure with the
+    /// setter's `write` in one allocation, the closure's type kept until
+    /// then (where it is erased, and where each node keeps what it gave:
+    /// `Bound` in this module). Without `keep` (no node keeps it: a bare
+    /// [`Style`], a span) a closure runs now, tracked by whatever is
+    /// running, and gives its value.
+    ///
+    /// The impls here keep the closure's type; this default, for any
+    /// other, keeps it as [`Self::into_value`] gives it, one allocation
+    /// more. One trait for every setter and every reactive prop, so a prop
+    /// given as `impl IntoValue` passes on to a style setter as it is.
+    #[doc(hidden)]
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
+    where
+        Self: Sized,
+        T: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, T) + Copy + 'static,
+    {
+        match self.into_value() {
+            Value::Fixed(v) => Setting(Given::Fixed(v)),
+            Value::Bound(f) if !keep => Setting(Given::Fixed(f())),
+            Value::Bound(f) => Setting(Given::Bound(Rc::new(BoundWrite::new(move || f(), write)))),
+        }
+    }
+}
+
+/// What a style setter was given, as [`IntoValue::into_setting`] keeps it.
+#[doc(hidden)]
+pub struct Setting<T>(Given<T>);
+
+enum Given<T> {
+    Fixed(T),
+    Bound(Rc<dyn Bound>),
 }
 
 /// A source of `T` that a setter of `T` takes as well: pixels for a length,
@@ -65,11 +99,26 @@ impl<T> IntoValue<T, marker::Fixed> for T {
     fn into_value(self) -> Value<T> {
         Value::Fixed(self)
     }
+
+    fn into_setting<W>(self, _: W, _: bool) -> Setting<T> {
+        Setting(Given::Fixed(self))
+    }
 }
 
 impl<T, F: Fn() -> T + 'static> IntoValue<T, marker::Bound> for F {
     fn into_value(self) -> Value<T> {
         Value::Bound(Rc::new(self))
+    }
+
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
+    where
+        T: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, T) + Copy + 'static,
+    {
+        if !keep {
+            return Setting(Given::Fixed(self()));
+        }
+        Setting(Given::Bound(Rc::new(BoundWrite::new(self, write))))
     }
 }
 
@@ -77,11 +126,26 @@ impl<T, S: Convert<T>> IntoValue<T, marker::Via<S>> for S {
     fn into_value(self) -> Value<T> {
         Value::Fixed(self.convert())
     }
+
+    fn into_setting<W>(self, _: W, _: bool) -> Setting<T> {
+        Setting(Given::Fixed(self.convert()))
+    }
 }
 
 impl<T, S: Convert<T>, F: Fn() -> S + 'static> IntoValue<T, marker::BoundVia<S>> for F {
     fn into_value(self) -> Value<T> {
         Value::Bound(Rc::new(move || self().convert()))
+    }
+
+    fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
+    where
+        T: Clone + PartialEq + 'static,
+        W: Fn(&mut Style, T) + Copy + 'static,
+    {
+        if !keep {
+            return Setting(Given::Fixed(self().convert()));
+        }
+        Setting(Given::Bound(Rc::new(BoundWrite::new(move || self().convert(), write))))
     }
 }
 
@@ -529,44 +593,88 @@ pub(crate) struct Op {
 enum Run {
     /// A fixed value, or a parent's restyle: it writes as it runs.
     Write(Rc<dyn Fn(&mut Style)>),
-    /// A closure: run on its own ([`Bound::eval`]), what it gave written
-    /// where the writes replay ([`Bound::write`]).
+    /// A closure: each node it is mounted on runs it on its own
+    /// ([`Mounted::eval`]) and writes what it gave there where the writes
+    /// replay ([`Mounted::write`]).
     Bound(Rc<dyn Bound>),
 }
 
-/// A bound setter's closure and the write of what it gives, kept apart so
-/// a node's resolve runs each closure under a tracker of its own and
-/// replays the others from what they last gave (ADR-0022: a binding that
-/// reads `focus_visible` does not run again on hover).
-pub(crate) trait Bound {
-    /// Run the closure, tracked by whatever is running, keeping what it
-    /// gave in `slot`: in the value already there when it is of its type,
-    /// so a run allocates nothing once the slot is made.
-    fn eval(&self, slot: &mut Option<Box<dyn Any>>);
-    /// Write what `slot` holds ([`Self::eval`] filled it).
-    fn write(&self, slot: &dyn Any, style: &mut Style);
-    /// Run the closure and write what it gives.
+/// A bound setter, as the element keeps it: its closure and the write of
+/// what the closure gives, one allocation behind one pointer, shared by
+/// every clone of the element and every node it is mounted on. It holds
+/// no state: what one mount last gave is that mount's ([`Mounted`]), so a
+/// node never sees another's value and a cold build (the cold check, a
+/// fork) runs it without touching a live node's.
+///
+/// Where the types go: a setter keeps the closure's type `F` and the
+/// setter's write `W` up to [`IntoValue::into_setting`], which makes the
+/// [`BoundWrite`] and erases it here, once per definition. A mount
+/// ([`Bound::mount`]) makes a [`Mount`] typed by the same `F`, `W` and `T`,
+/// erased once more behind [`Mounted`]: running the closure, comparing
+/// what it gave with what that mount last gave, and writing it are static
+/// calls inside one dynamic one, with no downcast.
+pub(crate) trait Bound: Any {
+    /// A mount of it on one node: the typed cell of what it last gave
+    /// there, empty until its first run.
+    fn mount(self: Rc<Self>) -> Box<dyn Mounted>;
+    /// Run the closure and write what it gives, keeping nothing (a bare
+    /// [`Style`], a span, a write replayed without its mount).
     fn apply(&self, style: &mut Style);
 }
 
-struct BoundWrite<T> {
-    f: Rc<dyn Fn() -> T>,
-    write: fn(&mut Style, T),
+/// One mount of a [`Bound`] on one node: the definition and what its
+/// closure last gave there, typed. Owned by that node's binding state
+/// (`layout::binding::BoundRun`), next to the node's tracker of it.
+pub(crate) trait Mounted {
+    /// Whether it is a mount of `def`.
+    fn is(&self, def: &Rc<dyn Bound>) -> bool;
+    /// Mount `def` here in place of its own definition, when it is of the
+    /// same closure and write (the same setter given the same closure
+    /// again, by an element built anew): what it last gave stays, to be
+    /// compared with what `def`'s closure gives. False when `def` is of
+    /// another type.
+    fn rebind(&mut self, def: &Rc<dyn Bound>) -> bool;
+    /// Run the closure, tracked by whatever is running, keeping what it
+    /// gave; whether that differs from what it last gave (true on the first
+    /// run). Allocates nothing past what the closure does.
+    ///
+    /// The cutoff is `PartialEq`, as a signal's is: a value equal to the
+    /// last is not written, and the node's style as last replayed stands.
+    /// So a type a setter binds must hold values equal under `PartialEq`
+    /// interchangeable for all a restyle or a replay may observe (an
+    /// `f32` that is `-0.0` where `+0.0` stood keeps `+0.0`); a type that
+    /// breaks this must not be bound.
+    fn eval(&mut self) -> bool;
+    /// Write what it last gave; false, writing nothing, before its first run.
+    fn write(&self, style: &mut Style) -> bool;
 }
 
-impl<T: Clone + 'static> Bound for BoundWrite<T> {
-    fn eval(&self, slot: &mut Option<Box<dyn Any>>) {
-        let v = (self.f)();
-        match slot.as_mut().and_then(|b| b.downcast_mut::<T>()) {
-            Some(held) => *held = v,
-            None => *slot = Some(Box::new(v)),
+/// A bound setter's closure `F` and the setter's write `W` of what it
+/// gives, `T`.
+struct BoundWrite<F, W, T> {
+    f: F,
+    write: W,
+    gives: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<F, W, T> BoundWrite<F, W, T> {
+    fn new(f: F, write: W) -> Self {
+        Self {
+            f,
+            write,
+            gives: std::marker::PhantomData,
         }
     }
+}
 
-    fn write(&self, slot: &dyn Any, style: &mut Style) {
-        if let Some(v) = slot.downcast_ref::<T>() {
-            (self.write)(style, v.clone());
-        }
+impl<F, W, T> Bound for BoundWrite<F, W, T>
+where
+    F: Fn() -> T + 'static,
+    W: Fn(&mut Style, T) + Copy + 'static,
+    T: Clone + PartialEq + 'static,
+{
+    fn mount(self: Rc<Self>) -> Box<dyn Mounted> {
+        Box::new(Mount { def: self, last: None })
     }
 
     fn apply(&self, style: &mut Style) {
@@ -574,11 +682,58 @@ impl<T: Clone + 'static> Bound for BoundWrite<T> {
     }
 }
 
+/// [`Mounted`] for a [`BoundWrite`]: the typed comparison cell.
+struct Mount<F, W, T> {
+    def: Rc<BoundWrite<F, W, T>>,
+    last: Option<T>,
+}
+
+impl<F, W, T> Mounted for Mount<F, W, T>
+where
+    F: Fn() -> T + 'static,
+    W: Fn(&mut Style, T) + Copy + 'static,
+    T: Clone + PartialEq + 'static,
+{
+    fn is(&self, def: &Rc<dyn Bound>) -> bool {
+        std::ptr::addr_eq(Rc::as_ptr(&self.def), Rc::as_ptr(def))
+    }
+
+    fn rebind(&mut self, def: &Rc<dyn Bound>) -> bool {
+        let any: Rc<dyn Any> = Rc::<dyn Bound>::clone(def);
+        match any.downcast::<BoundWrite<F, W, T>>() {
+            Ok(def) => {
+                self.def = def;
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn eval(&mut self) -> bool {
+        let v = (self.def.f)();
+        if self.last.as_ref() == Some(&v) {
+            return false;
+        }
+        self.last = Some(v);
+        true
+    }
+
+    fn write(&self, style: &mut Style) -> bool {
+        match &self.last {
+            Some(v) => {
+                (self.def.write)(style, v.clone());
+                true
+            }
+            None => false,
+        }
+    }
+}
+
 impl Op {
-    /// Its closure, for a bound setter.
-    pub(crate) fn bound(&self) -> Option<&dyn Bound> {
+    /// Its definition, for a bound setter.
+    pub(crate) fn bound(&self) -> Option<&Rc<dyn Bound>> {
         match &self.run {
-            Run::Bound(b) => Some(&**b),
+            Run::Bound(b) => Some(b),
             Run::Write(_) => None,
         }
     }
@@ -620,46 +775,52 @@ impl Bindings {
         }
     }
 
-    fn write(&mut self, fields: Fields, kind: Kind, run: Run) {
-        let ops = Rc::make_mut(self.0.get_or_insert_default());
-        // A later write of every field an earlier one wrote owns them: the
-        // earlier one goes, a restyle's (which writes what it writes)
-        // stays before it.
-        ops.retain(|o| o.kind == Kind::Restyle || !fields.covers(o.fields));
-        if kind == Kind::Fixed {
-            // Only fixed writes left: the fixed style holds them all.
-            if ops.iter().all(|o| o.kind == Kind::Fixed) {
-                self.0 = None;
-                return;
-            }
-            // What is left of the writes touches none of these fields: the
-            // fixed style holds this one as it stands under the replay.
-            if ops.iter().all(|o| o.kind != Kind::Restyle && !o.fields.meets(fields)) {
-                return;
-            }
-        }
-        ops.push(Op { fields, kind, run });
-    }
-
-    /// `fields` were written with a fixed value: it drops a binding of
-    /// no more than them, and, after another binding, replays in its place.
-    fn fixed<T: Clone + 'static>(&mut self, fields: Fields, value: T, write: fn(&mut Style, T)) {
-        // No earlier write touches these fields: the fixed style's value
-        // stands under the replay as it is, and nothing need be kept for it.
-        if let Some(ops) = &self.0
-            && ops.iter().all(|o| o.kind != Kind::Restyle && !o.fields.meets(fields))
-        {
+    /// `fields` were written with a fixed value. It owns what an earlier
+    /// write of no more than them wrote, which goes ([`owned`]); what is
+    /// left decides the rest, so the check runs after the drop: nothing
+    /// bound left, nothing replays (the fixed style holds every write); a
+    /// write left that touches these fields, or a restyle, and it replays
+    /// after them; else the fixed style holds it as it stands under the
+    /// replay. A list shared with a clone is copied only when it changes.
+    fn fixed<T, W>(&mut self, fields: Fields, value: &T, write: W)
+    where
+        T: Clone + 'static,
+        W: Fn(&mut Style, T) + 'static,
+    {
+        let Some(ops) = &mut self.0 else {
+            return;
+        };
+        let left = || ops.iter().filter(|o| !owned(fields, o));
+        if left().all(|o| o.kind == Kind::Fixed) {
+            self.0 = None;
             return;
         }
-        self.write(
-            fields,
-            Kind::Fixed,
-            Run::Write(Rc::new(move |s| write(s, value.clone()))),
-        );
+        let replays = left().any(|o| o.kind == Kind::Restyle || o.fields.meets(fields));
+        if !replays && !ops.iter().any(|o| owned(fields, o)) {
+            return;
+        }
+        let ops = Rc::make_mut(ops);
+        ops.retain(|o| !owned(fields, o));
+        if replays {
+            let value = value.clone();
+            ops.push(Op {
+                fields,
+                kind: Kind::Fixed,
+                run: Run::Write(Rc::new(move |s| write(s, value.clone()))),
+            });
+        }
     }
 
-    fn bound<T: Clone + 'static>(&mut self, fields: Fields, f: Rc<dyn Fn() -> T>, write: fn(&mut Style, T)) {
-        self.write(fields, Kind::Bound, Run::Bound(Rc::new(BoundWrite { f, write })));
+    /// `fields` were bound to `def`: it owns what an earlier write of no
+    /// more than them wrote, and replays after what is left.
+    fn bound(&mut self, fields: Fields, def: Rc<dyn Bound>) {
+        let ops = Rc::make_mut(self.0.get_or_insert_default());
+        ops.retain(|o| !owned(fields, o));
+        ops.push(Op {
+            fields,
+            kind: Kind::Bound,
+            run: Run::Bound(def),
+        });
     }
 
     /// Replay `f` after every write the node made, as a parent's restyle
@@ -679,6 +840,13 @@ impl Bindings {
     }
 }
 
+/// Whether a later write of every one of `fields` owns `op`: it wrote no
+/// more than them. A restyle (which writes what it writes) it never owns;
+/// that stays before it.
+fn owned(fields: Fields, op: &Op) -> bool {
+    op.kind != Kind::Restyle && fields.covers(op.fields)
+}
+
 /// Replay `ops` over `style`.
 pub(crate) fn apply(ops: &[Op], style: &mut Style) {
     for op in ops {
@@ -690,27 +858,29 @@ pub(crate) fn apply(ops: &[Op], style: &mut Style) {
 /// `bindings` to run where the node resolves; without `bindings` (a
 /// bare [`Style`], a span) it runs now, tracked by whatever is
 /// running.
-pub(crate) fn set<T: Clone + 'static, M>(
+pub(crate) fn set<T, M, W>(
     style: &mut Style,
     bindings: Option<&mut Bindings>,
     fields: Fields,
     value: impl IntoValue<T, M>,
-    write: fn(&mut Style, T),
-) {
-    match value.into_value() {
-        Value::Fixed(v) => {
-            // Without a binding the fixed style holds it alone: no clone
-            // (a spilled list would allocate one for nothing).
-            if let Some(b) = bindings
-                && !b.is_empty()
-            {
-                b.fixed(fields, v.clone(), write);
+    write: W,
+) where
+    T: Clone + PartialEq + 'static,
+    W: Fn(&mut Style, T) + Copy + 'static,
+{
+    match value.into_setting(write, bindings.is_some()).0 {
+        Given::Fixed(v) => {
+            // Cloned only when a binding keeps a replay of it too (a
+            // spilled list would allocate one for nothing).
+            if let Some(b) = bindings {
+                b.fixed(fields, &v, write);
             }
             write(style, v);
         }
-        Value::Bound(f) => match bindings {
-            Some(b) => b.bound(fields, f, write),
-            None => write(style, f()),
+        Given::Bound(def) => match bindings {
+            Some(b) => b.bound(fields, def),
+            // Not made: `into_setting` without `keep` gives a value.
+            None => def.apply(style),
         },
     }
 }
@@ -928,6 +1098,31 @@ mod tests {
             Some(1),
             "the binding it covered went, and with it what the fixed write replayed over"
         );
+    }
+
+    /// Whether a fixed write replays is decided by what is left once the
+    /// bindings it covers are dropped: here the one it overlapped goes, so
+    /// nothing is left that it touches and nothing of it is kept. A clone
+    /// that shared the writes keeps them.
+    #[test]
+    fn a_fixed_write_checks_overlap_after_dropping_what_it_covers() {
+        let (mut style, mut b) = (Style::default(), Bindings::default());
+        let opacity_fields = Fields::of(&[Field::Opacity]);
+        set(&mut style, Some(&mut b), opacity_fields, || 0.5_f32, opacity);
+        set(
+            &mut style,
+            Some(&mut b),
+            Fields::of(&[Field::Rotate]),
+            || 45.0_f32,
+            rotate,
+        );
+        let shared = b.clone();
+        set(&mut style, Some(&mut b), opacity_fields, 0.9_f32, opacity);
+        assert_eq!(b.ops().map(|o| o.len()), Some(1), "the rotate binding alone");
+        assert_eq!(shared.ops().map(|o| o.len()), Some(2), "the clone keeps its writes");
+        let s = resolved(&style, &b);
+        assert!((s.opacity - 0.9).abs() < f32::EPSILON);
+        assert!((s.transform.rotate - 45.0).abs() < f32::EPSILON);
     }
 
     #[test]

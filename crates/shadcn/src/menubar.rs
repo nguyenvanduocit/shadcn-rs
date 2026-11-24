@@ -20,7 +20,7 @@ use primitives::menu::MenuOptions;
 use primitives::menubar::{Menubar, MenubarMenu};
 
 use crate::dropdown_menu::{
-    MenuCheckboxItemProps, MenuContentProps, MenuItem, MenuItemProps, MenuPlace, MenuRadioGroupProps,
+    MenuCheckboxItemProps, MenuContentProps, MenuFamily, MenuItem, MenuItemProps, MenuPlace, MenuRadioGroupProps,
     MenuRadioItemProps, MenuRootProps, MenuSubTriggerProps, menu_box, menu_checkbox_item, menu_content, menu_group,
     menu_item, menu_item_separator, menu_radio_group, menu_radio_item, menu_row_base, menu_shortcut, menu_sub,
     menu_sub_trigger,
@@ -30,7 +30,7 @@ use gui::{Side, SideAlign};
 
 use crate::focus::StateLook;
 use crate::motion::{popper, popper_in};
-use crate::part::Part;
+use crate::part::{Part, part_root};
 use crate::theme::theme;
 
 /// What [`menubar`] is given: which menu is open (`""`: none), and what
@@ -164,6 +164,7 @@ pub fn menubar_menu() -> Part<MenubarMenuProps> {
 /// lit while focused or open. Pressing it opens its menu; pointing at it
 /// while another menu is open switches to it.
 #[must_use]
+#[track_caller]
 pub fn menubar_trigger(label: &str) -> Part<MenubarTriggerProps> {
     let root = div()
         .named("menubar-trigger")
@@ -182,7 +183,7 @@ pub fn menubar_trigger(label: &str) -> Part<MenubarTriggerProps> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let menu = use_context::<MenubarMenu>();
+            let menu = part_root::<_, MenubarMenu>(props, "menubar_trigger", "menubar_menu");
             move || {
                 let (label, root) = props.with(|p| (p.props.label.clone(), p.slot.0.clone()));
                 let Some(menu) = menu else {
@@ -210,6 +211,7 @@ pub struct MenubarTriggerProps {
 /// `bg-popover min-w-[12rem] overflow-hidden rounded-md border p-1
 /// shadow-md`; add items with `.child`.
 #[must_use]
+#[track_caller]
 pub fn menubar_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
@@ -228,6 +230,7 @@ pub fn menubar_content() -> Part<MenuContentProps> {
             offset: 8.0,
             fit_height: false,
         },
+        MenuFamily::Menubar,
     )
 }
 
@@ -246,13 +249,20 @@ pub fn menubar_radio_group() -> Part<MenuRadioGroupProps> {
 /// An item identified (and typed ahead) by `id`; add its icon, label and
 /// shortcut with `.child`, what picking it does with `.on_select`.
 #[must_use]
+#[track_caller]
 pub fn menubar_item(id: &str, item: MenuItem) -> Part<MenuItemProps> {
     let t = theme();
-    menu_item(menu_row_base(&t, item).named("menubar-item"), id, item)
+    menu_item(
+        menu_row_base(&t, item).named("menubar-item"),
+        id,
+        item,
+        MenuFamily::Menubar,
+    )
 }
 
 /// A checkbox item labelled `label` (`rounded-xs`); picking it toggles.
 #[must_use]
+#[track_caller]
 pub fn menubar_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheckboxItemProps> {
     let t = theme();
     let item = MenuItem {
@@ -268,11 +278,13 @@ pub fn menubar_checkbox_item(label: &str, disabled: bool) -> Part<MenuCheckboxIt
             .child(label.to_owned()),
         label,
         disabled,
+        MenuFamily::Menubar,
     )
 }
 
 /// A radio item setting its group's value to `value` (`rounded-xs`).
 #[must_use]
+#[track_caller]
 pub fn menubar_radio_item(label: &str, value: &str, disabled: bool) -> Part<MenuRadioItemProps> {
     let t = theme();
     let item = MenuItem {
@@ -289,6 +301,7 @@ pub fn menubar_radio_item(label: &str, value: &str, disabled: bool) -> Part<Menu
         label,
         value,
         disabled,
+        MenuFamily::Menubar,
     )
 }
 
@@ -319,13 +332,15 @@ pub fn menubar_shortcut(keys: &str) -> Text {
 /// A submenu (`MenubarSub`): give it a [`menubar_sub_trigger`] and a
 /// [`menubar_sub_content`].
 #[must_use]
+#[track_caller]
 pub fn menubar_sub() -> Part<MenuRootProps> {
-    menu_sub(div().named("menubar-sub"))
+    menu_sub(div().named("menubar-sub"), MenuFamily::Menubar)
 }
 
 /// The row opening its submenu (`data-[state=open]:bg-accent`, no gap); the
 /// content opens on the inline end.
 #[must_use]
+#[track_caller]
 pub fn menubar_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerProps> {
     let t = theme();
     menu_sub_trigger(
@@ -336,11 +351,13 @@ pub fn menubar_sub_trigger(label: &str, item: MenuItem) -> Part<MenuSubTriggerPr
             .child(icon(Icon::ChevronRight).margin_left(Length::Auto)),
         label,
         item,
+        MenuFamily::Menubar,
     )
 }
 
 /// A submenu's panel: `min-w-[8rem] overflow-hidden shadow-lg`.
 #[must_use]
+#[track_caller]
 pub fn menubar_sub_content() -> Part<MenuContentProps> {
     let t = theme();
     menu_content(
@@ -352,5 +369,6 @@ pub fn menubar_sub_content() -> Part<MenuContentProps> {
             Origin::Anchor,
         ),
         MenuPlace::Beside,
+        MenuFamily::Menubar,
     )
 }

@@ -19,7 +19,11 @@ use gui::{
 use crate::button::{ButtonSize, ButtonVariant, button};
 use crate::focus::StateLook;
 use crate::input::input;
-use crate::part::{Part, PartProps};
+use std::panic::Location;
+
+use primitives::context::use_root_at;
+
+use crate::part::{Part, PartProps, part_root};
 use crate::separator::{Orientation, separator};
 use crate::skeleton::skeleton;
 use crate::theme::{Colors, theme};
@@ -83,8 +87,15 @@ struct SidebarContext {
 }
 
 impl SidebarContext {
-    fn find() -> Option<Self> {
-        use_context::<Self>()
+    /// The provider's, for the part `part`: outside a `sidebar_provider`
+    /// it is a reported error and `None`.
+    fn find<P: 'static>(props: Signal<PartProps<P>>, part: &'static str) -> Option<Self> {
+        part_root(props, part, "sidebar_provider")
+    }
+
+    /// The same, for a part that keeps its own place (made at `at`).
+    fn find_at(part: &'static str, at: &'static Location<'static>) -> Option<Self> {
+        use_root_at(part, "sidebar_provider", at)
     }
 
     fn side(&self) -> SidebarSide {
@@ -228,6 +239,7 @@ impl Part<SidebarProps> {
 
 /// The sidebar; its header, content, footer and rail go inside.
 #[must_use]
+#[track_caller]
 pub fn sidebar() -> Part<()> {
     Part::new(
         (),
@@ -238,7 +250,7 @@ pub fn sidebar() -> Part<()> {
         |p| {
             component(p, |cx| {
                 let props = cx.props();
-                let ctx = SidebarContext::find();
+                let ctx = SidebarContext::find(props, "sidebar");
                 move || {
                     let inner = props.with(|p| p.slot.0.clone());
                     match &ctx {
@@ -334,6 +346,7 @@ fn frame(sb: &SidebarContext, inner: Div) -> Div {
 
 /// A button that opens and closes the sidebar.
 #[must_use]
+#[track_caller]
 pub fn sidebar_trigger() -> Part<()> {
     let root = button(ButtonVariant::Ghost, ButtonSize::Icon)
         .named("sidebar-trigger")
@@ -343,7 +356,7 @@ pub fn sidebar_trigger() -> Part<()> {
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            let ctx = SidebarContext::find(props, "sidebar_trigger");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match ctx.clone() {
@@ -359,9 +372,11 @@ pub fn sidebar_trigger() -> Part<()> {
 /// The strip along the sidebar's inner edge: shows a line on hover and
 /// toggles the sidebar on click. Put it last among the sidebar's children.
 #[must_use]
+#[track_caller]
 pub fn sidebar_rail() -> ComponentElement {
-    component((), |_| {
-        let ctx = SidebarContext::find();
+    component(Location::caller(), |cx| {
+        let at = cx.props().with_untracked(|at| *at);
+        let ctx = SidebarContext::find_at("sidebar_rail", at);
         let i = Interaction::new();
         move || {
             let Some(sb) = ctx.clone() else {
@@ -402,6 +417,7 @@ pub fn sidebar_rail() -> ComponentElement {
 
 /// The main area beside the sidebar; inset in a rounded card for the `inset` variant.
 #[must_use]
+#[track_caller]
 pub fn sidebar_inset() -> Part<()> {
     let t = theme();
     let root = div()
@@ -416,7 +432,7 @@ pub fn sidebar_inset() -> Part<()> {
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            let ctx = SidebarContext::find(props, "sidebar_inset");
             move || {
                 let root = props.with(|p| p.slot.0.clone());
                 match &ctx {
@@ -472,6 +488,7 @@ pub fn sidebar_footer() -> Div {
 
 /// The scrolling middle of the sidebar, between header and footer.
 #[must_use]
+#[track_caller]
 pub fn sidebar_content() -> Part<()> {
     let root = div()
         .named("sidebar-content")
@@ -483,7 +500,7 @@ pub fn sidebar_content() -> Part<()> {
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            let ctx = SidebarContext::find(props, "sidebar_content");
             move || {
                 let d = props.with(|p| p.slot.0.clone());
                 if icon_collapsed(ctx.as_ref()) {
@@ -534,6 +551,7 @@ pub fn sidebar_group() -> Div {
 
 /// A group's heading; slides up out of sight when collapsed to icons.
 #[must_use]
+#[track_caller]
 pub fn sidebar_group_label() -> Part<()> {
     let t = theme();
     let root = div()
@@ -555,7 +573,7 @@ pub fn sidebar_group_label() -> Part<()> {
     Part::new((), root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            let ctx = SidebarContext::find(props, "sidebar_group_label");
             move || {
                 props
                     .with(|p| p.slot.0.clone())
@@ -569,11 +587,15 @@ pub fn sidebar_group_label() -> Part<()> {
 }
 
 /// Hidden while the sidebar around it is collapsed to icons.
-fn hidden_when_icons(root: Div) -> Part<()> {
-    Part::new((), root, |p| {
+///
+/// `part` is the public part that makes it (a report names it).
+#[track_caller]
+fn hidden_when_icons(part: &'static str, root: Div) -> Part<&'static str> {
+    Part::new(part, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            let part = props.with_untracked(|p| p.props);
+            let ctx = SidebarContext::find(props, part);
             move || {
                 props
                     .with(|p| p.slot.0.clone())
@@ -586,9 +608,11 @@ fn hidden_when_icons(root: Div) -> Part<()> {
 
 /// A small icon button at the right of a group's label; add its icon with `.child`.
 #[must_use]
-pub fn sidebar_group_action() -> Part<()> {
+#[track_caller]
+pub fn sidebar_group_action() -> Part<&'static str> {
     let t = theme();
     hidden_when_icons(
+        "sidebar_group_action",
         div()
             .named("sidebar-group-action")
             .transition(Properties::TRANSFORM)
@@ -735,7 +759,8 @@ pub fn sidebar_menu_button(props: SidebarMenuButtonProps) -> Part<SidebarMenuBut
     Part::new(props, sized, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            // The collapsed-state styling is optional: a button alone is a button.
+            let ctx = use_context::<SidebarContext>();
             move || {
                 let (size, tip, root) = props.with(|p| (p.props.size, p.props.tooltip.clone(), p.slot.0.clone()));
                 let icons = icon_collapsed(ctx.as_ref());
@@ -762,6 +787,7 @@ pub fn sidebar_menu_button(props: SidebarMenuButtonProps) -> Part<SidebarMenuBut
 /// A small icon button at the right of its menu item, whose button has
 /// `size`; with `show_on_hover` it shows only while the pointer is on the item.
 #[must_use]
+#[track_caller]
 pub fn sidebar_menu_action(size: SidebarMenuButtonSize, show_on_hover: bool) -> Part<SidebarMenuAside> {
     let t = theme();
     let root = div()
@@ -783,11 +809,18 @@ pub fn sidebar_menu_action(size: SidebarMenuButtonSize, show_on_hover: bool) -> 
         i,
         &t,
     );
-    aside(SidebarMenuAside { show_on_hover }, root)
+    aside(
+        SidebarMenuAside {
+            show_on_hover,
+            part: "sidebar_menu_action",
+        },
+        root,
+    )
 }
 
 /// A count at the right of its menu item, whose button has `size`.
 #[must_use]
+#[track_caller]
 pub fn sidebar_menu_badge(size: SidebarMenuButtonSize) -> Part<SidebarMenuAside> {
     let root = div()
         .named("sidebar-menu-badge")
@@ -805,22 +838,31 @@ pub fn sidebar_menu_badge(size: SidebarMenuButtonSize) -> Part<SidebarMenuAside>
         .text_size(12.0)
         .line_height(16.0)
         .font_weight(500);
-    aside(SidebarMenuAside { show_on_hover: false }, root)
+    aside(
+        SidebarMenuAside {
+            show_on_hover: false,
+            part: "sidebar_menu_badge",
+        },
+        root,
+    )
 }
 
 /// What a menu item's action or badge is given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SidebarMenuAside {
     show_on_hover: bool,
+    /// The public part that makes it (a report names it).
+    part: &'static str,
 }
 
 /// An action or badge: brighter while the pointer is on its item, hidden
 /// when collapsed to icons.
+#[track_caller]
 fn aside(props: SidebarMenuAside, root: Div) -> Part<SidebarMenuAside> {
     Part::new(props, root, |p| {
         component(p, |cx| {
             let props = cx.props();
-            let ctx = SidebarContext::find();
+            let ctx = SidebarContext::find(props, props.with_untracked(|p| p.props.part));
             let item = item_interaction();
             move || {
                 let t = theme();
@@ -878,9 +920,11 @@ fn skeleton_width(id: &str) -> f32 {
 
 /// The nested list under a menu item; hidden when collapsed to icons.
 #[must_use]
-pub fn sidebar_menu_sub() -> Part<()> {
+#[track_caller]
+pub fn sidebar_menu_sub() -> Part<&'static str> {
     let t = theme();
     hidden_when_icons(
+        "sidebar_menu_sub",
         div()
             .named("sidebar-menu-sub")
             .border_left(1.0)
