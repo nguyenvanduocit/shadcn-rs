@@ -49,6 +49,7 @@ macro_rules! props {
         $(
             $(#[$doc])*
             #[must_use]
+            #[track_caller]
             fn $name<M>(mut self, value: impl IntoValue<$ty, M>) -> Self {
                 let (style, bindings) = self.style_and_bindings();
                 const FIELDS: Fields = Fields::of(&[$(Field::$field),+]);

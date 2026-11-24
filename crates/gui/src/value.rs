@@ -64,6 +64,7 @@ pub trait IntoValue<T, M> {
     /// more. One trait for every setter and every reactive prop, so a prop
     /// given as `impl IntoValue` passes on to a style setter as it is.
     #[doc(hidden)]
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
     where
         Self: Sized,
@@ -131,6 +132,7 @@ impl<T> IntoValue<T, marker::Fixed> for T {
         Value::Fixed(self)
     }
 
+    #[track_caller]
     fn into_setting<W>(self, _: W, _: bool) -> Setting<T> {
         Setting(Given::Fixed(self))
     }
@@ -141,6 +143,7 @@ impl<T, F: Fn() -> T + 'static> IntoValue<T, marker::Bound> for F {
         Value::Bound(Rc::new(self))
     }
 
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
     where
         T: Clone + PartialEq + 'static,
@@ -155,6 +158,7 @@ impl<T, S: Convert<T>> IntoValue<T, marker::Via<S>> for S {
         Value::Fixed(self.convert())
     }
 
+    #[track_caller]
     fn into_setting<W>(self, _: W, _: bool) -> Setting<T> {
         Setting(Given::Fixed(self.convert()))
     }
@@ -165,6 +169,7 @@ impl<T, S: Convert<T>, F: Fn() -> S + 'static> IntoValue<T, marker::BoundVia<S>>
         Value::Bound(Rc::new(move || self().convert()))
     }
 
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
     where
         T: Clone + PartialEq + 'static,
@@ -189,6 +194,7 @@ macro_rules! source_values {
                     Value::Bound(Rc::new(move || self.get()))
                 }
 
+                #[track_caller]
                 fn into_setting<W>(self, write: W, keep: bool) -> Setting<$gives>
                 where
                     $gives: Clone + PartialEq + 'static,
@@ -208,6 +214,7 @@ macro_rules! source_values {
                     Value::Bound(Rc::new(move || read.get()))
                 }
 
+                #[track_caller]
                 fn into_setting<W>(self, write: W, keep: bool) -> Setting<Target>
                 where
                     Target: Clone + PartialEq + 'static,
@@ -232,6 +239,7 @@ impl<T: Clone + 'static> IntoValue<T, marker::Source> for Signal<T> {
         Value::Bound(Rc::new(move || self.get()))
     }
 
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
     where
         T: Clone + PartialEq + 'static,
@@ -258,6 +266,7 @@ impl<T, S: IntoValue<T, marker::Source>> IntoValue<T, marker::Source> for FixedO
         }
     }
 
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
     where
         T: Clone + PartialEq + 'static,
@@ -280,6 +289,7 @@ impl<T: Convert<Target>, S: IntoValue<Target, marker::SourceVia<T>>, Target> Int
         }
     }
 
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<Target>
     where
         Target: Clone + PartialEq + 'static,
@@ -297,6 +307,7 @@ impl<S: Clone + Convert<T> + 'static, T: 'static> IntoValue<T, marker::SourceVia
         Value::Bound(Rc::new(move || self.get().convert()))
     }
 
+    #[track_caller]
     fn into_setting<W>(self, write: W, keep: bool) -> Setting<T>
     where
         T: Clone + PartialEq + 'static,
@@ -1060,6 +1071,7 @@ pub(crate) fn apply(ops: &[Op], style: &mut Style) {
 /// `bindings` to run where the node resolves; without `bindings` (a
 /// bare [`Style`], a span) it runs now, tracked by whatever is
 /// running.
+#[track_caller]
 pub(crate) fn set<T, M, W>(
     style: &mut Style,
     bindings: Option<&mut Bindings>,

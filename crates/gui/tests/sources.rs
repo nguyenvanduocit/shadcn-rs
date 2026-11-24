@@ -39,12 +39,14 @@ fn tree(each: impl Fn() -> Div) -> Element {
 }
 
 /// The trackers (render nodes) and subscriptions a tree of `bound` holds
-/// once laid out, past what the same tree with fixed values holds; and
-/// whether dropping it left the graph as it was.
+/// once laid out and settled (what the first layout woke has run), past
+/// what the same tree with fixed values holds; and whether dropping it
+/// left the graph as it was.
 fn held(bound: &Element, fixed: &Element) -> (i64, i64, bool) {
     let count = |root: &Element| {
         let before = graph();
         let mut t = LayoutTree::new();
+        lay_out(&mut t, root);
         lay_out(&mut t, root);
         let after = graph();
         drop(t);
@@ -71,6 +73,15 @@ fn held(bound: &Element, fixed: &Element) -> (i64, i64, bool) {
 fn a_source_mount_holds_no_tracker() {
     // Hover: a closure, then the source.
     let fixed = tree(|| div().interaction(Interaction::new()).size(10.0).background(REST));
+    // What the engine makes once per thread (a debug build's check of a
+    // map or a conversion) made before counting.
+    held(
+        &tree(|| {
+            let i = Interaction::new();
+            div().interaction(i).background(i.hover(REST, LIT))
+        }),
+        &fixed,
+    );
     let closure = tree(|| {
         let i = Interaction::new();
         div()
@@ -106,10 +117,17 @@ fn a_source_mount_holds_no_tracker() {
     );
     assert_eq!(
         held(&source, &fixed),
-        (2, 2, true),
-        "the first mount's tracker and the others' hub, gone with the tree"
+        (1, 1, true),
+        "the signal's hub alone, gone with the tree"
     );
-    assert_eq!(held(&mapped, &fixed), (2, 2, true), "a map of it: the same");
+    assert_eq!(held(&mapped, &fixed), (1, 1, true), "a map of it: the same");
+    let one = div().child(div().height(10.0).width(w)).into_element();
+    let one_fixed = div().child(div().height(10.0).width(10.0)).into_element();
+    assert_eq!(
+        held(&one, &one_fixed),
+        (1, 1, true),
+        "one mount: its own tracker, as a closure's"
+    );
 
     // A group of two signals, made before the tree (its hub with it).
     let (a, b) = (Signal::new(1.0_f32), Signal::new(0.5_f32));
@@ -133,6 +151,69 @@ fn a_source_mount_holds_no_tracker() {
     assert!(reads <= 2, "the group's own reads at most: {reads}");
 }
 
+/// The mounts of one signal hold one tracker and one read however many
+/// they are: 16, then the same 16 hidden and shown again, then one.
+#[test]
+fn a_signals_mounts_hold_one_tracker_through_hide_and_show() {
+    let (w, shown) = (Signal::new(10.0_f32), Signal::new(true));
+    let display = move |on: &bool| if *on { Display::Block } else { Display::None };
+    // The trackers and reads held past `before`, at each step, by trees
+    // whose nodes read `w` (`bound`) or not.
+    let steps = |bound: bool| {
+        let root = |n: usize| {
+            div()
+                .children((0..n).map(|_| {
+                    let d = div().height(10.0).display(shown.map(display));
+                    if bound { d.width(w) } else { d.width(10.0) }
+                }))
+                .into_element()
+        };
+        let before = graph();
+        let held = || {
+            let now = graph();
+            let d = |a: usize, b: usize| {
+                i64::try_from(a)
+                    .unwrap_or(i64::MAX)
+                    .saturating_sub(i64::try_from(b).unwrap_or(i64::MAX))
+            };
+            (
+                d(now.renders, before.renders),
+                d(now.subscriptions, before.subscriptions),
+            )
+        };
+        let mut t = LayoutTree::new();
+        let settle = |t: &mut LayoutTree, root: &Element| {
+            for _ in 0..3 {
+                lay_out(t, root);
+            }
+        };
+        let (many, one) = (root(N), root(1));
+        settle(&mut t, &many);
+        let at_first = held();
+        shown.set(false);
+        settle(&mut t, &many);
+        shown.set(true);
+        settle(&mut t, &many);
+        let shown_again = held();
+        settle(&mut t, &one);
+        let down_to_one = held();
+        [at_first, shown_again, down_to_one]
+    };
+    // What the engine makes once per thread made before counting.
+    steps(true);
+    let (bound, fixed) = (steps(true), steps(false));
+    let held: Vec<(i64, i64)> = bound
+        .iter()
+        .zip(&fixed)
+        .map(|(b, f)| (b.0.saturating_sub(f.0), b.1.saturating_sub(f.1)))
+        .collect();
+    assert_eq!(
+        held,
+        [(1, 1); 3],
+        "16 mounts, the same hidden and shown again, then one: a tracker and a read"
+    );
+}
+
 /// A write runs the mounts that read what it wrote, and no other: not
 /// the mounts of another signal, not another source on the same node.
 #[test]
@@ -144,6 +225,8 @@ fn a_write_runs_exactly_the_mounts_that_read_it() {
         .children((0..N).map(|_| div().width(w.map(|w| w / 2.0)).height(h)))
         .into_element();
     let mut t = LayoutTree::new();
+    // Settled: the first mount of each signal moved into its hub.
+    lay_out(&mut t, &root);
     lay_out(&mut t, &root);
     let _mounted = gui::component::take_bindings();
     let n = u64::try_from(N).unwrap_or(u64::MAX);
@@ -272,23 +355,90 @@ fn hovering_runs_the_hover_mounts_alone() {
 #[test]
 fn a_node_hidden_by_a_source_comes_back() {
     let shown = Signal::new(false);
+    // Three, so all of them read through the hub, with no tracker: hidden,
+    // their registrations alone wake the parent.
+    let hidden = |name: &'static str| {
+        div()
+            .named(name)
+            .size(10.0)
+            .display(shown.map(|on| if *on { Display::Block } else { Display::None }))
+    };
     let root = div()
-        .child(
-            div()
-                .named("hidden")
-                .size(10.0)
-                .display(shown.map(|on| if *on { Display::Block } else { Display::None })),
-        )
+        .child(hidden("hidden"))
+        .child(hidden("second"))
+        .child(hidden("third"))
         .into_element();
     let mut t = LayoutTree::new();
+    lay_out(&mut t, &root);
     lay_out(&mut t, &root);
     assert!(node(t.frame(), "hidden").is_none(), "hidden at first");
     shown.set(true);
     lay_out(&mut t, &root);
     assert!(node(t.frame(), "hidden").is_some(), "shown once its signal says so");
+    lay_out(&mut t, &root);
     shown.set(false);
     lay_out(&mut t, &root);
     assert!(node(t.frame(), "hidden").is_none(), "and hidden again");
+    shown.set(true);
+    lay_out(&mut t, &root);
+    assert!(
+        node(t.frame(), "hidden").is_some() && node(t.frame(), "third").is_some(),
+        "and shown again, woken by the hub's registrations alone"
+    );
+}
+
+/// A node hidden while its own setters read its own handle (hidden from
+/// the start, or hidden once shown and hovered): a hidden node cannot be
+/// hovered, so what it read of its own handle wakes nothing, and the
+/// window rests; shown again, it follows its handle.
+#[test]
+fn a_node_hidden_with_its_own_hover_source_rests() {
+    let shown = Signal::new(true);
+    let (own, gone) = (Interaction::new(), Interaction::new());
+    let ui = move || {
+        div()
+            .child(
+                div()
+                    .named("own")
+                    .interaction(own)
+                    .size(40.0)
+                    .background(own.hover(REST, LIT))
+                    .display(shown.map(|on| if *on { Display::Block } else { Display::None }))
+                    .child(text("own")),
+            )
+            .child(
+                div()
+                    .interaction(gone)
+                    .size(10.0)
+                    .background(gone.hover(REST, LIT))
+                    .display(Display::None),
+            )
+            .into_element()
+    };
+    let mut s = Scenario::measuring(ui, 200, 200, 1.0).expect("a scenario");
+    s.settle().expect("a frame");
+    let (x, y) = s.locate("own").expect("the node");
+    s.hover(x, y);
+    s.settle().expect("a frame");
+    assert_eq!(look(&s, "own"), Some(LIT));
+    s.act("hide", || shown.set(false));
+    for _ in 0..3 {
+        s.settle().expect("a frame");
+    }
+    let _settled = gui::component::take_due();
+    for k in 0..5 {
+        let r = s.frame("idle").expect("a frame");
+        assert_eq!(r.visits.resolved, 0, "idle frame {k} resolves nothing: {}", r.visits);
+        assert!(!gui::component::take_due(), "idle frame {k} asks for no other");
+    }
+    s.act("show", || shown.set(true));
+    s.settle().expect("a frame");
+    s.leave();
+    s.settle().expect("a frame");
+    assert_eq!(look(&s, "own"), Some(REST));
+    s.hover(x, y);
+    s.settle().expect("a frame");
+    assert_eq!(look(&s, "own"), Some(LIT), "shown again, it follows its handle");
 }
 
 /// A source of a handle whose node is built after it (a later sibling's)
@@ -516,6 +666,32 @@ fn a_node_hidden_by_another_nodes_hover_shows_with_it() {
     s.hover(x, y);
     s.settle().expect("a frame");
     assert!(node(s.last(), "tip").is_some(), "and shown again");
+}
+
+/// An opacity scaled by a signal on its conversion: a conversion that
+/// reads, as no conversion may.
+#[derive(Clone, PartialEq)]
+struct Scaled(f32, Signal<f32>);
+
+impl gui::value::Convert<f32> for Scaled {
+    fn convert(self) -> f32 {
+        self.0 * self.1.get()
+    }
+}
+
+/// The conversion of what a source gives is part of its map: one that
+/// reads a signal is reported, naming the setter's call, for the one
+/// mount of a signal and for those sharing its hub alike.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "tests/sources.rs")]
+fn a_conversion_reading_a_signal_is_reported() {
+    let (o, scale) = (Signal::new(0.5_f32), Signal::new(1.0_f32));
+    let root = div()
+        .children((0..2).map(|_| div().size(10.0).opacity(o.map(move |v| Scaled(*v, scale)))))
+        .into_element();
+    let mut t = LayoutTree::new();
+    lay_out(&mut t, &root);
 }
 
 /// A map given to a source reads only what it is given: one that reads a

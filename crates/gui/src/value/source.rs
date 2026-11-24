@@ -13,25 +13,28 @@
 //! node resolves for another reason.
 //!
 //! Who owns what:
-//! - An [`Interaction`] handle that a source reads owns one list
-//!   (`interact::HandleSources`), made by its first reader and gone with
-//!   its last, whatever node the handle is bound to. Writing a flag of a
-//!   node wakes the list of the handle bound to it, for that flag; binding
-//!   the handle to a node, or unbinding it, wakes the whole list once.
+//! - The flag sources of every [`Interaction`] handle share one list
+//!   ([`HANDLE_WAITERS`]), a chain per handle, whatever node the handle is
+//!   bound to: a handle costs no allocation of its own. Writing a flag of
+//!   a node wakes the chain of the handle bound to it, for that flag;
+//!   binding the handle to a node, or unbinding it, wakes the whole chain.
 //! - A signal read by one mount is read by that mount's own tracker, as a
 //!   closure is: one source costs what the closure it replaces does. Read
-//!   by more, the others share one hub, one tracker for all of them, made
-//!   by the second mount and gone with the last ([`HUBS`]).
+//!   by more, all of them share one hub, one tracker: the second mount
+//!   makes it, and the first moves in when its node resolves next
+//!   ([`HUBS`]). It goes with the last.
 //! - A group's hub is the group's ([`Group::new`]), one tracker for every
 //!   mount of every map of it.
 //! - A registration ([`Wait`]) is the mount's: it leaves the list when the
 //!   mount goes (its node, or its write no longer bound), or moves to the
 //!   node's parent when the node is hidden (`display: none`), as a
-//!   tracker's reads do.
+//!   tracker's reads do; not one on a handle bound inside the hidden
+//!   subtree, which is never hovered nor focused while hidden.
 //!
-//! A map given to a source (`signal.map(f)`, `group.map(f)`) reads only
-//! what it is given: it runs untracked, so a signal it read would not wake
-//! it. A debug build reports such a read, naming the setter's call.
+//! A map given to a source (`signal.map(f)`, `group.map(f)`), and the
+//! conversion of what it gives to the setter's type, read only what they
+//! are given: they run untracked, so a signal they read would not wake
+//! them. A debug build reports such a read, naming the setter's call.
 //!
 //! A cold build (the cold check) registers nothing and touches no hub: its
 //! mounts read their sources directly at each resolve, so it changes no
@@ -66,18 +69,33 @@ pub(crate) fn cold() -> bool {
 
 /// One mount waiting on a source: the mark of its node, what it waits
 /// for (a bit per [`Flag`], or [`EVERY`]), whether it was woken since it
-/// last ran, and its key.
+/// last ran, its key, and in a list of chains, its chain and the keys
+/// before and after it there.
 struct Waiter {
     mark: Mark,
     mask: u8,
     woken: Cell<bool>,
     key: usize,
+    chain: Option<Link>,
+}
+
+/// A waiter's place in its chain: the chain, and the keys before and after
+/// it ([`GONE`] at either end).
+#[derive(Clone, Copy)]
+struct Link {
+    id: u64,
+    prev: usize,
+    next: usize,
 }
 
 /// The mounts waiting on one source, kept dense: a wake visits the mounts
 /// that wait now, not as many as ever did. A key names a mount for as long
 /// as it waits, whatever its place; keys and places freed by mounts that
 /// went are reused, so registering in steady state allocates nothing.
+///
+/// One list may hold many sources, a chain each (the flags of every
+/// [`Interaction`] handle, a chain per handle): a handle costs no list of
+/// its own, and a wake of a chain visits that chain's mounts alone.
 #[derive(Default)]
 pub(crate) struct Waiters {
     list: RefCell<List>,
@@ -92,6 +110,15 @@ struct List {
     /// Each key's place in `items`, [`GONE`] once free.
     at: Vec<usize>,
     free: Vec<usize>,
+    /// The first key of each chain.
+    heads: HashMap<u64, usize>,
+}
+
+impl List {
+    fn get_mut(&mut self, key: usize) -> Option<&mut Waiter> {
+        let at = *self.at.get(key)?;
+        self.items.get_mut(at)
+    }
 }
 
 impl Waiters {
@@ -102,18 +129,38 @@ impl Waiters {
             return;
         };
         for w in &list.items {
-            #[cfg(test)]
-            self.visits.set(self.visits.get().saturating_add(1));
-            if w.mask & mask != 0 {
-                w.woken.set(true);
-                (w.mark)();
-            }
+            self.visit(w, mask);
         }
     }
 
-    /// Register a mount, woken through `mark` by a wake of any of `mask`;
-    /// `keep` is what the registration holds alive (a hub, a handle's list).
-    fn wait(self: &Rc<Self>, mark: &Mark, mask: u8, keep: Option<Rc<dyn Any>>) -> Wait {
+    /// Wake the waiters of chain `id` of any of `mask`. Allocates nothing.
+    pub(crate) fn wake_chain(&self, id: u64, mask: u8) {
+        let Ok(list) = self.list.try_borrow() else {
+            return;
+        };
+        let mut key = list.heads.get(&id).copied().unwrap_or(GONE);
+        while let Some(w) = list.at.get(key).and_then(|&at| list.items.get(at)) {
+            self.visit(w, mask);
+            key = w.chain.map_or(GONE, |c| c.next);
+        }
+    }
+
+    fn visit(&self, w: &Waiter, mask: u8) {
+        #[cfg(test)]
+        self.visits.set(self.visits.get().saturating_add(1));
+        if w.mask & mask != 0 {
+            w.woken.set(true);
+            (w.mark)();
+        }
+    }
+
+    /// Register a mount, woken through `mark` by a wake of any of `mask`
+    /// (of chain `chain`, if given); `keep` is what the registration holds
+    /// alive (a signal's hub).
+    ///
+    /// Panics if the list is waking: a wake runs marks alone, which push a
+    /// node to resolve and run no mount, so no mount registers during one.
+    fn wait(self: &Rc<Self>, mark: &Mark, mask: u8, chain: Option<u64>, keep: Option<Rc<dyn Any>>) -> Wait {
         let mut list = self.list.borrow_mut();
         let place = list.items.len();
         let key = match list.free.pop() {
@@ -128,11 +175,20 @@ impl Waiters {
                 list.at.len().saturating_sub(1)
             }
         };
+        // First in its chain.
+        let chain = chain.map(|id| {
+            let next = list.heads.insert(id, key).unwrap_or(GONE);
+            if let Some(n) = list.get_mut(next).and_then(|n| n.chain.as_mut()) {
+                n.prev = key;
+            }
+            Link { id, prev: GONE, next }
+        });
         list.items.push(Waiter {
             mark: Rc::clone(mark),
             mask,
             woken: Cell::new(false),
             key,
+            chain,
         });
         Wait {
             on: Some(Rc::clone(self)),
@@ -156,10 +212,10 @@ impl Waiters {
 pub(crate) struct Wait {
     on: Option<Rc<Waiters>>,
     key: usize,
-    /// What it holds alive: a signal's hub, a handle's list.
+    /// What it holds alive: a signal's hub.
     keep: Option<Rc<dyn Any>>,
-    /// The signal it reads alone, under its own tracker.
-    solo: Option<(usize, u32)>,
+    /// The signal it reads alone, under its own tracker, and its claim.
+    solo: Option<((usize, u32), u64)>,
 }
 
 impl Wait {
@@ -170,8 +226,12 @@ impl Wait {
     }
 
     /// Whether the source woke it since it last ran. A solo mount's
-    /// tracker says so for it.
+    /// tracker says so for it, until the hub took its claim: it then runs
+    /// to move in.
     fn woken(&self) -> bool {
+        if self.solo.is_some() {
+            return !self.is_solo();
+        }
         self.on.is_some() && self.with(|w| w.woken.get()).unwrap_or(true)
     }
 
@@ -181,34 +241,41 @@ impl Wait {
     }
 
     /// Whether it waits on `list` for `mask`; on `list` for another mask,
-    /// it waits for `mask` from now on.
+    /// it waits for `mask` from now on. False when it could not say so (the
+    /// list is waking): registered anew.
     fn holds(&self, list: &Rc<Waiters>, mask: u8) -> bool {
         if !self.on.as_ref().is_some_and(|on| Rc::ptr_eq(on, list)) {
             return false;
         }
-        if let Ok(mut l) = list.list.try_borrow_mut()
-            && let Some(&at) = l.at.get(self.key)
-            && let Some(w) = l.items.get_mut(at)
-        {
-            w.mask = mask;
+        let Ok(mut l) = list.list.try_borrow_mut() else {
+            return false;
+        };
+        match l.at.get(self.key).copied().and_then(|at| l.items.get_mut(at)) {
+            Some(w) => {
+                w.mask = mask;
+                true
+            }
+            None => false,
         }
-        true
     }
 
-    /// What it keeps alive, if it is a `T`.
-    fn kept<T: 'static>(&self) -> Option<&T> {
-        self.keep.as_deref().and_then(|k| k.downcast_ref::<T>())
+    /// The handle whose flag it waits on, for a flag source.
+    pub(crate) fn handle(&self) -> Option<u64> {
+        self.with(|w| w.chain.map(|c| c.id)).flatten()
     }
 
-    /// Whether it is the solo read of a signal: its mount runs under a
-    /// tracker of its own.
-    pub(crate) const fn is_solo(&self) -> bool {
-        self.solo.is_some()
+    /// Whether it is the solo read of a signal, its claim standing: its
+    /// mount runs under a tracker of its own.
+    pub(crate) fn is_solo(&self) -> bool {
+        self.solo.is_some_and(|(key, id)| claim(key, id, |_| ()).is_some())
     }
 
     /// Wake `mark`'s node from now on (a hidden node's parent, which
     /// builds the node again when what hid it changes).
     pub(crate) fn repoint(&self, mark: &Mark) {
+        if let Some((key, id)) = self.solo {
+            claim(key, id, |c| c.mark = Rc::clone(mark));
+        }
         if let Some(on) = &self.on
             && let Ok(mut l) = on.list.try_borrow_mut()
             && let Some(&at) = l.at.get(self.key)
@@ -221,8 +288,8 @@ impl Wait {
 
 impl Drop for Wait {
     fn drop(&mut self) {
-        if let Some(key) = self.solo {
-            solo_gone(key);
+        if let Some((key, id)) = self.solo {
+            solo_gone(key, id);
         }
         // Borrowed only while it wakes, and a mark drops no registration:
         // should one, the waiter stays, waking a node for nothing.
@@ -231,6 +298,21 @@ impl Drop for Wait {
             && let Some(at) = l.at.get(self.key).copied().filter(|&a| a != GONE)
             && at < l.items.len()
         {
+            // Out of its chain first.
+            if let Some(Link { id, prev, next }) = l.items.get(at).and_then(|w| w.chain) {
+                match l.get_mut(prev).and_then(|p| p.chain.as_mut()) {
+                    Some(p) => p.next = next,
+                    None if next == GONE => {
+                        l.heads.remove(&id);
+                    }
+                    None => {
+                        l.heads.insert(id, next);
+                    }
+                }
+                if let Some(n) = l.get_mut(next).and_then(|n| n.chain.as_mut()) {
+                    n.prev = prev;
+                }
+            }
             l.items.swap_remove(at);
             if let Some(moved) = l.items.get(at).map(|w| w.key)
                 && let Some(m) = l.at.get_mut(moved)
@@ -362,11 +444,23 @@ impl<F: Fn() -> T + 'static, T: 'static> Read for Closure<F> {
 }
 
 /// A source whose value converts to the setter's ([`super::Convert`]).
-pub(crate) struct Via<R, T>(pub(crate) R, std::marker::PhantomData<fn() -> T>);
+/// The conversion is part of its map: it reads only what it is given (a
+/// debug build reports a signal it reads, naming the setter's call), or
+/// its mounts would give what the order they ran in made them read.
+pub(crate) struct Via<R, T> {
+    read: R,
+    at: &'static Location<'static>,
+    to: std::marker::PhantomData<fn() -> T>,
+}
 
 impl<R, T> Via<R, T> {
+    #[track_caller]
     pub(crate) fn new(read: R) -> Self {
-        Self(read, std::marker::PhantomData)
+        Self {
+            read,
+            at: Location::caller(),
+            to: std::marker::PhantomData,
+        }
     }
 }
 
@@ -378,15 +472,16 @@ where
     const TRACKED: bool = R::TRACKED;
 
     fn get(&self) -> T {
-        super::Convert::convert(self.0.get())
+        super::Convert::convert(self.read.get())
     }
 
     fn peek(&self, solo: bool) -> T {
-        super::Convert::convert(self.0.peek(solo))
+        let v = self.read.peek(solo);
+        pure(self.at, || super::Convert::convert(v))
     }
 
     fn watch(&self, mark: &Mark, wait: &mut Option<Wait>) {
-        self.0.watch(mark, wait);
+        self.read.watch(mark, wait);
     }
 }
 
@@ -400,7 +495,7 @@ fn keep(
     hold: impl FnOnce() -> Option<Rc<dyn Any>>,
 ) {
     if !wait.as_ref().is_some_and(|w| w.holds(list, mask)) {
-        *wait = Some(list.wait(mark, mask, hold()));
+        *wait = Some(list.wait(mark, mask, None, hold()));
     }
 }
 
@@ -458,37 +553,65 @@ impl<T: Clone + 'static> Read for Toggle<T> {
     }
 
     fn watch(&self, mark: &Mark, wait: &mut Option<Wait>) {
-        let bit = self.flag.bit();
-        // Registered with this handle already: no lookup.
+        let (bit, id) = (self.flag.bit(), self.handle.id());
+        let list = HANDLE_WAITERS.with(Rc::clone);
+        // Registered with this handle already (for this flag from now on).
         if let Some(w) = wait.as_ref()
-            && let Some(s) = w.kept::<crate::interact::HandleSources>()
-            && s.handle == self.handle
+            && w.handle() == Some(id)
+            && w.holds(&list, bit)
         {
-            let list = Rc::clone(&s.waiters);
-            w.holds(&list, bit);
             return;
         }
-        let sources = self.handle.sources();
-        let list = Rc::clone(&sources.waiters);
-        *wait = Some(list.wait(mark, bit, Some(sources)));
+        *wait = Some(list.wait(mark, bit, Some(id), None));
     }
+}
+
+crate::engine::engine_local! {
+    /// The flag sources of every handle, a chain per handle: bound or not,
+    /// whatever node it is bound to.
+    [Shared("registered with by live mounts only: a cold build's mounts register nowhere")]
+    static HANDLE_WAITERS: Rc<Waiters> = Rc::default();
+}
+
+/// Wake the flag sources of handle `id` waiting for any of `mask`.
+pub(crate) fn wake_handle(id: u64, mask: u8) {
+    if mask == 0 || cold() {
+        return;
+    }
+    // The thread may be ending (its engine state with it).
+    HANDLE_WAITERS.try_with(|w| w.wake_chain(id, mask)).ok();
 }
 
 // ── one signal ────────────────────────────────────────────────────────
 
-/// What the mounts of one signal share: how many read it alone, under a
-/// tracker of their own, and the hub the others share.
+/// The claim of the one mount reading a signal alone: which claim it is,
+/// and the mark that wakes its node (to move into the hub, once another
+/// mount reads the signal).
+struct Claim {
+    id: u64,
+    mark: Mark,
+}
+
+/// What the mounts of one signal share: the claim of the one reading it
+/// alone, under a tracker of its own, or the hub all of them share.
 #[derive(Default)]
 struct SignalReaders {
-    solo: u32,
+    solo: Option<Claim>,
     hub: Weak<SignalHub>,
+}
+
+/// The readers of each signal a source reads, and the last claim made.
+#[derive(Default)]
+struct Readers {
+    last: u64,
+    by: HashMap<(usize, u32), SignalReaders>,
 }
 
 crate::engine::engine_local! {
     /// The readers of each signal a source reads, by the signal's slot and
     /// generation: gone with the last.
     [Shared("made and registered with by live mounts only: a cold build reads its signals directly")]
-    static HUBS: RefCell<HashMap<(usize, u32), SignalReaders>> = RefCell::default();
+    static HUBS: RefCell<Readers> = RefCell::default();
 }
 
 /// A signal's hub, and the signal it stands for.
@@ -498,19 +621,34 @@ pub(crate) struct SignalHub {
 }
 
 /// Drop the entry of `key` when nothing reads it any more.
-fn forget(h: &mut HashMap<(usize, u32), SignalReaders>, key: (usize, u32)) {
-    if h.get(&key).is_some_and(|r| r.solo == 0 && r.hub.strong_count() == 0) {
-        h.remove(&key);
+fn forget(h: &mut Readers, key: (usize, u32)) {
+    if h.by
+        .get(&key)
+        .is_some_and(|r| r.solo.is_none() && r.hub.strong_count() == 0)
+    {
+        h.by.remove(&key);
     }
 }
 
-/// A solo reader of `key` went.
-fn solo_gone(key: (usize, u32)) {
+/// Run `f` on the claim `(key, id)`, if it still stands (no hub took it).
+fn claim<R>(key: (usize, u32), id: u64, f: impl FnOnce(&mut Claim) -> R) -> Option<R> {
+    HUBS.try_with(|h| {
+        let mut h = h.try_borrow_mut().ok()?;
+        h.by.get_mut(&key)?.solo.as_mut().filter(|c| c.id == id).map(f)
+    })
+    .ok()
+    .flatten()
+}
+
+/// The claim `(key, id)` went with its mount.
+fn solo_gone(key: (usize, u32), id: u64) {
     // The thread may be ending (its engine state with it).
     HUBS.try_with(|h| {
         if let Ok(mut h) = h.try_borrow_mut() {
-            if let Some(r) = h.get_mut(&key) {
-                r.solo = r.solo.saturating_sub(1);
+            if let Some(r) = h.by.get_mut(&key)
+                && r.solo.as_ref().is_some_and(|c| c.id == id)
+            {
+                r.solo = None;
             }
             forget(&mut h, key);
         }
@@ -529,29 +667,41 @@ impl Drop for SignalHub {
     }
 }
 
-/// How a new mount reads `key`: alone, when no other mount reads it; else
-/// through the hub, made now if the other reads it alone.
-fn join(key: (usize, u32)) -> Option<Rc<SignalHub>> {
-    HUBS.with(|h| {
+/// How a mount reading `key` through `mark` joins its readers: alone (a
+/// claim), when no other mount reads it; else through the hub. The hub is
+/// made by the second mount, and the first, reading alone, is woken to
+/// move into it: N mounts of a signal hold one tracker.
+fn join(key: (usize, u32), mark: &Mark) -> Result<Rc<SignalHub>, u64> {
+    let (hub, moved) = HUBS.with(|h| {
         let mut h = h.borrow_mut();
-        let r = h.entry(key).or_default();
+        h.last = h.last.wrapping_add(1);
+        let id = h.last;
+        let r = h.by.entry(key).or_default();
         if let Some(hub) = r.hub.upgrade() {
-            return Some(hub);
+            return (Ok(hub), None);
         }
-        if r.solo == 0 {
-            r.solo = 1;
-            return None;
-        }
+        let Some(first) = r.solo.take() else {
+            r.solo = Some(Claim {
+                id,
+                mark: Rc::clone(mark),
+            });
+            return (Err(id), None);
+        };
         let hub = Rc::new(SignalHub { key, hub: Hub::new() });
         r.hub = Rc::downgrade(&hub);
-        Some(hub)
-    })
+        (Ok(hub), Some(first.mark))
+    });
+    // The first moves in when its node resolves next.
+    if let Some(m) = moved {
+        m();
+    }
+    hub
 }
 
 /// `f` of what a [`Signal`] holds, as a setter's value (`signal.map(f)`).
-/// Its first mount reads the signal under a tracker of its own; the
-/// others register with the signal's hub, one tracker for all of them.
-/// `f` reads only what it is given.
+/// Its one mount reads the signal under a tracker of its own, as a closure
+/// does; mounted more than once, all of them register with the signal's
+/// hub, one tracker for all of them. `f` reads only what it is given.
 pub struct Mapped<S: 'static, F> {
     signal: Signal<S>,
     f: F,
@@ -603,24 +753,32 @@ impl<S: 'static, T: 'static, F: Fn(&S) -> T + 'static> Read for Mapped<S, F> {
     fn watch(&self, mark: &Mark, wait: &mut Option<Wait>) {
         let signal = self.signal;
         let key = signal.key();
-        if wait.as_ref().is_some_and(|w| w.solo == Some(key)) {
-            // Read alone already, under its mount's tracker.
+        if let Some(w) = wait.as_ref()
+            && let Some((k, _)) = w.solo
+            && k == key
+            && w.is_solo()
+        {
+            // Read alone still, under its mount's tracker.
             return;
         }
-        // Its hub, held already, or joined now.
+        // Its hub, held already, or joined now (a claim taken by the hub
+        // joins it).
         let held = wait
             .as_ref()
             .and_then(|w| w.keep.clone())
             .and_then(|k| k.downcast::<SignalHub>().ok())
             .filter(|h| h.key == key);
-        let Some(hub) = held.or_else(|| join(key)) else {
-            *wait = Some(Wait {
-                on: None,
-                key: 0,
-                keep: None,
-                solo: Some(key),
-            });
-            return;
+        let hub = match held.map_or_else(|| join(key, mark), Ok) {
+            Ok(hub) => hub,
+            Err(id) => {
+                *wait = Some(Wait {
+                    on: None,
+                    key: 0,
+                    keep: None,
+                    solo: Some((key, id)),
+                });
+                return;
+            }
         };
         hub.hub.arm(|| {
             if signal.is_alive() {
@@ -787,7 +945,7 @@ mod tests {
     fn a_wake_visits_the_live_mounts_alone() {
         let w = Rc::new(Waiters::default());
         let (m, woke) = mark();
-        let mut waits: Vec<_> = (0..64).map(|_| w.wait(&m, EVERY, None)).collect();
+        let mut waits: Vec<_> = (0..64).map(|_| w.wait(&m, EVERY, None, None)).collect();
         let last = waits.pop();
         drop(waits);
         w.visits.set(0);
@@ -800,10 +958,44 @@ mod tests {
         );
         // Mounted and unmounted again and again: the same places.
         for _ in 0..10 {
-            let again: Vec<_> = (0..63).map(|_| w.wait(&m, EVERY, None)).collect();
+            let again: Vec<_> = (0..63).map(|_| w.wait(&m, EVERY, None, None)).collect();
             drop(again);
         }
         assert_eq!(w.sizes(), (1, 64), "one waits; no place was added");
+    }
+
+    /// Chains in one list, their waiters interleaved and some gone: a wake
+    /// of a chain visits the waiters of that chain left, and wakes them
+    /// alone; a chain emptied goes.
+    #[test]
+    fn a_chain_wakes_its_own_waiters_alone() {
+        let w = Rc::new(Waiters::default());
+        let (a, woke_a) = mark();
+        let (b, woke_b) = mark();
+        let mut waits: Vec<_> = (0..12)
+            .map(|k| {
+                if k % 2 == 0 {
+                    w.wait(&a, EVERY, Some(1), None)
+                } else {
+                    w.wait(&b, EVERY, Some(2), None)
+                }
+            })
+            .collect();
+        // Out of the middle, the head and the tail of each chain.
+        for k in [11, 10, 5, 4, 1, 0] {
+            drop(waits.remove(k));
+        }
+        w.visits.set(0);
+        w.wake_chain(1, EVERY);
+        assert_eq!(
+            (w.visits.get(), woke_a.get(), woke_b.get()),
+            (3, 3, 0),
+            "chain 1's three left"
+        );
+        w.wake_chain(2, 1);
+        assert_eq!(woke_b.get(), 3, "chain 2's three");
+        drop(waits);
+        assert!(w.list.borrow().heads.is_empty(), "emptied, the chains go");
     }
 
     /// A group mounted on many nodes, then on one: a change visits the one

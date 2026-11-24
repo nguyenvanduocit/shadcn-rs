@@ -62,8 +62,9 @@ pub struct Interaction(u64);
 /// node that is given an [`Interaction`] and disposed with the node: what
 /// hit testing and focus write, and what the handles bound to it read.
 /// A closure reads a flag's signal under its own tracker; a source
-/// ([`Interaction::hover`]) registers with the handle ([`HandleSources`]),
-/// which a write of a flag wakes, for that flag alone, through `bound`.
+/// ([`Interaction::hover`]) registers with the handle (its chain of the
+/// flag sources' list, `value::source`), which a write of a flag wakes,
+/// for that flag alone, through `bound`.
 #[derive(Clone)]
 pub(crate) struct NodeFlags {
     hovered: Signal<bool>,
@@ -82,48 +83,12 @@ impl PartialEq for NodeFlags {
     }
 }
 
-/// The sources reading one handle ([`Interaction::hover`]): their list,
-/// made by the first, gone with the last, whatever node the handle is
-/// bound to. A write of a flag of the node it is bound to wakes it for
-/// that flag; binding it to a node, or unbinding it, wakes all of it.
-pub(crate) struct HandleSources {
-    pub(crate) handle: Interaction,
-    pub(crate) waiters: std::rc::Rc<crate::value::source::Waiters>,
-}
-
-impl Drop for HandleSources {
-    fn drop(&mut self) {
-        // The thread may be ending (its handles with it); borrowed, the
-        // entry stays dead, and the next reader replaces it.
-        HANDLES
-            .try_with(|h| {
-                if let Ok(mut h) = h.try_borrow_mut()
-                    && h.sources.get(&self.handle.0).is_some_and(|s| s.strong_count() == 0)
-                {
-                    h.sources.remove(&self.handle.0);
-                }
-            })
-            .ok();
-    }
-}
-
 /// Wake the sources of `handle` registered for any of `mask` (none in a
-/// cold frame: what it writes is undone).
+/// cold frame: what it writes is undone). A write of a flag of the node it
+/// is bound to wakes them for that flag; binding it to a node, or
+/// unbinding it, wakes all of them.
 fn wake_sources(handle: Interaction, mask: u8) {
-    if mask == 0 || crate::value::source::cold() {
-        return;
-    }
-    let list = HANDLES
-        .try_with(|h| {
-            h.try_borrow()
-                .ok()
-                .and_then(|h| h.sources.get(&handle.0).and_then(std::rc::Weak::upgrade))
-        })
-        .ok()
-        .flatten();
-    if let Some(s) = list {
-        s.waiters.wake(mask);
-    }
+    crate::value::source::wake_handle(handle.0, mask);
 }
 
 impl std::fmt::Debug for NodeFlags {
@@ -177,9 +142,6 @@ struct Handles {
     early: crate::engine::ForkMap<u64, u64>,
     reads: u64,
     bind: Option<Signal<u64>>,
-    /// The sources reading each handle, live mounts' alone (a cold build
-    /// registers nowhere): not forked.
-    sources: std::collections::HashMap<u64, std::rc::Weak<HandleSources>>,
     /// The scalars as they were when a cold frame began.
     #[cfg(debug_assertions)]
     was: Option<(u64, u64, Option<Signal<u64>>)>,
@@ -440,21 +402,9 @@ impl Interaction {
         self.flags().is_some_and(|f| read(f.signal(flag)))
     }
 
-    /// Where a source of it registers, bound or not: its list, made now
-    /// if no source reads it yet.
-    pub(crate) fn sources(self) -> std::rc::Rc<HandleSources> {
-        HANDLES.with(|h| {
-            let mut h = h.borrow_mut();
-            if let Some(s) = h.sources.get(&self.0).and_then(std::rc::Weak::upgrade) {
-                return s;
-            }
-            let s = std::rc::Rc::new(HandleSources {
-                handle: self,
-                waiters: std::rc::Rc::default(),
-            });
-            h.sources.insert(self.0, std::rc::Rc::downgrade(&s));
-            s
-        })
+    /// Its number: the chain its sources register in, bound or not.
+    pub(crate) const fn id(self) -> u64 {
+        self.0
     }
 
     /// The flags it is bound to, and, unbound and read outside a render,
@@ -592,6 +542,11 @@ impl NodeInteraction {
     /// The node's flags, if it was ever given a handle.
     pub(crate) fn flags(&self) -> Option<NodeFlags> {
         self.flags.clone()
+    }
+
+    /// The handle bound to the node, if any.
+    pub(crate) const fn handle(&self) -> Option<Interaction> {
+        self.bound
     }
 
     /// The node was given no handle: its flags go.
@@ -1638,13 +1593,22 @@ impl InputState {
     pub fn sync_focus(&mut self, tree: &LayoutTree) {
         self.state.focused = focus::focused();
         self.state.focus_visible = focus::focus_visible();
+        // Where the focused node lies, found here once from the focus owner
+        // and nowhere else: a pass reads it before it descends, so an
+        // ancestor built before the focused node (a cold frame's are all
+        // built so) is told focus is within it as the live one is.
+        let frame = tree.frame();
+        let at = self.state.focused.and_then(|id| tree.focus_index(id));
+        let focus_at = at.and_then(|at| frame.nodes.get(at)).map(|n| (&n.path, n.layer));
+        let moved = self.state.focus_at.as_ref().map(|(p, l)| (p, *l)) != focus_at;
+        if moved {
+            self.state.focus_at = focus_at.map(|(p, l)| (p.clone(), l));
+        }
         let now = (self.state.focused, self.state.focus_visible);
-        if self.shown_focus == Some(now) {
+        if self.shown_focus == Some(now) && !moved {
             return;
         }
         self.shown_focus = Some(now);
-        let frame = tree.frame();
-        let at = self.state.focused.and_then(|id| tree.focus_index(id));
         let (mut chain, mut was) = (std::mem::take(&mut self.chain), std::mem::take(&mut self.was));
         chain.clear();
         chain.extend(at.into_iter().flat_map(|at| frame.ancestors(at)));
@@ -1652,7 +1616,6 @@ impl InputState {
         self.focus_marks.take(frame, &mut was, |i| {
             frame.behaviour(i).is_some_and(|b| b.interaction.is_some())
         });
-        let focus = at.and_then(|at| frame.nodes.get(at)).map(|n| (&n.path, n.layer));
         let keyboard = self.state.focus_visible;
         let write = |i: usize| {
             let (Some(b), Some(node)) = (frame.behaviour(i), frame.nodes.get(i)) else {
@@ -1664,7 +1627,7 @@ impl InputState {
                 node.layer,
                 at == Some(i),
                 b.field.is_some(),
-                focus,
+                focus_at,
                 keyboard,
             );
             it.set_focus(focused, visible, within);

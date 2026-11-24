@@ -352,6 +352,18 @@ impl LayoutTree {
             if let Some(b) = self.extra_mut(node.user).and_then(|e| e.style_binding.as_mut()) {
                 b.take_waits(&mut waits);
             }
+            // Not what reads a handle bound inside it: a hidden node is never
+            // hovered nor focused, and built again it registers anew. Handed
+            // on, its unbinding would wake the parent, which builds it hidden
+            // again, which unbinds it.
+            let mut k = from;
+            while let Some(w) = waits.get(k) {
+                if w.handle().is_some_and(|h| self.bound_inside(&node, h)) {
+                    drop(waits.swap_remove(k));
+                } else {
+                    k = k.saturating_add(1);
+                }
+            }
             let marks = Rc::clone(&self.marks);
             if let Some(p) = self.extra_mut(parent) {
                 if let Some(moved) = waits.get(from..)
@@ -368,6 +380,15 @@ impl LayoutTree {
             }
         }
         self.release(node);
+    }
+
+    /// Whether the handle numbered `handle` is bound to `node` or a node
+    /// below it.
+    fn bound_inside(&self, node: &Node, handle: u64) -> bool {
+        self.extra(node.user)
+            .and_then(|e| e.interaction.handle())
+            .is_some_and(|h| h.id() == handle)
+            || node.children.iter().any(|c| self.bound_inside(c, handle))
     }
 
     /// Recount what `node`'s subtree needs from its children.
