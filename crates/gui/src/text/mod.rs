@@ -334,8 +334,8 @@ struct Shaped {
     /// Its lines' boxes as so broken, by Blink's rules ([`rows`]).
     rows: Vec<Row>,
     shift: f32,
-    /// The widths `pretty` and `balance` settled on, by how they were asked.
-    settled: Vec<(Breaking, f32)>,
+    /// Where `pretty` and `balance` settled its lines, by how they were asked.
+    settled: Vec<(Breaking, Fit)>,
     /// Each line's size and baseline under the last few breakings, so
     /// layout's probes at alternating widths measure without breaking
     /// the lines again.
@@ -1047,41 +1047,30 @@ impl TextSystem {
                 };
             }
         } else if let Some(w) = width {
-            let settled = s.settled.iter().find(|(b, _)| *b == how).map(|(_, w)| *w);
-            let at = match settled {
-                Some(at) => at,
+            let settled = s.settled.iter().find(|(b, _)| *b == how).map(|(_, f)| *f);
+            let fit = match settled {
+                Some(fit) => fit,
                 None => {
-                    let at = match how.wrap_style {
-                        WrapStyle::Auto => w,
+                    let fit = match how.wrap_style {
+                        WrapStyle::Auto => Fit::whole(w),
                         WrapStyle::Pretty => pretty(&mut s.layout, &s.content, w, how.lines, &mut self.lines_broken),
                         WrapStyle::Balance => balance(&mut s.layout, w, how.lines, &mut self.lines_broken),
                     };
                     if s.settled.len() >= 8 {
                         s.settled.clear();
                     }
-                    s.settled.push((how, at));
-                    at
+                    s.settled.push((how, fit));
+                    fit
                 }
             };
-            match how.lines {
-                // Line by line, up to the most it asks for (Parley breaks
-                // incrementally): a clamped document's first line wrapping
-                // into thousands breaks only the lines shown.
-                Some(most) => {
-                    let mut lines = s.layout.break_lines();
-                    lines.state_mut().set_layout_max_advance(at);
-                    lines.state_mut().set_line_max_advance(at);
-                    let mut broken = 0_u32;
-                    // Only a line break yields: its boxes are in flow, and
-                    // it has no height to exceed.
-                    while broken < most && lines.break_next().is_some() {
-                        broken = broken.saturating_add(1);
-                    }
-                    lines.finish();
-                }
-                None => s.layout.break_all_lines(Some(at)),
-            }
-            s.shift = (w - at) * factor;
+            // Up to the most lines it asks for (Parley breaks line by
+            // line): a clamped document's first line wrapping into
+            // thousands breaks only the lines shown. Every line is aligned
+            // in the box, narrowed ones too: no shift.
+            let most = how
+                .lines
+                .map_or(usize::MAX, |m| usize::try_from(m).unwrap_or(usize::MAX));
+            break_fit(&mut s.layout, w, fit, most);
         }
         rows(&s.layout, &s.key, &mut s.rows);
         s.broken = Some(how);
@@ -3866,59 +3855,101 @@ fn empty_baseline(layout: &Layout<u32>, t: &ResolvedText) -> f32 {
 /// one past at most: what follows is not broken (Parley breaks line by
 /// line), so a long paragraph is not broken whole to learn it is long.
 /// Its lines are all broken when it returns `cap` or fewer.
-fn lines_upto(layout: &mut Layout<u32>, width: f32, cap: usize, broken: &mut u64) -> usize {
-    let mut lines = layout.break_lines();
-    lines.state_mut().set_layout_max_advance(width);
-    lines.state_mut().set_line_max_advance(width);
-    let mut n = 0_usize;
-    while n <= cap && lines.break_next().is_some() {
-        n = n.saturating_add(1);
-    }
-    lines.finish();
+fn lines_upto(layout: &mut Layout<u32>, width: f32, fit: Fit, cap: usize, broken: &mut u64) -> usize {
+    let n = break_fit(layout, width, fit, cap.saturating_add(1));
     *broken = broken.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
     n
 }
 
-/// Break `layout` at `width` whole (a paragraph known to be short), the
-/// lines it breaks counted in `broken`.
-fn break_short(layout: &mut Layout<u32>, width: f32, broken: &mut u64) -> usize {
-    layout.break_all_lines(Some(width));
-    *broken = broken.saturating_add(u64::try_from(layout.len()).unwrap_or(u64::MAX));
-    layout.len()
+/// Where a wrapped piece's lines break: those from line `from` on at most
+/// `at` wide, those before it at the box's width. `pretty` narrows a
+/// paragraph's last lines only, and `balance` all of them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Fit {
+    from: usize,
+    at: f32,
 }
 
-/// The narrowest width at which `layout` keeps the line count it has at
-/// `width` and its last line is not one word alone, as Chromium's
-/// `text-wrap: pretty` re-breaks short paragraphs; `width` itself when no
-/// width does. Only a paragraph of at most [`PRETTY_MAX_LINES`] lines, all
-/// of them shown (`shown`: a clamp's, else all): a clamp that hides its
-/// last line leaves its lines as they wrap, its hidden ones never broken.
-fn pretty(layout: &mut Layout<u32>, content: &str, width: f32, shown: Option<u32>, broken: &mut u64) -> f32 {
-    let cap = shown.map_or(PRETTY_MAX_LINES, |s| {
-        PRETTY_MAX_LINES.min(usize::try_from(s).unwrap_or(usize::MAX))
-    });
-    let count = lines_upto(layout, width, cap, broken);
-    if !(2..=cap).contains(&count) || !orphan(layout, content) {
-        return width;
+impl Fit {
+    /// Every line at the box's width `width`, as text wraps by default.
+    const fn whole(width: f32) -> Self {
+        Self { from: 0, at: width }
     }
+}
+
+/// Break `layout`'s lines in a box `width` wide as `fit` says, line by
+/// line and up to `most` of them: what follows is never broken. A
+/// narrowed line is still aligned in the whole box, as Blink places the
+/// lines its `ScoreLineBreaker` chose. How many lines it broke.
+fn break_fit(layout: &mut Layout<u32>, width: f32, fit: Fit, most: usize) -> usize {
+    let mut lines = layout.break_lines();
+    lines.state_mut().set_layout_max_advance(width);
+    let mut n = 0_usize;
+    while n < most {
+        let narrowed = n >= fit.from && fit.at < width;
+        lines
+            .state_mut()
+            .set_line_max_advance(if narrowed { fit.at } else { width });
+        // Only a line break yields: its boxes are in flow, and it has no
+        // height to exceed.
+        if lines.break_next().is_none() {
+            break;
+        }
+        if narrowed {
+            lines.set_prior_line_width(width);
+        }
+        n = n.saturating_add(1);
+    }
+    lines.finish();
+    n
+}
+
+/// Where `layout`'s last lines break so the last is not one short word
+/// alone, as Chromium's `text-wrap: pretty` (`ScoreLineBreaker`) re-breaks
+/// them: its last [`PRETTY_MAX_LINES`] lines (all of a shorter paragraph)
+/// at the narrowest width that keeps their count and sends a word down,
+/// the lines before them wrapping as they would. Only when the greedy last
+/// line is one word shorter than a third of the box (Blink's
+/// `ShouldOptimize`), and only a paragraph whose lines are all shown
+/// (`shown`: a clamp's, else all): a clamp that hides its last line leaves
+/// its lines as they wrap, its hidden ones never broken.
+fn pretty(layout: &mut Layout<u32>, content: &str, width: f32, shown: Option<u32>, broken: &mut u64) -> Fit {
+    let whole = Fit::whole(width);
+    let cap = shown.map_or(usize::MAX, |s| usize::try_from(s).unwrap_or(usize::MAX));
+    let count = lines_upto(layout, width, whole, cap, broken);
+    if !(2..=cap).contains(&count) || !orphan(layout, content) || !last_short(layout, width) {
+        return whole;
+    }
+    let from = count.saturating_sub(PRETTY_MAX_LINES);
+    let fit = |at| Fit { from, at };
     // Find the widest width that sends a word down to the last line.
     let (mut wide, mut narrow) = (width, 0.0_f32);
     while wide - narrow > 1.0 / LAYOUT_UNITS {
         let mid = (wide + narrow) / 2.0;
-        if lines_upto(layout, mid, count, broken) == count && orphan(layout, content) {
+        if lines_upto(layout, width, fit(mid), count, broken) == count && orphan(layout, content) {
             wide = mid;
         } else {
             narrow = mid;
         }
     }
-    if break_short(layout, narrow, broken) != count || orphan(layout, content) {
-        return width;
+    if lines_upto(layout, width, fit(narrow), count, broken) != count || orphan(layout, content) {
+        return whole;
     }
-    narrow
+    fit(narrow)
 }
 
-/// Most lines `text-wrap: pretty` re-breaks; Chromium looks at a paragraph's last four.
+/// Most lines `text-wrap: pretty` re-breaks: a paragraph's last four, as
+/// Chromium's (`kMaxLinesForOptimal`).
 const PRETTY_MAX_LINES: usize = 4;
+
+/// Whether the last line of `layout` is shorter than a third of `width`,
+/// Blink's measure of a last line worth re-breaking for.
+fn last_short(layout: &Layout<u32>, width: f32) -> bool {
+    layout.lines().next_back().is_some_and(|line| {
+        let m = line.metrics();
+        (m.advance - m.hanging_advance) * 3.0 < width
+    })
+}
 
 /// Whether the last line of `layout` holds a single word.
 fn orphan(layout: &Layout<u32>, content: &str) -> bool {
@@ -3937,24 +3968,24 @@ const BALANCE_MAX_LINES: usize = 6;
 /// Chromium balances (`text-wrap: balance`): only a paragraph of at most
 /// [`BALANCE_MAX_LINES`] lines, all of them shown (`shown`: a clamp's,
 /// else all); a longer one, or one a clamp cuts, is never broken whole.
-fn balance(layout: &mut Layout<u32>, width: f32, shown: Option<u32>, broken: &mut u64) -> f32 {
+fn balance(layout: &mut Layout<u32>, width: f32, shown: Option<u32>, broken: &mut u64) -> Fit {
     let cap = shown.map_or(BALANCE_MAX_LINES, |s| {
         BALANCE_MAX_LINES.min(usize::try_from(s).unwrap_or(usize::MAX))
     });
-    let count = lines_upto(layout, width, cap, broken);
+    let count = lines_upto(layout, width, Fit::whole(width), cap, broken);
     if !(2..=cap).contains(&count) {
-        return width;
+        return Fit::whole(width);
     }
     let (mut fits, mut wraps) = (width, 0.0_f32);
     while fits - wraps > 1.0 / LAYOUT_UNITS {
         let mid = (fits + wraps) / 2.0;
-        if lines_upto(layout, mid, count, broken) == count {
+        if lines_upto(layout, width, Fit::whole(mid), count, broken) == count {
             fits = mid;
         } else {
             wraps = mid;
         }
     }
-    fits
+    Fit::whole(fits)
 }
 
 /// Where a frame's primitives are recorded: the scene's items, its scale

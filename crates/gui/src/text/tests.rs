@@ -222,6 +222,74 @@ fn balance_evens_the_lines_and_pretty_leaves_no_orphan() {
     assert!(!orphan_line(s), "pretty leaves no word alone");
 }
 
+#[test]
+fn pretty_rebreaks_the_last_four_lines_of_a_long_paragraph() {
+    // Chromium's `ScoreLineBreaker` slides a four-line window to a
+    // paragraph's end: a paragraph of six or more lines loses its orphan
+    // too, its lines before the last four wrapping as they would.
+    let mut ts = TextSystem::new();
+    let auto = ResolvedText {
+        align: TextAlign::Center,
+        ..ResolvedText::root(Color::BLACK)
+    };
+    let pretty = ResolvedText {
+        wrap_style: WrapStyle::Pretty,
+        ..auto.clone()
+    };
+    let text = "Pretty text wraps its paragraph as usual until the last few lines, then sends a word or two \
+                down so that the last line of a long paragraph never holds one short word alone at its end";
+    let ranges = |s: &Shaped| -> Vec<std::ops::Range<usize>> { s.layout.lines().map(|l| l.text_range()).collect() };
+    let mut seen = None;
+    for w in (150_u16..400).step_by(3) {
+        let w = f32::from(w);
+        let p = ts.pieces(Paragraph::from(text), &auto);
+        ts.break_piece(p[0].hash, Breaking::of(&auto, Some(w)));
+        let s = &ts.shaped[&p[0].hash];
+        if s.layout.len() >= 6 && orphan_line(s) && last_short(&s.layout, w) {
+            seen = Some((w, ranges(s)));
+            break;
+        }
+    }
+    let (w, greedy) = seen.expect("a width at which the paragraph ends in an orphan");
+    let p = ts.pieces(Paragraph::from(text), &pretty);
+    ts.break_piece(p[0].hash, Breaking::of(&pretty, Some(w)));
+    let s = &ts.shaped[&p[0].hash];
+    assert!(!orphan_line(s), "pretty leaves no word alone at {w}px");
+    let lines = ranges(s);
+    assert_eq!(lines.len(), greedy.len(), "as many lines");
+    let kept = greedy.len() - PRETTY_MAX_LINES;
+    assert_eq!(lines[..kept], greedy[..kept], "the lines before the last four");
+    assert_ne!(lines[kept..], greedy[kept..], "the last four re-broken");
+    // Every line, narrowed or not, is centred in the whole box.
+    for line in s.layout.lines() {
+        let m = line.metrics();
+        let ink = m.advance - m.hanging_advance;
+        let mid = m.offset + m.inline_min_coord + ink / 2.0 + s.shift;
+        assert!((mid - w / 2.0).abs() < 0.01, "centred: {mid} in {w}");
+    }
+}
+
+#[test]
+fn pretty_leaves_a_last_word_wider_than_a_third_of_the_box() {
+    // Blink re-breaks only for a short last line: one word as wide as a
+    // third of the box or more stays where greedy breaking puts it.
+    let mut ts = TextSystem::new();
+    let auto = ResolvedText::root(Color::BLACK);
+    let pretty = ResolvedText {
+        wrap_style: WrapStyle::Pretty,
+        ..auto.clone()
+    };
+    let text = "These are a few words that come first incomprehensibilities";
+    let last = ts.measure("incomprehensibilities", &auto, None).0;
+    let w = ts.measure("These are a few words that come first", &auto, None).0 + 4.0;
+    assert!(last * 3.0 >= w && last < w, "{last} in {w}");
+    let p = ts.pieces(Paragraph::from(text), &pretty);
+    ts.break_piece(p[0].hash, Breaking::of(&pretty, Some(w)));
+    let s = &ts.shaped[&p[0].hash];
+    assert_eq!(s.layout.len(), 2);
+    assert!(orphan_line(s), "its last word left alone");
+}
+
 fn orphan_line(s: &Shaped) -> bool {
     orphan(&s.layout, &s.content)
 }

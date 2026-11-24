@@ -35,7 +35,10 @@ Option 3, in `crates/gui/src/text.rs`:
 - Each shaped paragraph keeps its lines' baselines (`css_baselines`): ascent and descent of the line's font (the one most
   of its glyphs use) rounded, the half-leading floored. Drawing puts each baseline on a whole device pixel.
 - `WrapStyle::{Auto, Balance, Pretty}` replaces the `balance` flag (`text_pretty()`, `text_balance()`); pretty narrows the
-  layout width by binary search until a word joins the last line without adding one (`pretty`, `PRETTY_MAX_LINES = 4`).
+  width of a paragraph's last four lines (all of a shorter one; `PRETTY_MAX_LINES = 4`, Blink's `kMaxLinesForOptimal`) by
+  binary search until a word joins the last line without adding one, the lines before them wrapping as they would; only
+  when the greedy last line is one word shorter than a third of the box (Blink's `ShouldOptimize`). Narrowed lines are
+  still aligned in the whole box (`pretty`, `Fit`, `break_fit`).
 - `tabular_nums` is an inherited text property that adds the `tnum` feature to the run's attributes.
 
 ## Consequences
