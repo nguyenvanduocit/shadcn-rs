@@ -66,6 +66,44 @@ pub fn run_seeded(iterations: u64, explicit: &[u64], mut test: impl FnMut(u64)) 
     }
 }
 
+// ── Measured and cold passes ─────────────────────────────────────────────────
+
+/// Which of a measuring test's two runs this is. A test that counts what a
+/// frame allocates or visits cannot run with the cold check on (the check
+/// allocates and visits too), so [`both_passes`] runs its body twice: the
+/// [`Pass::Measured`] run with the check off, asserting the measurements,
+/// then the [`Pass::Cold`] run with every frame checked against one built
+/// cold (ADR-0013), the measurement asserts skipped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    Measured,
+    Cold,
+}
+
+impl Pass {
+    /// Set `s` up for this pass: cold check off for the measured one, on for
+    /// the cold one (nothing in a release build, which has no check).
+    pub fn scenario(self, s: &mut crate::Scenario) {
+        s.check_cold(self == Self::Cold);
+    }
+
+    /// Run `assert` (a measurement's assertions) in the measured pass only.
+    pub fn measured(self, assert: impl FnOnce()) {
+        if self == Self::Measured {
+            assert();
+        }
+    }
+}
+
+/// Run `body` as the measured pass, then, in a build with the cold check,
+/// as the cold one.
+pub fn both_passes(body: impl Fn(Pass)) {
+    body(Pass::Measured);
+    if cfg!(debug_assertions) {
+        body(Pass::Cold);
+    }
+}
+
 // ── Rng ──────────────────────────────────────────────────────────────────────
 
 /// A small seeded generator (xorshift64, its state spread from the seed by

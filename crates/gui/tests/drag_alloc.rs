@@ -35,11 +35,16 @@ fn page(moves: &Rc<Cell<u32>>) -> gui::Element {
 
 #[test]
 fn a_drag_under_a_scaled_and_turned_ancestor_allocates_nothing_as_it_moves() {
+    gui::testing::both_passes(drag);
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn drag(pass: gui::testing::Pass) {
     let moves = Rc::new(Cell::new(0));
     let counted = Rc::clone(&moves);
     let mut s = Scenario::measuring(move || page(&counted), 600, 400, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     s.hover(90.0, 15.0);
     s.send(gui::window::Input::MouseDown { x: 90.0, y: 15.0 });
@@ -54,7 +59,7 @@ fn a_drag_under_a_scaled_and_turned_ancestor_allocates_nothing_as_it_moves() {
     for (step, x) in [98.0, 100.0, 102.0, 104.0].into_iter().enumerate() {
         let ((), input) = gui::heap::measure(|| s.hover(x, 16.0));
         let taken = bytes(input);
-        assert_eq!(taken, 0, "{taken} bytes allocated taking drag move {step} in");
+        pass.measured(|| assert_eq!(taken, 0, "{taken} bytes allocated taking drag move {step} in"));
     }
     assert_eq!(moves.get(), before.saturating_add(4), "each move reached the drag");
     s.send(gui::window::Input::MouseUp { x: 104.0, y: 16.0 });

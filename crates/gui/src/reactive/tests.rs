@@ -1261,105 +1261,196 @@ impl Node {
     }
 }
 
-/// `GUI_REACTIVE_SEED` replays one seed; `GUI_REACTIVE_ITERATIONS` sets how
-/// many graphs (400 by default; the plan's goal is 10,000).
-fn seeds() -> std::ops::RangeInclusive<u64> {
-    let var = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    match (var("GUI_REACTIVE_SEED"), var("GUI_REACTIVE_ITERATIONS")) {
-        (Some(seed), _) => seed..=seed,
-        (None, n) => 1..=n.unwrap_or(400),
-    }
+/// Graphs a local run checks; `ITERATIONS` (the one knob every seeded test
+/// shares, `testing::seeds`) sets how many, `SEED` replays from one.
+const GRAPHS: u64 = 1000;
+
+/// An effect whose read set changes between runs: it reads `deps[0]`, then
+/// `deps[1]` if that is even, else `deps[2]`, like a computed's `Spec`. It
+/// lives in a scope of its own, so a step can dispose it either way.
+struct Watcher {
+    spec: Spec,
+    scope: Scope,
+    effect: Effect,
+    alive: bool,
+}
+
+/// Which nodes `spec` reads when `get` gives the values.
+fn reads(spec: &Spec, get: &[i64]) -> [usize; 2] {
+    let first = spec.deps[0];
+    [
+        first,
+        if get[first] % 2 == 0 {
+            spec.deps[1]
+        } else {
+            spec.deps[2]
+        },
+    ]
 }
 
 #[test]
 fn seeded_graphs_match_a_full_recompute_after_every_step() {
-    for seed in seeds() {
-        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        let scope = Scope::new();
-        let signals = 2_usize.saturating_add(rng.below(6));
-        let computeds = 1_usize.saturating_add(rng.below(25));
-        let mut values: Vec<i64> = (0..signals).map(|_| i64::try_from(rng.below(10)).unwrap()).collect();
-        let mut specs: Vec<Spec> = Vec::new();
-        let nodes: Rc<RefCell<Vec<Node>>> = Rc::new(RefCell::new(Vec::new()));
-        let evals = Rc::new(RefCell::new(vec![0_u32; signals.saturating_add(computeds)]));
-        scope.run(|| {
-            for &v in &values {
-                nodes.borrow_mut().push(Node::Signal(Signal::new(v)));
-            }
-            for k in 0..computeds {
-                let below = signals.saturating_add(k);
-                let spec = Spec {
-                    deps: [rng.below(below), rng.below(below), rng.below(below)],
-                    modulo: 3_i64.saturating_add(i64::try_from(rng.below(5)).unwrap()),
-                };
-                specs.push(spec.clone());
-                let all = Rc::clone(&nodes);
-                let ev = Rc::clone(&evals);
-                let me = below;
-                let c = Computed::new(move || {
-                    bump_vec(&ev, me);
-                    let nodes: Vec<Node> = all.borrow().clone();
-                    eval(&spec, &|i| nodes[i].get())
-                });
-                nodes.borrow_mut().push(Node::Computed(c));
-            }
-        });
-        // Effects, each watching one node, recording what it saw.
-        let total = signals.saturating_add(computeds);
-        let watched: Vec<usize> = (0..4).map(|_| rng.below(total)).collect();
-        let seen: Rc<RefCell<Vec<Vec<i64>>>> = Rc::new(RefCell::new(vec![Vec::new(); watched.len()]));
-        scope.run(|| {
-            for (e, &w) in watched.iter().enumerate() {
-                let node = nodes.borrow()[w];
-                let s = Rc::clone(&seen);
-                Effect::new(move || {
-                    let v = node.get();
-                    s.borrow_mut()[e].push(v);
-                });
-            }
-        });
-        let oracle = |values: &[i64]| -> Vec<i64> {
-            let mut all: Vec<i64> = values.to_vec();
-            for spec in &specs {
-                let v = eval(spec, &|i| all[i]);
-                all.push(v);
-            }
-            all
-        };
-        let mut expected = oracle(&values);
-        for step in 0..60 {
-            let writes = 1_usize.saturating_add(rng.below(3));
-            let before = expected.clone();
-            let lens: Vec<usize> = seen.borrow().iter().map(Vec::len).collect();
-            batch(|| {
-                for _ in 0..writes {
-                    let i = rng.below(signals);
-                    let v = i64::try_from(rng.below(10)).unwrap();
-                    values[i] = v;
-                    if let Node::Signal(s) = nodes.borrow()[i] {
-                        s.set(v);
-                    }
-                }
+    crate::testing::run_seeded(GRAPHS, &[], seeded_graph);
+}
+
+#[expect(clippy::too_many_lines, reason = "one graph, built, driven and checked in order")]
+fn seeded_graph(seed: u64) {
+    let mut rng = Rng(seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    let scope = Scope::new();
+    let signals = 2_usize.saturating_add(rng.below(6));
+    let computeds = 1_usize.saturating_add(rng.below(25));
+    let mut values: Vec<i64> = (0..signals).map(|_| i64::try_from(rng.below(10)).unwrap()).collect();
+    let mut specs: Vec<Spec> = Vec::new();
+    let nodes: Rc<RefCell<Vec<Node>>> = Rc::new(RefCell::new(Vec::new()));
+    let evals = Rc::new(RefCell::new(vec![0_u32; signals.saturating_add(computeds)]));
+    scope.run(|| {
+        for &v in &values {
+            nodes.borrow_mut().push(Node::Signal(Signal::new(v)));
+        }
+        for k in 0..computeds {
+            let below = signals.saturating_add(k);
+            let spec = Spec {
+                deps: [rng.below(below), rng.below(below), rng.below(below)],
+                modulo: 3_i64.saturating_add(i64::try_from(rng.below(5)).unwrap()),
+            };
+            specs.push(spec.clone());
+            let all = Rc::clone(&nodes);
+            let ev = Rc::clone(&evals);
+            let me = below;
+            let c = Computed::new(move || {
+                bump_vec(&ev, me);
+                let nodes: Vec<Node> = all.borrow().clone();
+                eval(&spec, &|i| nodes[i].get())
             });
-            expected = oracle(&values);
-            for (k, node) in nodes.borrow().iter().enumerate() {
-                assert_eq!(node.get(), expected[k], "seed {seed} step {step}: node {k}");
-            }
-            for (e, &w) in watched.iter().enumerate() {
-                let seen = seen.borrow();
-                let ran = seen[e].len().saturating_sub(lens[e]);
-                let changed = before[w] != expected[w];
-                assert_eq!(
-                    ran,
-                    usize::from(changed),
-                    "seed {seed} step {step}: effect on {w} ran {ran}"
+            nodes.borrow_mut().push(Node::Computed(c));
+        }
+    });
+    // Effects, each watching one node, recording what it saw.
+    let total = signals.saturating_add(computeds);
+    let watched: Vec<usize> = (0..4).map(|_| rng.below(total)).collect();
+    let seen: Rc<RefCell<Vec<Vec<i64>>>> = Rc::new(RefCell::new(vec![Vec::new(); watched.len()]));
+    scope.run(|| {
+        for (e, &w) in watched.iter().enumerate() {
+            let node = nodes.borrow()[w];
+            let s = Rc::clone(&seen);
+            Effect::new(move || {
+                let v = node.get();
+                s.borrow_mut()[e].push(v);
+            });
+        }
+    });
+    // Effects with a read set that changes, one scope each; the steps
+    // dispose some, by the scope or by the effect.
+    let dyn_seen: Rc<RefCell<Vec<Vec<i64>>>> = Rc::new(RefCell::new(vec![Vec::new(); 4]));
+    let mut watchers: Vec<Watcher> = Vec::new();
+    scope.run(|| {
+        for e in 0..4 {
+            let spec = Spec {
+                deps: [rng.below(total), rng.below(total), rng.below(total)],
+                modulo: 3_i64.saturating_add(i64::try_from(rng.below(5)).unwrap()),
+            };
+            let own = Scope::new();
+            let (s, all, sp) = (Rc::clone(&dyn_seen), Rc::clone(&nodes), spec.clone());
+            let effect = own.run(|| {
+                Effect::new(move || {
+                    let nodes: Vec<Node> = all.borrow().clone();
+                    let v = eval(&sp, &|i| nodes[i].get());
+                    s.borrow_mut()[e].push(v);
+                })
+            });
+            watchers.push(Watcher {
+                spec,
+                scope: own,
+                effect,
+                alive: true,
+            });
+        }
+    });
+    let oracle = |values: &[i64]| -> Vec<i64> {
+        let mut all: Vec<i64> = values.to_vec();
+        for spec in &specs {
+            let v = eval(spec, &|i| all[i]);
+            all.push(v);
+        }
+        all
+    };
+    let mut expected = oracle(&values);
+    for step in 0..60 {
+        let writes = 1_usize.saturating_add(rng.below(3));
+        let before = expected.clone();
+        let lens: Vec<usize> = seen.borrow().iter().map(Vec::len).collect();
+        let dyn_lens: Vec<usize> = dyn_seen.borrow().iter().map(Vec::len).collect();
+        // Dispose one watcher now and then, before the writes: it must
+        // not run for them, and what it read must not keep it alive.
+        if rng.below(8) == 0 {
+            let w = rng.below(watchers.len());
+            let by_scope = rng.below(2) == 0;
+            let watcher = &mut watchers[w];
+            if watcher.alive {
+                if by_scope {
+                    watcher.scope.dispose();
+                    assert!(
+                        !watcher.scope.is_alive(),
+                        "seed {seed} step {step}: scope {w} alive after its dispose"
+                    );
+                } else {
+                    watcher.effect.dispose();
+                }
+                watcher.alive = false;
+                assert!(
+                    !watcher.effect.is_alive(),
+                    "seed {seed} step {step}: watcher {w} still alive"
                 );
-                assert_eq!(seen[e].last().copied(), Some(expected[w]));
             }
         }
-        scope.dispose();
-        assert_eq!(graph(), Graph::default(), "seed {seed}: the scope took everything");
+        batch(|| {
+            for _ in 0..writes {
+                let i = rng.below(signals);
+                let v = i64::try_from(rng.below(10)).unwrap();
+                values[i] = v;
+                if let Node::Signal(s) = nodes.borrow()[i] {
+                    s.set(v);
+                }
+            }
+        });
+        expected = oracle(&values);
+        for (k, node) in nodes.borrow().iter().enumerate() {
+            assert_eq!(node.get(), expected[k], "seed {seed} step {step}: node {k}");
+        }
+        for (e, &w) in watched.iter().enumerate() {
+            let seen = seen.borrow();
+            let ran = seen[e].len().saturating_sub(lens[e]);
+            let changed = before[w] != expected[w];
+            assert_eq!(
+                ran,
+                usize::from(changed),
+                "seed {seed} step {step}: effect on {w} ran {ran}"
+            );
+            assert_eq!(seen[e].last().copied(), Some(expected[w]));
+        }
+        for (e, watcher) in watchers.iter().enumerate() {
+            let seen = dyn_seen.borrow();
+            let ran = seen[e].len().saturating_sub(dyn_lens[e]);
+            // It reruns once when a node it read changed, by the read set
+            // of its last run; a disposed one never runs again.
+            let changed = reads(&watcher.spec, &before).iter().any(|&n| before[n] != expected[n]);
+            assert_eq!(
+                ran,
+                usize::from(watcher.alive && changed),
+                "seed {seed} step {step}: dynamic effect {e} (alive {}) ran {ran}",
+                watcher.alive
+            );
+            if watcher.alive {
+                assert_eq!(
+                    seen[e].last().copied(),
+                    Some(eval(&watcher.spec, &|i| expected[i])),
+                    "seed {seed} step {step}: dynamic effect {e}"
+                );
+            }
+        }
     }
+    scope.dispose();
+    assert_eq!(graph(), Graph::default(), "seed {seed}: the scope took everything");
 }
 
 fn bump_vec(v: &RefCell<Vec<u32>>, i: usize) {

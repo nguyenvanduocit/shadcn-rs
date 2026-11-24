@@ -176,7 +176,7 @@ Built as expected, with the differences in "As built" below.
 
 - **A signal keeps its value from before its first write** since it was last checked, as alien-signals keeps
   `currentValue` and `pendingValue`: a value written and written back within one batch wakes nothing. The seeded
-  comparison with the oracle found this (seed 4, step 12); it has its own test.
+  comparison with the oracle found this (seed 4, step 12, numbered from 1 then; `SEED=3` now); it has its own test.
 - **The flush goes on past a panicking effect** and raises the first panic again at its end. While a panic
   unwinds, no guard runs user code (a second panic would abort); queued effects and cleanups run at the next flush.
 - **`with` and `update` batch**: what `f` writes runs its effects after the value is released, never while it is
@@ -202,7 +202,7 @@ Measured (`cargo test -p gui`; release for the last two):
 | --- | --- |
 | Six invariants, six bugs, §3.6's 29 cases | covered by tests (case 8 by the oracle, 12 by link reuse), all pass |
 | alien-signals specs (`effect`, `effectScope`, `trigger`; `build` tests JS packaging, `conformance` an npm suite) | ported, pass |
-| Seeded graphs against a recompute-everything oracle | 10 000 graphs × 60 steps pass (`GUI_REACTIVE_ITERATIONS=10000`; CI runs 400) |
+| Seeded graphs against a recompute-everything oracle | 10 000 graphs × 60 steps pass (`ITERATIONS=10000`; a local run does 1000, CI 10 000; `SEED=n ITERATIONS=1` repeats one; the effects' read sets change and some are disposed mid-sequence) |
 | Steady updates allocate nothing | 0 allocations over 19 980 updates of a graph with 66 effects (`tests/reactive_alloc.rs`, counting allocator) |
 | A million-deep computed chain | updates and unwinds without recursion, 0.27 s (`--ignored`) |
 | 10 000 labelled signals | linear (40 000 take under 10× of 10 000) |

@@ -29,6 +29,28 @@ jobs:
       - run: cargo test -p gui --test adapter --locked -- --nocapture
       - run: cargo test --workspace --locked
       - run: "cargo test -p shadcn --lib --locked --features tabler,hugeicons,phosphor,remixicon icons::"
+      # Every frame equals one built cold (ADR-0013): every `Scenario` test of
+      # the workspace, each frame of it checked (debug builds only).
+      - run: cargo test --workspace --locked
+        env:
+          GUI_COLD_CHECK: "1"
+      # The same check on every stress scene's script. A release build with
+      # debug assertions: the scenes are large, and the check needs the latter.
+      # `--cold` prints the allocation budgets and does not judge them (the
+      # check allocates); the step above judges them.
+      - run: cargo run --release --locked -p shadcn --example stress -- --run --cold --cycles=0 --monkey=0
+        env:
+          GUI_COLD_CHECK: "1"
+          CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS: "true"
+      # Seeded random tests (ADR-0023): the local run is short; CI searches
+      # wider. `ITERATIONS` is the one knob (`gui::testing::seeds`); a failing
+      # seed is printed, and `SEED=n ITERATIONS=1` repeats it.
+      - run: cargo test -p gui --lib --locked reactive::tests::seeded
+        env:
+          ITERATIONS: "10000"
+      - run: cargo test -p gui --test seeded --locked
+        env:
+          ITERATIONS: "100"
       # Allocation budgets per scene and frame on the UI thread (ADR-0023): a
       # scene over its budget fails the run. Release: the scenes are large.
       - run: cargo run --release --locked -p shadcn --example stress -- --run --cycles=0 --monkey=0

@@ -14,6 +14,7 @@ use std::rc::Rc;
 use gui::app::Scenario;
 use gui::events::{Modifiers, NamedKey};
 use gui::prelude::*;
+use gui::testing::Pass;
 use gui::{Color, Interaction, div, span, text, text_bound};
 
 #[global_allocator]
@@ -52,15 +53,19 @@ fn rows(n: usize, runs: Rc<Cell<u32>>) -> gui::Element {
 /// Hover rows 7, 8 and 9 in turn over a column of `n` rows: each hover
 /// frame reruns two bindings, records two chunks, and allocates nothing on
 /// the UI thread.
-#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
 fn hover_rows(n: usize) {
+    gui::testing::both_passes(|pass| hover_rows_pass(pass, n));
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn hover_rows_pass(pass: Pass, n: usize) {
     let runs = Rc::new(Cell::new(0));
     let probe = Rc::clone(&runs);
     let mut s = Scenario::measuring(move || rows(n, Rc::clone(&probe)), 300, 700, 1.0).unwrap();
     // The reactive trace a scenario keeps for its reports records each
     // write: an app's frames keep none.
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     // Warm: the first hovers grow what a hover grows once (the hovered
     // set, the chains of nodes it compares, the painter's buffers).
@@ -79,40 +84,44 @@ fn hover_rows(n: usize) {
         let (x, y) = s.locate(row).unwrap();
         let ((), input) = gui::heap::measure(|| s.hover(x, y));
         let taken = input.map_or(u64::MAX, |t| t.allocated);
-        assert_eq!(taken, 0, "{taken} bytes allocated taking hover {step} in");
+        pass.measured(|| {
+            assert_eq!(taken, 0, "{taken} bytes allocated taking hover {step} in");
+        });
         let r = s.frame(&format!("hover {step}")).unwrap();
-        assert!(r.rendered.is_empty(), "no component renders: {:?}", r.rendered);
-        assert_eq!(r.layout.calls, 0, "nothing lays out");
-        assert_eq!(
-            r.visits.resolved, 2,
-            "the row the pointer left and the row it came to resolve: {}",
-            r.visits
-        );
-        assert_eq!(r.bindings, 2, "their bindings alone run");
-        assert_eq!(r.paint.recorded, 2, "their chunks alone record again: {}", r.paint);
-        let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        // From the frame's start to its paint: the input state taken in,
-        // the bindings run, the tree laid out.
-        let built = bytes(r.footprint.built);
-        assert_eq!(built, 0, "{built} bytes allocated building and laying out hover {step}");
-        // The two chunks recorded again and the commit that carries them.
-        let recorded = bytes(r.footprint.recorded);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        // The whole frame, its report written. The headless target
-        // composes and draws the commit on this thread: in an app that is
-        // the render thread's, so it is left out.
-        let (thread, committed) = (bytes(r.footprint.thread), bytes(r.footprint.committed));
-        let ui = thread.saturating_sub(committed);
-        assert_eq!(
-            ui, 0,
-            "{ui} bytes allocated on the UI thread for hover {step} (rows {n})"
-        );
+        pass.measured(|| {
+            assert!(r.rendered.is_empty(), "no component renders: {:?}", r.rendered);
+            assert_eq!(r.layout.calls, 0, "nothing lays out");
+            assert_eq!(
+                r.visits.resolved, 2,
+                "the row the pointer left and the row it came to resolve: {}",
+                r.visits
+            );
+            assert_eq!(r.bindings, 2, "their bindings alone run");
+            assert_eq!(r.paint.recorded, 2, "their chunks alone record again: {}", r.paint);
+            let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
+            // From the frame's start to its paint: the input state taken in,
+            // the bindings run, the tree laid out.
+            let built = bytes(r.footprint.built);
+            assert_eq!(built, 0, "{built} bytes allocated building and laying out hover {step}");
+            // The two chunks recorded again and the commit that carries them.
+            let recorded = bytes(r.footprint.recorded);
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            // The whole frame, its report written. The headless target
+            // composes and draws the commit on this thread: in an app that is
+            // the render thread's, so it is left out.
+            let (thread, committed) = (bytes(r.footprint.thread), bytes(r.footprint.committed));
+            let ui = thread.saturating_sub(committed);
+            assert_eq!(
+                ui, 0,
+                "{ui} bytes allocated on the UI thread for hover {step} (rows {n})"
+            );
+        });
     }
     // Row 7's ring reads only `focus_visible`: its node resolved again on
     // each hover, and the ring replayed from what it last gave.
-    assert_eq!(runs.get(), before, "the binding that reads focus_visible never ran");
+    pass.measured(|| assert_eq!(runs.get(), before, "the binding that reads focus_visible never ran"));
     let frame = s.frame("rest").unwrap();
-    assert_eq!(frame.visits.resolved, 0, "a steady frame resolves nothing");
+    pass.measured(|| assert_eq!(frame.visits.resolved, 0, "a steady frame resolves nothing"));
 }
 
 /// Hovering a part: no instance renders, nothing lays out, only the two
@@ -423,11 +432,15 @@ fn shadowed_rows(shadows: usize) -> gui::Element {
 /// one: each keeps a display of its own size to record into, and the
 /// spilled shadow list it records from is written over in place, so no
 /// frame allocates on the UI thread once warm.
-#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
 fn hover_small_and_big(shadows: usize) {
+    gui::testing::both_passes(|pass| hover_small_and_big_pass(pass, shadows));
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn hover_small_and_big_pass(pass: Pass, shadows: usize) {
     let mut s = Scenario::measuring(move || shadowed_rows(shadows), 300, 400, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     let (small, big) = (s.locate("row 3").unwrap(), s.locate("row 4").unwrap());
     for _ in 0..4 {
@@ -441,23 +454,25 @@ fn hover_small_and_big(shadows: usize) {
         let (x, y) = if step % 2 == 0 { small } else { big };
         s.hover(x, y);
         let r = s.frame(&format!("hover {step}")).unwrap();
-        assert_eq!(r.paint.recorded, 2, "both rows record again: {}", r.paint);
-        let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        let built = bytes(r.footprint.built);
-        assert_eq!(
-            built, 0,
-            "{built} bytes allocated building hover {step} ({shadows} shadows)"
-        );
-        let recorded = bytes(r.footprint.recorded);
-        assert_eq!(
-            recorded, 0,
-            "{recorded} bytes allocated recording hover {step} ({shadows} shadows)"
-        );
-        let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-        assert_eq!(
-            ui, 0,
-            "{ui} bytes allocated on the UI thread, hover {step} ({shadows} shadows)"
-        );
+        pass.measured(|| {
+            assert_eq!(r.paint.recorded, 2, "both rows record again: {}", r.paint);
+            let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
+            let built = bytes(r.footprint.built);
+            assert_eq!(
+                built, 0,
+                "{built} bytes allocated building hover {step} ({shadows} shadows)"
+            );
+            let recorded = bytes(r.footprint.recorded);
+            assert_eq!(
+                recorded, 0,
+                "{recorded} bytes allocated recording hover {step} ({shadows} shadows)"
+            );
+            let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
+            assert_eq!(
+                ui, 0,
+                "{ui} bytes allocated on the UI thread, hover {step} ({shadows} shadows)"
+            );
+        });
     }
 }
 
@@ -507,9 +522,14 @@ fn rows_over_a_huge_chunk() -> gui::Element {
 /// frame allocates on the UI thread.
 #[test]
 fn a_huge_chunk_recorded_each_frame_beside_small_ones_allocates_nothing() {
+    gui::testing::both_passes(huge_chunk);
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn huge_chunk(pass: Pass) {
     let mut s = Scenario::measuring(rows_over_a_huge_chunk, 300, 400, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     let paint = |s: &Scenario| {
         s.owners()
@@ -536,12 +556,14 @@ fn a_huge_chunk_recorded_each_frame_beside_small_ones_allocates_nothing() {
         let (x, y) = if step % 2 == 0 { a } else { b };
         s.hover(x, y);
         let r = s.frame(&format!("hover {step}")).unwrap();
-        assert_eq!(r.paint.recorded, 3, "both rows and the box record again: {}", r.paint);
-        let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        let recorded = bytes(r.footprint.recorded);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-        assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        pass.measured(|| {
+            assert_eq!(r.paint.recorded, 3, "both rows and the box record again: {}", r.paint);
+            let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
+            let recorded = bytes(r.footprint.recorded);
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
+            assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        });
     }
 }
 
@@ -583,9 +605,14 @@ fn a_row_that_grows_when_hovered() -> gui::Element {
 /// (which would grow): once warm, no frame allocates on the UI thread.
 #[test]
 fn a_chunk_that_changes_size_each_record_allocates_nothing() {
+    gui::testing::both_passes(changing_chunk);
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn changing_chunk(pass: Pass) {
     let mut s = Scenario::measuring(a_row_that_grows_when_hovered, 300, 400, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     let (rest, grows) = (s.locate("row 3").unwrap(), s.locate("row 4").unwrap());
     for _ in 0..8 {
@@ -599,12 +626,14 @@ fn a_chunk_that_changes_size_each_record_allocates_nothing() {
         let (x, y) = if step % 2 == 0 { rest } else { grows };
         s.hover(x, y);
         let r = s.frame(&format!("hover {step}")).unwrap();
-        assert_eq!(r.paint.recorded, 2, "both rows record again: {}", r.paint);
-        let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        let recorded = bytes(r.footprint.recorded);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-        assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        pass.measured(|| {
+            assert_eq!(r.paint.recorded, 2, "both rows record again: {}", r.paint);
+            let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
+            let recorded = bytes(r.footprint.recorded);
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
+            assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        });
     }
 }
 
@@ -647,15 +676,28 @@ fn hover_rows_allocating_nothing(ui: impl Fn() -> gui::Element + 'static, label:
 /// [`hover_rows_allocating_nothing`], with `check` run after each frame
 /// once warm (its allocations measured), given whether row 3 (else row
 /// 4) is hovered.
-#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
 fn hover_rows_checking(
     ui: impl Fn() -> gui::Element + 'static,
     label: fn(usize) -> String,
     check: impl Fn(&mut Scenario, bool),
 ) {
+    let ui = Rc::new(ui);
+    gui::testing::both_passes(|pass| {
+        let ui = Rc::clone(&ui);
+        hover_rows_pass_checking(pass, move || ui(), label, &check);
+    });
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn hover_rows_pass_checking(
+    pass: Pass,
+    ui: impl Fn() -> gui::Element + 'static,
+    label: fn(usize) -> String,
+    check: &impl Fn(&mut Scenario, bool),
+) {
     let mut s = Scenario::measuring(ui, 300, 400, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     let (a, b) = (s.locate(&label(3)).unwrap(), s.locate(&label(4)).unwrap());
     for _ in 0..8 {
@@ -669,19 +711,21 @@ fn hover_rows_checking(
         let (x, y) = if step % 2 == 0 { a } else { b };
         s.hover(x, y);
         let r = s.frame(&format!("hover {step}")).unwrap();
-        assert!(r.paint.recorded >= 2, "both labels record again: {}", r.paint);
-        let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        let recorded = bytes(r.footprint.recorded);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        // A hover resolves the paragraph again (its background binds) and
-        // writes its frame node anew: both share the content and runs it
-        // held, and layout copies nothing.
-        let built = bytes(r.footprint.built);
-        assert_eq!(built, 0, "{built} bytes allocated building hover {step}");
-        // The whole frame on the UI thread: layout, the text drawn again,
-        // the commit, the frame's end and its report.
-        let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-        assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        pass.measured(|| {
+            assert!(r.paint.recorded >= 2, "both labels record again: {}", r.paint);
+            let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
+            let recorded = bytes(r.footprint.recorded);
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            // A hover resolves the paragraph again (its background binds) and
+            // writes its frame node anew: both share the content and runs it
+            // held, and layout copies nothing.
+            let built = bytes(r.footprint.built);
+            assert_eq!(built, 0, "{built} bytes allocated building hover {step}");
+            // The whole frame on the UI thread: layout, the text drawn again,
+            // the commit, the frame's end and its report.
+            let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
+            assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        });
         check(&mut s, step % 2 == 0);
     }
 }
@@ -978,9 +1022,14 @@ fn a_row_over_a_long_paragraph() -> gui::Element {
 /// on the UI thread.
 #[test]
 fn a_long_paragraph_drawn_each_frame_allocates_nothing() {
+    gui::testing::both_passes(long_paragraph);
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn long_paragraph(pass: Pass) {
     let mut s = Scenario::measuring(a_row_over_a_long_paragraph, 300, 200, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     let paint = s
         .owners()
@@ -1003,23 +1052,25 @@ fn a_long_paragraph_drawn_each_frame_allocates_nothing() {
         let (x, y) = if step % 2 == 0 { row } else { rest };
         s.hover(x, y);
         let r = s.frame(&format!("hover {step}")).unwrap();
-        assert!(
-            r.paint.recorded >= 2,
-            "the row and the paragraph record again: {}",
-            r.paint
-        );
-        let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        let recorded = bytes(r.footprint.recorded);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        // A hover resolves the paragraph again (its background binds) and
-        // writes its frame node anew: both share the content and runs it
-        // held, and layout copies nothing.
-        let built = bytes(r.footprint.built);
-        assert_eq!(built, 0, "{built} bytes allocated building hover {step}");
-        // The whole frame on the UI thread: layout, the text drawn again,
-        // the commit, the frame's end and its report.
-        let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-        assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        pass.measured(|| {
+            assert!(
+                r.paint.recorded >= 2,
+                "the row and the paragraph record again: {}",
+                r.paint
+            );
+            let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
+            let recorded = bytes(r.footprint.recorded);
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            // A hover resolves the paragraph again (its background binds) and
+            // writes its frame node anew: both share the content and runs it
+            // held, and layout copies nothing.
+            let built = bytes(r.footprint.built);
+            assert_eq!(built, 0, "{built} bytes allocated building hover {step}");
+            // The whole frame on the UI thread: layout, the text drawn again,
+            // the commit, the frame's end and its report.
+            let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
+            assert_eq!(ui, 0, "{ui} bytes allocated on the UI thread, hover {step}");
+        });
     }
 }
 

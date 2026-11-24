@@ -421,14 +421,13 @@ impl Pipeline {
             // And the layers' focus rules, on the frame just laid out (ADR-0024).
             let hooks =
                 after_layout(self.tree.frame()) | crate::component::run_post() | self.input_state.settle(&self.tree);
-            if !(hooks | again | crate::component::take_due()) {
-                // The frame's last pass: focus left on a node it does not
-                // show goes, and what shows focus is laid out once more.
-                if !crate::focus::drop_lost(self.tree.frame()) {
-                    return timings;
-                }
-                self.input_state.sync_focus(&self.tree);
+            // The frame's last pass: focus left on a node it does not show
+            // goes, and what shows focus is laid out once more.
+            if !(hooks | again | crate::component::take_due()) && !crate::focus::drop_lost(self.tree.frame()) {
+                return timings;
             }
+            // Each pass is built over where focus is in the one before.
+            self.input_state.sync_focus(&self.tree);
             again = self.pass(&mut timings, pass);
         }
         // Out of passes: the last one's lost focus goes all the same.

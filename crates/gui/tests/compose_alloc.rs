@@ -33,8 +33,13 @@ fn two_lists() -> gui::Element {
 /// set of those shown is one kept), 100 commits each.
 #[test]
 fn a_commits_scroll_bookkeeping_allocates_nothing() {
+    gui::testing::both_passes(bookkeeping);
+}
+
+#[expect(clippy::expect_used, reason = "a scenario that cannot run is a failed test")]
+fn bookkeeping(pass: gui::testing::Pass) {
     let mut s = Scenario::measuring(two_lists, 400, 100, 1.0).expect("a scenario");
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.frame("first").expect("a frame");
     let c = s.compositor();
     let ((), heap) = gui::heap::measure(|| {
@@ -42,7 +47,7 @@ fn a_commits_scroll_bookkeeping_allocates_nothing() {
             c.recommit_scrollers();
         }
     });
-    assert_eq!(heap.expect("counted").allocations, 0, "at rest");
+    pass.measured(|| assert_eq!(heap.expect("counted").allocations, 0, "at rest"));
     let seen = c.presented().frame;
     let wheeled = c.wheel_input(gui::compositor::WheelInput {
         point: (50.0, 50.0),
@@ -64,13 +69,18 @@ fn a_commits_scroll_bookkeeping_allocates_nothing() {
             c.recommit_scrollers();
         }
     });
-    assert_eq!(heap.expect("counted").allocations, 0, "with a scroll owed");
+    pass.measured(|| assert_eq!(heap.expect("counted").allocations, 0, "with a scroll owed"));
 }
 
 #[test]
 fn a_frame_composed_over_a_scene_at_rest_allocates_nothing() {
+    gui::testing::both_passes(composed);
+}
+
+#[expect(clippy::expect_used, reason = "a scenario that cannot run is a failed test")]
+fn composed(pass: gui::testing::Pass) {
     let mut s = Scenario::measuring(two_lists, 400, 100, 1.0).expect("a scenario");
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.frame("first").expect("a frame");
     let c = s.compositor();
     // Warm: the frames kept for late wheels filled, a frame retired.
@@ -84,10 +94,12 @@ fn a_frame_composed_over_a_scene_at_rest_allocates_nothing() {
             c.compose(at);
         });
         let heap = heap.expect("counted");
-        assert_eq!(
-            (heap.allocations, heap.allocated),
-            (0, 0),
-            "frame {n} composed at rest allocated"
-        );
+        pass.measured(|| {
+            assert_eq!(
+                (heap.allocations, heap.allocated),
+                (0, 0),
+                "frame {n} composed at rest allocated"
+            );
+        });
     }
 }

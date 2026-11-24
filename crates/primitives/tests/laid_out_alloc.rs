@@ -15,6 +15,11 @@ static HEAP: gui::heap::Counting = gui::heap::COUNTING;
 
 #[test]
 fn unchanged_layouts_of_tabs_allocate_nothing_in_their_watchers() {
+    gui::testing::both_passes(tabs);
+}
+
+#[expect(clippy::expect_used, reason = "a scenario that cannot run is a failed test")]
+fn tabs(pass: gui::testing::Pass) {
     let told = Rc::new(Cell::new(0_u32));
     let t = Rc::clone(&told);
     let mut s = Scenario::measuring(
@@ -58,7 +63,7 @@ fn unchanged_layouts_of_tabs_allocate_nothing_in_their_watchers() {
     )
     .expect("a scenario");
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().expect("settled");
     for tab in ["tab 1", "tab 2", "tab 1"] {
         let (x, y) = s.locate(tab).expect("a tab");
@@ -75,12 +80,11 @@ fn unchanged_layouts_of_tabs_allocate_nothing_in_their_watchers() {
         s.hover(x, y);
         let r = s.frame("hover").expect("a frame");
         let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
-        taken += bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
+        taken = bytes(r.footprint.thread)
+            .saturating_sub(bytes(r.footprint.committed))
+            .saturating_add(taken);
     }
-    assert!(
-        told.get() >= before + 100,
-        "each frame laid the tabs out: {}",
-        told.get() - before
-    );
-    assert_eq!(taken, 0, "{taken} bytes allocated on the UI thread over 100 layouts");
+    let laid_out = told.get().saturating_sub(before);
+    assert!(laid_out >= 100, "each frame laid the tabs out: {laid_out}");
+    pass.measured(|| assert_eq!(taken, 0, "{taken} bytes allocated on the UI thread over 100 layouts"));
 }

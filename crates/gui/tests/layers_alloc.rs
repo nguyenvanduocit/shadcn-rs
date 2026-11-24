@@ -50,10 +50,15 @@ fn page(n: usize, open: Signal<bool>) -> gui::Element {
 
 #[test]
 fn hovering_in_an_open_layer_allocates_nothing() {
+    gui::testing::both_passes(hover);
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn hover(pass: gui::testing::Pass) {
     let open = Signal::new(true);
     let mut s = Scenario::measuring(move || page(30, open), 600, 700, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     for row in ["row 3", "row 4"] {
         let (x, y) = s.locate(row).unwrap();
@@ -67,20 +72,24 @@ fn hovering_in_an_open_layer_allocates_nothing() {
         let (x, y) = s.locate(row).unwrap();
         let ((), input) = gui::heap::measure(|| s.hover(x, y));
         let taken = bytes(input);
-        assert_eq!(taken, 0, "{taken} bytes allocated taking hover {step} in");
+        pass.measured(|| assert_eq!(taken, 0, "{taken} bytes allocated taking hover {step} in"));
         let r = s.frame(&format!("hover {step}")).unwrap();
         let built = bytes(r.footprint.built);
-        assert_eq!(
-            built, 0,
-            "{built} bytes allocated building hover {step} with a layer open"
-        );
+        pass.measured(|| {
+            assert_eq!(
+                built, 0,
+                "{built} bytes allocated building hover {step} with a layer open"
+            );
+        });
         let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-        assert_eq!(
-            ui, 0,
-            "{ui} bytes allocated on the UI thread for hover {step} with a layer open"
-        );
+        pass.measured(|| {
+            assert_eq!(
+                ui, 0,
+                "{ui} bytes allocated on the UI thread for hover {step} with a layer open"
+            );
+        });
     }
     let r = s.frame("rest").unwrap();
     let ui = bytes(r.footprint.thread).saturating_sub(bytes(r.footprint.committed));
-    assert_eq!(ui, 0, "a steady frame with a layer open allocates nothing");
+    pass.measured(|| assert_eq!(ui, 0, "a steady frame with a layer open allocates nothing"));
 }

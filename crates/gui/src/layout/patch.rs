@@ -477,7 +477,7 @@ impl LayoutTree {
     ) -> Option<Resolved> {
         let u = node.user;
         let disabled = inherit.disabled || common.disabled;
-        let (mut style, focused) = self.resolve(pass.state, el, common, disabled, ex, u, layer);
+        let mut style = self.resolve(pass.state, el, common, disabled, ex, u, layer);
         if style.display == Display::None {
             return None;
         }
@@ -832,10 +832,6 @@ impl LayoutTree {
                 self.mounting.push((f, u));
             }
         }
-        if focused {
-            self.focused = Some(ex.path.clone());
-            self.focused_layer = layer;
-        }
         ex.layer = layer;
         let mine = Inherit {
             text,
@@ -1026,7 +1022,7 @@ impl LayoutTree {
         ex: &mut Extra,
         u: u32,
         layer: usize,
-    ) -> (Style, bool) {
+    ) -> Style {
         let path = &ex.path;
         let enabled = !disabled;
         let focused = focus_of(common, path).is_some_and(|h| Some(h.id()) == state.focused);
@@ -1047,7 +1043,7 @@ impl LayoutTree {
                     layer,
                     focused,
                     matches!(el, Element::Input(_)),
-                    self.focused.as_ref().map(|f| (f, self.focused_layer)),
+                    state.focus_at.as_ref().map(|(f, l)| (f, *l)),
                     state.focus_visible,
                 );
                 i.write(crate::interact::Flags {
@@ -1061,7 +1057,7 @@ impl LayoutTree {
             }
             None => ex.interaction.clear(),
         }
-        let style = match common.bindings.ops() {
+        match common.bindings.ops() {
             Some(ops) => {
                 let base = &common.style;
                 ex.style_binding
@@ -1074,7 +1070,6 @@ impl LayoutTree {
                 ex.style_binding = None;
                 common.style.clone()
             }
-        };
-        (style, focused)
+        }
     }
 }

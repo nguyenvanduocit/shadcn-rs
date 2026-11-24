@@ -13,6 +13,7 @@
 
 use gui::app::Scenario;
 use gui::prelude::*;
+use gui::testing::Pass;
 use gui::{Color, Interaction, div, span, text};
 
 #[global_allocator]
@@ -45,9 +46,26 @@ fn from_record(r: &gui::inspect::FrameReport) -> (u64, u64) {
 /// Hover the points `at` (two rows) by turns once warm: each frame draws
 /// what they hold again (at least `records` chunks recorded again), and
 /// nothing from the record onward allocates. The scenario, its last frame
-/// hovering `at[1]`.
-#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+/// hovering `at[1]`. It runs twice (`gui::testing::Pass`): the cold pass
+/// first, its frames checked against a cold build and its allocations not
+/// judged, then the measured one, whose scenario it returns.
 fn hover(
+    build: impl Fn() -> gui::Element + 'static,
+    at: [(f32, f32); 2],
+    size: (u32, u32),
+    records: usize,
+) -> Scenario {
+    let build = std::rc::Rc::new(build);
+    if cfg!(debug_assertions) {
+        let b = std::rc::Rc::clone(&build);
+        hover_pass(Pass::Cold, move || b(), at, size, records);
+    }
+    hover_pass(Pass::Measured, move || build(), at, size, records)
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn hover_pass(
+    pass: Pass,
     build: impl Fn() -> gui::Element + 'static,
     at: [(f32, f32); 2],
     size: (u32, u32),
@@ -55,7 +73,7 @@ fn hover(
 ) -> Scenario {
     let mut s = Scenario::measuring(build, size.0, size.1, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     for _ in 0..10 {
         for (x, y) in at {
@@ -73,8 +91,10 @@ fn hover(
             r.paint
         );
         let (recorded, after) = from_record(&r);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        assert_eq!(after, 0, "{after} bytes allocated from the record on, hover {step}");
+        pass.measured(|| {
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            assert_eq!(after, 0, "{after} bytes allocated from the record on, hover {step}");
+        });
     }
     s
 }
@@ -148,6 +168,11 @@ fn drawing_a_line_through_another_font_hands_down_again_allocates_nothing() {
 /// through its end.
 #[test]
 fn resolving_a_decorated_paragraph_with_an_underlined_span_again_allocates_nothing() {
+    gui::testing::both_passes(underlined_span);
+}
+
+#[expect(clippy::unwrap_used, reason = "a scenario that cannot run is a failed test")]
+fn underlined_span(pass: Pass) {
     fn row(r: usize, i: Interaction) -> gui::Element {
         text(format!("row {r}: "))
             .span(span("underlined too").underline(true).underline_offset(2.0))
@@ -160,7 +185,7 @@ fn resolving_a_decorated_paragraph_with_an_underlined_span_again_allocates_nothi
     }
     let mut s = Scenario::measuring(|| rows(row), 400, 400, 1.0).unwrap();
     gui::reactive::stop_trace();
-    s.check_cold(false);
+    pass.scenario(&mut s);
     s.settle().unwrap();
     let at = [(40.0, 84.0), (40.0, 108.0)];
     for _ in 0..10 {
@@ -176,13 +201,15 @@ fn resolving_a_decorated_paragraph_with_an_underlined_span_again_allocates_nothi
         assert!(r.visits.resolved >= 2, "both rows resolve again: {}", r.visits);
         let bytes = |t: Option<gui::heap::ThreadHeap>| t.map_or(u64::MAX, |t| t.allocated);
         let built = bytes(r.footprint.built);
-        assert_eq!(
-            built, 0,
-            "{built} bytes allocated resolving and laying out hover {step}"
-        );
         let (recorded, after) = from_record(&r);
-        assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
-        assert_eq!(after, 0, "{after} bytes allocated from the record on, hover {step}");
+        pass.measured(|| {
+            assert_eq!(
+                built, 0,
+                "{built} bytes allocated resolving and laying out hover {step}"
+            );
+            assert_eq!(recorded, 0, "{recorded} bytes allocated recording hover {step}");
+            assert_eq!(after, 0, "{after} bytes allocated from the record on, hover {step}");
+        });
     }
 }
 

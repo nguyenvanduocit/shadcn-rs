@@ -337,7 +337,10 @@ impl LayoutTree {
                             width: cl.size.width,
                             height: cl.size.height,
                         },
-                        focus_within: self.focused.as_ref().is_some_and(|f| f.0.starts_with(&ce.path.0)),
+                        focus_within: state
+                            .focus_at
+                            .as_ref()
+                            .is_some_and(|(f, _)| f.0.starts_with(&ce.path.0)),
                     });
                 }
             }

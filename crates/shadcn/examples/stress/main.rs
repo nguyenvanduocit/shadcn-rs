@@ -16,6 +16,11 @@
 //! thread (ADR-0023: a steady frame's 95th percentile, and the costliest
 //! script step's frames together; CI runs `--run --cycles=0 --monkey=0`).
 //! Slow frames are reported, not failed: the scenes are built to be slow.
+//!
+//! `--cold` runs the scripts with every frame checked against one built cold
+//! (ADR-0013, `GUI_COLD_CHECK=1`, a build with debug assertions): the check
+//! allocates and takes time, so the budgets are printed and not judged, and
+//! a scene fails only when a command, a frame or the cold comparison does.
 
 mod scenes;
 mod threads;
@@ -51,6 +56,8 @@ struct Options {
     growth: u64,
     /// Print every drawing frame of the script (`--frames`).
     frames: bool,
+    /// Frames checked against a cold build; allocation budgets not judged (`--cold`).
+    cold: bool,
 }
 
 fn flag<'a>(args: &'a [String], key: &str) -> Option<&'a str> {
@@ -299,7 +306,7 @@ fn run_scene(scene: &scenes::Scene, o: &Options) -> Verdict {
             "  costliest action {} allocations for `{}` (budget {})",
             costliest.0, costliest.1, scene.budget.action
         );
-        if costliest.0 > scene.budget.action {
+        if costliest.0 > scene.budget.action && !o.cold {
             failed = true;
             line.push_str("  FAIL: over its allocation budget");
         }
@@ -327,7 +334,7 @@ fn run_scene(scene: &scenes::Scene, o: &Options) -> Verdict {
                 "  steady allocations p50 {}  p95 {}  max {} on the UI thread (budget {})",
                 allocs.p50, allocs.p95, allocs.max, scene.budget.steady
             );
-            if allocs.p95 > scene.budget.steady {
+            if allocs.p95 > scene.budget.steady && !o.cold {
                 failed = true;
                 line.push_str("  FAIL: over its allocation budget");
             }
@@ -422,10 +429,26 @@ fn run(args: &[String]) -> Result<bool, String> {
             .unwrap_or(64)
             .saturating_mul(1024),
         frames: args.iter().any(|a| a == "--frames"),
+        cold: args.iter().any(|a| a == "--cold"),
     };
+    if o.cold && !cfg!(debug_assertions) {
+        return Err(
+            "--cold needs a build with debug assertions: the cold check is compiled out without them".to_owned(),
+        );
+    }
+    if o.cold && std::env::var_os("GUI_COLD_CHECK").is_none_or(|v| v != "1") {
+        return Err("--cold needs GUI_COLD_CHECK=1".to_owned());
+    }
     // `threads` is no scene: ADR-0015's goals, on the app's own threads.
     let named_threads = names.iter().any(|n| *n == "threads");
-    let with_threads = names.is_empty() || named_threads;
+    // Its frames are the app's own threads', not a `Scenario`'s: no cold check.
+    if o.cold && named_threads {
+        return Err("`threads` has no cold check; --cold runs the scenes".to_owned());
+    }
+    let with_threads = !o.cold && (names.is_empty() || named_threads);
+    if o.cold && names.is_empty() {
+        println!("threads skipped (no cold check)\n");
+    }
     let names: Vec<&String> = names.into_iter().filter(|n| *n != "threads").collect();
     let chosen: Vec<&scenes::Scene> = if named_threads && names.is_empty() {
         Vec::new()

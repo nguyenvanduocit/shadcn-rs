@@ -78,8 +78,6 @@ impl LayoutTree {
         if let Ok(mut f) = self.fields.try_borrow_mut() {
             f.clear();
         }
-        self.focused = None;
-        self.focused_layer = 0;
         self.motion_seen = 0;
         self.frame = Frame::default();
         self.seen = None;
@@ -115,13 +113,6 @@ impl LayoutTree {
                 self.mark_path(p, need::RESOLVE);
             }
         }
-        let found = state
-            .focused
-            .and_then(|f| self.by_focus.get(&f))
-            .and_then(|&u| self.extra(u));
-        let (layer, path) = found.map_or((0, None), |e| (e.layer, Some(e.path.clone())));
-        self.focused_layer = layer;
-        self.focused = path;
         let mut frame = std::mem::take(&mut self.frame);
         frame.viewport = viewport;
         // A pass that rebuilds starts from the frame as it was, for what the

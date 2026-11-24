@@ -81,6 +81,12 @@ pub struct UiState {
     /// not taking in the compositor's scroll (ADR-0015).
     pub(crate) scroll_generation: ByScroller<u64>,
     pub focused: Option<FocusId>,
+    /// Where the focused node lies (its path and layer) in the frame the
+    /// next is built over, found once from the focus owner before a pass
+    /// descends ([`crate::interact::InputState::sync_focus`]): what
+    /// `focus_within` is decided by, the same for a live pass and a cold
+    /// one. Focus within a node is focus at or below it in the same layer.
+    pub(crate) focus_at: Option<(NodePath, usize)>,
     pub focus_visible: bool,
     /// Device pixels per logical pixel: scroll offsets move content by
     /// whole device pixels (ADR-0020). Zero leaves them as they are.
@@ -548,13 +554,6 @@ pub struct LayoutTree {
     schedule: Schedule,
     stats: Stats,
     visits: Visits,
-    /// The focused node's path, as the last pass found it: a scroll
-    /// container tells its handle which child holds focus (a virtual list
-    /// keeps that row built, ADR-0021).
-    focused: Option<NodePath>,
-    /// The layer the focused node is in: focus within a node is focus at
-    /// or below it in the same layer, as the frame's parents link them.
-    focused_layer: usize,
     /// The root's path, made once: a pass allocates nothing for it.
     root_path: NodePath,
     /// The frame as laid out, kept and written in place (ADR-0013).
@@ -651,8 +650,6 @@ impl LayoutTree {
             schedule,
             stats: Stats::default(),
             visits: Visits::default(),
-            focused: None,
-            focused_layer: 0,
             root_path: NodePath::new([PathSeg::Index(0)].into()),
             frame: Frame::default(),
             marks: Rc::default(),

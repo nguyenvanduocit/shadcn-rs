@@ -18,6 +18,10 @@ use gui::{Scenario, Signal};
 /// in a debug build, so each seed runs on a thread with a main thread's 8 MB.
 const STACK: usize = 8 << 20;
 
+/// Trees a local run checks; `ITERATIONS` (the one knob of every seeded test,
+/// `testing::seeds`) sets how many, and CI sets it higher.
+const SEEDS: u64 = 16;
+
 #[test]
 fn random_trees_edited_by_seed_equal_a_cold_build_every_frame() {
     std::thread::Builder::new()
@@ -29,7 +33,7 @@ fn random_trees_edited_by_seed_equal_a_cold_build_every_frame() {
 }
 
 fn edit_random_trees() {
-    run_seeded(8, &[], |seed| {
+    run_seeded(SEEDS, &[], |seed| {
         let tree = Signal::new(RandomTree::new(seed, 160, Topology::of_seed(seed)));
         let mut s = Scenario::measuring(move || tree.with(RandomTree::element), 800, 600, 1.0).expect("a scenario");
         s.check_cold(true);
