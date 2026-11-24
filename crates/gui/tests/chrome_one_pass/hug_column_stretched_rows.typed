@@ -1,0 +1,8 @@
+# The boxes of hug_column_stretched_rows.html that the typed containers lay out differently from Chrome, on
+# purpose (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+18 = 241.609375 0 120 72  # a hugging column in an AtMost(120) parent is 120; Chrome's is its min-content (177.30) and overflows
+19 = 245.609375 4 112 64
+20 = 245.609375 4 112 32
+22 = 277.609375 10 72 20  # the filling label takes what the icon and the gap leave of its Exact row, and is cut
+23 = 245.609375 36 112 32
+25 = 277.609375 42 72 20

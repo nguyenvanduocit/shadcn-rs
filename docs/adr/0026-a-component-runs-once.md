@@ -3,7 +3,10 @@
 Status: accepted, 2026-11-24; not yet built (M11, K4–K8). Supersedes ADR-0013's instance, render and scheduler; keeps
 its bindings by phase, its `Callback`, `Model`, context and panic rule. ADR-0013's status line changes at K8, when the
 old path is deleted, not before. Amends ADR-0010, ADR-0015, ADR-0022, ADR-0023 and ADR-0025 (see "Amendments").
-Written together with ADR-0028, which shares its definition of a cold frame.
+Written together with ADR-0028, which shares its definition of a cold frame. Amended by ADR-0027 (2026-11-24, small):
+the control functions also exist as methods of a typed container's `Lay`, `Row<T, K>` is a `Copy` handle, a
+component's root is always a box, and under a typed container a row's saved description is the list of slots its
+view emitted, which a cold rebuild replays.
 
 Who decided what:
 
@@ -83,6 +86,16 @@ pub fn each<T: Clone + PartialEq + 'static, K: Clone + Eq + Hash + Debug + 'stat
     view: impl Fn(Row<T, K>) -> Element + 'static) -> Each;
 pub fn dynamic_view<K: Clone + PartialEq + Debug + 'static>(
     which: impl Fn() -> K + 'static, view: impl Fn(&K) -> Element + 'static) -> Dynamic;
+
+// Under a typed container (ADR-0027), rows that take slots of their own: the same three as methods of the
+// container's `Lay`, their views taking it first. `Row<T, K>` is a `Copy` handle in both forms.
+impl<C> Lay<C> {
+    pub fn show(&mut self, when: impl Fn() -> bool + 'static, view: impl Fn(&mut Lay<C>) + 'static)
+        -> &mut LayShow<C>;                                                                        // .or_else(view)
+    pub fn each<T, K>(&mut self, items: impl Fn() -> Vec<T> + 'static, key: impl Fn(&T) -> K + 'static,
+        view: impl Fn(&mut Lay<C>, Row<T, K>) + 'static);
+    pub fn dynamic_view<K>(&mut self, which: impl Fn() -> K + 'static, view: impl Fn(&mut Lay<C>, &K) + 'static);
+}
 ```
 
 The `Clone` bounds come from ADR-0028's K4a list: a signal holds a value that can be copied, and item data and keys
@@ -148,9 +161,10 @@ are kept in signals.
   Content of a `Deferred` layer is mounted by its opener, so its owner chain is the logical parent; `child_step`'s
   special case for layers goes.
 - **A parent styles a child's root.** `restyle` on a `component` applies to the root its body returns, at mount; the
-  cached `Fallthrough` per output is deleted. On a boxless root (`show`, `each`, `dynamic_view`) it applies to the
-  root of each child the control node mounts. A parent that styles by place passes the place: a constant for a fixed
-  child, `row.index()` under `each`.
+  cached `Fallthrough` per output is deleted. **A component's root is always a box** (amended by ADR-0027,
+  2026-11-24): a boxless range (`show`, `each`, `dynamic_view`) appears only inline in the body that builds its
+  parent, so `restyle` never meets a boxless root. A parent that styles by place passes the place: a constant for a
+  fixed child, `row.index()` under `each`.
 - **A typed part's behaviour is registered by its mount** (tabs' `Item::active`, handlers, roving membership). A part
   that moves or changes key takes its registrations with it; one that unmounts takes them back.
 - **Lifecycle.** `on_mounted` runs after the first layout of the mount; `on_unmounted` is `on_cleanup`; `after_layout`
@@ -162,8 +176,10 @@ are kept in signals.
   `Signal::new` with `T: Clone`, time and randomness only through `gui::clock` and `gui::random`, the lints (signal
   types, captured `Rc<Cell>`, the system clock) and the clippy bans. F2 and F3 change no component code, and
   ADR-0030 is to need none. The lint for process-wide state is F1's.
-- **Layout parameters of rows under a boxless `each`** (`fill`, `hug` of a typed parent) are settled by L1 in
-  ADR-0027. The slice exercises that API before any S8 family port starts.
+- **Layout parameters of rows under a boxless `each`** (`fill`, `hug` of a typed parent) are settled by ADR-0027
+  ("Control functions under a typed container"): the row's view receives its container's `Lay` and says each row's
+  slot; the slot kind is read untracked and fixed per key. The slice exercises that API before any S8 family port
+  starts.
 
 ### The model value
 
@@ -392,7 +408,10 @@ Details that belong to this record:
 - **The cold tree** is the root's description mounted again into a detached layout tree, with ids in the cold
   domain. At a control node it takes the expected keys; for a key the live tree has, it mounts the description that
   row was mounted from (kept per row; each retained node keeps its element, `Extra.element`), without running its
-  body; for one the live tree lacks, it runs the body or view closure inside the fork.
+  body; for one the live tree lacks, it runs the body or view closure inside the fork. Under a typed container
+  (ADR-0027, amended 2026-11-24) the description kept per row is the list of slots its view emitted: each slot's
+  kind, its parameters and its child's description; the list may be empty. The cold tree is rebuilt from that list
+  and the view is not called again; a debug assertion compares each slot's kind with the saved one.
 - **The correspondence** maps each cold node to the live node it stands for. Its key has three parts:
   1. the correspondent of the node's physical parent;
   2. the full nested path of control ranges between that parent and the node, outermost first, each step being

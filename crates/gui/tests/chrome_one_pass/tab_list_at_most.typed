@@ -1,0 +1,24 @@
+# The boxes of tab_list_at_most.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"): `<box> = x y width height  # why`. Boxes are indexes in document order, as <name>.chrome
+# lists them from 0. This file lists geometry only: a box named here must differ from Chrome's, and every other
+# box of the typed tree equals Chrome's within the reader's tolerance. Which subtrees stay CSS is the reader's
+# rule, not written here. Written by hand from the ADR's rules; L2 is their first check.
+7 = 0 56 200 24  # one-line fills, 245.73 of content in an AtMost(200) row: the row is 200 (Chrome: its min-content, 245.73)
+8 = 0 56 50.880651 24  # each shrinks from its content by weight x content: content x 200 / 245.734375
+9 = 50.880651 56 59.680804 24
+10 = 110.561455 56 89.438545 24
+11 = 0 84 200 24  # the same with weights 2 / 1 / 1: the first gives up twice as much per px of content
+12 = 0 84 43.965013 24
+13 = 43.965013 84 62.448592 24
+14 = 106.413606 84 93.586394 24
+19 = 0 140 200 34  # triggers that are boxes, 265.03 of content in the 194 inside the row's padding
+20 = 3 143 52.108478 28  # content x 194 / 265.03125
+21 = 11 147 36.108478 20  # the label is a fit: it shrinks to its trigger's content box (Chrome: it keeps 55.19 and is clipped)
+22 = 55.108478 143 59.142436 28
+23 = 63.108478 147 43.142436 20
+24 = 114.250914 143 82.749086 28
+25 = 122.250914 147 66.749086 20
+27 = 3 181 43.140625 28  # fills that fit keep their content (Chrome: equal shares of the same total, 43.45 each)
+28 = 11 185 27.140625 20
+29 = 46.140625 181 43.765625 28
+30 = 54.140625 185 27.765625 20

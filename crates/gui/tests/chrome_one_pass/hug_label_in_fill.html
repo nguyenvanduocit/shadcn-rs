@@ -1,0 +1,19 @@
+<!-- A fill is cut only when every level down to the label is a fill or clips. A trigger that fills with min-width: 0 and holds a hugging one-line label: the trigger is its share, and the label keeps its width and lies over the next trigger. With the label a fill too (min-width: 0) it is the trigger's width; with the trigger clipping (overflow: hidden) the label keeps its width and is clipped. -->
+<div style="width: 300px">
+  <div style="display: flex; width: 240px">
+    <div style="flex: 1; min-width: 0; display: flex"><p style="flex: none; white-space: nowrap">Notifications and billing</p></div>
+    <div style="flex: 1; min-width: 0; display: flex"><p style="flex: none; white-space: nowrap">Account</p></div>
+  </div>
+  <div style="display: flex; width: 240px">
+    <div style="flex: 1; min-width: 0; display: flex"><p style="flex: 1; min-width: 0; white-space: nowrap">Notifications and billing</p></div>
+    <div style="flex: 1; min-width: 0; display: flex"><p style="flex: 1; min-width: 0; white-space: nowrap">Account</p></div>
+  </div>
+  <div style="display: flex; width: 240px">
+    <div style="flex: 1; min-width: 0; display: flex; overflow: hidden"><p style="flex: none; white-space: nowrap">Notifications and billing</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; overflow: hidden"><p style="flex: none; white-space: nowrap">Account</p></div>
+  </div>
+  <div style="display: flex; width: 240px">
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center"><p style="white-space: nowrap">Notifications and billing</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center"><p style="white-space: nowrap">Account</p></div>
+  </div>
+</div>

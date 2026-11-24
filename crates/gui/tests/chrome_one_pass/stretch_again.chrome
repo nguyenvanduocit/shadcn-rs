@@ -1,0 +1,25 @@
+# Chrome's boxes for stretch_again.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 204
+  div 0 0 240 72
+    div 0 0 20 72
+    p 28 0 174 72
+    div 210 0 30 72
+      div 210 0 30 67
+      div 210 67 30 5
+  div 0 72 240 72
+    p 0 72 172 72
+    div 180 72 60 72
+      div 180 72 60 10
+      div 180 82 60 62
+        div 180 82 40 62
+        div 220 82 20 62
+          div 220 82 20 57
+          div 220 139 20 5
+  div 0 144 240 60
+    div 0 144 20 60
+    p 28 144 174 60
+    div 210 144 30 60
+      div 210 144 30 55
+      div 210 199 30 5

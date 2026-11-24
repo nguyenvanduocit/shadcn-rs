@@ -1,0 +1,43 @@
+# Chrome's boxes for min_auto_column.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 900 100
+  div 0 0 100 100
+    div 0 0 100 30
+    div 0 30 100 120
+      div 0 30 100 120
+  div 110 0 100 100
+    div 110 0 100 30
+    div 110 30 100 70
+      div 110 30 100 120
+  div 220 0 100 100
+    div 220 0 100 30
+    div 220 30 100 70
+      div 220 30 100 120
+  div 330 0 100 100
+    div 330 0 100 30
+    p 330 30 100 120
+  div 440 0 100 100
+    div 440 0 100 30
+    p 440 30 100 70
+  div 550 0 100 100
+    div 550 0 100 50
+      div 550 0 100 50
+    div 550 50 100 50
+      div 550 50 100 50
+    div 550 100 100 50
+      div 550 100 100 50
+  div 660 0 100 100
+    div 660 0 100 33.34375
+      div 660 0 100 50
+    div 660 33.34375 100 33.328125
+      div 660 33.34375 100 50
+    div 660 66.671875 100 33.328125
+      div 660 66.671875 100 50
+  div 770 0 100 100
+    div 770 0 100 33.34375
+      div 770 0 100 20
+    div 770 33.34375 100 33.328125
+      div 770 33.34375 100 20
+    div 770 66.671875 100 33.328125
+      div 770 66.671875 100 20

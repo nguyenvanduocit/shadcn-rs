@@ -1,0 +1,38 @@
+<!-- Flexbox §4.5 in a column: the automatic minimum height is the content's height (for text, its height at the width it was given); min-height: 0 and a scroll container take it away. Then columns of items with no flex, 150px of content in 100px: they keep their content and the column overflows (a typed hug); items that clip shrink (a typed fit); items whose own height in px is more than their content shrink towards the content in CSS, and keep their height as a typed hug (ADR-0027). -->
+<div style="display: flex; width: 900px; column-gap: 10px; align-items: flex-start">
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="flex: none; height: 30px"></div>
+    <div style="flex: 1"><div style="height: 120px"></div></div>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="flex: none; height: 30px"></div>
+    <div style="flex: 1; min-height: 0"><div style="height: 120px"></div></div>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="flex: none; height: 30px"></div>
+    <div style="flex: 1; overflow: scroll"><div style="height: 120px"></div></div>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="flex: none; height: 30px"></div>
+    <p style="flex: 1">Text that wraps onto several lines in the column</p>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="flex: none; height: 30px"></div>
+    <p style="flex: 1; min-height: 0">Text that wraps onto several lines in the column</p>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div><div style="height: 50px"></div></div>
+    <div><div style="height: 50px"></div></div>
+    <div><div style="height: 50px"></div></div>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="overflow: hidden"><div style="height: 50px"></div></div>
+    <div style="overflow: hidden"><div style="height: 50px"></div></div>
+    <div style="overflow: hidden"><div style="height: 50px"></div></div>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 100px; height: 100px">
+    <div style="height: 50px"><div style="height: 20px"></div></div>
+    <div style="height: 50px"><div style="height: 20px"></div></div>
+    <div style="height: 50px"><div style="height: 20px"></div></div>
+  </div>
+</div>

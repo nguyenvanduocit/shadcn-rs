@@ -1,0 +1,22 @@
+# Chrome's boxes for hug_shrink.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 164
+  div 0 0 150 72
+    p 0 0 70.6875 72
+    p 78.6875 0 71.3125 72
+  div 0 72 150 24
+    p 0 72 136.34375 24
+    p 144.34375 72 137.546875 24
+  div 0 96 400 24
+    p 0 96 136.34375 24
+    p 144.34375 96 137.546875 24
+  div 0 120 400 24
+    p 0 120 136.34375 24
+    p 144.34375 120 137.546875 24
+  div 0 144 150 10
+    div 0 144 71 10
+    div 79 144 71 10
+  div 0 154 150 10
+    div 0 154 100 10
+    div 108 154 100 10

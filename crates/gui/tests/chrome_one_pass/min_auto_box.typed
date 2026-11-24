@@ -1,0 +1,4 @@
+# The boxes of min_auto_box.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+14 = 0 60 40 20  # an item with no flex and width: 80px is a fit whose content is 80: it shrinks to the 40 left, its floor being its padding and border (Chrome: the automatic minimum from its specified size keeps 80)
+16 = 40 60 60 20  # so the fixed box after it starts at 40, inside the row

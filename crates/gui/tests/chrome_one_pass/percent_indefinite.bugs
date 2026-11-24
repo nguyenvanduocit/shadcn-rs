@@ -1,0 +1,6 @@
+# Boxes of percent_indefinite.html that today's engine lays out wrongly (ADR-0027, "Bugs L2 fixes"). The format
+# is in fill_in_hug_row.bugs.
+22-24  # a paragraph of width: 50% in a content-sized row: its height is measured before its width settles (24 px, the height of its max-content width; Chrome 48)
+0  # its height, from that row
+18  # its height, from that row
+25-29  # their place, below that row

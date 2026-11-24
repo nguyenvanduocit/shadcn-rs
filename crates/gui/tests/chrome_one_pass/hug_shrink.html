@@ -1,0 +1,27 @@
+<!-- Content-sized items in a row too narrow: CSS's default (shrink 1) wraps the text down to its widest word; shrink 0 keeps each at its content and overflows; with room both are the same. -->
+<div style="width: 400px">
+  <div style="display: flex; width: 150px; column-gap: 8px">
+    <p>Settings and more</p>
+    <p>Another label here</p>
+  </div>
+  <div style="display: flex; width: 150px; column-gap: 8px">
+    <p style="flex-shrink: 0">Settings and more</p>
+    <p style="flex-shrink: 0">Another label here</p>
+  </div>
+  <div style="display: flex; width: 400px; column-gap: 8px">
+    <p>Settings and more</p>
+    <p>Another label here</p>
+  </div>
+  <div style="display: flex; width: 400px; column-gap: 8px">
+    <p style="flex-shrink: 0">Settings and more</p>
+    <p style="flex-shrink: 0">Another label here</p>
+  </div>
+  <div style="display: flex; width: 150px; column-gap: 8px">
+    <div style="width: 100px; height: 10px"></div>
+    <div style="width: 100px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 150px; column-gap: 8px">
+    <div style="flex: none; width: 100px; height: 10px"></div>
+    <div style="flex: none; width: 100px; height: 10px"></div>
+  </div>
+</div>

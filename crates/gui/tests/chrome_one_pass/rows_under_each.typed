@@ -1,0 +1,3 @@
+# The boxes of rows_under_each.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+20 = 199 125 98 20  # a label with no flex is a fit: it shrinks to its trigger (Chrome: it keeps 155.09 and lies over the trigger before it)

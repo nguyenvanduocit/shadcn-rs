@@ -1,0 +1,15 @@
+<!-- The app shell: a column of a known height with a fixed header and footer and a scrolling body that fills (a scroll container has no automatic minimum), and beside it a row of a fixed sidebar and a fill holding wide content. -->
+<div style="display: flex; flex-direction: column; width: 400px; height: 300px">
+  <div style="flex: none; height: 40px"></div>
+  <div style="display: flex; flex: 1; min-height: 0">
+    <div style="flex: none; width: 120px; display: flex; flex-direction: column">
+      <div style="flex: none; height: 32px"></div>
+      <div style="flex: 1; overflow-y: scroll"><div style="height: 500px"></div></div>
+      <div style="flex: none; height: 32px"></div>
+    </div>
+    <div style="flex: 1; min-width: 0; overflow: scroll">
+      <div style="width: 900px; height: 700px"></div>
+    </div>
+  </div>
+  <div style="flex: none; height: 24px"></div>
+</div>

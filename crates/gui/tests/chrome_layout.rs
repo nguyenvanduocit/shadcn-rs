@@ -42,7 +42,7 @@ use gui::style::{
     Style, Track,
 };
 use gui::text::TextSystem;
-use gui::{Element, IntoElement, Motion, Styled, div, text};
+use gui::{Element, ImageSource, IntoElement, Motion, Styled, div, image, text};
 
 /// The window both lay a fixture out in (`layout.mjs` uses the same).
 const WIDTH: f32 = 800.0;
@@ -349,7 +349,8 @@ fn styled<T: Styled>(mut node: T, style: Option<&str>) -> T {
 }
 
 /// A fixture element as gui's: `<div>` a box, `<p>` a paragraph of the
-/// text in it, white space collapsed as CSS collapses it.
+/// text in it, white space collapsed as CSS collapses it, `<img>` an image
+/// (the fixtures of `chrome_one_pass/`, ADR-0027; none here has one yet).
 fn build(e: roxmltree::Node<'_, '_>) -> Element {
     let style = e.attribute("style");
     match e.tag_name().name() {
@@ -370,6 +371,16 @@ fn build(e: roxmltree::Node<'_, '_>) -> Element {
         "p" => {
             let content = e.text().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
             styled(text(content), style).into_element()
+        }
+        // A replaced element: `<img data-natural="WxH"/>`, an image of that
+        // natural size (`one-pass.mjs` gives the page's one the same).
+        "img" => {
+            let natural = e.attribute("data-natural").expect("an <img> says its natural size");
+            let (w, h) = natural.split_once('x').expect("data-natural is WxH");
+            let (w, h) = (number(w) as u32, number(h) as u32);
+            let pixels = vec![0_u8; (w * h * 4) as usize];
+            let source = ImageSource::from_rgba(w, h, &pixels).expect("an image of that size");
+            styled(image(source), style).into_element()
         }
         other => panic!("no element <{other}>"),
     }
@@ -414,6 +425,7 @@ fn ours(nodes: &[FrameNode]) -> Vec<Placed> {
         depth[i] = depth[parent] + 1;
         let tag = match n.content {
             gui::layout::Content::Text { .. } => "p",
+            gui::layout::Content::Image { .. } => "img",
             _ => "div",
         };
         out.push(Placed {

@@ -1,0 +1,18 @@
+# Chrome's boxes for min_auto_aspect_ratio.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 170
+  div 0 0 100 50
+    div 0 0 100 50
+    div 100 0 60 50
+  div 0 50 100 50
+    div 0 50 100 50
+      div 0 50 70 10
+    div 100 50 60 50
+  div 0 100 100 50
+    div 0 100 40 50
+      div 0 100 70 10
+    div 40 100 60 50
+  div 0 150 100 20
+    div 0 150 40 20
+    div 40 150 60 20

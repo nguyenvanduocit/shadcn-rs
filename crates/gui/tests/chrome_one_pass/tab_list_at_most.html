@@ -1,0 +1,35 @@
+<!-- A tab list that hugs, in a 200px column aligned to its start: its triggers fill. While their labels fit, the list hugs and each trigger with an automatic minimum is as wide as its label (as flex: none). When they do not fit (246px of one-line labels), Chrome does not cap the list at the column: a one-line label's min-content is its whole width, so the list is 246px and overflows the column; with min-width: 0 that width is shared by weight and labels overflow their triggers, with automatic minimums each trigger keeps its label. Then triggers that are clipping boxes holding a label: Chrome gives them equal shares of the list's content width, also when it fits. A typed row differs here on purpose (ADR-0027): a list whose triggers fit keeps each at its content; one that does not fit is 200px, and each trigger shrinks from its content. The list with automatic minimums (the fifth) has no typed form: it is flex(), and Chrome's. -->
+<div style="display: flex; flex-direction: column; align-items: flex-start; width: 200px; row-gap: 4px">
+  <div style="display: flex">
+    <p style="flex: 1; white-space: nowrap">Account</p>
+    <p style="flex: 1; white-space: nowrap">Password</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: none; white-space: nowrap">Account</p>
+    <p style="flex: none; white-space: nowrap">Password</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Account</p>
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Password</p>
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Team and plan</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: 2; min-width: 0; white-space: nowrap">Account</p>
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Password</p>
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Team and plan</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: 1; white-space: nowrap">Account</p>
+    <p style="flex: 1; white-space: nowrap">Password</p>
+    <p style="flex: 1; white-space: nowrap">Team and plan</p>
+  </div>
+  <div style="display: flex; padding: 3px">
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center; padding: 4px 8px; overflow: hidden"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Account</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center; padding: 4px 8px; overflow: hidden"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Password</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center; padding: 4px 8px; overflow: hidden"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Team and plan</p></div>
+  </div>
+  <div style="display: flex; padding: 3px">
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center; padding: 4px 8px; overflow: hidden"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">One</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; justify-content: center; padding: 4px 8px; overflow: hidden"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Two</p></div>
+  </div>
+</div>

@@ -1,0 +1,4 @@
+# The boxes of fill_in_hug_row.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+5 = 0 28 62.515625 24  # fills that fit an AtMost(300) row keep their content (Chrome with min-width: 0: equal shares, the second label overflows its box)
+6 = 62.515625 28 170.5625 24

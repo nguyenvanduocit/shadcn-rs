@@ -1,0 +1,33 @@
+# Chrome's boxes for percent_indefinite.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 352
+  div 0 0 200 60
+    div 0 0 50 40
+      div 0 0 50 40
+    div 50 0 50 60
+  div 0 60 200 60
+    div 0 60 200 40
+      div 0 60 200 40
+    div 0 100 200 20
+  div 0 120 200 60
+    div 0 120 50 60
+      div 0 120 50 60
+      div 0 180 50 30
+    div 50 120 50 60
+  div 0 180 200 80
+    div 0 180 50 80
+      div 0 180 50 40
+    div 50 180 100 20
+  div 0 260 400 82
+    div 0 260 127.953125 34
+      div 0 260 63.96875 10
+      p 0 270 127.953125 24
+    div 0 294 222.09375 48
+      p 0 294 111.046875 48
+      div 111.046875 294 40 48
+  div 0 342 200 10
+    div 0 342 100 10
+      div 0 342 100 10
+    div 100 342 100 10
+      div 100 342 150 10

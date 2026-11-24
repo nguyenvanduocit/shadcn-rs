@@ -1,0 +1,19 @@
+# Chrome's boxes for min_auto_text_nowrap.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 120
+  div 0 0 160 24
+    p 0 0 202.109375 24
+    p 210.109375 0 33.921875 24
+  div 0 24 160 24
+    p 0 24 118.078125 24
+    p 126.078125 24 33.921875 24
+  div 0 48 160 24
+    p 0 48 118.078125 24
+    p 126.078125 48 33.921875 24
+  div 0 72 360 24
+    p 0 72 318.078125 24
+    p 326.078125 72 33.921875 24
+  div 0 96 360 24
+    p 0 96 318.078125 24
+    p 326.078125 96 33.921875 24

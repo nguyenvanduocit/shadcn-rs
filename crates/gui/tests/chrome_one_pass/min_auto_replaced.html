@@ -1,0 +1,31 @@
+<!-- Flexbox §4.5 for a replaced element (an image of natural size 100x50), 40px left in the row: its automatic minimum is the smaller of its content size (its natural width) and its specified or transferred size (a height carried through its ratio); min-width: 0 takes it away, and a fill is its share. -->
+<div style="width: 300px">
+  <div style="display: flex; width: 100px; align-items: flex-start">
+    <img data-natural="100x50"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 100px; align-items: flex-start">
+    <img data-natural="100x50" style="min-width: 0"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 100px; align-items: flex-start">
+    <img data-natural="100x50" style="height: 40px"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 100px; align-items: flex-start">
+    <img data-natural="100x50" style="width: 80px"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 100px; align-items: flex-start">
+    <img data-natural="100x50" style="width: 160px"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 100px; align-items: flex-start">
+    <img data-natural="100x50" style="flex: 1; min-width: 0"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+  <div style="display: flex; width: 300px; align-items: flex-start">
+    <img data-natural="100x50"/>
+    <div style="flex: none; width: 60px; height: 10px"></div>
+  </div>
+</div>

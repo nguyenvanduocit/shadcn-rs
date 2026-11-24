@@ -1,0 +1,14 @@
+# Chrome's boxes for fill_scroll_shell.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 300
+  div 0 0 400 40
+  div 0 40 400 236
+    div 0 40 120 236
+      div 0 40 120 32
+      div 0 72 120 172
+        div 0 72 120 500
+      div 0 244 120 32
+    div 120 40 280 236
+      div 120 40 900 700
+  div 0 276 400 24

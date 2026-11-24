@@ -28,7 +28,9 @@ svgtypes = "0.16"
 # The heap counted per process and per thread (ADR-0023): a counting
 # `GlobalAlloc` wrapper, since the workspace forbids `unsafe`.
 smelt-perf = "0.3"
-taffy = "0.15"
+# Pinned (ADR-0027): gui owns its layout engine; Taffy gives the vocabulary of
+# the CSS algorithms and the general grid, and is upgraded when we choose.
+taffy = "=0.15.1"
 # Shadows, filters and grid tracks are kept inline in a node's style, so a
 # binding that writes them allocates nothing (ADR-0022).
 smallvec = { version = "1", features = ["const_generics", "const_new"] }

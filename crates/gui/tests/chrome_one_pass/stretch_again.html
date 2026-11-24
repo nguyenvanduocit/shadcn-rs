@@ -1,0 +1,23 @@
+<!-- Stretched again, in a form typed containers take (min-height: 0 on the growers): a row of unknown height whose paragraph sets a 96px line; a column stretched to it holds a grower and a 5px foot, so it is measured for the line and laid out at it. Then two levels: a stretched column holding a stretched row holding a grower. Then the same row with a known height, where nothing is measured. -->
+<div style="width: 400px">
+  <div style="display: flex; width: 240px; column-gap: 8px">
+    <div style="flex: none; width: 20px"></div>
+    <p style="flex: 1; min-width: 0">A description long enough to wrap onto three lines here</p>
+    <div style="flex: none; width: 30px; display: flex; flex-direction: column"><div style="flex: 1; min-height: 0"></div><div style="flex: none; height: 5px"></div></div>
+  </div>
+  <div style="display: flex; width: 240px; column-gap: 8px">
+    <p style="flex: 1; min-width: 0">A description long enough to wrap onto three lines here</p>
+    <div style="flex: none; width: 60px; display: flex; flex-direction: column">
+      <div style="flex: none; height: 10px"></div>
+      <div style="flex: 1; min-height: 0; display: flex">
+        <div style="flex: 1; min-width: 0"></div>
+        <div style="flex: none; width: 20px; display: flex; flex-direction: column"><div style="flex: 1; min-height: 0"></div><div style="flex: none; height: 5px"></div></div>
+      </div>
+    </div>
+  </div>
+  <div style="display: flex; width: 240px; height: 60px; column-gap: 8px">
+    <div style="flex: none; width: 20px"></div>
+    <p style="flex: 1; min-width: 0">A description long enough to wrap onto three lines here</p>
+    <div style="flex: none; width: 30px; display: flex; flex-direction: column"><div style="flex: 1; min-height: 0"></div><div style="flex: none; height: 5px"></div></div>
+  </div>
+</div>

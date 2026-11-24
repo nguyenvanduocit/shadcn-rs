@@ -66,7 +66,7 @@ row when a milestone lands.
 | Typed contexts and parts | not yet | M11 K6; `use_context` and `shadcn/src/part.rs` are the old form |
 | Bindings (values or closures on setters) | partial | `gui/src/layout/binding.rs`; K1, K2 rework, K4b covers the a11y setters |
 | Retained layout, `CacheTree`, parallel islands, virtual lists (ADR-0014) | built | `gui/src/layout/engine/mod.rs`, `gui/src/list/` |
-| Typed one-pass layout (ADR-0027) | not yet | M12 L1-L3; the ADR is not written |
+| Typed one-pass layout (ADR-0027) | not yet | M12 L2-L3; the ADR is written and accepted (L1), nothing of it is in `gui/src`; Chrome fixtures in `gui/tests/chrome_one_pass/` |
 | Paint, property trees, retained chunks, GPU atlases, GPU paths and data chunks (ADR-0016-0018) | built | `gui/src/paint.rs`, `scene.rs`, `gpu/`, `chunk/`, `canvas/` |
 | Three threads, presentation time (ADR-0015) | built | `gui/src/compositor/thread.rs`, `clock.rs` |
 | Text: Parley, skrifa, Slug (ADR-0019) | built | `gui/Cargo.toml`, `gui/src/text/`, `gpu/slug.rs` |

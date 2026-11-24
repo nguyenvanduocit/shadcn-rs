@@ -1,0 +1,26 @@
+<!-- Growth factors that sum to less than 1 in a 200px row: CSS hands out only that fraction of the free space (flex: 0.5 alone takes half). A typed fill's weight is a proportion, so a lone fill(0.5) takes all of it (ADR-0027); where the weights sum to 1 or more the two agree. Last, two fills of 0.5 of which one is capped at 60px: once it is frozen the weight left is 0.5, so CSS hands the other only half of the free space; the typed fill takes all that is left (140). -->
+<div style="width: 300px">
+  <div style="display: flex; width: 200px; height: 10px">
+    <div style="flex: 0.5; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 10px">
+    <div style="flex: 0.25; min-width: 0"></div>
+    <div style="flex: 0.25; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 10px">
+    <div style="flex: none; width: 40px"></div>
+    <div style="flex: 0.5; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 10px">
+    <div style="flex: 0.5; min-width: 0"></div>
+    <div style="flex: 0.5; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 10px">
+    <div style="flex: 1; min-width: 0"></div>
+    <div style="flex: 3; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 10px">
+    <div style="flex: 0.5; min-width: 0; max-width: 60px"></div>
+    <div style="flex: 0.5; min-width: 0"></div>
+  </div>
+</div>

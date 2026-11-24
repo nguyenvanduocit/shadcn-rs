@@ -1,0 +1,25 @@
+# Chrome's boxes for min_auto_replaced.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 270
+  div 0 0 100 50
+    img 0 0 100 50
+    div 100 0 60 10
+  div 0 50 100 20
+    img 0 50 40 20
+    div 40 50 60 10
+  div 0 70 100 40
+    img 0 70 80 40
+    div 80 70 60 10
+  div 0 110 100 40
+    img 0 110 80 40
+    div 80 110 60 10
+  div 0 150 100 50
+    img 0 150 100 50
+    div 100 150 60 10
+  div 0 200 100 20
+    img 0 200 40 20
+    div 40 200 60 10
+  div 0 220 300 50
+    img 0 220 100 50
+    div 100 220 60 10

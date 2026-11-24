@@ -1,0 +1,34 @@
+# Chrome's boxes for rows_under_each.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 353
+  div 0 0 200 117
+    div 4 4 192 32
+      div 12 12 16 16
+      p 36 10 108.09375 20
+      p 152.09375 12 35.90625 16
+    div 4 40 192 32
+      div 12 48 16 16
+      p 36 46 107.6875 20
+      p 151.6875 48 36.3125 16
+    div 4 76 192 1
+    div 4 81 192 32
+      div 12 89 16 16
+      p 36 87 152 20
+  div 0 117 300 36
+    div 3 120 98 30
+      p 24.40625 125 55.1875 20
+    div 101 120 98 30
+      p 117.59375 125 64.796875 20
+    div 199 120 98 30
+      p 170.453125 125 155.09375 20
+  div 0 153 200 200
+    div 0 153 200 48
+      p 0 153 185.5625 48
+      p 193.5625 153 6.4375 48
+    div 0 253 200 24
+      p 0 253 172.65625 24
+      p 180.65625 253 19.34375 24
+    div 0 329 200 24
+      p 0 329 162.453125 24
+      p 170.453125 329 29.546875 24

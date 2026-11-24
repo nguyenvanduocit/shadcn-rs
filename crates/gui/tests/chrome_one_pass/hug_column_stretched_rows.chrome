@@ -1,0 +1,29 @@
+# Chrome's boxes for hug_column_stretched_rows.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 700 133
+  div 0 0 221.609375 133
+    p 4 4 213.609375 28
+    div 4 32 213.609375 64
+      div 4 32 213.609375 32
+        div 12 40 16 16
+        p 36 38 129.703125 20
+        p 173.703125 40 35.90625 16
+      div 4 64 213.609375 32
+        div 12 72 16 16
+        p 36 70 129.296875 20
+        p 173.296875 72 36.3125 16
+    div 4 96 213.609375 1
+    div 4 97 213.609375 32
+      div 4 97 213.609375 32
+        div 12 105 16 16
+        p 36 103 173.609375 20
+  div 241.609375 0 120 72
+    div 241.609375 0 177.296875 72
+      div 245.609375 4 169.296875 64
+        div 245.609375 4 169.296875 32
+          div 253.609375 12 16 16
+          p 277.609375 10 129.296875 20
+        div 245.609375 36 169.296875 32
+          div 253.609375 44 16 16
+          p 277.609375 42 129.296875 20

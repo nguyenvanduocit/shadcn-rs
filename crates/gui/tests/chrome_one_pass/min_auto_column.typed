@@ -1,0 +1,7 @@
+# The boxes of min_auto_column.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+34 = 770 0 100 50  # a column item with no flex is a hug, and its own height in px is its content: it keeps 50 and the column overflows (Chrome: its automatic minimum is its content, 20, so the three shrink to 33.33)
+36 = 770 50 100 50
+37 = 770 50 100 20  # its place, below the item before it
+38 = 770 100 100 50
+39 = 770 100 100 20

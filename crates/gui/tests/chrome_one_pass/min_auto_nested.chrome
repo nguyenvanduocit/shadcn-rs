@@ -1,0 +1,24 @@
+# Chrome's boxes for min_auto_nested.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 300 96
+  div 0 0 150 24
+    div 0 0 180.140625 24
+      div 0 0 180.140625 24
+        p 0 0 180.140625 24
+    div 180.140625 0 50 24
+  div 0 24 150 24
+    div 0 24 100 24
+      div 0 24 180.140625 24
+        p 0 24 180.140625 24
+    div 100 24 50 24
+  div 0 48 150 24
+    div 0 48 100 24
+      div 0 48 100 24
+        p 0 48 180.140625 24
+    div 100 48 50 24
+  div 0 72 150 24
+    div 0 72 100 24
+      div 0 72 100 24
+        p 0 72 100 24
+    div 100 72 50 24

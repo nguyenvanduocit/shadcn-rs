@@ -1,0 +1,31 @@
+<!-- Flexbox §4.5 on boxes: the content size suggestion (a 150px child), the specified size suggestion (width: 80px caps it), max-width capping it, and min-width: 0 or overflow: hidden removing it. -->
+<div style="width: 300px">
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="flex: 1"><div style="width: 150px; height: 10px"></div></div>
+    <div style="flex: none; width: 40px"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="flex: 1; min-width: 0"><div style="width: 150px; height: 10px"></div></div>
+    <div style="flex: none; width: 40px"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="flex: 1; overflow: hidden"><div style="width: 150px; height: 10px"></div></div>
+    <div style="flex: none; width: 40px"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="width: 80px"><div style="width: 150px; height: 10px"></div></div>
+    <div style="flex: none; width: 60px"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="width: 80px; min-width: 0"><div style="width: 150px; height: 10px"></div></div>
+    <div style="flex: none; width: 60px"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="flex: 1; max-width: 50px"><div style="width: 150px; height: 10px"></div></div>
+    <div style="flex: 1"></div>
+  </div>
+  <div style="display: flex; width: 100px; height: 20px">
+    <div style="width: 80px"></div>
+    <div style="flex: none; width: 60px"></div>
+  </div>
+</div>

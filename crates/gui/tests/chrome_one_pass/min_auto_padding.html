@@ -1,0 +1,25 @@
+<!-- With min-width: 0 a fill's floor is its padding and border; an explicit min-width is its floor; max-width its ceiling, the space it leaves going to the other fills. Last, two equal fills of which one has padding: CSS shares the space left after the padding and adds the padding back (120 / 80); a typed fill's share is its outer size (100 / 100, ADR-0027). -->
+<div style="width: 300px">
+  <div style="display: flex; width: 60px; height: 20px">
+    <div style="flex: none; width: 50px"></div>
+    <div style="flex: 1; min-width: 0; padding: 0 10px; border-width: 2px"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 20px">
+    <div style="flex: 1; min-width: 80px"></div>
+    <div style="flex: none; width: 150px"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 20px">
+    <div style="flex: 1; min-width: 0; max-width: 50px"></div>
+    <div style="flex: 1; min-width: 0"></div>
+    <div style="flex: 2; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 20px">
+    <div style="flex: 1; min-width: 0; padding: 0 30px"></div>
+    <div style="flex: 1; min-width: 0"></div>
+    <div style="flex: none; width: 150px"></div>
+  </div>
+  <div style="display: flex; width: 200px; height: 20px">
+    <div style="flex: 1; min-width: 0; padding: 0 20px"></div>
+    <div style="flex: 1; min-width: 0"></div>
+  </div>
+</div>

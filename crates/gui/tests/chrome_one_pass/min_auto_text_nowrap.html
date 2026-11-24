@@ -1,0 +1,23 @@
+<!-- Flexbox §4.5: a growing one-line label (the truncate case). Automatic minimum: it keeps its whole width and pushes the badge out; min-width: 0 or overflow: hidden: it takes what is left. -->
+<div style="width: 400px">
+  <div style="display: flex; width: 160px; column-gap: 8px">
+    <p style="flex: 1; white-space: nowrap">A label too long for the row</p>
+    <p style="flex: none">New</p>
+  </div>
+  <div style="display: flex; width: 160px; column-gap: 8px">
+    <p style="flex: 1; min-width: 0; white-space: nowrap">A label too long for the row</p>
+    <p style="flex: none">New</p>
+  </div>
+  <div style="display: flex; width: 160px; column-gap: 8px">
+    <p style="flex: 1; overflow: hidden; white-space: nowrap">A label too long for the row</p>
+    <p style="flex: none">New</p>
+  </div>
+  <div style="display: flex; width: 360px; column-gap: 8px">
+    <p style="flex: 1; white-space: nowrap">A label too long for the row</p>
+    <p style="flex: none">New</p>
+  </div>
+  <div style="display: flex; width: 360px; column-gap: 8px">
+    <p style="flex: 1; min-width: 0; white-space: nowrap">A label too long for the row</p>
+    <p style="flex: none">New</p>
+  </div>
+</div>

@@ -1,0 +1,23 @@
+# Chrome's boxes for wrap_fill.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 260
+  div 0 0 220 52
+    p 0 0 49.234375 24
+    p 53.234375 0 97.109375 24
+    p 154.34375 0 37.421875 24
+    p 0 28 57.765625 24
+    div 61.765625 28 158.234375 24
+  div 0 52 220 24
+    p 0 52 49.234375 24
+    p 53.234375 52 97.109375 24
+    div 154.34375 52 65.65625 24
+  div 0 76 300 60
+    div 0 76 93.328125 20
+    div 103.328125 76 93.34375 20
+    div 206.671875 76 93.328125 30
+    div 0 116 123.328125 20
+    div 133.328125 116 166.671875 20
+  div 0 136 100 124
+    p 0 136 250.421875 24
+    p 0 164 100 96

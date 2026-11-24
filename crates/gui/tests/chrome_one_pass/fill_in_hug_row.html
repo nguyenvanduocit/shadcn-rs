@@ -1,0 +1,31 @@
+<!-- Fills in a row that hugs its content (a tab list that is as wide as its triggers): there is no space left to share. With automatic minimums one-line labels end at their own widths; with min-width: 0 they are equal and the longer label overflows its box; text that can wrap is given an equal share and wraps though the row could have been wider; and a hugging row with one filling paragraph is capped by the column and wraps. -->
+<div style="display: flex; flex-direction: column; align-items: flex-start; width: 300px; row-gap: 4px">
+  <div style="display: flex">
+    <p style="flex: 1; white-space: nowrap">Account</p>
+    <p style="flex: 1; white-space: nowrap">Password and security</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Account</p>
+    <p style="flex: 1; min-width: 0; white-space: nowrap">Password and security</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: none; white-space: nowrap">Account</p>
+    <p style="flex: none; white-space: nowrap">Password and security</p>
+  </div>
+  <div style="display: flex">
+    <p style="flex: 1">Hi</p>
+    <p style="flex: 1">Some words that could stay on one line</p>
+  </div>
+  <div style="display: flex; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1">A filling paragraph in a hugging row, longer than the column is wide</p>
+  </div>
+  <div style="display: flex; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1; min-width: 0">A filling paragraph in a hugging row, longer than the column is wide</p>
+  </div>
+  <div style="display: flex; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1">Short fill</p>
+  </div>
+</div>

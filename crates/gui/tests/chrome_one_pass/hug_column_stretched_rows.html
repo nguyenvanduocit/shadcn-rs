@@ -1,0 +1,39 @@
+<!-- A menu: a column that hugs, whose rows are stretched to its width. The widest row sets the width, every row is then laid out at it, and the filling label of each takes what its icon and shortcut leave. Two levels deep: the menu holds groups (columns, stretched), a group holds rows. Then the same menu capped by a narrow parent. -->
+<div style="display: flex; align-items: flex-start; column-gap: 20px; width: 700px">
+  <div style="flex: none; display: flex; flex-direction: column; padding: 4px">
+    <p style="font-size: 12px; line-height: 16px; padding: 6px 8px">My account</p>
+    <div style="display: flex; flex-direction: column">
+      <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+        <div style="flex: none; width: 16px; height: 16px"></div>
+        <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Profile</p>
+        <p style="flex: none; font-size: 12px; line-height: 16px">Ctrl+P</p>
+      </div>
+      <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+        <div style="flex: none; width: 16px; height: 16px"></div>
+        <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Keyboard shortcuts</p>
+        <p style="flex: none; font-size: 12px; line-height: 16px">Ctrl+K</p>
+      </div>
+    </div>
+    <div style="height: 1px"></div>
+    <div style="display: flex; flex-direction: column">
+      <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+        <div style="flex: none; width: 16px; height: 16px"></div>
+        <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Log out</p>
+      </div>
+    </div>
+  </div>
+  <div style="flex: none; display: flex; flex-direction: column; align-items: flex-start; width: 120px">
+    <div style="display: flex; flex-direction: column; padding: 4px">
+      <div style="display: flex; flex-direction: column">
+        <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+          <div style="flex: none; width: 16px; height: 16px"></div>
+          <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Profile</p>
+        </div>
+        <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+          <div style="flex: none; width: 16px; height: 16px"></div>
+          <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Keyboard shortcuts</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

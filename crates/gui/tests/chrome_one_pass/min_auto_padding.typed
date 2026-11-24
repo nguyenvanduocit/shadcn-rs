@@ -1,0 +1,4 @@
+# The boxes of min_auto_padding.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+16 = 0 80 100 20  # a fill's share is its outer size: two fills of 1 in 200 are 100 each, the padding of 40 inside the first (Chrome: 160 shared, then the padding added: 120 / 80)
+17 = 100 80 100 20

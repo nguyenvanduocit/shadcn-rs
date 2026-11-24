@@ -1,0 +1,19 @@
+<!-- Flexbox §4.5, content size suggestion: a growing paragraph's automatic minimum is its widest word; min-width: 0 takes it away; with room both are the same. -->
+<div style="width: 400px">
+  <div style="display: flex; width: 120px; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1">Internationalization matters</p>
+  </div>
+  <div style="display: flex; width: 120px; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1; min-width: 0">Internationalization matters</p>
+  </div>
+  <div style="display: flex; width: 400px; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1">Internationalization matters</p>
+  </div>
+  <div style="display: flex; width: 400px; column-gap: 8px">
+    <div style="flex: none; width: 40px; height: 24px"></div>
+    <p style="flex: 1; min-width: 0">Internationalization matters</p>
+  </div>
+</div>

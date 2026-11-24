@@ -1,0 +1,31 @@
+<!-- The cross axis: in a row of unknown height the tallest item (wrapped text in a fill) sets the line and stretched items are laid out again at it; with a known height nothing depends on a sibling. A column stretches widths, or hugs them when not stretched. -->
+<div style="width: 400px">
+  <div style="display: flex; width: 240px; column-gap: 8px">
+    <div style="flex: none; width: 20px"></div>
+    <p style="flex: 1; min-width: 0">A description long enough to wrap onto three lines here</p>
+    <div style="flex: none; width: 30px; align-self: flex-start; height: 10px"></div>
+    <div style="flex: none; width: 30px; display: flex; flex-direction: column"><div style="flex: 1"></div><div style="height: 5px"></div></div>
+  </div>
+  <div style="display: flex; width: 240px; height: 60px; column-gap: 8px">
+    <div style="flex: none; width: 20px"></div>
+    <p style="flex: 1; min-width: 0">A description long enough to wrap onto three lines here</p>
+    <div style="flex: none; width: 30px; align-self: center; height: 10px"></div>
+    <div style="flex: none; width: 30px; display: flex; flex-direction: column"><div style="flex: 1"></div><div style="height: 5px"></div></div>
+  </div>
+  <div style="display: flex; width: 240px; column-gap: 8px; align-items: center">
+    <div style="flex: none; width: 20px; height: 20px"></div>
+    <p style="flex: 1; min-width: 0">A description long enough to wrap onto three lines here</p>
+    <p style="flex: none">End</p>
+  </div>
+  <div style="display: flex; flex-direction: column; width: 240px; row-gap: 4px">
+    <p>Stretched across the column</p>
+    <p style="align-self: flex-start">Hugs</p>
+    <p style="align-self: center">Centred</p>
+    <div style="height: 10px"></div>
+  </div>
+  <div style="display: flex; flex-direction: column; align-items: flex-start; row-gap: 4px">
+    <p>A column as wide as its widest child</p>
+    <div style="height: 10px; align-self: stretch"></div>
+    <p>Short</p>
+  </div>
+</div>

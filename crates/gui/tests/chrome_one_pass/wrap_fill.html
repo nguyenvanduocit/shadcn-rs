@@ -1,0 +1,26 @@
+<!-- Wrapping keeps CSS flex: tags that hug and an input that fills the rest of its line (tags_input), items that grow from a basis per line, and a wrapped line whose automatic minimum overflows. -->
+<div style="width: 400px">
+  <div style="display: flex; flex-wrap: wrap; gap: 4px; width: 220px">
+    <p style="flex: none; padding: 0 8px">Rust</p>
+    <p style="flex: none; padding: 0 8px">TypeScript</p>
+    <p style="flex: none; padding: 0 8px">Go</p>
+    <p style="flex: none; padding: 0 8px">Kotlin</p>
+    <div style="flex: 1; min-width: 60px; height: 24px"></div>
+  </div>
+  <div style="display: flex; flex-wrap: wrap; gap: 4px; width: 220px">
+    <p style="flex: none; padding: 0 8px">Rust</p>
+    <p style="flex: none; padding: 0 8px">TypeScript</p>
+    <div style="flex: 1; min-width: 60px; height: 24px"></div>
+  </div>
+  <div style="display: flex; flex-wrap: wrap; gap: 10px; width: 300px">
+    <div style="flex: 1 1 80px; height: 20px"></div>
+    <div style="flex: 1 1 80px; height: 20px"></div>
+    <div style="flex: 1 1 80px; height: 30px"></div>
+    <div style="flex: 1 1 80px; height: 20px"></div>
+    <div style="flex: 2 1 80px; height: 20px"></div>
+  </div>
+  <div style="display: flex; flex-wrap: wrap; gap: 4px; width: 100px">
+    <p style="white-space: nowrap">A nowrap item wider than the line</p>
+    <p>Wrapped words in an item wider than it</p>
+  </div>
+</div>

@@ -1,0 +1,21 @@
+<!-- shadcn's card header (card.rs): columns 1fr auto, implicit rows min-content, title and description in column 1, the action in column 2 spanning both rows, aligned start and end. With and without the action, and with a title that wraps. -->
+<div style="width: 400px">
+  <div style="display: grid; grid-auto-rows: min-content; grid-template-columns: 1fr auto; align-items: start; gap: 6px; padding: 0 24px; width: 360px">
+    <p style="grid-column: 1; line-height: 1; font-weight: 600">Card title</p>
+    <p style="grid-column: 1; font-size: 14px; line-height: 20px">A description of the card that is long enough to wrap onto a second line</p>
+    <div style="grid-column: 2; grid-row: 1 / span 2; align-self: start; justify-self: end"><div style="width: 64px; height: 36px"></div></div>
+  </div>
+  <div style="display: grid; grid-auto-rows: min-content; grid-template-columns: 1fr auto; align-items: start; gap: 6px; padding: 0 24px; width: 360px">
+    <p style="grid-column: 1; line-height: 1; font-weight: 600">Card title</p>
+    <p style="grid-column: 1; font-size: 14px; line-height: 20px">A short description</p>
+  </div>
+  <div style="display: grid; grid-auto-rows: min-content; grid-template-columns: 1fr auto; align-items: start; gap: 6px; padding: 0 24px; width: 200px">
+    <p style="grid-column: 1; line-height: 1; font-weight: 600">A card title that has to wrap</p>
+    <p style="grid-column: 1; font-size: 14px; line-height: 20px">Description</p>
+    <div style="grid-column: 2; grid-row: 1 / span 2; align-self: start; justify-self: end"><div style="width: 64px; height: 80px"></div></div>
+  </div>
+  <div style="display: grid; grid-auto-rows: min-content; grid-template-columns: 1fr auto; align-items: start; gap: 6px; padding: 0 24px; width: 360px">
+    <p style="grid-column: 1; line-height: 1; font-weight: 600">Title only</p>
+    <div style="grid-column: 2; grid-row: 1 / span 2; align-self: start; justify-self: end"><div style="width: 64px; height: 36px"></div></div>
+  </div>
+</div>

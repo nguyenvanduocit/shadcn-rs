@@ -1,0 +1,21 @@
+# Chrome's boxes for card_header_grid.html, written by crates/shadcn/verdict/one-pass.mjs: border boxes
+# (x y width height, logical px) in document order, indented by depth; Chrome 145,
+# a 800x600 window at 1x, gui's Inter.
+div 0 0 400 230
+  div 0 0 360 62
+    p 24 0 242 16
+    p 24 22 242 40
+    div 272 0 64 36
+      div 272 0 64 36
+  div 0 62 360 42
+    p 24 62 306 16
+    p 24 84 306 20
+  div 0 104 200 90
+    p 24 104 82 64
+    p 24 174 82 20
+    div 112 104 64 80
+      div 112 104 64 80
+  div 0 194 360 36
+    p 24 194 242 16
+    div 272 194 64 36
+      div 272 194 64 36

@@ -1,0 +1,33 @@
+<!-- Flexbox §4.5 and §9.7: with automatic minimums a weighted split is not the weights (an item held at its content freezes and the rest share what is left); with min-width: 0 it is exactly the weights. -->
+<div style="width: 300px">
+  <div style="display: flex; width: 300px; height: 20px">
+    <div style="flex: 1"><div style="width: 160px; height: 10px"></div></div>
+    <div style="flex: 1"></div>
+    <div style="flex: 1"></div>
+  </div>
+  <div style="display: flex; width: 300px; height: 20px">
+    <div style="flex: 1; min-width: 0"><div style="width: 160px; height: 10px"></div></div>
+    <div style="flex: 1; min-width: 0"></div>
+    <div style="flex: 1; min-width: 0"></div>
+  </div>
+  <div style="display: flex; width: 300px; height: 20px; column-gap: 10px">
+    <div style="flex: 2"></div>
+    <div style="flex: 1"><div style="width: 120px; height: 10px"></div></div>
+    <div style="flex: 1"><div style="width: 90px; height: 10px"></div></div>
+  </div>
+  <div style="display: flex; width: 300px; height: 20px; column-gap: 10px">
+    <div style="flex: 2; min-width: 0"></div>
+    <div style="flex: 1; min-width: 0"><div style="width: 120px; height: 10px"></div></div>
+    <div style="flex: 1; min-width: 0"><div style="width: 90px; height: 10px"></div></div>
+  </div>
+  <div style="display: flex; width: 300px">
+    <p style="flex: 1">One</p>
+    <p style="flex: 1">A second cell with more words</p>
+    <p style="flex: 1">Incomprehensibilities</p>
+  </div>
+  <div style="display: flex; width: 300px">
+    <p style="flex: 1; min-width: 0">One</p>
+    <p style="flex: 1; min-width: 0">A second cell with more words</p>
+    <p style="flex: 1; min-width: 0">Incomprehensibilities</p>
+  </div>
+</div>

@@ -1,0 +1,7 @@
+# The boxes of fill_weight_below_one.html that the typed containers lay out differently from Chrome, on purpose
+# (ADR-0027, "L3"). The format is in tab_list_at_most.typed.
+2 = 0 0 200 10  # a lone fill(0.5) takes all that is left: a weight is a proportion (Chrome: flex-grow 0.5 takes half, 100)
+4 = 0 10 100 10  # two fills of 0.25 share it all
+5 = 100 10 100 10
+8 = 40 20 160 10  # all that the fixed 40 leaves
+17 = 60 50 140 10  # the first fill freezes at its max of 60 and the other takes all that is left (Chrome: the weight left is 0.5, so it takes half of the free 200: 100)

@@ -1,0 +1,6 @@
+# Boxes of fill_in_hug_row.html that today's engine lays out wrongly (ADR-0027, "Bugs L2 fixes"), in document
+# order from 0 as <name>.chrome lists them: `<box>[-<box>]  # the bug`. L2 fixes the bug and deletes this file;
+# a box listed here that matches Chrome fails the test.
+10-18  # a hugging row in a column aligned to its start is not clamped to fit-content: the Definite arm of the container's main size (row.rs container_main_size, flex.rs determine_container_main_size) takes max-content
+0  # its height, from the rows above
+19-21  # their place, below the rows above

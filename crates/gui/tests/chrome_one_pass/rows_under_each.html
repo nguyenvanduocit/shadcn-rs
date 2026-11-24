@@ -1,0 +1,30 @@
+<!-- Rows of a list are direct children of their parent (a boxless `each` adds no box): gaps and justify-content count rows; each row is fixed icon, filling one-line label, hugging shortcut. Then a tab list of equal fills, and a windowed page of rows of different heights. -->
+<div style="width: 400px">
+  <div style="display: flex; flex-direction: column; row-gap: 4px; width: 200px; padding: 4px">
+    <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+      <div style="flex: none; width: 16px; height: 16px"></div>
+      <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Profile</p>
+      <p style="flex: none; font-size: 12px; line-height: 16px">Ctrl+P</p>
+    </div>
+    <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+      <div style="flex: none; width: 16px; height: 16px"></div>
+      <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Keyboard shortcuts and accessibility</p>
+      <p style="flex: none; font-size: 12px; line-height: 16px">Ctrl+K</p>
+    </div>
+    <div style="height: 1px"></div>
+    <div style="display: flex; align-items: center; column-gap: 8px; padding: 6px 8px">
+      <div style="flex: none; width: 16px; height: 16px"></div>
+      <p style="flex: 1; min-width: 0; white-space: nowrap; font-size: 14px; line-height: 20px">Log out</p>
+    </div>
+  </div>
+  <div style="display: flex; width: 300px; height: 36px; padding: 3px">
+    <div style="flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Account</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Password</p></div>
+    <div style="flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center"><p style="font-size: 14px; line-height: 20px; white-space: nowrap">Notifications and billing</p></div>
+  </div>
+  <div style="display: flex; flex-direction: column; justify-content: space-between; width: 200px; height: 200px">
+    <div style="display: flex; column-gap: 8px"><p style="flex: 1; min-width: 0">A row whose text wraps onto two lines</p><p style="flex: none">1</p></div>
+    <div style="display: flex; column-gap: 8px"><p style="flex: 1; min-width: 0">Short</p><p style="flex: none">22</p></div>
+    <div style="display: flex; column-gap: 8px"><p style="flex: 1; min-width: 0">Another row</p><p style="flex: none">333</p></div>
+  </div>
+</div>
