@@ -37,6 +37,23 @@ pub(crate) const READ_BACKDROP: u32 = 0;
 pub(crate) const READ_DARKEN: u32 = 1;
 pub(crate) const READ_LIGHTEN: u32 = 2;
 
+/// A record's head word: its kind in the low byte, then (by kind) a count or
+/// an atlas page at bit 8, a stop count or a read mode at bit 16 (a byte
+/// each), a glyph's gamma rows at bit 16 (luminance) and 20, 24, 28 (red,
+/// green, blue; four bits each). The shaders decode with these.
+pub(crate) const HEAD_KIND_MASK: u32 = 0xff;
+pub(crate) const ARG_LOW_SHIFT: u32 = 8;
+pub(crate) const ARG_HIGH_SHIFT: u32 = 16;
+pub(crate) const ARG_MASK: u32 = 0xff;
+pub(crate) const ROW_LUM_SHIFT: u32 = 16;
+pub(crate) const ROW_R_SHIFT: u32 = 20;
+pub(crate) const ROW_G_SHIFT: u32 = 24;
+pub(crate) const ROW_B_SHIFT: u32 = 28;
+pub(crate) const ROW_MASK: u32 = 0xf;
+/// Two 16-bit halves in a word: the low one, then the high one at this shift.
+pub(crate) const PAIR_SHIFT: u32 = 16;
+pub(crate) const PAIR_MASK: u32 = 0xffff;
+
 /// A solid record has radii (a text-through one: a background; a layer: a mask).
 pub(crate) const F_RADII: u32 = 1 << 8;
 /// A solid record has an inner rectangle cut out (a text-through one: a gradient).
@@ -82,7 +99,7 @@ pub(crate) fn half(v: f32) -> u16 {
 
 /// A straight colour as two words of halves (`unpack2x16float`).
 pub(crate) fn color(c: [f32; 4]) -> [u32; 2] {
-    let pack = |a: f32, b: f32| u32::from(half(a)) | (u32::from(half(b)) << 16);
+    let pack = |a: f32, b: f32| u32::from(half(a)) | (u32::from(half(b)) << PAIR_SHIFT);
     [pack(c[0], c[1]), pack(c[2], c[3])]
 }
 
@@ -91,7 +108,7 @@ fn f(v: [f32; 4]) -> [u32; 4] {
 }
 
 fn pair(a: u32, b: u32) -> u32 {
-    (a & 0xffff) | ((b & 0xffff) << 16)
+    (a & PAIR_MASK) | ((b & PAIR_MASK) << PAIR_SHIFT)
 }
 
 /// A gradient's stops: an offset and a straight colour each.
@@ -116,8 +133,13 @@ pub(crate) struct Glyph {
 
 impl Glyph {
     pub(crate) fn words(&self) -> [u32; 8] {
-        let [lum, r, g, b] = self.rows.map(|v| v.min(15));
-        let head = (self.kind & 0xff) | ((self.page & 0xff) << 8) | (lum << 16) | (r << 20) | (g << 24) | (b << 28);
+        let [lum, r, g, b] = self.rows.map(|v| v.min(ROW_MASK));
+        let head = (self.kind & HEAD_KIND_MASK)
+            | ((self.page & ARG_MASK) << ARG_LOW_SHIFT)
+            | (lum << ROW_LUM_SHIFT)
+            | (r << ROW_R_SHIFT)
+            | (g << ROW_G_SHIFT)
+            | (b << ROW_B_SHIFT);
         let [c0, c1] = color(self.color);
         [
             head,
@@ -220,7 +242,7 @@ pub(crate) struct Gradient {
 impl Gradient {
     pub(crate) fn push(&self, out: &mut Vec<u32>) {
         let n = u32::try_from(self.stops.len().min(255)).unwrap_or(0);
-        out.extend([KIND_GRADIENT | (n << 8), self.slot, 0, 0]);
+        out.extend([KIND_GRADIENT | (n << ARG_LOW_SHIFT), self.slot, 0, 0]);
         out.extend(f(self.rect));
         out.extend(f(self.radii));
         out.extend(f(self.line));
@@ -278,7 +300,7 @@ pub(crate) struct Read {
 
 impl Read {
     pub(crate) fn push(&self, out: &mut Vec<u32>) {
-        let flags = self.inner.map_or(0, |_| F_INNER) | ((self.mode & 0xff) << 16);
+        let flags = self.inner.map_or(0, |_| F_INNER) | ((self.mode & ARG_MASK) << ARG_HIGH_SHIFT);
         let [c0, c1] = color(self.color);
         out.extend([KIND_READ | flags, self.slot, c0, c1]);
         out.extend(f(self.rect));
@@ -315,7 +337,8 @@ impl TextThrough {
             .fill
             .as_ref()
             .map_or(0, |f| u32::try_from(f.2.len().min(255)).unwrap_or(0));
-        let flags = self.background.map_or(0, |_| F_RADII) | self.fill.as_ref().map_or(0, |_| F_INNER) | (n << 16);
+        let flags =
+            self.background.map_or(0, |_| F_RADII) | self.fill.as_ref().map_or(0, |_| F_INNER) | (n << ARG_HIGH_SHIFT);
         let (c, bg) = self.background.unwrap_or(([0.0; 4], [0.0; 4]));
         let [c0, c1] = color(c);
         out.extend([KIND_TEXT_THROUGH | flags, self.slot, c0, c1]);
@@ -347,7 +370,7 @@ impl Layer {
             .mask
             .as_ref()
             .map_or(0, |m| u32::try_from(m.1.len().min(255)).unwrap_or(0));
-        let flags = self.mask.as_ref().map_or(0, |_| F_RADII) | (n << 16);
+        let flags = self.mask.as_ref().map_or(0, |_| F_RADII) | (n << ARG_HIGH_SHIFT);
         let [c0, c1] = color([0.0, 0.0, 0.0, self.opacity.clamp(0.0, 1.0)]);
         out.extend([KIND_LAYER | flags, self.slot, c0, c1]);
         out.extend(f(self.quad));

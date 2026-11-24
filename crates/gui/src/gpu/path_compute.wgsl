@@ -37,10 +37,10 @@
 // a curve item (`ITEM`), a resident curve (`CURVE`) and a curve item's
 // scratch (head+, head-, tail+, tail- (device), start and end (local), first
 // and last direction (local), flags: `HEAD`); a job's flags (`F_STROKE`,
-// `F_EVEN_ODD`, `CAP_SHIFT`, `JOIN_SHIFT`), a curve item's (`C_*`), the caps
-// (`CAP_*`) and joins (`JOIN_*`).
-const FIX: f32 = 256.0;
-const TILE_FIX: i32 = 4096;
+// `F_EVEN_ODD`, `CAP_SHIFT`, `CAP_MASK`, `JOIN_SHIFT`, `JOIN_MASK`, in word
+// `JOB_FLAGS`), a curve item's (`C_*`), the caps (`CAP_*`) and joins
+// (`JOIN_*`); and `FIX`, the snapping grid (steps per pixel).
+const TILE_FIX: i32 = i32(TILE * FIX);
 const PIECE: f32 = 64.0;
 const NONE: u32 = 0xffffffffu;
 const NO_EDGE: f32 = -1.0e30;
@@ -277,7 +277,7 @@ fn connect(out: ptr<function, Out>, p: vec2<f32>, n0: vec2<f32>, n1: vec2<f32>, 
         emit(out, c, a_to);
         return;
     }
-    var join = (ju(job, 16u) >> JOIN_SHIFT) & 3u;
+    var join = (ju(job, JOB_FLAGS) >> JOIN_SHIFT) & JOIN_MASK;
     if (round_only) {
         join = JOIN_ROUND;
     }
@@ -369,7 +369,7 @@ fn flatten(@builtin(global_invocation_id) gid: vec3<u32>) {
     let last = order - 1u;
     let tol = jf(job, 19u);
     let n = clamp(wang(d0, d1, d2, d3, order, tol), 1u, bound);
-    let stroke = (ju(job, 16u) & F_STROKE) != 0u;
+    let stroke = (ju(job, JOB_FLAGS) & F_STROKE) != 0u;
     if (!stroke) {
         let end = device_point(item, last);
         var prev = d0;
@@ -476,14 +476,14 @@ fn joins(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let curve = work[item * ITEM];
     let job = work[item * ITEM + 1u];
-    if ((ju(job, 16u) & F_STROKE) == 0u) {
+    if ((ju(job, JOB_FLAGS) & F_STROKE) == 0u) {
         return;
     }
     // Joins and caps write after the curve's own lines.
     var out = Out(job, work[item * ITEM + 2u] + work[item * ITEM + 4u], 0u, work[item * ITEM + 5u]);
     let flags = cu(curve, 9u);
     let h = jf(job, 17u);
-    let cap = (ju(job, 16u) >> CAP_SHIFT) & 3u;
+    let cap = (ju(job, JOB_FLAGS) >> CAP_SHIFT) & CAP_MASK;
     let p = head(item, 4u);
     let u = head(item, 6u);
     if ((flags & C_DOT) != 0u) {
@@ -796,7 +796,7 @@ fn compact(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (row >= ju(job, 12u)) {
         return;
     }
-    let even_odd = (ju(job, 16u) & F_EVEN_ODD) != 0u;
+    let even_odd = (ju(job, JOB_FLAGS) & F_EVEN_ODD) != 0u;
     let first = ju(job, 8u) + row * w;
     let inst = ju(job, 15u) + row * w;
     let entry_base = ju(job, 13u);

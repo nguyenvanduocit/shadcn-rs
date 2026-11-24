@@ -2297,3 +2297,81 @@ fn paths_and_curve_glyphs_inside_their_clips_skip_the_clip_test_and_draw_the_sam
         "marked only when asked"
     );
 }
+
+/// V3: the renderer's own code makes every pipeline and bind group layout,
+/// on the device it requests for each variant (its features from the
+/// variant, as `with_adapter` asks for them), and a real draw or dispatch
+/// goes through each with the real bind groups and dynamic offsets: quads,
+/// atlas icons, paths (the compute passes and the render pass), curve text
+/// and a backdrop read. A validation error anywhere (a layout that is not
+/// the shader's, a `dynamic` that is not the draw's, a feature the shader
+/// needs and the device lacks) fails.
+#[test]
+fn every_pipeline_is_made_and_draws_in_both_variants_without_a_validation_error() {
+    for dual in [true, false] {
+        let mut gpu = GpuRenderer::headless_with(GpuOptions {
+            dual_source: dual,
+            ..GpuOptions::default()
+        })
+        .expect("a GPU");
+        assert_eq!(gpu.dual_source(), dual, "the variant the device was asked for");
+        let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let mut text = Glyphs::for_os();
+        gpu.capture(&busy_scene(128), None, &mut text).expect("read back");
+        let (curves, _) = glyph_scene(&mut text, 200.0, None);
+        gpu.capture(&curves, None, &mut text).expect("read back");
+        let below = stripes(96.0, 1.0);
+        let top = read(vec![Item::Backdrop {
+            bounds: rect(16.0, 16.0, 64.0, 64.0),
+            radius: Corners::default(),
+            curve: 1.0,
+            backdrop: crate::shape::Backdrop::blur(8.0),
+        }]);
+        let blurred = chunks((96, 96), &[(1, State::default(), &below), (2, State::default(), &top)]);
+        gpu.capture(&blurred, None, &mut text).expect("read back");
+        let error = pollster::block_on(scope.pop());
+        assert!(error.is_none(), "dual-source {dual}: {error:?}");
+    }
+}
+
+/// V3: a job's flags word reaches the compute and render shaders as Rust
+/// wrote it: the same pentagram filled non-zero has its centre, filled
+/// even-odd has none, stroked has none but its outline.
+#[test]
+fn a_fill_an_even_odd_fill_and_a_stroke_are_told_apart_on_the_gpu() {
+    let mut gpu = gpu();
+    let star = |rule: FillRule| {
+        let mut b = Path::builder().fill_rule(rule);
+        for (i, k) in [0_u8, 2, 4, 1, 3].into_iter().enumerate() {
+            let a = (f32::from(k) * 0.4 - 0.5) * std::f32::consts::PI;
+            let (x, y) = (48.0 + 40.0 * a.cos(), 48.0 + 40.0 * a.sin());
+            b = if i == 0 { b.move_to(x, y) } else { b.line_to(x, y) };
+        }
+        b.close().build()
+    };
+    let white = Gradient::Solid(Color::WHITE);
+    let nonzero = shot_of(
+        &mut gpu,
+        &star(FillRule::NonZero),
+        &PathStyle::fill(white.clone()),
+        (0.0, 0.0),
+    );
+    let even_odd = shot_of(
+        &mut gpu,
+        &star(FillRule::EvenOdd),
+        &PathStyle::fill(white.clone()),
+        (0.0, 0.0),
+    );
+    let stroked = shot_of(
+        &mut gpu,
+        &star(FillRule::NonZero),
+        &PathStyle::stroke(white, Stroke::round(4.0)),
+        (0.0, 0.0),
+    );
+    assert_eq!(at(&nonzero, 48, 48), [255; 4], "non-zero fills the centre");
+    assert_eq!(at(&even_odd, 48, 48), [0, 0, 0, 255], "even-odd leaves the centre");
+    assert_eq!(at(&even_odd, 48, 20), [255; 4], "and fills a point");
+    assert_eq!(at(&stroked, 48, 48), [0, 0, 0, 255], "a stroke leaves the centre");
+    assert_eq!(at(&stroked, 48, 9)[0], 255, "and covers its outline at the point");
+    assert_eq!(at(&stroked, 48, 20), [0, 0, 0, 255], "and not the inside");
+}

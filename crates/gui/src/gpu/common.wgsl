@@ -1,6 +1,6 @@
 // What every pipeline of the renderer shares: signed distances and area
 // coverage of rounded rectangles, and colour (sRGB, OKLab, premultiplying).
-// Prepended to each module by `gpu::module`.
+// Prepended to each module by `gpu::contract`.
 
 const M_PI_F: f32 = 3.1415926;
 

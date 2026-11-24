@@ -2,8 +2,9 @@
 //! device validates it, then read back as the bindings, struct sizes and
 //! constants the Rust side is checked against.
 
+use crate::gpu::contract::{REQUIRED_DOWNLEVEL, required_features};
 use naga::front::wgsl;
-use naga::valid::{Capabilities, GlobalUse, ValidationFlags, Validator};
+use naga::valid::{GlobalUse, ValidationFlags};
 use naga::{AddressSpace, ImageClass, ImageDimension, Module, ShaderStage, StorageAccess, TypeInner};
 use std::collections::BTreeMap;
 
@@ -13,15 +14,23 @@ pub(crate) enum Kind {
     Uniform {
         size: u32,
     },
+    /// A storage buffer, by its access and its elements' bytes (an array's
+    /// stride; a lone struct's size).
     Storage {
         read_only: bool,
+        element: u32,
     },
-    /// A float texture, by its dimension and whether it is an array.
+    /// A sampled texture, by its dimension, whether it is an array, and the
+    /// kind of what it samples.
     Texture {
         dim: ImageDimension,
         arrayed: bool,
+        sample: naga::ScalarKind,
+        multisampled: bool,
     },
-    Sampler,
+    Sampler {
+        comparison: bool,
+    },
 }
 
 /// A resource global: where it is bound, what it is, and the stages whose
@@ -38,32 +47,74 @@ pub(crate) struct Binding {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum Number {
     U32(u32),
+    I32(i32),
     F32(f32),
 }
+
+/// A struct as naga lays it out: its size in bytes, its members' names and
+/// byte offsets.
+#[derive(Clone, Debug)]
+pub(crate) struct StructLayout {
+    pub size: u32,
+    /// (name, byte offset, WGSL type).
+    pub members: Vec<(String, u32, String)>,
+}
+
+/// A Rust `#[repr(C)]` type against the WGSL struct `$name` of `$reflection`:
+/// the same size, and the listed fields (the shader's members, in order)
+/// the same names at the same offsets with the same scalar or vector type.
+/// A field added to or retyped on one side only changes the size or the
+/// members.
+macro_rules! assert_layout {
+    ($reflection:expr, $label:expr, $name:literal, $ty:ty, [$($field:ident),* $(,)?]) => {{
+        let found = $reflection
+            .structs
+            .get($name)
+            .unwrap_or_else(|| panic!("{}: no struct `{}`", $label, $name));
+        assert_eq!(
+            u64::from(found.size),
+            $crate::gpu::contract::bytes_of::<$ty>(),
+            "{}: `{}` bytes, shader against Rust",
+            $label,
+            $name
+        );
+        let probe = <$ty>::default();
+        let rust: Vec<(String, u32, String)> = vec![$((
+            stringify!($field).to_owned(),
+            u32::try_from(std::mem::offset_of!($ty, $field)).unwrap(),
+            $crate::gpu::contract::reflect::type_of(&probe.$field).to_owned(),
+        )),*];
+        assert_eq!(
+            found.members,
+            rust,
+            "{}: `{}` members (name, offset, type), shader against Rust",
+            $label,
+            $name
+        );
+    }};
+}
+pub(crate) use assert_layout;
 
 pub(crate) struct Reflection {
     /// By (group, binding).
     pub bindings: BTreeMap<(u32, u32), Binding>,
     pub constants: BTreeMap<String, Number>,
-    /// Named structs' sizes in bytes, by name.
-    pub struct_sizes: BTreeMap<String, u32>,
+    /// Named structs, by name.
+    pub structs: BTreeMap<String, StructLayout>,
     pub entry_points: Vec<(String, ShaderStage)>,
 }
 
-/// `source` parsed and validated, with dual-source blending allowed when
-/// it asks for it.
+/// `source` parsed and validated with the capabilities wgpu gives a device
+/// made as the renderer makes it for the variant `dual_source`
+/// ([`required_features`] and [`REQUIRED_DOWNLEVEL`], through wgpu's own
+/// mapping), not from what the source says.
 ///
 /// # Panics
 /// With naga's report when the shader does not parse or validate.
-pub(crate) fn reflect(label: &str, source: &str) -> Reflection {
+pub(crate) fn reflect(label: &str, source: &str, dual_source: bool) -> Reflection {
     let module = wgsl::parse_str(source).unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(source)));
-    // `unpack2x16float` is in every wgpu device's WGSL.
-    let capabilities = if source.contains("enable dual_source_blending") {
-        Capabilities::SHADER_FLOAT16_IN_FLOAT32 | Capabilities::DUAL_SOURCE_BLENDING
-    } else {
-        Capabilities::SHADER_FLOAT16_IN_FLOAT32
-    };
-    let info = Validator::new(ValidationFlags::all(), capabilities)
+    let features = required_features(dual_source);
+    let info = wgpu_naga_bridge::create_validator(features, REQUIRED_DOWNLEVEL, ValidationFlags::all())
         .validate(&module)
         .unwrap_or_else(|e| panic!("{label}: {}", e.emit_to_string(source)));
 
@@ -107,6 +158,9 @@ pub(crate) fn reflect(label: &str, source: &str) -> Reflection {
             naga::Expression::Literal(naga::Literal::U32(v)) => {
                 constants.insert(name.clone(), Number::U32(v));
             }
+            naga::Expression::Literal(naga::Literal::I32(v)) => {
+                constants.insert(name.clone(), Number::I32(v));
+            }
             naga::Expression::Literal(naga::Literal::F32(v)) => {
                 constants.insert(name.clone(), Number::F32(v));
             }
@@ -114,19 +168,75 @@ pub(crate) fn reflect(label: &str, source: &str) -> Reflection {
         }
     }
 
-    let mut struct_sizes = BTreeMap::new();
+    let mut structs = BTreeMap::new();
     for (_, ty) in module.types.iter() {
-        if let (Some(name), TypeInner::Struct { span, .. }) = (&ty.name, &ty.inner) {
-            struct_sizes.insert(name.clone(), *span);
+        if let (Some(name), TypeInner::Struct { span, members }) = (&ty.name, &ty.inner) {
+            structs.insert(
+                name.clone(),
+                StructLayout {
+                    size: *span,
+                    members: members
+                        .iter()
+                        .map(|m| {
+                            (
+                                m.name.clone().unwrap_or_default(),
+                                m.offset,
+                                describe(&module.types[m.ty].inner),
+                            )
+                        })
+                        .collect(),
+                },
+            );
         }
     }
 
     Reflection {
         bindings,
         constants,
-        struct_sizes,
+        structs,
         entry_points: module.entry_points.iter().map(|e| (e.name.clone(), e.stage)).collect(),
     }
+}
+
+/// A scalar or vector as WGSL spells it (`u32`, `vec2<f32>`).
+fn describe(inner: &TypeInner) -> String {
+    let scalar = |s: naga::Scalar| match (s.kind, s.width) {
+        (naga::ScalarKind::Float, 4) => "f32".to_owned(),
+        (naga::ScalarKind::Uint, 4) => "u32".to_owned(),
+        (naga::ScalarKind::Sint, 4) => "i32".to_owned(),
+        other => format!("{other:?}"),
+    };
+    match inner {
+        TypeInner::Scalar(s) => scalar(*s),
+        TypeInner::Vector { size, scalar: s } => {
+            let n = match size {
+                naga::VectorSize::Bi => 2,
+                naga::VectorSize::Tri => 3,
+                naga::VectorSize::Quad => 4,
+            };
+            format!("vec{n}<{}>", scalar(*s))
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+/// The WGSL type a Rust field type is laid out as.
+pub(crate) trait WgslType {
+    const NAME: &'static str;
+}
+macro_rules! wgsl_types {
+    ($($ty:ty => $name:literal),* $(,)?) => { $(impl WgslType for $ty { const NAME: &'static str = $name; })* };
+}
+wgsl_types! {
+    f32 => "f32", u32 => "u32", i32 => "i32",
+    [f32; 2] => "vec2<f32>", [f32; 3] => "vec3<f32>", [f32; 4] => "vec4<f32>",
+    [u32; 2] => "vec2<u32>", [u32; 3] => "vec3<u32>", [u32; 4] => "vec4<u32>",
+    [i32; 2] => "vec2<i32>", [i32; 3] => "vec3<i32>", [i32; 4] => "vec4<i32>",
+}
+
+/// The WGSL type name of a field's Rust type.
+pub(crate) fn type_of<T: WgslType>(_: &T) -> &'static str {
+    T::NAME
 }
 
 fn kind_of(module: &Module, space: AddressSpace, ty: naga::Handle<naga::Type>) -> Kind {
@@ -137,18 +247,23 @@ fn kind_of(module: &Module, space: AddressSpace, ty: naga::Handle<naga::Type>) -
         },
         AddressSpace::Storage { access } => Kind::Storage {
             read_only: !access.contains(StorageAccess::STORE),
+            element: match inner {
+                TypeInner::Array { stride, .. } => *stride,
+                other => other.size(module.to_ctx()),
+            },
         },
         _ => match *inner {
             TypeInner::Image {
                 dim,
                 arrayed,
-                class:
-                    ImageClass::Sampled {
-                        kind: naga::ScalarKind::Float,
-                        multi: false,
-                    },
-            } => Kind::Texture { dim, arrayed },
-            TypeInner::Sampler { comparison: false } => Kind::Sampler,
+                class: ImageClass::Sampled { kind, multi },
+            } => Kind::Texture {
+                dim,
+                arrayed,
+                sample: kind,
+                multisampled: multi,
+            },
+            TypeInner::Sampler { comparison } => Kind::Sampler { comparison },
             ref other => panic!("an unexpected resource type: {other:?}"),
         },
     }

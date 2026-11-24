@@ -37,8 +37,12 @@ use super::damage::Rect;
 use super::path;
 use crate::scene::Properties;
 
-/// Floats a clip entry takes (`PCLIP` vec4s in `common.wgsl`).
-pub(super) const ENTRY: usize = 20;
+/// Vec4s a clip entry takes (`PCLIP` in `common.wgsl`), the one number: its
+/// floats are four each.
+pub(super) const ENTRY_VEC4S: u32 = 5;
+/// Floats a clip entry takes.
+#[expect(clippy::as_conversions, reason = "a count, widened in a const")]
+pub(super) const ENTRY: usize = ENTRY_VEC4S as usize * 4;
 
 pub(super) const IDENTITY: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 

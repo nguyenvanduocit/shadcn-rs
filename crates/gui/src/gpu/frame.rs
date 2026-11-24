@@ -307,8 +307,7 @@ fn transform_entry(t: &crate::scene::TransformNode, s: f32) -> [f32; 2] {
     [t.offset.0 * s, t.offset.1 * s]
 }
 
-/// Vec4s a clip entry takes (`PCLIP` in `common.wgsl`).
-pub(super) const PCLIP_VEC4S: u32 = 5;
+use super::clips::ENTRY_VEC4S as PCLIP_VEC4S;
 
 /// A text-through mask to draw: into chunk `chunk`'s mask `k`.
 pub(super) struct MaskJob {
@@ -2400,16 +2399,20 @@ impl GpuRenderer {
         let mut globals = Vec::new();
         let mut block = |size: (u32, u32), origin: (i32, i32), to_canvas: [f32; 6]| {
             let mut b = vec![0_u8; stride];
-            let mut values: Vec<u8> = super::floats_to_bytes(&[
-                crate::convert::u32_to_f32(size.0),
-                crate::convert::u32_to_f32(size.1),
-                crate::convert::i32_to_f32(origin.0),
-                crate::convert::i32_to_f32(origin.1),
-            ]);
-            values.extend(bases.iter().flat_map(|v| v.to_ne_bytes()));
-            values.extend(super::floats_to_bytes(&to_canvas));
-            for (d, v) in b.iter_mut().zip(values) {
-                *d = v;
+            let [a, b_, c, d, e, f] = to_canvas;
+            let block = super::contract::Globals {
+                size: [crate::convert::u32_to_f32(size.0), crate::convert::u32_to_f32(size.1)],
+                origin: [
+                    crate::convert::i32_to_f32(origin.0),
+                    crate::convert::i32_to_f32(origin.1),
+                ],
+                bases,
+                to_canvas: [a, b_, c, d],
+                to_canvas_t: [e, f],
+                pad: [0.0; 2],
+            };
+            for (d, v) in b.iter_mut().zip(bytemuck::bytes_of(&block)) {
+                *d = *v;
             }
             globals.extend(b);
         };

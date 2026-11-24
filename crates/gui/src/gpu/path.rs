@@ -53,6 +53,11 @@ pub(crate) const C_JOIN_IN: u32 = 4;
 pub(crate) const C_DOT: u32 = 8;
 /// A job's flags word (word 16): stroked, filled even-odd, then the cap and
 /// the join in two bits each.
+pub(crate) const JOB_FLAGS: usize = 16;
+pub(crate) const CAP_MASK: u32 = 3;
+pub(crate) const JOIN_MASK: u32 = 3;
+/// The grid, in steps per pixel, the compute passes snap points to.
+pub(crate) const FIX: f32 = 256.0;
 pub(crate) const F_STROKE: u32 = 1;
 pub(crate) const F_EVEN_ODD: u32 = 2;
 pub(crate) const CAP_SHIFT: u32 = 4;
@@ -830,7 +835,7 @@ impl Paths {
             w[13] = entries_r.start;
             w[14] = entries;
             w[15] = inst_r.start;
-            w[16] = flags;
+            w[JOB_FLAGS] = flags;
             if let Some(p) = stroke {
                 w[17] = p.half.to_bits();
                 w[18] = p.miter_limit.to_bits();
@@ -958,17 +963,17 @@ impl Paths {
                 .saturating_add(u64::from(n_items).saturating_mul(u64::try_from(HEAD).unwrap_or(0)))
                 .saturating_mul(4),
         );
-        let params = [
-            points,
+        let params = super::contract::PassParams {
+            n_points: points,
             n_items,
-            lines,
-            rows,
-            line_at,
+            n_lines: lines,
+            n_rows: rows,
+            line_ranges: line_at,
             n_line_ranges,
-            row_at,
+            row_ranges: row_at,
             n_row_ranges,
-        ];
-        self.params.write(device, queue, &words_bytes(&params));
+        };
+        self.params.write(device, queue, bytemuck::bytes_of(&params));
         self.pending = Some(Pending {
             points,
             items: n_items,
@@ -1197,15 +1202,15 @@ fn dispatch(pass: &mut wgpu::ComputePass<'_>, groups: u32) {
 
 fn stroke_from_words(w: &[u32]) -> StrokeParams {
     let f = |i: usize| f32::from_bits(w.get(i).copied().unwrap_or(0));
-    let flags = w.get(16).copied().unwrap_or(0);
+    let flags = w.get(JOB_FLAGS).copied().unwrap_or(0);
     StrokeParams {
         half: f(17),
-        cap: match (flags >> CAP_SHIFT) & 3 {
+        cap: match (flags >> CAP_SHIFT) & CAP_MASK {
             CAP_ROUND => Cap::Round,
             CAP_SQUARE => Cap::Square,
             _ => Cap::Butt,
         },
-        join: match (flags >> JOIN_SHIFT) & 3 {
+        join: match (flags >> JOIN_SHIFT) & JOIN_MASK {
             JOIN_ROUND => Join::Round,
             JOIN_BEVEL => Join::Bevel,
             _ => Join::Miter,

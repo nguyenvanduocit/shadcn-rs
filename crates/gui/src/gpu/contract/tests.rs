@@ -1,19 +1,28 @@
 //! The assembled shaders against the Rust side (V3): naga parses and
-//! validates each as the device does, then the constants, uniform sizes,
-//! bindings and the stages that use them are compared with what Rust
-//! declares. No GPU needed.
+//! validates each with the capabilities the renderer's device has, then the
+//! uniform structs (size, member names and offsets, against the `#[repr(C)]`
+//! types the writers fill), the bindings and the stages that use them are
+//! compared with what Rust declares. No GPU needed.
 
-use super::reflect::{Binding, Kind, Number, Reflection, reflect};
+use super::reflect::{Binding, Kind, Number, Reflection, assert_layout, reflect};
 use super::*;
 use naga::{ImageDimension, ShaderStage};
 
-/// A module as the device compiles it, and the bind group tables it is
-/// paired with (group 0, group 1, ...).
+/// A module as the device compiles it, the bind group tables it is paired
+/// with (group 0, group 1, ...), and the check of its uniform types.
 struct Module {
     label: String,
     source: String,
+    /// The variant: the device is made with dual-source blending or not.
+    dual_source: bool,
     groups: Vec<&'static [Slot]>,
-    consts: Vec<&'static [Const]>,
+    structs: fn(&str, &Reflection),
+}
+
+fn no_structs(_: &str, _: &Reflection) {}
+
+fn target_globals(label: &str, r: &Reflection) {
+    assert_layout!(r, label, "Globals", TargetGlobals, [size, origin]);
 }
 
 fn modules() -> Vec<Module> {
@@ -21,20 +30,40 @@ fn modules() -> Vec<Module> {
         Module {
             label: "blit".into(),
             source: BLIT_WGSL.into(),
+            dual_source: false,
             groups: vec![CANVAS],
-            consts: vec![],
+            structs: no_structs,
         },
         Module {
             label: "read".into(),
             source: READ_WGSL.into(),
+            dual_source: false,
             groups: vec![READ_BACK],
-            consts: vec![],
+            structs: |label, r| assert_layout!(r, label, "Step", Step, [dir, sigma, _pad, size, _pad2]),
         },
         Module {
             label: "path passes".into(),
             source: passes(),
+            dual_source: false,
             groups: vec![PASSES],
-            consts: vec![PATH_COMPUTE],
+            structs: |label, r| {
+                assert_layout!(
+                    r,
+                    label,
+                    "Params",
+                    PassParams,
+                    [
+                        n_points,
+                        n_items,
+                        n_lines,
+                        n_rows,
+                        line_ranges,
+                        n_line_ranges,
+                        row_ranges,
+                        n_row_ranges
+                    ]
+                );
+            },
         },
     ];
     for dual in [false, true] {
@@ -42,20 +71,31 @@ fn modules() -> Vec<Module> {
         all.push(Module {
             label: format!("quads, {with}"),
             source: quads(dual),
+            dual_source: dual,
             groups: vec![QUADS, EXTRA],
-            consts: vec![COMMON, RECORDS],
+            structs: |label, r| {
+                assert_layout!(
+                    r,
+                    label,
+                    "Globals",
+                    Globals,
+                    [size, origin, bases, to_canvas, to_canvas_t]
+                );
+            },
         });
         all.push(Module {
             label: format!("paths, {with}"),
             source: paths(dual),
+            dual_source: dual,
             groups: vec![PATHS],
-            consts: vec![COMMON, PATH_RENDER],
+            structs: target_globals,
         });
         all.push(Module {
             label: format!("curve text, {with}"),
             source: curve_text(dual),
+            dual_source: dual,
             groups: vec![CURVE_TEXT_BINDS],
-            consts: vec![COMMON, CURVE_TEXT],
+            structs: target_globals,
         });
     }
     all
@@ -81,18 +121,47 @@ fn check_slot(label: &str, group: usize, slot: &Slot, found: &Binding) {
                 "{at}: uniform bytes, Rust against the shader's struct"
             );
         }
-        (Res::Storage { read_only }, Kind::Storage { read_only: shader }) => {
+        (
+            Res::Storage { read_only, element },
+            Kind::Storage {
+                read_only: shader,
+                element: stride,
+            },
+        ) => {
             assert_eq!(read_only, shader, "{at}: storage read_only");
+            assert_eq!(element, u64::from(stride), "{at}: storage element bytes");
         }
-        (Res::Texture(dim), Kind::Texture { dim: shader, arrayed }) => {
+        (
+            Res::Texture(dim, sample),
+            Kind::Texture {
+                dim: shader,
+                arrayed,
+                sample: kind,
+                multisampled,
+            },
+        ) => {
             let (want, want_array) = match dim {
                 wgpu::TextureViewDimension::D2 => (ImageDimension::D2, false),
                 wgpu::TextureViewDimension::D2Array => (ImageDimension::D2, true),
                 other => panic!("{at}: unchecked texture dimension {other:?}"),
             };
             assert_eq!((want, want_array), (shader, arrayed), "{at}: texture dimension");
+            let want_kind = match sample {
+                wgpu::TextureSampleType::Float { .. } => naga::ScalarKind::Float,
+                wgpu::TextureSampleType::Uint => naga::ScalarKind::Uint,
+                wgpu::TextureSampleType::Sint => naga::ScalarKind::Sint,
+                wgpu::TextureSampleType::Depth => naga::ScalarKind::Float,
+            };
+            assert_eq!(want_kind, kind, "{at}: what the texture samples");
+            assert!(!multisampled, "{at}: multisampled, but the tables bind single-sampled");
         }
-        (Res::Sampler, Kind::Sampler) => {}
+        (Res::Sampler(binding), Kind::Sampler { comparison }) => {
+            assert_eq!(
+                binding == wgpu::SamplerBindingType::Comparison,
+                comparison,
+                "{at}: sampler comparison"
+            );
+        }
         (rust, shader) => panic!("{at}: Rust declares {rust:?}, the shader {shader:?}"),
     }
     for stage in &found.used_by {
@@ -102,7 +171,7 @@ fn check_slot(label: &str, group: usize, slot: &Slot, found: &Binding) {
             slot.visibility
         );
     }
-    if let Res::Storage { read_only: true } | Res::Texture(_) | Res::Sampler = slot.res {
+    if let Res::Storage { read_only: true, .. } | Res::Texture(..) | Res::Sampler(_) = slot.res {
         assert!(found.written_by.is_empty(), "{at}: written, but declared read-only");
     }
 }
@@ -131,33 +200,95 @@ fn check_bindings(label: &str, reflection: &Reflection, groups: &[&[Slot]]) {
     }
 }
 
-fn number(value: Value) -> Number {
-    match value {
-        Value::U32(v) => Number::U32(v),
-        Value::Count(v) => Number::U32(u32::try_from(v).unwrap()),
-        Value::F32(v) => Number::F32(v),
-    }
-}
-
 #[test]
 fn shaders_agree_with_rust() {
     for module in modules() {
         let label = &module.label;
-        let reflection = reflect(label, &module.source);
+        let reflection = reflect(label, &module.source, module.dual_source);
         check_bindings(label, &reflection, &module.groups);
-        for (name, value) in module.consts.iter().flat_map(|c| c.iter()) {
-            assert_eq!(
-                reflection.constants.get(*name).copied(),
-                Some(number(*value)),
-                "{label}: constant {name}"
-            );
-        }
+        (module.structs)(label, &reflection);
         assert!(!reflection.entry_points.is_empty(), "{label}: no entry points");
     }
 }
 
-/// The WGSL sources do not declare a constant Rust owns: it is prepended,
-/// so it cannot differ.
+/// The path and curve-text passes read the first 16 bytes of the quad
+/// pass's globals block: the two types start the same.
+#[test]
+fn target_globals_prefix_the_globals() {
+    use std::mem::offset_of;
+    assert_eq!(offset_of!(Globals, size), offset_of!(TargetGlobals, size));
+    assert_eq!(offset_of!(Globals, origin), offset_of!(TargetGlobals, origin));
+    const { assert!(TARGET_GLOBALS <= GLOBALS) };
+}
+
+/// A constant derived in WGSL from owned ones is the derived value: the
+/// tile in snapped steps.
+#[test]
+fn derived_constants_follow_their_sources() {
+    let r = reflect("path passes", &passes(), false);
+    let steps = path::TILE * path::FIX;
+    assert_eq!(
+        r.constants.get("TILE_FIX"),
+        Some(&Number::I32(crate::convert::f32_to_i32(steps)))
+    );
+    // The prelude's numbers round-trip through naga unchanged (the format of
+    // `prelude`, not a second source of the values).
+    assert_eq!(r.constants.get("TILE"), Some(&Number::F32(path::TILE)));
+    assert_eq!(r.constants.get("FIX"), Some(&Number::F32(path::FIX)));
+}
+
+/// Every table lists a binding once, in order.
+#[test]
+fn binding_tables_have_no_duplicates() {
+    let tables: [(&str, &[Slot]); 7] = [
+        ("QUADS", QUADS),
+        ("EXTRA", EXTRA),
+        ("PATHS", PATHS),
+        ("PASSES", PASSES),
+        ("CURVE_TEXT_BINDS", CURVE_TEXT_BINDS),
+        ("CANVAS", CANVAS),
+        ("READ_BACK", READ_BACK),
+    ];
+    for (name, slots) in tables {
+        for (i, slot) in slots.iter().enumerate() {
+            assert!(
+                slots.iter().skip(i + 1).all(|s| s.binding != slot.binding),
+                "{name}: binding {} is listed twice",
+                slot.binding
+            );
+        }
+    }
+}
+
+/// Literals that encode what Rust owns, in the lines that decode it: a
+/// shift or mask of a record's head word, a job's flags word, or a bit
+/// pair of a word.
+fn literal_encodings(file: &str, text: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let code = line.split("//").next().unwrap_or("");
+        let head = code.contains("head") || code.contains("flags") || code.contains("ju(job");
+        let after = |needle: &str| {
+            code.match_indices(needle).any(|(i, _)| {
+                code[i.saturating_add(needle.len())..]
+                    .trim_start()
+                    .starts_with(|c: char| c.is_ascii_digit())
+            })
+        };
+        let hit = (head && (after(">>") || after("& ")))
+            || code.contains("ju(job, 16u)")
+            || code.contains("0xffffu")
+            || code.contains(">> 16u");
+        if hit {
+            found.push(format!("{file}:{}: {}", n.saturating_add(1), line.trim()));
+        }
+    }
+    found
+}
+
+/// The WGSL sources do not declare a constant Rust owns (it is prepended,
+/// so it cannot differ), nor spell one as a literal where they decode a
+/// word Rust encodes.
 #[test]
 fn constants_have_one_source() {
     let sources: [(&str, &str, &[&[Const]]); 5] = [
@@ -181,11 +312,25 @@ fn constants_have_one_source() {
                 "{file} declares `const {name}`: Rust owns it (gpu/contract.rs)"
             );
         }
+        let literals = literal_encodings(file, text);
+        assert!(
+            literals.is_empty(),
+            "a literal where Rust owns the layout (gpu/contract.rs):\n{}",
+            literals.join("\n")
+        );
     }
 }
 
-/// Facts the tables cannot show: how the constants fit the words they
-/// are packed in.
+/// No two of `fields` (name, bits) share a bit.
+fn apart(word: &str, fields: &[(&str, u32)]) {
+    for (i, (a, abits)) in fields.iter().enumerate() {
+        for (b, bbits) in fields.iter().skip(i.saturating_add(1)) {
+            assert_eq!(abits & bbits, 0, "{word}: `{a}` and `{b}` share a bit");
+        }
+    }
+}
+
+/// How the constants fit the words they are packed in.
 #[test]
 fn flags_fit_their_words() {
     let kinds: Vec<u32> = RECORDS
@@ -200,33 +345,51 @@ fn flags_fit_their_words() {
     sorted.sort_unstable();
     sorted.dedup();
     assert_eq!(sorted.len(), kinds.len(), "two kinds share a value");
+    let kind_bits = record::HEAD_KIND_MASK;
     assert!(
-        kinds.iter().all(|&k| k < 0x100),
-        "a kind spills out of the head's low byte"
+        kinds.iter().all(|&k| k & !kind_bits == 0),
+        "a kind spills out of its mask"
     );
-    let flags = [record::F_RADII, record::F_INNER, record::F_CURVE];
-    for f in flags {
-        assert!(
-            f.is_power_of_two() && (0x100..0x1_0000).contains(&f),
-            "flag {f:#x} outside bits 8..16"
-        );
-    }
-    assert_eq!(
-        flags.iter().fold(0, |a, f| a | f).count_ones(),
-        3,
-        "two flags share a bit"
+    // Fields that live in one head word together, each pair apart (no OR
+    // first): a solid, shadow, image, text-through, layer or read record has
+    // the kind, its flags and (the last three) a count or mode at bit 16; a
+    // gradient has the kind and a count at bit 8; a glyph the kind, a page
+    // at bit 8 and four gamma rows.
+    let arg = |shift: u32| record::ARG_MASK << shift;
+    let row = |shift: u32| record::ROW_MASK << shift;
+    apart(
+        "a record with flags",
+        &[
+            ("kind", kind_bits),
+            ("F_RADII", record::F_RADII),
+            ("F_INNER", record::F_INNER),
+            ("F_CURVE", record::F_CURVE),
+            ("count or mode", arg(record::ARG_HIGH_SHIFT)),
+        ],
+    );
+    apart(
+        "a gradient or glyph",
+        &[
+            ("kind", kind_bits),
+            ("count or page", arg(record::ARG_LOW_SHIFT)),
+            ("row lum", row(record::ROW_LUM_SHIFT)),
+            ("row r", row(record::ROW_R_SHIFT)),
+            ("row g", row(record::ROW_G_SHIFT)),
+            ("row b", row(record::ROW_B_SHIFT)),
+        ],
+    );
+    // A job's flags word: stroke, even-odd, then the cap and the join.
+    apart(
+        "a job's flags",
+        &[
+            ("F_STROKE", path::F_STROKE),
+            ("F_EVEN_ODD", path::F_EVEN_ODD),
+            ("cap", path::CAP_MASK << path::CAP_SHIFT),
+            ("join", path::JOIN_MASK << path::JOIN_SHIFT),
+        ],
     );
     const {
-        assert!(path::F_STROKE & path::F_EVEN_ODD == 0);
-        assert!(
-            path::CAP_SQUARE < 4 && path::JOIN_BEVEL < 4,
-            "caps and joins take two bits"
-        );
-        assert!(path::F_EVEN_ODD < 1 << path::CAP_SHIFT, "a job's flags reach its cap");
-        assert!(path::CAP_SHIFT + 2 <= path::JOIN_SHIFT, "a job's cap and join overlap");
+        assert!(path::CAP_SQUARE <= path::CAP_MASK && path::JOIN_BEVEL <= path::JOIN_MASK);
+        assert!(path::JOB_FLAGS < path::JOB, "the flags word is outside a job");
     }
-    assert_eq!(
-        usize::try_from(super::super::frame::PCLIP_VEC4S).unwrap() * 4,
-        clips::ENTRY
-    );
 }

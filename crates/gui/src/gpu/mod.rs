@@ -902,20 +902,22 @@ impl GpuRenderer {
         options: GpuOptions,
         wake: LostWaker,
     ) -> Result<Self, GpuError> {
-        let needed = wgpu::DownlevelFlags::COMPUTE_SHADERS | wgpu::DownlevelFlags::INDIRECT_EXECUTION;
-        if !adapter.get_downlevel_capabilities().flags.contains(needed) {
-            return Err(GpuError("the adapter cannot run compute shaders".to_owned()));
+        if !adapter
+            .get_downlevel_capabilities()
+            .flags
+            .contains(contract::REQUIRED_DOWNLEVEL)
+        {
+            return Err(GpuError(
+                "the adapter lacks compute shaders, indirect dispatch or half-float packing".to_owned(),
+            ));
         }
         let dual_source = options.dual_source && adapter.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING);
         let limits = adapter.limits();
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("gui"),
             // Timestamps time data chunks' passes where the adapter has them (ADR-0018).
-            required_features: if dual_source {
-                wgpu::Features::DUAL_SOURCE_BLENDING
-            } else {
-                wgpu::Features::empty()
-            } | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY),
+            required_features: contract::required_features(dual_source)
+                | (adapter.features() & wgpu::Features::TIMESTAMP_QUERY),
             required_limits: limits.clone(),
             ..Default::default()
         }))

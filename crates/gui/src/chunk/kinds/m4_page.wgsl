@@ -43,9 +43,8 @@ struct Gang {
 // Which of the gang's pages this thread reads.
 var<private> cur: u32;
 
-// Words of a partial: a node, then (x, y, floor) pixels of its first,
-// least, greatest and last point.
-const PARTIAL: u32 = 24u;
+// `PARTIAL`, the words of a partial (a node, then (x, y, floor) pixels of its
+// first, least, greatest and last point), is prepended from `m4.rs`.
 
 fn x_px(pp: PageP, i: u32) -> f32 {
     let hi = page_w(i);

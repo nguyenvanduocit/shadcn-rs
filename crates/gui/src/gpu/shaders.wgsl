@@ -32,7 +32,7 @@
 // coverage for subpixel (LCD) text, so one blend state serves all.
 //
 // The fragment stage's entry point for primitives is appended by
-// `gpu::module`, with or without dual-source blending (ADR-0019); `fs_fill`
+// `gpu::contract`, with or without dual-source blending (ADR-0019); `fs_fill`
 // is the one that writes an opaque rectangle over all it covers.
 
 struct Globals {
@@ -66,9 +66,11 @@ struct Globals {
 // An image or a layer, for the primitives that need one.
 @group(1) @binding(0) var extra: texture_2d<f32>;
 
-// `KIND_*` (a record's kind, the head word's low byte), `READ_*` and `F_*`
-// (a record's flags) are prepended by `gpu::module` from the Rust side
-// (`gpu/contract.rs`), so they cannot differ from what `record.rs` writes.
+// `KIND_*` (a record's kind, the head word's low byte), `READ_*`, `F_*` (a
+// record's flags) and the head word's bit layout (`HEAD_KIND_MASK`, `ARG_*`,
+// `ROW_*`, `PAIR_*`) are prepended by `gpu::contract::quads` from the Rust
+// side (`gpu/contract.rs`), so they cannot differ from what `record.rs`
+// writes. `Globals` is `gpu::contract::Globals`.
 
 fn word(at: u32) -> u32 {
     return records[at];
@@ -99,7 +101,7 @@ fn outset(r: vec4<f32>, d: f32) -> vec4<f32> {
 fn quad_of(at: u32, kind: u32) -> vec4<f32> {
     if (is_glyph(kind)) {
         let wh = word(at + 6u);
-        return vec4<f32>(wf(at + 4u), wf(at + 5u), f32(wh & 0xffffu), f32(wh >> 16u));
+        return vec4<f32>(wf(at + 4u), wf(at + 5u), f32(wh & PAIR_MASK), f32(wh >> PAIR_SHIFT));
     }
     switch kind {
         case KIND_SHADOW: {
@@ -128,7 +130,7 @@ struct Varying {
 @vertex
 fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> Varying {
     let at = index[instance];
-    let kind = word(at) & 0xffu;
+    let kind = word(at) & HEAD_KIND_MASK;
     let slot = bitcast<vec4<u32>>(props[globals.bases.x + word(at + 1u)]);
     let offset = props[globals.bases.y + slot.x].xy;
     let alpha = props[globals.bases.w + slot.z].x;
@@ -342,7 +344,7 @@ fn shade(input: Varying) -> Shaded {
     let window = input.position.xy + globals.origin;
     let p = window - input.offset;
     let head = word(at);
-    let kind = head & 0xffu;
+    let kind = head & HEAD_KIND_MASK;
     let color = wcolor(at + 2u);
     var out = vec4<f32>(0.0);
     var lcd = vec4<f32>(-1.0);
@@ -387,24 +389,28 @@ fn shade(input: Varying) -> Shaded {
             out = premul(color) * alpha;
         }
         case KIND_GRADIENT: {
-            let count = (head >> 8u) & 0xffu;
+            let count = (head >> ARG_LOW_SHIFT) & ARG_MASK;
             let g = record_gradient(at + 16u, count, p, w4(at + 12u));
             out = premul(g) * rrect_cov(p, w4(at + 4u), w4(at + 8u));
         }
         case KIND_MONO, KIND_MASK, KIND_COLOR, KIND_LCD: {
-            let page = i32((head >> 8u) & 0xffu);
+            let page = i32((head >> ARG_LOW_SHIFT) & ARG_MASK);
             let slot = word(at + 7u);
             let origin = vec2<f32>(wf(at + 4u), wf(at + 5u));
-            let texel = vec2<i32>(vec2<f32>(f32(slot & 0xffffu), f32(slot >> 16u)) + floor(p - origin));
+            let texel = vec2<i32>(vec2<f32>(f32(slot & PAIR_MASK), f32(slot >> PAIR_SHIFT)) + floor(p - origin));
             if (kind == KIND_MONO) {
-                let row = (head >> 16u) & 0xfu;
+                let row = (head >> ROW_LUM_SHIFT) & ROW_MASK;
                 out = premul(color) * gamma(textureLoad(mono_atlas, texel, page, 0).r, row);
             } else if (kind == KIND_MASK) {
                 // An icon's coverage, tinted.
                 out = premul(color) * textureLoad(mono_atlas, texel, page, 0).r;
             } else if (kind == KIND_LCD) {
                 let c = textureLoad(color_atlas, texel, page, 0).rgb;
-                let rows = vec3<u32>((head >> 20u) & 0xfu, (head >> 24u) & 0xfu, (head >> 28u) & 0xfu);
+                let rows = vec3<u32>(
+                    (head >> ROW_R_SHIFT) & ROW_MASK,
+                    (head >> ROW_G_SHIFT) & ROW_MASK,
+                    (head >> ROW_B_SHIFT) & ROW_MASK,
+                );
                 let cov = vec3<f32>(gamma(c.r, rows.x), gamma(c.g, rows.y), gamma(c.b, rows.z)) * color.a;
                 let alpha = max(cov.r, max(cov.g, cov.b));
                 out = vec4<f32>(color.rgb * cov, alpha);
@@ -434,7 +440,7 @@ fn shade(input: Varying) -> Shaded {
             let size = vec2<f32>(textureDimensions(extra));
             var px = textureSampleLevel(extra, linear_sampler, (q - a.xy) / size, 0.0) * inside;
             if ((head & F_RADII) != 0u) {
-                let count = (head >> 16u) & 0xffu;
+                let count = (head >> ARG_HIGH_SHIFT) & ARG_MASK;
                 px = px * record_gradient(at + 26u, count, q, w4(at + 22u)).a;
             }
             let filters = w4(at + 18u);
@@ -451,7 +457,7 @@ fn shade(input: Varying) -> Shaded {
                 fill = premul(color) * rrect_cov(p, w4(at + 8u), vec4<f32>(0.0));
             }
             if ((head & F_INNER) != 0u) {
-                let count = (head >> 16u) & 0xffu;
+                let count = (head >> ARG_HIGH_SHIFT) & ARG_MASK;
                 let g = premul(record_gradient(at + 20u, count, p, w4(at + 16u)))
                     * rrect_cov(p, w4(at + 12u), vec4<f32>(0.0));
                 fill = g + fill * (1.0 - g.a);
@@ -475,7 +481,7 @@ fn shade(input: Varying) -> Shaded {
             let origin = vec2<f32>(wf(at + 20u), wf(at + 21u));
             let level = wf(at + 22u);
             let valid = vec2<f32>(wf(at + 25u), wf(at + 26u));
-            let mode = (head >> 16u) & 0xffu;
+            let mode = (head >> ARG_HIGH_SHIFT) & ARG_MASK;
             if (mode == READ_BACKDROP) {
                 // Between texel centres, never past what was read.
                 let q = clamp((window - origin) / level, vec2<f32>(0.5), valid - 0.5);

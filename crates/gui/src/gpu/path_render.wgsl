@@ -10,7 +10,7 @@
 // the window, one in the path's own space) and an alpha.
 //
 // `fs_path` draws onto the window or a layer (its dual-source variant is
-// appended by `gpu::module`); `fs_mask` draws coverage alone into an R8
+// appended by `gpu::contract`); `fs_mask` draws coverage alone into an R8
 // atlas page, for icons rasterized once.
 
 struct Globals {
@@ -164,7 +164,7 @@ fn coverage(job: u32, tile: u32, p: vec2<f32>) -> f32 {
         }
         acc += line_area(l, px, py);
     }
-    if ((ju(job, 16u) & F_EVEN_ODD) != 0u) {
+    if ((ju(job, JOB_FLAGS) & F_EVEN_ODD) != 0u) {
         return abs(acc - 2.0 * round(0.5 * acc));
     }
     return min(abs(acc), 1.0);

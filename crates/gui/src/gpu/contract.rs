@@ -17,19 +17,21 @@ use crate::text::CURVE_EM;
 
 /// A value a shader reads as a `const`.
 #[derive(Clone, Copy)]
-pub(super) enum Value {
+pub(crate) enum Value {
     U32(u32),
     /// A count of words or vec4s, kept as the `usize` Rust indexes by.
     Count(usize),
+    /// A count kept as the `u64` buffer sizes are computed in.
+    Wide(u64),
     F32(f32),
 }
 
-pub(super) type Const = (&'static str, Value);
+pub(crate) type Const = (&'static str, Value);
 
 /// Read by `common.wgsl`, which every module of the main pass includes.
 pub(super) const COMMON: &[Const] = &[
     // Vec4s of a clip entry.
-    ("PCLIP", Value::Count(clips::ENTRY / 4)),
+    ("PCLIP", Value::U32(clips::ENTRY_VEC4S)),
 ];
 
 /// Read by `shaders.wgsl`: a record's kind (its head word's low byte), what
@@ -52,6 +54,17 @@ pub(super) const RECORDS: &[Const] = &[
     ("F_RADII", Value::U32(record::F_RADII)),
     ("F_INNER", Value::U32(record::F_INNER)),
     ("F_CURVE", Value::U32(record::F_CURVE)),
+    ("HEAD_KIND_MASK", Value::U32(record::HEAD_KIND_MASK)),
+    ("ARG_LOW_SHIFT", Value::U32(record::ARG_LOW_SHIFT)),
+    ("ARG_HIGH_SHIFT", Value::U32(record::ARG_HIGH_SHIFT)),
+    ("ARG_MASK", Value::U32(record::ARG_MASK)),
+    ("ROW_LUM_SHIFT", Value::U32(record::ROW_LUM_SHIFT)),
+    ("ROW_R_SHIFT", Value::U32(record::ROW_R_SHIFT)),
+    ("ROW_G_SHIFT", Value::U32(record::ROW_G_SHIFT)),
+    ("ROW_B_SHIFT", Value::U32(record::ROW_B_SHIFT)),
+    ("ROW_MASK", Value::U32(record::ROW_MASK)),
+    ("PAIR_SHIFT", Value::U32(record::PAIR_SHIFT)),
+    ("PAIR_MASK", Value::U32(record::PAIR_MASK)),
 ];
 
 /// Read by `path_render.wgsl`.
@@ -59,13 +72,18 @@ pub(super) const PATH_RENDER: &[Const] = &[
     ("TILE", Value::F32(path::TILE)),
     ("JOB", Value::Count(path::JOB)),
     ("DRAW", Value::Count(path::DRAW)),
+    ("JOB_FLAGS", Value::Count(path::JOB_FLAGS)),
     ("F_EVEN_ODD", Value::U32(path::F_EVEN_ODD)),
 ];
 
 /// Read by `path_compute.wgsl`.
 pub(super) const PATH_COMPUTE: &[Const] = &[
     ("TILE", Value::F32(path::TILE)),
+    ("FIX", Value::F32(path::FIX)),
     ("JOB", Value::Count(path::JOB)),
+    ("JOB_FLAGS", Value::Count(path::JOB_FLAGS)),
+    ("CAP_MASK", Value::U32(path::CAP_MASK)),
+    ("JOIN_MASK", Value::U32(path::JOIN_MASK)),
     ("ITEM", Value::Count(path::ITEM)),
     ("CURVE", Value::Count(path::CURVE)),
     ("HEAD", Value::Count(path::HEAD)),
@@ -93,12 +111,16 @@ pub(super) const CURVE_TEXT: &[Const] = &[
 ];
 
 /// `consts` as WGSL `const` declarations.
-pub(super) fn prelude(consts: &[&[Const]]) -> String {
+pub(crate) fn prelude(consts: &[&[Const]]) -> String {
     let mut out = String::new();
     for (name, value) in consts.iter().flat_map(|c| c.iter()) {
         match *value {
             Value::U32(v) => out.push_str(&format!("const {name}: u32 = {v}u;\n")),
             Value::Count(v) => out.push_str(&format!(
+                "const {name}: u32 = {}u;\n",
+                u32::try_from(v).unwrap_or(u32::MAX)
+            )),
+            Value::Wide(v) => out.push_str(&format!(
                 "const {name}: u32 = {}u;\n",
                 u32::try_from(v).unwrap_or(u32::MAX)
             )),
@@ -116,12 +138,15 @@ pub(super) enum Res {
         size: u64,
         dynamic: bool,
     },
+    /// A storage buffer of elements of `element` bytes (the array's stride):
+    /// the layout's minimum binding size.
     Storage {
         read_only: bool,
+        element: u64,
     },
-    /// A float texture, read filtered or by `textureLoad`.
-    Texture(wgpu::TextureViewDimension),
-    Sampler,
+    /// A texture and what it samples.
+    Texture(wgpu::TextureViewDimension, wgpu::TextureSampleType),
+    Sampler(wgpu::SamplerBindingType),
 }
 
 /// A binding of a bind group.
@@ -146,11 +171,15 @@ const fn uniform(binding: u32, visibility: wgpu::ShaderStages, size: u64, dynami
     }
 }
 
-const fn storage(binding: u32, visibility: wgpu::ShaderStages, read_only: bool) -> Slot {
+/// Bytes of a `u32` and of a `vec4` element.
+const WORD: u64 = 4;
+const VEC4: u64 = 16;
+
+const fn storage(binding: u32, visibility: wgpu::ShaderStages, read_only: bool, element: u64) -> Slot {
     Slot {
         binding,
         visibility,
-        res: Res::Storage { read_only },
+        res: Res::Storage { read_only, element },
     }
 }
 
@@ -158,30 +187,101 @@ const fn texture(binding: u32, dimension: wgpu::TextureViewDimension) -> Slot {
     Slot {
         binding,
         visibility: F,
-        res: Res::Texture(dimension),
+        res: Res::Texture(dimension, wgpu::TextureSampleType::Float { filterable: true }),
     }
 }
 
-/// Bytes of the quad pass's globals (`Globals` in `shaders.wgsl`).
-pub(super) const GLOBALS: u64 = 64;
-/// Bytes of the path and curve-text passes' globals (`Globals`, the target's size and origin).
-pub(super) const TARGET_GLOBALS: u64 = 16;
-/// Bytes of the path compute passes' parameters (`Params` in `path_compute.wgsl`).
-pub(super) const PASS_PARAMS: u64 = 32;
+/// What the adapter must have (the renderer refuses one that lacks it, and
+/// the tests validate the shaders with exactly these): compute and indirect
+/// dispatch for the path passes and chunks, and half-float packing in `f32`
+/// (`unpack2x16float`, which colours are stored with).
+pub(super) const REQUIRED_DOWNLEVEL: wgpu::DownlevelFlags = wgpu::DownlevelFlags::COMPUTE_SHADERS
+    .union(wgpu::DownlevelFlags::INDIRECT_EXECUTION)
+    .union(wgpu::DownlevelFlags::SHADER_F16_IN_F32);
+
+/// The features the device is made with, apart from the optional timestamps.
+pub(crate) fn required_features(dual_source: bool) -> wgpu::Features {
+    if dual_source {
+        wgpu::Features::DUAL_SOURCE_BLENDING
+    } else {
+        wgpu::Features::empty()
+    }
+}
+
+/// The bytes of a uniform block's Rust type.
+#[expect(clippy::as_conversions, reason = "a size, widened in a const")]
+pub(crate) const fn bytes_of<T>() -> u64 {
+    std::mem::size_of::<T>() as u64
+}
+
+/// The quad pass's uniform block (`Globals` in `shaders.wgsl`), at the start
+/// of a block of the globals buffer; the path and curve-text passes read its
+/// first 16 bytes as [`TargetGlobals`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct Globals {
+    /// The target's size in pixels, and where its top left sits in the window.
+    pub size: [f32; 2],
+    pub origin: [f32; 2],
+    /// Where each property table starts in `props` (vec4s).
+    pub bases: [u32; 4],
+    /// The map from the target's space to the canvas's: (a, b, c, d), (e, f).
+    pub to_canvas: [f32; 4],
+    pub to_canvas_t: [f32; 2],
+    pub pad: [f32; 2],
+}
+
+/// What the path and curve-text passes read of the globals.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct TargetGlobals {
+    pub size: [f32; 2],
+    pub origin: [f32; 2],
+}
+
+/// The path compute passes' parameters (`Params` in `path_compute.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct PassParams {
+    pub n_points: u32,
+    pub n_items: u32,
+    pub n_lines: u32,
+    pub n_rows: u32,
+    pub line_ranges: u32,
+    pub n_line_ranges: u32,
+    pub row_ranges: u32,
+    pub n_row_ranges: u32,
+}
+
+/// One pass of a read's blur (`Step` in `read.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct Step {
+    pub dir: [f32; 2],
+    pub sigma: f32,
+    pub _pad: f32,
+    pub size: [f32; 2],
+    pub _pad2: [f32; 2],
+}
+
+pub(super) const GLOBALS: u64 = bytes_of::<Globals>();
+pub(super) const TARGET_GLOBALS: u64 = bytes_of::<TargetGlobals>();
+pub(super) const PASS_PARAMS: u64 = bytes_of::<PassParams>();
+pub(super) const STEP: u64 = bytes_of::<Step>();
 
 /// The quad pass's group 0: globals, the records and their index, the
 /// property tables, the atlas pages, the sampler, the gamma table.
 pub(super) const QUADS: &[Slot] = &[
     uniform(0, VF, GLOBALS, true),
-    storage(1, VF, true),
-    storage(2, VF, true),
-    storage(3, VF, true),
+    storage(1, VF, true, WORD),
+    storage(2, VF, true, WORD),
+    storage(3, VF, true, VEC4),
     texture(4, D2_ARRAY),
     texture(5, D2_ARRAY),
     Slot {
         binding: 6,
         visibility: F,
-        res: Res::Sampler,
+        res: Res::Sampler(wgpu::SamplerBindingType::Filtering),
     },
     texture(7, D2),
 ];
@@ -189,35 +289,35 @@ pub(super) const QUADS: &[Slot] = &[
 pub(super) const EXTRA: &[Slot] = &[texture(0, D2)];
 pub(super) const PATHS: &[Slot] = &[
     uniform(0, VF, TARGET_GLOBALS, true),
-    storage(1, VF, true),
-    storage(2, VF, true),
-    storage(3, VF, true),
-    storage(4, VF, true),
-    storage(5, VF, true),
-    storage(6, VF, true),
-    storage(7, VF, true),
+    storage(1, VF, true, WORD),
+    storage(2, VF, true, WORD),
+    storage(3, VF, true, WORD),
+    storage(4, VF, true, VEC4),
+    storage(5, VF, true, VEC4),
+    storage(6, VF, true, VEC4),
+    storage(7, VF, true, VEC4),
 ];
 pub(super) const PASSES: &[Slot] = &[
     uniform(0, C, PASS_PARAMS, false),
-    storage(1, C, true),
-    storage(2, C, true),
-    storage(3, C, true),
-    storage(4, C, false),
-    storage(5, C, false),
-    storage(6, C, false),
-    storage(7, C, false),
-    storage(8, C, false),
-    storage(9, C, false),
+    storage(1, C, true, WORD),
+    storage(2, C, true, WORD),
+    storage(3, C, true, WORD),
+    storage(4, C, false, WORD),
+    storage(5, C, false, VEC4),
+    storage(6, C, false, WORD),
+    storage(7, C, false, VEC4),
+    storage(8, C, false, VEC4),
+    storage(9, C, false, WORD),
 ];
 pub(super) const CURVE_TEXT_BINDS: &[Slot] = &[
     uniform(0, VF, TARGET_GLOBALS, true),
-    storage(1, VF, true),
-    storage(2, VF, true),
-    storage(3, VF, true),
+    storage(1, VF, true, VEC4),
+    storage(2, VF, true, VEC4),
+    storage(3, VF, true, VEC4),
     texture(4, D2),
 ];
 pub(super) const CANVAS: &[Slot] = &[texture(0, D2)];
-pub(super) const READ_BACK: &[Slot] = &[texture(0, D2), uniform(1, F, super::read::STEP, true)];
+pub(super) const READ_BACK: &[Slot] = &[texture(0, D2), uniform(1, F, STEP, true)];
 
 /// A bind group layout of `slots`.
 pub(super) fn layout(device: &wgpu::Device, label: &str, slots: &[Slot]) -> wgpu::BindGroupLayout {
@@ -232,17 +332,17 @@ pub(super) fn layout(device: &wgpu::Device, label: &str, slots: &[Slot]) -> wgpu
                     has_dynamic_offset: dynamic,
                     min_binding_size: wgpu::BufferSize::new(size),
                 },
-                Res::Storage { read_only } => wgpu::BindingType::Buffer {
+                Res::Storage { read_only, element } => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only },
                     has_dynamic_offset: false,
-                    min_binding_size: None,
+                    min_binding_size: wgpu::BufferSize::new(element),
                 },
-                Res::Texture(view_dimension) => wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                Res::Texture(view_dimension, sample_type) => wgpu::BindingType::Texture {
+                    sample_type,
                     view_dimension,
                     multisampled: false,
                 },
-                Res::Sampler => wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                Res::Sampler(kind) => wgpu::BindingType::Sampler(kind),
             },
             count: None,
         })

@@ -15,9 +15,9 @@ use super::{
 };
 use crate::figure::{Cap, Draw, FillRule, Join, Path, PathStyle};
 
-const TILE: f32 = 16.0;
-const FIX: f32 = 256.0;
-const TILE_FIX: i32 = 4096;
+use super::{FIX, TILE};
+
+const TILE_FIX: i32 = (TILE * FIX) as i32;
 const PIECE: f32 = 64.0;
 const NO_EDGE: f32 = -1.0e30;
 

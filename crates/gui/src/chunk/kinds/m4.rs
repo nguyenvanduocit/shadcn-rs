@@ -10,14 +10,81 @@ use super::super::runtime::{Bind, BindKind, ChunkCompute, ChunkUpload, ComputeId
 use super::super::series::{NONE, column_count};
 use super::super::store::{BufferId, ResidentPage, split};
 use super::MarkView;
+use crate::gpu::contract::{Const, Value, bytes_of, prelude};
 
 /// The most device pixel columns a chunk reduces to.
 pub const MAX_COLUMNS: u32 = 16_384;
 /// Bytes between uniform blocks (wgpu's largest `min_uniform_buffer_offset_alignment`).
 pub const BLOCK: u64 = 256;
-/// Words of a partial, of an extended column (`m4_page.wgsl`, `m4_common.wgsl`).
+/// Words of a partial, of an extended column: prepended to every M4 shader
+/// (`m4_shader`), so the passes cannot differ from what is allocated here.
 const PARTIAL: u64 = 24;
 const COLUMN: u64 = 20;
+const M4_CONSTS: &[Const] = &[("PARTIAL", Value::Wide(PARTIAL)), ("COLUMN", Value::Wide(COLUMN))];
+
+/// What every M4 pass reads (`M4` in `m4_common.wgsl`), at the start of the
+/// chunk's uniform buffer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct M4Params {
+    cols: u32,
+    npages: u32,
+    before: u32,
+    after: u32,
+    /// The view's first x, as (high, low) words.
+    x0: [u32; 2],
+    kx: f32,
+    bx: f32,
+    /// The view's top y (high, low parts).
+    y1: [f32; 2],
+    ky: f32,
+    by: f32,
+    base: f32,
+    floor_on: u32,
+    n: u32,
+    pad: u32,
+}
+
+/// A page's parameters (`PageP` in `m4_page.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct PageP {
+    len: u32,
+    cap: u32,
+    at: u32,
+    y: u32,
+    levels: u32,
+    lo: u32,
+    col0: u32,
+    col1: u32,
+    out: u32,
+    fy: u32,
+    flo: u32,
+    pad: u32,
+}
+
+/// A gang's uniform block (`Gang` in `m4_page.wgsl`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
+struct GangP {
+    first: u32,
+    count: u32,
+    threads: u32,
+    pad: u32,
+}
+
+/// Bytes of the uniforms the passes bind a range of.
+const M4_BYTES: u64 = bytes_of::<M4Params>();
+const GANG_BYTES: u64 = bytes_of::<GangP>();
+/// Bytes of a page's parameters.
+const PAGE_P: u64 = bytes_of::<PageP>();
+
+/// An M4 shader: the constants, then `parts`.
+fn m4_shader(parts: &[&str]) -> String {
+    let mut s = prelude(&[M4_CONSTS]);
+    s.push_str(&wgsl(parts, &[]));
+    s
+}
 
 /// A shader of `parts` reading the pages bound as `pages` (one binding
 /// each, declared by `parts`).
@@ -38,7 +105,8 @@ pub(crate) fn wgsl(parts: &[&str], pages: &[&str]) -> String {
 /// on are the pages (`pg0`…), then their floor pages (`fpg0`…);
 /// `page_w` and `fpage_w` read the one the thread's `cur` picks.
 fn gang_wgsl(parts: &[&str], gang: u32, first: u32) -> String {
-    let mut s = String::from(include_str!("node.wgsl"));
+    let mut s = prelude(&[M4_CONSTS]);
+    s.push_str(include_str!("node.wgsl"));
     s.push_str(include_str!("x64.wgsl"));
     for p in parts {
         s.push_str(p);
@@ -79,8 +147,46 @@ fn page_binds(gang: u32) -> Vec<BindKind> {
 const GANG_FIRST: u32 = 5;
 /// The most pages a gang binds.
 const MAX_GANG: u32 = 16;
-/// Bytes of a page's parameters (`PageP`).
-const PAGE_P: u64 = 48;
+/// One pass of the M4 reduction: its pipeline's label, shader, entry point
+/// and bindings, as `M4Pipes::new` makes it and the tests check it.
+struct PassSpec {
+    label: &'static str,
+    source: String,
+    entry: &'static str,
+    binds: Vec<BindKind>,
+}
+
+/// The page pass (for gangs of `gang` pages), merge, scan and compact.
+fn pass_specs(gang: u32) -> [PassSpec; 4] {
+    use BindKind::{Storage, StorageWrite, Uniform};
+    let common = include_str!("m4_common.wgsl");
+    [
+        PassSpec {
+            label: "gui m4 page",
+            source: gang_wgsl(&[common, include_str!("m4_page.wgsl")], gang, GANG_FIRST),
+            entry: "page_pass",
+            binds: page_binds(gang),
+        },
+        PassSpec {
+            label: "gui m4 merge",
+            source: m4_shader(&[common, include_str!("m4_merge.wgsl")]),
+            entry: "merge",
+            binds: vec![Uniform, Storage, Storage, StorageWrite],
+        },
+        PassSpec {
+            label: "gui m4 scan",
+            source: m4_shader(&[common, include_str!("m4_scan.wgsl"), include_str!("scan.wgsl")]),
+            entry: "scan",
+            binds: vec![Uniform, Storage, StorageWrite],
+        },
+        PassSpec {
+            label: "gui m4 compact",
+            source: m4_shader(&[common, include_str!("m4_compact.wgsl")]),
+            entry: "compact",
+            binds: vec![Uniform, Storage, Storage, StorageWrite],
+        },
+    ]
+}
 
 pub(crate) struct M4Pipes {
     page: ComputeId,
@@ -93,8 +199,6 @@ pub(crate) struct M4Pipes {
 
 impl M4Pipes {
     pub(crate) fn new(ctx: &mut PipelineBuilder<'_>) -> Self {
-        use BindKind::{Storage, StorageWrite, Uniform};
-        let common = include_str!("m4_common.wgsl");
         // Storage bindings: the pages' parameters, the bounds, the
         // partials, then the pages and their floors; two uniforms besides.
         let limits = ctx.limits();
@@ -103,30 +207,7 @@ impl M4Pipes {
             .max_buffers_and_acceleration_structures_per_shader_stage
             .saturating_sub(5);
         let gang = (storage.min(buffers) / 2).clamp(1, MAX_GANG);
-        let page = ctx.compute(
-            "gui m4 page",
-            &gang_wgsl(&[common, include_str!("m4_page.wgsl")], gang, GANG_FIRST),
-            "page_pass",
-            &page_binds(gang),
-        );
-        let merge = ctx.compute(
-            "gui m4 merge",
-            &wgsl(&[common, include_str!("m4_merge.wgsl")], &[]),
-            "merge",
-            &[Uniform, Storage, Storage, StorageWrite],
-        );
-        let scan = ctx.compute(
-            "gui m4 scan",
-            &wgsl(&[common, include_str!("m4_scan.wgsl"), include_str!("scan.wgsl")], &[]),
-            "scan",
-            &[Uniform, Storage, StorageWrite],
-        );
-        let compact = ctx.compute(
-            "gui m4 compact",
-            &wgsl(&[common, include_str!("m4_compact.wgsl")], &[]),
-            "compact",
-            &[Uniform, Storage, Storage, StorageWrite],
-        );
+        let [page, merge, scan, compact] = pass_specs(gang).map(|p| ctx.compute(p.label, &p.source, p.entry, &p.binds));
         Self {
             page,
             gang,
@@ -254,20 +335,20 @@ impl M4State {
             };
             let f = floor_pages.as_ref().filter(|_| floor_ok).and_then(|f| f.get(k));
             let lay = p.layout;
-            let pp: [u32; 12] = [
-                p.len,
-                lay.cap,
-                p.at,
-                lay.y,
-                lay.levels,
-                if lay.lo == lay.y { NONE } else { lay.lo },
-                c0,
-                c1,
+            let pp = PageP {
+                len: p.len,
+                cap: lay.cap,
+                at: p.at,
+                y: lay.y,
+                levels: lay.levels,
+                lo: if lay.lo == lay.y { NONE } else { lay.lo },
+                col0: c0,
+                col1: c1,
                 out,
-                f.map_or(lay.y, |f| f.layout.y),
-                f.map_or(NONE, |f| if f.layout.lo == f.layout.y { NONE } else { f.layout.lo }),
-                0,
-            ];
+                fy: f.map_or(lay.y, |f| f.layout.y),
+                flo: f.map_or(NONE, |f| if f.layout.lo == f.layout.y { NONE } else { f.layout.lo }),
+                pad: 0,
+            };
             runs.push((
                 PageRun {
                     seq: p.seq,
@@ -285,37 +366,40 @@ impl M4State {
         let n = cols.saturating_add(2);
         let npages = u32::try_from(runs.len()).unwrap_or(0);
         let x0 = split(view.x0);
-        let m4: [u32; 16] = [
+        let m4 = M4Params {
             cols,
             npages,
-            columns.before.unwrap_or(NONE),
-            columns.after.unwrap_or(NONE),
-            x0.0,
-            x0.1,
-            kx.to_bits(),
-            bx.to_bits(),
-            y1.0.to_bits(),
-            y1.1.to_bits(),
-            ky.to_bits(),
-            by.to_bits(),
-            base.to_bits(),
-            u32::from(floor_ok),
+            before: columns.before.unwrap_or(NONE),
+            after: columns.after.unwrap_or(NONE),
+            x0: [x0.0, x0.1],
+            kx,
+            bx,
+            y1: [y1.0, y1.1],
+            ky,
+            by,
+            base,
+            floor_on: u32::from(floor_ok),
             n,
-            0,
-        ];
+            pad: 0,
+        };
         // A gang's block: its first page, how many, its threads.
         let gang = usize::try_from(pipes.gang).unwrap_or(1).max(1);
-        let gangs: Vec<[u32; 4]> = runs
+        let gangs: Vec<GangP> = runs
             .chunks(gang)
             .enumerate()
             .map(|(i, g)| {
                 let threads = g.iter().map(|(r, _)| r.columns).fold(0_u32, u32::saturating_add);
                 let count = u32::try_from(g.len()).unwrap_or(0);
-                [u32::try_from(i.saturating_mul(gang)).unwrap_or(0), count, threads, 0]
+                GangP {
+                    first: u32::try_from(i.saturating_mul(gang)).unwrap_or(0),
+                    count,
+                    threads,
+                    pad: 0,
+                }
             })
             .collect();
         let blocks = u64::try_from(gangs.len()).unwrap_or(0).saturating_add(1);
-        let pps: Vec<u32> = runs.iter().flat_map(|(_, pp)| *pp).collect();
+        let pps: Vec<PageP> = runs.iter().map(|(_, pp)| *pp).collect();
         let (Some(params), Some(pps_buf), Some(bounds_buf), Some(_), Some(table_buf), Some(_), Some(_), Some(_)) = (
             up.buffer(&mut self.params, BLOCK.saturating_mul(blocks)),
             up.buffer(&mut self.pps, u64::from(npages).saturating_mul(PAGE_P)),
@@ -331,12 +415,12 @@ impl M4State {
         ) else {
             return false;
         };
-        up.write(params, 0, words(&m4));
+        up.write(params, 0, bytemuck::bytes_of(&m4));
         for (i, g) in gangs.iter().enumerate() {
             let block = BLOCK.saturating_mul(u64::try_from(i).unwrap_or(0).saturating_add(1));
-            up.write(params, block, words(g));
+            up.write(params, block, bytemuck::bytes_of(g));
         }
-        up.write(pps_buf, 0, words(&pps));
+        up.write(pps_buf, 0, bytemuck::cast_slice(&pps));
         let b: Vec<u32> = columns
             .bounds
             .iter()
@@ -370,7 +454,7 @@ impl M4State {
         if self.n == 0 {
             return;
         }
-        let m4 = Bind::Range(params, 0, 64);
+        let m4 = Bind::Range(params, 0, M4_BYTES);
         let gang = usize::try_from(self.gang).unwrap_or(1).max(1);
         for (i, g) in self.runs.chunks(gang).enumerate() {
             let (Some(last), Some(pps)) = (g.last(), self.pps) else {
@@ -380,7 +464,7 @@ impl M4State {
             let block = BLOCK.saturating_mul(u64::try_from(i).unwrap_or(0).saturating_add(1));
             let mut binds = vec![
                 m4,
-                Bind::Range(params, block, 16),
+                Bind::Range(params, block, GANG_BYTES),
                 Bind::Buffer(pps),
                 Bind::Buffer(bounds),
                 Bind::Buffer(partials),
@@ -417,55 +501,93 @@ impl M4State {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::contract::reflect::{Kind, Number, reflect};
+    use crate::gpu::contract::reflect::{Kind, assert_layout, reflect};
+    use naga::ShaderStage;
 
-    /// The page pass's shader for every gang size it can be built with
-    /// (V3): naga validates each, and its bindings, struct sizes and
-    /// constants are the ones declared here.
+    /// Every pass of the M4 reduction (page pass for every gang size it can
+    /// be built with, merge, scan, compact), as `M4Pipes::new` builds them
+    /// (V3): naga validates each; its bindings, and the uniform structs it
+    /// reads (size, member names and offsets) against the `#[repr(C)]` types
+    /// the writers fill; and the sizes the passes bind.
     #[test]
-    fn page_pass_agrees_with_rust_for_every_gang() {
-        let common = include_str!("m4_common.wgsl");
+    fn passes_agree_with_rust_for_every_gang() {
         for gang in 1..=MAX_GANG {
-            let label = format!("m4 page, gang {gang}");
-            let source = gang_wgsl(&[common, include_str!("m4_page.wgsl")], gang, GANG_FIRST);
-            let r = reflect(&label, &source);
-            let binds = page_binds(gang);
-            assert_eq!(r.bindings.len(), binds.len(), "{label}: bindings");
-            for (i, bind) in binds.iter().enumerate() {
-                let at = u32::try_from(i).unwrap();
-                let found = r
-                    .bindings
-                    .get(&(0, at))
-                    .unwrap_or_else(|| panic!("{label}: Rust binds {at}, the shader declares none"));
-                let same = match (bind, found.kind) {
-                    (BindKind::Uniform, Kind::Uniform { .. }) => true,
-                    (BindKind::Storage, Kind::Storage { read_only }) => read_only,
-                    (BindKind::StorageWrite, Kind::Storage { read_only }) => !read_only,
-                    _ => false,
-                };
+            for spec in pass_specs(gang) {
+                let label = format!("{}, gang {gang}", spec.label);
+                let r = reflect(&label, &spec.source, false);
+                assert_eq!(r.bindings.len(), spec.binds.len(), "{label}: bindings");
+                for (i, bind) in spec.binds.iter().enumerate() {
+                    let at = u32::try_from(i).unwrap();
+                    let found = r
+                        .bindings
+                        .get(&(0, at))
+                        .unwrap_or_else(|| panic!("{label}: Rust binds {at}, the shader declares none"));
+                    let same = match (bind, found.kind) {
+                        (BindKind::Uniform, Kind::Uniform { .. }) => true,
+                        (BindKind::Storage, Kind::Storage { read_only, .. }) => read_only,
+                        (BindKind::StorageWrite, Kind::Storage { read_only, .. }) => !read_only,
+                        _ => false,
+                    };
+                    assert!(
+                        same,
+                        "{label}: binding {at} (`{}`): Rust {bind:?}, shader {:?}",
+                        found.name, found.kind
+                    );
+                    assert_eq!(
+                        found.written_by.is_empty(),
+                        !matches!(bind, BindKind::StorageWrite),
+                        "{label}: binding {at} written"
+                    );
+                    // The bytes a dispatch binds of a uniform (`compute`).
+                    if let Kind::Uniform { size } = found.kind {
+                        let bound = if at == 1 { GANG_BYTES } else { M4_BYTES };
+                        assert_eq!(u64::from(size), bound, "{label}: binding {at} bytes bound");
+                    }
+                }
                 assert!(
-                    same,
-                    "{label}: binding {at} (`{}`): Rust {bind:?}, shader {:?}",
-                    found.name, found.kind
+                    r.entry_points.contains(&(spec.entry.to_owned(), ShaderStage::Compute)),
+                    "{label}: no compute entry point `{}`",
+                    spec.entry
                 );
-                assert_eq!(
-                    found.written_by.is_empty(),
-                    !matches!(bind, BindKind::StorageWrite),
-                    "{label}: binding {at} written"
+                assert_layout!(
+                    r,
+                    &label,
+                    "M4",
+                    M4Params,
+                    [
+                        cols, npages, before, after, x0, kx, bx, y1, ky, by, base, floor_on, n, pad
+                    ]
                 );
+                if spec.entry == "page_pass" {
+                    assert_layout!(
+                        r,
+                        &label,
+                        "PageP",
+                        PageP,
+                        [len, cap, at, y, levels, lo, col0, col1, out, fy, flo, pad]
+                    );
+                    assert_layout!(r, &label, "Gang", GangP, [first, count, threads, pad]);
+                }
             }
-            assert_eq!(
-                r.struct_sizes.get("PageP").copied(),
-                u32::try_from(PAGE_P).ok(),
-                "{label}: PageP bytes"
-            );
-            assert_eq!(r.struct_sizes.get("Gang").copied(), Some(16), "{label}: Gang bytes");
-            for (name, words) in [("PARTIAL", PARTIAL), ("COLUMN", COLUMN)] {
-                assert_eq!(
-                    r.constants.get(name).copied(),
-                    u32::try_from(words).ok().map(Number::U32),
-                    "{label}: {name} words"
-                );
+        }
+    }
+
+    /// The words of a partial and of a column are Rust's: no M4 shader
+    /// declares them.
+    #[test]
+    fn m4_shaders_do_not_declare_the_sizes_rust_owns() {
+        for (file, text) in [
+            ("m4_common.wgsl", include_str!("m4_common.wgsl")),
+            ("m4_page.wgsl", include_str!("m4_page.wgsl")),
+            ("m4_merge.wgsl", include_str!("m4_merge.wgsl")),
+            ("m4_scan.wgsl", include_str!("m4_scan.wgsl")),
+            ("m4_compact.wgsl", include_str!("m4_compact.wgsl")),
+        ] {
+            for (name, _) in M4_CONSTS {
+                let declared = text
+                    .lines()
+                    .any(|l| l.trim_start().starts_with(&format!("const {name}:")));
+                assert!(!declared, "{file} declares `const {name}`: m4.rs owns it");
             }
         }
     }

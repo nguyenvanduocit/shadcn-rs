@@ -1,6 +1,6 @@
 // Linear gradients from a table of stops (two vec4s each: the offset, then
 // the straight colour), mixed in OKLab between stops as CSS mixes them.
-// Prepended by `gpu::module` to the modules that declare `stops`.
+// Prepended by `gpu::contract` to the modules that declare `stops`.
 
 // The colour of the gradient of stops `first..first + count` along `line`
 // (x0, y0, x1, y1) at `p`, padded past both ends.

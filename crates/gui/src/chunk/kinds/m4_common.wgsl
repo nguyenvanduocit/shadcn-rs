@@ -25,6 +25,5 @@ struct M4 {
     pad: u32,
 }
 
-// Words of an extended column's M4: its count, then four points of
-// (x pixel, y pixel, floor pixel, index).
-const COLUMN: u32 = 20u;
+// `COLUMN`, the words of an extended column's M4 (its count, then four points
+// of (x pixel, y pixel, floor pixel, index)), is prepended from `m4.rs`.

@@ -8,7 +8,7 @@
 @group(0) @binding(2) var<storage, read> partials: array<u32>;
 @group(0) @binding(3) var<storage, read_write> columns: array<u32>;
 
-const PARTIAL: u32 = 24u;
+// `PARTIAL` is prepended from `m4.rs`.
 
 struct Part {
     node: Node,

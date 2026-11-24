@@ -24,6 +24,7 @@
 //! before it, never last frame's result. A blend reads only the pixel it
 //! draws, which any damage part redraws first.
 
+use super::contract::{STEP, Step};
 use super::damage::Rect;
 use super::record::{self, READ_BACKDROP, READ_DARKEN, READ_LIGHTEN};
 use super::{Extra, GpuRenderer, Op, Texture, phys, push_op, radii, rgba};
@@ -35,8 +36,6 @@ use crate::shape::Blend;
 pub(super) const MOST_SIGMA: f32 = 4.0;
 /// The most halvings: a 32× smaller copy.
 const MOST_LEVELS: u32 = 5;
-/// Bytes of one pass's parameters (a `Step` in `read.wgsl`).
-pub(super) const STEP: u64 = 32;
 
 /// One read of a frame: the target's pixels `rect` covers (window,
 /// physical), and the blur they get.
@@ -254,18 +253,14 @@ impl GpuRenderer {
             let mut step = |dir: [f32; 2], sigma: f32, size: (u32, u32)| {
                 let at = r.words.len();
                 r.words.resize(at.saturating_add(stride), 0);
-                let values = [
-                    dir[0],
-                    dir[1],
+                let values = Step {
+                    dir,
                     sigma,
-                    0.0,
-                    crate::convert::u32_to_f32(size.0),
-                    crate::convert::u32_to_f32(size.1),
-                    0.0,
-                    0.0,
-                ];
-                for (d, v) in r.words.iter_mut().skip(at).zip(super::floats_to_bytes(&values)) {
-                    *d = v;
+                    size: [crate::convert::u32_to_f32(size.0), crate::convert::u32_to_f32(size.1)],
+                    ..Step::default()
+                };
+                for (d, v) in r.words.iter_mut().skip(at).zip(bytemuck::bytes_of(&values)) {
+                    *d = *v;
                 }
             };
             for level in 0..read.levels {

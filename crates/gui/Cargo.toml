@@ -53,7 +53,7 @@ gdt-cpus = "0.2606"
 wgpu = "30"
 etagere = "0.3"
 # Instance records are plain `u32` words, cast to bytes for upload without copying (ADR-0016).
-bytemuck = "1"
+bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 # Text (ADR-0019): Parley shapes, breaks lines and edits, fontique finds and
 # falls back between system fonts; glyph outlines, hinting and colour glyphs
@@ -94,6 +94,9 @@ fontique = { version = "0.13", features = ["fontconfig-dlopen"] }
 # The assembled shaders parsed and validated against the Rust side (V3,
 # `gpu/contract/`). The version wgpu 30 builds, so no second copy is compiled.
 naga = { version = "=30.0.2", default-features = false, features = ["wgsl-in"] }
+# Turns the device's features and downlevel flags into naga's capabilities,
+# as wgpu does when it validates a module.
+wgpu-naga-bridge = "=30.0.2"
 # The tree a platform adapter keeps, to check that incremental updates keep
 # AccessKit's contract and equal the whole tree (ADR-0021).
 accesskit_consumer = "0.39"
