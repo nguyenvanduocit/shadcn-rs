@@ -1,6 +1,6 @@
 # 0029. One crate holds the OS display boundary
 
-Status: proposed, 2026-11-24 (D1). Built with it: the crate `crates/gui-display` with a macOS backend and an X11
+Status: accepted under delegation, 2026-11-24 (D1), after two review rounds and a Codex check of every unsafe site. Built with it: the crate `crates/gui-display` with a macOS backend and an X11
 backend, wired into `gui`'s clock and platform thread; see "As built" for what is tested and "Open" for what is not
 built. Amends ADR-0015's time source (the "upstream contributions" it waited for are no longer the plan) and the
 workspace rule that no crate holds `unsafe` (AGENTS.md, "Safety holds"), by the user's decision of 2026-11-23.

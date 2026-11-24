@@ -305,6 +305,24 @@ fn every_apple_call_of_the_macos_backend_has_its_version_and_its_check() {
     }
 }
 
+/// What a site's soundness rests on beyond its count: the toolkit's XCB
+/// connection is adopted without being closed on drop (site 11), and a panic
+/// caught in the display link's callback is forgotten, never dropped there
+/// (site 8: a payload's `Drop` could unwind into Core Video).
+#[test]
+fn the_arguments_the_sites_rest_on_are_kept() {
+    let x11 = shipped(include_str!("../src/x11.rs"));
+    assert!(
+        x11.contains("XCBConnection::from_raw_xcb_connection(connection.as_ptr(), false)"),
+        "x11.rs: the adopted connection must not be disconnected on drop"
+    );
+    let macos = shipped(include_str!("../src/macos.rs"));
+    assert!(
+        macos.contains("std::mem::forget(payload);"),
+        "macos.rs: a caught panic's payload is forgotten in the callback"
+    );
+}
+
 #[test]
 fn the_minimum_macos_is_what_connect_checks_and_the_adr_states() {
     let (major, minor) = MACOS_MINIMUM;

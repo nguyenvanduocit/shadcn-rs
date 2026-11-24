@@ -608,6 +608,10 @@ fn stamp(at: NonNull<CVTimeStamp>) -> CVTimeStamp {
 }
 
 /// The display link's callback, on a Core Video thread.
+#[expect(
+    clippy::mem_forget,
+    reason = "a caught panic's payload is leaked, not dropped: its `Drop` could unwind into Core Video (site 8)"
+)]
 extern "C-unwind" fn output(
     _link: NonNull<CVDisplayLink>,
     _now: NonNull<CVTimeStamp>,
@@ -617,8 +621,11 @@ extern "C-unwind" fn output(
     context: *mut c_void,
 ) -> CVReturn {
     let number = context.addr();
-    // Nothing may unwind into Core Video.
-    std::panic::catch_unwind(|| ticked(number, output_time)).ok();
+    // Nothing may unwind into Core Video: a panic's payload is forgotten,
+    // not dropped, since its `Drop` could panic again outside the catch.
+    if let Err(payload) = std::panic::catch_unwind(|| ticked(number, output_time)) {
+        std::mem::forget(payload);
+    }
     CV_SUCCESS
 }
 
