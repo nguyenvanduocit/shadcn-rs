@@ -36,5 +36,5 @@ jobs:
       # twice must agree, by instructions where the VM exposes the counters
       # (perf_event_paranoid lowered for it), else by time.
       - run: sudo sysctl -w kernel.perf_event_paranoid=1
-      - run: crates/shadcn/bench.sh --frames=10 button card dialog table && crates/shadcn/bench.sh --frames=10 button card dialog table
+      - run: crates/shadcn/bench.sh --frames=10 button card dialog table && crates/shadcn/bench.sh --prev --frames=10 button card dialog table
       - uses: EmbarkStudios/cargo-deny-action@v2

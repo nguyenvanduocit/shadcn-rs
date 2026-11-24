@@ -85,6 +85,15 @@ main() {
   out="$reports/$style/$run"
   [ -z "$where" ] || { echo "$out"; exit 0; }
 
+  # A page the committed per-demo floor has no row for is a typo (or a page to add there): refuse it before
+  # anything is shot.
+  if [ -f "$here/baseline/$style.tsv" ]; then
+    for p in ${pages[@]+"${pages[@]}"}; do
+      cut -f1 "$here/baseline/$style.tsv" | grep -v '^#' | grep -Fqx -- "$p" \
+        || { echo "$p: no such page (verdict/baseline/$style.tsv has none)" >&2; exit 2; }
+    done
+  fi
+
   "$here/fetch.sh"
   if [ ! -f "$here/node_modules/.package-lock.json" ] || [ "$here/package-lock.json" -nt "$here/node_modules/.package-lock.json" ]; then
     (cd "$here" && npm ci --no-audit --no-fund)
@@ -124,6 +133,20 @@ main() {
     tolerance_now="$(grep '^tolerance ' "$out/verdict.txt")"
     if [ "$last_tolerance" = "$tolerance_now" ]; then
       node "$here/compare.mjs" "$last" "$out/verdict.json" | tee "$out/lower.txt" || status=1
+    fi
+    # The committed per-demo floor (verdict/baseline/<style>.tsv, B0): checked in a full run and in a subset of
+    # pages alike, for the settings it was taken at (light, the style's defaults, the default tolerance).
+    if [ -z "$dark" ] && [ -z "$chosen" ] && [ ${#tolerance[@]} -eq 0 ]; then
+      if [ -f "$here/baseline/$style.tsv" ]; then
+        # Every row of the pages asked for (every page when none) must have been scored.
+        cover=(--full); [ ${#pages[@]} -eq 0 ] || cover=("--pages=$(IFS=,; echo "${pages[*]}")")
+        node "$here/compare.mjs" --baseline "$here/baseline/$style.tsv" "$out/verdict.json" "${cover[@]}" "--demos=$out/demos.txt" \
+          | tee -a "$out/lower.txt" || status=1
+      else
+        echo "NOTICE: no per-demo baseline for $style (verdict/baseline/$style.tsv): its demos are not checked" >&2
+      fi
+    else
+      echo "NOTICE: the per-demo baseline (verdict/baseline/$style.tsv) is not checked: it holds for light, the style's default theme and the default tolerance only" >&2
     fi
     if [ "$run" = all ] && [ ${#tolerance[@]} -eq 0 ]; then
       score="$(sed -n 's|^score \([0-9]*\)/100 .*|\1|p' "$out/verdict.txt")"

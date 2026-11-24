@@ -20,7 +20,8 @@
 //! leaves more held than it found. `--json=PATH` writes a line per page for
 //! tools; `--baseline=PATH` compares with such a file from an earlier run and
 //! names each page whose best round's median moved past the noise ([`NOISE`]),
-//! a slower one counting as a FAIL: the before and after of a change,
+//! a slower one counting as a FAIL, as does a page that allocates more per
+//! frame or has no row in the baseline: the before and after of a change,
 //! headless. The best round, not all frames, because a whole round can land
 //! on a slower core (Apple silicon's efficiency cores) and double its times. Run it on a release build: a debug build's
 //! times say nothing about the app's.
@@ -58,8 +59,11 @@ const CONFIRM: usize = 2;
 /// between runs on an Apple silicon Mac mini (a 3.4ms page), so only a change past both is named.
 const NOISE: (f64, Duration) = (0.40, Duration::from_millis(1));
 /// How far a best round's instructions per frame may move before it counts:
-/// this share and this many, both.
-const INSTRUCTION_NOISE: (f64, u64) = (0.05, 200_000);
+/// this share of the baseline's plus this many. Calibrated on an Apple M4
+/// (docs/baseline-2026-11-24.md): three runs of the same tree moved a page's
+/// best round by at most 2.7% and 5 601 instructions, so the share is three
+/// times the worst and the floor covers the small pages' absolute jitter.
+const INSTRUCTION_NOISE: (f64, u64) = (0.08, 3_000);
 
 /// What `--bench` judges by and where it writes.
 #[derive(Clone, Debug)]
@@ -247,6 +251,14 @@ pub fn bench(only: &[String], options: &Options) -> Result<bool, ScenarioError> 
     if cfg!(debug_assertions) {
         eprintln!("bench: a debug build; its times say nothing about a release build's");
     }
+    if let Some(unknown) = only
+        .iter()
+        .find(|o| !crate::pages::ALL.iter().any(|p| p.name == o.as_str()))
+    {
+        return Err(ScenarioError::Io(std::io::Error::other(format!(
+            "bench: no page {unknown:?}"
+        ))));
+    }
     match Instructions::start() {
         Ok(c) => println!("instructions counted: {}", c.scope()),
         Err(why) => println!("instructions not counted: {why}; runs compare by time"),
@@ -277,7 +289,7 @@ pub fn bench(only: &[String], options: &Options) -> Result<bool, ScenarioError> 
         std::fs::write(path, format!("[\n{}\n]\n", lines.join(",\n")))?;
     }
     let slower = match &options.baseline {
-        Some(path) => compare(&benches, &before, path),
+        Some(path) => compare(&benches, &before, path, only.is_empty()),
         None => 0,
     };
     let failed = benches.iter().filter(|b| b.over_budget(options) || b.grew()).count();
@@ -294,11 +306,15 @@ pub fn bench(only: &[String], options: &Options) -> Result<bool, ScenarioError> 
     Ok(failed == 0 && slower == 0)
 }
 
-/// One page of an earlier run: its best round's median and instructions.
+/// One page of an earlier run: its best round's median and instructions, and
+/// the allocations and bytes a steady frame made (identical between runs of
+/// the same code, so any increase counts).
 struct Was {
     page: String,
     best: Duration,
     instructions: Option<u64>,
+    allocations: Option<usize>,
+    allocated: Option<u64>,
 }
 
 /// The best rounds a `--json` file at `path` holds, by page.
@@ -312,6 +328,8 @@ fn baseline(path: &std::path::Path) -> Result<Vec<Was>, ScenarioError> {
                 page: field(l, "page")?.to_owned(),
                 best: Duration::try_from_secs_f64(p50 / 1000.0).ok()?,
                 instructions: field(l, "best_instructions").and_then(|n| n.parse().ok()),
+                allocations: field(l, "allocations").and_then(|n| n.parse().ok()),
+                allocated: field(l, "allocated_bytes").and_then(|n| n.parse().ok()),
             })
         })
         .collect())
@@ -322,26 +340,57 @@ fn baseline(path: &std::path::Path) -> Result<Vec<Was>, ScenarioError> {
 /// time past [`NOISE`].
 fn moved(was: &Was, now: &Bench) -> Option<bool> {
     if let (Some(a), Some(b)) = (was.instructions, now.instructions) {
-        let by = a.abs_diff(b);
-        let share = u64_to_f64(by) / u64_to_f64(a.max(1));
-        return (share > INSTRUCTION_NOISE.0 && by > INSTRUCTION_NOISE.1).then_some(b > a);
+        let allowed = u64_to_f64(a) * INSTRUCTION_NOISE.0 + u64_to_f64(INSTRUCTION_NOISE.1);
+        return (u64_to_f64(a.abs_diff(b)) > allowed).then_some(b > a);
     }
     let by = now.best.abs_diff(was.best);
     let share = by.as_secs_f64() / was.best.as_secs_f64().max(1e-9);
     (share > NOISE.0 && by > NOISE.1).then_some(now.best > was.best)
 }
 
+/// What `now` allocates per steady frame past `was`: a count, or bytes, that
+/// went up. Both are exact between runs of the same code, so no tolerance.
+fn allocates_more(was: &Was, now: &Bench) -> Option<String> {
+    let heap = now.allocations?;
+    let count = was.allocations.filter(|&n| heap.allocations > n);
+    let size = was.allocated.filter(|&n| heap.allocated > n);
+    (count.is_some() || size.is_some()).then(|| {
+        format!(
+            "{} -> {} allocations, {} -> {} bytes a frame",
+            was.allocations.unwrap_or(heap.allocations),
+            heap.allocations,
+            was.allocated.unwrap_or(heap.allocated),
+            heap.allocated
+        )
+    })
+}
+
 /// Print each page whose best round moved past [`NOISE`] from `before` (read
-/// from `path`), and the count; returns how many got slower.
-fn compare(benches: &[Bench], before: &[Was], path: &std::path::Path) -> usize {
+/// from `path`) or that allocates more, and the count; returns how many got
+/// slower, a page `before` has no row for counted among them, and, when `full`
+/// (every page was asked for), a page of `before` that was not measured.
+fn compare(benches: &[Bench], before: &[Was], path: &std::path::Path, full: bool) -> usize {
     let (mut slower, mut faster, mut compared) = (0_usize, 0_usize, 0_usize);
     println!("\nagainst {}:", path.display());
+    if full {
+        for w in before.iter().filter(|w| !benches.iter().any(|b| b.page == w.page)) {
+            slower = slower.saturating_add(1);
+            println!("{:<7}{:<22} is in the baseline but was not measured", "SLOWER", w.page);
+        }
+    }
     for b in benches {
         let Some(w) = before.iter().find(|w| w.page == b.page) else {
+            slower = slower.saturating_add(1);
+            println!("{:<7}{:<22} has no row in the baseline: add it", "SLOWER", b.page);
             continue;
         };
         let was = w.best;
         compared = compared.saturating_add(1);
+        if let Some(more) = allocates_more(w, b) {
+            slower = slower.saturating_add(1);
+            println!("{:<7}{:<22} allocates more: {more}", "SLOWER", b.page);
+            continue;
+        }
         let word = match moved(w, b) {
             None => continue,
             Some(true) => {
@@ -374,8 +423,9 @@ fn compare(benches: &[Bench], before: &[Was], path: &std::path::Path) -> usize {
         );
     }
     println!(
-        "{compared} pages compared: {slower} SLOWER (each measured up to {CONFIRM} more times, the fastest kept), {faster} FASTER, the rest within {:.0}% of the instructions or, where not counted, {:.0}% or {} of the time",
+        "{compared} pages compared: {slower} SLOWER (each measured up to {CONFIRM} more times, the fastest kept; more allocations or bytes a frame, or no baseline row, count too), {faster} FASTER, the rest within {:.0}% + {} of the instructions or, where not counted, {:.0}% or {} of the time",
         INSTRUCTION_NOISE.0 * 100.0,
+        INSTRUCTION_NOISE.1,
         NOISE.0 * 100.0,
         ms(NOISE.1)
     );
