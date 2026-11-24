@@ -186,7 +186,7 @@ impl Pipeline {
             motion: Motion::default(),
             last_root: None,
             // A debug build's check: a release build has none to run.
-            cold_check: cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some(),
+            cold_check: cold_check_asked(),
             cold_scene: None,
             tree: LayoutTree::new(),
             access: access::Accessibility::default(),
@@ -417,21 +417,32 @@ impl Pipeline {
         // below the content), a node that starts leaving and a height that
         // was measured show in this frame, not the next.
         for pass in 1..LAYOUT_PASSES {
+            // The pass found focus elsewhere than it was built over (the
+            // focused node moved in its render): its flags are of where
+            // focus was, and one more pass, over where it is, settles them.
+            // Asked before settling, which takes where it is in.
+            let moved = !self.tree.focus_settled(self.input_state.state());
             // Post-flush: scroll handles' hooks, `on_mounted`, `on_updated`.
-            // And the layers' focus rules, on the frame just laid out (ADR-0024).
+            // And the layers' focus rules, on the frame just laid out
+            // (ADR-0024); settling takes in where focus is now.
             let hooks =
                 after_layout(self.tree.frame()) | crate::component::run_post() | self.input_state.settle(&self.tree);
+            let busy = hooks | again | moved | crate::component::take_due();
             // The frame's last pass: focus left on a node it does not show
             // goes, and what shows focus is laid out once more.
-            if !(hooks | again | crate::component::take_due()) && !crate::focus::drop_lost(self.tree.frame()) {
+            let lost = !busy && crate::focus::drop_lost(self.tree.frame());
+            if !busy && !lost {
                 return timings;
             }
-            // Each pass is built over where focus is in the one before.
-            self.input_state.sync_focus(&self.tree);
+            if lost {
+                self.input_state.sync_focus(&self.tree);
+            }
             again = self.pass(&mut timings, pass);
         }
-        // Out of passes: the last one's lost focus goes all the same.
-        if crate::focus::drop_lost(self.tree.frame()) {
+        // Out of passes: the last one's lost focus goes all the same, and
+        // where focus is now is what the next frame is built over.
+        let lost = crate::focus::drop_lost(self.tree.frame());
+        if lost || !self.tree.focus_settled(self.input_state.state()) {
             self.input_state.sync_focus(&self.tree);
         }
         timings
@@ -588,6 +599,7 @@ impl Pipeline {
             );
         }
         self.animating = clock::take_frame_request();
+        clock::end_frame();
 
         self.layout_diff(&mut report.diff);
         if !report.diff.is_empty() || !self.causes.is_empty() {
@@ -908,6 +920,15 @@ impl FrameReport {
     pub fn changed(&self) -> bool {
         !self.causes.is_empty() || !self.diff.is_empty()
     }
+}
+
+/// Whether every frame is checked against one built cold (ADR-0013): a
+/// debug build run with `GUI_COLD_CHECK` set to `1` or `true` (`0`, empty
+/// or anything else leaves it off). The one reading of the variable: the
+/// layout, the compositor, the GPU plan and the stress `--cold` run ask here.
+#[must_use]
+pub fn cold_check_asked() -> bool {
+    cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some_and(|v| v == "1" || v == "true")
 }
 
 /// How many times one frame may be resolved and laid out while post-flush
@@ -1420,7 +1441,7 @@ impl Scenario {
         let blank = Pixels::new(pw, ph).ok_or(ScenarioError::Size(pw, ph))?;
         let mut pipeline = Pipeline::new(component, true);
         pipeline.motion.set_instant(true);
-        clock::script(Duration::ZERO);
+        clock::script_fresh(Duration::ZERO);
         let gpu = GpuRenderer::headless().map_err(|e| ScenarioError::Gpu(e.to_string()))?;
         let read = dir.is_some();
         Ok(Self {
@@ -1865,7 +1886,7 @@ fn slug(name: &str) -> String {
 pub fn snapshot(view: impl IntoElement, path: &Path, width: u32, height: u32, scale: f32) -> Result<(), ScenarioError> {
     let element = view.into_element();
     let mut pipeline = Pipeline::new(move || element.clone(), false);
-    clock::script(Duration::ZERO);
+    clock::script_fresh(Duration::ZERO);
     let size = |v: u32| crate::text::physical(crate::convert::u32_to_f32(v), scale);
     let (pw, ph) = (size(width), size(height));
     let gpu = GpuRenderer::headless().map_err(|e| ScenarioError::Gpu(e.to_string()))?;

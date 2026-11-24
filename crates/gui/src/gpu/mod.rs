@@ -1184,7 +1184,7 @@ impl GpuRenderer {
             props: Table::new(&device, "gui properties"),
             tables: frame::Tables::default(),
             planned: None,
-            cold_plan: cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some(),
+            cold_plan: crate::app::cold_check_asked(),
             image_refs: foldhash::HashMap::default(),
             transient_ids: Vec::new(),
             swept: false,

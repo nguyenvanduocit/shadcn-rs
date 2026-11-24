@@ -1593,13 +1593,16 @@ impl InputState {
     pub fn sync_focus(&mut self, tree: &LayoutTree) {
         self.state.focused = focus::focused();
         self.state.focus_visible = focus::focus_visible();
-        // Where the focused node lies, found here once from the focus owner
-        // and nowhere else: a pass reads it before it descends, so an
-        // ancestor built before the focused node (a cold frame's are all
-        // built so) is told focus is within it as the live one is.
+        // Where the focused node lies, as the last pass found it
+        // ([`LayoutTree::focus_location`]): a pass reads it before it
+        // descends, so an ancestor built before the focused node (a cold
+        // frame's are all built so) is told focus is within it as the live
+        // one is. A pass that finds it elsewhere is followed by another
+        // ([`LayoutTree::focus_settled`]).
         let frame = tree.frame();
-        let at = self.state.focused.and_then(|id| tree.focus_index(id));
-        let focus_at = at.and_then(|at| frame.nodes.get(at)).map(|n| (&n.path, n.layer));
+        let found = self.state.focused.and_then(|id| tree.focus_location(id));
+        let at = found.map(|(i, _, _)| i);
+        let focus_at = found.map(|(_, p, l)| (p, l));
         let moved = self.state.focus_at.as_ref().map(|(p, l)| (p, *l)) != focus_at;
         if moved {
             self.state.focus_at = focus_at.map(|(p, l)| (p.clone(), l));

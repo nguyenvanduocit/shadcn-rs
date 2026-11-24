@@ -337,10 +337,10 @@ impl LayoutTree {
                             width: cl.size.width,
                             height: cl.size.height,
                         },
-                        focus_within: state
-                            .focus_at
-                            .as_ref()
-                            .is_some_and(|(f, _)| f.0.starts_with(&ce.path.0)),
+                        // Where the walk found it this pass, not where the
+                        // pass was built over: a row focus moved to is the
+                        // one kept.
+                        focus_within: self.focused.as_ref().is_some_and(|(f, _)| f.0.starts_with(&ce.path.0)),
                     });
                 }
             }

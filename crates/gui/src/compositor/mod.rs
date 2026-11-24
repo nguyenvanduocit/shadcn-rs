@@ -684,7 +684,7 @@ impl Compositor {
             spare: compose::Sources::default(),
             retired: None,
             work: compose::Work::default(),
-            cold_check: cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some(),
+            cold_check: crate::app::cold_check_asked(),
             frame: 0,
             presented: Arc::new(Presented::default()),
             ring: std::collections::VecDeque::new(),

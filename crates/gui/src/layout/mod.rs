@@ -554,6 +554,12 @@ pub struct LayoutTree {
     schedule: Schedule,
     stats: Stats,
     visits: Visits,
+    /// Where the walk found the focused node (its path and layer), each tree
+    /// as soon as it is patched: what placing reads (a scroll container
+    /// tells its handle which child holds focus, a virtual list keeps that
+    /// row built, ADR-0021), in the pass that moved it. Not what resolving
+    /// reads ([`UiState::focus_at`], decided before the walk).
+    focused: Option<(NodePath, usize)>,
     /// The root's path, made once: a pass allocates nothing for it.
     root_path: NodePath,
     /// The frame as laid out, kept and written in place (ADR-0013).
@@ -650,6 +656,7 @@ impl LayoutTree {
             schedule,
             stats: Stats::default(),
             visits: Visits::default(),
+            focused: None,
             root_path: NodePath::new([PathSeg::Index(0)].into()),
             frame: Frame::default(),
             marks: Rc::default(),
@@ -706,25 +713,55 @@ impl LayoutTree {
         self.by_focus.len()
     }
 
-    /// The index in the frame of the node holding focus `id`.
-    pub(crate) fn focus_index(&self, id: FocusId) -> Option<usize> {
-        // A node not shown holds no focus ([`Frame::shown`]).
-        let holds = |i: usize| {
-            self.frame.shown(i)
-                && self
-                    .frame
-                    .behaviour(i)
-                    .and_then(|b| b.focus)
-                    .is_some_and(|f| f.id() == id)
+    /// Where the node holding focus `id` lies in the frame as laid out: its
+    /// index, path and layer. The one word on where focus is, as the walk
+    /// found it: what [`UiState::focus_at`] is taken from, and what a pass
+    /// is checked against ([`Self::focus_settled`]).
+    pub(crate) fn focus_location(&self, id: FocusId) -> Option<(usize, &NodePath, usize)> {
+        let e = self.by_focus.get(&id).and_then(|&u| self.extra(u))?;
+        let i = usize::try_from(e.index).ok()?;
+        self.frame
+            .nodes
+            .get(i)
+            .filter(|n| n.path == e.path)
+            .map(|n| (i, &n.path, n.layer))
+    }
+
+    /// Whether the last pass found the focused node where `state` (what it
+    /// was built over) says it is: if not, the flags it resolved are of the
+    /// place focus left, and another pass, over where it is, is due.
+    pub(crate) fn focus_settled(&self, state: &UiState) -> bool {
+        let found = state
+            .focused
+            .and_then(|id| self.focus_location(id))
+            .map(|(_, p, l)| (p, l));
+        found == state.focus_at.as_ref().map(|(p, l)| (p, *l))
+    }
+
+    /// Take where the walk found the focused node (as the tree just patched
+    /// left [`Self::by_focus`]) before the tree is placed. Moved, the scroll
+    /// containers above where it was and where it is are placed again: what
+    /// they tell their handles of the child holding focus depends on it.
+    fn find_focus(&mut self, state: &UiState) {
+        let now = state
+            .focused
+            .and_then(|f| self.by_focus.get(&f).copied())
+            .and_then(|u| self.extra(u).map(|e| (u, e.path.clone(), e.layer)));
+        let same = match (&self.focused, &now) {
+            (Some((p, l)), Some((_, q, m))) => p == q && l == m,
+            (None, None) => true,
+            _ => false,
         };
-        let placed = self
-            .by_focus
-            .get(&id)
-            .and_then(|&u| self.extra(u))
-            .and_then(|e| usize::try_from(e.index).ok())
-            .filter(|&i| holds(i));
-        // A node not placed in this frame yet (or no longer): the frame's own word.
-        placed.or_else(|| (0..self.frame.nodes.len()).find(|&i| holds(i)))
+        if same {
+            return;
+        }
+        if let Some((p, _)) = self.focused.take() {
+            self.mark_scrollers_at(&p);
+        }
+        if let Some((u, p, l)) = now {
+            self.mark_scrollers_above(u);
+            self.focused = Some((p, l));
+        }
     }
 
     /// Whether a node at `path` is in the tree.
@@ -890,6 +927,22 @@ impl LayoutTree {
                 return;
             }
         }
+    }
+
+    /// The scroll containers holding the node at `path`, or, gone, holding
+    /// where it was (its nearest ancestor still in the tree, itself one).
+    fn mark_scrollers_at(&mut self, path: &NodePath) {
+        let found = self.by_path.get(path).copied().or_else(|| {
+            (1..path.0.len()).rev().find_map(|len| {
+                let up = NodePath::new(path.0.get(..len).map(Into::into).unwrap_or_default());
+                self.by_path.get(&up).copied()
+            })
+        });
+        let Some(u) = found else { return };
+        if self.extra(u).is_some_and(|e| e.behaviour.scroll.is_some()) {
+            self.mark(u, need::PLACE);
+        }
+        self.mark_scrollers_above(u);
     }
 
     /// The scroll containers holding node `u` (focus within them moved).

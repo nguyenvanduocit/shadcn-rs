@@ -788,7 +788,7 @@ impl Runtime {
             kinds.insert(id, k);
         }
         let timing = Timing::new(device, queue);
-        let cold_check = cfg!(debug_assertions) && std::env::var_os("GUI_COLD_CHECK").is_some();
+        let cold_check = crate::app::cold_check_asked();
         Self {
             kinds,
             pipes,

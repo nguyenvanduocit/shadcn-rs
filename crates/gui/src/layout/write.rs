@@ -78,6 +78,7 @@ impl LayoutTree {
         if let Ok(mut f) = self.fields.try_borrow_mut() {
             f.clear();
         }
+        self.focused = None;
         self.motion_seen = 0;
         self.frame = Frame::default();
         self.seen = None;
@@ -146,6 +147,8 @@ impl LayoutTree {
             0,
             NO_SLOT,
         );
+        // Patched: where the walk found focus, for placing it.
+        self.find_focus(state);
         let mut write = if std::mem::take(&mut self.structure) || structure_before || frame.nodes.is_empty() {
             Write::All
         } else {
@@ -265,6 +268,7 @@ impl LayoutTree {
             else {
                 continue;
             };
+            self.find_focus(state);
             let placement = t.deferred.positioning;
             let part_at = match placement {
                 Positioning::Over { anchor_part, .. } => frame_bounds_by_key(&frame, &t.anchor, anchor_part),

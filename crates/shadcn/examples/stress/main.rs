@@ -436,7 +436,7 @@ fn run(args: &[String]) -> Result<bool, String> {
             "--cold needs a build with debug assertions: the cold check is compiled out without them".to_owned(),
         );
     }
-    if o.cold && std::env::var_os("GUI_COLD_CHECK").is_none_or(|v| v != "1") {
+    if o.cold && !gui::app::cold_check_asked() {
         return Err("--cold needs GUI_COLD_CHECK=1".to_owned());
     }
     // `threads` is no scene: ADR-0015's goals, on the app's own threads.
