@@ -667,29 +667,149 @@ pub struct Keyed<K: 'static, V: 'static> {
 
 /// What a [`Keyed`] remembers: not reactive state, since nothing reads it
 /// tracked (an answer for a key never changes while it is kept).
+#[derive(Clone)]
 struct Memo<K, V> {
-    map: HashMap<K, (V, u32)>,
+    map: HashMap<K, Entry<V>>,
     /// Map operations so far: the measure of the work, for tests.
     work: u64,
+    /// The next entry's generation: a hold is of one entry, not of a key.
+    next: u64,
+}
+
+/// An identity kept for a key, and who holds it.
+#[derive(Clone, Copy)]
+struct Entry<V> {
+    value: V,
+    holders: u32,
+    /// Which issue of the key's identity this is.
+    generation: u64,
+}
+
+impl<K: Eq + std::hash::Hash + Clone, V: Copy> Memo<K, V> {
+    /// `value` kept for `key` unless an identity is already kept for it
+    /// (an `issue` that asked for its own key): the one kept.
+    fn keep(&mut self, key: &K, value: V, holders: u32) -> Entry<V> {
+        if let Some(e) = self.map.get_mut(key) {
+            e.holders = e.holders.saturating_add(holders);
+            return *e;
+        }
+        let key = key.clone();
+        let generation = self.next;
+        self.next = self.next.saturating_add(1);
+        let e = Entry {
+            value,
+            holders,
+            generation,
+        };
+        self.map.insert(key, e);
+        e
+    }
+}
+
+/// A memo as the store holds it, its type erased.
+trait ErasedMemo {
+    fn as_any(&self) -> &dyn std::any::Any;
+    /// A copy a fork writes in place of the live memo.
+    fn fork_clone(&self) -> Rc<dyn ErasedMemo>;
+}
+
+impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> ErasedMemo for std::cell::RefCell<Memo<K, V>> {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn fork_clone(&self) -> Rc<dyn ErasedMemo> {
+        Rc::new(std::cell::RefCell::new(self.borrow().clone()))
+    }
 }
 
 /// The memos of every [`Keyed`] on the thread, by slot, each held by its
-/// scope's life: freed as the scope that made it ends. A memo is shared
-/// with a cold frame, which only reads it: every write of a memo is
-/// skipped in a cold frame, and a [`Keyed`] made there has no memo.
+/// scope's life: freed as the scope that made it ends. Forked by the cold
+/// check as the rest of the engine's state is: a memo a fork writes is
+/// copied first and the copy is the fork's alone, a [`Keyed`] made in a
+/// fork has its memo in the fork, and all of it is dropped with the fork.
+/// Nothing here runs user code (a key's or a value's `Drop`) under the
+/// store's borrow: what leaves is handed back to be dropped after.
 #[derive(Default)]
 struct Memos {
-    slots: Vec<(u32, Option<Rc<dyn std::any::Any>>)>,
+    slots: Vec<(u32, Option<Rc<dyn ErasedMemo>>)>,
     free: Vec<usize>,
+    fork: Option<MemoFork>,
+}
+
+/// What a fork of the store holds.
+struct MemoFork {
+    /// Live slots at `base` and beyond are the fork's own.
+    base: usize,
+    news: usize,
+    copies: HashMap<usize, (u32, Rc<dyn ErasedMemo>)>,
 }
 
 crate::engine::engine_local! {
-    [Shared("every write of a memo is skipped in a cold frame, which reads the live memo")]
-    static MEMOS: std::cell::RefCell<Memos> = std::cell::RefCell::new(Memos::default());
+    [Fork(log)] static MEMOS: std::cell::RefCell<Memos> = std::cell::RefCell::default();
+}
+
+/// How a write reaches a memo.
+enum Target {
+    Ready(Rc<dyn ErasedMemo>),
+    /// A live memo a fork has not copied yet.
+    Copy(Rc<dyn ErasedMemo>),
 }
 
 impl Memos {
-    fn put(&mut self, memo: Rc<dyn std::any::Any>) -> (usize, u32) {
+    /// The memo of `slot`, as the running frame sees it.
+    fn read(&self, slot: usize, generation: u32) -> Option<Rc<dyn ErasedMemo>> {
+        if let Some(f) = &self.fork {
+            if let Some((g, rc)) = f.copies.get(&slot) {
+                return (*g == generation).then(|| Rc::clone(rc));
+            }
+            if slot >= f.base {
+                return None;
+            }
+        }
+        let (g, memo) = self.slots.get(slot)?;
+        if *g == generation { memo.clone() } else { None }
+    }
+
+    fn target(&self, slot: usize, generation: u32) -> Option<Target> {
+        if let Some(f) = &self.fork
+            && let Some((g, rc)) = f.copies.get(&slot)
+        {
+            return (*g == generation).then(|| Target::Ready(Rc::clone(rc)));
+        }
+        let memo = self.read(slot, generation)?;
+        Some(if self.fork.is_some() {
+            Target::Copy(memo)
+        } else {
+            Target::Ready(memo)
+        })
+    }
+
+    /// The fork's copy of `slot`; `copy` too if one was made meanwhile
+    /// (to be dropped by the caller, outside the borrow).
+    fn install(
+        &mut self,
+        slot: usize,
+        generation: u32,
+        copy: Rc<dyn ErasedMemo>,
+    ) -> (Rc<dyn ErasedMemo>, Option<Rc<dyn ErasedMemo>>) {
+        let Some(f) = self.fork.as_mut() else {
+            return (copy, None);
+        };
+        if let Some((_, rc)) = f.copies.get(&slot) {
+            return (Rc::clone(rc), Some(copy));
+        }
+        f.copies.insert(slot, (generation, Rc::clone(&copy)));
+        (copy, None)
+    }
+
+    fn put(&mut self, memo: Rc<dyn ErasedMemo>) -> (usize, u32) {
+        if let Some(f) = self.fork.as_mut() {
+            let slot = f.base.saturating_add(f.news);
+            f.news = f.news.saturating_add(1);
+            f.copies.insert(slot, (0, memo));
+            return (slot, 0);
+        }
         if let Some(i) = self.free.pop()
             && let Some(s) = self.slots.get_mut(i)
         {
@@ -701,14 +821,41 @@ impl Memos {
         (i, 0)
     }
 
-    fn release(&mut self, i: usize, generation: u32) {
-        if let Some(s) = self.slots.get_mut(i)
-            && s.0 == generation
-            && s.1.take().is_some()
-        {
-            s.0 = s.0.wrapping_add(1);
-            self.free.push(i);
+    /// Free `slot`; the memo, to be dropped by the caller.
+    fn release(&mut self, slot: usize, generation: u32) -> Option<Rc<dyn ErasedMemo>> {
+        if let Some(f) = self.fork.as_mut() {
+            // A fork frees only what it made: a live memo is its scope's.
+            return match f.copies.get(&slot) {
+                Some((g, _)) if *g == generation && slot >= f.base => f.copies.remove(&slot).map(|(_, rc)| rc),
+                _ => None,
+            };
         }
+        let s = self.slots.get_mut(slot)?;
+        if s.0 != generation {
+            return None;
+        }
+        let memo = s.1.take()?;
+        s.0 = s.0.wrapping_add(1);
+        self.free.push(slot);
+        Some(memo)
+    }
+}
+
+impl crate::engine::Logged for Memos {
+    fn begin(&mut self) {
+        self.fork = Some(MemoFork {
+            base: self.slots.len(),
+            news: 0,
+            copies: HashMap::new(),
+        });
+    }
+
+    fn drain(&mut self) -> Box<dyn std::any::Any> {
+        Box::new(self.fork.as_mut().map(|f| std::mem::take(&mut f.copies)))
+    }
+
+    fn rollback(&mut self) -> Box<dyn std::any::Any> {
+        Box::new(self.fork.take().map(|f| f.copies))
     }
 }
 
@@ -728,28 +875,33 @@ impl<K: 'static, V: 'static> fmt::Debug for Keyed<K, V> {
 
 impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// None issued yet, owned by the running scope (made where its owner
-    /// is).
+    /// is), and freed with it. Made with no scope running it is never
+    /// freed: a debug build reports it.
     #[must_use]
     #[track_caller]
     #[expect(clippy::new_without_default, reason = "made where its owner is: no default one")]
     pub fn new() -> Self {
-        let dead = Self {
-            slot: usize::MAX,
-            generation: 0,
-            ty: std::marker::PhantomData,
-        };
-        // A cold frame's is thrown away with it, and a live memo is never
-        // written there: it has none, and asks as one that is gone.
-        if crate::component::is_cold_render() {
-            return dead;
-        }
-        let memo: Rc<dyn std::any::Any> = Rc::new(std::cell::RefCell::new(Memo::<K, V> {
+        let memo: Rc<dyn ErasedMemo> = Rc::new(std::cell::RefCell::new(Memo::<K, V> {
             map: HashMap::new(),
             work: 0,
+            next: 0,
         }));
         let (slot, generation) = MEMOS.with(|m| m.borrow_mut().put(memo));
-        if crate::reactive::has_owner() {
-            on_cleanup(move || MEMOS.with(|m| m.borrow_mut().release(slot, generation)));
+        // A fork frees what it made as it ends, and a cleanup it registers
+        // may run live, on an owner that outlives it.
+        if !crate::component::is_cold_render() {
+            if crate::reactive::has_owner() {
+                on_cleanup(move || {
+                    let freed = MEMOS.with(|m| m.borrow_mut().release(slot, generation));
+                    drop(freed);
+                });
+            } else {
+                #[cfg(debug_assertions)]
+                eprintln!(
+                    "gui: `Keyed::new` at {} has no scope running: its memo is never freed",
+                    std::panic::Location::caller()
+                );
+            }
         }
         Self {
             slot,
@@ -758,126 +910,154 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
         }
     }
 
-    /// Its memo, while its scope lives.
-    fn memo(self) -> Option<Rc<std::cell::RefCell<Memo<K, V>>>> {
-        let any = MEMOS.with(|m| {
-            let m = m.borrow();
-            let (generation, memo) = m.slots.get(self.slot)?;
-            (*generation == self.generation).then(|| memo.clone()).flatten()
-        })?;
-        any.downcast::<std::cell::RefCell<Memo<K, V>>>().ok()
+    /// The memo, as the running frame sees it, read by `f` (nothing of the
+    /// caller's runs in it).
+    fn read<R>(self, f: impl FnOnce(&Memo<K, V>) -> R) -> Option<R> {
+        let rc = MEMOS.with(|m| m.borrow().read(self.slot, self.generation))?;
+        let cell = rc.as_any().downcast_ref::<std::cell::RefCell<Memo<K, V>>>()?;
+        let memo = cell.borrow();
+        Some(f(&memo))
     }
 
-    /// Count `n` operations: never from a cold frame, which reads.
-    fn count(memo: &std::cell::RefCell<Memo<K, V>>, n: u64) {
+    /// The memo written by `f`; in a fork, its copy (made first). What `f`
+    /// takes out of the memo is handed back, to be dropped by the caller
+    /// with nothing borrowed.
+    fn write<R>(self, f: impl FnOnce(&mut Memo<K, V>) -> R) -> Option<R> {
+        let target = MEMOS.with(|m| m.borrow().target(self.slot, self.generation))?;
+        let rc = match target {
+            Target::Ready(rc) => rc,
+            Target::Copy(live) => {
+                let copy = live.fork_clone();
+                let (rc, spare) = MEMOS.with(|m| m.borrow_mut().install(self.slot, self.generation, copy));
+                drop(spare);
+                rc
+            }
+        };
+        let cell = rc.as_any().downcast_ref::<std::cell::RefCell<Memo<K, V>>>()?;
+        let mut memo = cell.borrow_mut();
+        Some(f(&mut memo))
+    }
+
+    /// Count `n` operations of the live frame: the measure of its work (a
+    /// fork reads, and does not copy a memo to count).
+    fn count(self, n: u64) {
         if !crate::component::is_cold_render() {
-            let mut m = memo.borrow_mut();
-            m.work = m.work.saturating_add(n);
+            self.write(|m| m.work = m.work.saturating_add(n));
         }
     }
 
     /// The identity of `key`: the one issued while it is kept, else a new
     /// one `issue` makes from the engine's counters. Asking again gives
     /// the same, so a render (a cold one included) that asks gives what
-    /// the live frame gave. A cold frame keeps none it issues: what it
-    /// made is thrown away with it.
+    /// the live frame gave. What a cold frame keeps is its own (a fork's),
+    /// and thrown away with it.
     pub fn get(self, key: &K, issue: impl FnOnce() -> V) -> V {
-        let Some(memo) = self.memo() else {
-            return issue();
-        };
         // One batch: what `issue` triggers runs once the identity is kept,
         // so an effect asking for the same key finds it and issues none.
-        crate::reactive::batch(|| {
-            Self::count(&memo, 1);
-            let kept = memo.borrow().map.get(key).map(|(v, _)| *v);
-            kept.unwrap_or_else(|| {
+        crate::reactive::batch(|| self.get_in_batch(key, issue))
+    }
+
+    fn get_in_batch(self, key: &K, issue: impl FnOnce() -> V) -> V {
+        self.count(1);
+        match self.read(|m| m.map.get(key).map(|e| e.value)) {
+            Some(Some(v)) => v,
+            Some(None) => {
                 let v = issue();
-                if !crate::component::is_cold_render() {
-                    memo.borrow_mut().map.insert(key.clone(), (v, 0));
-                }
-                v
-            })
-        })
+                self.write(|m| m.keep(key, v, 0).value).unwrap_or(v)
+            }
+            None => issue(),
+        }
     }
 
     /// The identity issued to `key` while it is kept, if any: asks for
     /// none, keeps none.
     pub fn peek(self, key: &K) -> Option<V> {
-        let memo = self.memo()?;
-        Self::count(&memo, 1);
-        let held = memo.borrow();
-        held.map.get(key).map(|(v, _)| *v)
+        self.count(1);
+        self.read(|m| m.map.get(key).map(|e| e.value)).flatten()
     }
 
     /// [`Self::get`], and `key` held by the calling scope until it ends (in
     /// a render, while that render's output may be on screen): let go as
     /// the last of its holders leaves. The hold and its release are the
     /// scope's in the step that publishes the key, before any other code
-    /// runs, so a scope a panic ends still lets go. A cold frame, or no
-    /// scope, holds nothing.
+    /// runs, so a scope a panic ends still lets go. A hold is of the
+    /// identity it was given, not of the key: after [`Self::retain`] let
+    /// the key go, the old holder's release touches the identity issued
+    /// since no more. A cold frame, or no scope, holds nothing (a cleanup
+    /// a cold frame registers may run live).
     #[track_caller]
     pub fn hold(self, key: &K, issue: impl FnOnce() -> V) -> V {
         if crate::component::is_cold_render() || !crate::reactive::has_owner() {
             return self.get(key, issue);
         }
-        let v = self.get(key, issue);
-        self.add(key, v, 1);
-        let key = key.clone();
-        on_cleanup(move || self.add(&key, v, -1));
-        v
+        // Issue, count the hold and install its release in one batch: what
+        // is flushed as it ends (an observer that panics) finds all three.
+        crate::reactive::batch(|| {
+            let v = self.get_in_batch(key, issue);
+            self.count(1);
+            if let Some(generation) = self.write(|m| m.keep(key, v, 1).generation) {
+                let key = key.clone();
+                on_cleanup(move || self.release_hold(&key, generation));
+            }
+            v
+        })
     }
 
-    /// One holder more (`1`) or fewer (`-1`) of `key`, issued `v`: kept
-    /// while it has one.
-    fn add(self, key: &K, v: V, by: i8) {
-        let Some(memo) = self.memo() else {
-            return;
-        };
-        // A cold frame never holds or lets go.
-        if crate::component::is_cold_render() {
-            return;
-        }
-        Self::count(&memo, 1);
-        let mut memo = memo.borrow_mut();
-        let m = &mut memo.map;
-        if by > 0 {
-            let e = m.entry(key.clone()).or_insert((v, 0));
-            e.1 = e.1.saturating_add(1);
-        } else if let Some(e) = m.get_mut(key) {
-            e.1 = e.1.saturating_sub(1);
-            if e.1 == 0 {
-                m.remove(key);
-            }
-        }
+    /// One holder fewer of the identity of `key` issued as `generation`:
+    /// kept while it has one; none if that identity is gone.
+    fn release_hold(self, key: &K, generation: u64) {
+        self.count(1);
+        let gone = self
+            .write(|m| match m.map.get_mut(key) {
+                Some(e) if e.generation == generation => {
+                    e.holders = e.holders.saturating_sub(1);
+                    if e.holders == 0 { m.map.remove_entry(key) } else { None }
+                }
+                _ => None,
+            })
+            .flatten();
+        drop(gone);
     }
 
     /// Let go of each key `keep` refuses: asked for again, it is issued a
     /// new identity. `keep` must not ask this map.
     pub fn retain(self, mut keep: impl FnMut(&K, &V) -> bool) {
-        let Some(memo) = self.memo() else {
-            return;
-        };
-        // A cold frame lets go of none of the live frame's.
-        if crate::component::is_cold_render() {
-            return;
-        }
         // `keep` runs with nothing borrowed (it may trigger what reads this
-        // map); what it refused is taken out after.
+        // map); what it refused is taken out after, and dropped after that.
         crate::reactive::batch(|| {
-            let held: Vec<(K, V)> = memo.borrow().map.iter().map(|(k, (v, _))| (k.clone(), *v)).collect();
-            Self::count(&memo, u64::try_from(held.len()).unwrap_or(u64::MAX));
-            let refused: Vec<K> = held.into_iter().filter(|(k, v)| !keep(k, v)).map(|(k, _)| k).collect();
-            let mut memo = memo.borrow_mut();
-            for k in &refused {
-                memo.map.remove(k);
-            }
+            let Some(held) = self.read(|m| {
+                m.map
+                    .iter()
+                    .map(|(k, e)| (k.clone(), e.value, e.generation))
+                    .collect::<Vec<_>>()
+            }) else {
+                return;
+            };
+            self.count(u64::try_from(held.len()).unwrap_or(u64::MAX));
+            let refused: Vec<(K, u64)> = held
+                .into_iter()
+                .filter(|(k, v, _)| !keep(k, v))
+                .map(|(k, _, g)| (k, g))
+                .collect();
+            // Only the identities it was shown: one issued since stays.
+            let gone = self.write(|m| {
+                refused
+                    .iter()
+                    .filter_map(|(k, g)| {
+                        let same = m.map.get(k).is_some_and(|e| e.generation == *g);
+                        if same { m.map.remove_entry(k) } else { None }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            drop(gone);
+            drop(refused);
         });
     }
 
     /// How many keys it holds an identity for.
     #[must_use]
     pub fn len(self) -> usize {
-        self.memo().map_or(0, |m| m.borrow().map.len())
+        self.read(|m| m.map.len()).unwrap_or(0)
     }
 
     /// Whether it holds none.
@@ -889,7 +1069,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// The map operations done so far: the measure of its work.
     #[must_use]
     pub fn work(self) -> u64 {
-        self.memo().map_or(0, |m| m.borrow().work)
+        self.read(|m| m.work).unwrap_or(0)
     }
 }
 
@@ -923,27 +1103,126 @@ mod tests {
         assert_eq!(count.get(), 1, "neither ran");
     }
 
-    /// A cold frame reads a live memo and changes none of it: peeking or
-    /// asking counts no work, `retain` lets go of nothing, a key it asks
-    /// for that is not kept is issued but not kept, and a `Keyed` made
-    /// there has no memo.
+    /// A cold frame writes a copy of a live memo and the copy goes with the
+    /// frame: what it asks for it keeps for itself (two asks of one key in
+    /// the frame share an identity, as live ones do), `retain` lets go of
+    /// nothing live, work is counted live only, and a `Keyed` made there
+    /// has its memo in the frame.
     #[test]
-    fn a_cold_frame_reads_a_keyed_memo_and_never_writes_it() {
+    fn a_cold_frame_writes_a_copy_of_a_keyed_memo_and_the_live_one_is_untouched() {
         let owner = Scope::new();
         let keyed: Keyed<&'static str, u32> = owner.run(Keyed::new);
         assert_eq!(keyed.get(&"a", || 1), 1);
         let work = keyed.work();
+        let issued = Cell::new(0_u32);
         let cold = crate::engine::ColdFrame::begin();
         assert_eq!(keyed.peek(&"a"), Some(1), "it reads the live memo");
-        assert_eq!(keyed.get(&"b", || 2), 2, "a miss is issued...");
-        keyed.retain(|_, _| false);
+        let ask = || {
+            keyed.get(&"b", || {
+                issued.set(issued.get() + 1);
+                20 + issued.get()
+            })
+        };
+        assert_eq!((ask(), ask()), (21, 21), "one identity for the key in the frame");
+        assert_eq!(issued.get(), 1);
+        keyed.retain(|k, _| *k == "b");
+        assert_eq!(keyed.peek(&"a"), None, "the frame's copy let it go");
         let made: Keyed<&'static str, u32> = Scope::new().run(Keyed::new);
         assert_eq!(made.get(&"x", || 7), 7);
-        assert_eq!(made.len(), 0, "a Keyed made in a cold frame keeps none");
+        assert_eq!(made.len(), 1, "a Keyed made in a cold frame keeps its own");
         drop(cold);
         assert_eq!(keyed.work(), work, "no work counted from the cold frame");
-        assert_eq!(keyed.peek(&"a"), Some(1), "a cold retain let go of nothing");
-        assert_eq!(keyed.peek(&"b"), None, "...and not kept");
+        assert_eq!(keyed.peek(&"a"), Some(1), "the live memo kept what the frame let go");
+        assert_eq!(keyed.peek(&"b"), None, "and has none of what the frame asked for");
+        assert_eq!(made.len(), 0, "what the frame made is gone with it");
+        owner.dispose();
+    }
+
+    /// A key whose `Drop` asks another `Keyed` does not panic as a scope
+    /// frees a memo, lets a hold go or retains: no memo or store is
+    /// borrowed while it drops.
+    #[test]
+    fn a_keys_drop_that_asks_another_keyed_does_not_panic_in_cleanup() {
+        #[derive(Clone)]
+        struct Probe(u32, Keyed<u32, u32>);
+        impl PartialEq for Probe {
+            fn eq(&self, o: &Self) -> bool {
+                self.0 == o.0
+            }
+        }
+        impl Eq for Probe {}
+        impl std::hash::Hash for Probe {
+            fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+                self.0.hash(h);
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                std::hint::black_box(self.1.len());
+            }
+        }
+        let owner = Scope::new();
+        let other: Keyed<u32, u32> = owner.run(Keyed::new);
+        let probes: Keyed<Probe, u32> = owner.run(Keyed::new);
+        let part = Scope::new();
+        part.run(|| probes.hold(&Probe(1, other), || 1));
+        probes.get(&Probe(2, other), || 2);
+        probes.retain(|k, _| k.0 != 2);
+        part.dispose();
+        assert_eq!(probes.len(), 0);
+        let scoped = Scope::new();
+        scoped.run(|| {
+            let inner: Keyed<Probe, u32> = Keyed::new();
+            inner.get(&Probe(3, other), || 3);
+        });
+        scoped.dispose();
+        owner.dispose();
+    }
+
+    /// A hold is of the identity it was given: after `retain` let the key
+    /// go and another scope held the identity issued since, the first
+    /// scope ending takes nothing from it.
+    #[test]
+    fn a_hold_released_after_retain_leaves_the_identity_issued_since() {
+        let owner = Scope::new();
+        let keyed: Keyed<&'static str, u32> = owner.run(Keyed::new);
+        let (a, b) = (Scope::new(), Scope::new());
+        assert_eq!(a.run(|| keyed.hold(&"k", || 1)), 1);
+        keyed.retain(|_, _| false);
+        assert_eq!(keyed.peek(&"k"), None);
+        assert_eq!(b.run(|| keyed.hold(&"k", || 2)), 2, "a new identity");
+        a.dispose();
+        assert_eq!(keyed.peek(&"k"), Some(2), "a's release did not touch b's identity");
+        b.dispose();
+        assert_eq!(keyed.peek(&"k"), None, "b's release lets it go");
+        owner.dispose();
+    }
+
+    /// `hold` counts the hold and installs its release before what the
+    /// batch flushes runs: an observer that panics leaves a hold its scope
+    /// still releases.
+    #[test]
+    fn a_hold_whose_flush_panics_still_has_its_release() {
+        let owner = Scope::new();
+        let keyed: Keyed<&'static str, u32> = owner.run(Keyed::new);
+        let poke = Signal::new(0_u32);
+        owner.run(|| {
+            Effect::new(move || {
+                assert!(poke.get() == 0, "an observer that panics");
+            });
+        });
+        let part = Scope::new();
+        let held = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            part.run(|| {
+                keyed.hold(&"k", || {
+                    poke.set(1);
+                    5
+                })
+            })
+        }));
+        assert!(held.is_err(), "the observer's panic came out of the flush");
+        part.dispose();
+        assert_eq!(keyed.len(), 0, "the scope's end released the hold");
         owner.dispose();
     }
 

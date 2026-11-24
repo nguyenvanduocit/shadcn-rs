@@ -719,6 +719,23 @@ fn scenario(f: impl Fn() -> Element + 'static) -> Scenario {
     s
 }
 
+/// Every Scenario starts on the fixed default day, whatever an earlier one
+/// on the thread did to the clock: `today()` names the same day in each,
+/// and moves with a scenario's own clock.
+#[test]
+fn every_scenario_starts_on_the_fixed_day_and_moves_with_its_own_clock() {
+    let mut first = scenario(|| div().into_element());
+    let fixed = CalendarDate::today();
+    first.wait(std::time::Duration::from_secs(3 * 86_400));
+    assert_eq!(fixed.days_until(CalendarDate::today()), 3, "three days on in the first");
+    let _second = scenario(|| div().into_element());
+    assert_eq!(
+        CalendarDate::today(),
+        fixed,
+        "the next scenario starts from the default day again"
+    );
+}
+
 #[test]
 fn a_calendar_in_a_window_one_tab_stop_and_what_a_screen_reader_is_told() {
     let made = Rc::new(Cell::new(None::<Single>));

@@ -2140,9 +2140,13 @@ fn the_click_a_toast_swipe_ends_with_presses_nothing_once() {
     assert_eq!(t.with(<[_]>::len), 1, "short of 50 px it slides back");
     assert_eq!(acted.get(), 0, "the click the swipe ends with presses nothing");
     // That was the one click it swallowed, and the handler cleared the
-    // latch as it did: the next click presses (a latch left set would
-    // swallow this one too).
-    click(&mut s, (500.0, 420.0));
+    // latch as it did. Pressed from the keyboard, so that no pointer press
+    // clears the latch first (a press starts a drag, which does), the
+    // action runs: a latch left set would swallow this activation too.
+    plain(&mut s, NamedKey::F8);
+    plain(&mut s, NamedKey::Tab);
+    plain(&mut s, NamedKey::Tab);
+    plain(&mut s, NamedKey::Enter);
     assert_eq!(acted.get(), 1, "the latch was cleared by the click it swallowed");
     assert_eq!(t.with(<[_]>::len), 0, "and the action closes the toast");
 }

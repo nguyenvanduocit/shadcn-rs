@@ -194,7 +194,7 @@ impl Scheduler {
     #[must_use]
     pub fn new(seed: u64) -> Self {
         clock::cancel_all();
-        clock::script(Duration::ZERO);
+        clock::script_fresh(Duration::ZERO);
         Self {
             seed,
             rng: Rng::new(seed),
