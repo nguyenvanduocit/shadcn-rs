@@ -2,7 +2,7 @@
 
 Status: accepted under delegation 2026-11-25 (wave C (a), round 9); built; amended in round 10 (the switch follows
 "the compositor can scroll", ordered clamped commit, the log records where each input is taken, real-surface
-numbers). Supersedes I1, the input half of I2,
+numbers); narrowed the deep-position claim to virtual lists (round 14, Codex 2). Supersedes I1, the input half of I2,
 the residual race and the replay text of [ADR-0032](0032-scroll-is-ordered-by-what-the-ui-has-seen.md). I3–I7 of
 0032 stand, with I4's mount identity made exact below. Amends the input path of
 [ADR-0015](0015-gui-runs-on-three-threads-timed-by-presentation.md).
@@ -168,7 +168,11 @@ within 16 ms.
 `RECOVERY_WINDOW`, the thread diverts for good, under its own catch, then sends `FromRender::Failed`. The UI clears
 any latch on its way back, and the platform reports the failure and marks the app's exit code. Nothing quits: no
 send goes to a dead channel, since the switch sends everything straight to the UI, and the window keeps its last
-frame and takes input until it is closed (`ToPlatform::RenderFailed`; `ToPlatform::Quit` is gone).
+frame and takes input until it is closed (`ToPlatform::RenderFailed`; `ToPlatform::Quit` is gone). Nothing waits
+for a grant after it either (round 15, Codex r14 1: a move with the button held waited for a `Begin` that never
+came, as did the frame asked before the failure): the UI runs its own frames on its own tick, one display interval
+apart (`window::OwnFrames`), where held moves are resampled and what input changed is laid out and committed, and the
+frame it had asked for runs first (`past_the_last_recovery_a_drag_a_key_and_a_wheel_go_on_with_no_grant`).
 
 **One owner of a gesture's latch** (round 12, Codex 1). A gesture is latched on one side at a time, and the latch
 moves with the route, as a token does. Diverting, the compositor hands its latch to the UI and ends its own
@@ -217,8 +221,22 @@ speed (`Fling::lasts`), not when a frame finds it slow, so it ends at the same u
 (`a_fling_ends_at_the_same_place_whatever_its_frames`, failed 294.71 against 295.25). Jumps (`scroll_to`, a reveal)
 and range ends come from layout in f32 and land on the nearest unit (a jump to 0.1 px is at 0.1000003814); motion
 from there is exact. Chrome differs here: its scroll offsets are floats (`gfx::PointF`, snapped to physical pixels
-for paint), so the same divergence of summed cuts is open there, and an offset past 2^24 px loses whole pixels. Ours
-is a deliberate improvement, not a port: positions are exact to 2^-20 px up to 2^43 px.
+for paint), so the same divergence of summed cuts is open there, and an offset past 2^24 px loses whole pixels; its
+layout positions are `LayoutUnit` (1/64 px in an `int32`), capped near 33,554,431 px. Ours is a deliberate
+improvement, not a port, in the motion account: every scroll position and piece of motion is exact to 2^-20 px up to
+2^43 px. What is drawn from it is exact as far as content is positioned relative to a nearby origin. A virtual list
+positions its rows from its window's own origin (`list/virtual_list.rs`, `compute_at`), so its content is drawn
+exactly at any position the account holds. A plain scroll container is not yet: layout places its content at
+absolute window positions in f32 (`layout/place.rs`), the compositor adds the offset in f32 (`compose.rs`), and the
+shader covers pixels at absolute window coordinates (`common.wgsl`, `rrect_cov`), so its content is placed and drawn
+exactly only below 2^22 device px of depth (2,097,152 px at a scale of 2), pinned by
+`a_plain_container_is_exact_to_its_stated_depth`. Past 2^23 device px content is not drawn, and at 36,000,000 px a
+1 px step does not move it (Codex r14 2). The property-tree transform entry of ADR-0016 ("an offset in window
+pixels") is the broken invariant; ledger entry P12, after L2, owns making transforms parent-relative and exact with
+f32 only at the GPU boundary, and L2 keeps layout's offsets parent-relative so that it can.
+
+*Revisit* when P12 lands (the plain-container bound is then raised to that of the motion account, checked at
+36,000,000 px and 2^30 px), or when a target workload needs a plain container deeper than 2^22 device px before then.
 
 Order holds in both directions: what was sent before the switch reaches the UI before anything sent after it, since
 both reach the UI's one queue in the lock's order. While diverted, the UI is the only party that scrolls, so taking

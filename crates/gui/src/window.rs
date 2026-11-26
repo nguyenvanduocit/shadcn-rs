@@ -28,7 +28,7 @@ pub use decoration::{Chrome, Edge, WindowAction};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -485,7 +485,50 @@ fn track_pointer(presented: &crate::compositor::OnScreen, input: &Input) {
     }
 }
 
-/// The UI thread's loop: run frames when granted, input as it arrives,
+/// The UI's own frame clock, past the render thread's last recovery
+/// ([`FromRender::Failed`], ADR-0033): no frame is granted any more, so
+/// nothing the UI does waits for a grant. A frame it wants runs on its own
+/// tick, one display interval after the last, as granted ones did: the
+/// moves of a held button are resampled there, and what input changed
+/// (a wheel's scroll, a key's edit) is laid out and committed there.
+struct OwnFrames {
+    /// The display's interval, as the last grant gave it.
+    interval: Duration,
+    /// When the last of its frames ran.
+    last: Option<Instant>,
+    /// When the frame it wants runs.
+    due: Option<Instant>,
+}
+
+impl OwnFrames {
+    /// A frame is wanted: it runs a display interval after the last one,
+    /// and at once when none ran for as long.
+    fn ask(&mut self, now: Instant) {
+        let next = self.last.and_then(|l| l.checked_add(self.interval)).unwrap_or(now);
+        self.due = Some(next.max(now));
+    }
+
+    /// Whether a frame is due by `now`.
+    fn is_due(&self, now: Instant) -> bool {
+        self.due.is_some_and(|due| due <= now)
+    }
+
+    /// The frame due by `now`, if one is: a token for a frame shown an
+    /// interval on, as a grant predicts its present time.
+    fn begin(&mut self, now: Instant) -> Option<MainFrame> {
+        if !self.is_due(now) {
+            return None;
+        }
+        self.due = None;
+        self.last = Some(now);
+        let mut token = MainFrame::at(clock::nanos(now.checked_add(self.interval).unwrap_or(now)));
+        token.interval = self.interval;
+        Some(token)
+    }
+}
+
+/// The UI thread's loop: run frames when granted (past the render thread's
+/// last recovery, on its own tick, [`OwnFrames`]), input as it arrives,
 /// timers and mail when due, and say what the platform must show.
 pub(crate) fn ui_loop(
     handler: &mut dyn WindowHandler,
@@ -505,6 +548,10 @@ pub(crate) fn ui_loop(
     // ([`FromRender::Returned`]), and the input held until it is.
     let mut returning = false;
     let mut held_back: std::collections::VecDeque<ToUi> = std::collections::VecDeque::new();
+    // The display's interval, as the last grant gave it, and the UI's own
+    // frame clock once the render thread gave up.
+    let mut interval = Duration::from_micros(16_667);
+    let mut own: Option<OwnFrames> = None;
     let mut cursor = None;
     // Input carries the number of the frame it came under; it is looked
     // up on the timeline only as it is handled, so nothing waiting in the
@@ -551,15 +598,36 @@ pub(crate) fn ui_loop(
         follow(handler, edge, &mut cursor, &mut ime);
         wants |= wake.redraw || wake.animating;
         if wants && !asked && size.0 > 0 && size.1 > 0 {
-            link.tx.send(ToRender::NeedsFrame).ok();
+            match &mut own {
+                Some(own) => own.ask(Instant::now()),
+                None => {
+                    link.tx.send(ToRender::NeedsFrame).ok();
+                }
+            }
             asked = true;
         }
         // The one queue, in the order the render thread handed things on
-        // (ADR-0033); what was held for the UI's latch first, once back.
+        // (ADR-0033); what was held for the UI's latch first, once back;
+        // past the render thread's last recovery, its own frame when due,
+        // ordered with the queue as a grant is: after what is queued
+        // already, so a frame longer than an interval that asks for the
+        // next does not keep the input waiting (Opus and Codex r16).
         let msg = if !returning && let Some(m) = held_back.pop_front() {
             m
+        } else if let Some(o) = own.as_mut()
+            && o.is_due(Instant::now())
+        {
+            match rx.try_recv() {
+                Ok(m) => m,
+                Err(TryRecvError::Disconnected) => return,
+                Err(TryRecvError::Empty) => match o.begin(Instant::now()) {
+                    Some(token) => ToUi::Render(FromRender::Begin(token)),
+                    None => continue,
+                },
+            }
         } else {
-            match wake.next_timer {
+            let due = own.as_ref().and_then(|o| o.due);
+            match wake.next_timer.into_iter().chain(due).min() {
                 Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
                     Ok(m) => m,
                     Err(RecvTimeoutError::Timeout) => continue,
@@ -632,6 +700,7 @@ pub(crate) fn ui_loop(
             ToUi::Render(FromRender::Begin(token)) => {
                 asked = false;
                 wants = false;
+                interval = token.interval;
                 if let Some(due) = held.sample(token.present_at) {
                     send_move(handler, due);
                 }
@@ -702,9 +771,17 @@ pub(crate) fn ui_loop(
             // The render thread gave up: the UI stays, the one owner of
             // input from now on, taking it straight (ADR-0033, Codex r13
             // 2); the window keeps the last frame it showed. Its latch is
-            // its own: none is on its way back any more.
+            // its own: none is on its way back any more. No frame is granted
+            // any more either: it runs its own ([`OwnFrames`]), the one it
+            // asked for and that never comes (moves held for it) first.
             ToUi::Render(FromRender::Failed(why)) => {
                 returning = false;
+                own = Some(OwnFrames {
+                    interval,
+                    last: None,
+                    due: None,
+                });
+                wants |= std::mem::take(&mut asked);
                 platform(ToPlatform::RenderFailed(why));
             }
             // In order with the input around it: the moves held before it

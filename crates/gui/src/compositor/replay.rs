@@ -2478,29 +2478,23 @@ fn a_faulted_page(
 ) -> impl FnOnce() -> Box<dyn Fn() -> crate::Element> + Send + 'static {
     move || {
         let (inner, outer, fine) = (ScrollHandle::new(), ScrollHandle::new(), ScrollHandle::new());
-        // Each click builds the page again, a scope of its own with it, and
-        // disposes the scope before: the mailbox that one made is let go
+        // Each click builds the page again, and makes a scope of its own,
+        // disposing the one before: the mailbox that one made is let go
         // of, its handler (holding `mail`) with it, at once, with no
         // delivery to it (decision 5; `mail_kept` counts what is not).
+        // The click does it, not the build: a build changes app heap only
+        // through signals (ADR-0034, the render-purity contract), as a
+        // cold check builds it again in a world of its own, which a scope
+        // kept here and swapped by the build would leak out of.
         let clicks = crate::reactive::Signal::new(0_u32);
-        let scope: std::cell::RefCell<Option<crate::Scope>> = std::cell::RefCell::default();
+        let scope: std::rc::Rc<std::cell::RefCell<Option<crate::Scope>>> = std::rc::Rc::default();
         Box::new(move || {
             let note = |c: &std::sync::Arc<std::sync::Mutex<Vec<String>>>, s: String| {
                 c.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(s);
             };
             let built = clicks.get();
-            if let Some(before) = scope.borrow_mut().take() {
-                before.dispose();
-            }
-            let now = crate::Scope::new();
-            let held = std::sync::Arc::clone(&mail);
-            let sender = now.run(|| {
-                crate::mailbox::mailbox(move |(): ()| {
-                    std::hint::black_box(&held);
-                })
-            });
-            *scope.borrow_mut() = Some(now);
-            drop(sender);
+            // Weak: only a mailbox's handler holds `mail`, not the builds.
+            let (scope, mail) = (std::rc::Rc::clone(&scope), std::sync::Arc::downgrade(&mail));
             let (click, drag, wheel) = (calls.clone(), calls.clone(), calls.clone());
             div()
                 .width(300.0)
@@ -2514,6 +2508,18 @@ fn a_faulted_page(
                             fine.offset()
                         ),
                     );
+                    if let Some(before) = scope.borrow_mut().take() {
+                        before.dispose();
+                    }
+                    let now = crate::Scope::new();
+                    let held = mail.upgrade();
+                    let sender = now.run(|| {
+                        crate::mailbox::mailbox(move |(): ()| {
+                            std::hint::black_box(&held);
+                        })
+                    });
+                    *scope.borrow_mut() = Some(now);
+                    drop(sender);
                     clicks.set(built.saturating_add(1));
                 }))
                 // Steps finer than motion's unit, whose exact sum the
@@ -2832,9 +2838,9 @@ fn run_faulted(faults: &[(usize, Fault)], tag: usize) -> Option<Faulted> {
         takes.extend(w.take_input_latencies().into_iter().map(|(_, d)| d));
         hops.extend(w.take_forward_latencies().into_iter().map(|(_, d)| d));
     }
-    // The page built again by its clicks: only the last build's mailbox
-    // holds `mail`, beside this and the page's own closure, once the UI
-    // has let the others go.
+    // A scope made by each click: only the last click's mailbox holds
+    // `mail`, beside this and the page's own closure, once the UI has let
+    // the others go.
     let start = Instant::now();
     while Arc::strong_count(&mail) > 3 && start.elapsed() < Duration::from_secs(2) {
         std::thread::sleep(Duration::from_millis(5));
@@ -3021,7 +3027,7 @@ fn a_fault_before_any_input_loses_and_moves_no_wheel_and_replays() {
     replay_faulted(&clean).unwrap_or_else(|e| panic!("the run with no fault: {e}\n{}", clean.text));
     assert_eq!(
         clean.mail_kept, 0,
-        "the run with no fault kept disposed builds' mailboxes"
+        "the run with no fault kept disposed scopes' mailboxes"
     );
     // The fine list at the steps' exact sum: the other runs must hear
     // what this one heard, so they are held to it too.
@@ -3143,7 +3149,7 @@ fn a_fault_before_any_input_loses_and_moves_no_wheel_and_replays() {
                         why.push("past the last recovery, the handlers heard nothing".to_owned());
                     }
                     if run.mail_kept > 0 {
-                        why.push(format!("{} mailboxes of disposed builds kept", run.mail_kept));
+                        why.push(format!("{} mailboxes of disposed scopes kept", run.mail_kept));
                     }
                     if let Err(e) = replay_faulted(&run) {
                         why.push(format!("replay: {e}"));

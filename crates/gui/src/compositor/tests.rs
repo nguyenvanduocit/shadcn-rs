@@ -5323,6 +5323,89 @@ fn deep_in_a_long_list_every_step_moves_it_whatever_the_frames() {
     assert_eq!(run(false), 36_000_040.0);
 }
 
+/// ADR-0033 (round 14, Codex 2; the architect's D002): a plain scroll
+/// container, its content placed at absolute window positions in f32, is
+/// exact to the depth the ADR states, 2^22 device px. A marker just above
+/// it, at a scale of 1 and 2, is drawn where it belongs, each wheel step
+/// of 1 logical px (2 device px at a scale of 2) moves it as much on
+/// screen, and where the compositor shows the
+/// container equals where the UI lays it out, each frame checked against
+/// a cold build. Deeper is ledger entry P12's (36,000,000 px and 2^30 px).
+#[test]
+fn a_plain_container_is_exact_to_its_stated_depth() {
+    use crate::convert::u32_to_f32;
+    // 2^22 device px.
+    const DEPTH: f32 = 4_194_304.0;
+    for scale in [1.0_f32, 2.0] {
+        let marker = DEPTH / scale - 40.0;
+        let start = marker - 30.0;
+        let h = crate::ScrollHandle::new();
+        let mut s = Scenario::measuring(
+            move || {
+                div()
+                    .width(100.0)
+                    .height(100.0)
+                    .overflow_y(Overflow::Scroll)
+                    .track_scroll(&h)
+                    .child(div().height(marker))
+                    .child(div().height(10.0).background(Color::hex(0xff0000)))
+                    .child(div().height(200.0))
+                    .into_element()
+            },
+            100,
+            100,
+            scale,
+        )
+        .expect("a scenario");
+        s.check_cold(true);
+        s.settle().expect("a frame");
+        s.act("jump", || h.scroll_to((0.0, start)));
+        s.settle().expect("a frame");
+        // The marker's top row on screen, in logical px from the
+        // container's top, as read back.
+        let column = crate::text::physical(50.0, scale);
+        let drawn_at = |s: &mut Scenario| {
+            let p = s.shot(false).expect("a read back");
+            (0..p.height())
+                .find(|&y| {
+                    p.straight(column, y)
+                        .is_some_and(|[r, g, b, _]| r > 200 && g < 60 && b < 60)
+                })
+                .map(|y| u32_to_f32(y) / scale)
+        };
+        let shown = |s: &Scenario| s.presented().scroll.first().map_or(f32::NAN, |l| l.offset.1);
+        assert_eq!((h.offset().1, shown(&s)), (start, start), "scale {scale}: the jump");
+        assert_eq!(drawn_at(&mut s), Some(30.0), "scale {scale}: the marker is drawn");
+        for k in 1..=10_u8 {
+            let at = 10.0 + 2.0 * f32::from(k);
+            assert!(
+                s.compositor_wheel((50.0, 50.0), (0.0, 1.0), at),
+                "scale {scale}: step {k} scrolls"
+            );
+            let want = start + f32::from(k);
+            assert_eq!(shown(&s), want, "scale {scale}: step {k} shown");
+            assert_eq!(
+                drawn_at(&mut s),
+                Some(30.0 - f32::from(k)),
+                "scale {scale}: step {k} moves the marker 1 px, as the compositor draws it"
+            );
+            // The UI takes it in and lays it out: the same place, checked
+            // against a cold build.
+            s.settle().expect("a frame");
+            assert_eq!(
+                (h.offset().1, shown(&s)),
+                (want, want),
+                "scale {scale}: step {k}, UI = shown"
+            );
+            assert_eq!(
+                drawn_at(&mut s),
+                Some(30.0 - f32::from(k)),
+                "scale {scale}: step {k}, as the UI lays it out"
+            );
+        }
+    }
+}
+
 /// Codex r13 4: from a jump to 0.1 px (which lands on the grid, the
 /// nearest unit), a gesture out and back settles exactly where the jump
 /// put it whether a frame fell between its steps or not (failed:
@@ -5422,7 +5505,9 @@ fn past_the_last_recovery_a_drag_a_key_and_a_wheel_go_on_with_no_grant() {
         eprintln!("no GPU: skipped");
         return;
     };
-    assert!(wait_for(|_| w.presented().frame > 0), "a first frame");
+    // The page on screen (a frame before the UI's first commit shows
+    // nothing to hit).
+    assert!(wait_for(|_| w.presented().commit > 0), "the page's first frame");
     for _ in 0..4 {
         w.panic_render();
     }
@@ -5464,6 +5549,164 @@ fn past_the_last_recovery_a_drag_a_key_and_a_wheel_go_on_with_no_grant() {
     assert!(
         matches!(click, Some(Heard::Click(y)) if y > 0.0),
         "the wheel scrolled, laid out on the UI's frames: {click:?}"
+    );
+}
+
+/// A page past the render thread's last recovery whose frames cost
+/// `cost` and that always wants the next one (animating, a clock timer
+/// every millisecond): it says when a frame starts and what input it hears.
+struct SlowFrames {
+    cost: Duration,
+    slow: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    started: std::sync::mpsc::Sender<()>,
+    heard: std::sync::mpsc::Sender<crate::window::Input>,
+}
+
+impl crate::window::WindowHandler for SlowFrames {
+    fn frame(&mut self, _: &mut dyn Compose, _: MainFrame, _: (u32, u32), _: f32) {
+        if self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+            self.started.send(()).ok();
+            std::thread::sleep(self.cost);
+        }
+    }
+    fn idle(&mut self, _: &mut dyn Compose) -> crate::window::Wake {
+        let slow = self.slow.load(std::sync::atomic::Ordering::SeqCst);
+        crate::window::Wake {
+            animating: slow,
+            next_timer: slow
+                .then(|| Instant::now().checked_add(Duration::from_millis(1)))
+                .flatten(),
+            ..crate::window::Wake::default()
+        }
+    }
+    fn input(&mut self, input: crate::window::Input, _: &Shown) -> bool {
+        self.heard.send(input).ok();
+        true
+    }
+    fn take_scroll(&mut self, _: Pulled) -> bool {
+        false
+    }
+    fn take_gesture(&mut self, _: HandedGesture) {}
+    fn cursor(&self) -> crate::style::Cursor {
+        crate::style::Cursor::Default
+    }
+    fn ime_target(&mut self) -> Option<crate::interact::ImeTarget> {
+        None
+    }
+    fn access_update(&mut self, _: f32, _: &str) -> accesskit::TreeUpdate {
+        unreachable!("no screen reader connects")
+    }
+    fn access_reset(&mut self) {}
+    fn focused(&mut self) -> bool {
+        false
+    }
+    fn renderer_lost(&mut self) {}
+    fn chrome(&mut self, _: crate::window::Chrome) -> bool {
+        false
+    }
+    fn window_actions(&mut self) -> Vec<crate::window::WindowAction> {
+        Vec::new()
+    }
+}
+
+/// Past the render thread's last recovery, a page whose frames cost
+/// `cost` and that animates on a 1 ms clock: its own frames running, then
+/// `send`, and whether the page heard `want` within `within` (and how many
+/// frames started meanwhile).
+fn heard_past_slow_frames(cost: Duration, send: crate::window::Input, within: Duration) -> Option<(bool, usize)> {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    use std::sync::{Arc, mpsc};
+    let slow = Arc::new(AtomicBool::new(false));
+    let (started, starts) = mpsc::channel();
+    let (heard, hears) = mpsc::channel();
+    let page = SlowFrames {
+        cost,
+        slow: Arc::clone(&slow),
+        started,
+        heard,
+    };
+    let Ok(mut w) = crate::window::Offscreen::start(move || Box::new(page), (100, 100), 1.0, Duration::from_millis(8))
+    else {
+        eprintln!("no GPU: skipped");
+        return None;
+    };
+    for _ in 0..4 {
+        w.panic_render();
+    }
+    assert!(wait_for(|_| !w.through()), "input goes straight to the UI");
+    drop(w.capture_within(Duration::from_secs(5)));
+    slow.store(true, SeqCst);
+    // A frame is wanted: the first of the UI's own, slow ones starts.
+    w.input(crate::window::Input::PointerLeft);
+    starts
+        .recv_timeout(Duration::from_secs(2))
+        .expect("the UI's own frames run");
+    hears.try_iter().for_each(drop);
+    let want = send.clone();
+    w.input(send);
+    let until = Instant::now().checked_add(within).unwrap_or_else(Instant::now);
+    let mut got = false;
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        match hears.recv_timeout(left) {
+            Ok(i) if i == want => {
+                got = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => break,
+        }
+    }
+    slow.store(false, SeqCst);
+    Some((got, starts.try_iter().count()))
+}
+
+/// Opus r16: past the render thread's last recovery, frames longer than an
+/// interval, each asking for the next (an animation on a 1 ms clock), do
+/// not keep the UI from the input queued meanwhile: the UI's own frame is
+/// ordered with the queue, as a grant is (failed: a pointer move was never
+/// heard within 2 s with 25 ms frames).
+#[test]
+fn past_the_last_recovery_slow_animating_frames_still_hear_a_move() {
+    let moved = crate::window::Input::PointerMoved { x: 30.0, y: 30.0 };
+    let Some((heard, frames)) = heard_past_slow_frames(Duration::from_millis(25), moved, Duration::from_secs(2)) else {
+        return;
+    };
+    assert!(
+        heard,
+        "the move was not heard in 2 s; {frames} slow frames started meanwhile"
+    );
+}
+
+/// Opus r16's control: with frames shorter than an interval the move is
+/// heard (it was before the fix too).
+#[test]
+fn past_the_last_recovery_quick_animating_frames_hear_a_move() {
+    let moved = crate::window::Input::PointerMoved { x: 30.0, y: 30.0 };
+    let Some((heard, frames)) = heard_past_slow_frames(Duration::from_millis(2), moved, Duration::from_secs(2)) else {
+        return;
+    };
+    assert!(
+        heard,
+        "the move was not heard in 2 s; {frames} frames started meanwhile"
+    );
+}
+
+/// Codex r16 `slow_frames_yield_to_input`: an input queued during a 40 ms
+/// frame of the UI's own is handled before the next of its frames, as it
+/// would be before a grant queued after it (failed: 8 frames started and
+/// the Blur was not delivered within 400 ms).
+#[test]
+fn slow_frames_yield_to_input() {
+    let Some((heard, frames)) = heard_past_slow_frames(
+        Duration::from_millis(40),
+        crate::window::Input::Blur,
+        Duration::from_millis(400),
+    ) else {
+        return;
+    };
+    assert!(
+        heard,
+        "the Blur was not delivered; {frames} slow frames started meanwhile"
     );
 }
 
