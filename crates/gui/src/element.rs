@@ -297,6 +297,25 @@ pub(crate) struct Attrs {
     /// [`Div::aria_pos_in_set`]'s position and size as each was given:
     /// the set is told once both are.
     set_parts: (Option<usize>, Option<usize>),
+    /// Its index among a virtual list's rows, where the list built it
+    /// ([`Common::row_slot`]): told as its row index while the role it
+    /// resolves to is a row's and it sets no index of its own
+    /// ([`Self::told`]).
+    row_slot: Option<usize>,
+}
+
+impl Attrs {
+    /// What a screen reader is told of it: its semantics as resolved, with
+    /// what derives from them. A virtual row's index is decided here, from
+    /// the role the node resolved to (a bound role's, held over a panic
+    /// included), never by running the role's closure again.
+    pub(crate) fn told(&self) -> Semantics {
+        let mut s = self.semantics.clone();
+        if s.row_index.is_none() && s.role.is_some_and(crate::access::is_row_role) {
+            s.row_index = self.row_slot;
+        }
+        s
+    }
 }
 
 /// One attribute given bound: which setter (the last setter of an
@@ -350,29 +369,33 @@ impl Common {
         (&self.attrs, &self.bound_attrs)
     }
 
-    /// Its role as it was given: none, a value, or the closure that gives
-    /// it, so code that decides by the role decides as the role resolves.
-    pub(crate) fn role_given(&self) -> RoleGiven {
-        match self.bound_attrs.iter().rev().find(|op| op.name == ROLE) {
-            Some(op) => match op.def.read_any().downcast_ref::<Rc<dyn Fn() -> Role>>() {
-                Some(f) => RoleGiven::Bound(Rc::clone(f)),
-                None => RoleGiven::None,
-            },
-            None => self.attrs.semantics.role.map_or(RoleGiven::None, RoleGiven::Fixed),
+    /// Whether it was given a role at all, fixed or bound: what it is (its
+    /// role's value) is known only as it resolves ([`Attrs::told`]).
+    pub(crate) fn gives_role(&self) -> bool {
+        self.attrs.semantics.role.is_some() || self.bound_attrs.iter().any(|op| op.name == ROLE)
+    }
+
+    /// Mark it as the row at `index` of a virtual list (a value, or the
+    /// closure that gives it where a windowed list moves the row): its row
+    /// index while the role it resolves to is a row's ([`Attrs::told`]).
+    pub(crate) fn row_slot(&mut self, index: crate::value::Value<usize>) {
+        const SLOT: &str = "row_slot";
+        match index {
+            crate::value::Value::Fixed(at) => self.fix(SLOT, |a| a.row_slot = Some(at)),
+            crate::value::Value::Bound(read) => self.bind(SLOT, read, |a, at| a.row_slot = Some(at)),
         }
+    }
+
+    /// The closure the attribute `name` is bound to, if it is bound to one
+    /// giving `T`.
+    fn bound_read<T: 'static>(&self, name: &str) -> Option<Rc<dyn Fn() -> T>> {
+        let op = self.bound_attrs.iter().rev().find(|op| op.name == name)?;
+        op.def.read_any().downcast_ref::<Rc<dyn Fn() -> T>>().cloned()
     }
 }
 
 /// The name [`Div::role`] binds by.
 const ROLE: &str = "role";
-
-/// A node's role as it was given ([`Common::role_given`]).
-#[derive(Clone)]
-pub(crate) enum RoleGiven {
-    None,
-    Fixed(Role),
-    Bound(Rc<dyn Fn() -> Role>),
-}
 
 /// The targets of a relation ([`Div::labelled_by`] and the like), in order.
 pub type Targets = Vec<crate::access::NodeRef>;
@@ -1849,10 +1872,10 @@ impl<K> Node<K> {
     }
 
     /// Set the relation `name` to the targets `to` gives, as each relation
-    /// setter does. Values add up: each fixed call adds its targets after
-    /// those of the calls before it. A closure gives the whole list, in
-    /// order, and replaces what fixed calls before it added; a fixed call
-    /// after a closure drops the closure.
+    /// setter does. The list is built in call order: a fixed call appends
+    /// its targets; a closure replaces everything before it with what it
+    /// gives; a fixed call after a closure appends to what the closure
+    /// gives. So `controls(a).controls(|| vec![b]).controls(c)` is `[b, c]`.
     fn relation<M>(
         mut self,
         name: &'static str,
@@ -1861,7 +1884,17 @@ impl<K> Node<K> {
         set: fn(&mut Attrs, Targets),
     ) -> Self {
         match to.into_value() {
-            crate::value::Value::Fixed(v) => self.common.fix(name, |a| list(a).extend(v)),
+            crate::value::Value::Fixed(v) => match self.common.bound_read::<Targets>(name) {
+                Some(before) => {
+                    let read = move || {
+                        let mut all = before();
+                        all.extend(v.iter().cloned());
+                        all
+                    };
+                    self.common.bind(name, Rc::new(read), set);
+                }
+                None => list(&mut self.common.attrs).extend(v),
+            },
             crate::value::Value::Bound(read) => self.common.bind(name, read, set),
         }
         self

@@ -83,7 +83,6 @@ const ALLOWED: &[(&str, &str)] = &[
     ("gui:value/source.rs: GroupCell.read", "a source's read: in its reader's phase"),
     ("gui:layout/binding.rs: type TextBinding", "a bound text: read in its window's layout"),
     ("gui:layout/binding.rs: type DrawBinding", "a drawing: made in its window's paint"),
-    ("gui:element.rs: RoleGiven::Bound.0", "a bound role, handed by `Common::role_given` to the build that bound a row's index to it: read in its window's layout"),
     ("gui:layout/attrs.rs: Def.read","a bound attribute: read in its window's layout, where its node resolves (ADR-0026's accessibility phase)"),
     ("gui:layout/attrs.rs: type HeldWrite", "the engine's own: writes a value a binding held over a panic, in a cold build of its window's layout; no caller's closure"),
     ("gui:chunk/plot.rs: type XFn", "a plot's range: read in paint"),

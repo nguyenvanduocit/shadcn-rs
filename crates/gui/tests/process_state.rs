@@ -1741,7 +1741,6 @@ const CLOSURES: &[&str] = &[
     "crates/gui/src/canvas/plan.rs | Huge | the planner's cut of a huge object, called during the plan it is lent to: the engine's own, no caller state",
     "crates/gui/src/layout/binding.rs | TextBinding | bound text, read by the layout: pure",
     "crates/gui/src/layout/binding.rs | DrawBinding | a bound drawing, read by the layout: pure",
-    "crates/gui/src/element.rs | RoleGiven.Bound | a bound role, read by the layout through the row index bound to it: pure",
     "crates/gui/src/layout/attrs.rs | Def.read | a bound attribute, read by the layout as its node resolves: pure",
     "crates/gui/src/layout/attrs.rs | HeldWrite | the engine's own write of a value held over a panic, in a cold build: no caller's closure, pure",
     "crates/gui/src/layout/engine/mod.rs | Job | a layout island's job, lent to the pool for one pass: the engine's own, pure",

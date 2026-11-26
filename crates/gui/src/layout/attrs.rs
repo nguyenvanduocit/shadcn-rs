@@ -35,8 +35,9 @@ pub(crate) trait AttrBound: Any {
     /// A mount of it on one node, its tracker running `mark`.
     fn mount(self: Rc<Self>, mark: &crate::reactive::Mark) -> Box<dyn AttrRun>;
 
-    /// Its closure, an `Rc<dyn Fn() -> T>`, for code that decides by what
-    /// it gives as it resolves ([`crate::element::Common::role_given`]).
+    /// Its closure, an `Rc<dyn Fn() -> T>`, for a later setter of the same
+    /// attribute that builds on what it gives (a relation's fixed targets
+    /// after a closure's).
     fn read_any(&self) -> &dyn Any;
 }
 

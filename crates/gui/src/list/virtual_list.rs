@@ -16,7 +16,10 @@
 //!   around it are measured and the viewport shows it, estimates or not.
 //! - **The window** (the rows built) is the viewport plus the prefetch
 //!   margin above and below, decided at render from the anchor and the
-//!   viewport last laid out. The rows are the children of a scroll
+//!   viewport last laid out ([`virtual_list`]), or by the source of a keyed
+//!   `each` that is the window, in a list built once ([`virtual_each`],
+//!   ADR-0026: a moved window mounts and disposes rows and runs nothing
+//!   else). The rows are the children of a scroll
 //!   container whose offset is local to the window; after each layout the
 //!   list measures them, moves its anchor to where the wheel left the
 //!   viewport, and asks for another pass when the window must move (the
@@ -58,6 +61,10 @@ use crate::prelude::*;
 use crate::reactive::{Signal, detached};
 use crate::scroll::{Move, ScrollHandle, ScrollLayout};
 use crate::style::{BackgroundImage, Calc, LinearGradient, Stop, StopColor};
+
+mod windowed;
+
+pub use windowed::{ListRow, virtual_each, virtual_each_in};
 
 /// The viewport height a list assumes before its first layout.
 const FIRST_VIEWPORT: f32 = 600.0;
@@ -114,7 +121,7 @@ struct Request {
     bottom: Option<f32>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Plan {
     /// The rows the data holds.
     rows: u64,
@@ -357,6 +364,10 @@ struct State {
     around_focus: u64,
     /// The last render's plan, taken in: taken once.
     taken: Weak<dyn std::any::Any>,
+    /// The plan a windowed list's last commit built its rows from
+    /// ([`virtual_each`]): its source's result, kept while an equal one
+    /// comes again (so it is taken once), never written in part.
+    planned: Option<Rc<Plan>>,
 }
 
 /// The rows the last render built ([`State::built`]): replaced whole when
@@ -444,6 +455,7 @@ impl crate::engine::Parts for State {
             active_from,
             around_focus,
             taken,
+            planned,
         } = self;
         // The app's callback, its own box (or let go of at once, live
         // sharing it).
@@ -451,6 +463,7 @@ impl crate::engine::Parts for State {
         waiting.parts(out);
         built.parts(out);
         taken.parts(out);
+        planned.parts(out);
         // The engine's own: memory, a box each where it has drop glue.
         whole(extents, out);
         whole(since_lent, out);
@@ -538,6 +551,7 @@ impl crate::engine::ForkClone for State {
             active_from,
             around_focus,
             taken,
+            planned,
         } = self;
         Self {
             version: *version,
@@ -576,6 +590,7 @@ impl crate::engine::ForkClone for State {
             active_from: *active_from,
             around_focus: *around_focus,
             taken: Weak::clone(taken),
+            planned: planned.as_ref().map(Rc::clone),
         }
     }
 }
@@ -1102,6 +1117,7 @@ impl ListState {
             around_focus: 0,
             viewport_path: None,
             taken: Weak::<Plan>::new(),
+            planned: None,
         };
         let me = Self(crate::engine::allocate(&LISTS, state));
         scroll.on_layout_built(move |l, built| me.laid_out(scroll, l, built));
@@ -1735,9 +1751,13 @@ impl ListState {
                 })
             })
             .flatten();
-        // A row the list keyed: as a node, or as a component's root.
-        let Some(crate::geometry::PathSeg::Key(k) | crate::geometry::PathSeg::Component(k, _)) = seg else {
-            return None;
+        // A row the list keyed: as a node (a windowed list's row is also
+        // the root of its row's instance, and keeps its own key), or as a
+        // component's root.
+        let k = match seg? {
+            crate::geometry::PathSeg::Key(k) | crate::geometry::PathSeg::Component(_, Some(k)) => k,
+            crate::geometry::PathSeg::Component(k, None) => k,
+            crate::geometry::PathSeg::Index(_) => return None,
         };
         // Built in the last frame: in its window or pinned.
         let row = self
@@ -2251,17 +2271,27 @@ impl ListState {
     /// layout pass that laid them out, the frame's last too. Whether it put
     /// the container elsewhere.
     fn take(&self, built: &crate::scroll::Built) -> bool {
+        // A windowed list's container says so: the plan is the one its
+        // last commit kept ([`State::planned`]).
+        let plan: crate::scroll::Built = if built.is::<windowed::Windowed>() {
+            match self.peek(|s| s.planned.clone()).flatten() {
+                Some(p) => p,
+                None => return false,
+            }
+        } else {
+            Rc::clone(built)
+        };
         let fresh = self.write(|s| {
-            if Weak::ptr_eq(&s.taken, &Rc::downgrade(built)) {
+            if Weak::ptr_eq(&s.taken, &Rc::downgrade(&plan)) {
                 return false;
             }
-            s.taken = Rc::downgrade(built);
+            s.taken = Rc::downgrade(&plan);
             true
         });
         if fresh != Some(true) {
             return false;
         }
-        let Some(p) = built.downcast_ref::<Plan>() else {
+        let Some(p) = plan.downcast_ref::<Plan>() else {
             return false;
         };
         let Some(scroll) = self.scroll() else {
@@ -2392,31 +2422,79 @@ fn thumb_ink() -> BackgroundImage {
     .into()
 }
 
-/// Row `i` (keyed `k`) of a list, built as `el`: when it names a row's
+/// A row's index in its data: fixed for a render that builds the rows
+/// again (`virtual_list`), or the row's own, which a windowed list's
+/// commit writes when data moved its key ([`virtual_each`]).
+#[derive(Clone, Copy)]
+enum Index {
+    Fixed(u64),
+    Bound(windowed::RowOf),
+}
+
+impl Index {
+    /// Read where it is bound (tracked there).
+    fn get(self) -> usize {
+        let row = match self {
+            Self::Fixed(row) => row,
+            Self::Bound(r) => windowed::row_of(r),
+        };
+        usize::try_from(row).unwrap_or(usize::MAX)
+    }
+}
+
+/// Row `index` (keyed `k`) of a list, built as `el`: when it names a row's
 /// role (a table's row, an option) it is the row and carries the index;
 /// when it names another (a heading among options) it is left as it is;
-/// else it is wrapped in a row whose role its list's implies. A role given
-/// as a closure decides as it resolves: the row index is bound to it, so
-/// the node carries the index while its role is a row's.
-fn row_wrapper(i: u64, k: ElementKey, mut el: Element) -> Div {
-    use crate::element::RoleGiven;
-    let index = usize::try_from(i).unwrap_or(usize::MAX);
-    let named = el.common_mut().and_then(|c| match c.role_given() {
-        RoleGiven::Fixed(role) if crate::access::is_row_role(role) => {
-            c.fix("aria_row_index", |a| a.semantics.row_index = Some(index));
-            Some(())
-        }
-        RoleGiven::Bound(role) => {
-            let row = move || crate::access::is_row_role(role()).then_some(index);
-            c.bind("aria_row_index", Rc::new(row), |a, v| a.semantics.row_index = v);
-            Some(())
-        }
-        RoleGiven::Fixed(_) => Some(()),
-        RoleGiven::None => None,
+/// else it is wrapped in a row whose role its list's implies. Which it is
+/// is decided as its role resolves (a bound one, held over a panic,
+/// included): a node given a role is marked as the row at its index, told
+/// while that role is a row's and it sets no index of its own. A bound
+/// index is bound wherever it is carried.
+fn row_wrapper(index: Index, k: ElementKey, mut el: Element) -> Div {
+    let named = el.common_mut().filter(|c| c.gives_role()).map(|c| {
+        c.row_slot(match index {
+            Index::Fixed(_) => crate::value::Value::Fixed(index.get()),
+            Index::Bound(_) => crate::value::Value::Bound(Rc::new(move || index.get())),
+        });
     });
     let d = div().key(k);
-    let d = if named.is_some() { d } else { d.aria_row_index(index) };
+    let d = match (named, index) {
+        (Some(()), _) => d,
+        (None, Index::Fixed(_)) => d.aria_row_index(index.get()),
+        (None, Index::Bound(_)) => d.aria_row_index(move || index.get()),
+    };
     d.child(el)
+}
+
+/// List `s`'s scrollbar thumb, drawn while `hidden()` does not hold.
+fn thumb(s: ListState, hidden: impl Fn() -> bool + 'static) -> Div {
+    // The bindings read through the handle, not the signals it holds: a
+    // binding may run once more after the list's owner ended (its element
+    // still in a tree being replaced), and a list gone is inert.
+    let geometry = move || s.peek(|st| st.thumb).and_then(|t| t.get());
+    let shown = move || s.peek(|st| st.thumb_shown).is_some_and(|t| t.get());
+    div()
+        .named("virtual-list-thumb")
+        .position(Position::Absolute)
+        .right(THUMB_RIGHT)
+        .width(THUMB_WIDTH)
+        .radius(THUMB_WIDTH / 2.0)
+        .background_image(thumb_ink())
+        .top(move || geometry().map_or(0.0, |(y, _)| y))
+        .height(move || geometry().map_or(0.0, |(_, h)| h))
+        // Shown at once, faded out.
+        .opacity(move || if shown() { 1.0 } else { 0.0 })
+        .duration_ms(move || if shown() { 0.0 } else { THUMB_FADE_MS })
+        .ease(Easing::Linear)
+        .transition(crate::motion::Properties::OPACITY)
+        .display(move || {
+            if !hidden() && geometry().is_some() {
+                Display::Block
+            } else {
+                Display::None
+            }
+        })
+        .on_drag(move |e| s.drag_thumb(e))
 }
 
 /// A list of `rows` rows, `row(i)` built for those in view and prefetched,
@@ -2452,7 +2530,7 @@ pub fn virtual_list_in(
     let w = plan.window;
     let total = plan.total;
     let row_at = |i: u64, k: ElementKey| {
-        row_wrapper(i, k, row(i))
+        row_wrapper(Index::Fixed(i), k, row(i))
             .flex(Flex::NONE)
             .width(pct(100.0))
             .into_element()
@@ -2461,7 +2539,7 @@ pub fn virtual_list_in(
     // Kept built where nothing shows them: their bottom on the viewport's
     // top, out of the scroll range.
     let pinned = |&(i, k): &(u64, ElementKey)| {
-        row_wrapper(i, k, row(i))
+        row_wrapper(Index::Fixed(i), k, row(i))
             .position(Position::Absolute)
             .left(0.0)
             .width(pct(100.0))
@@ -2494,35 +2572,7 @@ pub fn virtual_list_in(
     // after each layout from the anchor over the whole extent, they move the
     // thumb without building the list again.
     let s = *state;
-    // The bindings read through the handle, not the signals it holds: a
-    // binding may run once more after the list's owner ended (its element
-    // still in a tree being replaced), and a list gone is inert.
-    let geometry = move || s.peek(|st| st.thumb).and_then(|t| t.get());
-    let shown = move || s.peek(|st| st.thumb_shown).is_some_and(|t| t.get());
-    let thumb = (!no_scrollbar.get()).then(|| {
-        div()
-            .named("virtual-list-thumb")
-            .position(Position::Absolute)
-            .right(THUMB_RIGHT)
-            .width(THUMB_WIDTH)
-            .radius(THUMB_WIDTH / 2.0)
-            .background_image(thumb_ink())
-            .top(move || geometry().map_or(0.0, |(y, _)| y))
-            .height(move || geometry().map_or(0.0, |(_, h)| h))
-            // Shown at once, faded out.
-            .opacity(move || if shown() { 1.0 } else { 0.0 })
-            .duration_ms(move || if shown() { 0.0 } else { THUMB_FADE_MS })
-            .ease(Easing::Linear)
-            .transition(crate::motion::Properties::OPACITY)
-            .display(move || {
-                if geometry().is_some() {
-                    Display::Block
-                } else {
-                    Display::None
-                }
-            })
-            .on_drag(move |e| s.drag_thumb(e))
-    });
+    let thumb = (!no_scrollbar.get()).then(|| thumb(s, || false));
     let list = div()
         .named("virtual-list")
         .position(Position::Relative)

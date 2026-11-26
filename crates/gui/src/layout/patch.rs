@@ -472,10 +472,21 @@ impl LayoutTree {
         ex: &mut Extra,
     ) -> Option<Resolved> {
         let u = node.user;
+        // The one order a node resolves in, so each binding reads the
+        // node's flags bound and as they are (never an unbound handle,
+        // whose late bind would be a write from the frame):
+        //   1. bind its handle and write the flags that come from no
+        //      attribute, `disabled` as it last resolved;
+        //   2. run its attribute phase;
+        //   3. write the flags that come from attributes (`disabled`), if
+        //      the phase changed them;
+        //   4. run its style phase ([`Self::resolve_style`]).
+        let (fixed, bound) = common.attrs_to_resolve();
+        let was_disabled = inherit.disabled || ex.attr_binding.as_deref().map_or(fixed, AttrBinding::attrs).disabled;
+        self.bind_flags(pass.state, el, common, was_disabled, ex, layer);
         // Its attributes (ADR-0026's accessibility binding phase): the
         // fixed ones, each bound one written over them as its closure last
         // gave, run again here only when what it read changed.
-        let (fixed, bound) = common.attrs_to_resolve();
         let attrs_changed = if bound.is_empty() {
             ex.attr_binding = None;
             false
@@ -497,7 +508,10 @@ impl LayoutTree {
             attrs.tab_reversed,
         );
         let disabled = inherit.disabled || own_disabled;
-        let mut style = self.resolve(pass.state, el, common, disabled, ex, u, layer);
+        if disabled != was_disabled {
+            self.bind_flags(pass.state, el, common, disabled, ex, layer);
+        }
+        let mut style = self.resolve_style(common, ex, u);
         if style.display == Display::None {
             return None;
         }
@@ -859,8 +873,7 @@ impl LayoutTree {
                     .attr_binding
                     .as_deref()
                     .map_or(common.attrs_to_resolve().0, AttrBinding::attrs)
-                    .semantics
-                    .clone(),
+                    .told(),
                 interaction: ex.interaction.flags(),
                 inert,
                 tab_stop: common.tab_stop.clone(),
@@ -1070,30 +1083,47 @@ impl LayoutTree {
         (structure, reach)
     }
 
-    #[expect(clippy::too_many_arguments, reason = "a node, what it inherits and where it is")]
-    fn resolve(
-        &self,
-        state: &UiState,
-        el: &Element,
-        common: &Common,
-        disabled: bool,
-        ex: &mut Extra,
-        u: u32,
-        layer: usize,
-    ) -> Style {
+    /// Its style phase: its style with each bound write over it, run after
+    /// its flags are bound and written ([`Self::resolve_own`]'s order).
+    fn resolve_style(&self, common: &Common, ex: &mut Extra, u: u32) -> Style {
+        match common.bindings.ops() {
+            Some(ops) => {
+                let base = &common.style;
+                // A cold build writes each bound write the live node holds
+                // over a panic as it last gave, never running it again;
+                // every other write runs, so it is checked (ADR-0015, rule
+                // 12: a hold per setter).
+                let held = self.held.get(&ex.path).map_or(&[][..], |h| h.style.as_slice());
+                ex.style_binding
+                    .get_or_insert_with(|| Box::new(StyleBinding::new(&self.marks, u)))
+                    .get(ops, base, held)
+            }
+            // Nothing bound any more: its trackers go, so what its old
+            // closures read resolves nothing (as a span's do).
+            None => {
+                ex.style_binding = None;
+                common.style.clone()
+            }
+        }
+    }
+
+    /// Bind the node's flags to the handle its element gives and write
+    /// them as the window's input state has them, `disabled` as given:
+    /// a handle a render made reads the node as it is. Hit testing and
+    /// focus write them from then on. [`Self::resolve_own`] holds the
+    /// order its bindings see them in.
+    fn bind_flags(&self, state: &UiState, el: &Element, common: &Common, disabled: bool, ex: &mut Extra, layer: usize) {
         let path = &ex.path;
         let enabled = !disabled;
         let focused = focus_of(common, path).is_some_and(|h| Some(h.id()) == state.focused);
-        // The node's own flags, bound to the handle its element gives and
-        // written as the window's input state has them, before its
-        // bindings read them: a handle a render made reads the node as it
-        // is. Hit testing and focus write them from then on.
         match common.interaction {
             // A detached tree binds no handle a live node holds: its
             // bindings read the flags the window's own tree bound and
             // wrote, which it leaves alone. A handle its own renders made
-            // (no live node has it) it binds, until it goes.
-            Some(handle) if self.detached && handle.is_bound() => {}
+            // (no live node has it) it binds, until it goes, and writes as
+            // any node writes its own: step 3 of the order writes the
+            // `disabled` its attributes gave to the handle step 1 bound.
+            Some(handle) if self.detached && handle.is_bound() && ex.interaction.handle() != Some(handle) => {}
             Some(handle) => {
                 let i = ex.interaction.bind(handle);
                 let (focused, focus_visible, focus_within) = crate::interact::focus_flags(
@@ -1114,25 +1144,6 @@ impl LayoutTree {
                 });
             }
             None => ex.interaction.clear(),
-        }
-        match common.bindings.ops() {
-            Some(ops) => {
-                let base = &common.style;
-                // A cold build writes each bound write the live node holds
-                // over a panic as it last gave, never running it again;
-                // every other write runs, so it is checked (ADR-0015, rule
-                // 12: a hold per setter).
-                let held = self.held.get(&ex.path).map_or(&[][..], |h| h.style.as_slice());
-                ex.style_binding
-                    .get_or_insert_with(|| Box::new(StyleBinding::new(&self.marks, u)))
-                    .get(ops, base, held)
-            }
-            // Nothing bound any more: its trackers go, so what its old
-            // closures read resolves nothing (as a span's do).
-            None => {
-                ex.style_binding = None;
-                common.style.clone()
-            }
         }
     }
 }

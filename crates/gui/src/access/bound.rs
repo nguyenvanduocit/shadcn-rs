@@ -616,6 +616,43 @@ fn r9_hidden_by_own_bound_disabled_comes_back() {
     }
 }
 
+/// Review r4 (Codex, K4b): siblings each hidden from their first frame by
+/// their own bound `disabled` come back each on its own flag, and every
+/// frame matches a cold one.
+#[test]
+fn r4_initially_hidden_siblings_wake_independently() {
+    let flags = [Signal::new(true), Signal::new(true)];
+    let handles = [Interaction::new(), Interaction::new()];
+    let mut s = Scenario::measuring(
+        move || {
+            div()
+                .children(flags.into_iter().zip(handles).zip(["A", "B"]).map(|((off, i), name)| {
+                    div()
+                        .named(name)
+                        .height(20.0)
+                        .disabled(off)
+                        .interaction(i)
+                        .display(move || if i.disabled() { Display::None } else { Display::Flex })
+                }))
+                .into_element()
+        },
+        100,
+        100,
+        1.0,
+    )
+    .unwrap();
+    s.check_cold(true);
+    for (a, b) in [(true, true), (false, true), (true, false), (false, false)] {
+        s.act("flags", || {
+            flags[0].set(a);
+            flags[1].set(b);
+        });
+        s.settle().unwrap();
+        assert_eq!(shows(&s, "A"), !a, "a={a} b={b}");
+        assert_eq!(shows(&s, "B"), !b, "a={a} b={b}");
+    }
+}
+
 /// A node hidden by its own style binding, whose content is bound, comes
 /// back showing what its content binding gives now, whatever changed while
 /// it was hidden: every kind of binding a node holds (style, attribute,
@@ -1016,8 +1053,7 @@ fn every_attribute_setter_is_listed() {
 #[test]
 fn only_the_resolve_reads_a_nodes_fixed_attributes() {
     const RESOLVE: &[&str] = &["element.rs", "layout/patch.rs", "access/bound.rs"];
-    const ROLE: &[&str] = &["element.rs", "list/virtual_list.rs", "access/bound.rs"];
-    let allowed: &[(&str, &[&str])] = &[("attrs_to_resolve(", RESOLVE), ("role_given(", ROLE)];
+    let allowed: &[(&str, &[&str])] = &[("attrs_to_resolve(", RESOLVE)];
     for (file, text) in sources() {
         for (call, files) in allowed {
             assert!(
@@ -1026,4 +1062,299 @@ fn only_the_resolve_reads_a_nodes_fixed_attributes() {
             );
         }
     }
+}
+
+// ---- Review round 2 (round 3's repros) ----
+
+/// The one node labelled `label` in the whole tree.
+fn node_labelled(s: &mut Scenario, label: &str) -> Node {
+    full(s)
+        .nodes
+        .into_iter()
+        .find(|(_, n)| n.label() == Some(label))
+        .map(|(_, n)| n)
+        .unwrap()
+}
+
+/// Review r2 (Opus hunt 1): an attribute closure reads its node's
+/// interaction flags as a style binding does: bound and written before it
+/// runs, so the first frame reads them as they are and a cold build agrees
+/// (no early read of an unbound handle bumps live state).
+#[test]
+fn r3a_an_attribute_reads_its_nodes_flags_bound() {
+    let mut s = counting(
+        move || {
+            let i = Interaction::new();
+            div()
+                .child(
+                    div()
+                        .height(10.0)
+                        .interaction(i)
+                        .disabled(true)
+                        .role(Role::Button)
+                        .aria_label(move || format!("d{}", i.disabled())),
+                )
+                .into_element()
+        },
+        100,
+    );
+    s.check_cold(true);
+    update(&mut s);
+    let n = full(&mut s);
+    assert!(n.nodes.iter().any(|(_, n)| n.label() == Some("dtrue")), "{:?}", n.nodes);
+}
+
+/// The same, a flag written by focus: Tab focuses the node, and its bound
+/// `aria_selected` reads it.
+#[test]
+fn r3a_an_attribute_follows_its_nodes_focus() {
+    let mut s = counting(
+        move || {
+            let i = Interaction::new();
+            div()
+                .child(
+                    div()
+                        .height(10.0)
+                        .interaction(i)
+                        .focusable()
+                        .role(Role::Tab)
+                        .aria_label("tab")
+                        .aria_selected(move || i.focused()),
+                )
+                .into_element()
+        },
+        100,
+    );
+    s.check_cold(true);
+    update(&mut s);
+    assert_eq!(node_labelled(&mut s, "tab").is_selected(), Some(false));
+    s.press(crate::events::NamedKey::Tab, crate::events::Modifiers::default());
+    update(&mut s);
+    assert_eq!(node_labelled(&mut s, "tab").is_selected(), Some(true));
+}
+
+/// Control: the same read from a style binding.
+#[test]
+fn r3a_a_style_binding_reads_its_nodes_flags_bound() {
+    let mut s = counting(
+        move || {
+            let i = Interaction::new();
+            div()
+                .child(
+                    div()
+                        .height(10.0)
+                        .interaction(i)
+                        .disabled(true)
+                        .role(Role::Button)
+                        .aria_label("b")
+                        .background(move || if i.disabled() { Color::WHITE } else { Color::BLACK }),
+                )
+                .into_element()
+        },
+        100,
+    );
+    s.check_cold(true);
+    update(&mut s);
+}
+
+/// Review r2 (Opus OOS 4, Codex hunt 1): a bound attribute whose first run
+/// panicked runs again only when what it read changes, not when its node
+/// resolves for another binding's sake.
+#[test]
+fn r3b_a_first_run_panic_does_not_rerun_on_an_unrelated_resolve() {
+    let runs = Rc::new(Cell::new(0_u32));
+    let (open, fail) = (Signal::new(false), Signal::new(0_u32));
+    let counted = Rc::clone(&runs);
+    let mut s = counting(
+        move || {
+            let counted = Rc::clone(&counted);
+            div()
+                .child(
+                    div()
+                        .height(10.0)
+                        .role(Role::Tab)
+                        .aria_label("tab")
+                        .aria_expanded(open)
+                        .aria_selected(move || -> bool {
+                            bump(&counted);
+                            let _ = fail.get();
+                            panic!("no selected value")
+                        }),
+                )
+                .into_element()
+        },
+        100,
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| s.settle())).is_err());
+    assert_eq!(runs.get(), 1);
+    s.act("open", || open.set(true));
+    s.settle().unwrap();
+    assert_eq!(runs.get(), 1, "an unrelated attribute's change does not run it again");
+    assert_eq!(node_labelled(&mut s, "tab").is_expanded(), Some(true));
+    s.act("what it read", || fail.set(1));
+    assert!(catch_unwind(AssertUnwindSafe(|| s.settle())).is_err());
+    assert_eq!(runs.get(), 2, "what it read changing runs it again");
+}
+
+/// The same for a bound text: one mechanism for every binding kind.
+#[test]
+fn r3b_a_text_whose_first_run_panicked_does_not_rerun_on_an_unrelated_resolve() {
+    let runs = Rc::new(Cell::new(0_u32));
+    let lit = Signal::new(false);
+    let counted = Rc::clone(&runs);
+    let mut s = counting(
+        move || {
+            let counted = Rc::clone(&counted);
+            div()
+                .child(
+                    crate::element::text_bound(move || -> String {
+                        bump(&counted);
+                        panic!("no text")
+                    })
+                    .background(move || if lit.get() { Color::WHITE } else { Color::BLACK }),
+                )
+                .into_element()
+        },
+        100,
+    );
+    assert!(catch_unwind(AssertUnwindSafe(|| s.settle())).is_err());
+    assert_eq!(runs.get(), 1);
+    s.act("lit", || lit.set(true));
+    s.settle().unwrap();
+    assert_eq!(runs.get(), 1, "its node's colour changing does not run it again");
+}
+
+/// One row of a table, built by `row`.
+fn one_row_table(row: impl Fn() -> Div + 'static) -> Scenario {
+    let state = crate::list::ListState::new(24.0);
+    let row = Rc::new(row);
+    counting(
+        move || {
+            let row = Rc::clone(&row);
+            crate::list::virtual_list(
+                &state,
+                1,
+                |i| i,
+                move |_| row().height(24.0).aria_label("r").into_element(),
+            )
+            .height(100.0)
+            .role(Role::Table)
+            .into_element()
+        },
+        200,
+    )
+}
+
+/// Review r2 (kept Codex C): the row index follows the role the node
+/// resolved to, held over a panic, not a second run of the role's closure.
+#[test]
+fn r3c_a_virtual_rows_index_follows_its_held_role() {
+    let row = Signal::new(false);
+    let failed = Rc::new(Cell::new(false));
+    let mut s = one_row_table(move || {
+        let failed = Rc::clone(&failed);
+        div().role(move || {
+            if row.get() {
+                assert!(failed.replace(true), "fails once");
+                Role::Row
+            } else {
+                Role::Heading
+            }
+        })
+    });
+    update(&mut s);
+    s.act("row", || row.set(true));
+    assert!(catch_unwind(AssertUnwindSafe(|| s.settle())).is_err());
+    let n = node_labelled(&mut s, "r");
+    assert_eq!((n.role(), n.row_index()), (Role::Heading, None));
+}
+
+/// Review r2 (fresh Codex 2): a fixed row role under a bound one whose
+/// first run panics is a row, with its index.
+#[test]
+fn r3c_a_virtual_row_whose_bound_role_panics_keeps_its_fixed_role_and_index() {
+    let mut s = one_row_table(|| div().role(Role::Row).role(|| -> Role { panic!("no role") }));
+    assert!(catch_unwind(AssertUnwindSafe(|| s.settle())).is_err());
+    let n = node_labelled(&mut s, "r");
+    assert_eq!((n.role(), n.row_index()), (Role::Row, Some(0)));
+}
+
+/// Review r2 (Opus 2): the list's index never replaces one the row set.
+#[test]
+fn r3c_a_virtual_row_keeps_its_own_index() {
+    for bound in [false, true] {
+        let mut s = one_row_table(move || {
+            let d = div().aria_row_index(7_usize);
+            if bound {
+                d.role(|| Role::Heading)
+            } else {
+                d.role(Role::Heading)
+            }
+        });
+        update(&mut s);
+        assert_eq!(node_labelled(&mut s, "r").row_index(), Some(7), "bound={bound}");
+        let mut s = one_row_table(move || {
+            let d = div().aria_row_index(7_usize);
+            if bound { d.role(|| Role::Row) } else { d.role(Role::Row) }
+        });
+        update(&mut s);
+        assert_eq!(node_labelled(&mut s, "r").row_index(), Some(7), "bound={bound}");
+    }
+}
+
+/// Review r2 (D): a relation's targets are built in call order: a fixed
+/// call appends, a closure replaces what came before with what it gives,
+/// and a fixed call after it appends to that.
+#[test]
+fn r3d_a_relations_targets_are_built_in_call_order() {
+    let (a, b, c) = (NodeRef::new(), NodeRef::new(), NodeRef::new());
+    let mut s = counting(
+        move || {
+            let target = |n: NodeRef, l: &'static str| div().height(5.0).role(Role::Label).aria_label(l).node_ref(n);
+            div()
+                .child(target(a, "a"))
+                .child(target(b, "b"))
+                .child(target(c, "c"))
+                .child(
+                    div()
+                        .height(5.0)
+                        .role(Role::Button)
+                        .aria_label("probe")
+                        .labelled_by(a)
+                        .labelled_by(move || vec![b])
+                        .labelled_by(c)
+                        .described_by(a)
+                        .described_by(move || b)
+                        .described_by(c)
+                        .controls(a)
+                        .controls(move || vec![b])
+                        .controls(c)
+                        .owns(a)
+                        .owns(move || b)
+                        .owns(c),
+                )
+                .into_element()
+        },
+        100,
+    );
+    update(&mut s);
+    let u = full(&mut s);
+    let id = |l: &str| {
+        u.nodes
+            .iter()
+            .find(|(_, n)| n.label() == Some(l))
+            .map(|(id, _)| *id)
+            .unwrap()
+    };
+    let want = vec![id("b"), id("c")];
+    let p = u
+        .nodes
+        .iter()
+        .find(|(_, n)| n.label() == Some("probe"))
+        .map(|(_, n)| n)
+        .unwrap();
+    assert_eq!(p.labelled_by(), want.as_slice());
+    assert_eq!(p.described_by(), want.as_slice());
+    assert_eq!(p.controls(), want.as_slice());
+    assert_eq!(p.owns(), want.as_slice());
 }

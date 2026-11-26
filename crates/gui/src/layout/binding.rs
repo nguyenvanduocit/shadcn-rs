@@ -13,7 +13,14 @@ use super::{Marks, need};
 pub(super) struct Tracked<K: ?Sized, T, E = ()> {
     /// Disposed in the world that made it as the binding ends (ADR-0035).
     node: Node,
-    memo: Option<(Rc<K>, E, T)>,
+    /// The closure and input of its last run, whether that run gave or
+    /// panicked: it runs again only when what that run read changes or
+    /// these are others. Kept apart from what it gave, so a run that
+    /// panicked (its first included) is not run again by its node
+    /// resolving for another binding's sake.
+    ran: Option<(Rc<K>, E)>,
+    /// What it last gave; `None` before it ever gave.
+    value: Option<T>,
     /// Its last run panicked in a turn: it gives what it gave before, and
     /// a cold build reuses that ([`HeldNode`]).
     held: bool,
@@ -28,7 +35,8 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
     pub(super) fn marking(mark: &crate::reactive::Mark) -> Self {
         Self {
             node: tracker(mark),
-            memo: None,
+            ran: None,
+            value: None,
             held: false,
         }
     }
@@ -41,7 +49,7 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
     /// panic changes.
     fn get_over(&mut self, f: &Rc<K>, input: &E, run: impl FnOnce() -> T) -> Option<T> {
         self.update_over(f, input, run, |_, _| false);
-        self.memo.as_ref().map(|(_, _, v)| v.clone())
+        self.value.clone()
     }
 
     /// Run it again as [`Self::get_over`] says, keeping what it gives in
@@ -54,7 +62,7 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
         run: impl FnOnce() -> T,
         same: impl FnOnce(&T, &T) -> bool,
     ) -> bool {
-        if let Some((g, e, _)) = &self.memo
+        if let Some((g, e)) = &self.ran
             && Rc::ptr_eq(g, f)
             && e == input
             && !self.node.is_marked()
@@ -63,11 +71,25 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
         }
         crate::component::count_binding();
         let node = *self.node;
+        // Its run, from here on, is this one: a panic below leaves it
+        // waiting on what it read before it panicked (its tracker keeps
+        // those reads), not on its node's next resolve.
+        match &mut self.ran {
+            Some((g, e)) => {
+                if !Rc::ptr_eq(g, f) {
+                    *g = Rc::clone(f);
+                }
+                if e != input {
+                    e.clone_from(input);
+                }
+            }
+            None => self.ran = Some((Rc::clone(f), input.clone())),
+        }
         match crate::engine::attempt(|| node.track(run)) {
             Ok(v) => {
                 self.held = false;
-                let changed = self.memo.as_ref().is_none_or(|(_, _, old)| !same(old, &v));
-                self.memo = Some((Rc::clone(f), input.clone(), v));
+                let changed = self.value.as_ref().is_none_or(|old| !same(old, &v));
+                self.value = Some(v);
                 changed
             }
             Err(failed) => {
@@ -82,7 +104,7 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
     /// to reuse as it is ([`HeldNode`]): `None` when it holds nothing;
     /// `Some(None)` when it holds what it gave before it ever gave.
     fn held(&self) -> Option<Option<T>> {
-        self.held.then(|| self.memo.as_ref().map(|(_, _, v)| v.clone()))
+        self.held.then(|| self.value.clone())
     }
 }
 
@@ -103,7 +125,7 @@ impl<K: ?Sized, T: Clone> Tracked<K, T> {
 
     /// What it last gave; `None` before it ever gave.
     pub(super) fn value(&self) -> Option<&T> {
-        self.memo.as_ref().map(|(_, _, v)| v)
+        self.value.as_ref()
     }
 
     /// Whether its last run panicked in a turn: it holds what it gave
