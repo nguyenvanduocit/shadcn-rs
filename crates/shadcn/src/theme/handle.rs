@@ -472,6 +472,10 @@ mod tests {
     /// The default theme and style read first inside a cold frame are made
     /// live: the next live reader gets the same handles, and they work.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test runs on a fresh thread for a fresh engine; no component code"
+    )]
     fn the_defaults_read_first_in_a_cold_frame_are_live_ones() {
         std::thread::spawn(|| {
             gui::testing::in_check(|| (use_theme().scheme(), use_design().get()));

@@ -28,7 +28,7 @@ use crate::color::Color;
 use crate::compositor::Commit;
 use crate::compositor::{Compositing, Hit, MovingNode, NodeKey, ScrollNode, ShownText, ThumbNode};
 use crate::effects;
-use crate::geometry::{Bounds, NodePath};
+use crate::geometry::{Bounds, NodeId};
 use crate::inspect::{PaintStats, Repaint};
 use crate::layout::{Changed, Content, Frame, FrameNode, Look, ReadAt, Since, input_text, text_width};
 use crate::scene::{
@@ -564,11 +564,11 @@ enum Role {
     Effect,
 }
 
-fn key(path: &NodePath, role: Role) -> u64 {
-    // The path's own key (one word), with the role: a fixed seed, so a
-    // chunk's id is the same in every frame.
+fn key(id: NodeId, role: Role) -> u64 {
+    // The node's published id (one word, ADR-0026), with the role: a fixed
+    // seed, so a chunk's id is the same in every frame.
     let mut h = foldhash::fast::FixedState::with_seed(0x9a1e_7c0d).build_hasher();
-    path.key().hash(&mut h);
+    id.published().hash(&mut h);
     role.hash(&mut h);
     h.finish()
 }
@@ -688,7 +688,7 @@ pub fn window_background(frame: &Frame, size: (u32, u32), scale: f32, fallback: 
 /// by its overlay chunk's id (the chunk that draws its caret).
 fn caret_mark(node: &FrameNode) -> Option<(u64, crate::edit::ShownMark)> {
     match &node.content {
-        Content::Input { edit, .. } => Some((key(&node.path, Role::Overlay), edit.mark())),
+        Content::Input { edit, .. } => Some((key(node.id, Role::Overlay), edit.mark())),
         _ => None,
     }
 }
@@ -1113,7 +1113,7 @@ impl Painter {
             if node.scroll(SIGHT).is_none() {
                 continue;
             }
-            let identity = (NodeKey::of(&node.path), crate::interact::owner_of(frame, i));
+            let identity = (NodeKey::of(node.id), crate::interact::owner_of(frame, i));
             let instance = was.get(&identity).copied().unwrap_or_else(|| {
                 self.next_scroll = self.next_scroll.wrapping_add(1);
                 self.next_scroll
@@ -1219,7 +1219,7 @@ impl Painter {
                     *c = Some(scene.chunks.len());
                 }
                 scene.chunks.push(Chunk {
-                    id: ChunkId(key(&node.path, Role::Chunk)),
+                    id: ChunkId(key(node.id, Role::Chunk)),
                     state: p.state(),
                     display,
                 });
@@ -1553,7 +1553,7 @@ impl Painter {
             }
             if let Some(c) = self.overlay_of.get(i).copied().flatten() {
                 let chunk = Chunk {
-                    id: ChunkId(key(&node.path, Role::Overlay)),
+                    id: ChunkId(key(node.id, Role::Overlay)),
                     state: p.over_state(),
                     display: self.chunk(node, Role::Overlay, p.snap, scale, generation, text),
                 };
@@ -1566,7 +1566,7 @@ impl Painter {
             match (self.chunk_of.get(i).copied().flatten(), display.items.is_empty()) {
                 (Some(c), false) => {
                     let chunk = Chunk {
-                        id: ChunkId(key(&node.path, Role::Chunk)),
+                        id: ChunkId(key(node.id, Role::Chunk)),
                         state: p.state(),
                         display,
                     };
@@ -1615,7 +1615,7 @@ impl Painter {
     /// content and keeps through a blink, so what it holds of the caret is
     /// as old as its own last recording, not the caret drawn.)
     fn caret_changed(&self, node: &FrameNode) -> bool {
-        let id = ChunkId(key(&node.path, Role::Overlay));
+        let id = ChunkId(key(node.id, Role::Overlay));
         self.chunks.get(&id).is_some_and(
             |r| matches!(&r.input, Input::Node { caret, .. } if *caret != caret_on(node, self.caret.clock)),
         )
@@ -1684,7 +1684,7 @@ impl Painter {
             let within = match node.scroll(SIGHT) {
                 Some(sc) => {
                     let index = u32::try_from(scrollers.len()).ok();
-                    let key = NodeKey::of(&node.path);
+                    let key = NodeKey::of(node.id);
                     // Its identity as the UI names it (`interact::owner_of`).
                     let owner = instance.or_else(|| frame.behaviour(i).and_then(|b| b.handlers.owner));
                     let identity = (key, owner);
@@ -1743,7 +1743,7 @@ impl Painter {
                     scroller: within,
                     wheel: wheel_below.last().copied().unwrap_or(false),
                     target: crate::compositor::HitTarget {
-                        key: NodeKey::of(&node.path),
+                        key: NodeKey::of(node.id),
                         owner: instance.or_else(|| frame.behaviour(i).and_then(|b| b.handlers.owner)),
                     },
                     cursor,
@@ -1752,7 +1752,7 @@ impl Painter {
             }
             if let Some(m) = &node.moving {
                 moving.push(MovingNode {
-                    key: NodeKey::of(&node.path),
+                    key: NodeKey::of(node.id),
                     transform: Some(p.transform),
                     effect: Some(p.effect),
                     moving: m.clone(),
@@ -1857,7 +1857,7 @@ impl Painter {
             rotate: t.rotate,
         });
         let transform = if node.translating || matrix.is_some() || node.moving.is_some() {
-            let id = self.transforms.id(key(&node.path, Role::Transform), now);
+            let id = self.transforms.id(key(node.id, Role::Transform), now);
             w.transform(
                 id,
                 TransformNode {
@@ -1880,7 +1880,7 @@ impl Painter {
         let clip = match node.clipper {
             Some(c) => {
                 let owner = frame.nodes.get(c);
-                let id = owner.map_or(0, |o| self.clips.id(key(&o.path, Role::Clip), now));
+                let id = owner.map_or(0, |o| self.clips.id(key(o.id, Role::Clip), now));
                 let up = self.placed.get(c);
                 let space = up.map_or(0, |o| o.transform);
                 // One chain across transforms: each clip carries its own
@@ -1905,7 +1905,7 @@ impl Painter {
             None => 0,
         };
         let effect = if effects::grouped(node) || node.moving.is_some() {
-            let id = self.effects.id(key(&node.path, Role::Effect), now);
+            let id = self.effects.id(key(node.id, Role::Effect), now);
             let opacity = if node.look.invisible { 0.0 } else { node.look.opacity };
             let subtree = matrix.is_some() || node.look.opacity < 1.0;
             if let Some(r) = self.region.get_mut(i) {
@@ -1939,7 +1939,7 @@ impl Painter {
         };
         let content = match node.scroll(SIGHT) {
             Some(s) => {
-                let id = self.transforms.id(key(&node.path, Role::Content), now);
+                let id = self.transforms.id(key(node.id, Role::Content), now);
                 w.transform(
                     id,
                     TransformNode {
@@ -1962,7 +1962,7 @@ impl Painter {
             let b = node.bounds(SIGHT);
             let radius = node.look.shape.used(b.width, b.height);
             let (padding, radius) = border_inner(b, radius, node.look.border).unwrap_or((b, radius));
-            let id = self.clips.id(key(&node.path, Role::Clip), now);
+            let id = self.clips.id(key(node.id, Role::Clip), now);
             w.clip(
                 id,
                 ClipNode {
@@ -2002,7 +2002,7 @@ impl Painter {
     ) -> Arc<Display> {
         let now = self.frame;
         let overlay = matches!(role, Role::Overlay);
-        let id = ChunkId(key(&node.path, role));
+        let id = ChunkId(key(node.id, role));
         let caret = caret_on(node, self.caret.clock);
         // What it may record: what its clip shows, and a margin.
         // A text input's content (its overlay chunk) lies under its scroll.
@@ -2218,7 +2218,7 @@ impl Painter {
                 *c = Some(scene.chunks.len());
             }
             scene.chunks.push(Chunk {
-                id: ChunkId(key(&node.path, Role::Overlay)),
+                id: ChunkId(key(node.id, Role::Overlay)),
                 state: p.over_state(),
                 display,
             });
@@ -2249,7 +2249,7 @@ impl Painter {
             let thumb_h = (b.height * b.height / content_h).max(20.0);
             let travel = (b.height - thumb_h - 4.0).max(0.0);
             let along = travel * (scroll.offset.1 / scroll.max.1);
-            let transform = self.transforms.id(key(&node.path, Role::ThumbTransform), now);
+            let transform = self.transforms.id(key(node.id, Role::ThumbTransform), now);
             w.transform(
                 transform,
                 TransformNode {
@@ -2263,7 +2263,7 @@ impl Painter {
             // `ScrollbarAnimationController`): hidden at rest, shown by the
             // compositor while the user scrolls it, then faded out. Its
             // opacity is this effect's, which only the compositor moves.
-            let effect = self.effects.id(key(&node.path, Role::ThumbEffect), now);
+            let effect = self.effects.id(key(node.id, Role::ThumbEffect), now);
             w.effect(
                 effect,
                 EffectNode {
@@ -2286,7 +2286,7 @@ impl Painter {
                 },
             );
             self.thumb_nodes.insert(
-                NodeKey::of(&node.path),
+                NodeKey::of(node.id),
                 ThumbNode {
                     transform,
                     effect,
@@ -2294,7 +2294,7 @@ impl Painter {
                     travel,
                 },
             );
-            let id = ChunkId(key(&node.path, Role::Thumb));
+            let id = ChunkId(key(node.id, Role::Thumb));
             let same = self.chunks.get(&id).is_some_and(|r| {
                 matches!(r.input, Input::Thumb { space, max, thumb, scale: k }
                     if space == node.space(SIGHT) && max == scroll.max && thumb == scroll.thumb && k == scale)
@@ -2713,7 +2713,7 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
             }
         }
         Content::Drawn(d) => {
-            let key = foldhash::fast::FixedState::with_seed(0x51c7_d2a9).hash_one(&node.path);
+            let key = foldhash::fast::FixedState::with_seed(0x51c7_d2a9).hash_one(node.id.published());
             d.shape(text);
             d.draw(node.content_box(SIGHT), target.scale, key, target.items);
         }
@@ -2890,12 +2890,12 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
         frame
             .nodes
             .iter()
-            .find(|n| {
+            .position(|n| {
                 [Role::Chunk, Role::Overlay, Role::Thumb]
                     .into_iter()
-                    .any(|r| key(&n.path, r) == id.0)
+                    .any(|r| key(n.id, r) == id.0)
             })
-            .map_or_else(|| format!("{id:?}"), |n| n.path.to_string())
+            .map_or_else(|| format!("{id:?}"), |i| frame.path_of(i).to_string())
     };
     if a.background != b.background || a.size != b.size || a.scale != b.scale {
         return Some("the target".to_owned());

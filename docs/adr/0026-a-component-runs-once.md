@@ -294,8 +294,15 @@ Today the virtual list chooses its window when it renders (`list/virtual_list.rs
 - **No row is pooled across keys.** A row that leaves the window is disposed; one that returns is a new mount. What
   is reused is storage (slots on a free list). State that leaks from one key to the next is the failure a pool
   invites.
-- **Duplicate keys outside the window** cannot be seen by the diff. An `each` source reports its keys; a windowed
-  source checks the whole key set in debug builds and reports a duplicate there.
+- **Duplicate keys outside the window** cannot be seen by the diff. An `each` source reports its keys. A windowed
+  list in a debug build owns one more effect, absent from release builds: it reads `rows()` and `key(i)` for
+  every row, tracked, and reports each key that two rows share and the window does not already show twice. It
+  reruns when anything it read changes, so a key changed in place at a fixed row count is checked; scroll and
+  window shifts do not rerun it. Keys computed from untracked data are not seen, by this check or by the window.
+  Sources above 2^20 rows are not checked: the effect reports once that the source is too large to check, and the
+  window's `each` still reports duplicates it shows. Each run checks one snapshot in one turn, never over several
+  frames. Revisit when sources feed the change log (K5): the check then keeps a key count updated per change and
+  drops the cap.
 - Reindexing after a splice writes `index` of rows that asked for it. The end spacer, the scroll anchor and the
   placement origin are the list state's. Paint order, hit testing and AccessKit actions follow the retained child order, not storage order
   (K5).
@@ -351,6 +358,45 @@ Today the virtual list chooses its window when it renders (`list/virtual_list.rs
 - **Generations: one policy for every engine id** (wave C §3.12). A slot whose generation would overflow is retired
   and never reused; an id never wraps. Every generation is 32 bits, node and synthetic slots included, so one slot is
   lost per 2³² reuses of it; retired slots are counted in devtools `memory`.
+- **As built (K4e; architect decision D025).** Until K8 every frame still gathers an element tree and layout patches
+  its retained tree from it, so identity is minted where retained nodes are made:
+  - *Who mints.* Each `LayoutTree` owns one allocator (`geometry::Ids`): live domain for the window's tree, cold
+    domain for a detached tree (a cold check's, a fork's). A node takes its id when it is built and keeps it while it
+    is patched, through a keyed move (the patch matches it by key). Release frees the slot with its generation bumped.
+    The allocator survives `forget` (the rebuild after a panicked pass).
+  - *Correspondence is adoption at build.* The legacy patch still matches elements by `PathSeg` (the stand-in for the
+    three-part key of "What a cold frame runs"), and a tree's adoption map, keyed by that path, gives a node being
+    built the id it should have: the cold tree is seeded from the live tree (a cold node standing for a live node
+    carries the live id, so frames compare directly and live per-node state is read; one with no correspondent has a
+    cold-domain id, so a structural difference shows); `forget` keeps its own map, and what the rebuild did not adopt
+    is released in that pass; a node released because it takes no space (`display: none`), or kept by a running
+    exit (the legacy ghost), parks its id until its parent is built again without it, or its exit ends. Adoption
+    takes an entry out, so it is injective: a second node at the same path gets a fresh id. The cold tree never
+    writes the live map.
+  - *Hidden is not unmounted.* A node hidden and shown again keeps its id, its scroll offset and its accessibility id,
+    as it kept its path before.
+  - *A change of owning instance at one place is a new node.* The patch releases and builds a node whose element
+    names another instance (`Handlers::instance`), so a component replaced by another at its key is new nodes, and
+    `ScrollId` is the `NodeId` alone (the owner it carried is gone).
+  - *Paths leave frames and consumers.* A frame node carries its `NodeId` and its last `PathSeg`; `@PATH` is derived
+    from parent links and each layer's anchor (`Frame::path_of`); "is below" is a walk of parent links; focus within
+    and a press's "covers" keep the ancestor ids taken once when focus moves or the press starts. Paint's property and
+    chunk ids, `NodeKey` and AccessKit ids are the published id. A text run's AccessKit id is a hash of its owner's
+    published id and its line, folded into the synthetic domain so it never names a node; a per-owner allocator of
+    synthetic ids is not built (a hash collision between two runs is a duplicate AccessKit id, the reason to revisit).
+    `inspect::NodeChange` names its node by id; the frame report's text prints the id, devtools `diff` the derived
+    path of a node still in the frame.
+  - *Unkeyed siblings beside a range* are placed by `PathSeg::Index` of their static place in their parent's
+    element list (`Common::place`), the seg they have when no range is there, so opening a branch, inserting rows
+    before them, or adding a control node beside them leaves their identity (issue K4a/25). An unkeyed component
+    there carries the place through its instance (`Chain::Root`'s third field, `Instance::place`) to its output's
+    root, and a layer whose content is a range to its box; the hashed static key is gone. Range rows are keyed
+    instances (`PathSeg::Component`), so a static `Index` never meets a row's segment.
+  - *What stays until K8.* `NodePath` lives inside layout (the patch's match key, the adoption map) and in the
+    legacy ghost splice of `Motion` (one path per leaving entry, gone with the ghost at K4d/K8), and, for K4c's
+    virtual list until it moves to ids, in `ScrollLayout::path` and `focus::path_of`. `patch`,
+    `patch_children` and the `ptr_eq` shortcuts stay as the one way an element becomes a retained node while the
+    workspace gathers elements; K8 deletes them with the old path, and K5's commit log replaces matching.
 
 ### The frame
 

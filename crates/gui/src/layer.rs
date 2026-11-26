@@ -28,7 +28,6 @@ use std::rc::Rc;
 
 use crate::events::Modifiers;
 use crate::focus::FocusScope;
-use crate::geometry::NodePath;
 use crate::layout::Frame;
 
 /// What a pointer is.
@@ -446,10 +445,7 @@ impl Stack {
         self.tab_keys.clear();
         self.tab_keys.push(None);
         for l in &frame.layers {
-            let owner = frame
-                .nodes
-                .get(l.root)
-                .and_then(|root| owner_of(frame, l.root, &root.path));
+            let owner = l.owner;
             self.owners.push(owner);
             self.tab_owners.push(owner);
             self.tab_keys.push(None);
@@ -475,12 +471,9 @@ impl Stack {
         }
         *asked = l.tab_after;
         let part = owner.zip(l.tab_after).and_then(|(o, key)| {
-            let path = &frame.nodes.get(o)?.path.0;
             (o..l.root).find(|&i| {
                 crate::interact::visited();
-                frame.nodes.get(i).is_some_and(|n| {
-                    n.path.0.starts_with(path) && n.path.0.last().and_then(|s| s.element_key()) == Some(key)
-                })
+                frame.nodes.get(i).is_some_and(|n| n.seg.element_key() == Some(key)) && frame.is_below(i, o)
             })
         });
         if let Some(slot) = self.tab_owners.get_mut(n) {
@@ -586,20 +579,4 @@ pub(crate) fn layer_start(frame: &Frame, layer: usize) -> usize {
         None => 0,
         Some(l) => frame.layers.get(l).map_or(frame.nodes.len(), |l| l.root),
     }
-}
-
-/// The node a deferred subtree whose root is node `root` at `path` was
-/// declared in: the node before it in paint order with the longest path
-/// that is a proper prefix of `path`.
-fn owner_of(frame: &Frame, root: usize, path: &NodePath) -> Option<usize> {
-    let segs = &path.0;
-    let mut best: Option<(usize, usize)> = None;
-    for (i, n) in frame.nodes.iter().enumerate().take(root) {
-        crate::interact::visited();
-        let p = &n.path.0;
-        if p.len() < segs.len() && segs.starts_with(p) && best.is_none_or(|(_, len)| p.len() > len) {
-            best = Some((i, p.len()));
-        }
-    }
-    best.map(|(i, _)| i)
 }

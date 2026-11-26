@@ -19,10 +19,13 @@ fn a_live_pipeline_dropped_in_a_check_retires_its_mail() {
     let mut sender = None;
     window.act("register", || sender = Some(gui::mailbox(|_: u8| {})));
     let sender = sender.expect("made in the window");
-    assert!(sender.send(1), "open: the window takes mail");
+    assert!(sender.send(1).is_ok(), "open: the window takes mail");
     gui::testing::in_check(move || drop(window));
     gui::engine::shutdown();
-    assert!(!sender.send(42), "the window closed live: its mailbox is retired");
+    assert!(
+        sender.send(42).is_err(),
+        "the window closed live: its mailbox is retired"
+    );
 }
 
 /// A live root a check drops ends live once the check has switched back:
@@ -42,11 +45,11 @@ fn a_live_root_dropped_in_a_check_retires_its_mail() {
     });
     let _ = root.resolve();
     let sender = made.take().expect("rendered");
-    assert!(sender.send(1), "mounted: its mailbox takes mail");
+    assert!(sender.send(1).is_ok(), "mounted: its mailbox takes mail");
     gui::testing::in_check(move || drop(root));
-    assert!(sender.send(2), "the check's drop retires nothing live");
+    assert!(sender.send(2).is_ok(), "the check's drop retires nothing live");
     gui::engine::shutdown();
-    assert!(!sender.send(42), "the root ended live: its mailbox is retired");
+    assert!(sender.send(42).is_err(), "the root ended live: its mailbox is retired");
     scope.dispose();
 }
 

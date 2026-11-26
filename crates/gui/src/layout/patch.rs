@@ -30,12 +30,25 @@ fn kind_of(el: &Element) -> u8 {
     }
 }
 
-/// The focus handle of a node: its own, or one from its path when it is
+/// The component instance whose output's root `el` is, if it is one.
+fn instance_of(el: &Element) -> Option<crate::reactive::OwnerId> {
+    el.common().and_then(|c| c.handlers.instance)
+}
+
+/// Whether retained node `e` stands for `el` when patched: the same kind,
+/// made by the same instance. One another instance made at its place (a
+/// component replaced at its key) is another node, with an id of its own
+/// (ADR-0026, "As built (K4e)").
+fn stands_for(e: &Extra, el: &Element) -> bool {
+    e.kind == kind_of(el) && instance_of(&e.element) == instance_of(el)
+}
+
+/// The focus handle of a node: its own, or one from its id when it is
 /// focusable by place.
-fn focus_of(common: &Common, path: &NodePath) -> Option<FocusHandle> {
+fn focus_of(common: &Common, id: crate::geometry::NodeId) -> Option<FocusHandle> {
     common
         .focus
-        .or_else(|| common.focusable.then(|| FocusHandle::for_path(path)))
+        .or_else(|| common.focusable.then(|| FocusHandle::for_node(id)))
 }
 
 /// What resolving a node's own style and content found.
@@ -76,7 +89,7 @@ impl LayoutTree {
     ) -> Option<(Node, engine::Change)> {
         let same = old
             .as_ref()
-            .is_some_and(|n| self.extra(n.user).is_some_and(|e| e.kind == kind_of(el)));
+            .is_some_and(|n| self.extra(n.user).is_some_and(|e| stands_for(e, el)));
         if same && let Some(mut n) = old {
             return match self.patch(pass, &mut n, el, inherit, layer, false) {
                 Some(change) => Some((n, change)),
@@ -109,7 +122,9 @@ impl LayoutTree {
     ) -> Option<Node> {
         el.common()?;
         self.structure = true;
+        let (id, parked) = self.take_id(&path);
         let u = self.alloc(Box::new(Extra {
+            id,
             path: path.clone(),
             kind: kind_of(el),
             name: None,
@@ -141,11 +156,13 @@ impl LayoutTree {
             inherit: None,
             mine: inherit.clone(),
             parent,
+            anchor: NO_SLOT,
             own: need::RESOLVE,
             below: 0,
             index: u32::MAX,
             ran: u64::MAX,
             kids: None,
+            rebuilt: 0,
             resolve: Tracker::default(),
             place: Tracker::default(),
             focus_id: None,
@@ -159,10 +176,13 @@ impl LayoutTree {
             interaction: crate::engine::Ends::default(),
         }));
         self.by_path.insert(path, u);
+        self.by_id.insert(id, u);
         let mut node = Node::new(BoxStyle::default(), None);
         node.user = u;
         if self.patch(pass, &mut node, el, inherit, layer, true).is_none() {
-            self.hide(parent, node);
+            // Hidden still: what of its subtree it parked stays parked.
+            let prior = self.untake(parked);
+            self.hide_as(parent, node, prior);
             return None;
         }
         Some(node)
@@ -230,6 +250,9 @@ impl LayoutTree {
         ex.mine = r.mine;
         ex.element = el.clone();
         ex.inherit = Some(inherit.clone());
+        // Its children are built again below: hidden ones it does not
+        // build again are gone ([`LayoutTree::settle_ids`]).
+        ex.rebuilt = self.passes;
         let visit = !common.joins.is_empty()
             || el
                 .kids()
@@ -238,7 +261,7 @@ impl LayoutTree {
         if visit {
             ex.own |= need::VISIT;
         }
-        if ex.motion && pass.motion.busy(&ex.path) {
+        if ex.motion && pass.motion.busy(ex.id) {
             // What moves is sampled again next pass.
             ex.own |= need::RESOLVE;
         }
@@ -321,6 +344,13 @@ impl LayoutTree {
     /// kind: [`Extra::trackers`]) as `parent`'s: a change there resolves
     /// `parent` again, which builds it.
     fn hide(&mut self, parent: u32, node: Node) {
+        self.hide_as(parent, node, Vec::new());
+    }
+
+    /// [`Self::hide`], with what its subtree parked before and did not
+    /// take again (ADR-0026, "As built (K4e)": hidden is not unmounted, so
+    /// its ids wait for it).
+    fn hide_as(&mut self, parent: u32, node: Node, prior: Vec<(NodePath, crate::geometry::NodeId)>) {
         let reads: Vec<crate::reactive::RenderNode> =
             self.extra(node.user).map_or_else(Vec::new, |e| e.trackers().collect());
         if !reads.is_empty() && parent != NO_SLOT {
@@ -375,7 +405,7 @@ impl LayoutTree {
                 p.hidden_waits = waits;
             }
         }
-        self.release(node);
+        self.release_as(node, (parent != NO_SLOT).then_some(parent), prior);
     }
 
     /// Whether the handle numbered `handle` is bound to `node` or a node
@@ -518,7 +548,7 @@ impl LayoutTree {
         if !common.joins.is_empty() {
             self.joining.push(u);
         }
-        let sampled = pass.motion.sample(&ex.path, &mut style);
+        let sampled = pass.motion.sample(ex.id, &ex.path, &mut style);
         ex.translating = sampled.translating;
         ex.curves = sampled.curves;
         ex.motion |= sampled.kept;
@@ -844,7 +874,7 @@ impl LayoutTree {
         let pass_through = common.pass_through || inert || passes;
         // An inert node keeps its focus id: it holds no focus as one not
         // shown ([`Frame::shown`]), and focus asked for it is refused.
-        let focus = focus_of(common, &ex.path).filter(|_| !disabled);
+        let focus = focus_of(common, ex.id).filter(|_| !disabled);
         let focus_id = focus.map(|h| h.id());
         // Patched to another focus handle (a field shown with another
         // `TextField`): the old one is no longer found here.
@@ -948,7 +978,7 @@ impl LayoutTree {
                     let seg = c.seg(i);
                     olds.next()
                         .and_then(|n| self.extra(n.user))
-                        .is_some_and(|e| e.kind == kind_of(c) && e.path.0.last() == Some(&seg))
+                        .is_some_and(|e| stands_for(e, c) && e.path.0.last() == Some(&seg))
                 })
                 && olds.next().is_none()
         };
@@ -1029,7 +1059,7 @@ impl LayoutTree {
             }
             let kind = kind_of(child);
             let here = old.get(i).and_then(Option::as_ref).and_then(|n| self.extra(n.user));
-            let at = if here.is_some_and(|e| e.kind == kind && e.path.0.last() == Some(&seg)) {
+            let at = if here.is_some_and(|e| stands_for(e, child) && e.path.0.last() == Some(&seg)) {
                 Some(i)
             } else {
                 index
@@ -1044,6 +1074,13 @@ impl LayoutTree {
                     })
                     .get(&(seg, kind))
                     .copied()
+                    // Another instance's node at its place is left to go.
+                    .filter(|&at| {
+                        old.get(at)
+                            .and_then(Option::as_ref)
+                            .and_then(|n| self.extra(n.user))
+                            .is_some_and(|e| stands_for(e, child))
+                    })
             };
             let found = at.and_then(|at| Some((at, old.get_mut(at)?.take()?)));
             match found {
@@ -1113,9 +1150,9 @@ impl LayoutTree {
     /// focus write them from then on. [`Self::resolve_own`] holds the
     /// order its bindings see them in.
     fn bind_flags(&self, state: &UiState, el: &Element, common: &Common, disabled: bool, ex: &mut Extra, layer: usize) {
-        let path = &ex.path;
+        let id = ex.id;
         let enabled = !disabled;
-        let focused = focus_of(common, path).is_some_and(|h| Some(h.id()) == state.focused);
+        let focused = focus_of(common, id).is_some_and(|h| Some(h.id()) == state.focused);
         match common.interaction {
             // A detached tree binds no handle a live node holds: its
             // bindings read the flags the window's own tree bound and
@@ -1127,16 +1164,16 @@ impl LayoutTree {
             Some(handle) => {
                 let i = ex.interaction.bind(handle);
                 let (focused, focus_visible, focus_within) = crate::interact::focus_flags(
-                    path,
+                    id,
                     layer,
                     focused,
                     matches!(el, Element::Input(_)),
-                    state.focus_at.as_ref().map(|(f, l)| (f, *l)),
+                    state.focus_at.as_ref(),
                     state.focus_visible,
                 );
                 i.write(crate::interact::Flags {
-                    hovered: enabled && state.hovered.contains(path),
-                    pressed: enabled && state.active.contains(path),
+                    hovered: enabled && state.hovered.contains(&id),
+                    pressed: enabled && state.active.contains(&id),
                     focused,
                     focus_visible,
                     focus_within,

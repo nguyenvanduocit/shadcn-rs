@@ -1107,7 +1107,7 @@ impl<P: 'static> Drawer<P> {
         }
         let o = gui::untracked(|| self.options());
         if let Some(veto) = &o.veto
-            && veto.call((open, reason)) == Dismiss::Veto
+            && veto.call((open, reason)) == Some(Dismiss::Veto)
         {
             return false;
         }

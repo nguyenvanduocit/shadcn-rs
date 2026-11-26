@@ -789,20 +789,26 @@ fn occurrences<T, K: Clone + Eq + Hash + Debug>(keys: &[K], report: Option<(&Des
                 key: format!("{key:?}"),
                 count,
             };
-            eprintln!("gui: {found}");
-            DUPLICATES.with(|d| {
-                let mut d = d.borrow_mut();
-                // Bounded: the oldest go first.
-                if d.len() >= DUPLICATES_KEPT {
-                    d.remove(0);
-                }
-                d.push(found);
-            });
+            report_duplicate(found);
         }
         reported.clear();
         reported.extend(repeated.into_iter().cloned());
     }
     occ
+}
+
+/// Tell `found`: through the frame's report and devtools, never on stderr
+/// (a list that keeps a duplicate would print per commit). A commit's, or
+/// one found outside a commit (a windowed list's debug scan of its whole
+/// source); bounded, the oldest go first.
+pub(crate) fn report_duplicate(found: DuplicateKey) {
+    DUPLICATES.with(|d| {
+        let mut d = d.borrow_mut();
+        if d.len() >= DUPLICATES_KEPT {
+            d.remove(0);
+        }
+        d.push(found);
+    });
 }
 
 /// How many duplicate-key reports wait for [`take_duplicate_keys`].

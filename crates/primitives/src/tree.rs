@@ -220,6 +220,7 @@ impl Default for TreeConfig {
 
 type Veto<K> = gui::Callback<(K, bool), Pick>;
 
+#[derive(Clone)]
 struct State<N: 'static, K: 'static> {
     data: TreeData<N, K>,
     config: TreeConfig,
@@ -431,7 +432,7 @@ impl<N: Clone + 'static, K: Clone + PartialEq + Eq + Hash + 'static, M: Choice<K
         }
         let open = !row.open;
         let veto = self.state.with_untracked(|s| s.veto_open.clone());
-        if veto.is_some_and(|f| f.call((row.key.clone(), open)) == Pick::Refuse) {
+        if veto.is_some_and(|f| f.call((row.key.clone(), open)) == Some(Pick::Refuse)) {
             return;
         }
         let key = row.key.clone();

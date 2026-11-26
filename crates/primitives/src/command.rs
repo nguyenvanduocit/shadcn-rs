@@ -641,14 +641,6 @@ impl Command {
         let flat = Signal::new(flatten(s0, f0, &query.get_untracked()));
         // The search a filter is for: a newer one makes older ones stale.
         let generation = Arc::new(AtomicU64::new(0));
-        let arrived = {
-            let generation = Arc::clone(&generation);
-            gui::mailbox(move |(g, rows): (u64, FlatRows)| {
-                if g == generation.load(AtomicOrdering::Relaxed) && flat.is_alive() {
-                    flat.set(Flat(Rc::new(rows)));
-                }
-            })
-        };
         watch(
             move || (sections.get(), query.get()),
             move |(SectionsRef(s, f), q), _| {
@@ -658,19 +650,29 @@ impl Command {
                     flat.set(flatten(Arc::clone(s), Arc::clone(f), q));
                     return;
                 }
-                let (s, f, q, tx, at) = (
+                let (s, f, q, at, now) = (
                     Arc::clone(s),
                     Arc::clone(f),
                     q.clone(),
-                    arrived.clone(),
+                    Arc::clone(&generation),
                     Arc::clone(&generation),
                 );
-                std::thread::spawn(move || {
-                    let stale = || at.load(AtomicOrdering::Relaxed) != g;
-                    if let Some(rows) = flatten_rows(s, f, &q, &stale) {
-                        tx.send((g, rows));
-                    }
-                });
+                // Off the UI thread, owned by the list (ADR-0026): cancelled
+                // with it, and stale once a newer search starts.
+                gui::spawn(
+                    move |cancel| {
+                        let stale = || cancel.is_cancelled() || at.load(AtomicOrdering::Relaxed) != g;
+                        flatten_rows(s, f, &q, &stale)
+                    },
+                    move |rows| {
+                        if let Some(rows) = rows
+                            && g == now.load(AtomicOrdering::Relaxed)
+                            && flat.is_alive()
+                        {
+                            flat.set(Flat(Rc::new(rows)));
+                        }
+                    },
+                );
             },
         );
         // The list's rows follow the data: other rows have other heights,

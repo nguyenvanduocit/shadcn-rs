@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use crate::edit::TextEdit;
 use crate::engine::{Commit, Owned};
-use crate::geometry::NodePath;
+use crate::geometry::{NodeId, NodePath, PathSeg};
 use crate::layer::{Entry, Layer, Stack, layer_start, within};
 use crate::layout::Frame;
 
@@ -266,8 +266,8 @@ crate::engine::engine_local! {
 /// Each window has its own, so laying one out or moving focus in it leaves
 /// another's as it was.
 pub struct FocusRoot {
-    /// Mixed into its path-derived ids ([`FocusHandle::for_path`]), so the
-    /// same place in two windows is two nodes.
+    /// Mixed into its node-derived ids ([`FocusHandle::for_node`]), so the
+    /// same node id in two windows is two nodes.
     salt: u64,
     focused: Owned<Option<FocusId>>,
     /// Whether the input modality was [`Modality::Keyboard`] when focus last
@@ -497,7 +497,7 @@ impl FocusRoot {
     /// (`engine::turn`).
     #[must_use]
     pub fn new() -> Rc<Self> {
-        // Hashed into the handles of its paths ([`FocusHandle::for_path`]),
+        // Hashed into the handles of its nodes ([`FocusHandle::for_node`]),
         // which a caller holds: unique as they are.
         let salt = crate::engine::unique_id(&WINDOWS);
         WINDOW_WORK.with_borrow_mut(|w| w.insert(salt, WindowWork::default()));
@@ -820,14 +820,15 @@ impl FocusHandle {
         }
     }
 
-    /// The handle of a node focusable by its place in the tree of the
-    /// current window: the same place in another window is another node.
+    /// The handle of a node focusable by its place, by its id in the tree
+    /// of the current window: the same id in another window is another
+    /// node.
     #[must_use]
-    pub fn for_path(path: &crate::geometry::NodePath) -> Self {
+    pub fn for_node(id: crate::geometry::NodeId) -> Self {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         current().salt.hash(&mut h);
-        path.hash(&mut h);
+        id.hash(&mut h);
         // The top bit keeps these apart from counted handles.
         Self {
             id: FocusId(h.finish() | (1 << 63)),
@@ -943,7 +944,12 @@ pub enum Modality {
 #[derive(Clone, Default)]
 struct Focusables {
     hidden: Vec<FocusId>,
-    paths: Vec<(FocusId, NodePath)>,
+    /// Each shown one's node, and where its chain starts and ends in
+    /// `chains`.
+    paths: Vec<(FocusId, NodeId, usize, usize)>,
+    /// The nodes from each shown one up, through layers, with their last
+    /// steps: one buffer, no allocation per node.
+    chains: Vec<(NodeId, PathSeg)>,
     /// The frame they were taken from: its epoch and change count.
     of: Option<(u64, usize)>,
 }
@@ -971,13 +977,16 @@ pub(crate) fn publish(frame: &Frame) {
         f.of = Some(key);
         f.hidden.clear();
         f.paths.clear();
+        f.chains.clear();
         for i in 0..frame.nodes.len() {
             let (Some(id), Some(n)) = (focus_at(frame, i), frame.nodes.get(i)) else {
                 continue;
             };
             if frame.shown(i) {
-                // Paths are shared: a clone is a count, not an allocation.
-                f.paths.push((id, n.path.clone()));
+                let start = f.chains.len();
+                f.chains
+                    .extend(frame.above(i).filter_map(|k| frame.nodes.get(k).map(|n| (n.id, n.seg))));
+                f.paths.push((id, n.id, start, f.chains.len()));
             } else {
                 f.hidden.push(id);
             }
@@ -990,11 +999,11 @@ pub(crate) fn publish(frame: &Frame) {
 /// layout, as focus moves.
 pub(crate) fn path_of(id: FocusId) -> Option<NodePath> {
     window_focus(|w| {
-        w?.focusables
-            .paths
-            .iter()
-            .find(|(i, _)| *i == id)
-            .map(|(_, p)| p.clone())
+        let f = &w?.focusables;
+        let &(_, _, from, to) = f.paths.iter().find(|(i, ..)| *i == id)?;
+        let mut segs: Vec<PathSeg> = f.chains.get(from..to)?.iter().map(|(_, s)| *s).collect();
+        segs.reverse();
+        Some(NodePath::new(segs.into()))
     })
 }
 
@@ -1292,10 +1301,10 @@ pub(crate) fn drop_lost(frame: &Frame) -> bool {
 
 /// A scope open in the last settled frame.
 struct Open {
-    /// Its region's path.
-    path: NodePath,
-    /// Its owner's path.
-    owner: Option<NodePath>,
+    /// Its region's node.
+    path: NodeId,
+    /// Its owner's node.
+    owner: Option<NodeId>,
     /// What held focus as it opened.
     to: Option<FocusId>,
     /// The node inside it that last held focus.
@@ -1329,7 +1338,7 @@ pub(crate) struct FocusManager {
     /// Every layer's region path as the last settle saw them: a layer not
     /// among them opened in this frame, and focus its opening moved is no
     /// focus outside it.
-    seen: Vec<NodePath>,
+    seen: Vec<NodeId>,
     /// The frame (its epoch and change count, which a trim never repeats)
     /// and the focus the last settle left: the rules read nothing else, so
     /// the same again is settled already.
@@ -1347,8 +1356,7 @@ impl FocusManager {
         if !handed && self.settled == Some((key, before)) {
             return Settled::default();
         }
-        // Paths are shared: a clone is a count, not an allocation.
-        let path = |i: usize| frame.nodes.get(i).map(|n| n.path.clone());
+        let path = |i: usize| frame.nodes.get(i).map(|n| n.id);
         let now = || {
             stack
                 .entries
@@ -1391,7 +1399,7 @@ impl FocusManager {
                 .map(FocusHandle::id)
                 .filter(live)
                 .or_else(|| c.to.filter(live))
-                .or_else(|| c.owner.as_ref().and_then(|o| near_owner(frame, stack, o)));
+                .or_else(|| c.owner.and_then(|o| near_owner(frame, stack, o)));
             // Nowhere to give it back to (its opener went with it): left
             // where it was, gone, for an enclosing trap's rule below to take
             // back inside it, else for the fixup at the end to drop.
@@ -1507,10 +1515,10 @@ impl FocusManager {
     /// it is not a primary press outside a modal layer: its scope gives no
     /// focus back as it closes (ADR-0024).
     pub(crate) fn pressed_outside(&mut self, frame: &Frame, i: usize) {
-        let Some(p) = frame.nodes.get(i).map(|n| &n.path) else {
+        let Some(p) = frame.nodes.get(i).map(|n| n.id) else {
             return;
         };
-        if let Some(o) = self.open.iter_mut().find(|o| o.path == *p) {
+        if let Some(o) = self.open.iter_mut().find(|o| o.path == p) {
             o.pressed_outside = true;
         }
     }
@@ -1566,8 +1574,8 @@ fn first_in(frame: &Frame, stack: &Stack, e: &Entry) -> Option<FocusId> {
 /// Where focus goes back to when what held it is gone: the first focusable
 /// node of the owner at `owner` (its trigger), else its nearest focusable
 /// ancestor.
-fn near_owner(frame: &Frame, stack: &Stack, owner: &NodePath) -> Option<FocusId> {
-    let o = frame.nodes.iter().position(|n| n.path == *owner)?;
+fn near_owner(frame: &Frame, stack: &Stack, owner: NodeId) -> Option<FocusId> {
+    let o = frame.index_of(owner)?;
     if stack.blocked(o) {
         return None;
     }

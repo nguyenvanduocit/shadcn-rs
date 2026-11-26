@@ -380,6 +380,11 @@ mod zone_tests {
     /// zones 25 hours apart (`TZ`), it names two different days, each the
     /// one it is now there.
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "the test runs itself again in two time zones (`TZ`): a process is the only way to set a zone"
+    )]
     fn today_follows_the_local_time_zone() {
         if std::env::var_os(PROBE).is_some() {
             let d = CalendarDate::today();

@@ -111,6 +111,7 @@ impl<T: Clone> Snapshot<T> {
     }
 }
 
+#[derive(Clone)]
 struct State<T: Clone> {
     items: SumTree<Plain<T>>,
     version: u64,

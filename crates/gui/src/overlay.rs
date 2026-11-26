@@ -133,7 +133,7 @@ pub fn record_overlay(size: (u32, u32), scale: f32, text: &mut TextSystem, overl
     }
     if let Some(n) = overlay.hovered {
         stroke(&mut target, n.bounds(SIGHT), 2.0, Color::hex(HOVER));
-        let label = format!("{}  {}  {}", n.path, describe(n), n.bounds(SIGHT));
+        let label = format!("{}  {}  {}", n.id, describe(n), n.bounds(SIGHT));
         chip(
             &mut target,
             text,

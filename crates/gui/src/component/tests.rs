@@ -163,7 +163,9 @@ fn a_callback_is_always_the_latest_and_never_renders_the_child() {
             .child(component(
                 Callback::new(move |x: i32| x + b),
                 move |cx: Ctx<Callback<i32, i32>>| {
-                    *call.borrow_mut() = Some(Callback::new(move |x| cx.props().with_untracked(|f| f.call(x))));
+                    *call.borrow_mut() = Some(Callback::new(move |x| {
+                        cx.props().with_untracked(|f| f.call(x)).unwrap_or_default()
+                    }));
                     move || {
                         bump(&c);
                         text("child").into_element()
@@ -175,11 +177,11 @@ fn a_callback_is_always_the_latest_and_never_renders_the_child() {
     root.resolve();
     let f = call_out.borrow().clone();
     let f = f.as_ref();
-    got.set(f.map_or(0, |f| f.call(1)));
+    got.set(f.and_then(|f| f.call(1)).unwrap_or(0));
     assert_eq!(got.get(), 11);
     base.set(20);
     root.resolve();
-    assert_eq!(f.map_or(0, |f| f.call(1)), 21, "the latest closure");
+    assert_eq!(f.and_then(|f| f.call(1)).unwrap_or(0), 21, "the latest closure");
     assert_eq!(child_renders.get(), 1);
 }
 
@@ -212,10 +214,10 @@ fn a_callback_the_child_kept_in_setup_calls_the_closure_passed_last() {
     });
     root.resolve();
     let kept = kept.borrow().clone().expect("kept in setup");
-    assert_eq!(kept.call(()), 1);
+    assert_eq!(kept.call(()), Some(1));
     id.set(2);
     root.resolve();
-    assert_eq!(kept.call(()), 2, "the closure passed last");
+    assert_eq!(kept.call(()), Some(2), "the closure passed last");
     assert_eq!(child_renders.get(), 1, "the child not rendered again");
 }
 
@@ -259,7 +261,7 @@ fn a_shared_callback_replaced_for_one_child_stays_for_the_other() {
         .iter()
         .map(|(clone, handle)| (clone.call(()), handle.call(())))
         .collect();
-    assert_eq!(calls, [("save", "save"), ("save", "other")]);
+    assert_eq!(calls, [(Some("save"), Some("save")), (Some("save"), Some("other"))]);
 }
 
 /// A parent passing, each render, a closure that wraps the one it passed
@@ -278,7 +280,7 @@ fn a_decorating_callback_calls_the_one_it_wraps_and_is_freed_with_the_tree() {
         let (t, before) = (Rc::clone(&token), prev.borrow().clone());
         let cb = Callback::new(move |x: i32| {
             let _ = &t;
-            before.as_ref().map_or(x, |b| b.call(x)) + 1
+            before.as_ref().and_then(|b| b.call(x)).unwrap_or(x) + 1
         });
         *prev.borrow_mut() = Some(cb.clone());
         let k = Rc::clone(&k);
@@ -294,10 +296,12 @@ fn a_decorating_callback_calls_the_one_it_wraps_and_is_freed_with_the_tree() {
     n.set(1);
     root.resolve();
     let handle = kept.borrow().clone().expect("kept");
-    assert_eq!(handle.call(0), 2, "the newest, wrapping the first once");
+    assert_eq!(handle.call(0), Some(2), "the newest, wrapping the first once");
     drop(root);
     assert!(weak.upgrade().is_none(), "freed with the tree");
-    assert_eq!(handle.call(0), 0, "its instance gone: nothing");
+    // `Ctx::event`'s handle is the instance's, made with no owner: it runs
+    // and finds nothing to call (ADR-0026 deletes it at K8).
+    assert_eq!(handle.call(0), Some(0), "its instance gone: nothing");
 }
 
 /// Props `(Option<Callback>, Callback)` going from `(None, b1)` to
@@ -324,10 +328,10 @@ fn handles_to_an_optional_and_a_plain_callback_call_their_own_fields() {
     });
     root.resolve();
     let (a, b) = kept.borrow().clone().expect("kept");
-    assert_eq!((a.call(()), b.call(())), ("", "b1"));
+    assert_eq!((a.call(()), b.call(())), (Some(""), Some("b1")));
     with_a.set(true);
     root.resolve();
-    assert_eq!((a.call(()), b.call(())), ("a", "b2"));
+    assert_eq!((a.call(()), b.call(())), (Some("a"), Some("b2")));
 }
 
 /// The cold check renders the parent again, which passes a closure of
@@ -351,13 +355,13 @@ fn a_cold_check_leaves_what_a_held_handle_calls() {
     });
     root.resolve();
     let handle = kept.borrow().clone().expect("kept");
-    assert_eq!(handle.call(()), 1);
+    assert_eq!(handle.call(()), Some(1));
     root.cold(|frame| {
         frame.resolve();
         assert_eq!(renders.get(), 2, "the cold check rendered the parent");
     });
-    assert_eq!(handle.call(()), 1, "the live closure, not the cold one");
-    assert_eq!(handle.call(()), 1);
+    assert_eq!(handle.call(()), Some(1), "the live closure, not the cold one");
+    assert_eq!(handle.call(()), Some(1));
 }
 
 #[test]
@@ -652,7 +656,7 @@ fn a_cold_render_that_panics_leaves_the_live_props_and_ends_the_cold_check() {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold(|f| f.resolve())));
     assert!(caught.is_err(), "the cold render panicked");
     assert!(!is_cold_render(), "the cold check is over");
-    assert_eq!(handle.call(()), 1, "the live closure");
+    assert_eq!(handle.call(()), Some(1), "the live closure");
 }
 
 /// A child's props signal, kept by a test.
@@ -873,7 +877,8 @@ fn handlers_given_to_one_node_add_up_by_their_rules() {
 
 /// Every path of the scenario's last frame, which must all differ.
 fn unique_paths(s: &crate::app::Scenario) -> Vec<crate::geometry::NodePath> {
-    let paths: Vec<_> = s.last().nodes.iter().map(|n| n.path.clone()).collect();
+    let f = s.last();
+    let paths: Vec<_> = (0..f.nodes.len()).map(|i| f.path_of(i)).collect();
     for (i, p) in paths.iter().enumerate() {
         assert!(!paths[..i].contains(p), "{p} twice in {paths:?}");
     }
@@ -1011,7 +1016,7 @@ fn a_keyed_wrapper_keeps_its_drag_as_a_sibling_is_inserted_before_it() {
 
 /// The frame node whose last path segment is `seg`.
 fn node_by_seg(s: &crate::app::Scenario, seg: crate::geometry::PathSeg) -> Option<usize> {
-    s.last().nodes.iter().position(|n| n.path.0.last() == Some(&seg))
+    s.last().nodes.iter().position(|n| n.seg == seg)
 }
 
 #[test]
@@ -1054,8 +1059,8 @@ fn a_cached_root_given_again_is_marked_once_and_is_the_same_node() {
     let owner = crate::reactive::Scope::new().id().owner_id();
     let cached = div().width(10.0).into_element();
     let mut cache = None;
-    let first = mark_root(&mut cache, cached.clone(), Some(7), owner);
-    let again = mark_root(&mut cache, cached.clone(), Some(7), owner);
+    let first = mark_root(&mut cache, cached.clone(), Some(7), None, owner);
+    let again = mark_root(&mut cache, cached.clone(), Some(7), None, owner);
     assert!(first.ptr_eq(&again), "the same marked node");
     assert!(!first.ptr_eq(&cached), "the cached one is left as it was");
     assert_eq!(first.common().and_then(|c| c.handlers.instance), Some(owner));

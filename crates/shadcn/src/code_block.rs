@@ -455,9 +455,10 @@ pub fn code_block_copy_button(value: impl Into<String>) -> Part<CodeBlockCopyPro
             let reset: Signal<Option<TimerId>> = Signal::new(None);
             // The reset timer belongs to the instance: it is cancelled with it.
             let owner = gui::Scope::new();
-            let copy = move || {
-                let value = props.with_untracked(|p| p.props.value.clone());
-                if !gui::clipboard::copy(&value) {
+            // "Copied" shows on the clipboard's answer (ADR-0028: an effect
+            // with an outcome is confirm-then-act).
+            let answer = gui::port(move |(wrote, ()): (gui::clipboard::Wrote, ())| {
+                if wrote.is_err() {
                     return;
                 }
                 if let Some(timer) = reset.get_untracked() {
@@ -465,6 +466,10 @@ pub fn code_block_copy_button(value: impl Into<String>) -> Part<CodeBlockCopyPro
                 }
                 copied.set(true);
                 reset.set(Some(owner.run(|| clock::after(COPIED_FOR, move || copied.set(false)))));
+            });
+            let copy = move || {
+                let value = props.with_untracked(|p| p.props.value.clone());
+                gui::clipboard::write(value, (), answer);
             };
             move || {
                 let shown = if copied.get() { Icon::Check } else { Icon::Copy };

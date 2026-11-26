@@ -50,15 +50,16 @@ use crate::scene::{
 };
 use crate::text::{GlyphUpdate, Glyphs};
 
-/// A laid-out node across frames, by its path (what the painter keys its
-/// property tree nodes by).
+/// A laid-out node across frames, by its published id (ADR-0026, what the
+/// painter keys its property tree nodes by): two nodes never share one,
+/// and a stale one names no node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NodeKey(pub u64);
 
 impl NodeKey {
     #[must_use]
-    pub fn of(path: &crate::geometry::NodePath) -> Self {
-        Self(path.key())
+    pub fn of(id: crate::geometry::NodeId) -> Self {
+        Self(id.published())
     }
 }
 

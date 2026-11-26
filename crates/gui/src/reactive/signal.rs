@@ -110,14 +110,14 @@ impl<T: fmt::Debug + 'static> fmt::Debug for Signal<T> {
     }
 }
 
-impl<T: Default + 'static> Default for Signal<T> {
+impl<T: Clone + Default + 'static> Default for Signal<T> {
     #[track_caller]
     fn default() -> Self {
         Self::new(T::default())
     }
 }
 
-impl<T: fmt::Debug + 'static> Signal<T> {
+impl<T: Clone + fmt::Debug + 'static> Signal<T> {
     /// A signal that traces and debug reports show by `label` instead of its
     /// id, and whose value the devtools read ([`super::probes`]) and, for a
     /// plain value (a number, `bool`, `char` or `String`), write.
@@ -129,12 +129,22 @@ impl<T: fmt::Debug + 'static> Signal<T> {
     }
 }
 
-impl<T: 'static> Signal<T> {
+impl<T: Clone + 'static> Signal<T> {
+    /// A signal holding `value`. `T: Clone` (ADR-0026, ADR-0028 "What
+    /// lands at K4a"): a signal holds a value, not a handle, so devtools
+    /// and stepping back can keep a copy of it.
+    ///
+    /// ```compile_fail
+    /// struct Handle;
+    /// let _ = gui::reactive::Signal::new(Handle);
+    /// ```
     #[track_caller]
     pub fn new(value: T) -> Self {
         Self::create(value, None, Location::caller())
     }
+}
 
+impl<T: 'static> Signal<T> {
     fn create(value: T, label: Option<&'static str>, created_at: &'static Location<'static>) -> Self {
         let cell: Rc<RefCell<Slot<T>>> = Rc::new(RefCell::new(Slot {
             value,

@@ -646,7 +646,7 @@ impl<P: 'static> Tooltip<P> {
         let f = self.overrides.with_untracked(Rc::clone);
         if *reason != DismissReason::Programmatic
             && let Some(veto) = gui::untracked(|| f()).veto
-            && veto.call(*reason) == Dismiss::Veto
+            && veto.call(*reason) == Some(Dismiss::Veto)
         {
             return Dismiss::Veto;
         }
@@ -657,6 +657,10 @@ impl<P: 'static> Tooltip<P> {
 
 /// The fork tests: forks are built in debug builds only (ADR-0028, F2).
 #[cfg(all(test, debug_assertions))]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "each test runs on a fresh thread of its own, for a fresh engine; no component code"
+)]
 mod tests {
     use super::{TooltipOptions, TooltipProvider};
 

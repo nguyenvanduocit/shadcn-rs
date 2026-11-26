@@ -56,7 +56,7 @@ use accesskit::{
 
 use crate::element::{InputType, Relations, Semantics};
 use crate::focus::FocusId;
-use crate::geometry::{Bounds, NodePath};
+use crate::geometry::Bounds;
 use crate::layout::{Behaviour, Changed, Content, Frame, FrameNode, ReadAt, Since, input_text};
 use crate::style::ResolvedText;
 use crate::text::{TextRun, TextSystem};
@@ -140,19 +140,19 @@ fn hasher() -> impl Hasher {
     foldhash::fast::FixedState::with_seed(0xa11e_5021).build_hasher()
 }
 
-/// A node's identity across frames: its path, so a screen reader's place
-/// survives a frame that rebuilds everything.
-pub(crate) fn id_of(path: &NodePath) -> NodeId {
-    let mut h = hasher();
-    path.hash(&mut h);
-    NodeId(h.finish().max(1))
+/// A node's identity across frames: its published [`crate::geometry::NodeId`]
+/// (ADR-0026), kept through a keyed move and a frame that rebuilds
+/// everything, never another node's.
+pub(crate) fn id_of(id: crate::geometry::NodeId) -> NodeId {
+    NodeId(id.published())
 }
 
-/// The id of text run `index` of the field `parent`.
+/// The id of text run `index` of the field `parent`: in the synthetic
+/// domain (the top bits 2), so it never names a node.
 fn run_id(parent: NodeId, index: usize) -> NodeId {
     let mut h = hasher();
     (parent.0, index, "run").hash(&mut h);
-    NodeId(h.finish().max(1))
+    NodeId((h.finish() & ((1 << 62) - 1)) | (2 << 62))
 }
 
 /// The node an action from assistive technology names, in `frame`: none
@@ -160,7 +160,7 @@ fn run_id(parent: NodeId, index: usize) -> NodeId {
 /// rendered), so an action queued for a node since dropped does nothing.
 #[must_use]
 pub fn target(frame: &Frame, id: NodeId) -> Option<usize> {
-    let i = frame.nodes.iter().position(|n| id_of(&n.path) == id)?;
+    let i = frame.nodes.iter().position(|n| id_of(n.id) == id)?;
     // Shown ([`Frame::shown`]), and out of the tree by none of its
     // ancestors' semantics.
     let in_tree = |k: usize| frame.shown(k) && frame.behaviour(k).is_some_and(|b| !b.semantics.hidden);
@@ -760,7 +760,7 @@ impl Accessibility {
         let Some(mut inputs) = inputs_of(frame, i, b, set, scrolls, unavailable, outer, space, hidden) else {
             return NONE;
         };
-        let id = id_of(&n.path);
+        let id = id_of(n.id);
         if !inputs.relations.is_empty() {
             self.relating.insert(id);
         }
@@ -769,7 +769,7 @@ impl Accessibility {
                 debug_assert!(
                     k.stamp != stamp,
                     "two nodes share the accessibility id {id:?} ({})",
-                    n.path
+                    frame.path_of(i)
                 );
                 k.stamp = stamp;
                 // Compared with the selection kept: a caret moved alone
@@ -1232,7 +1232,7 @@ pub(crate) fn selection_in(
         multiline: *multiline,
         focused: *focused,
     };
-    let parent = id_of(&n.path);
+    let parent = id_of(n.id);
     let runs = field_runs(&edit.text, &field, text);
     let byte = |p: &TextPosition| {
         runs.iter()

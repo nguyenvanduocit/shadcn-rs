@@ -756,6 +756,7 @@ impl Family {
 }
 
 /// The persisting of a group's layout.
+#[derive(Clone)]
 struct Persist {
     id: String,
     storage: Rc<dyn Storage>,
@@ -765,6 +766,7 @@ struct Persist {
 /// Its cells are the world's that made the group: a check writes none of a
 /// live one's (ADR-0034, S7). They are written only by the group's own
 /// layout callbacks, actions and drag handlers, never by a setup or render.
+#[derive(Clone)]
 struct State {
     options: Rc<dyn Fn() -> SplitterOptions>,
     direction: ReadDirection,

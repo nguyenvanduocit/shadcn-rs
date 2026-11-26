@@ -166,53 +166,207 @@ const ALLOWED: &[(&str, &str)] = &[
     ("shadcn:stepper.rs: type Fill", RENDER),
     ("shadcn:theme/handle.rs: Edit.0", "a theme edit: applied by its caller, in its turn"),
     ("shadcn:toggle_group.rs: ToggleGroupContext.look", PURE),
+    ("gui:port.rs: type Deliver", "a port's deliver: kept only inside Entry.deliver, a Stored"),
+    // K4g: bounds written only on an impl (CLIP's lint gaps).
+    ("gui:component.rs: Pending<S: Fn>", "a component's setup, kept until its description mounts: run once, in the render that mounts it (RENDER)"),
+    ("gui:value.rs: BoundWrite<W: Fn>", "a style write: pure, in its window's layout (as Run::Write.0)"),
+    ("gui:value.rs: Mount<W: Fn>", "a bound style write's mount: its write is BoundWrite's, run in its window's layout"),
+    ("gui:value.rs: FixedOr<S: Fn>", "a setter's value or closure: read where its node resolves, as Value::Bound.0 (PURE)"),
+    ("gui:value/source.rs: Closure<F: Fn>", "a setter's closure: read where its node resolves, in its window's phase (PURE)"),
+    ("gui:value/source.rs: Mapped<F: Fn>", "`signal.map(f)`: f reads only what it is given, where its node resolves (PURE)"),
+    ("gui:value/source.rs: Grouped<F: Fn>", "`group.map(f)`: f reads only what it is given, where its node resolves (PURE)"),
+    ("primitives:collection.rs: FromFn<A: Fn>", PURE),
+    ("primitives:collection.rs: FromFn<L: Fn>", PURE),
+    ("primitives:listbox.rs: OptionsFn<A: Fn>", PURE),
+    ("primitives:listbox.rs: OptionsFn<L: Fn>", PURE),
+    ("primitives:listbox.rs: OptionsFn<V: Fn>", PURE),
+    // K4g: closure types kept in a store a later turn reads (CLIP's lint
+    // gaps). Each keeps a type listed above, for the reason given there.
+    ("gui:mailbox.rs: engine_local! static BOXES", "the drains (type Drain, above): the engine's own, the user's handler inside each is Stored"),
+    ("gui:mailbox.rs: engine_local! static WAKE", "the window's wake (type Wake, above): rings the window, runs no user code"),
+    ("gui:layer.rs: engine_local! static ANSWERS", "the layers' dismiss handlers (type DismissHandler, above): run in the layer stack's dispatch, a turn of its window"),
+    ("gui:list/virtual_list.rs: engine_local! static LISTS", "the lists' states, each with its active-row hook (State.active_from, below): asked in its window's layout"),
+    ("gui:list/virtual_list.rs: State.active_from", "a Holder of the list's ActiveFrom (above): asked in its window's layout"),
+    ("primitives:accordion.rs: Accordion.state", "the part's State in a signal; its options closure (State.options, above) is PURE"),
+    ("primitives:carousel.rs: Carousel.state", "the part's State in a signal; its options closure (State.options, above) is PURE"),
+    ("primitives:pagination.rs: Pagination.state", "the part's State in a signal; its options closure (State.options, above) is PURE"),
+    ("primitives:scroll_area.rs: ScrollArea.state", "the part's State in a signal; its options closure (State.options, above) is PURE"),
+    ("primitives:splitter.rs: Splitter.state", "the part's State in a signal; its options closure (State.options, above) is PURE"),
+    ("primitives:tabs.rs: Tabs.state", "the part's State in a signal; its options closure (State.options, above) is PURE"),
+    ("primitives:tags_input.rs: TagsInput.state", "the part's State in a signal; its availability closure (State.tag_availability, above) is PURE"),
+    ("primitives:command.rs: Command.holds", "the filter (type Holds, above) in a signal: PURE, called where the list filters"),
+    ("primitives:form.rs: FormField.rule", "the field's rule (type Rule, above) in a signal: PURE, called where the field validates"),
+    ("primitives:hover.rs: Grace.on_exit", "a Callback in a signal: called by the grace area's own pointer handling, a dispatch of its window; it runs as its maker"),
+    ("primitives:presence.rs: Present.tell", "a Callback in a signal: called as the node reports a stage, through a hook after layout (Stored); it runs as its maker"),
+    ("primitives:tooltip.rs: engine_local! static ASKS", "a TooltipProvider whose options closure (TooltipProvider.options, above) is PURE"),
+    ("primitives:tooltip.rs: engine_local! static WINDOW", "a TooltipProvider whose options closure (TooltipProvider.options, above) is PURE"),
+    ("shadcn:message_scroller.rs: Engine.anchor_of", "a Holder of the anchor test (type IsAnchor, above): PURE"),
+    ("shadcn:navigation_menu.rs: Panels.0", "the panels' slots (type PanelSlot, above) in a signal: renders, called where the viewport renders"),
+];
+
+/// What the whole sources say a closure is, beyond `dyn Fn*` (CLIP's lint
+/// gaps, K4g): a trait of the crates that is a closure (an `Fn*`
+/// supertrait, a blanket impl over an `Fn*`-bounded type, or a `call`
+/// method), and a type of the crates that keeps one (it is a hit, or
+/// `Callback` and `Derive`), which counts where it is kept in a store a
+/// later turn reads: a signal, a holder, a registry, an app handle.
+#[derive(Default)]
+struct Known {
+    fn_traits: BTreeSet<String>,
+    /// Each type name the sources define, and the files that define one.
+    defined: std::collections::BTreeMap<String, BTreeSet<String>>,
+    /// Of those, the files whose type of that name keeps a closure.
+    wrappers: std::collections::BTreeMap<String, BTreeSet<String>>,
+}
+
+impl Known {
+    /// Whether `name`, written in `file`, is a type that keeps a closure:
+    /// the file's own type of that name if it defines one, else the
+    /// crates' (every type of that name keeps one); `Callback` and
+    /// `Derive` always.
+    fn is_wrapper(&self, name: &str, file: &str) -> bool {
+        let wraps = self.wrappers.get(name);
+        match self.defined.get(name) {
+            Some(files) if files.contains(file) => wraps.is_some_and(|w| w.contains(file)),
+            Some(files) => wraps.is_some_and(|w| files.is_subset(w)),
+            None => matches!(name, "Callback" | "Derive"),
+        }
+    }
+}
+
+/// The containers that keep a value for whoever reads it later.
+const STORES: &[&str] = &[
+    "Signal",
+    "Computed",
+    "Holder",
+    "Registry",
+    "Keyed",
+    "Collection",
+    "AppHandle",
+    "ForkMap",
 ];
 
 /// What a type holds.
-#[derive(Default)]
-struct Holds {
+struct Holds<'k> {
+    known: &'k Known,
+    /// The file the type is written in.
+    file: &'k str,
+    /// How many stores the visit is inside.
+    stored: usize,
     closure: bool,
 }
 
-impl<'a> Visit<'a> for Holds {
+impl<'a> Visit<'a> for Holds<'_> {
     fn visit_type_path(&mut self, t: &'a syn::TypePath) {
+        let Some(last) = t.path.segments.last() else {
+            return;
+        };
         // What a Stored keeps carries its window: not a hit.
-        if t.path.segments.last().is_some_and(|s| s.ident == "Stored") {
+        if last.ident == "Stored" {
             return;
         }
+        if self.stored > 0 && self.known.is_wrapper(&last.ident.to_string(), self.file) {
+            self.closure = true;
+        }
+        let store = STORES.iter().any(|s| last.ident == s);
+        if store {
+            self.stored = self.stored.saturating_add(1);
+        }
         syn::visit::visit_type_path(self, t);
+        if store {
+            self.stored = self.stored.saturating_sub(1);
+        }
     }
 
     fn visit_type_trait_object(&mut self, t: &'a syn::TypeTraitObject) {
-        if t.bounds.iter().any(is_fn_bound) {
+        if t.bounds.iter().any(|b| is_fn_bound(b, self.known)) {
             self.closure = true;
         }
         syn::visit::visit_type_trait_object(self, t);
     }
 
     fn visit_type_impl_trait(&mut self, t: &'a syn::TypeImplTrait) {
-        if t.bounds.iter().any(is_fn_bound) {
+        if t.bounds.iter().any(|b| is_fn_bound(b, self.known)) {
             self.closure = true;
         }
         syn::visit::visit_type_impl_trait(self, t);
     }
 }
 
-fn is_fn_bound(b: &syn::TypeParamBound) -> bool {
+fn is_fn_bound(b: &syn::TypeParamBound, known: &Known) -> bool {
     match b {
-        syn::TypeParamBound::Trait(t) => t
-            .path
-            .segments
-            .last()
-            .is_some_and(|s| s.ident == "Fn" || s.ident == "FnMut" || s.ident == "FnOnce"),
+        syn::TypeParamBound::Trait(t) => t.path.segments.last().is_some_and(|s| {
+            s.ident == "Fn"
+                || s.ident == "FnMut"
+                || s.ident == "FnOnce"
+                || known.fn_traits.contains(&s.ident.to_string())
+        }),
         _ => false,
     }
 }
 
-fn holds_closure(t: &syn::Type) -> bool {
-    let mut h = Holds::default();
+fn holds_closure(t: &syn::Type, known: &Known, file: &str) -> bool {
+    let mut h = Holds {
+        known,
+        file,
+        stored: 0,
+        closure: false,
+    };
     h.visit_type(t);
     h.closure
+}
+
+/// The traits of a file that are closures: an `Fn*` supertrait, a method
+/// named `call`, `call_mut` or `call_once`, or a blanket impl for an
+/// `Fn*`-bounded type.
+#[derive(Default)]
+struct Traits(BTreeSet<String>);
+
+impl<'a> Visit<'a> for Traits {
+    fn visit_item_trait(&mut self, t: &'a syn::ItemTrait) {
+        let none = Known::default();
+        let calls = t.items.iter().any(|i| {
+            matches!(i, syn::TraitItem::Fn(f) if matches!(f.sig.ident.to_string().as_str(), "call" | "call_mut" | "call_once"))
+        });
+        if calls || t.supertraits.iter().any(|b| is_fn_bound(b, &none)) {
+            self.0.insert(t.ident.to_string());
+        }
+    }
+
+    fn visit_item_impl(&mut self, i: &'a syn::ItemImpl) {
+        let none = Known::default();
+        if let Some((_, path, _)) = &i.trait_
+            && let syn::Type::Path(p) = &*i.self_ty
+            && let Some(ty) = p.path.get_ident()
+            && fn_bounded(&i.generics, &none).contains(&ty.to_string())
+            && let Some(name) = path.segments.last()
+        {
+            self.0.insert(name.ident.to_string());
+        }
+    }
+}
+
+/// The type parameters `g` bounds by `Fn*` (or a closure trait), in its
+/// list or its where clause.
+fn fn_bounded(g: &syn::Generics, known: &Known) -> BTreeSet<String> {
+    let mut bounded = BTreeSet::new();
+    for p in g.type_params() {
+        if p.bounds.iter().any(|b| is_fn_bound(b, known)) {
+            bounded.insert(p.ident.to_string());
+        }
+    }
+    if let Some(w) = &g.where_clause {
+        for pred in &w.predicates {
+            if let syn::WherePredicate::Type(t) = pred
+                && t.bounds.iter().any(|b| is_fn_bound(b, known))
+                && let syn::Type::Path(p) = &t.bounded_ty
+                && let Some(id) = p.path.get_ident()
+            {
+                bounded.insert(id.to_string());
+            }
+        }
+    }
+    bounded
 }
 
 fn is_test(attrs: &[syn::Attribute]) -> bool {
@@ -226,41 +380,82 @@ fn is_test(attrs: &[syn::Attribute]) -> bool {
 /// The hits of one file.
 struct Lint<'f> {
     file: &'f str,
+    known: &'f Known,
+    /// The file's type definitions' parameters, by name, in order: what an
+    /// impl's arguments stand for.
+    params: std::collections::BTreeMap<String, Vec<String>>,
     hits: Vec<String>,
 }
 
-impl Lint<'_> {
+impl<'f> Lint<'f> {
+    fn new(file: &'f str, known: &'f Known, syntax: &syn::File) -> Self {
+        let mut params = std::collections::BTreeMap::new();
+        for item in &syntax.items {
+            let (name, g) = match item {
+                syn::Item::Struct(s) => (&s.ident, &s.generics),
+                syn::Item::Enum(e) => (&e.ident, &e.generics),
+                _ => continue,
+            };
+            params.insert(name.to_string(), g.type_params().map(|p| p.ident.to_string()).collect());
+        }
+        Self {
+            file,
+            known,
+            params,
+            hits: Vec::new(),
+        }
+    }
+
     fn hit(&mut self, item: String) {
-        self.hits.push(format!("{}: {item}", self.file));
+        if !self.hits.iter().any(|h| h.ends_with(&format!(": {item}"))) {
+            self.hits.push(format!("{}: {item}", self.file));
+        }
     }
 
     /// A type definition's parameters bounded by `Fn*`.
     fn generics(&mut self, name: &syn::Ident, g: &syn::Generics) {
-        let mut bounded = BTreeSet::new();
-        for p in g.type_params() {
-            if p.bounds.iter().any(is_fn_bound) {
-                bounded.insert(p.ident.to_string());
-            }
-        }
-        if let Some(w) = &g.where_clause {
-            for pred in &w.predicates {
-                if let syn::WherePredicate::Type(t) = pred
-                    && t.bounds.iter().any(is_fn_bound)
-                    && let syn::Type::Path(p) = &t.bounded_ty
-                    && let Some(id) = p.path.get_ident()
-                {
-                    bounded.insert(id.to_string());
-                }
-            }
-        }
-        for p in bounded {
+        for p in fn_bounded(g, self.known) {
             self.hit(format!("{name}<{p}: Fn>"));
+        }
+    }
+
+    /// An impl's parameters bounded by `Fn*` that fill a parameter of the
+    /// type it implements: a field of that parameter keeps a closure,
+    /// though the type's definition bounds nothing. Named by the type's own
+    /// parameter when the file defines it, so a bound written on both is
+    /// one hit.
+    fn impl_bounds(&mut self, i: &syn::ItemImpl) {
+        let bounded = fn_bounded(&i.generics, self.known);
+        if bounded.is_empty() {
+            return;
+        }
+        let syn::Type::Path(p) = &*i.self_ty else { return };
+        let Some(last) = p.path.segments.last() else { return };
+        let syn::PathArguments::AngleBracketed(args) = &last.arguments else {
+            return;
+        };
+        let types = args.args.iter().filter_map(|a| match a {
+            syn::GenericArgument::Type(t) => Some(t),
+            _ => None,
+        });
+        for (k, t) in types.enumerate() {
+            if let syn::Type::Path(tp) = t
+                && let Some(id) = tp.path.get_ident()
+                && bounded.contains(&id.to_string())
+            {
+                let own = self
+                    .params
+                    .get(&last.ident.to_string())
+                    .and_then(|ps| ps.get(k).cloned())
+                    .unwrap_or_else(|| id.to_string());
+                self.hit(format!("{}<{own}: Fn>", last.ident));
+            }
         }
     }
 
     fn fields(&mut self, owner: &str, fields: &syn::Fields) {
         for (i, f) in fields.iter().enumerate() {
-            if is_test(&f.attrs) || !holds_closure(&f.ty) {
+            if is_test(&f.attrs) || !holds_closure(&f.ty, self.known, self.file) {
                 continue;
             }
             let name = f.ident.as_ref().map_or_else(|| i.to_string(), ToString::to_string);
@@ -274,21 +469,31 @@ impl Lint<'_> {
         flatten(tokens, &mut flat);
         let mut last_static = None;
         let mut said = BTreeSet::new();
-        for w in flat.windows(2) {
-            if let [TokenTree::Ident(a), TokenTree::Ident(b)] = w {
-                if a == "static" {
-                    last_static = Some(b.to_string());
-                }
-                // Only what a static the macro declares keeps: a macro
-                // that declares none (`parts_whole!`) keeps nothing.
-                if a == "dyn"
-                    && (b == "Fn" || b == "FnMut" || b == "FnOnce")
-                    && let Some(at) = &last_static
-                    && said.insert(at.clone())
-                {
-                    self.hit(format!("{name}! static {at}"));
-                }
+        let mut before: Option<String> = None;
+        for t in &flat {
+            let TokenTree::Ident(b) = t else {
+                before = None;
+                continue;
+            };
+            let b = b.to_string();
+            let after_static = before.as_deref() == Some("static");
+            if after_static {
+                last_static = Some(b.clone());
             }
+            // Only what a static the macro declares keeps: a macro that
+            // declares none (`parts_whole!`) keeps nothing. A static's
+            // value is a store: a closure type of the crates kept in it
+            // counts as `dyn Fn` does.
+            let closure = (before.as_deref() == Some("dyn")
+                && (b == "Fn" || b == "FnMut" || b == "FnOnce" || self.known.fn_traits.contains(&b)))
+                || (!after_static && self.known.is_wrapper(&b, self.file));
+            if closure
+                && let Some(at) = &last_static
+                && said.insert(at.clone())
+            {
+                self.hit(format!("{name}! static {at}"));
+            }
+            before = Some(b);
         }
     }
 }
@@ -318,6 +523,7 @@ impl<'a> Visit<'a> for Lint<'_> {
 
     fn visit_item_impl(&mut self, i: &'a syn::ItemImpl) {
         if !is_test(&i.attrs) {
+            self.impl_bounds(i);
             syn::visit::visit_item_impl(self, i);
         }
     }
@@ -349,14 +555,14 @@ impl<'a> Visit<'a> for Lint<'_> {
         if is_test(&t.attrs) {
             return;
         }
-        if holds_closure(&t.ty) {
+        if holds_closure(&t.ty, self.known, self.file) {
             self.hit(format!("type {}", t.ident));
         }
         self.generics(&t.ident, &t.generics);
     }
 
     fn visit_item_static(&mut self, s: &'a syn::ItemStatic) {
-        if !is_test(&s.attrs) && holds_closure(&s.ty) {
+        if !is_test(&s.attrs) && holds_closure(&s.ty, self.known, self.file) {
             self.hit(format!("static {}", s.ident));
         }
     }
@@ -387,10 +593,10 @@ fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Every hit in gui, primitives and shadcn src.
-fn hits() -> BTreeSet<String> {
+/// Every source of gui, primitives and shadcn, named `crate:file`, parsed.
+fn parsed() -> Vec<(String, syn::File)> {
     let crates = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    let mut all = BTreeSet::new();
+    let mut all = Vec::new();
     for name in ["gui", "primitives", "shadcn"] {
         let root = crates.join(name).join("src");
         let mut files = Vec::new();
@@ -403,16 +609,95 @@ fn hits() -> BTreeSet<String> {
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&path).expect("source");
             let file = syn::parse_file(&text).expect("every source parses");
-            let at = format!("{name}:{rel}");
-            let mut lint = Lint {
-                file: &at,
-                hits: Vec::new(),
-            };
-            lint.visit_file(&file);
-            all.extend(lint.hits);
+            all.push((format!("{name}:{rel}"), file));
         }
     }
     all
+}
+
+/// The type a hit names (`Name.field`, `type Name`, `Name<F: Fn>`,
+/// `Name::Variant.0`): a type that keeps a closure.
+fn hit_type(hit: &str) -> Option<String> {
+    let item = hit.rsplit_once(": ").map_or(hit, |(_, i)| i);
+    let item = item.strip_prefix("type ").unwrap_or(item);
+    if item.contains('!') || item.starts_with("static ") {
+        return None;
+    }
+    let end = item.find(['.', '<', ':']).unwrap_or(item.len());
+    item.get(..end).map(str::to_owned)
+}
+
+/// Every hit in `sources`: the closure traits found first, then the hits
+/// with no store counted, whose types (with `Callback` and `Derive`) are
+/// the wrappers a store must not keep, then the hits again with them.
+fn hits_of(sources: &[(String, syn::File)]) -> BTreeSet<String> {
+    let mut traits = Traits::default();
+    let mut defined: std::collections::BTreeMap<String, BTreeSet<String>> = std::collections::BTreeMap::new();
+    for (at, file) in sources {
+        traits.visit_file(file);
+        let mut types = Types(Vec::new());
+        types.visit_file(file);
+        for name in types.0 {
+            defined.entry(name).or_default().insert(at.clone());
+        }
+    }
+    let mut known = Known {
+        fn_traits: traits.0,
+        defined,
+        wrappers: std::collections::BTreeMap::new(),
+    };
+    let run = |known: &Known| {
+        let mut all = BTreeSet::new();
+        for (at, file) in sources {
+            let mut lint = Lint::new(at, known, file);
+            lint.visit_file(file);
+            all.extend(lint.hits);
+        }
+        all
+    };
+    // To a fixed point: a type keeping a wrapper in a store is a wrapper.
+    let mut hits = run(&known);
+    loop {
+        for h in &hits {
+            if let (Some((file, _)), Some(name)) = (h.split_once(": "), hit_type(h)) {
+                known.wrappers.entry(name).or_default().insert(file.to_owned());
+            }
+        }
+        let next = run(&known);
+        if next == hits {
+            return hits;
+        }
+        hits = next;
+    }
+}
+
+/// The names of the types a file defines (structs, enums, aliases), test
+/// modules aside.
+struct Types(Vec<String>);
+
+impl<'a> Visit<'a> for Types {
+    fn visit_item_mod(&mut self, m: &'a syn::ItemMod) {
+        if !is_test(&m.attrs) {
+            syn::visit::visit_item_mod(self, m);
+        }
+    }
+
+    fn visit_item_struct(&mut self, s: &'a syn::ItemStruct) {
+        self.0.push(s.ident.to_string());
+    }
+
+    fn visit_item_enum(&mut self, e: &'a syn::ItemEnum) {
+        self.0.push(e.ident.to_string());
+    }
+
+    fn visit_item_type(&mut self, t: &'a syn::ItemType) {
+        self.0.push(t.ident.to_string());
+    }
+}
+
+/// Every hit in gui, primitives and shadcn src.
+fn hits() -> BTreeSet<String> {
+    hits_of(&parsed())
 }
 
 /// ADR-0015: every closure the three crates keep is in `Stored` or said
@@ -449,20 +734,84 @@ fn the_lint_finds_each_kind_and_passes_stored() {
         #[cfg(test)] struct T { f: Box<dyn Fn()> }
     ";
     let file = syn::parse_file(src).expect("parses");
-    let mut lint = Lint {
-        file: "x",
-        hits: Vec::new(),
-    };
-    lint.visit_file(&file);
     assert_eq!(
-        lint.hits,
+        hits_of(&[("x".to_owned(), file)]).into_iter().collect::<Vec<_>>(),
         [
             "x: A.f",
             "x: B<F: Fn>",
             "x: C<F: Fn>",
             "x: D::V.0",
-            "x: type E",
             "x: engine_local! static H",
+            "x: type E",
         ]
+    );
+}
+
+/// CLIP's lint gaps (K4g), each found, and each passing once the closure
+/// goes (the revert proof: `good` is `bad` with the closure taken out):
+/// - a field of a type parameter bounded by `Fn*` only on an impl;
+/// - a closure wrapper (`Callback`, or a type of the crates that keeps
+///   one) kept in a store a later turn reads (a signal, an app handle, a
+///   static);
+/// - `AppHandle<dyn Fn>`;
+/// - a trait of the crates that is a closure (an `Fn` supertrait, a
+///   blanket impl over closures, a `call` method), as `dyn` or as a bound.
+#[test]
+fn the_lint_closes_the_clip_gaps() {
+    let bad = r"
+        struct P<F> { f: F }
+        impl<F: Fn()> P<F> { fn go(&self) { (self.f)() } }
+        struct Q<G> { g: G }
+        impl<G> Q<G> where G: FnMut(u8) {}
+        struct R { on: Signal<Callback<u8>> }
+        struct Keeps { f: Rc<dyn Fn()> }
+        struct S { k: Signal<Option<Keeps>> }
+        struct T { h: AppHandle<dyn Fn()> }
+        engine_local! { static U: RefCell<Vec<Callback<()>>> = RefCell::default(); }
+        trait Act: Fn(u8) {}
+        trait Run { fn call(&self); }
+        trait Hook {}
+        impl<F: Fn()> Hook for F {}
+        struct V { a: Box<dyn Act>, r: Rc<dyn Run>, h: Box<dyn Hook> }
+        struct W<H: Hook> { h: H }
+    ";
+    let bad = syn::parse_file(bad).expect("parses");
+    assert_eq!(
+        hits_of(&[("x".to_owned(), bad)]).into_iter().collect::<Vec<_>>(),
+        [
+            "x: Keeps.f",
+            "x: P<F: Fn>",
+            "x: Q<G: Fn>",
+            "x: R.on",
+            "x: S.k",
+            "x: T.h",
+            "x: V.a",
+            "x: V.h",
+            "x: V.r",
+            "x: W<H: Fn>",
+            "x: engine_local! static U",
+        ]
+    );
+    let good = r"
+        struct P<F> { f: F }
+        impl<F: Clone> P<F> {}
+        struct Q<G> { g: G }
+        impl<G> Q<G> where G: Copy {}
+        struct R { on: Signal<u8>, given: Callback<u8> }
+        struct Keeps { f: Rc<u8> }
+        struct S { k: Signal<Option<Keeps>> }
+        struct T { h: AppHandle<dyn Any> }
+        engine_local! { static U: RefCell<Vec<u8>> = RefCell::default(); }
+        trait Act: Clone {}
+        trait Run { fn go(&self); }
+        trait Hook {}
+        impl Hook for u8 {}
+        struct V { a: Box<dyn Act>, r: Rc<dyn Run>, h: Box<dyn Hook> }
+        struct W<H: Hook> { h: H }
+    ";
+    let good = syn::parse_file(good).expect("parses");
+    assert!(
+        hits_of(&[("x".to_owned(), good)]).is_empty(),
+        "nothing left once the closures went"
     );
 }

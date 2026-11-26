@@ -232,6 +232,11 @@ pub struct Common {
     /// component is keyed: its path segment is the component's
     /// ([`crate::geometry::PathSeg::Component`]).
     pub(crate) component_key: Option<ElementKey>,
+    /// Its static place among its parent's elements, when it is unkeyed
+    /// beside a range: its path segment is that place
+    /// ([`crate::geometry::PathSeg::Index`]), the one it had before any
+    /// range, whatever the ranges before it hold (ADR-0026, K4e).
+    pub(crate) place: Option<u32>,
     /// A name the debug tools show for this node.
     pub(crate) name: Option<&'static str>,
     pub(crate) style: Style,
@@ -910,13 +915,17 @@ impl Element {
     }
 
     /// Its path segment as child `index` of its parent: the keyed
-    /// component's whose root it is, else its key, else its place.
+    /// component's whose root it is, else its key, else its static place
+    /// beside a range, else its place.
     #[must_use]
     pub(crate) fn seg(&self, index: usize) -> crate::geometry::PathSeg {
         use crate::geometry::PathSeg;
-        // A layer at a keyed component's root is placed as its content.
+        // A layer at a keyed component's root, or at a static place, is
+        // placed as its content.
         if let Self::Deferred(d) = self
-            && d.child.common().is_some_and(|c| c.component_key.is_some())
+            && d.child
+                .common()
+                .is_some_and(|c| c.component_key.is_some() || c.place.is_some())
         {
             return d.child.seg(index);
         }
@@ -926,7 +935,9 @@ impl Element {
                 key,
                 ..
             }) => PathSeg::Component(*k, *key),
-            _ => self.key().map_or(PathSeg::Index(index), PathSeg::Key),
+            Some(Common { key: Some(k), .. }) => PathSeg::Key(*k),
+            Some(Common { place: Some(p), .. }) => PathSeg::Index(usize::try_from(*p).unwrap_or(index)),
+            _ => PathSeg::Index(index),
         }
     }
 

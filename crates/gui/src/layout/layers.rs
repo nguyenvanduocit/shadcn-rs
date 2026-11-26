@@ -33,13 +33,7 @@ impl LayoutTree {
     /// Whether the node at `path`, placed in `frame`, is hidden other than
     /// by sleeping, dormant alone, and inert.
     pub(super) fn shown_at(&self, frame: &Frame, path: &NodePath) -> (bool, bool, bool) {
-        let at = self
-            .by_path
-            .get(path)
-            .and_then(|&u| self.extra(u))
-            .and_then(|e| usize::try_from(e.index).ok())
-            .filter(|&i| frame.nodes.get(i).is_some_and(|n| &n.path == path));
-        let Some(i) = at else {
+        let Some(i) = self.placed_at(frame, path) else {
             return (false, false, false);
         };
         let inert = frame.behaviour(i).is_some_and(|b| b.inert);
@@ -49,13 +43,20 @@ impl LayoutTree {
     }
 
     pub(super) fn bounds_at(&self, frame: &Frame, path: &NodePath) -> Option<Bounds> {
-        let i = self.by_path.get(path).and_then(|&u| self.extra(u)).map(|e| e.index)?;
-        frame
-            .nodes
-            .get(usize::try_from(i).ok()?)
-            .filter(|n| &n.path == path)
-            .map(|n| n.bounds)
-            .or_else(|| frame_bounds_of(frame, path))
+        let e = self.by_path.get(path).and_then(|&u| self.extra(u))?;
+        let i = usize::try_from(e.index)
+            .ok()
+            .filter(|&i| frame.nodes.get(i).is_some_and(|n| n.id == e.id))
+            .or_else(|| frame.index_of(e.id))?;
+        frame.nodes.get(i).map(|n| n.bounds)
+    }
+
+    /// Where the node at `path` is placed in `frame`, if it is.
+    pub(super) fn placed_at(&self, frame: &Frame, path: &NodePath) -> Option<usize> {
+        let e = self.by_path.get(path).and_then(|&u| self.extra(u))?;
+        usize::try_from(e.index)
+            .ok()
+            .filter(|&i| frame.nodes.get(i).is_some_and(|n| n.id == e.id))
     }
 
     /// Lay a layer's root out against its anchor; where it goes and how it opened.
@@ -191,16 +192,12 @@ impl LayoutTree {
     }
 }
 
-/// The box of the node at `path`, once placed.
-fn frame_bounds_of(frame: &Frame, path: &NodePath) -> Option<Bounds> {
-    frame.nodes.iter().find(|n| &n.path == path).map(|n| n.bounds)
-}
-
-/// The box of the node keyed `key` inside the node at `anchor`, once placed.
-pub(super) fn frame_bounds_by_key(frame: &Frame, anchor: &NodePath, key: ElementKey) -> Option<Bounds> {
-    frame
-        .nodes
-        .iter()
-        .find(|n| n.path.0.starts_with(&anchor.0) && n.path.0.last().and_then(|s| s.element_key()) == Some(key))
+/// The box of the node keyed `key` at or below node `anchor` of `frame`,
+/// through layers, once placed.
+pub(super) fn frame_bounds_by_key(frame: &Frame, anchor: Option<usize>, key: ElementKey) -> Option<Bounds> {
+    let anchor = anchor?;
+    (anchor..frame.nodes.len())
+        .find(|&i| frame.nodes.get(i).is_some_and(|n| n.seg.element_key() == Some(key)) && frame.is_below(i, anchor))
+        .and_then(|i| frame.nodes.get(i))
         .map(|n| n.bounds)
 }

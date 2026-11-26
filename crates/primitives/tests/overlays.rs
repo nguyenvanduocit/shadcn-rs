@@ -1266,7 +1266,7 @@ fn drawer_page(props: Open, options: impl Fn() -> DrawerOptions + 'static) -> Dr
             DrawerOptions {
                 veto: Some(gui::Callback::new(move |(open, why): (bool, ChangeReason)| {
                     heard.borrow_mut().push((open, why));
-                    refuse.as_ref().map_or(Dismiss::Close, |r| r.call((open, why)))
+                    refuse.as_ref().and_then(|r| r.call((open, why))).unwrap_or_default()
                 })),
                 ..o
             }
@@ -2639,6 +2639,10 @@ fn an_anchored_toast_shows_above_its_anchor_and_pauses_as_the_region_does() {
 }
 
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test is the outside world: a thread of its own sends the promise's result"
+)]
 fn a_promise_toast_loads_until_its_result_arrives_from_another_thread() {
     let mut p = tab_page();
     let t = p.toaster;
@@ -2658,9 +2662,10 @@ fn a_promise_toast_loads_until_its_result_arrives_from_another_thread() {
     assert_eq!(status(), Some((ToastStatus::Loading, "Saving")));
     wait(&mut p.s, 5000 * MS);
     assert_eq!(status(), Some((ToastStatus::Loading, "Saving")), "loading, it stays");
-    std::thread::spawn(move || tx.send(Ok("Saved")))
+    let sent = std::thread::spawn(move || tx.send(Ok("Saved")))
         .join()
         .expect("the worker");
+    assert!(sent.is_ok(), "the toast's mailbox is open");
     p.s.settle().expect("settled");
     assert_eq!(status(), Some((ToastStatus::Success, "Saved")), "in place, a success");
     assert!(

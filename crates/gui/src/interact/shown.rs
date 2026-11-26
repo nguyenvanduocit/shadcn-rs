@@ -94,7 +94,7 @@ impl HitKeys {
             self.table.as_deref().is_some_and(|t| std::ptr::eq(t, hits)),
             "asked of the table it indexed"
         );
-        let key = NodeKey::of(&frame.nodes.get(i)?.path);
+        let key = NodeKey::of(frame.nodes.get(i)?.id);
         let owner = owner_of(frame, i);
         let from = self.keys.partition_point(|e| e.0 < key);
         self.keys

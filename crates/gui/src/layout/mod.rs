@@ -58,7 +58,7 @@ use crate::color::Color;
 use crate::edit::TextField;
 use crate::element::{Deferred, Element, Handler, InputMode, Positioning};
 use crate::focus::FocusId;
-use crate::geometry::{Bounds, NodePath, PathSeg};
+use crate::geometry::{Bounds, NodeId, NodePath, PathSeg};
 use crate::icon::Icon;
 use crate::motion::Motion;
 use crate::style::{ContentStyle, Display, Edges, Effects, Overflow, Position, ResolvedText, Ring, Style};
@@ -73,8 +73,8 @@ pub type Node = engine::Node<BoxStyle, Leaf>;
 /// The interactive state a frame is built with.
 #[derive(Clone, Debug, Default)]
 pub struct UiState {
-    pub hovered: HashSet<NodePath>,
-    pub active: HashSet<NodePath>,
+    pub hovered: HashSet<NodeId>,
+    pub active: HashSet<NodeId>,
     /// The offsets of the scroll containers without a handle, by identity
     /// ([`ScrollId`]), exactly ([`crate::compositor::motion`]).
     pub(crate) scroll: ByScroller<crate::compositor::motion::Exact>,
@@ -82,16 +82,60 @@ pub struct UiState {
     /// not taking in the compositor's scroll (ADR-0015).
     pub(crate) scroll_generation: ByScroller<u64>,
     pub focused: Option<FocusId>,
-    /// Where the focused node lies (its path and layer) in the frame the
-    /// next is built over, found once from the focus owner before a pass
-    /// descends ([`crate::interact::InputState::sync_focus`]): what
-    /// `focus_within` is decided by, the same for a live pass and a cold
-    /// one. Focus within a node is focus at or below it in the same layer.
-    pub(crate) focus_at: Option<(NodePath, usize)>,
+    /// Where the focused node lies (it and its ancestors, and its layer) in
+    /// the frame the next is built over, found once from the focus owner
+    /// before a pass descends ([`crate::interact::InputState::sync_focus`]):
+    /// what `focus_within` is decided by, the same for a live pass and a
+    /// cold one. Focus within a node is focus at or below it in the same layer.
+    pub(crate) focus_at: Option<FocusAt>,
     pub focus_visible: bool,
     /// Device pixels per logical pixel: scroll offsets move content by
     /// whole device pixels (ADR-0020). Zero leaves them as they are.
     pub scale: f32,
+}
+
+/// Where the focused node lies ([`UiState::focus_at`]): its id and its
+/// ancestors' within its layer, innermost first, taken once as focus moves
+/// (ADR-0026: "is below" is a walk of parent links, made once here, not
+/// per node), and its layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FocusAt {
+    pub(crate) chain: Rc<[NodeId]>,
+    pub(crate) layer: usize,
+}
+
+impl FocusAt {
+    /// Node `i` of `frame` and its ancestors.
+    pub(crate) fn of(frame: &Frame, i: usize) -> Option<Self> {
+        let layer = frame.nodes.get(i)?.layer;
+        let chain: Rc<[NodeId]> = frame
+            .ancestors(i)
+            .filter_map(|k| frame.nodes.get(k).map(|n| n.id))
+            .collect();
+        Some(Self { chain, layer })
+    }
+
+    /// Whether `at` is where node `i` of `frame` (`None`: no node) lies, as
+    /// [`Self::of`] would take it, walked with nothing allocated: asked
+    /// every pass, it is taken anew only when focus moved.
+    pub(crate) fn same(at: Option<&Self>, frame: &Frame, i: Option<usize>) -> bool {
+        let Some(i) = i.filter(|&i| i < frame.nodes.len()) else {
+            return at.is_none();
+        };
+        let Some(at) = at else { return false };
+        let mut chain = at.chain.iter();
+        frame.nodes.get(i).is_some_and(|n| n.layer == at.layer)
+            && frame
+                .ancestors(i)
+                .filter_map(|k| frame.nodes.get(k).map(|n| n.id))
+                .all(|id| chain.next() == Some(&id))
+            && chain.next().is_none()
+    }
+
+    /// Whether focus is at or below node `id` in `layer`.
+    pub(crate) fn within(&self, id: NodeId, layer: usize) -> bool {
+        self.layer == layer && self.chain.contains(&id)
+    }
 }
 
 impl UiState {
@@ -153,6 +197,10 @@ type Marks = Rc<crate::engine::WorldRefCell<Vec<(u32, u8)>>>;
 /// What the tree keeps beside each layout node: who it is and what paint
 /// and input read of it.
 struct Extra {
+    /// Who it is (ADR-0026, "Node identity"): taken when it was built.
+    id: NodeId,
+    /// Where it is: the patch's match key and the correspondence's
+    /// (ADR-0026, "As built (K4e)"), made once when it was built.
     path: NodePath,
     kind: u8,
     name: Option<&'static str>,
@@ -222,6 +270,9 @@ struct Extra {
     mine: Inherit,
     /// Its parent's slot ([`NO_SLOT`] for a root).
     parent: u32,
+    /// For a layer's root, the slot of the node the layer was declared in
+    /// ([`NO_SLOT`] else): what "is below" continues through.
+    anchor: u32,
     /// What it needs ([`need`]) and what its subtree needs.
     own: u8,
     below: u8,
@@ -231,6 +282,9 @@ struct Extra {
     ran: u64,
     /// What it passed its children when last placed.
     kids: Option<Placed>,
+    /// The pass that last built its children again (resolved it): its
+    /// hidden children parked before then and not again are gone.
+    rebuilt: u64,
     /// What patching and placing it read (ADR-0013).
     resolve: Tracker,
     place: Tracker,
@@ -263,6 +317,11 @@ struct Extra {
 }
 
 impl Extra {
+    /// Its last step in the tree.
+    fn seg(&self) -> PathSeg {
+        self.path.0.last().copied().unwrap_or(PathSeg::Index(0))
+    }
+
     /// Every tracker its resolve and its bindings hold, of every kind
     /// (style, spans, attributes, text, drawing): what decided what it
     /// is. A node that takes no space hands these to its parent (the
@@ -393,6 +452,17 @@ fn trim_scratch<T>(v: &mut Vec<T>, keep: usize) {
 
 /// No slot: the parent of a root.
 const NO_SLOT: u32 = u32::MAX;
+
+/// A released subtree's ids, kept for it to take again ([`LayoutTree::parked`]).
+struct Parked {
+    /// Each node's path and id, its root first.
+    ids: Vec<(NodePath, NodeId)>,
+    /// For a hidden subtree, its parent (slot and id): built again without
+    /// it, the subtree is gone. `None` for one motion keeps.
+    holder: Option<(u32, NodeId)>,
+    /// The pass it was parked in.
+    pass: u64,
+}
 
 /// The part of a resolved [`Style`] that placing and paint read.
 #[derive(Default)]
@@ -577,6 +647,26 @@ pub struct LayoutTree {
     /// Boxed: a pass takes each out and puts it back.
     extras: Vec<Option<Box<Extra>>>,
     free: Vec<u32>,
+    /// Its nodes' ids (ADR-0026): live for the window's tree, cold for a
+    /// detached one. Kept when the tree is dropped after a panic.
+    ids: crate::geometry::Ids,
+    /// The ids nodes built at a path this pass take, first built first
+    /// (ADR-0026, "As built (K4e)": correspondence is adoption): a cold
+    /// tree's live correspondents, what a tree dropped after a panic held,
+    /// the subtree under a hidden node shown again. Taken out as adopted,
+    /// so no two nodes share one; what is left at the end of the pass is
+    /// freed.
+    adopt: foldhash::HashMap<NodePath, Vec<NodeId>>,
+    /// The ids of subtrees released but not gone (ADR-0026, "As built
+    /// (K4e)"), by their root's path: one hidden (`display: none`) until
+    /// its parent is built again without it, one whose motion plays on
+    /// (an exit) until motion lets every id in it go.
+    parked: foldhash::HashMap<NodePath, Parked>,
+    /// Passes laid out, for [`Extra::rebuilt`] and [`Parked::pass`].
+    passes: u64,
+    /// Nodes built at a path another node of the tree holds (duplicate
+    /// keys): each took an id of its own.
+    duplicates: u64,
     schedule: Schedule,
     stats: Stats,
     visits: Visits,
@@ -584,8 +674,10 @@ pub struct LayoutTree {
     /// as soon as it is patched: what placing reads (a scroll container
     /// tells its handle which child holds focus, a virtual list keeps that
     /// row built, ADR-0021), in the pass that moved it. Not what resolving
-    /// reads ([`UiState::focus_at`], decided before the walk).
-    focused: Option<(NodePath, usize)>,
+    /// reads ([`UiState::focus_at`], decided before the walk). With the
+    /// slots of it and its ancestors, innermost first.
+    focused: Option<(NodeId, usize)>,
+    focused_slots: Vec<(u32, NodeId)>,
     /// The root's path, made once: a pass allocates nothing for it.
     root_path: NodePath,
     /// The frame as laid out, kept and written in place (ADR-0013).
@@ -597,6 +689,7 @@ pub struct LayoutTree {
     probe: binding::Node,
     /// Nodes by path and by focus id, to mark what interactive state names.
     by_path: foldhash::HashMap<NodePath, u32>,
+    by_id: foldhash::HashMap<NodeId, u32>,
     by_focus: foldhash::HashMap<FocusId, u32>,
     /// The field showing each text field handle, by its focus: one at a
     /// time ([`LayoutTree::claim_fields`]).
@@ -607,8 +700,9 @@ pub struct LayoutTree {
     /// Scroll writes the passes placed (tests: a pass costs what changed).
     #[cfg(test)]
     scroll_marked: u64,
-    /// Paths of nodes released this pass that motion kept a state for.
-    released: Vec<NodePath>,
+    /// Nodes released this pass that motion kept a state for, with where
+    /// they were.
+    released: Vec<(NodeId, NodePath)>,
     /// This pass added, removed or reordered a node: the frame is rebuilt.
     structure: bool,
     /// The layers' paths, as the last pass placed them, each with when it
@@ -699,10 +793,20 @@ impl LayoutTree {
             layers: Vec::new(),
             extras: Vec::new(),
             free: Vec::new(),
+            ids: crate::geometry::Ids::new(if crate::engine::forking() {
+                crate::geometry::Domain::Cold
+            } else {
+                crate::geometry::Domain::Live
+            }),
+            adopt: foldhash::HashMap::default(),
+            parked: foldhash::HashMap::default(),
+            passes: 0,
+            duplicates: 0,
             schedule,
             stats: Stats::default(),
             visits: Visits::default(),
             focused: None,
+            focused_slots: Vec::new(),
             root_path: NodePath::new([PathSeg::Index(0)].into()),
             frame: Frame::default(),
             marks: Rc::new(crate::engine::WorldRefCell::new(
@@ -711,6 +815,7 @@ impl LayoutTree {
             )),
             probe: binding::Node::new(crate::reactive::detached(|| crate::reactive::RenderNode::new(|| {}))),
             by_path: foldhash::HashMap::default(),
+            by_id: foldhash::HashMap::default(),
             by_focus: foldhash::HashMap::default(),
             by_field: foldhash::HashMap::default(),
             mounting: Vec::new(),
@@ -764,28 +869,25 @@ impl LayoutTree {
     }
 
     /// Where the node holding focus `id` lies in the frame as laid out: its
-    /// index, path and layer. The one word on where focus is, as the walk
+    /// index, id and layer. The one word on where focus is, as the walk
     /// found it: what [`UiState::focus_at`] is taken from, and what a pass
     /// is checked against ([`Self::focus_settled`]).
-    pub(crate) fn focus_location(&self, id: FocusId) -> Option<(usize, &NodePath, usize)> {
+    pub(crate) fn focus_location(&self, id: FocusId) -> Option<(usize, NodeId, usize)> {
         let e = self.by_focus.get(&id).and_then(|&u| self.extra(u))?;
         let i = usize::try_from(e.index).ok()?;
         self.frame
             .nodes
             .get(i)
-            .filter(|n| n.path == e.path)
-            .map(|n| (i, &n.path, n.layer))
+            .filter(|n| n.id == e.id)
+            .map(|n| (i, n.id, n.layer))
     }
 
     /// Whether the last pass found the focused node where `state` (what it
     /// was built over) says it is: if not, the flags it resolved are of the
     /// place focus left, and another pass, over where it is, is due.
     pub(crate) fn focus_settled(&self, state: &UiState) -> bool {
-        let found = state
-            .focused
-            .and_then(|id| self.focus_location(id))
-            .map(|(_, p, l)| (p, l));
-        found == state.focus_at.as_ref().map(|(p, l)| (p, *l))
+        let found = state.focused.and_then(|id| self.focus_location(id)).map(|(i, _, _)| i);
+        FocusAt::same(state.focus_at.as_ref(), &self.frame, found)
     }
 
     /// Take where the walk found the focused node (as the tree just patched
@@ -796,28 +898,67 @@ impl LayoutTree {
         let now = state
             .focused
             .and_then(|f| self.by_focus.get(&f).copied())
-            .and_then(|u| self.extra(u).map(|e| (u, e.path.clone(), e.layer)));
+            .and_then(|u| self.extra(u).map(|e| (u, e.id, e.layer)));
+        // The same node under the same ancestors: nothing moved.
         let same = match (&self.focused, &now) {
-            (Some((p, l)), Some((_, q, m))) => p == q && l == m,
+            (Some((p, l)), Some((u, q, m))) => {
+                p == q && l == m && self.focused_slots.iter().copied().eq(self.above(*u))
+            }
             (None, None) => true,
             _ => false,
         };
         if same {
             return;
         }
-        if let Some((p, _)) = self.focused.take() {
-            self.mark_scrollers_at(&p);
+        if self.focused.take().is_some() {
+            // The scroll containers above where it was: from its nearest
+            // ancestor still in the tree.
+            let was = std::mem::take(&mut self.focused_slots);
+            if let Some(&(u, _)) = was.iter().find(|&&(u, id)| self.extra(u).is_some_and(|e| e.id == id)) {
+                if self.extra(u).is_some_and(|e| e.behaviour.scroll.is_some()) {
+                    self.mark(u, need::PLACE);
+                }
+                self.mark_scrollers_above(u);
+            }
+            self.focused_slots = was;
         }
-        if let Some((u, p, l)) = now {
+        self.focused_slots.clear();
+        if let Some((u, id, l)) = now {
             self.mark_scrollers_above(u);
-            self.focused = Some((p, l));
+            self.focused = Some((id, l));
+            let mut slots = std::mem::take(&mut self.focused_slots);
+            slots.extend(self.above(u));
+            self.focused_slots = slots;
         }
+    }
+
+    /// Slot `u` and its ancestors' slots, with their ids, innermost first.
+    fn above(&self, u: u32) -> impl Iterator<Item = (u32, NodeId)> + '_ {
+        std::iter::successors(Some(u), |&s| {
+            self.extra(s)
+                .map(|e| if e.parent == NO_SLOT { e.anchor } else { e.parent })
+                .filter(|&p| p != NO_SLOT)
+        })
+        // Layers nest at most as deep as trees do.
+        .take(MAX_TREE_DEPTH.saturating_mul(8))
+        .filter_map(|s| self.extra(s).map(|e| (s, e.id)))
+    }
+
+    /// Whether the focused node, as the walk found it, is slot `u` or below it.
+    fn focus_below(&self, u: u32) -> bool {
+        self.focused_slots.iter().any(|&(s, _)| s == u)
     }
 
     /// Whether a node at `path` is in the tree.
     #[must_use]
     pub fn holds(&self, path: &NodePath) -> bool {
         self.by_path.contains_key(path)
+    }
+
+    /// The id of the node at `path`, if the tree holds one (tests).
+    #[must_use]
+    pub fn id_at(&self, path: &NodePath) -> Option<NodeId> {
+        self.by_path.get(path).and_then(|&u| self.extra(u)).map(|e| e.id)
     }
 
     /// The frame's nodes from an index on as they were before passes since
@@ -893,13 +1034,55 @@ impl LayoutTree {
         u32::try_from(self.extras.len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
+    /// Let `node` and its subtree go. Their ids are freed, or parked when
+    /// motion keeps a state for one of them (an exit may bring it back as
+    /// the legacy ghost, ADR-0026 "As built (K4e)").
     fn release(&mut self, node: Node) {
+        self.release_as(node, None, Vec::new());
+    }
+
+    /// [`Self::release`]; with `holder`, `node` is a child of the node in
+    /// slot `holder` that takes no space, its ids parked (with `prior`,
+    /// what it parked before and did not take again) until `holder` is
+    /// built again without it.
+    fn release_as(&mut self, node: Node, holder: Option<u32>, prior: Vec<(NodePath, NodeId)>) {
+        let root = self.extra(node.user).map(|e| e.path.clone());
+        let mut ids = Vec::new();
+        let mut kept = false;
+        self.release_nodes(node, &mut ids, &mut kept);
+        ids.extend(prior);
+        let holder = holder.and_then(|h| self.extra(h).map(|e| (h, e.id)));
+        match root {
+            Some(root) if holder.is_some() || kept => {
+                let pass = self.passes;
+                if let Some(was) = self.parked.insert(root, Parked { ids, holder, pass }) {
+                    for (_, id) in was.ids {
+                        self.ids.free(id);
+                    }
+                }
+            }
+            _ => {
+                for (_, id) in ids {
+                    self.ids.free(id);
+                }
+            }
+        }
+    }
+
+    /// Take `node`'s subtree out of the tree, its ids into `ids` (root
+    /// first); `kept` when motion keeps a state for one.
+    fn release_nodes(&mut self, node: Node, ids: &mut Vec<(NodePath, NodeId)>, kept: &mut bool) {
         self.structure = true;
         if let Some(slot) = usize::try_from(node.user).ok().and_then(|i| self.extras.get_mut(i))
             && let Some(ex) = slot.take()
         {
+            ids.push((ex.path.clone(), ex.id));
+            *kept |= ex.motion;
             if self.by_path.get(&ex.path) == Some(&node.user) {
                 self.by_path.remove(&ex.path);
+            }
+            if self.by_id.get(&ex.id) == Some(&node.user) {
+                self.by_id.remove(&ex.id);
             }
             if let Some(f) = ex.focus_id
                 && self.by_focus.get(&f) == Some(&node.user)
@@ -912,13 +1095,141 @@ impl LayoutTree {
                 self.by_field.remove(&f);
             }
             if ex.motion {
-                self.released.push(ex.path.clone());
+                self.released.push((ex.id, ex.path.clone()));
             }
             self.free.push(node.user);
         }
         for c in node.children {
-            self.release(c);
+            self.release_nodes(c, ids, kept);
         }
+    }
+
+    /// The id a node built at `path` takes: one parked for it or adopted
+    /// at its path, else a new one; with what of its subtree was parked
+    /// with it (put up for adoption below it, [`Self::adopt`]).
+    fn take_id(&mut self, path: &NodePath) -> (NodeId, Vec<(NodePath, NodeId)>) {
+        if let Some(p) = self.parked.remove(path) {
+            let mut ids = p.ids.into_iter();
+            if let Some((_, id)) = ids.next() {
+                let rest: Vec<(NodePath, NodeId)> = ids.collect();
+                for (p, id) in &rest {
+                    self.adopt.entry(p.clone()).or_default().push(*id);
+                }
+                return (id, rest);
+            }
+        }
+        if self.by_path.contains_key(path) {
+            self.duplicates = self.duplicates.saturating_add(1);
+        }
+        let adopted = self
+            .adopt
+            .get_mut(path)
+            .and_then(|v| (!v.is_empty()).then(|| v.remove(0)));
+        (adopted.unwrap_or_else(|| self.ids.mint()), Vec::new())
+    }
+
+    /// What of `rest` (parked below a node built again, [`Self::take_id`])
+    /// no node below it took: taken back from adoption, to be parked
+    /// again with it when it hides once more.
+    fn untake(&mut self, rest: Vec<(NodePath, NodeId)>) -> Vec<(NodePath, NodeId)> {
+        rest.into_iter()
+            .filter(|(p, id)| {
+                let Some(v) = self.adopt.get_mut(p) else { return false };
+                let Some(at) = v.iter().position(|x| x == id) else {
+                    return false;
+                };
+                v.remove(at);
+                true
+            })
+            .collect()
+    }
+
+    /// At the end of a pass: ids up for adoption that no node took are
+    /// freed (those of another tree, a cold tree's live correspondents,
+    /// are not its to free), and parked subtrees that are gone too: a
+    /// hidden one whose parent was built again without it, or that went
+    /// with it, and one motion no longer keeps.
+    fn settle_ids(&mut self, motion: &Motion) {
+        for (_, ids) in self.adopt.drain() {
+            for id in ids {
+                self.ids.free(id);
+            }
+        }
+        let pass = self.passes;
+        let gone: Vec<NodePath> = self
+            .parked
+            .iter()
+            .filter(|(_, p)| match p.holder {
+                Some((slot, id)) => match self.extra(slot) {
+                    Some(h) if h.id == id => h.rebuilt == pass && p.pass != pass,
+                    _ => true,
+                },
+                None => !p.ids.iter().any(|(_, id)| motion.keeps(*id)),
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in gone {
+            if let Some(p) = self.parked.remove(&path) {
+                for (_, id) in p.ids {
+                    self.ids.free(id);
+                }
+            }
+        }
+    }
+
+    /// The id of each node of the tree by its path, in tree order: what a
+    /// tree built beside it adopts (ADR-0026, the correspondence).
+    fn correspondence(&self) -> foldhash::HashMap<NodePath, Vec<NodeId>> {
+        fn walk(t: &LayoutTree, n: &Node, out: &mut foldhash::HashMap<NodePath, Vec<NodeId>>) {
+            if let Some(e) = t.extra(n.user) {
+                out.entry(e.path.clone()).or_default().push(e.id);
+            }
+            for c in &n.children {
+                walk(t, c, out);
+            }
+        }
+        let mut out = foldhash::HashMap::default();
+        for n in self.root.iter().chain(self.layers.iter().map(|l| &l.node)) {
+            walk(self, n, &mut out);
+        }
+        for (path, p) in &self.parked {
+            if let Some((_, id)) = p.ids.first() {
+                out.entry(path.clone()).or_default().push(*id);
+            }
+        }
+        out
+    }
+
+    /// How many ids it has freed: what holds state by id lets go of what
+    /// a freed one held when this changes.
+    #[must_use]
+    pub fn freed(&self) -> u64 {
+        self.ids.freed()
+    }
+
+    /// Id slots retired for good at their last generation (ADR-0026,
+    /// "Generations"; devtools `memory`).
+    #[must_use]
+    pub fn retired_ids(&self) -> u64 {
+        self.ids.retired()
+    }
+
+    /// Whether `id` names a node of this tree (one hidden included).
+    #[must_use]
+    pub fn holds_id(&self, id: NodeId) -> bool {
+        self.ids.holds(id)
+    }
+
+    /// Nodes built at a path another node held (tests).
+    #[cfg(test)]
+    pub(crate) fn duplicates(&self) -> u64 {
+        self.duplicates
+    }
+
+    /// Ids its allocator holds (tests: none leak).
+    #[cfg(test)]
+    pub(crate) fn ids_held(&self) -> usize {
+        self.ids.held()
     }
 
     fn take_extra(&mut self, u: u32) -> Option<Box<Extra>> {
@@ -929,21 +1240,6 @@ impl LayoutTree {
         if let Some(slot) = usize::try_from(u).ok().and_then(|i| self.extras.get_mut(i)) {
             *slot = Some(extra);
         }
-    }
-
-    /// The component instance whose output `ex` is: the nearest marked
-    /// root above it, itself included, else its own owner, as
-    /// [`crate::interact`] names a node ([`ScrollId`]). Its ancestors are
-    /// in the tree while it is placed.
-    fn owner_of(&self, ex: &Extra) -> Option<crate::reactive::OwnerId> {
-        let mut at = Some(ex);
-        while let Some(e) = at {
-            if let Some(i) = e.behaviour.handlers.instance {
-                return Some(i);
-            }
-            at = self.extra(e.parent);
-        }
-        ex.behaviour.handlers.owner
     }
 
     /// Mark `need` on node `u`, and as a need below on its ancestors.
@@ -961,38 +1257,11 @@ impl LayoutTree {
         }
     }
 
-    /// Mark `need` on the node at `path`, or on its nearest ancestor in the
-    /// tree when it is not.
-    fn mark_path(&mut self, path: &NodePath, need: u8) {
-        if let Some(&u) = self.by_path.get(path) {
+    /// Mark `need` on the node `id` names, if the tree holds it.
+    fn mark_id(&mut self, id: NodeId, need: u8) {
+        if let Some(&u) = self.by_id.get(&id) {
             self.mark(u, need);
-            return;
         }
-        let mut len = path.0.len();
-        while len > 1 {
-            len = len.saturating_sub(1);
-            let up = NodePath::new(path.0.get(..len).map(Into::into).unwrap_or_default());
-            if let Some(&u) = self.by_path.get(&up) {
-                self.mark(u, need);
-                return;
-            }
-        }
-    }
-
-    /// The scroll containers holding the node at `path`, or, gone, holding
-    /// where it was (its nearest ancestor still in the tree, itself one).
-    fn mark_scrollers_at(&mut self, path: &NodePath) {
-        let found = self.by_path.get(path).copied().or_else(|| {
-            (1..path.0.len()).rev().find_map(|len| {
-                let up = NodePath::new(path.0.get(..len).map(Into::into).unwrap_or_default());
-                self.by_path.get(&up).copied()
-            })
-        });
-        let Some(u) = found else { return };
-        if self.extra(u).is_some_and(|e| e.behaviour.scroll.is_some()) {
-            self.mark(u, need::PLACE);
-        }
-        self.mark_scrollers_above(u);
     }
 
     /// The scroll containers holding node `u` (focus within them moved).
@@ -1054,12 +1323,12 @@ impl LayoutTree {
         }
         // The scroll containers written since the last pass, and only
         // those ([`ByScroller`]'s log).
-        for p in &written {
+        for &id in &written {
             #[cfg(test)]
             {
                 self.scroll_marked = self.scroll_marked.saturating_add(1);
             }
-            self.mark_path(p, need::PLACE);
+            self.mark_id(id, need::PLACE);
         }
         if seen.scale != state.scale {
             // Scroll offsets and moving translations round to the new pixels.
@@ -1104,7 +1373,11 @@ pub(crate) fn layout_carrying(
 ) -> Frame {
     let mut tree = LayoutTree::new();
     tree.detached = true;
+    tree.ids = crate::geometry::Ids::new(crate::geometry::Domain::Cold);
     if let Some(w) = window {
+        // The correspondence (ADR-0026): a node standing for one of the
+        // window's carries its id; one with none has a cold id.
+        tree.adopt = w.correspondence();
         tree.carried = w.layers.iter().map(|l| (l.path.clone(), l.opened)).collect();
         tree.opened = w.opened;
         tree.held = w.held_values();

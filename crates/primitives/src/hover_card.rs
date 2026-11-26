@@ -341,7 +341,7 @@ impl<P: 'static> HoverCard<P> {
         }
         if *reason != DismissReason::Programmatic
             && let Some(veto) = gui::untracked(|| self.options()).veto
-            && veto.call(*reason) == Dismiss::Veto
+            && veto.call(*reason) == Some(Dismiss::Veto)
         {
             return Dismiss::Veto;
         }

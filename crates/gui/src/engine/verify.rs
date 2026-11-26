@@ -942,7 +942,7 @@ fn differential(inputs: &[Input], probes: &[Probe]) -> (Vec<String>, Vec<String>
             crate::clock::registry_summary(),
             crate::component::post_summary(),
             second.borrow().is_some(),
-            second_mail.send(0),
+            second_mail.send(0).is_ok(),
         ));
         // The handles' state, as the registry holds it (review r17,
         // decision 1): the app's root and the views'.
@@ -1337,7 +1337,7 @@ fn rich_window_ends(in_check: bool) -> Left {
             "hovered and focused before"
         );
         let sender = sender.expect("made");
-        assert!(sender.send(1));
+        assert!(sender.send(1).is_ok());
         // The shown view arrives (its loan of heights made), so both
         // engines drop the same window.
         for _ in 0..10_000 {
@@ -1366,7 +1366,7 @@ fn rich_window_ends(in_check: bool) -> Left {
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
-        let sent = sender.send(2);
+        let sent = sender.send(2).is_ok();
         let _ = crate::mailbox::deliver();
         Left {
             graph: size(),

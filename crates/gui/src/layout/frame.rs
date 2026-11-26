@@ -7,7 +7,7 @@ use crate::edit::TextField;
 use crate::element::{ElementKey, Handler, Handlers, InputMode, Semantics};
 use crate::events::ClickEvent;
 use crate::focus::FocusHandle;
-use crate::geometry::{Bounds, NodePath};
+use crate::geometry::{Bounds, NodeId, NodePath, PathSeg};
 use crate::icon::Icon;
 use crate::scroll::ScrollHandle;
 use crate::style::{Corners, Cursor, Edges, Effects, Painted, ResolvedText, Ring};
@@ -140,7 +140,11 @@ impl PartialEq for Moving {
 /// is layout's to write and read only through a [`Sight`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameNode {
-    pub path: NodePath,
+    /// Who it is across frames (ADR-0026, "Node identity").
+    pub id: NodeId,
+    /// Its last step in the tree: its key, or its place among its
+    /// siblings. Its whole path is derived ([`Frame::path_of`]).
+    pub seg: PathSeg,
     pub name: Option<&'static str>,
     /// The border box in window pixels: `space` moved by `offset`.
     pub(in crate::layout) bounds: Bounds,
@@ -279,7 +283,8 @@ impl FrameNode {
     /// chunk's state), unmoved, with no content and no parent.
     pub(crate) fn in_space(&self, look: Look) -> Self {
         Self {
-            path: self.path.clone(),
+            id: self.id,
+            seg: self.seg,
             name: self.name,
             bounds: self.space,
             content_box: self.space_content,
@@ -376,6 +381,10 @@ impl Behaviour {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Layer {
     pub root: usize,
+    /// The node it was declared in (its anchor): what its root's derived
+    /// path ([`Frame::path_of`]) and "is below" ([`Frame::up`]) continue
+    /// from.
+    pub owner: Option<usize>,
     pub anchor: Option<Bounds>,
     /// The keyed node inside its owner its Tab stops follow
     /// ([`crate::Deferred::tab_after`]).
@@ -429,11 +438,11 @@ impl Before {
         if self.repainted.is_empty() {
             return d;
         }
-        let marked: HashMap<&NodePath, Bounds> = self
+        let marked: HashMap<NodeId, Bounds> = self
             .repainted
             .iter()
             .filter_map(|&k| self.nodes.get(k))
-            .map(|n| (&n.path, n.bounds))
+            .map(|n| (n.id, n.bounds))
             .collect();
         // The diff's nodes that stayed or came are in `now`'s order, those
         // that went after them: walk `now`, taking each diffed node in turn.
@@ -441,18 +450,18 @@ impl Before {
         let mut found = found.into_iter().peekable();
         let mut changes = Vec::with_capacity(found.len().saturating_add(marked.len()));
         for n in now {
-            let next = found.next_if(|c| c.path == n.path && !matches!(c.change, Change::Removed { .. }));
+            let next = found.next_if(|c| c.id == n.id && !matches!(c.change, Change::Removed { .. }));
             match next {
                 Some(mut c) => {
                     if let Change::Updated { repainted, .. } = &mut c.change {
-                        *repainted |= marked.contains_key(&n.path);
+                        *repainted |= marked.contains_key(&n.id);
                     }
                     changes.push(c);
                 }
                 None => {
-                    if let Some(&before) = marked.get(&n.path) {
+                    if let Some(&before) = marked.get(&n.id) {
                         changes.push(NodeChange {
-                            path: n.path.clone(),
+                            id: n.id,
                             what: What::of(n),
                             change: Change::Updated {
                                 before,
@@ -566,5 +575,45 @@ impl Frame {
     /// The node and its ancestors within its layer, innermost first.
     pub fn ancestors(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
         std::iter::successors(Some(i), |&n| self.nodes.get(n).and_then(|node| node.parent))
+    }
+
+    /// Node `i`'s parent; for a layer's root, the node the layer was
+    /// declared in (ADR-0026: "is below" is a walk of parent links).
+    #[must_use]
+    pub fn up(&self, i: usize) -> Option<usize> {
+        let n = self.nodes.get(i)?;
+        n.parent.or_else(|| {
+            let l = self.layers.get(n.layer.checked_sub(1)?)?;
+            // Written before `i`, so a walk up always ends.
+            l.owner.filter(|&o| l.root == i && o < i)
+        })
+    }
+
+    /// The node and every node above it, through the layers it was
+    /// declared in, innermost first.
+    pub fn above(&self, i: usize) -> impl Iterator<Item = usize> + '_ {
+        std::iter::successors(Some(i), |&n| self.up(n))
+    }
+
+    /// Whether node `i` is node `of` or below it, through layers.
+    #[must_use]
+    pub fn is_below(&self, i: usize, of: usize) -> bool {
+        self.above(i).any(|n| n == of)
+    }
+
+    /// Node `i`'s path, derived from its parent links (ADR-0026: a path is
+    /// derived, not stored): what `@PATH` prints and selects.
+    #[must_use]
+    pub fn path_of(&self, i: usize) -> NodePath {
+        let mut segs: Vec<PathSeg> = self.above(i).filter_map(|n| self.nodes.get(n).map(|n| n.seg)).collect();
+        segs.reverse();
+        NodePath::new(segs.into())
+    }
+
+    /// The node `id` names in this frame. A walk: for tools and tests, and
+    /// for what is asked once, not per frame.
+    #[must_use]
+    pub fn index_of(&self, id: NodeId) -> Option<usize> {
+        self.nodes.iter().position(|n| n.id == id)
     }
 }

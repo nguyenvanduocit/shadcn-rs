@@ -767,7 +767,7 @@ impl<T: Clone + 'static> Toaster<T> {
                 }
                 if s.swipe.release() {
                     let veto = self.options.with_untracked(|o| o.veto_swipe.clone());
-                    if veto.is_none_or(|v| v.call(id) == Dismiss::Close) {
+                    if veto.is_none_or(|v| v.call(id) != Some(Dismiss::Veto)) {
                         self.dismiss(id);
                     }
                 }

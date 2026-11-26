@@ -351,6 +351,7 @@ impl Bar {
     }
 }
 
+#[derive(Clone)]
 struct State {
     handle: ScrollHandle,
     options: Rc<dyn Fn() -> ScrollAreaOptions>,

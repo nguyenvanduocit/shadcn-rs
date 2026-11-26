@@ -44,8 +44,10 @@ pub mod overlay;
 pub mod paint;
 pub mod place;
 pub mod placement;
+pub mod port;
 pub mod priority;
 pub mod process;
+pub mod random;
 pub mod reactive;
 pub mod scene;
 pub mod scroll;
@@ -88,11 +90,12 @@ pub use layer::{
     Dismiss, DismissPolicy, DismissReason, Layer, LayerHandle, PointerButton, PointerKind, PointerOutside,
 };
 pub use list::{ListState, virtual_list};
-pub use mailbox::{Sender, mailbox};
+pub use mailbox::{Closed, Sender, mailbox};
 pub use members::Members;
 pub use motion::{Animation, Easing, Motion, Properties, Slide, Stage};
 pub use place::Place;
 pub use placement::Placement;
+pub use port::{Cancel, Port, Task, port, spawn};
 pub use reactive::{
     Collection, Computed, Effect, Scope, Signal, batch, detached, on_cleanup, trigger, untracked, watch,
 };

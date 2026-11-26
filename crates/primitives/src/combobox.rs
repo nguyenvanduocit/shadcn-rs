@@ -143,6 +143,7 @@ impl<T: 'static> Clone for TextValue<T> {
     }
 }
 
+#[derive(Clone)]
 struct State<T: 'static, M: 'static> {
     config: ComboboxConfig,
     display: Display<M>,

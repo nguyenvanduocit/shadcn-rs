@@ -62,6 +62,7 @@ use crate::reactive::{Signal, detached};
 use crate::scroll::{Move, ScrollHandle, ScrollLayout};
 use crate::style::{BackgroundImage, Calc, LinearGradient, Stop, StopColor};
 
+mod pins;
 mod windowed;
 
 pub use windowed::{ListRow, virtual_each, virtual_each_in};
@@ -141,6 +142,22 @@ struct Plan {
     /// The scroll request revision it was built against: a request made
     /// since (an effect that ran after the render) wins over its anchor.
     rev: u64,
+    /// What it pinned from that its own signals tell, not the version.
+    read: Signalled,
+}
+
+/// The inputs a plan's pins were worked out from that are told by their
+/// own signals, not by the list's version (the source tracks them): the
+/// row count `rows()` gave, and the active row [`ListState::active_from`]'s
+/// closure gave (`None` when the active row is [`ListState::set_active`]'s,
+/// behind the version). The pins check compares the rows built with these
+/// as the plan read them ([`ListState::check_pins`]): one of them changed
+/// mid-pass (a sibling's layout callback writing its signal) reruns the
+/// source, and is no stale plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Signalled {
+    rows: u64,
+    active: Option<Option<u64>>,
 }
 
 /// A list's heights lent to be reordered off the UI thread
@@ -349,25 +366,80 @@ struct State {
     dragging: bool,
     /// The owner's hook, run once the window is settled.
     hook: Option<Hook>,
-    /// The row holding focus, as last laid out, and its key.
-    focus_row: Option<(u64, ElementKey)>,
     /// Where the scroll container sits, as last laid out: its rows are
     /// its children.
     viewport_path: Option<crate::geometry::NodePath>,
-    /// The row its owner treats as current (an active option).
-    active: Option<u64>,
-    /// Or what tells it, read as the list renders ([`ListState::active_from`]).
+    /// The focused row, the rows around it and the active row: what pins
+    /// rows outside the window, written through its setters alone, each
+    /// change told to the version ([`pins`]).
+    pins: pins::Pins,
+    /// Or what tells the active row, read as the list renders
+    /// ([`ListState::active_from`]): a tracked read of its own.
     /// Held by the owner's instance while it is mounted: a list state that
     /// outlives it (reused by another list) never calls it once it left.
     active_from: crate::Holder<ActiveFrom>,
-    /// Rows on each side of the focused one kept built with it.
-    around_focus: u64,
-    /// The last render's plan, taken in: taken once.
-    taken: Weak<dyn std::any::Any>,
+    /// The plan last taken in: taken once, and again after the rows built
+    /// were let go ([`forget_built`]).
+    taken: Taken,
     /// The plan a windowed list's last commit built its rows from
-    /// ([`virtual_each`]): its source's result, kept while an equal one
-    /// comes again (so it is taken once), never written in part.
-    planned: Option<Rc<Plan>>,
+    /// ([`virtual_each`]) and its number: its source's result, kept while
+    /// an equal one comes again, never written in part.
+    planned: Option<(u64, Rc<Plan>)>,
+    /// The number the next plan kept takes.
+    plans: u64,
+    /// The version ([`Self::version`]) the plan standing was worked out
+    /// at: the pins check compares only a plan as new as the inputs
+    /// ([`ListState::check_pins`]).
+    planned_at: u64,
+}
+
+/// Which plan was taken in last ([`ListState::take`]): a render's, known by
+/// its allocation, or a windowed list's, by its number. `None` after the
+/// rows built were let go, so the plan standing is taken in again whole.
+#[derive(Clone, Default)]
+enum Taken {
+    #[default]
+    None,
+    Render(Weak<dyn std::any::Any>),
+    Kept(u64),
+}
+
+/// The row holding focus now, found among the rows built while they are
+/// still known by place ([`ListState::focus_now`]), carried through what
+/// moves the rows ([`Self::map`]). The one way to let go of the rows
+/// built ([`forget_built`]) takes it: focus moved this turn, after the
+/// last layout noted it, is not lost with the places it was found by.
+#[derive(Clone, Copy, Debug)]
+struct FocusNow(Option<KeyedRow>);
+
+impl FocusNow {
+    /// Where the rows moved it: `to` its new row, `None` if it went.
+    fn map(self, to: impl FnOnce(u64) -> Option<u64>) -> Self {
+        Self(self.0.and_then(|(row, key)| to(row).map(|r| (r, key))))
+    }
+}
+
+/// Row `row` after `removed` rows at `at` were replaced by `inserted`:
+/// `None` for a row removed.
+fn spliced_row(row: u64, at: u64, removed: u64, inserted: u64) -> Option<u64> {
+    if row >= at.saturating_add(removed) {
+        Some(row.saturating_sub(removed).saturating_add(inserted))
+    } else if row >= at {
+        None
+    } else {
+        Some(row)
+    }
+}
+
+/// The rows built, and those pinned, were found by position and no longer
+/// are (a splice, a reorder): the window is decided anew, and the plan
+/// standing, equal or not, is taken in again. Focus is where `focus`,
+/// found before and carried through the move, says.
+fn forget_built(s: &mut State, focus: FocusNow) {
+    s.pins.set_focus_row(focus.0);
+    s.window = Window::default();
+    Built::set(&mut s.built, &[], &[], 0, Signalled::default());
+    s.taken = Taken::None;
 }
 
 /// The rows the last render built ([`State::built`]): replaced whole when
@@ -380,6 +452,9 @@ struct Built {
     /// of them come before it.
     pins: Vec<(u64, ElementKey)>,
     pins_before: usize,
+    /// What the plan it came from read that its own signals tell
+    /// ([`Signalled`]).
+    read: Signalled,
 }
 
 impl Built {
@@ -387,7 +462,7 @@ impl Built {
     /// room kept, no allocation once it has enough); a new one where a
     /// check's copy shares it, which costs what it holds, not what it
     /// replaces, and leaves live's as it was.
-    fn set(built: &mut Rc<Self>, keys: &[ElementKey], pins: &[(u64, ElementKey)], pins_before: usize) {
+    fn set(built: &mut Rc<Self>, keys: &[ElementKey], pins: &[(u64, ElementKey)], pins_before: usize, read: Signalled) {
         match Rc::get_mut(built) {
             Some(b) => {
                 b.keys.clear();
@@ -395,12 +470,14 @@ impl Built {
                 b.pins.clear();
                 b.pins.extend_from_slice(pins);
                 b.pins_before = pins_before;
+                b.read = read;
             }
             None => {
                 *built = Rc::new(Self {
                     keys: keys.to_vec(),
                     pins: pins.to_vec(),
                     pins_before,
+                    read,
                 });
             }
         }
@@ -449,21 +526,23 @@ impl crate::engine::Parts for State {
             hiding,
             dragging,
             hook,
-            focus_row,
             viewport_path,
-            active,
+            pins,
             active_from,
-            around_focus,
             taken,
             planned,
+            plans,
+            planned_at,
         } = self;
         // The app's callback, its own box (or let go of at once, live
         // sharing it).
         hook.parts(out);
         waiting.parts(out);
         built.parts(out);
-        taken.parts(out);
-        planned.parts(out);
+        if let Taken::Render(taken) = taken {
+            taken.parts(out);
+        }
+        planned.map(|(_, plan)| plan).parts(out);
         // The engine's own: memory, a box each where it has drop glue.
         whole(extents, out);
         whole(since_lent, out);
@@ -495,10 +574,10 @@ impl crate::engine::Parts for State {
             hide_at,
             hiding,
             dragging,
-            focus_row,
-            active,
+            pins,
             active_from,
-            around_focus,
+            plans,
+            planned_at,
         );
     }
 }
@@ -545,13 +624,13 @@ impl crate::engine::ForkClone for State {
             hiding,
             dragging,
             hook,
-            focus_row,
             viewport_path,
-            active,
+            pins,
             active_from,
-            around_focus,
             taken,
             planned,
+            plans,
+            planned_at,
         } = self;
         Self {
             version: *version,
@@ -584,13 +663,13 @@ impl crate::engine::ForkClone for State {
             hiding: *hiding,
             dragging: *dragging,
             hook: hook.as_ref().map(Rc::clone),
-            focus_row: *focus_row,
             viewport_path: viewport_path.clone(),
-            active: *active,
+            pins: *pins,
             active_from: *active_from,
-            around_focus: *around_focus,
-            taken: Weak::clone(taken),
-            planned: planned.as_ref().map(Rc::clone),
+            taken: taken.clone(),
+            planned: planned.as_ref().map(|(n, plan)| (*n, Rc::clone(plan))),
+            plans: *plans,
+            planned_at: *planned_at,
         }
     }
 }
@@ -795,17 +874,15 @@ impl fmt::Debug for Noted {
 /// the write that applies it ([`ListState::follow_reorder`]).
 struct Follow {
     anchor: Anchor,
-    focus_row: Option<(u64, ElementKey)>,
+    focus_row: FocusNow,
 }
 
 impl Follow {
     fn apply(self, s: &mut State) {
         s.anchor = self.anchor;
-        s.focus_row = self.focus_row;
         // The rows built, and those pinned, were found by position: the
-        // window is decided anew.
-        s.window = Window::default();
-        Built::set(&mut s.built, &[], &[], 0);
+        // window is decided anew, and the plan taken in again.
+        forget_built(s, self.focus_row);
         // The rows around the anchor may be estimates: it holds, as a row
         // scrolled to does, until the viewport shows it measured, aligned
         // as a scroll still pending asked (its bottom, say).
@@ -844,7 +921,7 @@ struct Seen {
 /// as found by key, taken before any call of the caller's `to`.
 struct ReadSet {
     seen: Seen,
-    focus: Option<KeyedRow>,
+    focus: FocusNow,
     /// The window's focused node `focus` was worked out from: state of the
     /// window's, not the list's, so validated beside [`Seen`] (a `to` that
     /// moves focus refuses the reorder).
@@ -857,7 +934,7 @@ impl Seen {
             anchor: s.anchor,
             request: s.request,
             requests: s.requests,
-            focus_row: s.focus_row,
+            focus_row: s.pins.focus_row(),
             window: s.window,
             pinned: s.pinned,
             to_end: s.to_end,
@@ -1003,6 +1080,25 @@ fn compute_at(s: &State, ext: &ExtentTree, anchor: Anchor, reach: f32) -> Window
     }
 }
 
+/// The rows pinned outside window `w` of `rows` rows: the focused row, the
+/// `around` rows on each side of it, and the active row, in order, each
+/// once. What a plan pins and what the layout hook checks it against
+/// ([`ListState::check_pins`]): one rule.
+fn pin_rows(focus: Option<u64>, active: Option<u64>, around: u64, w: Window, rows: u64) -> Vec<u64> {
+    let neighbours = focus
+        .into_iter()
+        .flat_map(|row| row.saturating_sub(around)..row.saturating_add(around).saturating_add(1).min(rows));
+    let mut pins: Vec<u64> = focus
+        .into_iter()
+        .chain(neighbours)
+        .chain(active.filter(|&r| r < rows))
+        .filter(|r| !(w.first..w.last).contains(r))
+        .collect();
+    pins.sort_unstable();
+    pins.dedup();
+    pins
+}
+
 /// The row of a window starting at `first` whose key is `k` among `keys`,
 /// or among the rows `pins` holds.
 fn row_keyed(first: u64, keys: &[ElementKey], pins: &[(u64, ElementKey)], k: ElementKey) -> Option<u64> {
@@ -1012,16 +1108,34 @@ fn row_keyed(first: u64, keys: &[ElementKey], pins: &[(u64, ElementKey)], k: Ele
         .or_else(|| pins.iter().find(|(_, key)| *key == k).map(|(r, _)| *r))
 }
 
+/// The row, and its key, of the container's child `j` when `built` built
+/// the window starting at `first`: the pinned rows before the window, the
+/// window's rows, the pinned rows after it (and nothing for the room below
+/// them). By place, so two rows sharing a key stay two.
+fn row_of_child(first: u64, built: &Built, j: usize) -> Option<KeyedRow> {
+    let before = built.pins_before.min(built.pins.len());
+    let Some(i) = j.checked_sub(before) else {
+        return built.pins.get(j).copied();
+    };
+    if let Some(&k) = built.keys.get(i) {
+        return Some((first.saturating_add(u64::try_from(i).unwrap_or(u64::MAX)), k));
+    }
+    let after = i.saturating_sub(built.keys.len()).saturating_add(before);
+    built.pins.get(after).copied()
+}
+
 /// What a layout found, measured into the state ([`ListState::laid_out`]).
 enum Measured {
     /// Focus left the row kept built for it: the list renders again.
     Unpinned,
-    /// The window laid out, the scroll asked for when it was, and which of
-    /// the container's children are the window's rows.
+    /// The window laid out, the scroll asked for when it was, which of the
+    /// container's children are the window's rows, and whether focus moved
+    /// to another row (the rows pinned for it are built next).
     Rows {
         w: Window,
         asked: Option<Request>,
         rows: std::ops::Range<usize>,
+        refocused: bool,
     },
 }
 
@@ -1111,13 +1225,13 @@ impl ListState {
             hiding: false,
             dragging: false,
             hook: None,
-            focus_row: None,
-            active: None,
+            pins: pins::Pins::default(),
             active_from: detached(crate::Holder::new),
-            around_focus: 0,
             viewport_path: None,
-            taken: Weak::<Plan>::new(),
+            taken: Taken::None,
             planned: None,
+            plans: 0,
+            planned_at: 0,
         };
         let me = Self(crate::engine::allocate(&LISTS, state));
         scroll.on_layout_built(move |l, built| me.laid_out(scroll, l, built));
@@ -1196,12 +1310,25 @@ impl ListState {
         // what the handle took in is clamped to its range as it came.
         debug_assert!(added.0 == 0.0, "a vertical list took in {added:?}");
         let added = added.1;
-        LISTS.with_borrow(|l| {
+        // A render may not write the version it reads (a render that sets
+        // the active row as it builds, the old path): the change waits,
+        // noted, for the next write outside one, the list's layout hook's
+        // at the latest, in the same frame.
+        let tell = crate::reactive::phase() != crate::reactive::Phase::Render;
+        let wrote = LISTS.with_borrow(|l| {
             l.write(self.0, |s| {
                 absorb(s, added);
-                f(s)
+                let out = f(s);
+                let changed = tell && s.pins.take_changed();
+                (out, changed.then_some(s.version))
             })
-        })
+        });
+        let (out, version) = wrote?;
+        // Every change to what pins rows reaches the window's source.
+        if let Some(version) = version {
+            version.update(|v| *v = v.wrapping_add(1));
+        }
+        Some(out)
     }
 
     /// Its scroll container's handle.
@@ -1593,7 +1720,11 @@ impl ListState {
     /// Build `px` pixels of rows beyond the viewport on each side (one
     /// viewport by default).
     pub fn set_prefetch(&self, px: f32) {
-        self.write(|s| s.prefetch = Some(px.max(0.0)));
+        let px = Some(px.max(0.0));
+        if self.write(|s| std::mem::replace(&mut s.prefetch, px) != px) == Some(true) {
+            // The window is decided anew from it.
+            self.bump();
+        }
     }
 
     /// Keep the last row in view as rows are added while the view is at the end.
@@ -1673,10 +1804,10 @@ impl ListState {
 
     /// The row its owner treats as current, kept built (and in what a
     /// screen reader holds) while it is scrolled out of view: an option
-    /// highlighted by the keyboard (`aria-activedescendant`). Read when the
-    /// list renders.
+    /// highlighted by the keyboard (`aria-activedescendant`). A change
+    /// builds the list's rows again.
     pub fn set_active(&self, row: Option<u64>) {
-        self.write(|s| s.active = row);
+        self.write(|s| s.pins.set_active(row));
     }
 
     /// The row its owner treats as current is what `f` gives, read (tracked)
@@ -1696,15 +1827,16 @@ impl ListState {
 
     /// Keep `rows` rows on each side of the focused one built with it (0 by
     /// default), so Tab and Shift+Tab from a row scrolled away reach its
-    /// neighbours, not the rows in view. Read when the list renders.
+    /// neighbours, not the rows in view. A change builds the list's rows
+    /// again.
     pub fn keep_around_focus(&self, rows: u64) {
-        self.write(|s| s.around_focus = rows);
+        self.write(|s| s.pins.set_around(rows));
     }
 
     /// The row holding focus, as last laid out.
     #[must_use]
     pub fn focused_row(&self) -> Option<u64> {
-        self.read(|s| s.focus_row).flatten().map(|(row, _)| row)
+        self.read(|s| s.pins.focus_row()).flatten().map(|(row, _)| row)
     }
 
     /// The rows built outside the window, kept for focus and the active row.
@@ -1759,10 +1891,16 @@ impl ListState {
             crate::geometry::PathSeg::Component(k, None) => k,
             crate::geometry::PathSeg::Index(_) => return None,
         };
-        // Built in the last frame: in its window or pinned.
-        let row = self
-            .read(|s| row_keyed(s.window.first, &s.built.keys, &s.built.pins, k))
-            .flatten()
+        // The row the layout found holding it, by its place among the
+        // rows built (keys may repeat): when that row has this key.
+        let laid = self.read(|s| s.pins.focus_row()).flatten().filter(|&(_, key)| key == k);
+        // Else built in the last frame: in its window or pinned.
+        let row = laid
+            .map(|(r, _)| r)
+            .or_else(|| {
+                self.read(|s| row_keyed(s.window.first, &s.built.keys, &s.built.pins, k))
+                    .flatten()
+            })
             // Or in the window this render builds.
             .or_else(|| {
                 keys.iter()
@@ -1781,7 +1919,7 @@ impl ListState {
         w: Window,
         rows: u64,
         key: &dyn Fn(u64) -> ElementKey,
-    ) -> (Option<KeyedRow>, Vec<KeyedRow>) {
+    ) -> (Option<KeyedRow>, Vec<KeyedRow>, Signalled) {
         let focus = focus.and_then(|(row, k)| {
             if row < rows && key(row) == k {
                 return Some((row, k));
@@ -1790,25 +1928,35 @@ impl ListState {
             let to = row.saturating_add(KEY_SEARCH).min(rows);
             (from..to).find(|&r| key(r) == k).map(|r| (r, k))
         });
-        let Some((active_from, active, around)) = self.read(|s| (s.active_from, s.active, s.around_focus)) else {
-            return (None, Vec::new());
+        let Some((active, from_signal)) = self.active_read() else {
+            return (None, Vec::new(), Signalled::default());
         };
-        let from = active_from.get();
-        let active = from.map_or(active, |f| f()).filter(|&r| r < rows).map(|r| (r, key(r)));
-        let neighbours = focus.into_iter().flat_map(|(row, _)| {
-            (row.saturating_sub(around)..row.saturating_add(around).saturating_add(1).min(rows))
-                .filter(move |&r| r != row)
-                .map(|r| (r, key(r)))
-        });
-        let mut pins: Vec<(u64, ElementKey)> = focus
+        let read = Signalled {
+            rows,
+            active: from_signal.then_some(active),
+        };
+        let around = self.read(|s| s.pins.around()).unwrap_or(0);
+        let pins = pin_rows(focus.map(|(r, _)| r), active, around, w, rows)
             .into_iter()
-            .chain(neighbours)
-            .chain(active)
-            .filter(|(r, _)| !(w.first..w.last).contains(r))
+            .map(|r| match focus {
+                Some((f, k)) if f == r => (r, k),
+                _ => (r, key(r)),
+            })
             .collect();
-        pins.sort_unstable_by_key(|(r, _)| *r);
-        pins.dedup_by_key(|(r, _)| *r);
-        (focus, pins)
+        (focus, pins, read)
+    }
+
+    /// The active row: what [`Self::active_from`]'s closure gives (a
+    /// tracked read, called with no list borrowed), else what
+    /// [`Self::set_active`] set; `None` once the list is gone. And whether
+    /// it came from the closure (an input its own signals tell, not the
+    /// version).
+    fn active_read(&self) -> Option<(Option<u64>, bool)> {
+        let (active_from, active) = self.read(|s| (s.active_from, s.pins.active()))?;
+        Some(match active_from.get() {
+            Some(f) => (f(), true),
+            None => (active, false),
+        })
     }
 
     /// Scroll so `row`'s top is the viewport's.
@@ -1913,6 +2061,9 @@ impl ListState {
     /// Rows `at..at + removed` were replaced by `inserted` new ones (not
     /// yet measured); the anchor keeps its row.
     pub fn splice(&self, at: u64, removed: u64, inserted: u64) {
+        // The row holding focus now, found while the rows built are known
+        // by place, and where the splice puts it.
+        let focus = self.focus_now().map(|row| spliced_row(row, at, removed, inserted));
         self.write(|s| {
             s.extents.splice(at, removed, inserted);
             reshaped(s);
@@ -1923,9 +2074,13 @@ impl ListState {
                 a.row = at;
                 a.offset = 0.0;
             }
-            if s.window.last > at {
+            let pinned_after = s.built.pins.iter().any(|&(r, _)| r >= at);
+            if s.window.last > at || pinned_after {
                 // The rows built moved: the window is decided anew.
-                s.window = Window::default();
+                forget_built(s, focus);
+            } else {
+                // The focused row follows its row, wherever it is.
+                s.pins.set_focus_row(focus.0);
             }
         });
         // The anchor holds its row: the rows moved under the place shown.
@@ -1982,8 +2137,19 @@ impl ListState {
                 offset: 0.0,
             },
         };
-        let focus_row = focus.and_then(|(r, k)| to(r).filter(|&r| r < rows).map(|r| (r, k)));
+        let focus_row = focus.map(|r| to(r).filter(|&r| r < rows));
         Follow { anchor, focus_row }
+    }
+
+    /// The row holding focus now, moved this turn or not: found by the
+    /// focused node's key among the rows built while they are still known
+    /// by place, else as the last layout noted it. What every operation
+    /// that lets go of the rows built reads first ([`forget_built`]).
+    fn focus_now(&self) -> FocusNow {
+        let Some((window, held)) = self.read(|s| (s.window, s.pins.focus_row())) else {
+            return FocusNow(None);
+        };
+        FocusNow(self.noted_focus(window, &[]).or(held))
     }
 
     /// What a reorder reads of the list, taken before any call of the
@@ -1991,11 +2157,9 @@ impl ListState {
     /// read phase starts), so a `to` that writes the list changes it and
     /// the commit refuses.
     fn read_set(&self) -> Option<ReadSet> {
-        let (window, focus_row, seen) = self.read(|s| (s.window, s.focus_row, Seen::of(s)))?;
-        // What holds focus now (moved this turn or not), found by its key
-        // among the rows built while they are still known by position.
+        let seen = self.read(Seen::of)?;
         let focused = crate::untracked(crate::focus::focused);
-        let focus = self.noted_focus(window, &[]).or(focus_row);
+        let focus = self.focus_now();
         Some(ReadSet { seen, focus, focused })
     }
 
@@ -2078,16 +2242,19 @@ impl ListState {
             let before = s.built.pins_before.min(l.children.len());
             let rows = before..before.saturating_add(built).min(l.children.len());
             let children = l.children.get(rows.clone()).unwrap_or_default();
-            // The row holding focus, by its key, built in the window or pinned.
+            // The row holding focus, by its place among the rows built (a
+            // key two rows share names one of them only), in the window or
+            // pinned.
             let focus = l
                 .children
                 .iter()
-                .find(|c| c.focus_within)
-                .and_then(|c| c.key)
-                .and_then(|k| row_keyed(w.first, &s.built.keys, &s.built.pins, k).map(|r| (r, k)));
-            let held = s.focus_row;
+                .position(|c| c.focus_within)
+                .and_then(|j| row_of_child(w.first, &s.built, j));
+            let held = s.pins.focus_row();
             let unpinned = held.is_some_and(|(r, _)| !(w.first..w.last).contains(&r)) && focus != held;
-            s.focus_row = focus;
+            // Through its setter: the window's source reads it, and runs
+            // again for it (the rows kept around it, [`Pins`]).
+            s.pins.set_focus_row(focus);
             if unpinned {
                 return Measured::Unpinned;
             }
@@ -2115,16 +2282,26 @@ impl ListState {
                     };
                 }
             }
-            Measured::Rows { w, asked, rows }
+            Measured::Rows {
+                w,
+                asked,
+                rows,
+                refocused: focus != held,
+            }
         });
-        let (w, asked, rows) = match measured {
+        let (w, asked, rows, refocused) = match measured {
             None => return false,
             Some(Measured::Unpinned) => {
                 // Focus left the row kept built for it: it goes.
                 self.bump();
                 return true;
             }
-            Some(Measured::Rows { w, asked, rows }) => (w, asked, rows),
+            Some(Measured::Rows {
+                w,
+                asked,
+                rows,
+                refocused,
+            }) => (w, asked, rows, refocused),
         };
         let children = l.children.get(rows).unwrap_or_default();
         let (_, reach) = scroll.reach();
@@ -2170,7 +2347,11 @@ impl ListState {
             self.bump();
             return true;
         }
-        // The rows built still cover it: nothing to build.
+        // The rows built still cover it: nothing to build. Unless focus
+        // moved, the rows they pin are those built.
+        if cfg!(debug_assertions) && !refocused {
+            self.check_pins(w);
+        }
         let hook = self
             .write(|s| {
                 s.window = next;
@@ -2198,7 +2379,47 @@ impl ListState {
                 wheeled: scroll.take_wheeled(),
             })
         });
-        thumb_moved | fitted | owner
+        thumb_moved | fitted | owner | refocused
+    }
+
+    /// The referee of what a plan reads (debug builds): once a layout
+    /// settles on window `w` with focus where it was, and the plan built
+    /// was worked out at the version standing (no input told a change
+    /// since, which a sibling's layout callback may have through a setter:
+    /// the source runs again for it), the rows built outside it are those
+    /// the pins name ([`pin_rows`], the plan's own rule): the inputs
+    /// behind the version as they stand, those the source tracks by their
+    /// own signals as the plan read them ([`Signalled`]). A pin input
+    /// that changed without telling the version leaves the rows built for
+    /// the old one, and this says so here instead of a row going missing
+    /// later.
+    fn check_pins(&self, w: Window) {
+        let Some((focus, around, set_active, built, version, at)) = self.read(|s| {
+            (
+                s.pins.focus_row(),
+                s.pins.around(),
+                s.pins.active(),
+                Rc::clone(&s.built),
+                s.version,
+                s.planned_at,
+            )
+        }) else {
+            return;
+        };
+        if crate::reactive::untracked(|| version.get()) != at {
+            return;
+        }
+        // The inputs the source tracks by their own signals, as the plan
+        // read them (a change of one since reruns it); those behind the
+        // version, as they stand.
+        let read = built.read;
+        let active = read.active.unwrap_or(set_active);
+        let want = pin_rows(focus.map(|(r, _)| r), active, around, w, read.rows);
+        let have: Vec<u64> = built.pins.iter().map(|(r, _)| *r).collect();
+        assert_eq!(
+            have, want,
+            "a list's pinned rows are not those its pins name: a plan input changed without bumping its version"
+        );
     }
 
     /// The anchor kept on its key after the data moved under it, over
@@ -2244,12 +2465,12 @@ impl ListState {
                 });
                 let ext = resized.as_ref().unwrap_or(&s.extents);
                 let window = compute_at(s, ext, followed.unwrap_or(s.anchor), reach);
-                (window, total(s, ext), s.focus_row, s.requests)
+                (window, total(s, ext), s.pins.focus_row(), s.requests)
             })
             .unwrap_or_default();
         let keys: Vec<ElementKey> = (window.first..window.last).map(key).collect();
         let focus = self.noted_focus(window, &keys).or(focus_row);
-        let (focus, pins) = self.pins_for(focus, window, rows, key);
+        let (focus, pins, read) = self.pins_for(focus, window, rows, key);
         let pins_before = pins.iter().take_while(|(r, _)| *r < window.first).count();
         Plan {
             rows,
@@ -2261,31 +2482,38 @@ impl ListState {
             focus,
             total,
             rev,
+            read,
         }
     }
 
-    /// Take in what the render built from, once (the plan is known by its
-    /// own allocation, which the `Weak` held keeps from being reused, so a
-    /// plan taken again changes nothing): the heights matched to its data,
-    /// the anchor kept on its key, the rows it built. Taken after every
-    /// layout pass that laid them out, the frame's last too. Whether it put
-    /// the container elsewhere.
+    /// Take in what the render built from, once until the rows built are
+    /// let go ([`forget_built`]): the heights matched to its data, the
+    /// anchor kept on its key, the rows it built. A render's plan is known
+    /// by its own allocation (the `Weak` held keeps it from being reused), a
+    /// windowed list's by the number it was kept under; a plan taken again
+    /// changes nothing. Taken after every layout pass that laid them out,
+    /// the frame's last too. Whether it put the container elsewhere.
     fn take(&self, built: &crate::scroll::Built) -> bool {
         // A windowed list's container says so: the plan is the one its
         // last commit kept ([`State::planned`]).
-        let plan: crate::scroll::Built = if built.is::<windowed::Windowed>() {
+        let (plan, this): (crate::scroll::Built, Taken) = if built.is::<windowed::Windowed>() {
             match self.peek(|s| s.planned.clone()).flatten() {
-                Some(p) => p,
+                Some((n, p)) => (p, Taken::Kept(n)),
                 None => return false,
             }
         } else {
-            Rc::clone(built)
+            (Rc::clone(built), Taken::Render(Rc::downgrade(built)))
         };
         let fresh = self.write(|s| {
-            if Weak::ptr_eq(&s.taken, &Rc::downgrade(&plan)) {
+            let same = match (&s.taken, &this) {
+                (Taken::Kept(a), Taken::Kept(b)) => a == b,
+                (Taken::Render(a), Taken::Render(b)) => Weak::ptr_eq(a, b),
+                _ => false,
+            };
+            if same {
                 return false;
             }
-            s.taken = Rc::downgrade(&plan);
+            s.taken = this;
             true
         });
         if fresh != Some(true) {
@@ -2316,8 +2544,8 @@ impl ListState {
         }
         self.write(|s| {
             s.window = p.window;
-            Built::set(&mut s.built, &p.keys, &p.pins, p.pins_before);
-            s.focus_row = p.focus;
+            Built::set(&mut s.built, &p.keys, &p.pins, p.pins_before, p.read);
+            s.pins.adopt_focus_row(p.focus);
         });
         scroll.offset() != was
     }
@@ -2525,8 +2753,11 @@ pub fn virtual_list_in(
         return div().named("virtual-list");
     };
     // Read so a moved window renders again.
-    version.with(|_| ());
+    let at = version.with(|v| *v);
     let plan = state.plan(rows, &key);
+    // The plan this render builds is the one for version `at` (a cache
+    // of what it read: no reader's scroll moves, nothing is told).
+    LISTS.with_borrow(|l| l.write(state.0, |s| s.planned_at = at));
     let w = plan.window;
     let total = plan.total;
     let row_at = |i: u64, k: ElementKey| {
@@ -4192,7 +4423,7 @@ mod tests {
         let n = 20_000_u64;
         let keys: Vec<ElementKey> = (0..n).collect();
         let pins: Vec<(u64, ElementKey)> = (0..n).map(|r| (r, r)).collect();
-        state.write(|s| Built::set(&mut s.built, &keys, &pins, 7));
+        state.write(|s| Built::set(&mut s.built, &keys, &pins, 7, Signalled::default()));
         let wake: Rc<dyn Fn()> = Rc::new(|| ());
         for holder in 1..=1_000 {
             state.wait_for_heights(holder, Rc::downgrade(&wake));

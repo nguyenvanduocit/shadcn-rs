@@ -5,8 +5,10 @@
 //! painted, inert, while its exit animation plays ([`MotionStyle::exit`],
 //! reka's `Presence`).
 //!
-//! A node is the same node across frames when its [`NodePath`] is (keys keep
-//! it through a reorder). [`Motion`] holds, per path, what runs; the layout
+//! A node is the same node across frames when its [`NodeId`] is (keys keep
+//! it through a reorder, ADR-0026). [`Motion`] holds, per node, what runs;
+//! a subtree that leaves keeps its path too, to put its last element back
+//! in its slot (the legacy ghost, until K4d's leaving lists); the layout
 //! asks it for each node's values this frame ([`Motion::sample`]) and tells it
 //! what the frame held ([`Motion::finish`]), which is when a node that was
 //! there and is gone starts leaving. Time is the frame clock's.
@@ -19,7 +21,7 @@ use std::sync::Arc;
 use crate::clock;
 use crate::color::Color;
 use crate::element::Element;
-use crate::geometry::{NodePath, PathSeg};
+use crate::geometry::{NodeId, NodePath, PathSeg};
 use crate::style::{Calc, Edges, Length, Ring, Shadow, Style};
 
 /// A CSS timing function: how far along a value is at a share of its time.
@@ -834,6 +836,8 @@ struct NodeState {
     /// Where it reports its stages, and the last it reported.
     report: Option<StageReport>,
     told: Option<Stage>,
+    /// Where it was last sampled: what a subtree leaving is found by.
+    path: NodePath,
 }
 
 impl NodeState {
@@ -902,6 +906,9 @@ impl NodeState {
 struct Leaving {
     /// The path of its root, which is also its slot's in the parent.
     path: NodePath,
+    /// The nodes that left with an exit, its root's or below: the layout
+    /// builds them again (the ghost) with these ids.
+    ids: Vec<(NodeId, NodePath)>,
     /// The element in the parent's slot as it last rendered, made inert (a
     /// [`Element::Deferred`] when it is a layer).
     slot: Element,
@@ -913,10 +920,10 @@ struct Leaving {
     until: u64,
 }
 
-/// What runs, across frames, by node path; the pipeline owns one.
+/// What runs, across frames, by node; the pipeline owns one.
 #[derive(Clone, Default)]
 pub struct Motion {
-    nodes: HashMap<NodePath, NodeState>,
+    nodes: HashMap<NodeId, NodeState>,
     leaving: Vec<Leaving>,
     /// When the last finite motion of the last pass ends, nanoseconds on
     /// the frame clock.
@@ -929,9 +936,9 @@ pub struct Motion {
     /// nanoseconds on the frame clock.
     wake_at: Option<u64>,
     /// Nodes whose after-mount animation started this pass.
-    mounting: Vec<NodePath>,
+    mounting: Vec<(NodeId, NodePath)>,
     /// Nodes with an exit that left the tree this pass.
-    gone: Vec<NodePath>,
+    gone: Vec<(NodeId, NodePath)>,
     /// Stages reached this pass, told once it is laid out.
     stages: Vec<(StageReport, Stage)>,
     /// A node waited for its natural height and has it now: lay out again.
@@ -968,9 +975,12 @@ impl Motion {
     /// End every transition, finite animation and exit running now.
     fn finish_all(&mut self) {
         self.generation = self.generation.wrapping_add(1);
-        let left: Vec<NodePath> = self.leaving.drain(..).map(|l| l.path).collect();
-        self.nodes
-            .retain(|path, _| !left.iter().any(|l| path.0.starts_with(&l.0)));
+        let left: Vec<NodeId> = self
+            .leaving
+            .drain(..)
+            .flat_map(|l| l.ids.into_iter().map(|(id, _)| id))
+            .collect();
+        self.nodes.retain(|id, _| !left.contains(id));
         for state in self.nodes.values_mut() {
             state.end_runs();
         }
@@ -992,20 +1002,25 @@ impl Motion {
         self.generation
     }
 
-    /// The nodes it keeps a state for.
-    pub(crate) fn paths(&self) -> impl Iterator<Item = &NodePath> {
-        self.nodes.keys()
+    /// The nodes it keeps a state for, with where each was last sampled.
+    pub(crate) fn kept(&self) -> impl Iterator<Item = (NodeId, &NodePath)> {
+        self.nodes.iter().map(|(id, s)| (*id, &s.path))
     }
 
-    /// Whether the node at `path` moves: it is sampled again next pass.
-    pub(crate) fn busy(&self, path: &NodePath) -> bool {
-        self.nodes.get(path).is_some_and(|s| s.busy) || self.leaving_since(path).is_some()
+    /// Whether it keeps a state for node `id`, or `id` is leaving.
+    pub(crate) fn keeps(&self, id: NodeId) -> bool {
+        self.nodes.contains_key(&id) || self.leaving_since(id).is_some()
     }
 
-    /// The node at `path`, laid out, is `height` tall: its natural height
-    /// when it measures one.
-    pub(crate) fn natural(&mut self, path: &NodePath, height: f32) {
-        if let Some(s) = self.nodes.get_mut(path)
+    /// Whether node `id` moves: it is sampled again next pass.
+    pub(crate) fn busy(&self, id: NodeId) -> bool {
+        self.nodes.get(&id).is_some_and(|s| s.busy) || self.leaving_since(id).is_some()
+    }
+
+    /// Node `id`, laid out, is `height` tall: its natural height when it
+    /// measures one.
+    pub(crate) fn natural(&mut self, id: NodeId, height: f32) {
+        if let Some(s) = self.nodes.get_mut(&id)
             && s.measure
         {
             self.again |= s.wanted_natural && s.natural.is_none();
@@ -1013,19 +1028,19 @@ impl Motion {
         }
     }
 
-    /// The nodes at `released` left the tree this pass (`present` says
-    /// which paths it still holds): those with an exit start leaving at
-    /// [`Motion::finish`], the others are forgotten.
-    pub(crate) fn left(&mut self, released: &[NodePath], present: &dyn Fn(&NodePath) -> bool) {
-        for path in released {
+    /// The nodes `released` (each with where it was) left the tree this
+    /// pass (`present` says which paths it still holds): those with an
+    /// exit start leaving at [`Motion::finish`], the others are forgotten.
+    pub(crate) fn left(&mut self, released: &[(NodeId, NodePath)], present: &dyn Fn(&NodePath) -> bool) {
+        for (id, path) in released {
             if present(path) {
                 continue;
             }
-            let leaving = self.leaving.iter().any(|l| path.0.starts_with(&l.path.0));
-            match self.nodes.get(path) {
-                Some(s) if s.exit.is_some() && !leaving => self.gone.push(path.clone()),
+            let leaving = self.leaving_since(*id).is_some();
+            match self.nodes.get(id) {
+                Some(s) if s.exit.is_some() && !leaving => self.gone.push((*id, path.clone())),
                 Some(_) if !leaving => {
-                    if let Some(r) = self.nodes.remove(path).and_then(|s| s.report) {
+                    if let Some(r) = self.nodes.remove(id).and_then(|s| s.report) {
                         self.stages.push((r.clone(), Stage::Exiting));
                         self.stages.push((r, Stage::Exited));
                     }
@@ -1060,12 +1075,14 @@ impl Motion {
         self.wake_at = Some(self.wake_at.map_or(at, |w| w.min(at)));
     }
 
-    /// When the subtree holding `path` started leaving.
-    fn leaving_since(&self, path: &NodePath) -> Option<u64> {
-        self.leaving
-            .iter()
-            .find(|l| path.0.starts_with(&l.path.0))
-            .map(|l| l.since)
+    /// When the subtree holding node `id` started leaving.
+    fn leaving_since(&self, id: NodeId) -> Option<u64> {
+        self.leaving_of(id).map(|l| l.since)
+    }
+
+    /// The leaving subtree node `id` left with.
+    fn leaving_of(&self, id: NodeId) -> Option<&Leaving> {
+        self.leaving.iter().find(|l| l.ids.iter().any(|(i, _)| *i == id))
     }
 
     /// Set what moves in `style`, the resolved style of the node at `path`,
@@ -1073,18 +1090,21 @@ impl Motion {
     /// transition or an animation set it apart from its own value), which
     /// paint then applies as a transform rather than in the node's place
     /// (ADR-0016: animated values beside layout values).
-    pub(crate) fn sample(&mut self, path: &NodePath, style: &mut Style) -> Sampled {
+    pub(crate) fn sample(&mut self, id: NodeId, path: &NodePath, style: &mut Style) -> Sampled {
         let moves = style.motion.as_deref().is_some_and(MotionStyle::moves);
-        if !moves && (self.nodes.is_empty() || !self.nodes.contains_key(path)) {
+        if !moves && (self.nodes.is_empty() || !self.nodes.contains_key(&id)) {
             return Sampled::default();
         }
         let rest = (style.transform.translate, style.transform.toward_anchor);
         let m = style.motion.take().unwrap_or_default();
-        let leaving = self.leaving_since(path);
+        let leaving = self.leaving_since(id);
         let now = clock::frame_nanos();
         let (reduced, hold) = (self.reduced, self.hold_loops);
         let finite_still = reduced || self.instant;
-        let state = self.nodes.entry(path.clone()).or_default();
+        let state = self.nodes.entry(id).or_default();
+        if state.path != *path {
+            state.path = path.clone();
+        }
         let mut busy = Busy::default();
         transitions(state, style, &m, finite_still, now, &mut busy);
 
@@ -1105,7 +1125,7 @@ impl Motion {
                 if state.playing.as_ref().is_none_or(|p| &p.animation != a) {
                     state.mounting = a.after_mount;
                     if a.after_mount {
-                        self.mounting.push(path.clone());
+                        self.mounting.push((id, path.clone()));
                     }
                     // One that may not run has ended as it starts, so it
                     // does not run later either (a scenario's motion played
@@ -1206,7 +1226,7 @@ impl Motion {
                 self.wake_by(until);
             }
             if leaving.is_some()
-                && let Some(l) = self.leaving.iter().find(|l| path.0.starts_with(&l.path.0))
+                && let Some(l) = self.leaving_of(id)
             {
                 self.wake_by(l.until);
             }
@@ -1229,8 +1249,8 @@ impl Motion {
     pub(crate) fn finish(&mut self, previous: Option<&Element>, present: &dyn Fn(&NodePath) -> bool) -> bool {
         let mut again = std::mem::take(&mut self.again);
 
-        for path in std::mem::take(&mut self.mounting) {
-            let Some(s) = self.nodes.get_mut(&path) else { continue };
+        for (id, path) in std::mem::take(&mut self.mounting) {
+            let Some(s) = self.nodes.get_mut(&id) else { continue };
             if !s.mounting {
                 continue;
             }
@@ -1244,13 +1264,13 @@ impl Motion {
             }
         }
 
-        let gone: Vec<NodePath> = std::mem::take(&mut self.gone)
+        let gone: Vec<(NodeId, NodePath)> = std::mem::take(&mut self.gone)
             .into_iter()
-            .filter(|path| self.leaving_since(path).is_none())
+            .filter(|(id, _)| self.leaving_since(*id).is_none())
             .collect();
         if !gone.is_empty() && !self.reduced && !self.instant {
             let now = clock::frame_nanos();
-            for path in &gone {
+            for (_, path) in &gone {
                 // The topmost node that left with it is the one to keep.
                 let mut len = path.0.len();
                 while len > 1
@@ -1265,21 +1285,23 @@ impl Motion {
                 if self.leaving.iter().any(|l| root.0.starts_with(&l.path.0)) {
                     continue;
                 }
-                let until = gone
+                let with: Vec<(NodeId, NodePath)> =
+                    gone.iter().filter(|(_, p)| p.0.starts_with(&root.0)).cloned().collect();
+                let until = with
                     .iter()
-                    .filter(|p| p.0.starts_with(&root.0))
-                    .filter_map(|p| self.nodes.get(p)?.exit.as_ref())
+                    .filter_map(|(id, _)| self.nodes.get(id)?.exit.as_ref())
                     .filter_map(|(a, duration)| a.end(now, *duration))
                     .fold(now, u64::max);
                 if let Some((mut slot, index)) = previous.and_then(|p| slot_at(p, &root)) {
-                    for p in gone.iter().filter(|p| p.0.starts_with(&root.0)) {
-                        if let Some(r) = self.nodes.get(p).and_then(|s| s.report.clone()) {
+                    for (id, _) in &with {
+                        if let Some(r) = self.nodes.get(id).and_then(|s| s.report.clone()) {
                             self.stages.push((r, Stage::Exiting));
                         }
                     }
                     inert(&mut slot);
                     self.leaving.push(Leaving {
                         path: root,
+                        ids: with,
                         slot,
                         index,
                         since: now,
@@ -1290,9 +1312,9 @@ impl Motion {
             }
         }
         // What left and does not leave with an exit is forgotten.
-        for path in &gone {
-            if self.leaving_since(path).is_none()
-                && let Some(r) = self.nodes.remove(path).and_then(|s| s.report)
+        for (id, _) in &gone {
+            if self.leaving_since(*id).is_none()
+                && let Some(r) = self.nodes.remove(id).and_then(|s| s.report)
             {
                 self.stages.push((r.clone(), Stage::Exiting));
                 self.stages.push((r, Stage::Exited));
@@ -1334,9 +1356,9 @@ impl Motion {
                     // In tree order, outer first, whatever the map's order.
                     let mut told: Vec<(&NodePath, &StageReport)> = self
                         .nodes
-                        .iter()
-                        .filter(|(path, _)| path.0.starts_with(&l.path.0))
-                        .filter_map(|(path, s)| Some((path, s.report.as_ref()?)))
+                        .values()
+                        .filter(|s| s.path.0.starts_with(&l.path.0))
+                        .filter_map(|s| Some((&s.path, s.report.as_ref()?)))
                         .collect();
                     told.sort_by_cached_key(|(path, _)| (path.0.len(), format!("{:?}", path.0)));
                     self.stages
@@ -1347,7 +1369,7 @@ impl Motion {
         }
         // What left is forgotten; back again, it enters anew.
         self.nodes
-            .retain(|path, _| !ended.iter().any(|e| path.0.starts_with(&e.0)));
+            .retain(|_, s| !ended.iter().any(|e| s.path.0.starts_with(&e.0)));
         root
     }
 }

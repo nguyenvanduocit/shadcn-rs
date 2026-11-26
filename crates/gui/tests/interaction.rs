@@ -1256,13 +1256,13 @@ fn hiding_the_focused_node_of_a_trapped_dialog_keeps_focus_inside() {
 }
 
 /// The focus id of the region of layer `layer` in the last frame: a
-/// path's id is its window's, so it is asked in a turn of that window.
+/// node's id is its window's, so it is asked in a turn of that window.
 #[expect(clippy::expect_used, reason = "a layer not open is a failed test")]
 fn region(s: &mut Scenario, layer: usize) -> gui::focus::FocusId {
     let f = s.last();
     let root = f.layers.get(layer).expect("the layer is open").root;
-    let path = f.nodes.get(root).expect("its root is a node").path.clone();
-    s.read(|| gui::FocusHandle::for_path(&path).id())
+    let id = f.nodes.get(root).expect("its root is a node").id;
+    s.read(|| gui::FocusHandle::for_node(id).id())
 }
 
 /// A focused node hidden with its dialog in one pass: the dialog closes

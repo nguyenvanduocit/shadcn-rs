@@ -287,6 +287,7 @@ type Veto = gui::Callback<DismissReason, bool>;
 /// live one's (ADR-0034, S7). The sideways move and veto are set only by
 /// this crate's constructors (`pub(crate)`) in the setup that made the
 /// level, and read by the level's own handlers.
+#[derive(Clone)]
 struct Level {
     open: Rc<dyn OpenModel>,
     parent: Option<Menu>,
@@ -890,7 +891,9 @@ impl Menu {
     fn pick(self, row: &Row, by_keyboard: bool) {
         match &row.kind {
             Kind::Item(f) => {
-                if f.call(()) == Dismiss::Close && self.level.is_alive() {
+                // An item whose owner is gone answers as an item with no
+                // answer: it closes.
+                if f.call(()).unwrap_or_default() == Dismiss::Close && self.level.is_alive() {
                     self.close_all();
                 }
             }
@@ -990,7 +993,7 @@ impl Menu {
     /// The dismiss request `reason` to the root's layer.
     fn dismissed(self, reason: &DismissReason) -> Dismiss {
         let veto = self.with(|l| l.veto.with(Clone::clone));
-        if veto.is_some_and(|v| v.call(*reason)) {
+        if veto.is_some_and(|v| v.call(*reason) == Some(true)) {
             return Dismiss::Veto;
         }
         self.close_all();
@@ -1241,7 +1244,7 @@ impl Menu {
         self.entry(
             d.role(Role::MenuItemCheckBox).aria_checked(checked),
             item,
-            Kind::Item(gui::Callback::new(move |()| on_select.call(next))),
+            Kind::Item(gui::Callback::new(move |()| on_select.call(next).unwrap_or_default())),
         )
     }
 

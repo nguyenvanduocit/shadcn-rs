@@ -202,6 +202,7 @@ pub fn range(page: usize, count: usize, siblings: usize, show_edges: bool) -> Ve
     }
 }
 
+#[derive(Clone)]
 struct State {
     options: Rc<dyn Fn() -> PaginationOptions>,
     names: PaginationNames,

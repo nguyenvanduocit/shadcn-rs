@@ -62,6 +62,7 @@ type StopInputs = (u64, Option<FocusId>, Option<FocusId>);
 
 /// Its cells are the world's that made the group ([`WorldCell`]): a check
 /// writes none of a live group's (ADR-0034, S7).
+#[derive(Clone)]
 struct State<T: 'static> {
     items: Collection<T>,
     keymap: Keymap,

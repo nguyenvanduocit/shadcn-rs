@@ -142,7 +142,7 @@ impl LayoutTree {
             });
             ex.place = tracker;
             if ex.measures {
-                motion.natural(&ex.path, fresh.bounds.height);
+                motion.natural(ex.id, fresh.bounds.height);
             }
             let fresh_behaviour = std::mem::take(&mut ex.fresh_behaviour);
             let spans = !ex.behaviour.spans.is_empty();
@@ -159,7 +159,7 @@ impl LayoutTree {
                         self.put_extra(u, ex);
                         return;
                     };
-                    debug_assert!(slot.path == fresh.path, "a frame node written in place is another node");
+                    debug_assert!(slot.id == fresh.id, "a frame node written in place is another node");
                     let mut changed = false;
                     // Its spans lie where they did unless its text or
                     // where it lies changed: a colour changing finds none.
@@ -330,7 +330,7 @@ impl LayoutTree {
                 e.down = e.down.max(cy + cl.size.height + cl.margin.bottom);
                 if ex.behaviour.scroll.is_some() {
                     tracked.push(ScrollChild {
-                        key: ce.path.0.last().and_then(|seg| seg.element_key()),
+                        key: ce.seg().element_key(),
                         bounds: Bounds {
                             x: cx,
                             y: cy,
@@ -340,7 +340,7 @@ impl LayoutTree {
                         // Where the walk found it this pass, not where the
                         // pass was built over: a row focus moved to is the
                         // one kept.
-                        focus_within: self.focused.as_ref().is_some_and(|(f, _)| f.0.starts_with(&ce.path.0)),
+                        focus_within: self.focus_below(c.user),
                     });
                 }
             }
@@ -355,7 +355,7 @@ impl LayoutTree {
                     },
                     (e.down + l.padding.bottom + l.border.bottom - l.size.height).max(0.0),
                 );
-                let id = || (ex.path.clone(), self.owner_of(ex));
+                let id = || ex.id;
                 // Exactly ([`crate::compositor::motion`]): the place held,
                 // clamped to the range's end on the same grid; its pixels
                 // are what is drawn.
@@ -385,6 +385,7 @@ impl LayoutTree {
             });
             if let (Some(h), Some(s)) = (&ex.behaviour.scroll, scroll) {
                 let laid = ScrollLayout {
+                    id: ex.id,
                     path: ex.path.clone(),
                     bounds,
                     padding: Edges {
@@ -532,7 +533,8 @@ impl LayoutTree {
             },
         };
         let fresh = FrameNode {
-            path: ex.path.clone(),
+            id: ex.id,
+            seg: ex.seg(),
             name: ex.name,
             bounds,
             content_box,

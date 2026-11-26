@@ -15,7 +15,7 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 
-use crate::engine::WorldCell;
+use crate::engine::{WorldCell, WorldRefCell};
 use std::fmt;
 use std::rc::Rc;
 
@@ -108,8 +108,9 @@ impl<T: 'static> fmt::Debug for Holder<T> {
     }
 }
 
-impl<T: 'static> Holder<T> {
+impl<T: Clone + 'static> Holder<T> {
     /// An empty slot, owned by the running scope (made where its owner is).
+    /// What it holds is a signal's value, so `Clone` (ADR-0026).
     #[must_use]
     #[track_caller]
     #[expect(
@@ -121,7 +122,9 @@ impl<T: 'static> Holder<T> {
             held: Signal::new(None),
         }
     }
+}
 
+impl<T: 'static> Holder<T> {
     /// Hold `value` from now on: what the slot held before is let go. The
     /// registration returned takes it back ([`Self::clear`]).
     pub fn set(self, value: T) -> Registration {
@@ -221,6 +224,7 @@ const NIL: usize = usize::MAX;
 /// One slot of the slab: its entry while it holds one, its generation (a
 /// key from before the slot was reused finds another), and its neighbours
 /// in the order the entries registered.
+#[derive(Clone)]
 struct Slot<T> {
     value: Option<T>,
     generation: u64,
@@ -248,6 +252,7 @@ struct Key {
 /// that made the registry ([`WorldCell`]), so a check reading a live
 /// registry counts no read, queues no removal and adds no visit to it
 /// (review r18, Codex nit, Opus plausible 1).
+#[derive(Clone)]
 struct Entries<T> {
     slots: Vec<Slot<T>>,
     free: Vec<usize>,
@@ -261,7 +266,7 @@ struct Entries<T> {
     /// waits for them.
     readers: WorldCell<u32>,
     /// The removals that waited, applied as the last read ends.
-    queued: WorldCell<Vec<Key>>,
+    queued: WorldRefCell<Vec<Key>>,
     /// Slots stepped through, read or written: the measure of the work.
     visits: WorldCell<u64>,
 }
@@ -340,9 +345,7 @@ impl<T> Entries<T> {
             return;
         }
         self.gone.set(self.gone.get().saturating_add(1));
-        let mut queued = self.queued.take();
-        queued.push(key);
-        self.queued.set(queued);
+        self.queued.with_mut(|q| q.push(key));
     }
 
     fn remove(&mut self, key: Key) {
@@ -487,9 +490,9 @@ impl<T: 'static> Drop for Reading<T> {
     }
 }
 
-impl<T: 'static> Registry<T> {
+impl<T: Clone + 'static> Registry<T> {
     /// An empty registry, owned by the running scope (made where its owner
-    /// is).
+    /// is). What it holds is a signal's value, so `Clone` (ADR-0026).
     #[must_use]
     #[track_caller]
     #[expect(
@@ -506,12 +509,14 @@ impl<T: 'static> Registry<T> {
                 linked: 0,
                 gone: WorldCell::new("a registry's removal count (`holder::Entries::gone`)", 0),
                 readers: WorldCell::new("a registry's read count (`holder::Entries::readers`)", 0),
-                queued: WorldCell::new("a registry's waiting removals (`holder::Entries::queued`)", Vec::new()),
+                queued: WorldRefCell::new("a registry's waiting removals (`holder::Entries::queued`)", Vec::new()),
                 visits: WorldCell::new("a registry's work count (`holder::Entries::visits`)", 0),
             }),
         }
     }
+}
 
+impl<T: 'static> Registry<T> {
     /// Give it `value` while the calling setup's instance is mounted: added
     /// as it mounts, taken out as it unmounts (by its slot, at once, or as
     /// the reads under way end).

@@ -73,25 +73,37 @@ impl<T> Clone for Sender<T> {
     }
 }
 
+/// A send to a mailbox that is gone ([`Sender::send`]): its scope ended,
+/// its window closed, or its thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the mailbox is closed")
+    }
+}
+
+impl std::error::Error for Closed {}
+
 impl<T: Send> Sender<T> {
-    /// Hand `value` to the UI thread and wake the window; `false` once the
-    /// mailbox is gone (its scope ended, or its thread).
+    /// Hand `value` to the UI thread and wake the window; [`Closed`] once
+    /// the mailbox is gone (its scope ended, or its thread), the value
+    /// dropped (ADR-0028, "The outbox").
     ///
     /// Sent from the UI thread while a fork is open there (a check,
     /// ADR-0028), it reaches nothing and wakes nothing: what a fork sends
     /// is its own and goes with it, whichever sender it used (one made
-    /// before the fork included), and it counts as sent. Another thread is
-    /// the outside world, and sends at once.
-    pub fn send(&self, value: T) -> bool {
+    /// before the fork included), and it counts as sent (`Ok`). Another
+    /// thread is the outside world, and sends at once.
+    pub fn send(&self, value: T) -> Result<(), Closed> {
         if crate::engine::forking() {
             drop(value);
-            return true;
+            return Ok(());
         }
-        let sent = self.tx.send(value).is_ok();
-        if sent {
-            self.bell.ring();
-        }
-        sent
+        self.tx.send(value).map_err(|_| Closed)?;
+        self.bell.ring();
+        Ok(())
     }
 }
 
@@ -213,10 +225,13 @@ pub(crate) fn close_window(window: &crate::focus::FocusRoot) -> usize {
                 .collect()
         })
         .unwrap_or_default();
-    let n = ids.len();
+    let mut n = ids.len();
     for id in ids {
         crate::engine::contained(|| retire(id));
     }
+    // The ports made in it close in the same step: a port is the mailbox
+    // of the UI thread's own posts (ADR-0028).
+    n = n.saturating_add(crate::port::close_window(window));
     n
 }
 
@@ -446,7 +461,7 @@ mod tests {
         wake_with(Arc::new(move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
         }));
-        std::thread::spawn(move || (1..=3).all(|n| sender.send(n)))
+        std::thread::spawn(move || (1..=3).all(|n| sender.send(n).is_ok()))
             .join()
             .unwrap();
         assert!(got.borrow().is_empty(), "nothing runs off the UI thread");
@@ -470,7 +485,7 @@ mod tests {
         let (a, b) = (make("a"), make("b"));
         assert_eq!(a.bell.at.site, b.bell.at.site, "one site");
         assert_eq!(b.bell.at.nth, a.bell.at.nth + 1, "numbered in order");
-        assert!(a.send(1) && a.send(2) && b.send(3));
+        assert!(a.send(1).is_ok() && a.send(2).is_ok() && b.send(3).is_ok());
         let rung = Arc::new(Mutex::new(Vec::new()));
         let into = Arc::clone(&rung);
         wake_with(Arc::new(move |at| into.lock().unwrap().push(at)));
@@ -500,11 +515,11 @@ mod tests {
         let into = Rc::clone(&got);
         let fails = mailbox(|_: u32| panic!("a handler fails"));
         let works = mailbox(move |n: u32| into.borrow_mut().push(n));
-        assert!(fails.send(1) && works.send(2));
+        assert!(fails.send(1).is_ok() && works.send(2).is_ok());
         let delivered = std::panic::catch_unwind(deliver);
         assert!(delivered.is_err(), "the panic is raised");
         assert_eq!(*got.borrow(), [2], "the other mailbox drained");
-        assert!(works.send(3));
+        assert!(works.send(3).is_ok());
         drop(fails);
         assert!(deliver());
         assert_eq!(*got.borrow(), [2, 3], "and stays open");
@@ -522,11 +537,11 @@ mod tests {
         let into = Rc::clone(&got);
         let writes = mailbox(move |n: u32| s.set(n));
         let works = mailbox(move |n: u32| into.borrow_mut().push(n));
-        assert!(writes.send(1) && works.send(2));
+        assert!(writes.send(1).is_ok() && works.send(2).is_ok());
         let delivered = std::panic::catch_unwind(deliver);
         assert!(delivered.is_err(), "the effect's panic is raised");
         assert_eq!(*got.borrow(), [2], "the other mailbox drained");
-        assert!(works.send(3) && writes.send(4));
+        assert!(works.send(3).is_ok() && writes.send(4).is_ok());
         assert!(deliver(), "both still open");
         assert_eq!(*got.borrow(), [2, 3]);
         assert_eq!(s.get(), 4, "the writing one too");
@@ -543,7 +558,7 @@ mod tests {
         let e = crate::Effect::new(move || r.borrow_mut().push((a.get(), b.get())));
         let first = mailbox(move |n: u32| a.set(n));
         let second = mailbox(move |n: u32| b.set(n));
-        assert!(first.send(1) && second.send(2));
+        assert!(first.send(1).is_ok() && second.send(2).is_ok());
         assert!(deliver());
         assert_eq!(*runs.borrow(), [(0, 0), (1, 2)], "one run for the delivery");
         e.dispose();
@@ -562,7 +577,7 @@ mod tests {
         let s = Rc::clone(&seen);
         crate::Effect::new(move || s.borrow_mut().push(status.get()));
         let sender = mailbox(move |n: u32| status.set(Status::Ready(n)));
-        std::thread::spawn(move || (1..=3).all(|n| sender.send(n)))
+        std::thread::spawn(move || (1..=3).all(|n| sender.send(n).is_ok()))
             .join()
             .unwrap();
         assert!(deliver());
@@ -580,11 +595,11 @@ mod tests {
             let got = crate::Signal::new(0_u32);
             (mailbox(move |n: u32| got.set(n)), got)
         });
-        assert!(sender.send(1));
+        assert_eq!(sender.send(1), Ok(()));
         assert!(deliver());
         assert_eq!(got.get(), 1);
         scope.dispose();
-        assert!(!sender.send(2), "gone with its scope: nothing to send to");
+        assert_eq!(sender.send(2), Err(Closed), "gone with its scope: nothing to send to");
         assert!(!deliver(), "closed: its handler would write a disposed signal");
     }
 
@@ -656,12 +671,16 @@ mod tests {
         }));
         assert!(p.is_err(), "the check faults at the boom");
         drop(parked);
-        assert!(sender.send(1));
+        assert!(sender.send(1).is_ok());
         assert!(deliver(), "open while its window is");
         assert_eq!(got.get(), 1);
         assert_eq!(window.close(), Ok(()));
         assert_eq!(boxes(), held, "its drain went with its window");
-        assert!(!sender.send(2), "closed with its window: nothing to send to");
+        assert_eq!(
+            sender.send(2),
+            Err(Closed),
+            "closed with its window: nothing to send to"
+        );
         assert!(!deliver());
         assert_eq!(got.get(), 1, "its handler never runs again");
     }
@@ -685,10 +704,10 @@ mod tests {
         }
         assert_eq!((boxes(), bells()), (held, rung), "no drain kept, none piled up");
         assert!(
-            senders.iter().all(|s| !s.send(1)),
+            senders.iter().all(|s| s.send(1).is_err()),
             "sent to nothing: the cold mailboxes are gone"
         );
-        assert!(live.send(1));
+        assert!(live.send(1).is_ok());
         assert!(deliver(), "the live mailbox delivers");
         assert_eq!(got.get(), 0, "the cold mailboxes' handlers never run");
     }
@@ -708,18 +727,18 @@ mod tests {
             counted.fetch_add(1, Ordering::SeqCst);
         }));
         // Sent live, waiting for the next delivery.
-        assert!(sender.send(1));
+        assert!(sender.send(1).is_ok());
         let captured = sender.clone();
         {
             let _cold = crate::engine::ColdFrame::begin();
-            assert!(captured.send(2), "counts as sent");
+            assert_eq!(captured.send(2), Ok(()), "counts as sent");
             assert!(!deliver(), "a fork delivers nothing");
         }
         assert_eq!(rings.load(Ordering::SeqCst), 1, "the fork's send woke nothing");
         assert!(got.borrow().is_empty(), "no handler ran in the fork");
         assert!(deliver());
         assert_eq!(*got.borrow(), [1], "what was sent live, not what the fork sent");
-        assert!(sender.send(3));
+        assert!(sender.send(3).is_ok());
         assert!(deliver());
         assert_eq!(*got.borrow(), [1, 3], "the mailbox works live after");
     }

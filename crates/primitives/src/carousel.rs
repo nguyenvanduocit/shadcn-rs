@@ -538,6 +538,7 @@ struct SlideMeta {
 }
 
 /// A press on the viewport, from its start.
+#[derive(Clone)]
 struct Drag {
     from: (f32, f32),
     /// When it went down (ms), for a faded swipe's speed.
@@ -559,6 +560,7 @@ struct Drag {
 
 /// Its cells are the world's that made the carousel: a check writes none
 /// of a live one's (ADR-0034, S7).
+#[derive(Clone)]
 struct State {
     options: Rc<dyn Fn() -> CarouselOptions>,
     direction: ReadDirection,
@@ -586,7 +588,7 @@ struct State {
     scrolling: WorldCell<Option<f32>>,
     /// The slides laid out, as a set, kept from pass to pass for letting go
     /// of the heights of those that left.
-    present: WorldCell<HashSet<SlideKey>>,
+    present: WorldRefCell<HashSet<SlideKey>>,
     /// The slides and heights those passes stepped through: the measure of
     /// their work, for tests.
     prune_work: WorldCell<u64>,
@@ -720,7 +722,7 @@ impl<P: 'static> Carousel<P> {
                 at: WorldCell::new("where a carousel's track was sent", 0.0),
                 pending: WorldCell::new("a carousel's pending snap", None),
                 scrolling: WorldCell::new("a carousel's auto-scroll", None),
-                present: WorldCell::new("a carousel's slides laid out", HashSet::new()),
+                present: WorldRefCell::new("a carousel's slides laid out", HashSet::new()),
                 prune_work: WorldCell::new("a carousel's prune work (tests)", 0),
             }),
         };
@@ -752,7 +754,7 @@ impl<P: 'static> Carousel<P> {
                 if me.state.is_alive() {
                     me.state.with_untracked(|s| {
                         s.prune_work.set(s.prune_work.get().saturating_add(steps));
-                        s.present.set(present);
+                        s.present.replace(present);
                     });
                 }
             });

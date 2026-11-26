@@ -251,8 +251,8 @@ fn order(f: &Frame, d: &crate::inspect::LayoutDiff) -> Vec<usize> {
         .map(|c| {
             f.nodes
                 .iter()
-                .position(|n| n.path == c.path)
-                .unwrap_or_else(|| panic!("{:?} is not in the frame: {d}", c.path))
+                .position(|n| n.id == c.id)
+                .unwrap_or_else(|| panic!("{:?} is not in the frame: {d}", c.id))
         })
         .collect()
 }
@@ -343,7 +343,7 @@ fn a_rebuild_reports_a_removal_beside_a_keyed_reorder_once_each() {
     let child = |k: usize| k + 1;
     for k in 0..8 {
         let key = key_of(&format!("c{k}"));
-        assert_eq!(f.nodes[child(k)].path.0.last(), Some(&PathSeg::Key(key)));
+        assert_eq!(f.nodes[child(k)].seg, PathSeg::Key(key));
     }
     // Painted, then c2 and c5 repainted in place.
     write_at(&mut f, child(2), -1.0, true);
@@ -364,8 +364,8 @@ fn a_rebuild_reports_a_removal_beside_a_keyed_reorder_once_each() {
     let before = f.before.take().expect("kept");
     assert_eq!(before.repainted, [child(2) - 1, child(5) - 1]);
     let d = before.diff(&f);
-    let got: Vec<(NodePath, Change)> = d.changes.iter().map(|c| (c.path.clone(), c.change.clone())).collect();
-    let path = |k: usize| painted[child(k)].path.clone();
+    let got: Vec<(NodeId, Change)> = d.changes.iter().map(|c| (c.id, c.change.clone())).collect();
+    let path = |k: usize| painted[child(k)].id;
     let bounds = |at: usize| painted[at].bounds;
     let moved = |k: usize, to: usize| Change::Updated {
         before: bounds(child(k)),
@@ -701,7 +701,7 @@ fn a_pass_that_panics_leaves_motion_nothing_of_the_nodes_it_dropped() {
         let (mut motion, mut ts) = (Motion::default(), TextSystem::new());
         let mut tree = LayoutTree::new();
         lay(&mut tree, &root(true), &mut motion, &mut ts);
-        assert_eq!(motion.paths().count(), 1, "the moving node has a state");
+        assert_eq!(motion.kept().count(), 1, "the moving node has a state");
         boom.set(true);
         let gone = root(false);
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -710,7 +710,7 @@ fn a_pass_that_panics_leaves_motion_nothing_of_the_nodes_it_dropped() {
         assert!(unwound.is_err(), "the pass panicked");
         boom.set(false);
         lay(&mut tree, &gone, &mut motion, &mut ts);
-        assert_eq!(motion.paths().count(), 0, "the node that went left no state behind");
+        assert_eq!(motion.kept().count(), 0, "the node that went left no state behind");
     });
 }
 
@@ -924,24 +924,16 @@ fn a_deferred_layer_opens_below_its_anchor_and_stays_on_screen() {
 #[test]
 fn a_scroll_offset_is_set_in_constant_work_however_many_paths_are_kept() {
     let mut state = UiState::default();
-    let path = |i: usize| NodePath::new([PathSeg::Index(0), PathSeg::Index(i)].into());
+    let id = |i: u32| crate::geometry::NodeId::live(i);
     for i in 0..1_000 {
-        state.set_scroll((path(i), None), units2((0.0, 1.0)));
+        state.set_scroll(id(i), units2((0.0, 1.0)));
     }
-    let (a, b) = (crate::reactive::Scope::new(), crate::reactive::Scope::new());
-    let (a, b) = (a.run(crate::reactive::owner), b.run(crate::reactive::owner));
     let before = state.scroll.visited;
-    state.set_scroll((path(500), a), units2((0.0, 20.0)));
-    state.set_scroll((path(500), b), units2((0.0, 30.0)));
+    state.set_scroll(id(500), units2((0.0, 20.0)));
+    state.set_scroll(id(500), units2((0.0, 30.0)));
     assert_eq!(state.scroll.visited - before, 2, "one entry a write");
-    assert_eq!(
-        state.scroll.get(&(path(500), a)),
-        None,
-        "the owner replaced at the path left nothing"
-    );
-    assert_eq!(state.scroll.get(&(path(500), b)), Some(&units2((0.0, 30.0))));
-    assert_eq!(state.scroll.get(&(path(500), None)), None);
-    assert_eq!(state.scroll.paths().count(), 1_000, "one entry a path");
+    assert_eq!(state.scroll.get(&id(500)), Some(&units2((0.0, 30.0))));
+    assert_eq!(state.scroll.ids().count(), 1_000, "one entry a node");
 }
 
 /// A layout pass places the scroll writes since the last pass, and
@@ -961,19 +953,18 @@ fn a_pass_places_only_the_scrolls_written_since_the_last() {
         .into_element();
     let mut tree = LayoutTree::new();
     tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
-    let list = find(tree.frame(), "list").path.clone();
+    let list = find(tree.frame(), "list").id;
     for i in 0..999 {
-        let other = NodePath::new([PathSeg::Index(7), PathSeg::Index(i)].into());
-        state.set_scroll((other, None), units2((0.0, 1.0)));
+        state.set_scroll(crate::geometry::NodeId::live(10_000 + i), units2((0.0, 1.0)));
     }
-    state.set_scroll((list.clone(), None), units2((0.0, 10.0)));
+    state.set_scroll(list, units2((0.0, 10.0)));
     tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     assert_eq!(state.scroll.logged(), 0, "the pass took the log");
     let before = tree.scroll_marked;
     for i in 0..10_000_u16 {
-        state.set_scroll((list.clone(), None), units2((0.0, f32::from(i % 300))));
+        state.set_scroll(list, units2((0.0, f32::from(i % 300))));
     }
-    state.set_scroll((list, None), units2((0.0, 50.0)));
+    state.set_scroll(list, units2((0.0, 50.0)));
     assert_eq!(state.scroll.logged(), 1, "one path written, one entry");
     tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     assert_eq!(tree.scroll_marked - before, 1, "one placement for it");
@@ -1034,8 +1025,8 @@ fn scrolled_children_move_up_and_are_clipped() {
             .into_element()
     };
     let before = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
-    let path = find(&before, "list").path.clone();
-    state.scroll.insert((path, None), units2((0.0, 1000.0)));
+    let id = find(&before, "list").id;
+    state.scroll.insert(id, units2((0.0, 1000.0)));
     let after = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     let list = find(&after, "list");
     assert_eq!(list.scroll.map(|s| s.offset.1), Some(300.0), "clamped to 400 - 100");
@@ -1063,8 +1054,8 @@ fn a_scroll_offset_moves_content_by_whole_device_pixels() {
             .into_element()
     };
     let before = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
-    let path = find(&before, "list").path.clone();
-    state.scroll.insert((path, None), units2((0.0, 10.3)));
+    let id = find(&before, "list").id;
+    state.scroll.insert(id, units2((0.0, 10.3)));
     let after = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     assert_eq!(
         find(&after, "first").bounds.y,
@@ -1224,8 +1215,12 @@ fn check(seed: u64, schedule: Schedule) {
     for step in 0..40 {
         let el = div().width(pct(100.0)).child(element(&s)).into_element();
         let width = if step % 13 == 12 { 300.0 } else { 400.0 };
-        let warm = tree.layout(&el, width, 300.0, &state, &mut Motion::default(), &mut ts);
-        let cold = layout(&el, width, 300.0, &state, &mut Motion::default(), &mut ts);
+        let warm = tree
+            .layout(&el, width, 300.0, &state, &mut Motion::default(), &mut ts)
+            .clone();
+        // As the cold check builds: a node standing for a live one carries
+        // its id, one with none a cold id, which the diff shows.
+        let cold = layout_carrying(&el, width, 300.0, &state, &mut Motion::default(), &mut ts, Some(&tree));
         let d = crate::inspect::diff(&cold.nodes, &warm.nodes);
         assert!(
             d.is_empty() && warm.nodes.len() == cold.nodes.len(),
@@ -1788,7 +1783,7 @@ fn a_hidden_inline_is_no_focus_and_no_action_target() {
             .find(|&i| f.behaviour(i).is_some_and(|b| b.handlers.click.is_some()))
             .expect("the button");
         assert_eq!(f.nodes[i].look.invisible, !shown, "{width}px: hidden or shown");
-        let id = crate::access::id_of(&f.nodes[i].path);
+        let id = crate::access::id_of(f.nodes[i].id);
         assert_eq!(
             crate::access::target(&f, id).is_some(),
             shown,
@@ -2200,4 +2195,300 @@ mod asks {
         );
         assert_eq!(stats.measures, 4 * 2, "{stats:?}");
     }
+}
+
+// K4e: node identity (ADR-0026, "Node identity").
+
+/// The id of each node named in `names`.
+fn ids_named<const N: usize>(f: &Frame, names: [&str; N]) -> [NodeId; N] {
+    names.map(|n| find(f, n).id)
+}
+
+const OUTER: [&str; 3] = ["a", "b", "c"];
+const INNER: [&str; 3] = ["a.in", "b.in", "c.in"];
+
+/// Keyed boxes in `order`, each with a child: box `k` is keyed `k`.
+fn keyed_boxes(order: [usize; 3]) -> Element {
+    div()
+        .children(order.map(|k| {
+            div()
+                .key(k as u64)
+                .named(OUTER[k])
+                .height(10.0)
+                .child(div().named(INNER[k]).size(4.0))
+        }))
+        .into_element()
+}
+
+/// A keyed move keeps each moved node, and every node below it, its id,
+/// and with it its accessibility id and compositor key.
+#[test]
+fn a_keyed_move_keeps_each_node_and_what_is_below_it_its_id() {
+    let (mut tree, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+    let f = lay(&mut tree, &keyed_boxes([0, 1, 2]), &mut motion, &mut ts);
+    let before = (ids_named(f, OUTER), ids_named(f, INNER));
+    assert!(before.0.iter().chain(&before.1).all(|id| id.is_some()));
+    let f = lay(&mut tree, &keyed_boxes([2, 0, 1]), &mut motion, &mut ts);
+    let after = (ids_named(f, OUTER), ids_named(f, INNER));
+    assert_eq!(after, before, "the same nodes");
+    assert!(
+        f.index_of(before.0[2]) < f.index_of(before.0[0]),
+        "moved: c is first now"
+    );
+    assert_eq!(
+        after.0.map(crate::access::id_of),
+        before.0.map(crate::access::id_of),
+        "the same accessibility ids"
+    );
+    assert_eq!(
+        after.0.map(crate::compositor::NodeKey::of),
+        before.0.map(crate::compositor::NodeKey::of),
+        "the same compositor keys"
+    );
+}
+
+/// A keyed move in a window keeps focus on the moved node (focusable by
+/// its node, `focusable`) and its motion: the animation it plays runs on
+/// from when it started, not from the move.
+#[test]
+fn a_keyed_move_keeps_focus_and_motion_on_the_moved_node() {
+    use crate::events::{Modifiers, NamedKey};
+    let swapped = crate::reactive::Signal::new(false);
+    let mut s = crate::app::Scenario::measuring(
+        move || {
+            let row = |k: u64, name: &'static str| {
+                div()
+                    .key(k)
+                    .named(name)
+                    .focusable()
+                    .width(100.0)
+                    .height(30.0)
+                    .animation(Animation::pulse())
+            };
+            let rows = if swapped.get() {
+                [row(2, "b"), row(1, "a")]
+            } else {
+                [row(1, "a"), row(2, "b")]
+            };
+            div().width(400.0).height(100.0).children(rows).into_element()
+        },
+        400,
+        100,
+        1.0,
+    )
+    .expect("a scenario");
+    s.play_motion();
+    s.settle().expect("a frame");
+    s.press(NamedKey::Tab, Modifiers::default());
+    s.settle().expect("a frame");
+    let focused = |s: &mut crate::app::Scenario| {
+        let id = s.read(crate::focus::focused).expect("focused");
+        crate::focus::node_of(s.last(), id)
+            .and_then(|i| s.last().nodes.get(i))
+            .map(|n| (n.name, n.id))
+    };
+    let curves = |s: &crate::app::Scenario| find(s.last(), "a").moving.as_ref().map(|m| (*m.curves).clone());
+    let a = find(s.last(), "a").id;
+    assert_eq!(focused(&mut s), Some((Some("a"), a)), "Tab focused a");
+    let playing = curves(&s);
+    assert!(playing.is_some(), "a plays");
+    s.wait(std::time::Duration::from_millis(300));
+    s.act("swap", || swapped.set(true));
+    s.settle().expect("a frame");
+    assert!(
+        find(s.last(), "a").bounds.y > find(s.last(), "b").bounds.y,
+        "moved below b"
+    );
+    assert_eq!(find(s.last(), "a").id, a, "the same node");
+    assert_eq!(focused(&mut s), Some((Some("a"), a)), "focus stays on it");
+    assert_eq!(curves(&s), playing, "its animation runs on from where it started");
+}
+
+/// Where focus lies is taken once as focus moves, not each pass: frames
+/// with focus at rest keep the one they took (bench: +9 allocations a
+/// steady frame when every pass took it anew).
+#[test]
+fn focus_at_rest_is_checked_with_nothing_allocated() {
+    let handle = FocusHandle::new();
+    let root = div()
+        .child(
+            div()
+                .named("outer")
+                .child(div().named("f").track_focus(handle).size(20.0)),
+        )
+        .into_element();
+    let (mut tree, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+    let f = lay(&mut tree, &root, &mut motion, &mut ts);
+    let i = f.nodes.iter().position(|n| n.name == Some("f")).expect("f");
+    let state = UiState {
+        focused: Some(handle.id()),
+        focus_at: FocusAt::of(f, i),
+        ..UiState::default()
+    };
+    let chain = &state.focus_at.as_ref().expect("taken").chain;
+    assert_eq!(chain.first(), Some(&find(f, "f").id));
+    assert!(chain.contains(&find(f, "outer").id), "its ancestors too");
+    let (settled, allocations) = crate::heap::allocations(|| tree.focus_settled(&state));
+    assert!(settled, "focus is where it was taken");
+    assert_eq!(allocations, 0, "asked each pass: nothing allocated");
+    let elsewhere = UiState {
+        focus_at: FocusAt::of(tree.frame(), 0),
+        ..state.clone()
+    };
+    assert!(!tree.focus_settled(&elsewhere), "taken elsewhere: not settled");
+}
+
+/// A node removed lets its id go: no node is named by it again, and one
+/// built at its place has a new one.
+#[test]
+fn a_removed_node_lets_its_id_go_and_its_place_gets_a_new_one() {
+    let (mut tree, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+    let built = |with: bool| {
+        let d = div().child(div().named("kept").size(4.0));
+        if with { d.child(div().named("x").size(4.0)) } else { d }.into_element()
+    };
+    let x = find(lay(&mut tree, &built(true), &mut motion, &mut ts), "x").id;
+    let held = tree.ids_held();
+    lay(&mut tree, &built(false), &mut motion, &mut ts);
+    assert!(!tree.holds_id(x), "let go");
+    assert_eq!(tree.ids_held(), held - 1, "and no other");
+    let again = find(lay(&mut tree, &built(true), &mut motion, &mut ts), "x").id;
+    assert_ne!(again, x, "a new id: a stale one never names it");
+    assert_eq!(again.slot(), x.slot(), "its slot reused");
+    assert_eq!(again.generation(), x.generation() + 1, "a generation on");
+}
+
+/// A node hidden (`display: none`) is not unmounted: shown again, it and
+/// what is below it have the ids they had.
+#[test]
+fn a_hidden_node_shown_again_keeps_its_id() {
+    let (mut tree, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+    let built = |shown: bool| {
+        div()
+            .child(
+                div()
+                    .named("a")
+                    .size(10.0)
+                    .display(if shown { Display::Block } else { Display::None })
+                    .child(div().named("a.in").size(4.0)),
+            )
+            .child(div().named("b").size(4.0))
+            .into_element()
+    };
+    let before = ids_named(lay(&mut tree, &built(true), &mut motion, &mut ts), ["a", "a.in", "b"]);
+    let f = lay(&mut tree, &built(false), &mut motion, &mut ts);
+    assert!(f.nodes.iter().all(|n| n.name != Some("a")), "hidden");
+    assert!(
+        tree.holds_id(before[0]) && tree.holds_id(before[1]),
+        "its ids held while hidden"
+    );
+    let f = lay(&mut tree, &built(true), &mut motion, &mut ts);
+    assert_eq!(ids_named(f, ["a", "a.in", "b"]), before);
+}
+
+/// A pass that panics leaves the tree as a new one, but its nodes built
+/// again on the retry are the nodes they were: the same ids, none leaked.
+#[test]
+fn a_pass_that_panics_keeps_the_ids_of_the_nodes_built_again() {
+    on_its_own_thread(|| {
+        let boom = crate::reactive::Signal::new(false);
+        let root = div()
+            .children(OUTER.into_iter().enumerate().map(move |(i, n)| {
+                div().named(n).height(10.0).width(move || {
+                    if i == 1 && boom.get() {
+                        std::panic::panic_any("a binding panicked");
+                    }
+                    10.0
+                })
+            }))
+            .into_element();
+        let (mut tree, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+        let before = ids_named(lay(&mut tree, &root, &mut motion, &mut ts), OUTER);
+        let held = tree.ids_held();
+        boom.set(true);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            lay(&mut tree, &root, &mut motion, &mut ts);
+        }));
+        assert!(unwound.is_err(), "the pass panicked");
+        boom.set(false);
+        assert_eq!(ids_named(lay(&mut tree, &root, &mut motion, &mut ts), OUTER), before);
+        assert_eq!(tree.ids_held(), held, "no id leaked");
+    });
+}
+
+/// The cold build carrying the window's tree gives each node standing
+/// for a live one the live one's id; a node with none has a cold id.
+#[test]
+fn a_cold_build_gives_each_node_the_id_of_the_live_one_it_stands_for() {
+    let (mut live, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+    let ids = ids_named(lay(&mut live, &keyed_boxes([0, 1, 2]), &mut motion, &mut ts), OUTER);
+    let cold = layout_carrying(
+        &keyed_boxes([1, 2, 0]),
+        400.0,
+        300.0,
+        &UiState::default(),
+        &mut Motion::default(),
+        &mut ts,
+        Some(&live),
+    );
+    assert_eq!(ids_named(&cold, OUTER), ids, "adopted");
+    assert!(
+        cold.nodes
+            .iter()
+            .all(|n| n.id.domain() == crate::geometry::Domain::Live)
+    );
+    let fresh = layout_carrying(
+        &keyed_boxes([1, 2, 0]),
+        400.0,
+        300.0,
+        &UiState::default(),
+        &mut Motion::default(),
+        &mut ts,
+        None,
+    );
+    assert!(
+        fresh
+            .nodes
+            .iter()
+            .all(|n| n.id.domain() == crate::geometry::Domain::Cold)
+    );
+}
+
+/// Two nodes at one path (siblings keyed alike): each its own id.
+#[test]
+fn two_nodes_at_one_path_have_ids_of_their_own() {
+    let (mut tree, mut motion, mut ts) = (LayoutTree::new(), Motion::default(), TextSystem::new());
+    let root = div()
+        .child(div().key(1).named("x").size(4.0))
+        .child(div().key(1).named("y").size(4.0))
+        .into_element();
+    for _ in 0..2 {
+        let [x, y] = ids_named(lay(&mut tree, &root, &mut motion, &mut ts), ["x", "y"]);
+        assert_ne!(x, y);
+    }
+    assert!(tree.duplicates() > 0, "counted");
+}
+
+/// A slot freed is reused a generation on; one whose generation would
+/// overflow is retired, never reused.
+#[test]
+fn an_id_slot_at_its_last_generation_is_retired() {
+    use crate::geometry::{Domain, Ids};
+    let mut ids = Ids::new(Domain::Live);
+    let a = ids.mint();
+    ids.free(a);
+    let b = ids.mint();
+    assert_eq!((b.slot(), b.generation()), (a.slot(), a.generation() + 1));
+    assert!(!ids.holds(a) && ids.holds(b));
+    ids.free(a);
+    assert!(ids.holds(b), "a stale id frees nothing");
+    ids.set_generation(b.slot(), u32::MAX);
+    let last = NodeId::from_published((u64::from(b.slot()) << 32) | u64::from(u32::MAX)).expect("an id");
+    assert!(ids.holds(last));
+    ids.free(last);
+    assert_eq!(ids.retired(), 1);
+    assert!(!ids.holds(last));
+    let next = ids.mint();
+    assert_ne!(next.slot(), last.slot(), "never reused");
+    assert_eq!(ids.held(), 1);
 }

@@ -223,3 +223,37 @@ fn the_windowed_list_against_the_list_built_at_render() {
         assert!(each_steady <= render_steady.max(STEADY_BUDGET));
     }
 }
+
+/// The whole-source duplicate-key check (ADR-0026, D033) is a debug
+/// build's alone: a release build reads the keys the window needs, never
+/// every row's.
+#[test]
+fn the_whole_source_key_check_is_a_debug_builds_alone() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    let calls = Rc::new(Cell::new(0_u64));
+    let c = Rc::clone(&calls);
+    let state = ListState::new(30.0);
+    let page = move || {
+        let c = Rc::clone(&c);
+        virtual_each(
+            &state,
+            || 10_000,
+            move |i| {
+                c.set(c.get().saturating_add(1));
+                i
+            },
+            |r| row(r.index_untracked()),
+        )
+        .size(pct(100.0))
+        .into_element()
+    };
+    let mut s = Scenario::measuring(page, 1024, 768, 1.0).unwrap();
+    s.settle().unwrap();
+    assert_eq!(
+        calls.get() >= 10_000,
+        cfg!(debug_assertions),
+        "keys read at mount: {}",
+        calls.get()
+    );
+}

@@ -524,7 +524,7 @@ impl<P: 'static> Dialog<P> {
         }
         if *reason != DismissReason::Programmatic
             && let Some(veto) = &o.veto
-            && veto.call(*reason) == Dismiss::Veto
+            && veto.call(*reason) == Some(Dismiss::Veto)
         {
             return Dismiss::Veto;
         }

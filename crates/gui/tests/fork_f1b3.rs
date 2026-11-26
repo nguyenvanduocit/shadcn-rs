@@ -33,6 +33,7 @@ fn debug_lend() {
 /// its body never run.
 #[test]
 fn equality_lend() {
+    #[derive(Clone)]
     struct Probe(Cell<u8>, Rc<Cell<Option<String>>>);
     impl PartialEq for Probe {
         fn eq(&self, _: &Self) -> bool {

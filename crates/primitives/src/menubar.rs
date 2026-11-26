@@ -89,6 +89,7 @@ impl<P: 'static> BarValue for UseModel<P, String> {
     }
 }
 
+#[derive(Clone)]
 struct Bar {
     value: Rc<dyn BarValue>,
     wrap: Wrap,

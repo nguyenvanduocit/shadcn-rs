@@ -45,7 +45,7 @@ impl ReadbackTo {
 
     fn send(&self, r: Readout) {
         // A closed mailbox (its scope ended) drops what arrives.
-        self.tx.send(r);
+        self.tx.send(r).ok();
     }
 }
 

@@ -4817,7 +4817,7 @@ fn one_field_node_shown_with_a_thousand_handles_by_turns_holds_one_claim() {
             .nodes
             .iter()
             .find(|n| matches!(n.content, crate::layout::Content::Input { .. }))
-            .map(|n| n.path.clone())
+            .map(|n| n.id)
     };
     let first = path(&s);
     for k in 1..=1000 {

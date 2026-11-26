@@ -27,9 +27,13 @@
 //!   again, so a plan is taken once; a cold frame keeps its own in its copy
 //!   of the state.
 
+#[cfg(debug_assertions)]
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::{Index, LISTS, ListState, Plan, pixels, resize, row_wrapper, thumb, total};
+#[cfg(debug_assertions)]
+use crate::component::{DuplicateKey, report_duplicate};
 use crate::component::{Row, each};
 use crate::element::{Div, Element, ElementKey, IntoElement, Role, div};
 use crate::prelude::*;
@@ -54,6 +58,14 @@ impl Slot {
         }
     }
 }
+
+/// The most rows a windowed list's debug check of its whole source reads
+/// ([`check_keys`], D033): about a million keys hashed, tens of
+/// milliseconds in a debug build, per change of what it read. Larger
+/// sources are told once as not checked whole (their window's [`each`]
+/// still tells what it shows). The change log (K5) lifts it.
+#[cfg(debug_assertions)]
+const KEYS_CHECKED_MAX: u64 = 1 << 20;
 
 /// A row of a windowed list's [`each`].
 pub(super) type RowOf = Row<Slot, Option<ElementKey>>;
@@ -118,7 +130,7 @@ impl ListState {
         let Some((version, end_space)) = self.peek(|s| (s.version, s.end_space)) else {
             return Vec::new();
         };
-        version.with(|_| ());
+        let at = version.with(|v| *v);
         let plan = self.plan(rows, key);
         let w = plan.window;
         let (before, after) = plan.pins.split_at(plan.pins_before.min(plan.pins.len()));
@@ -136,20 +148,104 @@ impl ListState {
                 height: end_space.to_bits(),
             });
         }
-        self.keep_plan(plan);
+        self.keep_plan(plan, at);
         out
     }
 
-    /// Keep `plan` for the layout hook unless an equal one is kept: that one
-    /// stays, so it is taken once. Moves nothing (no reader's scroll is
-    /// taken in, as [`Self::poke`] does): a cache of what the source
-    /// worked out.
-    fn keep_plan(self, plan: Plan) {
-        let kept = self.peek(|s| s.planned.as_deref() == Some(&plan)).unwrap_or(true);
-        if !kept {
-            LISTS.with_borrow(|l| l.write(self.0, |s| s.planned = Some(Rc::new(plan))));
-        }
+    /// Keep `plan`, worked out at version `at`, for the layout hook, under a
+    /// new number, unless an equal one is kept: that one stays, with its
+    /// number, so it is taken once (and again when the rows built were let
+    /// go, [`super::forget_built`]). Either way the plan standing is now
+    /// the one for version `at` ([`super::State::planned_at`]). Moves
+    /// nothing (no reader's scroll is taken in, as [`Self::poke`] does): a
+    /// cache of what the source worked out.
+    fn keep_plan(self, plan: Plan, at: u64) {
+        let kept = self
+            .peek(|s| s.planned.as_ref().is_some_and(|(_, p)| **p == plan))
+            .unwrap_or(true);
+        LISTS.with_borrow(|l| {
+            l.write(self.0, |s| {
+                s.planned_at = at;
+                if !kept {
+                    s.plans = s.plans.wrapping_add(1);
+                    s.planned = Some((s.plans, Rc::new(plan)));
+                }
+            })
+        });
     }
+}
+
+/// Debug builds: the list's check of its whole source for keys two rows
+/// share (ADR-0026, D033), which the window's [`each`] cannot see while
+/// one of them is outside it. An effect the list's owner owns: it reads
+/// `rows()` and every `key(i)`, tracked, so it runs again when one of them
+/// changes (a key changed in place at the same row count too), never on a
+/// scroll. One snapshot, checked whole in one turn, up to
+/// [`KEYS_CHECKED_MAX`] rows; over it, told once that it is not checked.
+/// A key is told once while it stays duplicated, and not when the window
+/// shows it twice (its [`each`] tells that one).
+#[cfg(debug_assertions)]
+fn check_keys(
+    s: ListState,
+    rows: Rc<dyn Fn() -> u64>,
+    key: Rc<dyn Fn(u64) -> ElementKey>,
+    site: &'static std::panic::Location<'static>,
+) {
+    use std::cell::{Cell, RefCell};
+    let reported: RefCell<Vec<ElementKey>> = RefCell::new(Vec::new());
+    let too_large = Cell::new(false);
+    let _check = crate::reactive::Effect::new(move || {
+        // Its state was disposed: no list to check (nor plan to work out).
+        if s.peek(|_| ()).is_none() {
+            return;
+        }
+        let n = rows();
+        if n > KEYS_CHECKED_MAX {
+            if !too_large.replace(true) {
+                report_duplicate(DuplicateKey {
+                    node: "virtual_each",
+                    site,
+                    key: format!("not checked: {n} rows, over {KEYS_CHECKED_MAX}"),
+                    count: 0,
+                });
+            }
+            return;
+        }
+        let mut seen: HashMap<ElementKey, u32> = HashMap::with_capacity(usize::try_from(n).unwrap_or(0));
+        for i in 0..n {
+            let c = seen.entry(key(i)).or_insert(0);
+            *c = c.saturating_add(1);
+        }
+        let mut repeated: Vec<(ElementKey, u32)> = seen.into_iter().filter(|&(_, c)| c > 1).collect();
+        repeated.sort_unstable();
+        // What the window builds as things stand (worked out as its source
+        // does, before or after it ran), read untracked: a scroll is no
+        // reason to run again.
+        let shown = if repeated.is_empty() {
+            Vec::new()
+        } else {
+            let plan = crate::reactive::untracked(|| s.plan(n, &*key));
+            plan.keys
+                .into_iter()
+                .chain(plan.pins.into_iter().map(|(_, k)| k))
+                .collect()
+        };
+        let mut was = reported.borrow_mut();
+        for &(k, count) in &repeated {
+            let twice = shown.iter().filter(|&&x| x == k).count() >= 2;
+            if twice || was.contains(&k) {
+                continue;
+            }
+            report_duplicate(DuplicateKey {
+                node: "virtual_each",
+                site,
+                key: format!("{k:?}"),
+                count,
+            });
+        }
+        was.clear();
+        was.extend(repeated.iter().map(|&(k, _)| k));
+    });
 }
 
 /// A list of `rows()` rows, each built by `view` once, when its key comes
@@ -190,9 +286,12 @@ pub fn virtual_each_in<E: IntoElement>(
         return div().named("virtual-list");
     };
     let rows: Rc<dyn Fn() -> u64> = Rc::new(rows);
+    let key: Rc<dyn Fn(u64) -> ElementKey> = Rc::new(key);
+    #[cfg(debug_assertions)]
+    check_keys(s, Rc::clone(&rows), Rc::clone(&key), std::panic::Location::caller());
     let source = {
         let rows = Rc::clone(&rows);
-        move || s.slots(rows(), &key)
+        move || s.slots(rows(), &*key)
     };
     let built = each(source, Slot::key, move |r: RowOf| match r.item_untracked() {
         Slot::Row { key, .. } => placed(r, key, &view),

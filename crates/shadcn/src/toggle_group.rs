@@ -308,7 +308,9 @@ impl IntoElement for ToggleGroupItem {
                             p.value.clone(),
                             focus,
                             availability,
-                            Box::new(move || after.call(())),
+                            Box::new(move || {
+                                after.call(());
+                            }),
                         )
                         .when(joined, |d| {
                             d.radius(0.0)

@@ -133,16 +133,25 @@ Wrap the button in a `DialogTrigger` and put the settings form in `DialogContent
 struct Pattern {
     /// Whether the reply was copied in the last two seconds.
     copied: Signal<bool>,
-    /// Owns the timer that clears `copied`.
-    owner: gui::Scope,
+    /// The clipboard's answer: "Copied" shows once the write is done, and
+    /// a timer of a scope of its own clears it.
+    copy_answer: gui::Port<(gui::clipboard::Wrote, ())>,
     feedback: Signal<Option<bool>>,
 }
 
 impl Pattern {
     fn new() -> Self {
+        let copied = Signal::labeled("reply copied", false);
+        let owner = gui::Scope::new();
+        let copy_answer = gui::port(move |(wrote, ()): (gui::clipboard::Wrote, ())| {
+            if wrote.is_ok() {
+                copied.set(true);
+                owner.run(|| gui::clock::after(std::time::Duration::from_secs(2), move || copied.set(false)));
+            }
+        });
         Self {
-            copied: Signal::labeled("reply copied", false),
-            owner: gui::Scope::new(),
+            copied,
+            copy_answer,
             feedback: Signal::labeled("feedback", None),
         }
     }
@@ -171,13 +180,8 @@ impl Pattern {
             ..MessageProps::default()
         };
         let copied = self.copied.get();
-        let (flag, owner, feedback) = (self.copied, self.owner, self.feedback);
-        let copy = move || {
-            if gui::clipboard::copy(REPLY) {
-                flag.set(true);
-                owner.run(|| gui::clock::after(std::time::Duration::from_secs(2), move || flag.set(false)));
-            }
-        };
+        let (answer, feedback) = (self.copy_answer, self.feedback);
+        let copy = move || gui::clipboard::write(REPLY.to_owned(), (), answer);
         let (up, down) = (feedback, feedback);
         let vote = |s: &Signal<Option<bool>>, v: bool| s.update(|f| *f = if *f == Some(v) { None } else { Some(v) });
         div()

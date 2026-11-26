@@ -519,7 +519,7 @@ fn execute_one(target: &mut dyn Target, log: &FrameLog, words: &[String]) -> Res
         }
         "paints" | "flash" => text(paints(log)),
         "hangs" => text(hangs(log)),
-        "diff" => text(diff(target.last_diff())),
+        "diff" => text(diff(target.last_diff(), target.frame())),
         "click" | "rclick" => {
             let sel = arg(0, "a node (SEL)")?;
             let scrolled = reveal(target, sel)?;
@@ -644,7 +644,7 @@ fn execute_one(target: &mut dyn Target, log: &FrameLog, words: &[String]) -> Res
                 .frame()
                 .nodes
                 .get(i)
-                .map(|n| access::id_of(&n.path))
+                .map(|n| access::id_of(n.id))
                 .unwrap_or(NodeId(0));
             let out = target.send(Input::Act(ActionRequest {
                 action,
@@ -784,7 +784,8 @@ fn pick(frame: &Frame, sel: &str) -> Result<Pick, String> {
         return frame
             .nodes
             .iter()
-            .position(|n| n.path.to_string() == path)
+            .enumerate()
+            .position(|(i, _)| frame.path_of(i).to_string() == path)
             .map(Pick::Node)
             .ok_or_else(|| format!("no node at @{path} in this frame"));
     }
@@ -1037,7 +1038,7 @@ fn moved_since(frame: &Frame, seen: Option<&Presented>, i: usize) -> bool {
     let (Some(seen), Some(n)) = (seen, frame.nodes.get(i)) else {
         return false;
     };
-    let key = crate::compositor::NodeKey::of(&n.path);
+    let key = crate::compositor::NodeKey::of(n.id);
     !seen
         .hits
         .iter()
@@ -1070,7 +1071,7 @@ fn label(frame: &Frame, i: usize) -> String {
     frame
         .nodes
         .get(i)
-        .map(|n| format!("@{} {}", n.path, inspect::describe(n)))
+        .map(|n| format!("@{} {}", frame.path_of(i), inspect::describe(n)))
         .unwrap_or_default()
 }
 
@@ -1211,7 +1212,7 @@ fn tree(frame: &Frame, root: Option<usize>, max_depth: Option<usize>) -> String 
         out.push_str(&format!(
             "{}@{}  {}  {}  {}\n",
             "  ".repeat(depth),
-            n.path,
+            frame.path_of(i),
             inspect::describe(n),
             n.bounds(SIGHT),
             behaviour(frame, i)
@@ -1237,7 +1238,7 @@ fn components(frame: &Frame, root: Option<usize>) -> String {
         out.push_str(&format!(
             "{}#{name}  @{}  {}  {}\n",
             "  ".repeat(depth),
-            n.path,
+            frame.path_of(i),
             n.bounds(SIGHT),
             behaviour(frame, i)
         ));
@@ -1251,7 +1252,7 @@ fn node_detail(frame: &Frame, i: usize) -> String {
         return String::new();
     };
     let mut out = String::new();
-    out.push_str(&format!("@{}  {}\n", n.path, inspect::describe(n)));
+    out.push_str(&format!("@{}  {}\n", frame.path_of(i), inspect::describe(n)));
     out.push_str(&format!(
         "  box        {}  content {}\n",
         n.bounds(SIGHT),
@@ -1357,8 +1358,8 @@ fn node_detail(frame: &Frame, i: usize) -> String {
     let ancestry: Vec<String> = frame
         .ancestors(i)
         .skip(1)
-        .filter_map(|a| frame.nodes.get(a))
-        .filter_map(|a| a.name.map(|name| format!("#{name} @{}", a.path)))
+        .filter_map(|a| Some((a, frame.nodes.get(a)?.name?)))
+        .map(|(a, name)| format!("#{name} @{}", frame.path_of(a)))
         .collect();
     if !ancestry.is_empty() {
         out.push_str(&format!("  inside     {}\n", ancestry.join(" < ")));
@@ -1402,7 +1403,7 @@ fn find(frame: &Frame, needle: &str) -> String {
         };
         out.push_str(&format!(
             "@{}  {}  {}  {}{via}\n",
-            n.path,
+            frame.path_of(i),
             inspect::describe(n),
             n.bounds(SIGHT),
             behaviour(frame, i)
@@ -1446,7 +1447,7 @@ fn a11y(frame: &Frame, update: &accesskit::TreeUpdate, root: Option<usize>) -> S
     let nodes: std::collections::HashMap<NodeId, &accesskit::Node> =
         update.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let start = match root {
-        Some(i) => match frame.nodes.get(i).map(|n| access::id_of(&n.path)) {
+        Some(i) => match frame.nodes.get(i).map(|n| access::id_of(n.id)) {
             Some(id) if nodes.contains_key(&id) => id,
             _ => return format!("{} is not in what a screen reader hears", label(frame, i)),
         },
@@ -1513,10 +1514,8 @@ fn a11y(frame: &Frame, update: &accesskit::TreeUpdate, root: Option<usize>) -> S
             if !actions.is_empty() {
                 line.push_str(&format!(" [{}]", actions.join(",")));
             }
-            if let Some(i) = access::target(frame, id)
-                && let Some(n) = frame.nodes.get(i)
-            {
-                line.push_str(&format!("  @{}", n.path));
+            if let Some(i) = access::target(frame, id).filter(|&i| i < frame.nodes.len()) {
+                line.push_str(&format!("  @{}", frame.path_of(i)));
             }
             out.push_str(&format!("{line}\n"));
             depth.saturating_add(1)
@@ -1898,7 +1897,7 @@ fn hangs(log: &FrameLog) -> String {
     out.trim_end().to_owned()
 }
 
-fn diff(d: &LayoutDiff) -> String {
+fn diff(d: &LayoutDiff, frame: &Frame) -> String {
     if d.is_empty() {
         return "the last frames changed nothing".to_owned();
     }
@@ -1919,7 +1918,12 @@ fn diff(d: &LayoutDiff) -> String {
                 w.join(", ")
             }
         };
-        out.push_str(&format!("@{}  {}  {how}\n", c.path, c.what));
+        // A node that went is in no frame: it shows by its id alone.
+        let at = match frame.index_of(c.id) {
+            Some(i) => format!("@{}", frame.path_of(i)),
+            None => c.id.to_string(),
+        };
+        out.push_str(&format!("{at}  {}  {how}\n", c.what));
     }
     if d.changes.len() > 80 {
         out.push_str(&format!("… {} more", d.changes.len().saturating_sub(80)));
@@ -2388,10 +2392,13 @@ pub(crate) fn listen(path: &Path, to_ui: crate::mailbox::Sender<Request>) -> std
                         continue;
                     }
                     let (tx, rx) = std::sync::mpsc::channel();
-                    let answer = if to_ui.send(Request {
-                        line: line.clone(),
-                        answer: tx,
-                    }) {
+                    let answer = if to_ui
+                        .send(Request {
+                            line: line.clone(),
+                            answer: tx,
+                        })
+                        .is_ok()
+                    {
                         rx.recv_timeout(ANSWER_WITHIN).unwrap_or_else(|_| {
                             "error: the window did not answer (hidden or minimised windows draw no frames)".to_owned()
                         })

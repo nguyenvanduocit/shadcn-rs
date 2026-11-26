@@ -22,6 +22,13 @@
 //! allocates and takes time, so the budgets are printed and not judged, and
 //! a scene fails only when a command, a frame or the cold comparison does.
 
+// An app, not a component (ADR-0028, "The boundary for app callbacks"):
+// the stress runner reads files and runs threads of its own.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an app's own I/O and threads; the bans hold component code"
+)]
+
 mod scenes;
 mod threads;
 

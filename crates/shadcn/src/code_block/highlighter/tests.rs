@@ -180,6 +180,10 @@ fn languages_outside_the_list_stay_plain() {
 
 /// A bump of irosashi in `Cargo.lock` must come with a fresh copy of the files in `assets/irosashi/`.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test reads the repository's lock file and provenance note; no component code"
+)]
 fn the_vendored_assets_are_the_locked_irosashi() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let Ok(lock) = std::fs::read_to_string(root.join("../../Cargo.lock")) else {

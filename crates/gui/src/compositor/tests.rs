@@ -3830,30 +3830,36 @@ fn a_gesture_latched_to_a_list_that_left_and_came_back_by_its_key_scrolls_it_no_
     };
     // A is first in tree order.
     let a_key = s.parts().1.compositor.scene.compositing.scrollers[0].key;
-    let a_offset = |s: &mut Scenario| {
+    let a_offset = |s: &mut Scenario, key| {
         let c = &s.parts().1.compositor;
         c.scene
             .compositing
             .scrollers
             .iter()
-            .find(|n| n.key == a_key)
+            .find(|n| n.key == key)
             .map(|n| c.scrolls.offset(n, 0).1)
     };
     event(&mut s, 50.0, 0.0, true);
     event(&mut s, 50.0, 0.016, false);
-    assert!(a_offset(&mut s).is_some_and(|y| y > 0.0), "A scrolled");
+    assert!(a_offset(&mut s, a_key).is_some_and(|y| y > 0.0), "A scrolled");
     a.set(false);
     s.frame("A gone").expect("a frame");
-    assert_eq!(a_offset(&mut s), None, "A left");
+    assert_eq!(a_offset(&mut s, a_key), None, "A left");
     a.set(true);
     s.frame("A back").expect("a frame");
-    // Back where the layout kept it, as another instance.
-    let back = a_offset(&mut s);
+    // Back where the layout kept it, as another node (ADR-0026: a new id).
+    let back_key = s.parts().1.compositor.scene.compositing.scrollers[0].key;
+    assert_ne!(back_key, a_key, "the A that came back is another node");
+    let back = a_offset(&mut s, back_key);
     assert!(back.is_some(), "A is back");
     // The fingers never lifted: the same gesture, now over B.
     event(&mut s, 250.0, 0.032, false);
     event(&mut s, 250.0, 0.048, false);
-    assert_eq!(a_offset(&mut s), back, "the A that came back is not the gesture's");
+    assert_eq!(
+        a_offset(&mut s, back_key),
+        back,
+        "the A that came back is not the gesture's"
+    );
 }
 
 /// A list made by component `which` (two types), keyed 5: the same path
@@ -5745,7 +5751,7 @@ fn a_retired_mailbox_lets_go_of_its_handler_at_once() {
         return;
     };
     let (probe, replied) = rx.recv_timeout(Duration::from_secs(5)).expect("the page's probe");
-    assert!(probe.send(()));
+    assert!(probe.send(()).is_ok());
     assert_eq!(
         replied.recv_timeout(Duration::from_secs(5)).ok(),
         Some(false),

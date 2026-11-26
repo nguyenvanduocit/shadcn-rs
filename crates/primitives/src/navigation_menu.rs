@@ -190,6 +190,7 @@ pub enum Motion {
 /// Its cells are the world's that made the menu: a check writes none of a
 /// live one's (ADR-0034, S7). The boxes are written by the menu's own
 /// layout callback on its triggers and links, bounded by those laid out.
+#[derive(Clone)]
 struct Nav {
     value: Rc<dyn NavValue>,
     options: NavOptions,
@@ -683,7 +684,8 @@ impl NavigationMenu {
         let d = d.role(Role::Link);
         let d = if active { d.aria_current(AriaCurrent::Page) } else { d };
         d.on_click(move |ev| {
-            if on_select.call(()) == Dismiss::Close && !ev.modifiers.command && self.nav.is_alive() {
+            if on_select.call(()).unwrap_or_default() == Dismiss::Close && !ev.modifiers.command && self.nav.is_alive()
+            {
                 closing.call(());
                 self.root_menu().close_tree();
             }
@@ -692,7 +694,7 @@ impl NavigationMenu {
 }
 
 /// The world's that made the item: a check writes none of a live one's.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Flags {
     /// Escape closed it: the pointer does not open it again until it
     /// leaves the trigger and comes back.

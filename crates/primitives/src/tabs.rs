@@ -115,6 +115,7 @@ pub struct Indicator {
     pub thickness: f32,
 }
 
+#[derive(Clone)]
 struct State {
     options: Rc<dyn Fn() -> TabsOptions>,
     /// The tab asked for by its focus arriving or by a press, and the frame

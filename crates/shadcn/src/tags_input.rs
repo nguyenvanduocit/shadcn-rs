@@ -364,7 +364,7 @@ impl IntoElement for TagsInputInput {
                             // The caller's keys first, then the tags input's
                             // (before the field's own editing).
                             let keys = keys.clone();
-                            move |ev| keys.call(ev.clone()) || ctx.key(ev)
+                            move |ev| keys.call(ev.clone()) == Some(true) || ctx.key(ev)
                         })
                         .into_element()
                 })

@@ -630,14 +630,14 @@ fn window(items: Signal<Vec<u64>>) -> impl Fn() -> Element + 'static {
     }
 }
 
-/// What names the node `text` shows in: its path (bounds and hit testing
+/// What names the node `text` shows in: its id (bounds and hit testing
 /// find it by it), its accessibility id and the compositor's key (paint).
-fn ids(s: &crate::Scenario, text: &str) -> (crate::geometry::NodePath, u64, crate::compositor::NodeKey) {
+fn ids(s: &crate::Scenario, text: &str) -> (crate::geometry::NodeId, u64, crate::compositor::NodeKey) {
     let node = crate::inspect::find_text(&s.last().nodes, text).expect("on screen");
     (
-        node.path.clone(),
-        crate::access::id_of(&node.path).0,
-        crate::compositor::NodeKey::of(&node.path),
+        node.id,
+        crate::access::id_of(node.id).0,
+        crate::compositor::NodeKey::of(node.id),
     )
 }
 
@@ -964,19 +964,66 @@ fn a_sibling_keeps_its_path_as_a_range_before_it_changes() {
     let (a, b) = (ids(&s, "A"), ids(&s, "B"));
     s.act("open", || open.set(true));
     s.frame("opened").expect("a frame");
-    assert_eq!((ids(&s, "A"), ids(&s, "B")), (a.clone(), b.clone()), "opening a branch");
+    assert_eq!((ids(&s, "A"), ids(&s, "B")), (a, b), "opening a branch");
     s.act("insert", || items.set(vec![0, 1, 2, 3]));
     s.frame("inserted").expect("a frame");
     assert_eq!((ids(&s, "A"), ids(&s, "B")), (a, b), "inserting rows");
 }
 
+/// K4a issue 25 (K4e): a control node added beside unkeyed siblings (a
+/// node, a component, a layer) leaves each its id: an unkeyed node beside
+/// a range is placed by its static place, the place it had before any
+/// range, not re-keyed once as the first range comes.
+#[test]
+fn a_range_added_beside_unkeyed_siblings_leaves_them_their_ids() {
+    use crate::styled::Styled;
+    let ranged = Signal::new(false);
+    let mut s = crate::Scenario::measuring(
+        move || {
+            let d = div()
+                .width(200.0)
+                .child(text("A"))
+                .child(component((), |_| || text("C").into_element()))
+                .child(crate::element::deferred(
+                    crate::element::Positioning::At { x: 0.0, y: 300.0 },
+                    text("L"),
+                ))
+                .child(text("B"));
+            if ranged.get() {
+                d.child(show(|| true, || text("row")))
+            } else {
+                d
+            }
+            .into_element()
+        },
+        200,
+        400,
+        1.0,
+    )
+    .expect("a scenario");
+    s.frame("first").expect("a frame");
+    let before: Vec<_> = ["A", "C", "L", "B"].iter().map(|t| ids(&s, t)).collect();
+    s.act("add a range", || ranged.set(true));
+    s.frame("ranged").expect("a frame");
+    assert!(
+        crate::inspect::find_text(&s.last().nodes, "row").is_some(),
+        "the range shows"
+    );
+    let after: Vec<_> = ["A", "C", "L", "B"].iter().map(|t| ids(&s, t)).collect();
+    assert_eq!(after, before, "adding a range");
+    s.act("take it away", || ranged.set(false));
+    s.frame("unranged").expect("a frame");
+    let after: Vec<_> = ["A", "C", "L", "B"].iter().map(|t| ids(&s, t)).collect();
+    assert_eq!(after, before, "taking it away");
+}
+
 // Round 3 (review r2): each repro below failed before its fix.
 
 fn path_of(s: &crate::Scenario, text: &str) -> crate::geometry::NodePath {
-    crate::inspect::find_text(&s.last().nodes, text)
-        .expect("on screen")
-        .path
-        .clone()
+    let f = s.last();
+    let n = crate::inspect::find_text(&f.nodes, text).expect("on screen");
+    let i = f.nodes.iter().position(|m| std::ptr::eq(m, n)).expect("in the frame");
+    f.path_of(i)
 }
 
 /// A (Opus r2-1): an unkeyed component whose root is a range keeps its

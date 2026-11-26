@@ -31,6 +31,8 @@ mod control;
 
 use children::Children;
 
+#[cfg(debug_assertions)]
+pub(crate) use control::report_duplicate;
 pub use control::{
     DuplicateKey, Dynamic, Each, Row, Show, StructureStats, dynamic_view, each, show, structure_stats,
     take_duplicate_keys,
@@ -86,7 +88,7 @@ impl<P: 'static> Ctx<P> {
                     .is_alive()
                     .then(|| props.with_untracked(|p| field(p).cloned()))
                     .flatten();
-                now.map_or_else(R::default, |f| f.call(arg))
+                now.and_then(|f| f.call(arg)).unwrap_or_default()
             }),
             // The callback it finds runs as its own maker.
             owner: None,
@@ -122,29 +124,31 @@ impl<A: 'static, R: 'static> Callback<A, R> {
     }
 
     /// Call it, untracked, in the instance that made it; through the one
-    /// gate a caller's closure is reached by ([`crate::engine::call_out`]):
-    /// inside a fork it does not run (what it writes is the outside
-    /// world's, which no rollback puts back, ADR-0028 rule 5). An event's
-    /// callback answers nothing, and a fork calls it to no effect. One
-    /// whose answer the fork would need (a veto) is a bug there, loud in a
-    /// debug build, and answers `R::default()`.
-    pub fn call(&self, arg: A) -> R
-    where
-        R: Default,
-    {
+    /// gate a caller's closure is reached by ([`crate::engine::call_out`]).
+    /// `None` when it did not run (ADR-0026): its owner was disposed (a
+    /// call into a disposed owner has a defined result, not a run with no
+    /// owner), a fork is open (what it writes is the outside world's, which
+    /// no rollback puts back, ADR-0028 rule 5), or it panicked inside a
+    /// dispatch, which keeps the panic. A caller that asks for a veto
+    /// treats `None` as no veto. One whose answer a fork would need is a
+    /// bug there, loud in a debug build.
+    pub fn call(&self, arg: A) -> Option<R> {
+        if let Some(owner) = self.owner
+            && !crate::reactive::is_live(owner)
+        {
+            return None;
+        }
         let called = crate::engine::call_out(crate::engine::Site::Callback, || match self.owner {
             Some(owner) => crate::reactive::run_owned(Some(owner), || (self.f)(arg)),
             None => crate::reactive::untracked(|| (self.f)(arg)),
         });
-        // `None` live: it panicked inside a dispatch, which keeps the panic
-        // ([`crate::engine::call_out`]), and answers as no callback would.
-        called.unwrap_or_else(|| {
-            debug_assert!(
-                !crate::engine::forking() || std::any::TypeId::of::<R>() == std::any::TypeId::of::<()>(),
-                "a fork needs the answer of a caller's callback, which it never calls"
-            );
-            R::default()
-        })
+        debug_assert!(
+            called.is_some()
+                || !crate::engine::forking()
+                || std::any::TypeId::of::<R>() == std::any::TypeId::of::<()>(),
+            "a fork needs the answer of a caller's callback, which it never calls"
+        );
+        called
     }
 }
 
@@ -882,6 +886,10 @@ struct Instance {
     /// chain: what tells apart the roots of unkeyed siblings that key
     /// theirs alike.
     at: usize,
+    /// That outermost's static place beside a range, when it is unkeyed
+    /// there: its output's root is placed by it
+    /// ([`crate::element::Common::place`]).
+    place: Option<u32>,
     /// Its last render's output as given and as marked ([`marked`]), when
     /// it was given a node shared with another (a cached output): the
     /// same output given again is the same marked node.
@@ -964,6 +972,7 @@ impl Instance {
             generation: self.generation,
             key: self.key,
             at: self.at,
+            place: self.place,
             marked: self.marked.clone(),
             parent: self.parent,
             depth: self.depth,
@@ -2016,6 +2025,7 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
             generation: 0,
             key: None,
             at: 0,
+            place: None,
             marked: None,
             parent,
             depth,
@@ -2239,7 +2249,7 @@ fn resolve(id: Id) -> Element {
     let mut seen = Children::with_capacity(before.len());
     // A component that is the root of this output is placed by this
     // instance's key, its own nested in it.
-    let chain = with_tree(|t| t.get(id).map(|i| Chain::Root(i.key, i.at))).unwrap_or(Chain::Child(0));
+    let chain = with_tree(|t| t.get(id).map(|i| Chain::Root(i.key, i.at, i.place))).unwrap_or(Chain::Child(0));
     // Expanded again: a slot a setup's panic left empty mounts anew.
     cleared_setups(id);
     // An output that is a control node is a range: kept whole for a
@@ -2250,9 +2260,9 @@ fn resolve(id: Id) -> Element {
             let (ctl, range) = expand_control(id, c, 0, &before, &mut seen);
             // The box stands in for this instance's root: placed by the
             // instance's key, made by it, as `mark_root` places a root.
-            let place = with_tree(|t| t.get(id).map(|i| (i.key, i.scope.id().owner_id())));
-            let (key, owner) = place.map_or((None, None), |(k, o)| (k, Some(o)));
-            (boxed(ctl, &range, key, owner), Some(range))
+            let place = with_tree(|t| t.get(id).map(|i| (i.key, i.place, i.scope.id().owner_id())));
+            let (key, at, owner) = place.map_or((None, None, None), |(k, p, o)| (k, p, Some(o)));
+            (boxed(ctl, &range, key, at, owner), Some(range))
         }
         _ => (
             expand(id, &raw, 0, chain, &before, &mut seen).unwrap_or_else(|| raw.clone()),
@@ -2291,16 +2301,24 @@ fn resolve(id: Id) -> Element {
 /// kept. The box takes the place of what it stands in for (`key`: the
 /// owning instance's key, or the static slot or key of the layer it is the
 /// content of), so its path is the one that root would have had.
-fn boxed(ctl: Id, range: &Rc<[Element]>, key: Option<ElementKey>, owner: Option<crate::reactive::OwnerId>) -> Element {
-    let key = if control::suppressed(control::Suppress::Unplaced) {
-        None
+fn boxed(
+    ctl: Id,
+    range: &Rc<[Element]>,
+    key: Option<ElementKey>,
+    place: Option<u32>,
+    owner: Option<crate::reactive::OwnerId>,
+) -> Element {
+    let (key, place) = if control::suppressed(control::Suppress::Unplaced) {
+        (None, None)
     } else {
-        key
+        (key, place)
     };
     let cached = with_tree(|t| {
         t.get(ctl)
             .and_then(|i| i.boxed.as_ref())
-            .filter(|(r, b)| Rc::ptr_eq(r, range) && b.common().and_then(|c| c.component_key) == key)
+            .filter(|(r, b)| {
+                Rc::ptr_eq(r, range) && b.common().map(|c| (c.component_key, c.place)) == Some((key, place))
+            })
             .map(|(_, b)| b.clone())
     });
     if let Some(b) = cached {
@@ -2309,6 +2327,7 @@ fn boxed(ctl: Id, range: &Rc<[Element]>, key: Option<ElementKey>, owner: Option<
     let mut b = crate::element::div().children(range.iter().cloned()).into_element();
     if let Some(c) = b.common_mut() {
         c.component_key = key;
+        c.place = place;
         if owner.is_some() {
             c.handlers.instance = owner;
         }
@@ -2338,26 +2357,31 @@ enum Chain {
     /// Child `n` of a node.
     Child(usize),
     /// The root of an instance's output: that instance's key (the chain's
-    /// so far), and its outermost's place.
-    Root(Option<ElementKey>, usize),
+    /// so far), its outermost's place, and that one's static place beside
+    /// a range when it is unkeyed there.
+    Root(Option<ElementKey>, usize, Option<u32>),
 }
 
 impl Chain {
-    /// The key a component keyed `own` placed here is placed by, and its
-    /// outermost's place. Every component of a chain of roots adds its
-    /// own: wrappers keyed 1 and 2 whose roots are each keyed 7 place them
-    /// apart, as do unkeyed wrappers side by side, by their places.
-    fn place(self, own: Option<ElementKey>) -> (Option<ElementKey>, usize) {
+    /// The key a component keyed `own` placed here is placed by, its
+    /// outermost's place, and that one's static place. Every component of
+    /// a chain of roots adds its own: wrappers keyed 1 and 2 whose roots
+    /// are each keyed 7 place them apart, as do unkeyed wrappers side by
+    /// side, by their places.
+    fn place(self, own: Option<ElementKey>) -> (Option<ElementKey>, usize, Option<u32>) {
         match (self, own) {
-            (Self::Child(n), own) => (own, n),
-            (Self::Root(outer, n), None) => (outer, n),
-            (Self::Root(Some(outer), n), Some(own)) => (Some(path_step(path_step(0x6e65_7374, outer), own)), n),
-            (Self::Root(None, n), Some(own)) => (
+            (Self::Child(n), own) => (own, n, None),
+            (Self::Root(outer, n, p), None) => (outer, n, p),
+            (Self::Root(Some(outer), n, _), Some(own)) => {
+                (Some(path_step(path_step(0x6e65_7374, outer), own)), n, None)
+            }
+            (Self::Root(None, n, _), Some(own)) => (
                 Some(path_step(
                     path_step(0x0070_6c63, u64::try_from(n).unwrap_or(u64::MAX)),
                     own,
                 )),
                 n,
+                None,
             ),
         }
     }
@@ -2390,11 +2414,11 @@ fn expand(
         // static slot beside a range), else its position.
         Element::Component(c) if c.control.is_some() => {
             let (ctl, range) = expand_control(parent, c, path, before, seen);
-            let key = match chain {
-                Chain::Root(key, _) => key,
-                Chain::Child(_) => None,
+            let (key, place) = match chain {
+                Chain::Root(key, _, place) => (key, place),
+                Chain::Child(_) => (None, None),
             };
-            Some(boxed(ctl, &range, key, None))
+            Some(boxed(ctl, &range, key, place, None))
         }
         Element::Component(c) => {
             let slot = InstanceKey {
@@ -2475,19 +2499,20 @@ fn expand(
                 }
             };
             seen.insert(slot, child);
-            let (key, at) = chain.place(c.key);
+            let (key, at, place) = chain.place(c.key);
             with_tree(|t| {
                 if let Some(i) = t.get_mut(child)
-                    && (i.key, i.at) != (key, at)
+                    && (i.key, i.at, i.place) != (key, at, place)
                 {
                     i.key = key;
                     i.at = at;
+                    i.place = place;
                     // Kept, its place changed: its root marked again from
                     // the chain as it is now, and its output expanded
                     // again (a root component of its takes the new chain),
                     // with no render.
                     if let Some(raw) = i.raw.take() {
-                        i.raw = Some(mark_root(&mut i.marked, raw, key, i.scope.id().owner_id()));
+                        i.raw = Some(mark_root(&mut i.marked, raw, key, place, i.scope.id().owner_id()));
                         i.below = true;
                     }
                 }
@@ -2527,10 +2552,12 @@ fn expand(
                     continue;
                 }
                 let chain = match rc {
-                    Element::Component(c) if ranged && c.key.is_none() => Chain::Root(Some(static_key(i)), i),
+                    Element::Component(c) if ranged && c.key.is_none() => Chain::Root(None, i, u32::try_from(i).ok()),
                     // A layer whose content is a range: its box is placed
                     // by the layer's static slot.
-                    Element::Deferred(d) if ranged && is_control(&d.child) => Chain::Root(Some(static_key(i)), i),
+                    Element::Deferred(d) if ranged && is_control(&d.child) => {
+                        Chain::Root(None, i, u32::try_from(i).ok())
+                    }
                     _ => Chain::Child(i),
                 };
                 match expand(parent, rc, at, chain, before, seen) {
@@ -2633,13 +2660,6 @@ fn is_control(el: &Element) -> bool {
     matches!(el, Element::Component(c) if c.control.is_some())
 }
 
-/// The key a node beside a range is placed by: its static place among its
-/// parent's elements, whatever the ranges before it hold (ADR-0026,
-/// "the node's static child position").
-fn static_key(at: usize) -> ElementKey {
-    path_step(0x7374_6174_6963, u64::try_from(at).unwrap_or(u64::MAX))
-}
-
 /// Whether `el` holds a control node, not looking into components (each
 /// marks its own output).
 fn holds_control(el: &Element) -> bool {
@@ -2652,9 +2672,11 @@ fn holds_control(el: &Element) -> bool {
 }
 
 /// `raw` with each unkeyed node beside a range in a box placed by its
-/// static place ([`static_key`]): a branch opened or rows inserted before
-/// it leave its path, and with it its scroll, motion and accessibility
-/// id, as they were. Done once per render, so the marked nodes are the
+/// static place among its parent's elements
+/// ([`crate::element::Common::place`], ADR-0026,
+/// "the node's static child position"): the place it had before any
+/// range, so a range added, a branch opened or rows inserted before it
+/// leave its path, and with it its node id, as they were. Done once per render, so the marked nodes are the
 /// same between renders. What holds no control node is not copied.
 fn mark_statics(mut raw: Element) -> Element {
     if !holds_control(&raw) {
@@ -2669,17 +2691,19 @@ fn mark_statics(mut raw: Element) -> Element {
     if let Some(kids) = raw.kids_mut() {
         for (i, kid) in kids.iter_mut().enumerate() {
             if ranged {
-                let unkeyed = |c: &crate::element::Common| c.key.is_none() && c.component_key.is_none();
+                let place = u32::try_from(i).ok();
+                let unkeyed =
+                    |c: &crate::element::Common| c.key.is_none() && c.component_key.is_none() && c.place != place;
                 if let Element::Deferred(d) = &mut *kid {
                     if d.child.common().is_some_and(unkeyed)
                         && let Some(c) = Rc::make_mut(d).child.common_mut()
                     {
-                        c.component_key = Some(static_key(i));
+                        c.place = place;
                     }
                 } else if kid.common().is_some_and(unkeyed)
                     && let Some(c) = kid.common_mut()
                 {
-                    c.component_key = Some(static_key(i));
+                    c.place = place;
                 }
             }
             *kid = mark_statics(std::mem::take(kid));
@@ -2696,35 +2720,36 @@ fn mark_root(
     cache: &mut Option<(Element, Element)>,
     raw: Element,
     key: Option<ElementKey>,
+    place: Option<u32>,
     owner: crate::reactive::OwnerId,
 ) -> Element {
-    if !unmarked(&raw, key, owner) {
+    if !unmarked(&raw, key, place, owner) {
         return raw;
     }
     if !raw.is_shared() {
         *cache = None;
-        return marked(raw, key, owner);
+        return marked(raw, key, place, owner);
     }
     if let Some((from, to)) = cache.as_ref()
         && from.ptr_eq(&raw)
     {
         return to.clone();
     }
-    let to = marked(raw.clone(), key, owner);
+    let to = marked(raw.clone(), key, place, owner);
     *cache = Some((raw, to.clone()));
     to
 }
 
 /// Whether `raw`'s root (through a layer around it) lacks the mark
 /// [`marked`] writes.
-fn unmarked(raw: &Element, key: Option<ElementKey>, owner: crate::reactive::OwnerId) -> bool {
+fn unmarked(raw: &Element, key: Option<ElementKey>, place: Option<u32>, owner: crate::reactive::OwnerId) -> bool {
     match raw {
         // A component at the root marks its own, placed by this key.
         Element::Component(_) => false,
-        Element::Deferred(d) => unmarked(&d.child, key, owner),
+        Element::Deferred(d) => unmarked(&d.child, key, place, owner),
         other => other
             .common()
-            .is_some_and(|c| c.component_key != key || c.handlers.instance != Some(owner)),
+            .is_some_and(|c| c.component_key != key || c.place != place || c.handlers.instance != Some(owner)),
     }
 }
 
@@ -2735,18 +2760,19 @@ fn unmarked(raw: &Element, key: Option<ElementKey>, owner: crate::reactive::Owne
 /// component's DOM, and shares it with no sibling), and made by the
 /// instance (`owner`, its scope): what tells a node it made from one
 /// another instance made at its path.
-fn marked(mut raw: Element, key: Option<ElementKey>, owner: crate::reactive::OwnerId) -> Element {
+fn marked(mut raw: Element, key: Option<ElementKey>, place: Option<u32>, owner: crate::reactive::OwnerId) -> Element {
     if let Element::Deferred(d) = &raw {
         return Element::Deferred(Rc::new(crate::element::Deferred {
             positioning: d.positioning,
             placed: d.placed,
             anchor_part: d.anchor_part,
             tab_after: d.tab_after,
-            child: marked(d.child.clone(), key, owner),
+            child: marked(d.child.clone(), key, place, owner),
         }));
     }
     if let Some(c) = raw.common_mut() {
         c.component_key = key;
+        c.place = place;
         c.handlers.instance = Some(owner);
     }
     raw
@@ -2833,8 +2859,8 @@ fn render(id: Id) {
         let Some(i) = t.get_mut(id) else {
             return (Vec::new(), true, Vec::new(), None);
         };
-        let (key, owner) = (i.key, i.scope.id().owner_id());
-        i.raw = Some(mark_root(&mut i.marked, mark_statics(raw), key, owner));
+        let (key, place, owner) = (i.key, i.place, i.scope.id().owner_id());
+        i.raw = Some(mark_root(&mut i.marked, mark_statics(raw), key, place, owner));
         i.renders = i.renders.saturating_add(1);
         i.render_scopes.push(rs);
         let excess = i.render_scopes.len().saturating_sub(KEPT_RENDERS);

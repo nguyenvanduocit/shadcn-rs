@@ -548,6 +548,7 @@ impl ListConfig {
 /// A refusal hook: the caller's answer to each choice.
 type Veto<T> = gui::Callback<T, Pick>;
 
+#[derive(Clone)]
 struct State<T: 'static> {
     config: ListConfig,
     veto: Option<Veto<T>>,
@@ -768,7 +769,7 @@ impl<T: Clone + PartialEq + 'static> ListCore<T> {
         }
         let v = options.value(index)?;
         let veto = self.state.with_untracked(|s| s.veto.clone());
-        if veto.is_some_and(|f| f.call(v.clone()) == Pick::Refuse) {
+        if veto.is_some_and(|f| f.call(v.clone()) == Some(Pick::Refuse)) {
             return None;
         }
         Some(v)
@@ -969,6 +970,7 @@ impl<T: Clone + PartialEq + 'static> ListCore<T> {
 pub type Source<T> = Rc<dyn Fn() -> Rc<dyn Options<T>>>;
 
 /// A virtual list's rows and the data laid on them.
+#[derive(Clone)]
 struct Virtual<T: 'static> {
     state: ListState,
     source: Source<T>,

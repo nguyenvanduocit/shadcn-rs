@@ -63,6 +63,19 @@ const ENTRIES: &[Entry] = &[
         Guard,
         "one dispatch's routing, ended as it returns or unwinds; borrows the pipeline",
     ),
+    // port.rs
+    e(
+        "crates/gui/src/port.rs",
+        "Running",
+        Guard,
+        "a port's delivery under way, cleared as it returns or unwinds; borrows the port's flag",
+    ),
+    e(
+        "crates/gui/src/port.rs",
+        "CancelOnDrop",
+        Plumbing,
+        "sets a spawned job's atomic cancel token, read by the job's own thread (other threads)",
+    ),
     // canvas
     e(
         "crates/gui/src/canvas/planner.rs",

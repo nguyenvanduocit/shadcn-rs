@@ -18,7 +18,7 @@ use crate::events::{
     ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey, PointerId, TouchEvent, TouchPhase,
 };
 use crate::focus::{self, FocusId, FocusManager, Modality};
-use crate::geometry::{Bounds, NodePath};
+use crate::geometry::{Bounds, NodeId};
 use crate::gesture::Gesture;
 use crate::layer::{Dismiss, DismissReason, PointerButton, PointerKind, PointerOutside, Stack};
 use crate::layout::{Behaviour, Content, Frame, LayoutTree, UiState, input_text};
@@ -663,14 +663,14 @@ pub(crate) struct Flags {
 /// Chrome's `:focus-visible`; it is within a node it is in or under, in
 /// the node's layer.
 pub(crate) fn focus_flags(
-    path: &NodePath,
+    id: NodeId,
     layer: usize,
     focused: bool,
     field: bool,
-    focus: Option<(&NodePath, usize)>,
+    focus: Option<&crate::layout::FocusAt>,
     by_keyboard: bool,
 ) -> (bool, bool, bool) {
-    let within = focused || focus.is_some_and(|(f, l)| l == layer && f.0.starts_with(&path.0));
+    let within = focused || focus.is_some_and(|f| f.within(id, layer));
     (focused, focused && (by_keyboard || field), within)
 }
 
@@ -685,8 +685,12 @@ pub(crate) fn focus_flags(
 /// one compare.
 #[derive(Clone, Debug)]
 struct Held {
-    path: NodePath,
-    /// The instance that made it ([`owner_of`]).
+    id: NodeId,
+    /// It and the nodes above it, innermost first, as it was found: what a
+    /// press "covers" once it is gone (ADR-0026: taken once, no walk).
+    above: std::rc::Rc<[NodeId]>,
+    /// The instance that made it ([`owner_of`]): what a teardown that
+    /// takes it with it is told by.
     owner: Option<crate::reactive::OwnerId>,
     /// The frame epoch and index it was last found at: the world's that
     /// made it, a check finding a live one keeps nothing (ADR-0034, S7).
@@ -698,7 +702,11 @@ impl Held {
     fn of(frame: &Frame, i: usize) -> Option<Self> {
         let n = frame.nodes.get(i)?;
         Some(Self {
-            path: n.path.clone(),
+            id: n.id,
+            above: frame
+                .above(i)
+                .filter_map(|k| frame.nodes.get(k).map(|n| n.id))
+                .collect(),
             owner: owner_of(frame, i),
             at: crate::engine::WorldCell::new("where a held node was last found", (frame.epoch(), i)),
         })
@@ -711,15 +719,14 @@ impl Held {
     fn find(&self, frame: &Frame) -> Option<usize> {
         const GONE: usize = usize::MAX;
         let (epoch, i) = self.at.get();
-        let here =
-            |i: usize| frame.nodes.get(i).is_some_and(|n| n.path == self.path) && owner_of(frame, i) == self.owner;
+        let here = |i: usize| frame.nodes.get(i).is_some_and(|n| n.id == self.id);
         if epoch == frame.epoch() && (i == GONE || here(i)) {
             return (i != GONE).then_some(i);
         }
         let found = if here(i) {
             Some(i)
         } else {
-            let key = crate::compositor::NodeKey::of(&self.path);
+            let key = crate::compositor::NodeKey::of(self.id);
             NODES.with(|n| {
                 let mut n = n.borrow_mut();
                 n.refresh(frame);
@@ -812,7 +819,7 @@ impl<E> Grip<E> {
     fn label(&self, frame: &Frame) -> String {
         match self.node.find(frame) {
             Some(i) => label(frame, i),
-            None => format!("{} (gone)", self.node.path),
+            None => format!("{} (gone)", self.node.id),
         }
     }
 }
@@ -829,10 +836,10 @@ struct Pointer {
     /// press and pan start from). `None` once a frame did not hold it: a
     /// node made again with the same key is another, and is not pressed.
     hit: Option<Held>,
-    /// The path of the node it went down on, kept once that node has gone
-    /// ([`Self::hit`] is then `None`): a contact's tap lifting on what is
-    /// left above it clicks there.
-    down: Option<NodePath>,
+    /// The node it went down on and those above it (innermost first), kept
+    /// once that node has gone ([`Self::hit`] is then `None`): a contact's
+    /// tap lifting on what is left above it clicks there.
+    down: Option<std::rc::Rc<[NodeId]>>,
     /// Its hit and the nodes above it show pressed (`:active`).
     pressing: bool,
     /// Where it went down, and where it was last, on screen.
@@ -989,6 +996,9 @@ pub struct InputState {
     /// The focus and whether it showed when the nodes' [`Interaction`]s
     /// were last written: focus moved since when it differs.
     shown_focus: Option<(Option<FocusId>, bool)>,
+    /// How many ids the layout had freed when what gone nodes held was
+    /// last let go of ([`LayoutTree::freed`]).
+    freed_seen: u64,
     /// The nodes hit testing wrote hovered, pressed, and focused or with
     /// focus within: a change writes the nodes that left the chain and
     /// those that came to it, not the frame.
@@ -1124,7 +1134,7 @@ fn label(frame: &Frame, i: usize) -> String {
     frame
         .nodes
         .get(i)
-        .map(|n| format!("{} {}", n.path, crate::inspect::describe(n)))
+        .map(|n| format!("{} {}", frame.path_of(i), crate::inspect::describe(n)))
         .unwrap_or_default()
 }
 
@@ -1230,7 +1240,7 @@ impl ScrollIndex {
                     // Written in place: the node is the one it was (its
                     // path too), only whether it scrolls may have changed.
                     let Some(n) = frame.nodes.get(i) else { continue };
-                    let entry = (NodeKey::of(&n.path), i);
+                    let entry = (NodeKey::of(n.id), i);
                     match (self.by_key.binary_search(&entry), laid_scroll(n).is_some()) {
                         (Err(at), true) => self.by_key.insert(at, entry),
                         (Ok(at), false) => {
@@ -1245,7 +1255,7 @@ impl ScrollIndex {
                 for (i, n) in frame.nodes.iter().enumerate() {
                     visited();
                     if laid_scroll(n).is_some() {
-                        self.by_key.push((NodeKey::of(&n.path), i));
+                        self.by_key.push((NodeKey::of(n.id), i));
                     }
                 }
                 self.by_key.sort_unstable();
@@ -1337,7 +1347,7 @@ impl NodeIndex {
                 self.by_key.clear();
                 for (i, n) in frame.nodes.iter().enumerate() {
                     visited();
-                    self.by_key.push((NodeKey::of(&n.path), i));
+                    self.by_key.push((NodeKey::of(n.id), i));
                 }
                 self.by_key.sort_unstable();
             }
@@ -1376,7 +1386,7 @@ crate::engine::engine_local! {
 enum Holder<'f> {
     Handle(&'f ScrollHandle),
     Field(TextField),
-    State(&'f NodePath, Option<crate::reactive::OwnerId>),
+    State(NodeId),
 }
 
 impl<'f> Holder<'f> {
@@ -1392,11 +1402,7 @@ impl<'f> Holder<'f> {
         if let Some(h) = b.and_then(|b| b.scroll.as_ref()) {
             return Some(Self::Handle(h));
         }
-        frame.nodes.get(i).map(|n| Self::State(&n.path, owner_of(frame, i)))
-    }
-
-    fn id(path: &NodePath, owner: Option<crate::reactive::OwnerId>) -> crate::layout::ScrollId {
-        (path.clone(), owner)
+        frame.nodes.get(i).map(|n| Self::State(n.id))
     }
 
     /// How many times the UI jumped it, as of now (not as last laid out):
@@ -1405,11 +1411,7 @@ impl<'f> Holder<'f> {
         match self {
             Self::Handle(h) => h.generation(),
             Self::Field(f) => f.scroll_generation(),
-            Self::State(p, o) => state
-                .scroll_generation
-                .get(&Self::id(p, *o))
-                .copied()
-                .unwrap_or_default(),
+            Self::State(id) => state.scroll_generation.get(id).copied().unwrap_or_default(),
         }
     }
 
@@ -1436,8 +1438,8 @@ impl<'f> Holder<'f> {
                 f.synced(next);
                 next != was
             }
-            Self::State(p, o) => {
-                let id = Self::id(p, *o);
+            Self::State(id) => {
+                let id = *id;
                 let was = state.scroll.get(&id).copied().unwrap_or(laid.pos);
                 let next = clamp(was);
                 if next == was {
@@ -1453,10 +1455,10 @@ impl<'f> Holder<'f> {
 /// Whether `path` is the node at `down` or above it: its segments begin
 /// `down`'s. While the node at `down` is `gone`, only those above it are:
 /// one made again with its key is another.
-fn covers(path: &NodePath, down: &NodePath, gone: bool) -> bool {
-    let (a, b) = (&path.0[..], &down.0[..]);
-    let within = if gone { a.len() < b.len() } else { a.len() <= b.len() };
-    within && b.get(..a.len()) == Some(a)
+fn covers(id: NodeId, down: &[NodeId], gone: bool) -> bool {
+    // `down` is the node and those above it, innermost first.
+    let above = if gone { down.get(1..).unwrap_or_default() } else { down };
+    above.contains(&id)
 }
 
 /// What a press that went down on node `from` and came up on node `h`
@@ -1465,13 +1467,8 @@ fn covers(path: &NodePath, down: &NodePath, gone: bool) -> bool {
 /// `from` up to that ancestor being disabled or unavailable. Found up the
 /// two chains, whatever the size of the tree.
 fn click_target(frame: &Frame, from: usize, h: usize) -> Option<usize> {
-    let down = &frame.nodes.get(from)?.path.0[..];
-    let common = frame.ancestors(h).find(|&i| {
-        frame
-            .nodes
-            .get(i)
-            .is_some_and(|n| down.get(..n.path.0.len()) == Some(&n.path.0[..]))
-    })?;
+    frame.nodes.get(from)?;
+    let common = frame.ancestors(h).find(|&i| frame.is_below(from, i))?;
     if !Reach::Activation.reaches(frame, from, common) {
         return None;
     }
@@ -1743,10 +1740,17 @@ impl InputState {
         let frame = tree.frame();
         let found = self.state.focused.and_then(|id| tree.focus_location(id));
         let at = found.map(|(i, _, _)| i);
-        let focus_at = found.map(|(_, p, l)| (p, l));
-        let moved = self.state.focus_at.as_ref().map(|(p, l)| (p, *l)) != focus_at;
+        let moved = !crate::layout::FocusAt::same(self.state.focus_at.as_ref(), frame, at);
         if moved {
-            self.state.focus_at = focus_at.map(|(p, l)| (p.clone(), l));
+            self.state.focus_at = at.and_then(|i| crate::layout::FocusAt::of(frame, i));
+        }
+        let focus_at = self.state.focus_at.clone();
+        // What layout freed is let go of (ADR-0026: one id never names
+        // another node, so what a gone container held is garbage).
+        if tree.freed() != self.freed_seen {
+            self.freed_seen = tree.freed();
+            self.state.scroll.retain(|id| tree.holds_id(id));
+            self.state.scroll_generation.retain(|id| tree.holds_id(id));
         }
         let now = (self.state.focused, self.state.focus_visible);
         if self.shown_focus == Some(now) && !moved {
@@ -1767,11 +1771,11 @@ impl InputState {
             };
             let Some(it) = &b.interaction else { return };
             let (focused, visible, within) = focus_flags(
-                &node.path,
+                node.id,
                 node.layer,
                 at == Some(i),
                 b.field.is_some(),
-                focus_at,
+                focus_at.as_ref(),
                 keyboard,
             );
             it.set_focus(focused, visible, within, c);
@@ -1803,7 +1807,7 @@ impl InputState {
     }
 
     /// Whether `self.chain` holds other nodes than `paths` names.
-    fn chain_differs(&self, frame: &Frame, marks: &Marked, paths: &HashSet<NodePath>) -> bool {
+    fn chain_differs(&self, frame: &Frame, marks: &Marked, paths: &HashSet<NodeId>) -> bool {
         if marks.epoch == Some(frame.epoch()) {
             return marks.nodes != self.chain;
         }
@@ -1811,14 +1815,14 @@ impl InputState {
             || self
                 .chain
                 .iter()
-                .any(|&i| frame.nodes.get(i).is_none_or(|n| !paths.contains(&n.path)))
+                .any(|&i| frame.nodes.get(i).is_none_or(|n| !paths.contains(&n.id)))
     }
 
     /// `paths` as the nodes of `self.chain` (kept, so a change allocates
     /// nothing once it has held as many).
-    fn set_paths(frame: &Frame, chain: &[usize], paths: &mut HashSet<NodePath>) {
+    fn set_paths(frame: &Frame, chain: &[usize], paths: &mut HashSet<NodeId>) {
         paths.clear();
-        paths.extend(chain.iter().filter_map(|&i| frame.nodes.get(i).map(|n| n.path.clone())));
+        paths.extend(chain.iter().filter_map(|&i| frame.nodes.get(i).map(|n| n.id)));
     }
 
     /// Write the nodes pressed: those any pointer presses (its hit and the
@@ -1840,7 +1844,7 @@ impl InputState {
         let mut was = std::mem::take(&mut self.was);
         let active = &self.state.active;
         self.press_marks.take(frame, &mut was, |i| {
-            frame.nodes.get(i).is_some_and(|n| active.contains(&n.path))
+            frame.nodes.get(i).is_some_and(|n| active.contains(&n.id))
         });
         // One step: the flags, the paths and the marks, effects reading
         // the flags run after all of them (the hover transaction, ADR-0015).
@@ -1929,7 +1933,7 @@ impl InputState {
             let mut was = std::mem::take(&mut self.was);
             let hovered = &self.state.hovered;
             self.hover_marks.take(frame, &mut was, |i| {
-                frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
+                frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.id))
             });
             self.commit_hover(frame, was);
             self.tell_hover();
@@ -2024,7 +2028,7 @@ impl InputState {
         let mut was = std::mem::take(&mut self.was);
         let hovered = &self.state.hovered;
         self.hover_marks.take(frame, &mut was, |i| {
-            frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
+            frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.id))
         });
         self.chain.clear();
         self.commit_hover(frame, was);
@@ -2234,7 +2238,7 @@ impl InputState {
             return out;
         };
         p.hit = h.and_then(|i| Held::of(frame, i));
-        p.down = p.hit.as_ref().map(|h| h.path.clone());
+        p.down = p.hit.as_ref().map(|h| std::rc::Rc::clone(&h.above));
         p.pressing = true;
         p.start = (x, y);
         p.last = (x, y);
@@ -2562,7 +2566,7 @@ impl InputState {
                     .take_while(|&a| a == i || frame.nodes.get(a).is_some_and(|n| laid_scroll(n).is_none()))
                     .any(|a| frame.behaviour(a).is_some_and(|b| b.handlers.wheel.is_some()));
                 Some(crate::compositor::HitTarget {
-                    key: crate::compositor::NodeKey::of(&held.path),
+                    key: crate::compositor::NodeKey::of(held.id),
                     owner: held.owner,
                 })
             },
@@ -2656,7 +2660,7 @@ impl InputState {
             .ancestors(h)
             .filter_map(|i| frame.nodes.get(i))
             .find(|n| laid_scroll(n).is_some())
-            .map(|n| crate::compositor::NodeKey::of(&n.path));
+            .map(|n| crate::compositor::NodeKey::of(n.id));
         let held = self
             .latch_of(whose)
             .and_then(|l| l.held(&step, || Some(under)))
@@ -2722,7 +2726,7 @@ impl InputState {
             && let Some((began, _)) = self.scroll_latch.holds()
         {
             let to = crate::compositor::HitTarget {
-                key: crate::compositor::NodeKey::of(&node.path),
+                key: crate::compositor::NodeKey::of(node.id),
                 owner: owner_of(frame, i),
             };
             self.scroll_motion
@@ -3036,7 +3040,7 @@ impl InputState {
         }
         let mut p = Pointer::new(id, ev.kind, (x, y));
         p.hit = h.and_then(|h| Held::of(frame, h));
-        p.down = p.hit.as_ref().map(|h| h.path.clone());
+        p.down = p.hit.as_ref().map(|h| std::rc::Rc::clone(&h.above));
         p.pressing = true;
         p.raw = raw;
         p.gesture = Some(gesture);
@@ -3233,13 +3237,13 @@ impl InputState {
         text: &mut TextSystem,
         ev: &TouchEvent,
         (x, y): (f32, f32),
-        (down, held): (Option<&NodePath>, Option<&Held>),
+        (down, held): (Option<&std::rc::Rc<[NodeId]>>, Option<&Held>),
     ) -> Outcome {
         let gone = held.is_none();
         let (h, ..) = self.locate(frame, x, y);
         let on_its_own = h
             .and_then(|h| frame.nodes.get(h))
-            .is_some_and(|n| down.is_some_and(|d| covers(&n.path, d, gone)));
+            .is_some_and(|n| down.is_some_and(|d| covers(n.id, d, gone)));
         if !on_its_own {
             return Outcome::redraw();
         }
@@ -3835,11 +3839,7 @@ impl InputState {
                 child = a;
                 continue;
             };
-            let key = frame
-                .nodes
-                .get(child)
-                .and_then(|c| c.path.0.last())
-                .and_then(|seg| seg.element_key());
+            let key = frame.nodes.get(child).and_then(|c| c.seg.element_key());
             if let (Some(h), Some(k)) = (handle, key)
                 && let Some(moved) = h.reveal(k)
             {
@@ -4033,7 +4033,11 @@ impl InputState {
         let line = cfg!(target_os = "macos") && ev.modifiers.command;
         // What the key does, read off the edit as it is (borrowed, its text
         // never copied), then done to it in place: a caret moved writes
-        // the caret alone.
+        // the caret alone. A copy or a cut takes the selection out, to put
+        // on the clipboard once the edit is let go of.
+        // The text copied and, for a cut, the revision and range it came from.
+        type Copied = (String, Option<(u64, (usize, usize))>);
+        let mut copied: Option<Copied> = None;
         let op = field.edit.with_untracked(|e| {
             let mut to = |s: Step| mode.value_offset(e, text.step(&content, &it.t, it.width, caret_at, s));
             let collapse = !shift && !word && !line && e.has_selection();
@@ -4089,16 +4093,18 @@ impl InputState {
                 Key::Character(c) if ev.modifiers.primary() && c.eq_ignore_ascii_case("a") => EditOp::SelectAll,
                 Key::Character(c) if ev.modifiers.primary() && c.eq_ignore_ascii_case("c") => {
                     if copyable {
-                        crate::clipboard::copy(e.selected_text());
+                        copied = Some((e.selected_text().to_owned(), None));
                     }
                     EditOp::Keep
                 }
+                // A cut deletes on the clipboard's answer, and only what was
+                // copied, at the revision it was copied from (ADR-0028:
+                // confirm-then-act): never on a stale answer.
                 Key::Character(c) if ev.modifiers.primary() && c.eq_ignore_ascii_case("x") => {
-                    if copyable && crate::clipboard::copy(e.selected_text()) {
-                        EditOp::Insert(Cow::Borrowed(""))
-                    } else {
-                        EditOp::Keep
+                    if copyable && e.has_selection() {
+                        copied = Some((e.selected_text().to_owned(), Some((e.revision(), e.selection()))));
                     }
+                    EditOp::Keep
                 }
                 Key::Character(c) if ev.modifiers.primary() && c.eq_ignore_ascii_case("v") => {
                     let pasted = crate::clipboard::paste().unwrap_or_default();
@@ -4111,6 +4117,22 @@ impl InputState {
                 _ => EditOp::Insert(Cow::Borrowed(typed(ev)?)),
             })
         })?;
+        if let Some((out, cut)) = copied {
+            let edit = field.edit;
+            crate::clipboard::answered(out, cut, move |wrote, cut| {
+                let Some((revision, (from, to))) = cut else {
+                    return;
+                };
+                if wrote.is_err() || !edit.is_alive() || edit.with_untracked(|e| e.revision()) != revision {
+                    return;
+                }
+                edit.update(|e| {
+                    e.place(from, false);
+                    e.place(to, true);
+                    e.insert("");
+                });
+            });
+        }
         let changes = field.edit.with_untracked(|e| match &op {
             EditOp::Keep => false,
             EditOp::Place(at, extend) => *at != e.caret || (!extend && *at != e.anchor),
@@ -4358,7 +4380,7 @@ mod tests {
             ui.key(&frame, &mut text, &named(k, false, false));
         }
         let i = focused_node(&frame, focus.id()).expect("the unavailable node");
-        let id = access::id_of(&frame.nodes[i].path);
+        let id = access::id_of(frame.nodes[i].id);
         ui.act(
             &frame,
             &mut text,
@@ -4426,23 +4448,37 @@ mod tests {
         }
     }
 
-    /// The frame `root` lays out to in 400 by 100.
+    crate::engine::engine_local! {
+        /// The test's window tree: each test runs on a thread of its own,
+        /// so the frames it lays out are passes of one retained tree, whose
+        /// nodes keep their ids from frame to frame as a window's do
+        /// (ADR-0026, "Node identity").
+        [Fresh] static TREE: std::cell::RefCell<Option<Box<crate::layout::LayoutTree>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// The frame `root` lays out to in 400 by 100, a pass of the test's
+    /// retained tree.
     fn laid_out(root: &crate::element::Element, ui: &InputState, text: &mut TextSystem) -> Frame {
-        layout(
-            root,
-            400.0,
-            100.0,
-            ui.state(),
-            &mut crate::motion::Motion::default(),
-            text,
-        )
+        TREE.with_borrow_mut(|t| {
+            t.get_or_insert_with(Box::default)
+                .layout(
+                    root,
+                    400.0,
+                    100.0,
+                    ui.state(),
+                    &mut crate::motion::Motion::default(),
+                    text,
+                )
+                .clone()
+        })
     }
 
     fn click_of(frame: &Frame, i: usize) -> ActionRequest {
         ActionRequest {
             action: Action::Click,
             target_tree: accesskit::TreeId::ROOT,
-            target_node: access::id_of(&frame.nodes[i].path),
+            target_node: access::id_of(frame.nodes[i].id),
             data: None,
         }
     }
@@ -4531,7 +4567,7 @@ mod tests {
         // AccessKit reads it and what it holds as disabled, and offers no Click.
         let tree = access::tree(&frame, None, 1.0, "test", &mut text);
         let node = |i: usize| {
-            let id = access::id_of(&frame.nodes[i].path);
+            let id = access::id_of(frame.nodes[i].id);
             tree.nodes.iter().find(|(n, _)| *n == id).map(|(_, n)| n.clone())
         };
         let c = node(control).expect("the control in the tree");
@@ -4709,11 +4745,7 @@ mod tests {
     /// The frame index of the box [`shifting`] keys 1.
     fn target_at(frame: &Frame) -> usize {
         let key = crate::geometry::PathSeg::Key(1);
-        frame
-            .nodes
-            .iter()
-            .position(|n| n.path.0.last() == Some(&key))
-            .expect("the target")
+        frame.nodes.iter().position(|n| n.seg == key).expect("the target")
     }
 
     /// Three frames of [`shifting`]: the target first, after a sibling
@@ -4725,8 +4757,8 @@ mod tests {
         let (was, now) = (target_at(&first), target_at(&moved));
         assert_ne!(was, now, "the target moved in the frame");
         assert_eq!(
-            moved.nodes[was].path.0.last(),
-            Some(&crate::geometry::PathSeg::Key(100)),
+            moved.nodes[was].seg,
+            crate::geometry::PathSeg::Key(100),
             "where it was is another node that takes every gesture"
         );
         (first, moved, gone)
@@ -4932,12 +4964,13 @@ mod tests {
         let mut text = TextSystem::new();
         let mut ui = InputState::default();
         let (a, b) = (crate::focus::FocusHandle::new(), crate::focus::FocusHandle::new());
+        // Passes of one tree: A kept as B comes to the top, then gone.
         let first = laid_out(&column(&log, &[(1, "A", a)]), &ui, &mut text);
-        // A replaced by B before the finger lifts.
-        let replaced = laid_out(&column(&log, &[(2, "B", b)]), &ui, &mut text);
         // B came to the top and A moved below it.
         let swapped = laid_out(&column(&log, &[(2, "B", b), (1, "A", a)]), &ui, &mut text);
-        let path_a = first.nodes[hit(&first, 10.0, 10.0).expect("A")].path.clone();
+        // A replaced by B before the finger lifts.
+        let replaced = laid_out(&column(&log, &[(2, "B", b)]), &ui, &mut text);
+        let path_a = first.nodes[hit(&first, 10.0, 10.0).expect("A")].id;
 
         // Replaced: what the finger went down on has gone, so its lift is
         // no tap, and B, made in its place, takes nothing of it. A gets
@@ -5010,9 +5043,10 @@ mod tests {
         let log = Log::default();
         let mut text = TextSystem::new();
         let mut ui = InputState::default();
+        // Passes of one tree: the old slider kept as it moves, then gone.
         let old = laid_out(&slider_at(&log, 1, "old", 0), &ui, &mut text);
-        let new = laid_out(&slider_at(&log, 2, "new", 0), &ui, &mut text);
         let moved = laid_out(&slider_at(&log, 1, "old", 1), &ui, &mut text);
+        let new = laid_out(&slider_at(&log, 2, "new", 0), &ui, &mut text);
 
         // Replaced: what the finger went down on has gone, so its lift is
         // no tap, and the new slider takes nothing of it.
@@ -5092,10 +5126,9 @@ mod tests {
         let container = first
             .nodes
             .iter()
-            .find(|n| n.path.0.last() == Some(&crate::geometry::PathSeg::Key(9)))
+            .find(|n| n.seg == crate::geometry::PathSeg::Key(9))
             .expect("the container")
-            .path
-            .clone();
+            .id;
 
         ui.mouse_down(&first, &mut text, 30.0, 10.0);
         ui.rehover(&first, &mut text);
@@ -5114,7 +5147,7 @@ mod tests {
         assert_eq!(taken(&log), ["Move 30,15"], "by the wheel");
 
         // Scrolled by the program: the same.
-        ui.state.scroll.insert((container, None), motion::units2((0.0, 12.0)));
+        ui.state.scroll.insert(container, motion::units2((0.0, 12.0)));
         let jumped = laid_out(&scrolled_slider(&log), &ui, &mut text);
         ui.rehover(&jumped, &mut text);
         ui.rehover(&jumped, &mut text);
@@ -5125,11 +5158,7 @@ mod tests {
     /// The frame index of the node keyed `k`.
     fn keyed(frame: &Frame, k: u64) -> usize {
         let key = crate::geometry::PathSeg::Key(k);
-        frame
-            .nodes
-            .iter()
-            .position(|n| n.path.0.last() == Some(&key))
-            .expect("the keyed node")
+        frame.nodes.iter().position(|n| n.seg == key).expect("the keyed node")
     }
 
     /// A container scrolling down (key 9) holding a box that takes drags
@@ -5178,7 +5207,7 @@ mod tests {
             .filter_map(|(i, n)| {
                 let s = n.scroll(OUTSIDE)?;
                 Some(crate::compositor::ShownScroll {
-                    key: crate::compositor::NodeKey::of(&n.path),
+                    key: crate::compositor::NodeKey::of(n.id),
                     owner: owner_of(frame, i),
                     offset: s.offset,
                     applied: s.applied,
@@ -5221,16 +5250,9 @@ mod tests {
         // What the compositor scrolled to and shows: the outer container 10
         // down, the inner one 5 more; the UI has not taken it in yet.
         let laid = laid_out(&nested_scrolls(&log), &ui, &mut text);
-        let (outer, inner) = (
-            laid.nodes[keyed(&laid, 9)].path.clone(),
-            laid.nodes[keyed(&laid, 3)].path.clone(),
-        );
-        ui.state
-            .scroll
-            .insert((outer.clone(), None), motion::units2((0.0, 10.0)));
-        ui.state
-            .scroll
-            .insert((inner.clone(), None), motion::units2((0.0, 5.0)));
+        let (outer, inner) = (laid.nodes[keyed(&laid, 9)].id, laid.nodes[keyed(&laid, 3)].id);
+        ui.state.scroll.insert(outer, motion::units2((0.0, 10.0)));
+        ui.state.scroll.insert(inner, motion::units2((0.0, 5.0)));
         let scrolled = laid_out(&nested_scrolls(&log), &ui, &mut text);
         let shown = presented(&scrolled, &mut text);
         ui.state.scroll.clear();
@@ -5266,8 +5288,8 @@ mod tests {
 
         // The UI takes the scroll in: laid out where the screen showed it,
         // nothing moved under the pointer.
-        ui.state.scroll.insert((outer, None), motion::units2((0.0, 10.0)));
-        ui.state.scroll.insert((inner, None), motion::units2((0.0, 5.0)));
+        ui.state.scroll.insert(outer, motion::units2((0.0, 10.0)));
+        ui.state.scroll.insert(inner, motion::units2((0.0, 5.0)));
         let caught_up = laid_out(&nested_scrolls(&log), &ui, &mut text);
         ui.show(Some(shown.clone()));
         ui.rehover(&caught_up, &mut text);
@@ -5312,12 +5334,12 @@ mod tests {
         let mut ui = InputState::default();
         let at = |frame: &Frame| {
             let list = keyed(frame, 9);
-            (frame.nodes[list].path.clone(), owner_of(frame, list))
+            (frame.nodes[list].id, owner_of(frame, list))
         };
         // What the compositor scrolled to and shows: the list 10 down.
         let frame = laid_out(&rows(&clicked), &ui, &mut text);
-        let (list, owner) = at(&frame);
-        ui.state.scroll.insert((list, owner), motion::units2((0.0, 10.0)));
+        let (list, _) = at(&frame);
+        ui.state.scroll.insert(list, motion::units2((0.0, 10.0)));
         let scrolled = laid_out(&rows(&clicked), &ui, &mut text);
         let shown = presented(&scrolled, &mut text);
         assert!(
@@ -5533,9 +5555,7 @@ mod tests {
         ui.mouse_down(&folded, &mut text, 30.0, 10.0);
         ui.mouse_up(&folded, 30.0, 10.0);
         assert!(taken(&log).is_empty(), "a node scaled to 0 is hit by nothing");
-        let free = hit(&folded, 30.0, 10.0)
-            .and_then(|i| folded.nodes.get(i))
-            .map(|n| n.path.clone());
+        let free = hit(&folded, 30.0, 10.0).and_then(|i| folded.nodes.get(i)).map(|n| n.id);
         assert_ne!(free, Some(path_at(&doubled, 10.0, 10.0)), "nor by the free hit test");
     }
 
@@ -5657,7 +5677,7 @@ mod tests {
         };
         let shown = laid_out(&field(false, false), &ui, &mut text);
         let target = crate::compositor::HitTarget {
-            key: crate::compositor::NodeKey::of(&path_at(&shown, 10.0, 10.0)),
+            key: crate::compositor::NodeKey::of(path_at(&shown, 10.0, 10.0)),
             owner: None,
         };
         ui.wheel_at(&shown, notched((10.0, 10.0)), (0.0, 40.0), Some(target));
@@ -5704,7 +5724,7 @@ mod tests {
         };
         let shown = laid_out(&page(false), &ui, &mut text);
         let target = crate::compositor::HitTarget {
-            key: crate::compositor::NodeKey::of(&path_at(&shown, 10.0, 10.0)),
+            key: crate::compositor::NodeKey::of(path_at(&shown, 10.0, 10.0)),
             owner: None,
         };
         let now = laid_out(&page(true), &ui, &mut text);
@@ -5742,13 +5762,8 @@ mod tests {
             .into_element()
         };
         let laid = laid_out(&page(false), &ui, &mut text);
-        let list = laid.nodes[keyed(&laid, 2)].path.clone();
-        let offset = |ui: &InputState| {
-            ui.state
-                .scroll
-                .get(&(list.clone(), None))
-                .map_or(0.0, |o| motion::px(o.1))
-        };
+        let list = laid.nodes[keyed(&laid, 2)].id;
+        let offset = |ui: &InputState| ui.state.scroll.get(&list).map_or(0.0, |o| motion::px(o.1));
         let pad = |point: (f32, f32), began: bool| crate::compositor::WheelStep {
             point,
             time: crate::clock::current_nanos(),
@@ -5789,34 +5804,34 @@ mod tests {
                 .into_element()
         };
         let (a, b) = (crate::reactive::Scope::new(), crate::reactive::Scope::new());
-        let first = laid_out(&a.run(|| list("A")), &ui, &mut text);
+        // One retained tree: what replaces a node at its place is another
+        // node, with an id of its own (ADR-0026, "As built (K4e)").
+        let mut tree = crate::layout::LayoutTree::new();
+        let mut motion = crate::motion::Motion::default();
+        let mut lay = |el: &crate::element::Element, ui: &InputState, text: &mut TextSystem| {
+            tree.layout(el, 400.0, 100.0, ui.state(), &mut motion, text).clone()
+        };
+        let first = lay(&made_by(a, || list("A")), &ui, &mut text);
         let i = keyed(&first, 2);
-        let (key, owner_a) = (
-            crate::compositor::NodeKey::of(&first.nodes[i].path),
-            owner_of(&first, i),
-        );
-        let replaced = laid_out(&b.run(|| list("B")), &ui, &mut text);
+        let (id_a, owner_a) = (first.nodes[i].id, owner_of(&first, i));
+        let replaced = lay(&made_by(b, || list("B")), &ui, &mut text);
         let j = keyed(&replaced, 2);
-        let path = replaced.nodes[j].path.clone();
-        let owner_b = owner_of(&replaced, j);
-        assert!(owner_a.is_some() && owner_a != owner_b, "two instances at one path");
-        let delta = |owner| crate::compositor::ScrollDelta {
-            key,
+        let (id_b, owner_b) = (replaced.nodes[j].id, owner_of(&replaced, j));
+        assert!(owner_a.is_some() && owner_a != owner_b, "two instances at one place");
+        assert_ne!(id_a, id_b, "two nodes, two ids");
+        let delta = |id, owner| crate::compositor::ScrollDelta {
+            key: crate::compositor::NodeKey::of(id),
             owner,
             delta: motion::units2((0.0, 30.0)),
             reach: (0.0, 0.0),
             steps: 1,
             ..Default::default()
         };
-        ui.take_scroll(&replaced, &[delta(owner_a)]);
+        ui.take_scroll(&replaced, &[delta(id_a, owner_a)]);
+        assert_eq!(ui.state.scroll.get(&id_b), None, "B took none of A's");
+        ui.take_scroll(&replaced, &[delta(id_b, owner_b)]);
         assert_eq!(
-            ui.state.scroll.get(&(path.clone(), owner_b)),
-            None,
-            "B took none of A's"
-        );
-        ui.take_scroll(&replaced, &[delta(owner_b)]);
-        assert_eq!(
-            ui.state.scroll.get(&(path, owner_b)),
+            ui.state.scroll.get(&id_b),
             Some(&motion::units2((0.0, 30.0))),
             "B's is B's"
         );
@@ -5851,7 +5866,7 @@ mod tests {
             let s = frame.nodes[i].scroll(OUTSIDE).expect("a scroll container");
             assert_eq!(s.offset, (0.0, 0.0), "shown at 0");
             crate::compositor::ScrollDelta {
-                key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+                key: crate::compositor::NodeKey::of(frame.nodes[i].id),
                 owner: owner_of(frame, i),
                 delta: motion::units2((0.0, 30.0)),
                 reach: (0.0, 0.0),
@@ -5886,7 +5901,7 @@ mod tests {
     fn scrolled_from(frame: &Frame, key: u64, dy: f32) -> crate::compositor::ScrollDelta {
         let i = keyed(frame, key);
         crate::compositor::ScrollDelta {
-            key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+            key: crate::compositor::NodeKey::of(frame.nodes[i].id),
             owner: owner_of(frame, i),
             delta: motion::units2((0.0, dy)),
             reach: (0.0, 0.0),
@@ -5917,7 +5932,7 @@ mod tests {
             let s = frame.nodes[i].scroll(OUTSIDE).expect("a field scrolls");
             assert!(s.max.0 > 100.0, "its text runs past its box");
             crate::compositor::ScrollDelta {
-                key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+                key: crate::compositor::NodeKey::of(frame.nodes[i].id),
                 owner: owner_of(frame, i),
                 delta: motion::units2((30.0, 0.0)),
                 reach: (0.0, 0.0),
@@ -6047,7 +6062,7 @@ mod tests {
             .position(|n| laid_scroll(n).is_some())
             .expect("the list");
         let delta = crate::compositor::ScrollDelta {
-            key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+            key: crate::compositor::NodeKey::of(frame.nodes[i].id),
             owner: owner_of(&frame, i),
             delta: motion::units2((0.0, 1.0)),
             reach: (0.0, 0.0),
@@ -6197,7 +6212,7 @@ mod tests {
             .map(|n| (n.bounds(OUTSIDE).x + 10.0, n.bounds(OUTSIDE).y + 10.0))
             .unwrap_or_default();
         let target = crate::compositor::HitTarget {
-            key: crate::compositor::NodeKey::of(&path_at(&frame, at.0, at.1)),
+            key: crate::compositor::NodeKey::of(path_at(&frame, at.0, at.1)),
             owner: None,
         };
         let sample = |k: u64| crate::compositor::WheelStep {
@@ -6260,7 +6275,7 @@ mod tests {
         let laid = laid_out(&page(false), &ui, &mut text);
         let i = keyed(&laid, 2);
         let list = crate::compositor::HitTarget {
-            key: crate::compositor::NodeKey::of(&laid.nodes[i].path),
+            key: crate::compositor::NodeKey::of(laid.nodes[i].id),
             owner: owner_of(&laid, i),
         };
         let pad = |began: bool| crate::compositor::WheelStep {
@@ -6276,9 +6291,9 @@ mod tests {
         };
         ui.wheel_at(&laid, pad(true), (0.0, 30.0), Some(list));
         let modal = laid_out(&page(true), &ui, &mut text);
-        let inner = modal.nodes[keyed(&modal, 3)].path.clone();
+        let inner = modal.nodes[keyed(&modal, 3)].id;
         ui.wheel_at(&modal, pad(false), (0.0, 30.0), Some(list));
-        let offset = ui.state.scroll.get(&(inner, None)).map_or(0.0, |o| motion::px(o.1));
+        let offset = ui.state.scroll.get(&inner).map_or(0.0, |o| motion::px(o.1));
         assert_eq!(offset, 30.0, "the modal's scroller took the gesture on");
     }
 
@@ -6314,13 +6329,8 @@ mod tests {
             .into_element()
         };
         let laid = laid_out(&page(false), &ui, &mut text);
-        let list = laid.nodes[keyed(&laid, 2)].path.clone();
-        let offset = |ui: &InputState| {
-            ui.state
-                .scroll
-                .get(&(list.clone(), None))
-                .map_or(0.0, |o| motion::px(o.1))
-        };
+        let list = laid.nodes[keyed(&laid, 2)].id;
+        let offset = |ui: &InputState| ui.state.scroll.get(&list).map_or(0.0, |o| motion::px(o.1));
         ui.touch(&laid, &mut text, &contact(1, TouchPhase::Started, 50.0, 50.0));
         ui.touch(&laid, &mut text, &contact(1, TouchPhase::Moved, 50.0, 20.0));
         let panned = offset(&ui);
@@ -6359,7 +6369,7 @@ mod tests {
         let shown = laid_out(&column(("A", 1), Some(("B", 2))), &ui, &mut text);
         let a = path_at(&shown, 10.0, 10.0);
         let target = crate::compositor::HitTarget {
-            key: crate::compositor::NodeKey::of(&a),
+            key: crate::compositor::NodeKey::of(a),
             owner: None,
         };
         // The UI's frame now has B above A: the wheel the render thread
@@ -6404,12 +6414,8 @@ mod tests {
         let mut ui = InputState::default();
         crate::clock::script(std::time::Duration::from_secs(10));
         let laid = laid_out(&nested_lists(), &ui, &mut text);
-        let (outer, inner) = (
-            laid.nodes[keyed(&laid, 9)].path.clone(),
-            laid.nodes[keyed(&laid, 3)].path.clone(),
-        );
-        let offset =
-            |ui: &InputState, p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| motion::px(o.1));
+        let (outer, inner) = (laid.nodes[keyed(&laid, 9)].id, laid.nodes[keyed(&laid, 3)].id);
+        let offset = |ui: &InputState, p: &NodeId| ui.state.scroll.get(p).map_or(0.0, |o| motion::px(o.1));
         let wheel = |ui: &mut InputState, text: &mut TextSystem| {
             let frame = laid_out(&nested_lists(), ui, text);
             ui.wheel_at(&frame, notched((20.0, 20.0)), (0.0, 100.0), None);
@@ -6436,12 +6442,8 @@ mod tests {
         let mut ui = InputState::default();
         crate::clock::script(std::time::Duration::from_secs(10));
         let laid = laid_out(&nested_lists(), &ui, &mut text);
-        let (outer, inner) = (
-            laid.nodes[keyed(&laid, 9)].path.clone(),
-            laid.nodes[keyed(&laid, 3)].path.clone(),
-        );
-        let offset =
-            |ui: &InputState, p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| motion::px(o.1));
+        let (outer, inner) = (laid.nodes[keyed(&laid, 9)].id, laid.nodes[keyed(&laid, 3)].id);
+        let offset = |ui: &InputState, p: &NodeId| ui.state.scroll.get(p).map_or(0.0, |o| motion::px(o.1));
         let touch = |ui: &mut InputState, text: &mut TextSystem, ev: TouchEvent| {
             let frame = laid_out(&nested_lists(), ui, text);
             ui.touch(&frame, text, &ev);
@@ -6529,12 +6531,9 @@ mod tests {
         let mut ui = InputState::default();
         crate::clock::script(std::time::Duration::from_secs(10));
         let laid = laid_out(&two_declining_lists(), &ui, &mut text);
-        let (a, b) = (
-            laid.nodes[keyed(&laid, 1)].path.clone(),
-            laid.nodes[keyed(&laid, 2)].path.clone(),
-        );
+        let (a, b) = (laid.nodes[keyed(&laid, 1)].id, laid.nodes[keyed(&laid, 2)].id);
         let offsets = |ui: &InputState| {
-            let of = |p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| motion::px(o.1));
+            let of = |p: &NodeId| ui.state.scroll.get(p).map_or(0.0, |o| motion::px(o.1));
             (of(&a), of(&b))
         };
         let wheel = |ui: &mut InputState, text: &mut TextSystem, step: crate::compositor::WheelStep| {
@@ -6697,6 +6696,16 @@ mod tests {
             .into_element()
     }
 
+    /// `el` as the output of the instance whose scope is `scope`: its root
+    /// marked as a component's (`component::marked`).
+    fn made_by(scope: crate::reactive::Scope, el: impl FnOnce() -> crate::element::Element) -> crate::element::Element {
+        let mut el = scope.run(el);
+        if let Some(c) = el.common_mut() {
+            c.handlers.instance = Some(scope.id().owner_id());
+        }
+        el
+    }
+
     #[test]
     fn a_node_another_instance_made_at_its_path_in_one_rebuild_is_another_node() {
         let log = Log::default();
@@ -6705,8 +6714,8 @@ mod tests {
         // Two owners, as two components of different types at the same
         // place: the second's box has the first's path.
         let (a, b) = (crate::reactive::Scope::new(), crate::reactive::Scope::new());
-        let first = laid_out(&a.run(|| keyed_one(&log, "A")), &ui, &mut text);
-        let replaced = laid_out(&b.run(|| keyed_one(&log, "B")), &ui, &mut text);
+        let first = laid_out(&made_by(a, || keyed_one(&log, "A")), &ui, &mut text);
+        let replaced = laid_out(&made_by(b, || keyed_one(&log, "B")), &ui, &mut text);
         // Pressed on A, released on B, which replaced it in one rebuild:
         // A's drag is cancelled, and B gets no end, nor a click, nor A's.
         ui.mouse_down(&first, &mut text, 20.0, 15.0);
@@ -6928,7 +6937,9 @@ mod tests {
                                 crate::element::div()
                                     .width(100.0)
                                     .height(30.0)
-                                    .on_click(move |_| act.call(()))
+                                    .on_click(move |_| {
+                                        act.call(());
+                                    })
                                     .into_element()
                             }
                         });
@@ -7078,7 +7089,7 @@ mod tests {
         // The UI's frame now: the animation ended, the button at 1x and no
         // longer moving. The frame the press came under showed it at 2x.
         let rested = laid_out(&scaled_button(&log, 1.0), &ui, &mut text);
-        let key = crate::compositor::NodeKey::of(&path_at(&rested, 10.0, 10.0));
+        let key = crate::compositor::NodeKey::of(path_at(&rested, 10.0, 10.0));
         let turned = crate::style::Painted {
             scale: 2.0,
             rotate: 0.0,
@@ -7279,7 +7290,7 @@ mod tests {
         let mut ui = InputState::default();
         let (a, b) = (crate::focus::FocusHandle::new(), crate::focus::FocusHandle::new());
         let frame = laid_out(&column(&log, &[(1, "A", a), (2, "B", b)]), &ui, &mut text);
-        let path_a = frame.nodes[hit(&frame, 10.0, 10.0).expect("A")].path.clone();
+        let path_a = frame.nodes[hit(&frame, 10.0, 10.0).expect("A")].id;
 
         ui.mouse_down(&frame, &mut text, 10.0, 10.0);
         assert_eq!(taken(&log), ["A mouse down", "A Start"]);
@@ -7318,8 +7329,8 @@ mod tests {
     }
 
     /// The path of the node under `(x, y)`.
-    fn path_at(frame: &Frame, x: f32, y: f32) -> NodePath {
-        frame.nodes[hit(frame, x, y).expect("a node")].path.clone()
+    fn path_at(frame: &Frame, x: f32, y: f32) -> NodeId {
+        frame.nodes[hit(frame, x, y).expect("a node")].id
     }
 
     /// A box at 0..100 by 0..40 clicked as "A", and below it at 40..80 a
@@ -7573,15 +7584,17 @@ mod tests {
 
         // The same with the finger's: B goes and comes back while the
         // mouse holds A; only the finger's raw touch and drag are cancelled.
+        // Passes of the same tree: A (made again above) kept throughout.
         let without_b = laid_out(&column(&log, &[(1, "A", a)]), &ui, &mut text);
-        ui.mouse_down(&both, &mut text, 10.0, 10.0);
-        ui.touch(&both, &mut text, &finger(TouchPhase::Started, 10.0, 50.0));
-        ui.touch(&both, &mut text, &finger(TouchPhase::Moved, 60.0, 50.0));
+        let back = laid_out(&column(&log, &[(1, "A", a), (2, "B", b)]), &ui, &mut text);
+        ui.mouse_down(&again, &mut text, 10.0, 10.0);
+        ui.touch(&again, &mut text, &finger(TouchPhase::Started, 10.0, 50.0));
+        ui.touch(&again, &mut text, &finger(TouchPhase::Moved, 60.0, 50.0));
         ui.rehover(&without_b, &mut text);
-        ui.rehover(&both, &mut text);
-        ui.touch(&both, &mut text, &finger(TouchPhase::Moved, 70.0, 50.0));
-        ui.touch(&both, &mut text, &finger(TouchPhase::Ended, 70.0, 50.0));
-        ui.mouse_up(&both, 10.0, 10.0);
+        ui.rehover(&back, &mut text);
+        ui.touch(&back, &mut text, &finger(TouchPhase::Moved, 70.0, 50.0));
+        ui.touch(&back, &mut text, &finger(TouchPhase::Ended, 70.0, 50.0));
+        ui.mouse_up(&back, 10.0, 10.0);
         assert_eq!(
             taken(&log),
             [

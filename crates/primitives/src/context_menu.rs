@@ -55,7 +55,7 @@ pub struct ContextMenu {
 }
 
 /// The world's that made the menu: a check writes none of a live one's.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct AreaState {
     area: WorldCell<Option<Bounds>>,
     by_pointer: WorldCell<bool>,

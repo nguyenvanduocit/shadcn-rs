@@ -9,7 +9,7 @@ use std::fmt;
 use std::time::Duration;
 
 pub use crate::geometry::Bounds;
-use crate::geometry::NodePath;
+use crate::geometry::{NodeId, NodePath};
 use crate::heap::{Heap, ThreadHeap};
 pub use crate::layout::Stats as LayoutStats;
 use crate::layout::{Content, FrameNode};
@@ -83,17 +83,18 @@ impl Change {
     }
 }
 
-/// One changed node: where it is, what it is, and how it changed. It holds
-/// nothing on the heap (its path is shared), so a frame's report says what
-/// changed without allocating.
+/// One changed node: which node it is, what it is, and how it changed. It
+/// holds nothing on the heap, so a frame's report says what changed without
+/// allocating; [`Frame::path_of`](crate::layout::Frame::path_of) finds where
+/// the node is.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeChange {
-    pub path: NodePath,
+    pub id: NodeId,
     pub what: What,
     pub change: Change,
 }
 
-/// Every node that differs between two frames, matched by [`NodePath`].
+/// Every node that differs between two frames, matched by [`NodeId`].
 #[derive(Debug, Default, PartialEq)]
 pub struct LayoutDiff {
     pub changes: Vec<NodeChange>,
@@ -165,7 +166,7 @@ impl fmt::Display for LayoutDiff {
             write!(f, " (largest shift {:.0}px)", self.largest_shift())?;
         }
         for c in self.changes.iter() {
-            write!(f, "\n  {} {:<14} {:<28} ", sign(&c.change), c.path.to_string(), c.what)?;
+            write!(f, "\n  {} {:<14} {:<28} ", sign(&c.change), c.id.to_string(), c.what)?;
             match &c.change {
                 Change::Added { after } => write!(f, "{after}")?,
                 Change::Removed { before } => write!(f, "was {before}")?,
@@ -206,14 +207,15 @@ fn sign(change: &Change) -> char {
 }
 
 /// Compare two frames node by node. A node is the same node in both frames
-/// when it has the same [`NodePath`], so a keyed list keeps its items matched
-/// when they reorder and an unkeyed list matches by position.
+/// when it has the same [`NodeId`]: a node keeps its id while the tree
+/// keeps it, through a keyed move (ADR-0026, "Node identity"), and a cold
+/// build gives a node the id of the live node it stands for.
 #[must_use]
 pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
     // Both lists are in tree order: what lines up at the front and at the
     // back is the same node, compared without a lookup; only the middle,
-    // where nodes came and went, is matched by path.
-    let same = |(b, a): (&FrameNode, &FrameNode)| b.path == a.path;
+    // where nodes came and went, is matched by id.
+    let same = |(b, a): (&FrameNode, &FrameNode)| b.id == a.id;
     let front = before.iter().zip(after).take_while(|&p| same(p)).count();
     let (before_rest, after_rest) = (before.get(front..).unwrap_or(&[]), after.get(front..).unwrap_or(&[]));
     let back = before_rest
@@ -231,7 +233,7 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
     let mut push = |now: &FrameNode, change: Option<Change>| {
         if let Some(change) = change {
             changes.push(NodeChange {
-                path: now.path.clone(),
+                id: now.id,
                 what: What::of(now),
                 change,
             });
@@ -247,17 +249,16 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
         after.get(..front).unwrap_or(&[]),
         &mut push,
     );
-    let old: HashMap<&NodePath, (usize, &FrameNode)> =
-        old_mid.iter().enumerate().map(|(i, r)| (&r.path, (i, r))).collect();
-    let mut seen: HashSet<&NodePath> = HashSet::with_capacity(new_mid.len());
+    let old: HashMap<NodeId, (usize, &FrameNode)> = old_mid.iter().enumerate().map(|(i, r)| (r.id, (i, r))).collect();
+    let mut seen: HashSet<NodeId> = HashSet::with_capacity(new_mid.len());
     // Where each node that stayed was, in the order they are now: those off
     // its longest increasing run changed places with the rest (paint and
     // hit testing go in this order), reported unless another change of
     // theirs already is (a node is reported once).
     let mut stayed: Vec<(usize, &FrameNode, bool)> = Vec::new();
     for now in new_mid {
-        seen.insert(&now.path);
-        let change = match old.get(&now.path) {
+        seen.insert(now.id);
+        let change = match old.get(&now.id) {
             None => Some(Change::Added {
                 after: now.bounds(SIGHT),
             }),
@@ -269,12 +270,13 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
         };
         push(now, change);
     }
-    // Order is among siblings: each parent's children that stayed (a path
-    // keeps its parent's, so they had the same one before), in the order
+    // Order is among siblings: each parent's children that stayed (a node
+    // moved to another parent is another node, so they had the same one
+    // before), in the order
     // they are now, against the order they were in.
-    let mut siblings: HashMap<(usize, Option<&NodePath>), Vec<usize>> = HashMap::new();
+    let mut siblings: HashMap<(usize, Option<NodeId>), Vec<usize>> = HashMap::new();
     for (k, &(_, now, _)) in stayed.iter().enumerate() {
-        let parent = now.parent.and_then(|p| after.get(p)).map(|p| &p.path);
+        let parent = now.parent.and_then(|p| after.get(p)).map(|p| p.id);
         siblings.entry((now.layer, parent)).or_default().push(k);
     }
     let mut moved_among = Vec::new();
@@ -304,7 +306,7 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
         after_rest.get(cut(after_rest)..).unwrap_or(&[]),
         &mut push,
     );
-    for was in old_mid.iter().filter(|r| !seen.contains(&r.path)) {
+    for was in old_mid.iter().filter(|r| !seen.contains(&r.id)) {
         push(
             was,
             Some(Change::Removed {
@@ -405,7 +407,7 @@ pub(crate) fn logged(
         };
         if repainted || moved(&now.bounds(SIGHT), &before) || resized(&now.bounds(SIGHT), &before) {
             out.push(NodeChange {
-                path: now.path.clone(),
+                id: now.id,
                 what: What::of(now),
                 change: Change::Updated {
                     before,
@@ -559,8 +561,16 @@ impl fmt::Debug for Snippet {
 #[must_use]
 pub fn dump(nodes: &[FrameNode]) -> String {
     let mut out = String::new();
+    // A node's path is derived from its parent's (ADR-0026: paths are not
+    // stored); a parent comes before its children in tree order.
+    let mut paths: Vec<(usize, String)> = Vec::with_capacity(nodes.len());
     for r in nodes {
-        let indent = "  ".repeat(r.path.depth());
+        let seg = NodePath::new(vec![r.seg].into()).to_string();
+        let (depth, path) = match r.parent.and_then(|p| paths.get(p)) {
+            Some((d, p)) => (d.saturating_add(1), format!("{p}/{seg}")),
+            None => (0, seg),
+        };
+        let indent = "  ".repeat(depth);
         let detail = match &r.content {
             Content::Text { text, .. } => format!("  {}px w{} {}", text.size, text.weight, text.color),
             _ => String::new(),
@@ -572,10 +582,11 @@ pub fn dump(nodes: &[FrameNode]) -> String {
         };
         out.push_str(&format!(
             "{indent}{:<12} {} {}{detail}{layer}\n",
-            r.path.to_string(),
+            path,
             describe(r),
             r.bounds(SIGHT)
         ));
+        paths.push((depth, path));
     }
     out
 }
@@ -772,6 +783,10 @@ pub struct FrameReport {
     /// Signals written in a phase after an earlier phase of the frame read
     /// them (ADR-0013's debug check; debug builds).
     pub late: Vec<crate::reactive::LateWrite>,
+    /// Keys a control node's commit found duplicated this frame (ADR-0026),
+    /// in every build: each reported once while it stays duplicated, at
+    /// most 64 a frame ([`crate::component::take_duplicate_keys`]).
+    pub duplicate_keys: Vec<crate::component::DuplicateKey>,
     /// What the renderer drew and uploaded.
     pub drawn: crate::scene::Drawn,
     pub footprint: Footprint,
@@ -882,6 +897,9 @@ impl fmt::Display for FrameReport {
         writeln!(f, "  paint    {}  gpu {}", self.paint, self.drawn)?;
         for late in &self.late {
             writeln!(f, "  LATE     {late}")?;
+        }
+        for dup in &self.duplicate_keys {
+            writeln!(f, "  DUP KEY  {dup}")?;
         }
         write!(f, "  holds    {}", self.footprint)
     }
@@ -1015,7 +1033,7 @@ pub fn ms(d: Duration) -> String {
 mod tests {
     use super::*;
     use crate::element::{Element, IntoElement, div, text};
-    use crate::layout::{UiState, layout};
+    use crate::layout::{LayoutTree, UiState};
     use crate::styled::Styled;
     use crate::text::TextSystem;
 
@@ -1023,17 +1041,28 @@ mod tests {
         div().key(key).height(40.0).child(text(label)).into_element()
     }
 
+    crate::engine::engine_local! {
+        /// The test's window tree: each test runs on a thread of its own,
+        /// so its frames are passes of one retained tree, whose nodes keep
+        /// their ids from frame to frame (ADR-0026, "Node identity").
+        [Fresh] static TREE: std::cell::RefCell<Option<Box<LayoutTree>>> = const { std::cell::RefCell::new(None) };
+    }
+
     fn frame(cards: Vec<Element>) -> Vec<FrameNode> {
         let mut ts = TextSystem::new();
-        layout(
-            &div().children(cards).into_element(),
-            400.0,
-            400.0,
-            &UiState::default(),
-            &mut crate::motion::Motion::default(),
-            &mut ts,
-        )
-        .nodes
+        TREE.with_borrow_mut(|t| {
+            t.get_or_insert_with(Box::default)
+                .layout(
+                    &div().children(cards).into_element(),
+                    400.0,
+                    400.0,
+                    &UiState::default(),
+                    &mut crate::motion::Motion::default(),
+                    &mut ts,
+                )
+                .nodes
+                .clone()
+        })
     }
 
     #[test]

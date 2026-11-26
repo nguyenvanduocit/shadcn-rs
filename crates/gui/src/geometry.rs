@@ -123,6 +123,209 @@ impl fmt::Display for Bounds {
     }
 }
 
+/// Which allocator made a [`NodeId`] (ADR-0026, "Node identity").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Domain {
+    /// A node of the window's retained tree.
+    Live,
+    /// A node a detached tree (a cold check's, a fork's) built with no live
+    /// node to stand for.
+    Cold,
+    /// What the engine publishes that is no retained node (an
+    /// accessibility text run).
+    Synthetic,
+}
+
+/// A retained node's identity (ADR-0026, "Node identity"): issued when the
+/// node is built, kept while it is patched (through a keyed move, while it
+/// is hidden), never naming another node. Its 64 bits are what is
+/// published (AccessKit, the compositor's [`crate::compositor::NodeKey`]):
+/// domain 2 | slot 30 | generation 32. Generations start at 1, so no id is
+/// zero, and [`NodeId::default`] names nothing.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeId(u64);
+
+/// Slots a domain holds.
+const SLOTS: u32 = 1 << 30;
+
+impl NodeId {
+    fn new(domain: Domain, slot: u32, generation: u32) -> Self {
+        let d: u64 = match domain {
+            Domain::Live => 0,
+            Domain::Cold => 1,
+            Domain::Synthetic => 2,
+        };
+        Self((d << 62) | (u64::from(slot & (SLOTS - 1)) << 32) | u64::from(generation))
+    }
+
+    /// The id published as `bits`: `None` for bits no allocator makes.
+    #[must_use]
+    pub fn from_published(bits: u64) -> Option<Self> {
+        let id = Self(bits);
+        (bits >> 62 != 3 && id.generation() != 0).then_some(id)
+    }
+
+    /// What is published: the whole id.
+    #[must_use]
+    pub fn published(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub fn domain(self) -> Domain {
+        match self.0 >> 62 {
+            0 => Domain::Live,
+            1 => Domain::Cold,
+            _ => Domain::Synthetic,
+        }
+    }
+
+    #[must_use]
+    pub fn slot(self) -> u32 {
+        u32::try_from((self.0 >> 32) & u64::from(SLOTS - 1)).unwrap_or(0)
+    }
+
+    #[must_use]
+    pub fn generation(self) -> u32 {
+        u32::try_from(self.0 & u64::from(u32::MAX)).unwrap_or(0)
+    }
+
+    /// A live id of slot `slot` (tests).
+    #[cfg(test)]
+    pub(crate) fn live(slot: u32) -> Self {
+        Self::new(Domain::Live, slot, 1)
+    }
+
+    /// Whether it names a node at all (not [`NodeId::default`]).
+    #[must_use]
+    pub fn is_some(self) -> bool {
+        self.generation() != 0
+    }
+}
+
+impl fmt::Debug for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let d = match self.domain() {
+            Domain::Live => "n",
+            Domain::Cold => "c",
+            Domain::Synthetic => "s",
+        };
+        write!(f, "{d}{}.{}", self.slot(), self.generation())
+    }
+}
+
+impl fmt::Display for NodeId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
+
+/// An allocator of [`NodeId`]s in one domain: a slot freed is reused with
+/// its generation one higher, so a stale id never names the node now in
+/// its slot; a slot whose generation would overflow is retired, never
+/// reused (ADR-0026, "Generations").
+#[derive(Debug)]
+pub(crate) struct Ids {
+    domain: Domain,
+    /// Each slot's current generation.
+    generations: Vec<u32>,
+    free: Vec<u32>,
+    /// Slots retired at the last generation.
+    retired: u64,
+    /// Ids freed so far.
+    freed: u64,
+}
+
+impl Ids {
+    pub(crate) fn new(domain: Domain) -> Self {
+        Self {
+            domain,
+            generations: Vec::new(),
+            free: Vec::new(),
+            retired: 0,
+            freed: 0,
+        }
+    }
+
+    /// Ids freed so far.
+    pub(crate) fn freed(&self) -> u64 {
+        self.freed
+    }
+
+    /// A new id.
+    pub(crate) fn mint(&mut self) -> NodeId {
+        if let Some(slot) = self.free.pop() {
+            let g = usize::try_from(slot)
+                .ok()
+                .and_then(|s| self.generations.get(s))
+                .copied()
+                .unwrap_or(1);
+            return NodeId::new(self.domain, slot, g);
+        }
+        let slot = u32::try_from(self.generations.len()).unwrap_or(u32::MAX);
+        debug_assert!(slot < SLOTS, "a domain holds at most 2^30 slots");
+        self.generations.push(1);
+        NodeId::new(self.domain, slot, 1)
+    }
+
+    /// Whether `id` is one of its own, not yet freed.
+    pub(crate) fn holds(&self, id: NodeId) -> bool {
+        id.domain() == self.domain
+            && usize::try_from(id.slot())
+                .ok()
+                .and_then(|s| self.generations.get(s))
+                .is_some_and(|&g| g == id.generation())
+    }
+
+    /// Let `id` go: its slot is reused with the next generation. Not its
+    /// own (another domain's, an id freed already) is left alone.
+    pub(crate) fn free(&mut self, id: NodeId) {
+        if !self.holds(id) {
+            return;
+        }
+        let Some(g) = usize::try_from(id.slot())
+            .ok()
+            .and_then(|s| self.generations.get_mut(s))
+        else {
+            return;
+        };
+        self.freed = self.freed.wrapping_add(1);
+        match g.checked_add(1) {
+            Some(next) => {
+                *g = next;
+                self.free.push(id.slot());
+            }
+            None => {
+                // Retired: its generation stays past every id it made.
+                *g = 0;
+                self.retired = self.retired.saturating_add(1);
+            }
+        }
+    }
+
+    /// Slots retired for good.
+    pub(crate) fn retired(&self) -> u64 {
+        self.retired
+    }
+
+    /// Ids held now.
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.generations
+            .len()
+            .saturating_sub(self.free.len())
+            .saturating_sub(usize::try_from(self.retired).unwrap_or(usize::MAX))
+    }
+
+    /// Set a slot's generation (tests: overflow).
+    #[cfg(test)]
+    pub(crate) fn set_generation(&mut self, slot: u32, g: u32) {
+        if let Some(s) = usize::try_from(slot).ok().and_then(|s| self.generations.get_mut(s)) {
+            *s = g;
+        }
+    }
+}
+
 /// One step of a [`NodePath`]: a child's position among its siblings, or its
 /// key when it has one; the root of a keyed component's output is placed by
 /// the component's key, with its own key if it has one (a segment no

@@ -252,11 +252,7 @@ fn a_rotation_by_one_is_one_move_that_keeps_identity() {
     assert_eq!(shown, (0..10).collect::<Vec<_>>());
     // Key 0, first before, is the last row now: it is 40 tall (its key),
     // the rest as their keys say.
-    let last = s
-        .last()
-        .nodes
-        .iter()
-        .find(|n| n.path.0.last().and_then(|p| p.element_key()) == Some(0));
+    let last = s.last().nodes.iter().find(|n| n.seg.element_key() == Some(0));
     assert!(last.is_some_and(|n| n.bounds(OUTSIDE).height == 40.0 && n.bounds(OUTSIDE).y > 200.0));
 }
 
@@ -306,13 +302,13 @@ fn rows_recycled_near_the_end_of_ten_million_are_one_key_for_bounds_paint_hit_an
     s.hover(100.0, 200.0);
     // Each step's accessibility id of each row built, by key: a row kept
     // from one step to the next keeps its id, and no id is two keys'.
-    let ids = |s: &Scenario| -> HashMap<ElementKey, crate::geometry::NodePath> {
+    let ids = |s: &Scenario| -> HashMap<ElementKey, crate::geometry::NodeId> {
         s.last()
             .nodes
             .iter()
             .filter_map(|n| {
-                let k = n.path.0.last().and_then(|p| p.element_key())?;
-                matches!(n.path.0.last(), Some(crate::geometry::PathSeg::Component(..))).then(|| (k, n.path.clone()))
+                let k = n.seg.element_key()?;
+                matches!(n.seg, crate::geometry::PathSeg::Component(..)).then_some((k, n.id))
             })
             .collect()
     };
@@ -326,12 +322,12 @@ fn rows_recycled_near_the_end_of_ten_million_are_one_key_for_bounds_paint_hit_an
         for (k, path) in &now {
             if let Some(before) = was.get(k) {
                 assert_eq!(
-                    crate::access::id_of(before),
-                    crate::access::id_of(path),
+                    crate::access::id_of(*before),
+                    crate::access::id_of(*path),
                     "row {k} kept its id"
                 );
             }
-            let key = every.entry(crate::access::id_of(path)).or_insert(*k);
+            let key = every.entry(crate::access::id_of(*path)).or_insert(*k);
             assert_eq!(*key, *k, "an id names one key");
         }
         was = now;
@@ -355,14 +351,10 @@ fn rows_recycled_near_the_end_of_ten_million_are_one_key_for_bounds_paint_hit_an
         // The row node: the text's ancestor keyed as a row of the list.
         let wrapper = frame
             .ancestors(i)
-            .find(|&a| frame.nodes[a].path.0.last().and_then(|p| p.element_key()).is_some())
+            .find(|&a| frame.nodes[a].seg.element_key().is_some())
             .unwrap();
         let w = &frame.nodes[wrapper];
-        assert_eq!(
-            w.path.0.last().and_then(|p| p.element_key()),
-            Some(row),
-            "its box is its key's"
-        );
+        assert_eq!(w.seg.element_key(), Some(row), "its box is its key's");
         let b = n.bounds(OUTSIDE);
         let wb = w.bounds(OUTSIDE);
         assert!(
@@ -379,7 +371,7 @@ fn rows_recycled_near_the_end_of_ten_million_are_one_key_for_bounds_paint_hit_an
             );
         }
         // Its accessibility node is its row of the data.
-        let id = crate::access::id_of(&w.path);
+        let id = crate::access::id_of(w.id);
         let node = access.get(&id).unwrap();
         assert_eq!(node.role(), AccessRole::ListItem);
         assert_eq!(
@@ -574,4 +566,458 @@ fn a_row_focused_then_scrolled_away_at_once_keeps_focus() {
     assert!(state.anchor().row >= 5_000, "the window moved");
     assert_eq!(s.read(crate::focus::focused), Some(focus.id()), "row 3 keeps focus");
     assert_eq!(state.focused_row(), Some(3), "kept built, pinned");
+}
+
+// ── Round 1 (review K4c r1): plan inputs behind the version ─────────────────
+
+/// Focus handles of a focusable list's rows, by the row of the data each
+/// was mounted at (`index_untracked`, so equal keys are told apart).
+type Handles = Rc<RefCell<HashMap<u64, crate::FocusHandle>>>;
+
+/// A list of `rows()` rows keyed `key(i)`, 24 tall each, each row focusable
+/// with its handle kept in `handles` by its row when mounted.
+fn focusable(
+    state: ListState,
+    rows: Signal<u64>,
+    key: impl Fn(u64) -> ElementKey + Clone + 'static,
+    handles: &Handles,
+) -> impl Fn() -> Element + 'static {
+    let handles = Rc::clone(handles);
+    move || {
+        let h = Rc::clone(&handles);
+        div()
+            .width(300.0)
+            .child(
+                virtual_each(
+                    &state,
+                    move || rows.get(),
+                    key.clone(),
+                    move |r| {
+                        let focus = crate::FocusHandle::new();
+                        h.borrow_mut().insert(r.index_untracked(), focus);
+                        div()
+                            .height(24.0)
+                            .track_focus(focus)
+                            .child(text_bound(move || format!("row {}", r.index())))
+                    },
+                )
+                .height(400.0),
+            )
+            .into_element()
+    }
+}
+
+/// The duplicate keys the frames rendered since the last call told.
+fn duplicates(s: &mut Scenario) -> Vec<crate::component::DuplicateKey> {
+    s.take_reports().into_iter().flat_map(|r| r.duplicate_keys).collect()
+}
+
+fn handle(handles: &Handles, row: u64) -> crate::FocusHandle {
+    handles.borrow().get(&row).copied().unwrap()
+}
+
+/// Opus 1: an identity reorder of a list followed at its end resets the
+/// rows built, and the source gives the plan it gave before. That plan is
+/// taken in again, so the focused row pinned outside the window stays.
+#[test]
+fn identity_reorder_at_followed_end_keeps_pinned_focus() {
+    for at_end in [false, true] {
+        let state = ListState::new(24.0);
+        let handles = Handles::default();
+        let mut s = scenario(focusable(state, Signal::new(1_000), |i| i, &handles));
+        let focus = handle(&handles, 3);
+        s.act("focus row 3", || focus.focus());
+        s.settle().unwrap();
+        s.act("away", || {
+            if at_end {
+                state.follow_tail(true);
+                state.scroll_to_end();
+            } else {
+                state.scroll_to_row(500);
+            }
+        });
+        s.settle().unwrap();
+        assert_eq!(state.pinned(), [3], "at_end={at_end}");
+        s.act("identity reorder", || assert!(state.reorder(1_000, Some)));
+        s.settle().unwrap();
+        assert_eq!(
+            s.read(crate::focus::focused),
+            Some(focus.id()),
+            "at_end={at_end}: focus kept"
+        );
+        assert_eq!(state.focused_row(), Some(3), "at_end={at_end}");
+        assert_eq!(state.pinned(), [3], "at_end={at_end}");
+    }
+}
+
+/// Opus 2: a row at the window's edge gains focus; the rows kept around it
+/// that lie outside the window are pinned with it.
+#[test]
+fn focus_at_window_edge_with_neighbours() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let mut s = scenario(focusable(state, Signal::new(MILLIONS), |i| i, &handles));
+    s.act("around 2, far away", || {
+        state.keep_around_focus(2);
+        state.scroll_to_row(5_000);
+    });
+    s.settle().unwrap();
+    let first = state.window().start;
+    assert!(first > 4_000, "{first}");
+    let focus = handle(&handles, first);
+    s.act("focus the window's first row", || focus.focus());
+    s.settle().unwrap();
+    assert_eq!(state.focused_row(), Some(first));
+    assert_eq!(state.pinned(), [first - 2, first - 1]);
+}
+
+/// Codex 1: rows spliced in far above a focused row pinned outside the
+/// window: it follows its key to its new row and stays pinned and focused.
+#[test]
+fn pinned_focus_large_splice() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let shift = Signal::new(0_u64);
+    let count = Signal::new(10_000_u64);
+    let key = move |i: u64| i.wrapping_sub(shift.get());
+    let mut s = scenario(focusable(state, count, key, &handles));
+    let focus = handle(&handles, 3);
+    s.act("focus key 3 and jump", || {
+        focus.focus();
+        state.scroll_to_row(5_000);
+    });
+    s.settle().unwrap();
+    assert_eq!(state.pinned(), [3]);
+    s.act("insert 1 000 rows at the start", || {
+        state.splice(0, 0, 1_000);
+        shift.set(1_000);
+        count.set(11_000);
+    });
+    s.settle().unwrap();
+    assert_eq!(state.anchor().row, 6_000);
+    assert_eq!(state.focused_row(), Some(1_003));
+    assert_eq!(state.pinned(), [1_003]);
+    assert_eq!(s.read(crate::focus::focused), Some(focus.id()));
+}
+
+/// Codex 2: the active row set alone, nothing else changed, is built.
+#[test]
+fn changing_active_alone() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let mut s = scenario(focusable(state, Signal::new(10_000), |i| i, &handles));
+    s.act("active 900", || state.set_active(Some(900)));
+    s.settle().unwrap();
+    assert_eq!(state.pinned(), [900]);
+    s.act("none active", || state.set_active(None));
+    s.settle().unwrap();
+    assert!(state.pinned().is_empty());
+}
+
+/// Codex 3: rows 3 and 4 share a key; focus on row 4 is row 4's, not the
+/// first row with its key.
+#[test]
+fn duplicate_inside_window_focus() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let key = |i: u64| if i == 4 { 3 } else { i };
+    let mut s = scenario(focusable(state, Signal::new(1_000), key, &handles));
+    let reported = duplicates(&mut s);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    let focus = handle(&handles, 4);
+    s.act("focus row 4", || focus.focus());
+    s.settle().unwrap();
+    assert_eq!(state.focused_row(), Some(4));
+    // Laid out again with both rows in the window: still row 4.
+    s.hover(100.0, 200.0);
+    s.wheel(10.0);
+    s.settle().unwrap();
+    assert_eq!(state.focused_row(), Some(4));
+    assert_eq!(s.read(crate::focus::focused), Some(focus.id()));
+}
+
+/// Codex 4: the last of 10 000 rows repeats key 9 998, far outside the
+/// window: a debug build tells it once, from the whole source.
+#[cfg(debug_assertions)]
+#[test]
+fn duplicate_outside_window() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let key = |i: u64| if i == 9_999 { 9_998 } else { i };
+    let mut s = scenario(focusable(state, Signal::new(10_000), key, &handles));
+    let reported = duplicates(&mut s);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported.first().map(|d| (d.key.as_str(), d.count)), Some(("9998", 2)));
+    s.act("scroll", || state.scroll_to_row(300));
+    s.settle().unwrap();
+    let again = duplicates(&mut s);
+    assert!(again.is_empty(), "told once per row count: {again:?}");
+}
+
+/// The referee: a pin input written past its setter (the version never
+/// hears of it) is caught by the layout hook's check, not left to drop a
+/// row later.
+#[cfg(debug_assertions)]
+#[test]
+fn a_pin_input_written_untold_is_caught_at_layout() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let mut s = scenario(focusable(state, Signal::new(10_000), |i| i, &handles));
+    s.act("active 900", || state.set_active(Some(900)));
+    s.settle().unwrap();
+    assert_eq!(state.pinned(), [900]);
+    s.act("active 950, untold", || {
+        state.write(|st| st.pins.set_active_untold(Some(950)));
+    });
+    s.hover(100.0, 200.0);
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        s.wheel(10.0);
+        s.settle()
+    }));
+    let message = match caught {
+        Err(p) => p
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|m| (*m).to_owned()))
+            .unwrap_or_default(),
+        Ok(r) => format!("{:?}", r.err()),
+    };
+    assert!(message.contains("without bumping its version"), "{message}");
+}
+
+/// Kept Codex r2: the last of 10 000 keys changed in place, the row count
+/// the same, to repeat its neighbour's: told once (D033: the check reads
+/// every key tracked).
+#[cfg(debug_assertions)]
+#[test]
+fn a_key_changed_in_place_to_a_duplicate_is_told() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let last = Signal::new(9_999_u64);
+    let key = move |i: u64| if i == 9_999 { last.get() } else { i };
+    let mut s = scenario(focusable(state, Signal::new(10_000), key, &handles));
+    assert!(duplicates(&mut s).is_empty());
+    s.act("key 9999 becomes 9998", || last.set(9_998));
+    s.settle().unwrap();
+    let reported = duplicates(&mut s);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert_eq!(reported.first().map(|d| (d.key.as_str(), d.count)), Some(("9998", 2)));
+}
+
+/// Fresh Codex r2 3: a same-length splice past the window replaces the
+/// last row with one keyed as its neighbour: told once.
+#[cfg(debug_assertions)]
+#[test]
+fn same_length_offscreen_splice() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let last = Signal::new(999_u64);
+    let key = move |i: u64| if i == 999 { last.get() } else { i };
+    let mut s = scenario(focusable(state, Signal::new(1_000), key, &handles));
+    assert!(duplicates(&mut s).is_empty());
+    s.act("replace the last row", || {
+        state.splice(999, 1, 1);
+        last.set(998);
+    });
+    s.settle().unwrap();
+    let reported = duplicates(&mut s);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+}
+
+/// The whole-source check reads every key once per change of what it
+/// read, in a debug build alone; a scroll reads the window's keys only.
+#[test]
+fn the_key_check_runs_in_debug_alone_and_never_on_scroll() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let calls = Rc::new(Cell::new(0_u64));
+    let c = Rc::clone(&calls);
+    let key = move |i: u64| {
+        c.set(c.get().saturating_add(1));
+        i
+    };
+    let mut s = scenario(focusable(state, Signal::new(10_000), key, &handles));
+    assert_eq!(
+        calls.get() >= 10_000,
+        cfg!(debug_assertions),
+        "keys read at mount: {}",
+        calls.get()
+    );
+    calls.set(0);
+    s.act("scroll", || state.scroll_to_row(5_000));
+    s.settle().unwrap();
+    assert!(calls.get() < 2_000, "keys read by a scroll: {}", calls.get());
+}
+
+/// A source over the check's cap is told once as not checked whole.
+#[cfg(debug_assertions)]
+#[test]
+fn a_source_over_the_key_check_cap_is_told_once() {
+    let state = ListState::new(24.0);
+    let handles = Handles::default();
+    let rows = (1_u64 << 20) + 1;
+    let mut s = scenario(focusable(state, Signal::new(rows), |i| i, &handles));
+    let reported = duplicates(&mut s);
+    assert_eq!(reported.len(), 1, "{reported:?}");
+    assert!(
+        reported
+            .first()
+            .is_some_and(|d| d.count == 0 && d.key.starts_with("not checked")),
+        "{reported:?}"
+    );
+    s.act("scroll", || state.scroll_to_row(5_000));
+    s.settle().unwrap();
+    assert!(duplicates(&mut s).is_empty());
+}
+
+/// Fresh Codex r2 1: a list's layout callback sets a sibling list's active
+/// row through its setter, mid-pass: legal, the sibling builds it next, and
+/// the referee does not take the plan built before as stale.
+#[test]
+fn sibling_layout_updates_pin() {
+    let (first, second) = (ListState::new(24.0), ListState::new(24.0));
+    let rows = |r: ListRow| {
+        div()
+            .height(24.0)
+            .child(text_bound(move || format!("row {}", r.index())))
+    };
+    let mut s = scenario(move || {
+        div()
+            .width(300.0)
+            .child(virtual_each(&first, || 1_000, |i| i, rows).height(200.0))
+            .child(virtual_each(&second, || 1_000, |i| i, rows).height(200.0))
+            .into_element()
+    });
+    let once = Cell::new(false);
+    first.on_layout(move |_| {
+        if once.replace(true) {
+            return false;
+        }
+        second.set_active(Some(900));
+        true
+    });
+    s.hover(100.0, 100.0);
+    s.wheel(8.0);
+    s.settle().unwrap();
+    s.settle().unwrap();
+    assert_eq!(second.pinned(), [900]);
+}
+
+/// Two 1 000-row lists in one page, 200 tall each.
+fn two_lists(first: ListState, second: ListState) -> impl Fn() -> Element + 'static {
+    let rows = |r: ListRow| {
+        div()
+            .height(24.0)
+            .child(text_bound(move || format!("row {}", r.index())))
+    };
+    move || {
+        div()
+            .width(300.0)
+            .child(virtual_each(&first, || 1_000, |i| i, rows).height(200.0))
+            .child(virtual_each(&second, || 1_000, |i| i, rows).height(200.0))
+            .into_element()
+    }
+}
+
+/// Codex r4 1: a list's layout callback writes the signal a sibling's
+/// active row is read from, mid-pass: the sibling's source tracks it and
+/// runs again; the referee does not take the plan built before as stale.
+/// In an act, the same write is the control.
+#[test]
+fn sibling_layout_changes_active_from_signal() {
+    for mid_pass in [false, true] {
+        let (first, second) = (ListState::new(24.0), ListState::new(24.0));
+        let act = Signal::new(None::<u64>);
+        second.active_from(move || act.get());
+        let mut s = scenario(two_lists(first, second));
+        if mid_pass {
+            let once = Cell::new(false);
+            first.on_layout(move |_| {
+                if once.replace(true) {
+                    return false;
+                }
+                act.set(Some(900));
+                true
+            });
+        } else {
+            s.act("active 900", || act.set(Some(900)));
+        }
+        s.hover(100.0, 100.0);
+        s.wheel(8.0);
+        s.settle().unwrap();
+        s.settle().unwrap();
+        assert_eq!(second.pinned(), [900], "mid_pass={mid_pass}");
+    }
+}
+
+/// Codex r4 2: the whole-source key check of a list whose state was
+/// disposed does nothing when its keys change (no plan worked out from a
+/// state that is gone). The check alone: a list left mounted on a disposed
+/// state is its owner's bug, apart from this.
+#[cfg(debug_assertions)]
+#[test]
+fn disposed_state_then_duplicate_key() {
+    let state = ListState::new(24.0);
+    let dup = Signal::new(false);
+    let key: Rc<dyn Fn(u64) -> ElementKey> = Rc::new(move |i| if i == 99 && dup.get() { 98 } else { i });
+    super::check_keys(state, Rc::new(|| 100), key, std::panic::Location::caller());
+    assert!(crate::component::take_duplicate_keys().is_empty());
+    state.dispose();
+    dup.set(true);
+    assert!(crate::component::take_duplicate_keys().is_empty());
+}
+
+/// What drops the rows built by place while focus may be newer than the
+/// last layout (fresh Codex r2 2).
+#[derive(Clone, Copy, Debug)]
+enum Discard {
+    /// One row inserted at the start.
+    Splice,
+    /// The rows reversed.
+    Reorder,
+}
+
+/// Focus moved to row 3 in the same turn as `discard` and a jump away: the
+/// row holding focus is found where it is now, before the rows built are
+/// dropped, and followed through.
+#[test]
+fn focus_then_discard_in_one_turn() {
+    for discard in [Discard::Splice, Discard::Reorder] {
+        let state = ListState::new(24.0);
+        let handles = Handles::default();
+        let (shift, reversed) = (Signal::new(0_u64), Signal::new(false));
+        let count = Signal::new(10_000_u64);
+        let key = move |i: u64| {
+            if reversed.get() {
+                9_999_u64.wrapping_sub(i)
+            } else {
+                i.wrapping_sub(shift.get())
+            }
+        };
+        let mut s = scenario(focusable(state, count, key, &handles));
+        let focus = handle(&handles, 3);
+        let expected = match discard {
+            Discard::Splice => 4,
+            Discard::Reorder => 9_996,
+        };
+        s.act("focus, discard, jump", || {
+            focus.focus();
+            match discard {
+                Discard::Splice => {
+                    state.splice(0, 0, 1);
+                    shift.set(1);
+                    count.set(10_001);
+                }
+                Discard::Reorder => {
+                    assert!(state.reorder(10_000, |p| Some(9_999 - p)));
+                    reversed.set(true);
+                }
+            }
+            state.scroll_to_row(5_000);
+        });
+        s.settle().unwrap();
+        assert_eq!(state.focused_row(), Some(expected), "{discard:?}");
+        assert_eq!(state.pinned(), [expected], "{discard:?}");
+        assert_eq!(s.read(crate::focus::focused), Some(focus.id()), "{discard:?}");
+    }
 }

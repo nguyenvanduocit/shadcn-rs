@@ -736,7 +736,7 @@ pub fn column(s: &SeriesSnapshot, sum: Summary) -> Column {
 }
 
 /// A series as its owner holds it (the UI thread): its pages, what it keeps.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SeriesState {
     id: u64,
     version: u64,

@@ -629,7 +629,7 @@ impl TextField {
 
 /// How a text field's content is scrolled: its position, and the caret
 /// reveals asked (a generation) and taken.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FieldView {
     /// Exactly ([`crate::compositor::motion`]): its pixels are drawn.
     pub pos: crate::compositor::motion::Exact,

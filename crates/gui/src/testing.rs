@@ -886,7 +886,7 @@ mod tests {
                     let tx = sender.clone();
                     let delay = s.random_delay(Duration::from_millis(30));
                     s.spawn_after(delay, format!("send {p}.{n}"), move |_| {
-                        assert!(tx.send(p * 10 + n + 1));
+                        assert!(tx.send(p * 10 + n + 1).is_ok());
                     });
                 }
             }

@@ -1255,7 +1255,10 @@ fn feed() -> Render {
                                 let send = send.clone();
                                 std::thread::spawn(move || {
                                     for i in 0..MESSAGES {
-                                        if !send.send(format!("burst {round} message {i}: lorem ipsum dolor")) {
+                                        if send
+                                            .send(format!("burst {round} message {i}: lorem ipsum dolor"))
+                                            .is_err()
+                                        {
                                             break;
                                         }
                                     }

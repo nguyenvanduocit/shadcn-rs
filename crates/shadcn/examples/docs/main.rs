@@ -37,6 +37,14 @@
 //! `-- --attach [--socket=PATH] [CMD…]` sends commands (or stdin's lines) to
 //! the newest app listening.
 
+// An app, not a component (ADR-0028, "The boundary for app callbacks": an
+// app answers for its own effects): the docs read and write files, start
+// the browser and run their own threads.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "an app's own I/O, processes and threads; the bans hold component code"
+)]
+
 mod bench;
 mod docs;
 mod pages;

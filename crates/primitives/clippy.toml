@@ -2,6 +2,43 @@ allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true
 allow-indexing-slicing-in-tests = true
+
+# Per-thread state is declared with `gui::engine_local!`, which gives each
+# piece the policy a cold frame applies to it (`gui::engine`); a raw
+# `thread_local!` would be shared with the cold frame unseen.
+disallowed-macros = [
+    { path = "std::thread_local", reason = "declare per-thread state with gui::engine_local!, which gives it a cold policy" },
+]
+
+# ADR-0028, "What lands at K4a": an effect a check cannot hold back would leave from a sampled check. Component code
+# reaches threads, files, processes and the clipboard only through gui (`gui::spawn`, a port the app makes,
+# `gui::clipboard::write`). The clipboard has no direct call to ban here: this crate does not depend on `arboard`, and
+# `gui::clipboard::copy` is not public. `crates/gui/tests/component_lints.rs` checks this file keeps these bans and
+# that primitives' and shadcn's files are the same.
+disallowed-methods = [
+    { path = "std::thread::spawn", reason = "work off the UI thread goes through gui::spawn: owned by its scope, cancelled with it, never started in a check (ADR-0026, ADR-0028)" },
+    { path = "std::thread::Builder::spawn", reason = "work off the UI thread goes through gui::spawn (ADR-0028)" },
+    { path = "std::thread::Builder::spawn_scoped", reason = "work off the UI thread goes through gui::spawn (ADR-0028)" },
+    { path = "std::thread::scope", reason = "work off the UI thread goes through gui::spawn (ADR-0028)" },
+    { path = "std::fs::read", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::read_to_string", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::read_dir", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::write", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::copy", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::rename", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::remove_file", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::remove_dir", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::remove_dir_all", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::create_dir", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::create_dir_all", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::metadata", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::File::open", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::File::create", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::OpenOptions::new", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::process::Command::new", reason = "a process is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::process::exit", reason = "a component never ends the process (ADR-0028)" },
+]
+
 # Membership across components goes through `gui::Registry` and
 # `gui::Holder` (registered as a part mounts), and a part's identities
 # are derived from its owner's (`NodeRef::derived`, `FocusHandle::derived`):
@@ -9,11 +46,7 @@ allow-indexing-slicing-in-tests = true
 # Each cell left is its owner's alone, and says so where it is declared.
 disallowed-types = [
     { path = "std::cell::RefCell", reason = "an owner-only cell says so with `#[expect]`; membership across components is `gui::Registry` or `gui::Holder`" },
-]
-
-# Per-thread state is declared with `gui::engine_local!`, which gives each
-# piece the policy a cold frame applies to it (`gui::engine`); a raw
-# `thread_local!` would be shared with the cold frame unseen.
-disallowed-macros = [
-    { path = "std::thread_local", reason = "declare per-thread state with gui::engine_local!, which gives it a cold policy" },
+    { path = "std::fs::File", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::fs::OpenOptions", reason = "file I/O is an app's, through a port it makes (ADR-0028)" },
+    { path = "std::process::Command", reason = "a process is an app's, through a port it makes (ADR-0028)" },
 ]

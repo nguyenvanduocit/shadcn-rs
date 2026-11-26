@@ -53,8 +53,38 @@ impl LayoutTree {
     /// anew. Its layers keep the order they last opened in, carried as a
     /// cold build carries the window's: the next pass opens them so.
     fn forget(&mut self, motion: &mut Motion) {
-        let gone: Vec<NodePath> = motion.paths().cloned().chain(self.released.drain(..)).collect();
+        let gone: Vec<(crate::geometry::NodeId, NodePath)> = motion
+            .kept()
+            .map(|(id, p)| (id, p.clone()))
+            .chain(self.released.drain(..))
+            .collect();
         motion.left(&gone, &|_| false);
+        // Every node keeps its id: the rebuild adopts them by path, and what
+        // it does not adopt is freed as it ends (ADR-0026, "As built (K4e)").
+        let mut adopt = self.correspondence();
+        // A pass that panicked mid patch dropped, as it unwound, the
+        // children it had taken out of their parent and the node it was
+        // resolving: out of the tree, their ids still held. Each is adopted
+        // by the path it was built at, or freed when none is known.
+        let reached: foldhash::HashSet<crate::geometry::NodeId> = adopt.values().flatten().copied().collect();
+        let paths: foldhash::HashMap<u32, &NodePath> = self.by_path.iter().map(|(p, &u)| (u, p)).collect();
+        for (&id, u) in self.by_id.iter().filter(|(id, _)| !reached.contains(id)) {
+            match paths.get(u) {
+                Some(&p) => adopt.entry(p.clone()).or_default().push(id),
+                None => self.ids.free(id),
+            }
+        }
+        for p in self.parked.drain().map(|(_, p)| p) {
+            for (q, id) in p.ids.into_iter().skip(1) {
+                adopt.entry(q).or_default().push(id);
+            }
+        }
+        for (path, ids) in std::mem::take(&mut self.adopt) {
+            adopt.entry(path).or_default().extend(ids);
+        }
+        self.adopt = adopt;
+        self.by_id.clear();
+        self.focused_slots.clear();
         self.carried.clear();
         self.carried.extend(self.layer_paths.drain(..));
         self.root = None;
@@ -94,15 +124,16 @@ impl LayoutTree {
             height,
         };
         self.lists.begin_pass();
+        self.passes = self.passes.wrapping_add(1);
         self.stats = Stats::default();
         self.visits = Visits::default();
         self.take_marks(state);
         if motion.generation() != self.motion_seen {
             // What runs changed for every node at once: each is sampled again.
             self.motion_seen = motion.generation();
-            let paths: Vec<NodePath> = motion.paths().cloned().collect();
-            for p in &paths {
-                self.mark_path(p, need::RESOLVE);
+            let ids: Vec<crate::geometry::NodeId> = motion.kept().map(|(id, _)| id).collect();
+            for id in ids {
+                self.mark_id(id, need::RESOLVE);
             }
         }
         let mut frame = std::mem::take(&mut self.frame);
@@ -217,10 +248,12 @@ impl LayoutTree {
         // nested layer opens after the layer it is in, so it comes later.
         while let Some(t) = take_oldest(&mut todo, &old_layers, &self.carried) {
             layer = layer.saturating_add(1);
+            // The node it was declared in, as placed.
+            let owner = self.placed_at(&frame, &t.anchor);
             let anchor = t
                 .deferred
                 .anchor_part
-                .and_then(|k| frame_bounds_by_key(&frame, &t.anchor, k))
+                .and_then(|k| frame_bounds_by_key(&frame, owner, k))
                 .or_else(|| self.bounds_at(&frame, &t.anchor));
             // A layer inherits its look from the window's root, not its
             // anchor, as content portalled to `<body>` does: a menu opened
@@ -260,10 +293,16 @@ impl LayoutTree {
             else {
                 continue;
             };
+            // Its root continues "is below" through the node it was
+            // declared in.
+            let anchor_slot = self.by_path.get(&t.anchor).copied().unwrap_or(NO_SLOT);
+            if let Some(e) = self.extra_mut(node.user) {
+                e.anchor = anchor_slot;
+            }
             self.find_focus(state);
             let placement = t.deferred.positioning;
             let part_at = match placement {
-                Positioning::Over { anchor_part, .. } => frame_bounds_by_key(&frame, &t.anchor, anchor_part),
+                Positioning::Over { anchor_part, .. } => frame_bounds_by_key(&frame, owner, anchor_part),
                 _ => None,
             };
             let reuse = memo.filter(|m| {
@@ -292,6 +331,7 @@ impl LayoutTree {
             self.structure = false;
             let at = Layer {
                 root: frame.nodes.len(),
+                owner,
                 anchor,
                 tab_after: t.deferred.tab_after,
             };
@@ -305,6 +345,7 @@ impl LayoutTree {
                     let mut retabbed = None;
                     if let Some(l) = frame.layers.get_mut(layer.saturating_sub(1)) {
                         l.anchor = anchor;
+                        l.owner = owner;
                         if l.tab_after != t.deferred.tab_after {
                             l.tab_after = t.deferred.tab_after;
                             retabbed = Some(l.root);
@@ -384,6 +425,7 @@ impl LayoutTree {
         leaf::end_pass();
         motion.left(&self.released, &|p| self.by_path.contains_key(p));
         self.released.clear();
+        self.settle_ids(motion);
         self.frame = frame;
     }
 

@@ -118,6 +118,10 @@ fn vendored_libraries_carry_permissive_licences() {
 /// licence files. A clarification whose hash no longer matches is dropped silently and the crate falls back to its
 /// `license` field, so this test keeps the hashes in step with the files: `cargo deny` then checks the expression.
 #[test]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test reads the repository's deny.toml and the vendored licences; no component code"
+)]
 fn deny_clarifies_the_vendored_licences() {
     let root = env!("CARGO_MANIFEST_DIR");
     let deny = std::fs::read_to_string(format!("{root}/../../deny.toml")).expect("deny.toml");

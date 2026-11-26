@@ -69,11 +69,14 @@ struct DataTable {
     email: Signal<bool>,
     amount: Signal<bool>,
     page: Signal<usize>,
+    /// The clipboard's answer to "Copy payment ID": nothing waits on it.
+    copied: gui::Port<(gui::clipboard::Wrote, ())>,
 }
 
 impl DataTable {
     fn new() -> Self {
         Self {
+            copied: gui::port(|_: (gui::clipboard::Wrote, ())| {}),
             filter: TextField::new(""),
             sorted_desc: Signal::labeled("email sorting", None),
             selected: Signal::labeled("selected payments", Vec::new()),
@@ -210,6 +213,7 @@ fn data_table(dt: &DataTable) -> Div {
             )
             .into_element(),
             Column::Actions => {
+                let copied = dt.copied;
                 let menu_for = |name: &'static str| dropdown_menu_item(name, MenuItem::default()).child(name);
                 table_cell(
                     dropdown_menu()
@@ -226,9 +230,7 @@ fn data_table(dt: &DataTable) -> Div {
                                 .child(dropdown_menu_label("Actions", false))
                                 .child(
                                     dropdown_menu_item("Copy payment ID", MenuItem::default())
-                                        .on_select(move |_| {
-                                            gui::clipboard::copy(id);
-                                        })
+                                        .on_select(move |_| gui::clipboard::write(id.to_owned(), (), copied))
                                         .child("Copy payment ID"),
                                 )
                                 .child(dropdown_menu_separator())

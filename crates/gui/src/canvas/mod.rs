@@ -1168,7 +1168,7 @@ impl WorldSnapshot {
 }
 
 /// What a world holds (the UI thread's side).
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct WorldState {
     id: u64,
     version: u64,

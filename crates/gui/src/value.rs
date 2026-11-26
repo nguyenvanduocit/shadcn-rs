@@ -41,6 +41,7 @@ use source::{Closure, Read, Via};
 pub use source::{Group, Grouped, Mapped, Toggle};
 
 /// What a setter was given: a value, or a closure that gives one.
+#[derive(Clone)]
 pub enum Value<T> {
     Fixed(T),
     Bound(Rc<dyn Fn() -> T>),

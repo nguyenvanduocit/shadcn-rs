@@ -17,7 +17,9 @@ use crate::style::Edges;
 /// A scroll container as last laid out.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ScrollLayout {
-    /// Where the container sits in the tree.
+    /// Which node the container is (ADR-0026).
+    pub id: crate::geometry::NodeId,
+    /// Where it sits in the tree (until the windowed list, K4c, reads `id`).
     pub path: crate::geometry::NodePath,
     /// The border box in window pixels.
     pub bounds: Bounds,

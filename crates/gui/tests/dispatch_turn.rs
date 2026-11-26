@@ -101,7 +101,7 @@ fn mail_drains_past_a_panicking_handler_and_the_first_panic_stays_first() {
             w.borrow_mut().settle().expect("frame");
         }
     });
-    assert!(tx.send(1) && tx.send(2));
+    assert!(tx.send(1).is_ok() && tx.send(2).is_ok());
     let r = catch_unwind(AssertUnwindSafe(|| a.act("go", || go.set(true))));
     let got = (r.as_ref().err().and_then(said), seen.get());
     // The effects hold the second window: gone before the thread's end.
@@ -130,7 +130,7 @@ fn a_frame_delivers_mail_in_a_turn() {
             out.set(true);
         })
     });
-    assert!(tx.send(()));
+    assert!(tx.send(()).is_ok());
     let r = catch_unwind(AssertUnwindSafe(|| s.settle()));
     assert_eq!(r.as_ref().err().and_then(said), Some("gated"));
     assert!(after.get(), "the handler went on past the gated call");

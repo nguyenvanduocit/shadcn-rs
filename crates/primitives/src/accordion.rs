@@ -125,6 +125,7 @@ impl Default for AccordionOptions {
     }
 }
 
+#[derive(Clone)]
 struct State<T: 'static> {
     open: Rc<dyn OpenSections<T>>,
     options: Rc<dyn Fn() -> AccordionOptions>,

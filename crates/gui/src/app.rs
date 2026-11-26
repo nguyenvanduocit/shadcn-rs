@@ -1189,6 +1189,8 @@ impl Pipeline {
         report.painted.clear();
         report.painted.extend_from_slice(self.painter.painted());
         report.late = reactive::take_late_writes();
+        // Bounded where they are kept (64); none on stderr (ADR-0026).
+        report.duplicate_keys = crate::component::take_duplicate_keys();
         report.drawn = drawn;
         let mut footprint = self.footprint();
         footprint.built = built.zip(thread_before).map(|(after, before)| after.since(before));
@@ -1251,6 +1253,7 @@ impl Pipeline {
             paint: crate::inspect::PaintStats::default(),
             painted: Vec::new(),
             late: Vec::new(),
+            duplicate_keys: Vec::new(),
             drawn,
         }
     }
@@ -2571,7 +2574,8 @@ impl Scenario {
         self.pipeline
             .input_state
             .layer_nodes()
-            .filter_map(|i| frame.nodes.get(i).map(|n| format!("{:?}", n.path)))
+            .filter(|&i| i < frame.nodes.len())
+            .map(|i| format!("{:?}", frame.path_of(i)))
             .collect()
     }
 
@@ -3501,7 +3505,7 @@ mod tests {
         let whole = crate::inspect::diff(&was, &frame.nodes);
         assert!(whole.changes.len() >= 200, "every box and its child moved");
         let key = |d: &LayoutDiff| {
-            let mut k: Vec<String> = d.changes.iter().map(|c| format!("{} {:?}", c.path, c.change)).collect();
+            let mut k: Vec<String> = d.changes.iter().map(|c| format!("{} {:?}", c.id, c.change)).collect();
             k.sort();
             k
         };

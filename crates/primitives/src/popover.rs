@@ -247,7 +247,7 @@ impl<P: 'static> Popover<P> {
         let o = gui::untracked(|| self.options());
         if *reason != DismissReason::Programmatic
             && let Some(veto) = &o.veto
-            && veto.call(*reason) == Dismiss::Veto
+            && veto.call(*reason) == Some(Dismiss::Veto)
         {
             return Dismiss::Veto;
         }

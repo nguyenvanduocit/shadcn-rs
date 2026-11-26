@@ -2393,7 +2393,7 @@ fn mail_from_another_thread_replays_in_its_place_among_the_input() {
     // Another thread mails while the platform's input comes.
     let mailer = std::thread::spawn(move || {
         for n in 1..=24_u32 {
-            sender.send(n);
+            sender.send(n).ok();
             std::thread::sleep(Duration::from_millis(3));
         }
     });
@@ -2448,7 +2448,7 @@ fn mail_from_another_thread_replays_in_its_place_among_the_input() {
         .expect("the page made its mailbox");
     let mailer = std::thread::spawn(move || {
         for n in 1..=24_u32 {
-            sender.send(n);
+            sender.send(n).ok();
         }
     });
     let frames = replay_observed(&mut s, &log);

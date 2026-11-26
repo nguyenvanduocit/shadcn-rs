@@ -276,7 +276,9 @@ fn fixture(p: Parts, members: Members<u32>) -> Scenario {
                 .top(0.)
                 .size(80.)
                 .member(&members, if p.shift.get() { 2 } else { 1 })
-                .on_click(move |_| callback.call(1))
+                .on_click(move |_| {
+                    callback.call(1);
+                })
                 .on_secondary_click(move |_| call("B", "secondary_click", ""))
                 .on_key_down(move |k| {
                     call("B", "key_down", format!("{:?}", k.key));
@@ -611,7 +613,7 @@ fn apply(s: &mut Scenario, path: Path, step: Step, cx: &Ctx) {
             {
                 let m = cx.mail.borrow();
                 let tx = m.as_ref().expect("the mailbox");
-                assert!(tx.send(1) && tx.send(2));
+                assert!(tx.send(1).is_ok() && tx.send(2).is_ok());
             }
             // Delivered in the frame's turn, before it builds.
             alone(|| s.settle().expect("frame"));
@@ -1072,8 +1074,16 @@ const CATCHES: &[(&str, usize, &str)] = &[
     ),
     (
         "component.rs",
-        1,
-        "F1 (ADR-0034, S3): a check's cold build that panicked, raised as its string",
+        2,
+        "F1 (ADR-0034, S3): a check's cold build that panicked, raised as its string; and the structural \
+         referee (ADR-0026, K4a) failing a cold resolve as a panic of the cold build, which the check's own \
+         arbiter catches and reports as `Mismatch::Panicked` (it runs only inside a check, never in a turn)",
+    ),
+    (
+        "access/bound.rs",
+        9,
+        "test code (K4b): the whole file is a test module (`access.rs` declares it under `#[cfg(test)]`), \
+         whose tests catch a binding's panic out of `Scenario::settle` to assert it; no UI turn of the app",
     ),
     (
         "app.rs",

@@ -341,6 +341,12 @@ const HANDLES: &[(&str, &str, &str)] = &[
         "Fork(log): a list's state, held in the lists' `ForkSlab` and saved whole at a fork's first write; the plan it keeps (`taken`) is never written after it is made",
     ),
     (
+        // K4c round 4, D034.
+        "crates/gui/src/list/virtual_list.rs",
+        "Taken",
+        "Fork by value, inside `State` (Fork(log)): which plan was taken in, a kept plan's number or a `Weak` naming a render's plan by identity, only compared, never upgraded or written through; a fork's copy is its own and goes with the fork",
+    ),
+    (
         "crates/gui/src/scroll.rs",
         "State",
         "Fork(log): a scroll handle's state, held in the handles' `ForkSlab` and saved whole at a fork's first write; the plan it is handed (`Built`) is never written after it is made, and its hooks are callbacks",

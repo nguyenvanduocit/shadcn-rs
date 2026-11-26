@@ -198,6 +198,7 @@ type Shown<T> = Rc<dyn Fn(&T) -> String>;
 type Tell<T> = gui::Callback<T>;
 type TellRefused<T> = gui::Callback<(T, Refused)>;
 
+#[derive(Clone)]
 struct State<T: 'static> {
     config: TagsConfig,
     convert: Convert<T>,

@@ -194,6 +194,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test is the worker: it proves a filter is Send and Sync by using one on a thread"
+    )]
     fn a_filter_goes_to_a_worker_thread() {
         fn send_sync<T: Send + Sync>(_: &T) {}
         let f = Filter::default();

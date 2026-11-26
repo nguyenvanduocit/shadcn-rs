@@ -809,7 +809,7 @@ fn work(shared: &Shared, to: &Sender<Outcome>) {
             Ok(Some(built)) => {
                 shared.finished.fetch_add(1, Atomic::AcqRel);
                 if !stale() {
-                    to.send(Outcome::Built(built));
+                    to.send(Outcome::Built(built)).ok();
                 }
             }
             Ok(None) => {}
@@ -819,7 +819,7 @@ fn work(shared: &Shared, to: &Sender<Outcome>) {
                     .map(|s| (*s).to_owned())
                     .or_else(|| panic.downcast_ref::<String>().cloned())
                     .unwrap_or_else(|| "a closure of the request panicked".to_owned());
-                to.send(Outcome::Failed { request, message });
+                to.send(Outcome::Failed { request, message }).ok();
             }
         }
     }
