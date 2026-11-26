@@ -1216,8 +1216,8 @@ fn a_cold_snapshot_leaves_the_worlds_caches_empty() {
     let cold = crate::engine::in_cold_frame(|| w.snapshot());
     assert!(cold.unshaped.is_empty(), "the cold paint shapes everything itself");
     w.0.with_untracked(|s| {
-        assert!(s.snapshot.borrow().is_none(), "no snapshot cached");
-        assert!(s.base.borrow().is_none(), "no base cached");
-        assert_eq!(s.unshaped.borrow().len(), 1, "the text still waits for the live paint");
+        assert!(s.snapshot.with(Option::is_none), "no snapshot cached");
+        assert!(s.base.with(Option::is_none), "no base cached");
+        assert_eq!(s.unshaped.with(Vec::len), 1, "the text still waits for the live paint");
     });
 }

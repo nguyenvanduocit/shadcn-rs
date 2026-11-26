@@ -26,6 +26,16 @@ use std::rc::Rc;
 use crate::element::{Element, ElementKey, IntoElement};
 use crate::reactive::{RenderNode, Scope, Signal, SignalRef};
 
+mod children;
+mod control;
+
+use children::Children;
+
+pub use control::{
+    DuplicateKey, Dynamic, Each, Row, Show, StructureStats, dynamic_view, each, show, structure_stats,
+    take_duplicate_keys,
+};
+
 /// What an instance's setup gets: its props, reactive.
 pub struct Ctx<P: 'static> {
     props: Signal<P>,
@@ -740,6 +750,9 @@ pub struct ComponentElement {
     /// fallthrough: a parent that joins or sizes its children by position
     /// styles a component's root as it would a node's).
     pub(crate) fallthrough: Option<Fallthrough>,
+    /// A control node's description ([`show`], [`each`], [`dynamic_view`]):
+    /// its rows are spliced into its parent's children, with no box.
+    control: Option<Rc<dyn control::Control>>,
 }
 
 /// A parent's change to a component's root style, applied after the
@@ -825,6 +838,7 @@ where
         type_id: TypeId::of::<S>(),
         mount: Box::new(Pending { props, setup }),
         fallthrough: None,
+        control: None,
     }
 }
 
@@ -896,7 +910,8 @@ struct Instance {
     raw: Option<Element>,
     /// `raw` with every placeholder replaced by its instance's output.
     output: Option<Element>,
-    children: HashMap<InstanceKey, Id>,
+    /// In the order they were placed: torn down the last first.
+    children: Children,
     /// Its output as its parent's fallthrough styled it: the output it was
     /// made from, the fallthrough, and the result, so a clean instance
     /// gives back the same styled node.
@@ -914,6 +929,16 @@ struct Instance {
     /// nothing to another's, and what a cold frame of its root reuses as
     /// it is ([`Holds`]).
     holds: Holds,
+    /// A control node's rows and description ([`control`]); its rows are
+    /// its children, each an instance whose render gives back what its
+    /// view built once.
+    control: Option<Box<dyn control::State>>,
+    /// A control node's last range: its rows' outputs, in order. For
+    /// another instance, its output's range when its output is a control
+    /// node (a row whose view is a list).
+    range: Option<Rc<[Element]>>,
+    /// A control node's range as placed where no box takes it ([`boxed`]).
+    boxed: Option<(Rc<[Element]>, Element)>,
 }
 
 /// What an instance holds over panics of its user code caught in turns
@@ -962,6 +987,9 @@ impl Instance {
             renders: self.renders,
             met: self.met.clone(),
             holds: self.holds.clone(),
+            control: self.control.as_ref().map(|c| c.clone_box()),
+            range: self.range.clone(),
+            boxed: self.boxed.clone(),
         }
     }
 }
@@ -1527,6 +1555,8 @@ fn apply_marks() {
 pub struct Root {
     life: Rc<Life>,
     render: Render,
+    /// Its last handle's end ([`RootEnd`]).
+    _end: crate::engine::Ends<RootEnd>,
 }
 
 crate::engine::fork_data_struct! {
@@ -1590,6 +1620,7 @@ impl Root {
         Self {
             life: Rc::new(Life { key }),
             render,
+            _end: crate::engine::Ends::new(RootEnd(key)),
         }
     }
 
@@ -1684,9 +1715,11 @@ impl Root {
         let left = LEAVING.with(|l| l.borrow_mut().as_mut().map(std::mem::take));
         let outer = LEAVING.with(|l| l.borrow_mut().take());
         let id = self.id();
-        crate::engine::contained(|| unmount(id));
+        // The engine's re-run retirement of a failed render (ADR-0035, D3):
+        // the root keeps its owner and mounts again at a later resolve.
+        crate::engine::contained(|| unmount_by(id, Scope::retire));
         crate::engine::contained(|| {
-            each_to_completion(left.unwrap_or_default(), Scope::dispose);
+            each_to_completion(left.unwrap_or_default(), Scope::retire);
         });
         LEAVING.with(|l| *l.borrow_mut() = outer);
         // The hooks queued for the instances torn down are cancelled.
@@ -1735,7 +1768,7 @@ impl Root {
         let out = self.resolve();
         let left = LEAVING.with(|l| l.borrow_mut().take()).unwrap_or_default();
         drop(guard);
-        (out, Leaving(left))
+        (out, Leaving::new(left))
     }
 
     /// Run `f` in a cold frame of this tree ([`ColdFrame`]), the debug
@@ -1826,7 +1859,19 @@ impl ColdFrame {
     }
 
     /// The root's output, the tree resolved cold.
+    ///
+    /// First the structural referee (ADR-0026): every control node's source
+    /// listed again against what its commit gave the parent. A difference
+    /// fails the check as a panic of the cold build does: the cold path
+    /// differs where the live one did not.
     pub fn resolve(&self) -> Element {
+        let wrong = control::referee(self.root);
+        if !wrong.is_empty() {
+            std::panic::resume_unwind(Box::new(format!(
+                "the structural referee: the live structure differs from its sources:\n{}",
+                wrong.join("\n")
+            )));
+        }
         apply_marks();
         resolve(self.root)
     }
@@ -1878,10 +1923,11 @@ impl Life {
         ROOTS.with_borrow(|s| s.write(self.key, f));
     }
 
-    /// Unmount the tree, once, in the running world: an explicit end (its
-    /// scope's dispose, its window's close, `Root::close`) a check makes
-    /// ends the check's copy of the root, and unmounts the check's tree
-    /// (review r17, decision 3).
+    /// Unmount the tree, once, in the running world. A check never ends a
+    /// live root: since ADR-0035 D3, an explicit end (its scope's dispose,
+    /// its window's close, `Root::close`) made inside a check that would
+    /// dispose live nodes is refused as a fault of the check. A root the
+    /// check made itself ends in the check's world, with its tree.
     fn end(&self) {
         end_root(self.key);
     }
@@ -1893,13 +1939,15 @@ fn end_root(key: crate::engine::SlabId) {
     // nothing is left to unmount.
     let id = ROOTS
         .try_with(|s| {
-            s.borrow().write(key, |s| {
-                if s.ended {
-                    None
-                } else {
-                    s.ended = true;
-                    Some(s.id)
-                }
+            s.with(|s| {
+                s.write(key, |s| {
+                    if s.ended {
+                        None
+                    } else {
+                        s.ended = true;
+                        Some(s.id)
+                    }
+                })
             })
         })
         .ok()
@@ -1925,25 +1973,26 @@ impl crate::focus::WindowOwned for Life {
     }
 }
 
-impl Drop for Root {
-    /// Its last handle: the tree unmounted, then its state let go. A live
-    /// root a check lets go is ended once the check has switched back
-    /// ([`crate::engine::dropped`]), never in the check's world, however
-    /// the check lets it go, by a normal drop or as its body unwinds
-    /// (Codex r15-4).
-    fn drop(&mut self) {
-        let key = self.life.key;
+/// A root's last handle: the tree unmounted, then its state let go, in the
+/// world that made it ([`crate::engine::Ends`], ADR-0035). A live root a
+/// check lets go is ended once the check has switched back, never in the
+/// check's world, however the check lets it go, by a normal drop or as
+/// its body unwinds (Codex r15-4).
+struct RootEnd(crate::engine::SlabId);
+
+impl crate::engine::Ending for RootEnd {
+    fn end(self) {
+        let key = self.0;
         let end = move || {
             end_root(key);
-            let _gone = ROOTS.try_with(|s| s.borrow_mut().remove(key));
+            let _gone = ROOTS.try_with(|s| s.with_mut(|s| s.remove(key)));
         };
-        let live = crate::engine::LiveDrop::in_drop();
         if std::thread::panicking() {
-            if let Err(later) = crate::engine::attempt(|| crate::engine::dropped(live, key.made_in_fork(), end)) {
+            if let Err(later) = crate::engine::attempt(end) {
                 later.dismiss();
             }
         } else {
-            crate::engine::dropped(live, key.made_in_fork(), end);
+            end();
         }
     }
 }
@@ -1982,7 +2031,7 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
             below: false,
             raw: None,
             output: None,
-            children: HashMap::new(),
+            children: Children::default(),
             styled: None,
             context,
             mounted: Vec::new(),
@@ -1990,6 +2039,9 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
             renders: 0,
             met: std::rc::Weak::new(),
             holds: Holds::default(),
+            control: None,
+            range: None,
+            boxed: None,
         })
     });
     let generation = id.generation;
@@ -2050,14 +2102,22 @@ impl Drop for PopCurrent {
 
 /// Unmount `id` and everything below it: hooks, then its scope.
 fn unmount(id: Id) {
+    unmount_by(id, Scope::dispose);
+}
+
+/// [`unmount`], its scopes ended by `end` (the engine's retirement of a
+/// failed render's tree passes [`Scope::retire`], ADR-0035, D3).
+fn unmount_by(id: Id, end: fn(Scope)) {
     let Some(inst) = with_tree(|t| t.take(id)) else {
         return;
     };
     // Each child, then each scope, though one's hooks panic: the first
     // panic goes on once all are down (inside a turn, to its arbiter).
+    // One order (ADR-0026, "Teardown has one order"): the children the
+    // last placed first, as a scope runs its cleanups the last made first.
     let mut all = crate::engine::Gather::new();
-    for child in inst.children.values() {
-        all.run(|| unmount(*child));
+    for child in inst.children.values().rev() {
+        all.run(|| unmount_by(*child, end));
     }
     let mut scopes = inst.render_scopes;
     scopes.push(inst.scope);
@@ -2071,7 +2131,7 @@ fn unmount(id: Id) {
         None => false,
     });
     if !kept {
-        all.run(|| each_to_completion(scopes, Scope::dispose));
+        all.run(|| each_to_completion(scopes, end));
     }
     count(|s| s.unmounts = s.unmounts.saturating_add(1));
     all.finish();
@@ -2082,33 +2142,41 @@ fn unmount(id: Id) {
 /// which disposes them, each instance's render scopes then its own, the
 /// deepest first.
 #[must_use]
-pub(crate) struct Leaving(Vec<Scope>);
+pub(crate) struct Leaving(crate::engine::Ends<Scopes>);
+
+/// The scopes of a [`Leaving`], disposed in the world that made it
+/// ([`crate::engine::Ends`], ADR-0035).
+pub(crate) struct Scopes(Vec<Scope>);
 
 impl Leaving {
+    fn new(scopes: Vec<Scope>) -> Self {
+        Self(crate::engine::Ends::new(Scopes(scopes)))
+    }
+
     /// Whether no instance left.
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.0.0.is_empty()
     }
 
     /// Whether `owner` (as [`handler_owner`] gives it) is what a leaving
     /// instance owns its handlers by.
     pub(crate) fn holds(&self, owner: crate::reactive::OwnerId) -> bool {
-        self.0.iter().any(|s| s.id().owner_id() == owner)
+        self.0.0.iter().any(|s| s.id().owner_id() == owner)
     }
 }
 
-impl Drop for Leaving {
-    fn drop(&mut self) {
-        // Every one is disposed, though one's cleanup panics. Dropped as a
+impl crate::engine::Ending for Scopes {
+    fn end(self) {
+        // Every one is disposed, though one's cleanup panics. Ended as a
         // panic unwinds, a cleanup's panic is dropped: raised over the one
         // going on, it would abort the process.
+        let scopes = self.0;
         if std::thread::panicking() {
-            let scopes = &mut self.0;
-            if let Err(later) = crate::engine::attempt(|| each_to_completion(scopes.drain(..), Scope::dispose)) {
+            if let Err(later) = crate::engine::attempt(|| each_to_completion(scopes, Scope::dispose)) {
                 later.dismiss();
             }
         } else {
-            each_to_completion(self.0.drain(..), Scope::dispose);
+            each_to_completion(scopes, Scope::dispose);
         }
     }
 }
@@ -2129,7 +2197,7 @@ struct LeaveGuard(Option<Vec<Scope>>);
 impl Drop for LeaveGuard {
     fn drop(&mut self) {
         let left = LEAVING.with(|l| std::mem::replace(&mut *l.borrow_mut(), self.0.take()));
-        drop(left.map(Leaving));
+        drop(left.map(Leaving::new));
     }
 }
 
@@ -2167,16 +2235,36 @@ fn resolve(id: Id) -> Element {
     let Some(raw) = raw else {
         return Element::Empty;
     };
-    let before: HashMap<InstanceKey, Id> = with_tree(|t| t.get(id).map(|i| i.children.clone()).unwrap_or_default());
-    let mut seen: HashMap<InstanceKey, Id> = HashMap::with_capacity(before.len());
+    let before: Children = with_tree(|t| t.get(id).map(|i| i.children.clone()).unwrap_or_default());
+    let mut seen = Children::with_capacity(before.len());
     // A component that is the root of this output is placed by this
     // instance's key, its own nested in it.
     let chain = with_tree(|t| t.get(id).map(|i| Chain::Root(i.key, i.at))).unwrap_or(Chain::Child(0));
     // Expanded again: a slot a setup's panic left empty mounts anew.
     cleared_setups(id);
-    let out = expand(id, &raw, 0, chain, &before, &mut seen).unwrap_or_else(|| raw.clone());
+    // An output that is a control node is a range: kept whole for a
+    // parent that splices it (a row of a control node), and given to any
+    // other in one implicit box.
+    let (out, range) = match &raw {
+        Element::Component(c) if c.control.is_some() => {
+            let (ctl, range) = expand_control(id, c, 0, &before, &mut seen);
+            // The box stands in for this instance's root: placed by the
+            // instance's key, made by it, as `mark_root` places a root.
+            let place = with_tree(|t| t.get(id).map(|i| (i.key, i.scope.id().owner_id())));
+            let (key, owner) = place.map_or((None, None), |(k, o)| (k, Some(o)));
+            (boxed(ctl, &range, key, owner), Some(range))
+        }
+        _ => (
+            expand(id, &raw, 0, chain, &before, &mut seen).unwrap_or_else(|| raw.clone()),
+            None,
+        ),
+    };
+    // Those that left, the last placed first (the teardown order).
     each_to_completion(
-        before.iter().filter(|(slot, child)| seen.get(*slot) != Some(*child)),
+        before
+            .iter()
+            .rev()
+            .filter(|(slot, child)| seen.get(slot) != Some(*child)),
         |(_, child)| unmount(*child),
     );
     with_tree(|t| {
@@ -2188,10 +2276,60 @@ fn resolve(id: Id) -> Element {
             i.raw = Some(raw);
             i.children = seen;
             i.output = Some(out.clone());
+            if i.control.is_none() {
+                i.range = range;
+            }
             i.below = pending;
         }
     });
     out
+}
+
+/// The range of control node `ctl` in one box, where no box takes it (a
+/// component's root, a layer's content, a paragraph's inline): the same
+/// box while the range and its place are the same, so layout patches it as
+/// kept. The box takes the place of what it stands in for (`key`: the
+/// owning instance's key, or the static slot or key of the layer it is the
+/// content of), so its path is the one that root would have had.
+fn boxed(ctl: Id, range: &Rc<[Element]>, key: Option<ElementKey>, owner: Option<crate::reactive::OwnerId>) -> Element {
+    let key = if control::suppressed(control::Suppress::Unplaced) {
+        None
+    } else {
+        key
+    };
+    let cached = with_tree(|t| {
+        t.get(ctl)
+            .and_then(|i| i.boxed.as_ref())
+            .filter(|(r, b)| Rc::ptr_eq(r, range) && b.common().and_then(|c| c.component_key) == key)
+            .map(|(_, b)| b.clone())
+    });
+    if let Some(b) = cached {
+        return b;
+    }
+    let mut b = crate::element::div().children(range.iter().cloned()).into_element();
+    if let Some(c) = b.common_mut() {
+        c.component_key = key;
+        if owner.is_some() {
+            c.handlers.instance = owner;
+        }
+    }
+    with_tree(|t| {
+        if let Some(i) = t.get_mut(ctl) {
+            i.boxed = Some((Rc::clone(range), b.clone()));
+        }
+    });
+    b
+}
+
+/// What instance `id` gives a parent that splices: its range when its
+/// output is a control node's, else its one output.
+fn resolve_into(id: Id, out: &mut Vec<Element>) {
+    let one = resolve(id);
+    match with_tree(|t| t.get(id).and_then(|i| i.range.clone())) {
+        Some(range) if control::truncated(range.len()) => out.extend(range.iter().take(1).cloned()),
+        Some(range) => out.extend(range.iter().cloned()),
+        None => out.push(one),
+    }
 }
 
 /// Where a component sits, for the key its output's root is placed by.
@@ -2241,10 +2379,23 @@ fn expand(
     raw: &Element,
     path: u64,
     chain: Chain,
-    before: &HashMap<InstanceKey, Id>,
-    seen: &mut HashMap<InstanceKey, Id>,
+    before: &Children,
+    seen: &mut Children,
 ) -> Option<Element> {
     match raw {
+        // A control node where no box takes a range (a layer's content, a
+        // paragraph's inline): its rows in one implicit box, all of them,
+        // live and cold alike (ADR-0026, "Control nodes").
+        // The box takes the place the chain gives (a component's key, a
+        // static slot beside a range), else its position.
+        Element::Component(c) if c.control.is_some() => {
+            let (ctl, range) = expand_control(parent, c, path, before, seen);
+            let key = match chain {
+                Chain::Root(key, _) => key,
+                Chain::Child(_) => None,
+            };
+            Some(boxed(ctl, &range, key, None))
+        }
         Element::Component(c) => {
             let slot = InstanceKey {
                 path,
@@ -2349,15 +2500,46 @@ fn expand(
             })
         }
         // A box's children and a paragraph's atomic inlines alike.
+        // A control node among a box's children gives its rows in its
+        // place, with no box of its own (ADR-0026). A paragraph's atomic
+        // inlines stand on its content's object marks, one each: there it
+        // gives one.
         Element::Div(_) | Element::Text(_) => {
             let all = raw.kids()?;
+            let splices = matches!(raw, Element::Div(_));
             let mut kids: Option<Vec<Element>> = None;
+            let copied = |i: usize| {
+                let mut v = Vec::with_capacity(all.len());
+                v.extend(all.iter().take(i).cloned());
+                v
+            };
+            // Beside a range, an unkeyed component's root is placed by its
+            // static place, as [`mark_statics`] places the other nodes.
+            let ranged = splices && all.iter().any(is_control);
             for (i, rc) in all.iter().enumerate() {
-                let step = child_step(rc, i);
-                if let Some(new) = expand(parent, rc, path_step(path, step), Chain::Child(i), before, seen)
-                    && let Some(at) = kids.get_or_insert_with(|| all.to_vec()).get_mut(i)
+                let at = path_step(path, child_step(rc, i));
+                if let Element::Component(c) = rc
+                    && c.control.is_some()
+                    && splices
                 {
-                    *at = new;
+                    let (_, range) = expand_control(parent, c, at, before, seen);
+                    kids.get_or_insert_with(|| copied(i)).extend(range.iter().cloned());
+                    continue;
+                }
+                let chain = match rc {
+                    Element::Component(c) if ranged && c.key.is_none() => Chain::Root(Some(static_key(i)), i),
+                    // A layer whose content is a range: its box is placed
+                    // by the layer's static slot.
+                    Element::Deferred(d) if ranged && is_control(&d.child) => Chain::Root(Some(static_key(i)), i),
+                    _ => Chain::Child(i),
+                };
+                match expand(parent, rc, at, chain, before, seen) {
+                    Some(new) => kids.get_or_insert_with(|| copied(i)).push(new),
+                    None => {
+                        if let Some(kids) = kids.as_mut() {
+                            kids.push(rc.clone());
+                        }
+                    }
                 }
             }
             kids.map(|kids| raw.with_kids(kids))
@@ -2375,6 +2557,135 @@ fn expand(
         }),
         _ => None,
     }
+}
+
+/// The range of the control node `c` places at `path` under `parent`: its
+/// instance made on first sight (a scope under the parent's, its source
+/// tracked by its own node), given the newer description when a parent on
+/// the old path rendered again, and resolved ([`control::resolve_control`]).
+fn expand_control(
+    parent: Id,
+    c: &Rc<ComponentElement>,
+    path: u64,
+    before: &Children,
+    seen: &mut Children,
+) -> (Id, Rc<[Element]>) {
+    let none = || {
+        (
+            Id {
+                slot: usize::MAX,
+                generation: 0,
+            },
+            Rc::from(Vec::new()),
+        )
+    };
+    let Some(desc) = c.control.as_ref() else {
+        return none();
+    };
+    let slot = InstanceKey {
+        path,
+        type_id: c.type_id,
+    };
+    if seen.contains_key(&slot) {
+        eprintln!(
+            "gui: two `{}` nodes share one key under one parent; the second is not shown",
+            c.name
+        );
+        return none();
+    }
+    let child = match before.get(&slot) {
+        Some(&child) => {
+            with_tree(|t| {
+                if let Some(i) = t.get_mut(child)
+                    && !std::rc::Weak::ptr_eq(&i.met, &Rc::downgrade(c))
+                {
+                    i.met = Rc::downgrade(c);
+                    if let Some(state) = i.control.as_mut() {
+                        state.renew(desc.as_any());
+                    }
+                    i.dirty = true;
+                }
+            });
+            child
+        }
+        None => {
+            let scope = with_tree(|t| t.get(parent).map(|p| p.scope));
+            let scope = scope.map_or_else(Scope::detached, |s| s.run(Scope::new));
+            let child = create(Some(parent), scope, Box::new(()), Rc::new(Element::default), c.name);
+            with_tree(|t| {
+                if let Some(i) = t.get_mut(child) {
+                    i.control = Some(desc.fresh());
+                    i.met = Rc::downgrade(c);
+                }
+                if let Some(p) = t.get_mut(parent) {
+                    p.children.insert(slot, child);
+                }
+            });
+            child
+        }
+    };
+    seen.insert(slot, child);
+    apply_marks();
+    (child, control::resolve_control(child))
+}
+
+fn is_control(el: &Element) -> bool {
+    matches!(el, Element::Component(c) if c.control.is_some())
+}
+
+/// The key a node beside a range is placed by: its static place among its
+/// parent's elements, whatever the ranges before it hold (ADR-0026,
+/// "the node's static child position").
+fn static_key(at: usize) -> ElementKey {
+    path_step(0x7374_6174_6963, u64::try_from(at).unwrap_or(u64::MAX))
+}
+
+/// Whether `el` holds a control node, not looking into components (each
+/// marks its own output).
+fn holds_control(el: &Element) -> bool {
+    match el {
+        Element::Deferred(d) => holds_control(&d.child),
+        other => other
+            .kids()
+            .is_some_and(|k| k.iter().any(|k| is_control(k) || holds_control(k))),
+    }
+}
+
+/// `raw` with each unkeyed node beside a range in a box placed by its
+/// static place ([`static_key`]): a branch opened or rows inserted before
+/// it leave its path, and with it its scroll, motion and accessibility
+/// id, as they were. Done once per render, so the marked nodes are the
+/// same between renders. What holds no control node is not copied.
+fn mark_statics(mut raw: Element) -> Element {
+    if !holds_control(&raw) {
+        return raw;
+    }
+    if let Element::Deferred(d) = &mut raw {
+        let d = Rc::make_mut(d);
+        d.child = mark_statics(std::mem::take(&mut d.child));
+        return raw;
+    }
+    let ranged = matches!(raw, Element::Div(_)) && raw.kids().is_some_and(|k| k.iter().any(is_control));
+    if let Some(kids) = raw.kids_mut() {
+        for (i, kid) in kids.iter_mut().enumerate() {
+            if ranged {
+                let unkeyed = |c: &crate::element::Common| c.key.is_none() && c.component_key.is_none();
+                if let Element::Deferred(d) = &mut *kid {
+                    if d.child.common().is_some_and(unkeyed)
+                        && let Some(c) = Rc::make_mut(d).child.common_mut()
+                    {
+                        c.component_key = Some(static_key(i));
+                    }
+                } else if kid.common().is_some_and(unkeyed)
+                    && let Some(c) = kid.common_mut()
+                {
+                    c.component_key = Some(static_key(i));
+                }
+            }
+            *kid = mark_statics(std::mem::take(kid));
+        }
+    }
+    raw
 }
 
 /// Instance's render output `raw`, its root marked ([`marked`]) where it
@@ -2523,7 +2834,7 @@ fn render(id: Id) {
             return (Vec::new(), true, Vec::new(), None);
         };
         let (key, owner) = (i.key, i.scope.id().owner_id());
-        i.raw = Some(mark_root(&mut i.marked, raw, key, owner));
+        i.raw = Some(mark_root(&mut i.marked, mark_statics(raw), key, owner));
         i.renders = i.renders.saturating_add(1);
         i.render_scopes.push(rs);
         let excess = i.render_scopes.len().saturating_sub(KEPT_RENDERS);
@@ -2542,7 +2853,9 @@ fn render(id: Id) {
         }
         (old, first, updated, Some(owner))
     });
-    each_to_completion(old, Scope::dispose);
+    // The engine's re-run retirement (ADR-0035, D3): a check's re-render
+    // of a live instance retires its old scope as the arena's transaction.
+    each_to_completion(old, Scope::retire);
     if let Some(owner) = scope
         && !first
     {
@@ -2713,9 +3026,8 @@ pub fn provide<T: 'static>(value: T) {
     crate::engine::no_component_context();
     let value: Rc<dyn Any> = Rc::new(value);
     let Some(id) = current() else {
-        GLOBAL.with(|g| {
-            g.borrow_mut()
-                .insert(TypeId::of::<T>(), crate::engine::AppHandle::new(value));
+        GLOBAL.with_borrow_mut(|g| {
+            g.insert(TypeId::of::<T>(), crate::engine::AppHandle::new(value));
         });
         return;
     };
@@ -2739,7 +3051,7 @@ pub fn use_context<T: Clone + 'static>() -> Option<T> {
     crate::engine::no_component_context();
     let key = TypeId::of::<T>();
     let local = current().and_then(|id| with_tree(|t| t.get(id).and_then(|i| i.context.get(&key).cloned())));
-    let any = local.or_else(|| GLOBAL.with(|g| g.borrow().get(&key).map(crate::engine::AppHandle::rc)))?;
+    let any = local.or_else(|| GLOBAL.with_borrow(|g| g.get(&key).map(crate::engine::AppHandle::rc)))?;
     any.downcast_ref::<T>().cloned()
 }
 

@@ -1814,7 +1814,7 @@ fn inert(el: &mut Element) {
         c.focus = None;
         c.focusable = false;
         c.pass_through = true;
-        c.inert = true;
+        c.fix("inert", |a| a.inert = true);
     }
     if let Some(kids) = el.kids_mut() {
         kids.iter_mut().for_each(inert);

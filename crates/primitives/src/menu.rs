@@ -496,7 +496,7 @@ impl Menu {
     /// the direction turns them.
     pub(crate) fn set_sideways(self, f: impl Into<gui::Callback<bool>>) {
         let f = f.into();
-        self.with(|l| *l.sideways.borrow_mut() = Some(f));
+        self.with(|l| l.sideways.with_mut(|s| *s = Some(f)));
     }
 
     /// Refuse the dismiss requests `veto` says are not outside for this
@@ -504,7 +504,7 @@ impl Menu {
     /// on its triggers).
     pub(crate) fn veto(self, veto: impl Into<gui::Callback<DismissReason, bool>>) {
         let veto = veto.into();
-        self.with(|l| *l.veto.borrow_mut() = Some(veto));
+        self.with(|l| l.veto.with_mut(|v| *v = Some(veto)));
     }
 
     /// Whether this level is open (tracked).
@@ -980,7 +980,7 @@ impl Menu {
     }
 
     fn go_sideways(self, forward: bool) -> bool {
-        let f = self.with(|l| l.sideways.borrow().clone());
+        let f = self.with(|l| l.sideways.with(Clone::clone));
         f.is_some_and(|f| {
             f.call(forward);
             true
@@ -989,7 +989,7 @@ impl Menu {
 
     /// The dismiss request `reason` to the root's layer.
     fn dismissed(self, reason: &DismissReason) -> Dismiss {
-        let veto = self.with(|l| l.veto.borrow().clone());
+        let veto = self.with(|l| l.veto.with(Clone::clone));
         if veto.is_some_and(|v| v.call(*reason)) {
             return Dismiss::Veto;
         }
@@ -1182,7 +1182,7 @@ impl Menu {
         });
         if !self.is_open() {
             // Kept mounted while closed: hidden, no layer, no keys, no trap.
-            return d.role(Role::Menu).aria_hidden();
+            return d.role(Role::Menu).aria_hidden(true);
         }
         let d = link
             .content(d, labelled || parent.is_some())

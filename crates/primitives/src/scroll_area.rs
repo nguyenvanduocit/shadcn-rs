@@ -796,7 +796,7 @@ impl ScrollArea {
         let bar = self.bar(axis);
         let rtl = self.rtl();
         let corner = move |w: bool| self.corner_size().map_or(0.0, |(cw, ch)| if w { cw } else { ch });
-        let d = d.position(Position::Absolute).aria_hidden();
+        let d = d.position(Position::Absolute).aria_hidden(true);
         let d = match axis {
             Axis::Vertical => {
                 let d = d.top(0.0).bottom(move || Length::Px(corner(false)));
@@ -853,7 +853,7 @@ impl ScrollArea {
         }
         let at = move || self.thumb_at(axis).unwrap_or_default();
         let rtl = self.rtl();
-        let d = d.flex_shrink(0.0).aria_hidden();
+        let d = d.flex_shrink(0.0).aria_hidden(true);
         Some(match axis {
             Axis::Vertical => d
                 .height(move || Length::Px(at().length))
@@ -874,7 +874,7 @@ impl ScrollArea {
             .bottom(0.0)
             .width(w)
             .height(h)
-            .aria_hidden();
+            .aria_hidden(true);
         Some(if self.rtl() { d.left(0.0) } else { d.right(0.0) })
     }
 

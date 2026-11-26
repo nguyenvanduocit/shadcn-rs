@@ -1267,13 +1267,13 @@ impl Levelled<'_, '_, '_> {
         let inner = k < self.levels.len();
         if inner
             && let Some(memo) = &self.memo
-            && let Some(known) = memo.borrow().get(&key)
+            && let Some(known) = memo.with(|m| m.get(&key).copied())
         {
-            return *known;
+            return known;
         }
         let v = self.measure(k, g);
         if inner && let Some(memo) = &self.memo {
-            memo.borrow_mut().insert(key, v);
+            memo.with_mut(|m| m.insert(key, v));
         }
         v
     }

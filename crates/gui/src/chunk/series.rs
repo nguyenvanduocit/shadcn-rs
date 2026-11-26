@@ -230,18 +230,54 @@ impl PageData {
 }
 
 /// A page and where it starts in the series (points ever appended before it).
-#[derive(Debug)]
+///
+/// Its data is the engine's alone (ADR-0035, D5): app code reads points by
+/// copy, through [`SeriesSnapshot::get`], up to the snapshot's length. No
+/// reference into a live page reaches app code, so none is held across a
+/// check's switch, and the series' lock is never held across user code.
+///
+/// ```compile_fail,E0616
+/// // Codex r19-2's reproducer: a check wrote a live point through a snapshot.
+/// let owner = gui::Scope::new();
+/// let plot = owner.run(gui::chunk::plot::series);
+/// plot.push(5, 2.0);
+/// let sampled = plot.snapshot_untracked();
+/// let (page, _, _) = sampled.pages().next().unwrap();
+/// page.data.write().unwrap().y[0] = 9.0;
+/// ```
+///
+/// ```compile_fail,E0599
+/// // Codex F1b r1-2's reproducer: a check opened with a live page lent.
+/// let owner = gui::Scope::new();
+/// let plot = owner.run(gui::chunk::plot::series);
+/// plot.push(1, 1.0);
+/// let sampled = plot.snapshot_untracked();
+/// let (page, _, _) = sampled.pages().next().unwrap();
+/// let _ = page.with(|data| gui::testing::check(|| data.y[0]));
+/// ```
 pub struct Page {
     /// Its identity, for the GPU's copy.
     pub seq: u64,
     pub start: u64,
-    pub data: RwLock<PageData>,
+    data: RwLock<PageData>,
+}
+
+/// By its identity alone: formatting takes no lock, so the caller's writer
+/// never runs while the page is held (ADR-0035 D4).
+impl std::fmt::Debug for Page {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Page")
+            .field("seq", &self.seq)
+            .field("start", &self.start)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Page {
-    /// Its data to read (a poisoned lock still holds whole points: every
-    /// write leaves the page consistent before it can panic).
-    pub fn read(&self) -> RwLockReadGuard<'_, PageData> {
+    /// Its data to read, held by the engine alone (a poisoned lock still
+    /// holds whole points: every write leaves the page consistent before
+    /// it can panic).
+    pub(crate) fn read(&self) -> RwLockReadGuard<'_, PageData> {
         self.data.read().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }

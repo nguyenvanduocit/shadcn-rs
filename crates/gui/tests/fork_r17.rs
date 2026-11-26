@@ -88,10 +88,11 @@ impl Drop for ListBomb {
 #[test]
 fn a_check_drains_each_list_hook_on_its_own() {
     if std::env::var_os("GUI_R17_LIST_CHILD").is_some() {
-        let lists = [gui::ListState::new(24.0), gui::ListState::new(24.0)];
+        let lists = Rc::new([gui::ListState::new(24.0), gui::ListState::new(24.0)]);
         let result = std::panic::catch_unwind(|| {
-            gui::testing::in_check(|| {
-                for list in &lists {
+            let lists = Rc::clone(&lists);
+            gui::testing::in_check(move || {
+                for list in lists.iter() {
                     let b = ListBomb;
                     list.on_layout(move |_| {
                         std::hint::black_box(&b);
@@ -144,8 +145,10 @@ fn a_check_leaves_a_poisoned_live_root_to_remount_live() {
     let first = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.resolve()));
     assert!(first.is_err() && root.is_poisoned(), "poisoned live");
     fail.set(false);
-    gui::testing::in_check(|| {
-        let _ = root.resolve();
+    let root = Rc::new(root);
+    let held = Rc::clone(&root);
+    gui::testing::in_check(move || {
+        let _ = held.resolve();
     });
     assert!(root.is_poisoned(), "the check cleared the live remount");
     let before = renders.get();
@@ -176,9 +179,11 @@ fn a_render_panicking_in_a_check_leaves_the_live_root_whole() {
             gui::Element::Empty
         })
     });
-    let in_check = gui::testing::in_check(|| {
-        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.resolve()));
-        (resolved.is_err(), root.is_poisoned())
+    let root = Rc::new(root);
+    let held = Rc::clone(&root);
+    let in_check = gui::testing::in_check(move || {
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| held.resolve()));
+        (resolved.is_err(), held.is_poisoned())
     });
     assert_eq!(renders.get(), 1, "the check's resolve did the first render");
     assert_eq!(
@@ -198,8 +203,9 @@ fn a_render_panicking_in_a_check_leaves_the_live_root_whole() {
 
 // ── Codex r17 3: a check closing a window ────────────────────────────────
 
-/// A check that closes a window acts on its own world: the live close
-/// after still unmounts the root the window owns.
+/// A check that closes a live window is refused, a fault (ADR-0035, D3:
+/// a value's end outside the world that made it): the live root stands,
+/// and the live close after still unmounts the root the window owns.
 #[test]
 fn window_owns_root_after_check_close() {
     let mut w = gui::app::Pipeline::new(|| gui::Element::Empty, false);
@@ -215,17 +221,24 @@ fn window_owns_root_after_check_close() {
         held = Some(r);
     });
     let s = seen.get().expect("rendered");
-    gui::testing::in_check(|| w.close().expect("closed in the check"));
+    let w = Rc::new(std::cell::RefCell::new(w));
+    let handle = Rc::clone(&w);
+    let checked = gui::testing::check(move || drop(handle.borrow_mut().close()));
+    assert!(
+        matches!(&checked, Err(gui::engine::CheckReport::Faulted(why)) if why.contains("Foreign")),
+        "{checked:?}"
+    );
     gui::engine::shutdown();
     assert!(s.is_alive(), "the check's close unmounted the live root");
-    w.close().expect("closed");
+    w.borrow_mut().close().expect("closed");
     gui::engine::shutdown();
     assert!(!s.is_alive(), "live window close missed its registered root");
     drop(held);
 }
 
-/// A check that disposes of a live scope acts on its own world: the
-/// scope's roots and signals live on, and its live dispose ends them.
+/// A check that disposes of a live scope is refused, a fault (ADR-0035,
+/// D3): the scope's roots and signals live on, and its live dispose ends
+/// them.
 #[test]
 fn a_check_disposing_a_live_scope_ends_nothing_live() {
     let scope = gui::Scope::new();
@@ -239,7 +252,11 @@ fn a_check_disposing_a_live_scope_ends_nothing_live() {
     });
     let _ = root.resolve();
     let signal = seen.get().expect("rendered");
-    gui::testing::in_check(|| scope.dispose());
+    let checked = gui::testing::check(move || scope.dispose());
+    assert!(
+        matches!(&checked, Err(gui::engine::CheckReport::Faulted(why)) if why.contains("Foreign")),
+        "{checked:?}"
+    );
     gui::engine::shutdown();
     assert!(signal.is_alive(), "the check's dispose unmounted the live root");
     scope.dispose();

@@ -11,7 +11,8 @@ use super::{Marks, need};
 /// closure is another one, or the input `E` it runs over changed; its
 /// change dirties its node alone.
 pub(super) struct Tracked<K: ?Sized, T, E = ()> {
-    node: crate::reactive::RenderNode,
+    /// Disposed in the world that made it as the binding ends (ADR-0035).
+    node: Node,
     memo: Option<(Rc<K>, E, T)>,
     /// Its last run panicked in a turn: it gives what it gave before, and
     /// a cold build reuses that ([`HeldNode`]).
@@ -20,8 +21,13 @@ pub(super) struct Tracked<K: ?Sized, T, E = ()> {
 
 impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
     pub(super) fn new(marks: &Marks, u: u32) -> Self {
+        Self::marking(&resolve_mark(marks, u))
+    }
+
+    /// One whose tracker runs `mark`: the mark a node's bindings share.
+    pub(super) fn marking(mark: &crate::reactive::Mark) -> Self {
         Self {
-            node: tracker(&resolve_mark(marks, u)),
+            node: tracker(mark),
             memo: None,
             held: false,
         }
@@ -34,25 +40,40 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
     /// shows nothing of it), and runs again when what it read before the
     /// panic changes.
     fn get_over(&mut self, f: &Rc<K>, input: &E, run: impl FnOnce() -> T) -> Option<T> {
-        if let Some((g, e, v)) = &self.memo
+        self.update_over(f, input, run, |_, _| false);
+        self.memo.as_ref().map(|(_, _, v)| v.clone())
+    }
+
+    /// Run it again as [`Self::get_over`] says, keeping what it gives in
+    /// place, copied nowhere; whether it ran and gave what `same` tells
+    /// apart from what it gave before (a first run that gives, always).
+    fn update_over(
+        &mut self,
+        f: &Rc<K>,
+        input: &E,
+        run: impl FnOnce() -> T,
+        same: impl FnOnce(&T, &T) -> bool,
+    ) -> bool {
+        if let Some((g, e, _)) = &self.memo
             && Rc::ptr_eq(g, f)
             && e == input
             && !self.node.is_marked()
         {
-            return Some(v.clone());
+            return false;
         }
         crate::component::count_binding();
-        let node = self.node;
+        let node = *self.node;
         match crate::engine::attempt(|| node.track(run)) {
             Ok(v) => {
                 self.held = false;
-                self.memo = Some((Rc::clone(f), input.clone(), v.clone()));
-                Some(v)
+                let changed = self.memo.as_ref().is_none_or(|(_, _, old)| !same(old, &v));
+                self.memo = Some((Rc::clone(f), input.clone(), v));
+                changed
             }
             Err(failed) => {
                 crate::component::contain_binding(failed);
                 self.held = true;
-                self.memo.as_ref().map(|(_, _, v)| v.clone())
+                false
             }
         }
     }
@@ -69,22 +90,47 @@ impl<K: ?Sized, T: Clone> Tracked<K, T> {
     pub(super) fn get(&mut self, f: &Rc<K>, run: impl FnOnce() -> T) -> Option<T> {
         self.get_over(f, &(), run)
     }
-}
 
-impl<K: ?Sized, T, E> Drop for Tracked<K, T, E> {
-    fn drop(&mut self) {
-        // Even while unwinding (a binding panicked): a tracker left
-        // subscribed would mark a node gone; disposing is safe then.
-        self.node.release(crate::engine::LiveDrop::in_drop());
+    /// Run it again as [`Self::get`] says, keeping what it gives in place
+    /// ([`Self::value`]): whether that is another value now. Nothing is
+    /// copied, so a binding that did not run costs a check.
+    pub(super) fn refresh(&mut self, f: &Rc<K>, run: impl FnOnce() -> T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.update_over(f, &(), run, |old, new| old == new)
+    }
+
+    /// What it last gave; `None` before it ever gave.
+    pub(super) fn value(&self) -> Option<&T> {
+        self.memo.as_ref().map(|(_, _, v)| v)
+    }
+
+    /// Whether its last run panicked in a turn: it holds what it gave
+    /// before ([`HeldNode`]).
+    pub(super) fn is_held(&self) -> bool {
+        self.held
     }
 }
+
+impl<K: ?Sized, T, E> Tracked<K, T, E> {
+    /// Its tracker: what its closure read.
+    pub(super) fn tracker(&self) -> crate::reactive::RenderNode {
+        *self.node
+    }
+}
+
+/// A node's tracker, owned by one binding or phase alone: disposed in the
+/// world that made it as its owner ends (ADR-0035, D1), even while a panic
+/// unwinds (a tracker left subscribed would mark a node gone).
+pub(super) type Node = crate::engine::Ends<crate::reactive::RenderNode>;
 
 /// One phase's subscription of one node (ADR-0013: a signal read while
 /// patching or placing a node marks only that phase of that node). Made
 /// by the first run that reads anything; until then the tree's probe runs
 /// the phase and keeps nothing.
 #[derive(Default)]
-pub(super) struct Tracker(pub(super) Option<crate::reactive::RenderNode>);
+pub(super) struct Tracker(pub(super) Option<Node>);
 
 impl Tracker {
     pub(super) fn run<R>(
@@ -95,7 +141,7 @@ impl Tracker {
         need: u8,
         f: impl FnOnce() -> R,
     ) -> R {
-        if let Some(t) = self.0 {
+        if let Some(t) = self.0.as_deref().copied() {
             return t.track(f);
         }
         let out = probe.track(f);
@@ -103,24 +149,14 @@ impl Tracker {
             let marks = Rc::clone(marks);
             let t = crate::reactive::detached(|| {
                 crate::reactive::RenderNode::new(move || {
-                    if let Ok(mut m) = marks.try_borrow_mut() {
-                        m.push((u, need));
-                    }
+                    marks.try_with_mut(|m| m.push((u, need)));
                     crate::component::frame_due();
                 })
             });
             t.take_deps(probe);
-            self.0 = Some(t);
+            self.0 = Some(Node::new(t));
         }
         out
-    }
-}
-
-impl Drop for Tracker {
-    fn drop(&mut self) {
-        if let Some(t) = self.0.take() {
-            t.release(crate::engine::LiveDrop::in_drop());
-        }
     }
 }
 
@@ -142,7 +178,7 @@ pub(super) struct StyleBinding {
     runs: Vec<Option<BoundRun>>,
     /// What the replay itself read: made only while a parent's restyle
     /// replays (the one write that may read signals).
-    replay: Option<crate::reactive::RenderNode>,
+    replay: Option<Node>,
     /// The writes, the fixed style and the style replayed, as last resolved.
     memo: Option<(Rc<Vec<crate::value::Op>>, Style, Style)>,
 }
@@ -155,7 +191,7 @@ pub(super) struct StyleBinding {
 #[derive(Default)]
 pub(super) struct BoundRun {
     /// Made at a closure's first run; none for a source.
-    pub(super) node: Option<crate::reactive::RenderNode>,
+    pub(super) node: Option<Node>,
     /// `None` before its first run, once its write is no longer bound, and
     /// after its closure panicked outside a turn (it runs anew at the next
     /// resolve).
@@ -187,6 +223,8 @@ pub(super) struct HeldNode {
     pub(super) text: Option<Option<Arc<str>>>,
     /// The drawing (`None` inside: it never drew).
     pub(super) draw: Option<Option<crate::chunk::Drawing>>,
+    /// Its held bound attributes ([`super::attrs::AttrBinding`]).
+    pub(super) attrs: Vec<super::attrs::HeldAttr>,
 }
 
 impl HeldNode {
@@ -196,6 +234,7 @@ impl HeldNode {
         spans: &[Option<StyleBinding>],
         text: Option<&TextBinding>,
         draw: Option<&DrawBinding>,
+        attrs: Option<&super::attrs::AttrBinding>,
     ) -> Option<Self> {
         let held = Self {
             style: style.map(StyleBinding::held).unwrap_or_default(),
@@ -209,8 +248,14 @@ impl HeldNode {
                 .collect(),
             text: text.and_then(Tracked::held),
             draw: draw.and_then(Tracked::held),
+            attrs: attrs.map(super::attrs::AttrBinding::held).unwrap_or_default(),
         };
-        (!held.style.is_empty() || !held.spans.is_empty() || held.text.is_some() || held.draw.is_some()).then_some(held)
+        (!held.style.is_empty()
+            || !held.spans.is_empty()
+            || held.text.is_some()
+            || held.draw.is_some()
+            || !held.attrs.is_empty())
+        .then_some(held)
     }
 }
 
@@ -218,7 +263,7 @@ impl BoundRun {
     /// Whether it must run: its closure's tracker was marked, or its
     /// source woke it.
     fn due(&self) -> bool {
-        self.node.is_some_and(crate::reactive::RenderNode::is_marked) || self.mounted.as_ref().is_some_and(|m| m.due())
+        self.node.as_deref().is_some_and(|n| n.is_marked()) || self.mounted.as_ref().is_some_and(|m| m.due())
     }
 
     /// Mount `def` here; whether its closure must run (mounted anew, or
@@ -257,14 +302,12 @@ impl BoundRun {
         let node = &mut self.node;
         let ran = crate::engine::attempt(|| {
             if m.tracked() {
-                let node = *node.get_or_insert_with(|| tracker(mark));
+                let node = **node.get_or_insert_with(|| tracker(mark));
                 node.track(|| m.eval())
             } else {
                 // A source in place of a closure: what the closure read
                 // wakes nothing.
-                if let Some(node) = node.take() {
-                    node.dispose();
-                }
+                drop(node.take());
                 crate::reactive::untracked(|| m.eval())
             }
         });
@@ -289,7 +332,7 @@ impl BoundRun {
     fn unbind(&mut self) {
         self.mounted = None;
         self.held = false;
-        if let Some(node) = self.node
+        if let Some(node) = self.node.as_deref().copied()
             && node.has_deps()
         {
             node.track(|| ());
@@ -297,21 +340,11 @@ impl BoundRun {
     }
 }
 
-impl Drop for BoundRun {
-    fn drop(&mut self) {
-        // Even while unwinding (its closure panicked): a tracker left
-        // subscribed would mark a node gone; disposing is safe then.
-        if let Some(node) = self.node {
-            node.release(crate::engine::LiveDrop::in_drop());
-        }
-    }
-}
-
 /// A binding's tracker, owned by the binding that holds it (disposed when
-/// it drops), not by a scope of its own: a scope per bound node would cost
-/// an arena node and its list for nothing.
-fn tracker(mark: &crate::reactive::Mark) -> crate::reactive::RenderNode {
-    crate::reactive::detached(|| crate::reactive::RenderNode::marking(mark))
+/// it drops, in its own world: [`Node`]), not by a scope of its own: a
+/// scope per bound node would cost an arena node and its list for nothing.
+fn tracker(mark: &crate::reactive::Mark) -> Node {
+    Node::new(crate::reactive::detached(|| crate::reactive::RenderNode::marking(mark)))
 }
 
 /// What a tracker of node `u`'s resolve runs when something it read
@@ -321,9 +354,7 @@ fn tracker(mark: &crate::reactive::Mark) -> crate::reactive::RenderNode {
 pub(super) fn resolve_mark(marks: &Marks, u: u32) -> crate::reactive::Mark {
     let marks = Rc::clone(marks);
     Rc::new(move || {
-        if let Ok(mut m) = marks.try_borrow_mut() {
-            m.push((u, need::RESOLVE));
-        }
+        marks.try_with_mut(|m| m.push((u, need::RESOLVE)));
         crate::component::frame_due();
     })
 }
@@ -353,7 +384,11 @@ impl StyleBinding {
 
     /// Every tracker it holds.
     pub(super) fn nodes(&self) -> impl Iterator<Item = crate::reactive::RenderNode> + '_ {
-        self.runs.iter().flatten().filter_map(|r| r.node).chain(self.replay)
+        self.runs
+            .iter()
+            .flatten()
+            .filter_map(|r| r.node.as_deref().copied())
+            .chain(self.replay.as_deref().copied())
     }
 
     /// Its sources' registrations, taken out into `into`: its node is
@@ -409,7 +444,7 @@ impl StyleBinding {
             }
         }
         if !changed
-            && !self.replay.is_some_and(crate::reactive::RenderNode::is_marked)
+            && !self.replay.as_deref().is_some_and(|n| n.is_marked())
             && let Some((_, b, out)) = &memo
             && b == base
         {
@@ -443,12 +478,10 @@ impl StyleBinding {
         // Only a parent's restyle reads as it replays: a fixed write writes
         // a value, a bound one what its mount gave above.
         let out = if ops.iter().any(crate::value::Op::restyles) {
-            let node = *self.replay.get_or_insert_with(|| tracker(&self.mark));
+            let node = **self.replay.get_or_insert_with(|| tracker(&self.mark));
             node.track(replay)
         } else {
-            if let Some(node) = self.replay.take() {
-                node.dispose();
-            }
+            drop(self.replay.take());
             crate::reactive::untracked(replay)
         };
         match &mut memo {
@@ -463,15 +496,6 @@ impl StyleBinding {
         }
         self.memo = memo;
         out
-    }
-}
-
-impl Drop for StyleBinding {
-    fn drop(&mut self) {
-        // Even while unwinding (a restyle panicked), as a run's tracker.
-        if let Some(node) = self.replay.take() {
-            node.release(crate::engine::LiveDrop::in_drop());
-        }
     }
 }
 

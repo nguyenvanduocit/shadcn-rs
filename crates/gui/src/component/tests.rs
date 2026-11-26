@@ -663,8 +663,9 @@ type MadeProps = (u32, Callback<()>);
 type HeldCallback = Rc<RefCell<Option<Signal<MadeProps>>>>;
 
 /// The cold check reads the props a fresh placeholder passes and writes
-/// none: run while the child's props are borrowed, it neither aborts nor
-/// leaves the live props, or anything due to render, changed.
+/// none: opened while the child's props are borrowed, it is refused
+/// (ADR-0035, D4); run after, it leaves neither the live props nor anything
+/// due to render changed.
 #[cfg(debug_assertions)]
 #[test]
 fn a_cold_check_run_while_a_childs_props_are_borrowed_writes_none_of_them() {
@@ -696,7 +697,12 @@ fn a_cold_check_run_while_a_childs_props_are_borrowed_writes_none_of_them() {
     root.resolve();
     let props = held.borrow().expect("the child's props");
     assert_eq!(renders.get(), 1);
-    props.with_untracked(|_| root.cold(|f| f.resolve()));
+    // A check opened inside a lend of live state is refused, its body
+    // never run (ADR-0035, D4, F1b round 2): the props stay as they are.
+    let refused = props.with_untracked(|_| root.cold(|f| f.resolve()));
+    assert!(refused.is_none(), "a check opened inside a lend");
+    assert_eq!(cold_saw.get(), 0);
+    root.cold(|f| f.resolve());
     assert_eq!(
         cold_saw.get(),
         2,

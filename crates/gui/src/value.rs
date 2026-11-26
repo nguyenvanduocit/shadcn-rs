@@ -903,7 +903,7 @@ where
     }
 
     fn tracked(&self) -> bool {
-        R::TRACKED || self.wait.as_ref().is_some_and(source::Wait::is_solo)
+        R::TRACKED || self.wait.as_ref().is_some_and(|w| w.is_solo())
     }
 
     fn prepare(&mut self, mark: &crate::reactive::Mark) {
@@ -915,7 +915,7 @@ where
     }
 
     fn eval(&mut self) -> bool {
-        let solo = self.wait.as_ref().is_some_and(source::Wait::is_solo);
+        let solo = self.wait.as_ref().is_some_and(|w| w.is_solo());
         let v = self.def.read.peek(solo);
         if self.last.as_ref() == Some(&v) {
             return false;

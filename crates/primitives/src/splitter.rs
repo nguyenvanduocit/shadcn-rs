@@ -544,16 +544,25 @@ pub trait Storage {
 /// A [`Storage`] that lasts as long as the app: layouts survive a group
 /// unmounting and mounting again. It is the world's that made it: a check
 /// saves nothing into a live one (ADR-0034, S7).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct MemoryStorage(Rc<WorldRefCell<HashMap<String, SavedLayout>>>);
+
+/// Its saved layouts, read through the cell's lend (a `WorldRefCell`'s own
+/// `Debug` names it only, ADR-0035 D4): what the writer runs, it runs as
+/// user code inside a lend.
+impl std::fmt::Debug for MemoryStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.with(|m| f.debug_tuple("MemoryStorage").field(m).finish())
+    }
+}
 
 impl Storage for MemoryStorage {
     fn load(&self, key: &str) -> Option<SavedLayout> {
-        self.0.borrow().get(key).cloned()
+        self.0.with(|m| m.get(key).cloned())
     }
 
     fn save(&self, key: &str, layout: SavedLayout) {
-        self.0.borrow_mut().insert(key.to_owned(), layout);
+        self.0.with_mut(|m| m.insert(key.to_owned(), layout));
     }
 }
 
@@ -1040,8 +1049,8 @@ impl<P: 'static> Splitter<P> {
             }
         });
         self.state.with_untracked(|s| {
-            s.before_collapse.borrow_mut().remove(&index);
-            s.told.borrow_mut().remove(&index);
+            s.before_collapse.with_mut(|m| m.remove(&index));
+            s.told.with_mut(|m| m.remove(&index));
         });
         self.roster.update(|r| *r = r.wrapping_add(1));
     }
@@ -1177,15 +1186,16 @@ impl<P: 'static> Splitter<P> {
         let constraints = gui::untracked(|| self.constraints());
         self.state.with_untracked(|s| {
             // Remember a panel's size as it collapses: expanding restores it.
-            let mut memory = s.before_collapse.borrow_mut();
-            for (i, c) in constraints.iter().enumerate() {
-                let (Some(&was), Some(&is)) = (now.get(i), next.get(i)) else {
-                    continue;
-                };
-                if c.collapsible && same(is, c.collapsed) && !same(was, c.collapsed) {
-                    memory.insert(i, was);
+            s.before_collapse.with_mut(|memory| {
+                for (i, c) in constraints.iter().enumerate() {
+                    let (Some(&was), Some(&is)) = (now.get(i), next.get(i)) else {
+                        continue;
+                    };
+                    if c.collapsible && same(is, c.collapsed) && !same(was, c.collapsed) {
+                        memory.insert(i, was);
+                    }
                 }
-            }
+            });
         });
         let held = gui::untracked(|| self.layout.get());
         if held != next {
@@ -1219,11 +1229,11 @@ impl<P: 'static> Splitter<P> {
         // what it was last told, the first telling included.
         for (i, (&shown, panel)) in sizes.iter().zip(&panels).enumerate() {
             let Some(panel) = panel else { continue };
-            let last = self.state.with_untracked(|s| s.told.borrow().get(&i).copied());
+            let last = self.state.with_untracked(|s| s.told.with(|t| t.get(&i).copied()));
             if last.is_some_and(|l| same(l, shown)) {
                 continue;
             }
-            self.state.with_untracked(|s| s.told.borrow_mut().insert(i, shown));
+            self.state.with_untracked(|s| s.told.with_mut(|t| t.insert(i, shown)));
             if let Some(f) = &panel.on_resize {
                 f.call((shown, last));
             }
@@ -1284,7 +1294,7 @@ impl<P: 'static> Splitter<P> {
         let saved = SavedLayout {
             layout: layout.to_vec(),
             expand_to: self.state.with_untracked(|s| {
-                let mut e: Vec<(usize, f64)> = s.before_collapse.borrow().iter().map(|(i, v)| (*i, *v)).collect();
+                let mut e: Vec<(usize, f64)> = s.before_collapse.with(|m| m.iter().map(|(i, v)| (*i, *v)).collect());
                 e.sort_by_key(|(i, _)| *i);
                 e
             }),
@@ -1311,7 +1321,7 @@ impl<P: 'static> Splitter<P> {
         let unsafe_layout = match saved {
             Some(saved) if saved.layout.len() == constraints.len() => {
                 self.state.with_untracked(|s| {
-                    *s.before_collapse.borrow_mut() = saved.expand_to.iter().copied().collect();
+                    s.before_collapse.replace(saved.expand_to.iter().copied().collect());
                 });
                 saved.layout
             }
@@ -1416,7 +1426,7 @@ impl<P: 'static> Splitter<P> {
         }
         let before = self
             .state
-            .with_untracked(|s| s.before_collapse.borrow().get(&index).copied());
+            .with_untracked(|s| s.before_collapse.with(|m| m.get(&index).copied()));
         let to = before.filter(|b| *b >= c.min).unwrap_or(c.min);
         let last = index.saturating_add(1) == layout.len();
         let (pivot, delta) = if last {
@@ -1442,15 +1452,16 @@ impl<P: 'static> Splitter<P> {
     /// The boxes of the handles mounted now, by the panel each follows.
     fn handle_boxes(self) -> Vec<(usize, Bounds)> {
         self.state.with_untracked(|s| {
-            let mut boxes = s.handle_boxes.borrow_mut();
             let mounted: Vec<(usize, bool)> = s
                 .handles
                 .with(|l| l.iter().map(|h| (h.value, h.availability.actionable())).collect());
-            // A handle no longer mounted is forgotten, its thickness too.
-            boxes.retain(|i, _| mounted.iter().any(|(m, _)| m == i));
-            let mut out: Vec<(usize, Bounds)> = boxes.iter().map(|(i, b)| (*i, *b)).collect();
-            out.sort_by_key(|(i, _)| *i);
-            out
+            s.handle_boxes.with_mut(|boxes| {
+                // A handle no longer mounted is forgotten, its thickness too.
+                boxes.retain(|i, _| mounted.iter().any(|(m, _)| m == i));
+                let mut out: Vec<(usize, Bounds)> = boxes.iter().map(|(i, b)| (*i, *b)).collect();
+                out.sort_by_key(|(i, _)| *i);
+                out
+            })
         })
     }
 
@@ -1582,9 +1593,7 @@ impl<P: 'static> Splitter<P> {
         if self.limit.get_untracked().is_some() {
             self.limit.set(None);
         }
-        let partners = self
-            .state
-            .with_untracked(|s| std::mem::take(&mut *s.partners.borrow_mut()));
+        let partners = self.state.with_untracked(|s| s.partners.with_mut(std::mem::take));
         for m in partners {
             if m.alive() {
                 m.stop();
@@ -1617,10 +1626,10 @@ impl<P: 'static> Splitter<P> {
                 }
             }
             family.cross(&reached);
-            self.state.with_untracked(|s| *s.partners.borrow_mut() = partners);
+            self.state.with_untracked(|s| s.partners.with_mut(|p| *p = partners));
             return;
         }
-        let partners = self.state.with_untracked(|s| s.partners.borrow().clone());
+        let partners = self.state.with_untracked(|s| s.partners.with(Clone::clone));
         for m in &partners {
             if m.alive() {
                 m.drag(e);
@@ -1779,7 +1788,7 @@ impl<P: 'static> Splitter<P> {
             .item(d, Item::new(index, focus).availability(availability))
             .on_measured(move |b| {
                 self.state.with_untracked(|s| {
-                    s.handle_boxes.borrow_mut().insert(index, *b);
+                    s.handle_boxes.with_mut(|h| h.insert(index, *b));
                 });
             })
             .cursor(move || availability.actionable().then(|| self.cursor(index)))

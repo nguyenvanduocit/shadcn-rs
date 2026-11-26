@@ -1019,7 +1019,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
         if !crate::engine::is_cold() {
             if crate::engine::allocating(crate::reactive::has_owner) {
                 crate::reactive::on_release(move || {
-                    let freed = MEMOS.with(|m| m.borrow_mut().remove(id));
+                    let freed = MEMOS.with_borrow_mut(|m| m.remove(id));
                     drop(freed);
                 });
             } else {
@@ -1039,7 +1039,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// The memo, as the running frame sees it, read by `f` (nothing of the
     /// caller's runs in it).
     fn read<R>(self, f: impl FnOnce(&Memo<K, V>) -> R) -> Option<R> {
-        let rc = MEMOS.with(|m| m.borrow().read(self.id, |b| Rc::clone(&b.0)))?;
+        let rc = MEMOS.with_borrow(|m| m.read(self.id, |b| Rc::clone(&b.0)))?;
         let cell = rc.as_any().downcast_ref::<std::cell::RefCell<Memo<K, V>>>()?;
         let memo = cell.borrow();
         Some(f(&memo))
@@ -1050,7 +1050,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// takes out of the memo is handed back, to be dropped by the caller
     /// with nothing borrowed.
     fn write<R>(self, f: impl FnOnce(&mut Memo<K, V>) -> R) -> Option<R> {
-        let rc = MEMOS.with(|m| m.borrow().write(self.id, |b| Rc::clone(&b.0)))?;
+        let rc = MEMOS.with_borrow(|m| m.write(self.id, |b| Rc::clone(&b.0)))?;
         let cell = rc.as_any().downcast_ref::<std::cell::RefCell<Memo<K, V>>>()?;
         let mut memo = cell.borrow_mut();
         Some(f(&mut memo))
@@ -1567,7 +1567,7 @@ mod tests {
                 let _cold = crate::engine::ColdFrame::begin();
                 SHARED_MEMO.with(|k| *k)
             };
-            let held = |k: Keyed<&'static str, u32>| MEMOS.with(|m| m.borrow().contains(k.id));
+            let held = |k: Keyed<&'static str, u32>| MEMOS.with_borrow(|m| m.contains(k.id));
             assert!(!held(stand_in), "the fork's stand-in is gone with it");
             let live = SHARED_MEMO.with(|k| *k);
             let kept = crate::engine::in_cold_frame(|| SHARED_MEMO.with(|k| *k));

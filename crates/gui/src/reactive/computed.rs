@@ -70,7 +70,8 @@ impl<T: PartialEq + 'static> Computed<T> {
             let Ok(mut slot) = store.try_borrow_mut() else {
                 runtime::misuse(&format!("the computed made at {created_at} read itself"));
             };
-            if slot.as_ref() == Some(&new) {
+            // `T::eq` is app code run with the slot borrowed: a lend.
+            if crate::engine::lend(|| slot.as_ref() == Some(&new)) {
                 return false;
             }
             if runtime::cold_owns(id) {
@@ -123,7 +124,8 @@ impl<T: 'static> Computed<T> {
         let _batch = runtime::BatchGuard::new();
         let value = cell.try_borrow().ok();
         match value.as_deref() {
-            Some(Some(v)) => f(v),
+            // A lend to user code: no check opens inside it (ADR-0035, D4).
+            Some(Some(v)) => crate::engine::lend(|| f(v)),
             _ => runtime::misuse(&format!(
                 "the computed made at {} was read while it computes (it reads itself)",
                 self.created_at

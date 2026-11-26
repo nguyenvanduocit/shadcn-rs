@@ -88,6 +88,9 @@ impl Drop for Routing<'_> {
 
 /// Turns a component into frames and routes input back into it.
 pub struct Pipeline {
+    /// Its window's close as it ends ([`Closing`]): first, so before the
+    /// rest of it drops.
+    _closing: crate::engine::Ends<Closing>,
     /// The window's focus: made current as the window's code runs.
     focus: std::rc::Rc<crate::focus::FocusRoot>,
     /// The app's instance tree (ADR-0013).
@@ -167,7 +170,10 @@ pub struct Pipeline {
 /// placement, a scroll handle's layout read while placing a layer): no
 /// node to mark, so a change lays out and records the whole frame.
 struct Trackers {
-    scope: reactive::Scope,
+    /// Their scope, disposed in the pipeline's world as it ends: a live
+    /// pipeline a check lets go of has it disposed live, after the switch
+    /// (review r18, V2; ADR-0035).
+    _scope: crate::engine::Ends<TrackersScope>,
     layout: RenderNode,
     paint: RenderNode,
     /// One of them changed: the next frame is laid out and recorded whole.
@@ -189,7 +195,7 @@ impl Trackers {
         };
         let (layout, paint) = scope.run(|| (RenderNode::new(mark(&whole)), RenderNode::new(mark(&whole))));
         Self {
-            scope,
+            _scope: crate::engine::Ends::new(TrackersScope(scope)),
             layout,
             paint,
             whole,
@@ -197,18 +203,14 @@ impl Trackers {
     }
 }
 
-/// Their scope is the pipeline's world's: a live pipeline a check lets go
-/// of has its trackers' scope disposed live, once the check has switched
-/// back, never in the check's world, where the dispose would be the check's
-/// and the live scope never end (review r18, V2).
-impl Drop for Trackers {
-    fn drop(&mut self) {
-        let scope = self.scope;
-        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), self.whole.is_here(), move || {
-            if !std::thread::panicking() {
-                scope.dispose();
-            }
-        });
+/// The trackers' scope ([`Trackers`]).
+struct TrackersScope(reactive::Scope);
+
+impl crate::engine::Ending for TrackersScope {
+    fn end(self) {
+        if !std::thread::panicking() {
+            self.0.dispose();
+        }
     }
 }
 
@@ -224,22 +226,22 @@ fn no_update() -> accesskit::TreeUpdate {
 }
 
 /// The pipeline is its window's live owner (ADR-0034, S4 and S5): as it
-/// ends, its window closes, whoever still holds its `Rc`, in the window's
-/// own world. A live pipeline a check drops closes live once the check has
-/// switched back, through the release queue; never by the explicit close,
-/// which acts on the running world, so inside a check on the check's copy
-/// of the window, leaving the live one open with its mail (review r18,
-/// Codex 1). A drop never panics: a panic of the close is said and dropped.
-impl Drop for Pipeline {
-    fn drop(&mut self) {
-        let window = Rc::clone(&self.focus);
-        let root = self.root.closer();
-        let made_in_fork = window.made_in_fork();
-        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), made_in_fork, move || {
-            if let Err(said) = close_window(&window, root) {
-                eprintln!("gui: closing a window, user code panicked: {said}");
-            }
-        });
+/// ends, its window closes, whoever still holds its `Rc`, in the world that
+/// made the pipeline ([`crate::engine::Ends`], ADR-0035). A live pipeline a
+/// check drops closes live once the check has switched back; never by the
+/// explicit close, which acts on the running world (review r18, Codex 1).
+/// The close is its first field, so it ends before the rest. It never
+/// panics: a panic of the close is said and dropped.
+struct Closing {
+    window: Rc<crate::focus::FocusRoot>,
+    root: Box<dyn FnOnce()>,
+}
+
+impl crate::engine::Ending for Closing {
+    fn end(self) {
+        if let Err(said) = close_window(&self.window, self.root) {
+            eprintln!("gui: closing a window, user code panicked: {said}");
+        }
     }
 }
 
@@ -267,9 +269,14 @@ impl Pipeline {
             Some(c) => Box::new(c),
             None => Box::new(|| Element::Empty),
         };
+        let root = Root::of_pipeline(component);
         Self {
+            _closing: crate::engine::Ends::new(Closing {
+                window: Rc::clone(&focus),
+                root: Box::new(root.closer()),
+            }),
             focus,
-            root: Root::of_pipeline(component),
+            root,
             trackers: Trackers::new(),
             text: TextSystem::new(),
             painter: Painter::default(),
@@ -1903,7 +1910,7 @@ impl WindowHandler for Live {
     }
 
     fn window_actions(&mut self) -> Vec<WindowAction> {
-        std::mem::take(&mut *self.actions.borrow_mut())
+        self.actions.with_mut(std::mem::take)
     }
 
     fn idle(&mut self, target: &mut dyn Compose) -> Wake {

@@ -26,15 +26,74 @@ use crate::prelude::*;
 /// build: for a test of another crate's per-thread state (ADR-0034, S10).
 /// The production operation is the pipeline's check of a frame, with a
 /// closed report ([`crate::engine::CheckReport`]); this hook is the only
-/// raw closure entry outside `gui`, and is for tests.
+/// raw closure entry outside `gui`, is for tests, and is not in a release
+/// build.
+///
+/// `f` and what it gives back are `'static`, as every body the engine runs
+/// in a check is (a render, an effect): no borrow of live state, so no
+/// value lent to the caller, can be carried into a check, however the
+/// caller was reached (a closure, a trait method, a drop, another thread;
+/// ADR-0035 D4). What `f` can reach it reaches by handle, through the
+/// world checks.
+///
+/// ```compile_fail,E0521
+/// // Codex F1b r2: a check opened from a payload's `Debug`, its body
+/// // borrowing the payload a world cell lends.
+/// struct Probe(std::cell::Cell<u8>);
+/// impl std::fmt::Debug for Probe {
+///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+///         write!(f, "{:?}", gui::testing::check(|| self.0.set(9)))
+///     }
+/// }
+/// ```
+///
+/// ```compile_fail,E0521
+/// // Codex F1b r2: a scoped thread carrying a lent `&mut` into a check.
+/// let live = gui::engine::WorldRefCell::new("counter", 7);
+/// live.with_mut(|slot| {
+///     std::thread::scope(|scope| {
+///         scope.spawn(move || gui::testing::in_check(move || *slot = 9));
+///     });
+/// });
+/// ```
 ///
 /// # Panics
 /// `f` panicked (its panic goes on, as a string); the check faulted, was
 /// dropped at a site that cannot answer in one, or the thread is poisoned.
 #[doc(hidden)]
 #[cfg(debug_assertions)]
-pub fn in_check<R>(f: impl FnOnce() -> R) -> R {
+pub fn in_check<R: 'static>(f: impl FnOnce() -> R + 'static) -> R {
     crate::engine::in_cold_frame(f)
+}
+
+/// [`in_check`], its end said in the closed report, as a frame's check
+/// says it: its result if it stands, else why not. `f` is `'static`, as
+/// [`in_check`]'s is. A check opened while user code runs (inside a lend
+/// of world state, a render, an effect) is refused, its body never run:
+/// `Skipped` naming `InUserCode` (ADR-0035 D4's run-time rule).
+///
+/// ```compile_fail,E0597
+/// // Codex F1b r2: a check writing a collection row it borrows.
+/// let rows = gui::reactive::Collection::new([std::cell::Cell::new(7)]);
+/// let snapshot = rows.snapshot();
+/// let row = snapshot.get(0).unwrap();
+/// let _ = gui::testing::check(|| row.set(9));
+/// ```
+///
+/// # Errors
+/// The check did not stand: why.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn check<R: 'static>(f: impl FnOnce() -> R + 'static) -> Result<R, crate::engine::CheckReport> {
+    use crate::engine::{CheckReport, Ended, Mismatch};
+    match crate::engine::fork(f) {
+        Ended::Kept(out) => Ok(out),
+        Ended::Dropped(site) => Err(CheckReport::Skipped(site.to_owned())),
+        Ended::Cancelled => Err(CheckReport::Cancelled),
+        Ended::Poisoned => Err(CheckReport::Skipped(String::from("poisoned"))),
+        Ended::Panicked(said) => Err(CheckReport::Mismatch(Mismatch::Panicked(said))),
+        Ended::Faulted(fault) => Err(CheckReport::Faulted(fault.to_string())),
+    }
 }
 
 // ── Seeds ────────────────────────────────────────────────────────────────────

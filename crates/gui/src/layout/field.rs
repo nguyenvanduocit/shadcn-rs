@@ -63,7 +63,7 @@ impl LayoutTree {
         self.by_field
             .len()
             .saturating_add(self.mounting.capacity())
-            .saturating_add(self.fields.borrow().capacity())
+            .saturating_add(self.fields.with(Vec::capacity))
     }
 
     /// What placing text fields said of their scroll since last taken
@@ -72,7 +72,7 @@ impl LayoutTree {
     /// allocates nothing once they have grown.
     pub(crate) fn swap_fields(&self, into: &mut Vec<FieldSettled>) {
         into.clear();
-        std::mem::swap(&mut *self.fields.borrow_mut(), into);
+        self.fields.with_mut(|f| std::mem::swap(f, into));
     }
 }
 

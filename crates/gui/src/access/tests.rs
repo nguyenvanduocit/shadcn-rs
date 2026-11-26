@@ -36,7 +36,7 @@ fn a_screen_reader_reads_names_roles_and_focus_and_can_press_and_type() {
                 .child(text("New agent")),
         )
         .child(div().aria_label("Close").role(Role::Button).child(icon(Icon::X)))
-        .child(div().aria_hidden().child(text("decoration")))
+        .child(div().aria_hidden(true).child(text("decoration")))
         .child(text_input(&field).placeholder("Ask the assistant").width(200.0))
         .into_element();
     let mut text_system = TextSystem::new();

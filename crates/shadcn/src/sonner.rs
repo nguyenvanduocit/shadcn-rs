@@ -218,7 +218,7 @@ struct Store {
 
 impl Store {
     fn last() -> Option<Self> {
-        TOASTERS.with(|t| t.borrow().iter().max_by_key(|(n, _)| **n).map(|(_, s)| **s))
+        TOASTERS.with_borrow(|t| t.iter().max_by_key(|(n, _)| **n).map(|(_, s)| **s))
     }
 
     /// Show `toast` as `id`, in front of the others, or in place of the
@@ -352,12 +352,9 @@ pub fn toaster() -> Element {
         // shared list (one that never mounts, a cold re-render's, leaves it).
         gui::while_mounted(move || {
             let n = gui::engine::unique_id(&MOUNTED);
-            TOASTERS.with(|t| {
-                t.borrow_mut()
-                    .replace(n, gui::engine::AppHandle::new(std::rc::Rc::new(store)))
-            });
+            TOASTERS.with_borrow_mut(|t| t.replace(n, gui::engine::AppHandle::new(std::rc::Rc::new(store))));
             move || {
-                TOASTERS.try_with(|t| t.borrow_mut().forget(&n)).ok();
+                TOASTERS.try_with(|t| t.with_mut(|t| t.forget(&n))).ok();
             }
         });
         move || stack(store)

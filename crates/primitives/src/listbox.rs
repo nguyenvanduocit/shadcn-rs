@@ -1696,15 +1696,16 @@ mod tests {
             }
         }
         let cell = Rc::new(Cell::new(0));
-        let outside = Bound::new(Outside(Rc::clone(&cell)));
-        let wrote = gui::testing::in_check(|| std::panic::catch_unwind(|| outside.set(1)));
+        let outside = Rc::new(Bound::new(Outside(Rc::clone(&cell))));
+        let held = Rc::clone(&outside);
+        let wrote = gui::testing::in_check(move || std::panic::catch_unwind(|| held.set(1)));
         assert!(wrote.is_err(), "loud");
         assert_eq!(cell.get(), 0, "nothing written");
         outside.set(2);
         assert_eq!(cell.get(), 2, "live, written");
         let signal = gui::Signal::new(0_u32);
         let held = Bound::new(signal);
-        gui::testing::in_check(|| held.set(1));
+        gui::testing::in_check(move || held.set(1));
         assert_eq!(signal.get_untracked(), 0, "a signal, written in the fork and put back");
     }
 }

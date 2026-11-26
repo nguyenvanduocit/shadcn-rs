@@ -1567,7 +1567,7 @@ impl<P: 'static> Carousel<P> {
                 let virt = gui::untracked(|| self.virt());
                 let time = gui::clock::current_seconds() * 1000.0;
                 self.state.with_untracked(|s| {
-                    *s.drag.borrow_mut() = Some(Drag {
+                    s.drag.replace(Some(Drag {
                         from: (e.x, e.y),
                         time,
                         base,
@@ -1578,12 +1578,12 @@ impl<P: 'static> Carousel<P> {
                         samples: Vec::new(),
                         position: base,
                         travel: 0.0,
-                    });
+                    }));
                 });
             }
             DragPhase::Move => self.drag_move(e, horizontal, options.fade),
             DragPhase::End => {
-                let drag = self.state.with_untracked(|s| s.drag.borrow_mut().take());
+                let drag = self.state.with_untracked(|s| s.drag.with_mut(Option::take));
                 let Some(drag) = drag.filter(|d| d.started && !d.aborted) else {
                     return;
                 };
@@ -1596,7 +1596,7 @@ impl<P: 'static> Carousel<P> {
             }
             // Stopped without a release: back to the snap it was on.
             DragPhase::Cancel => {
-                let drag = self.state.with_untracked(|s| s.drag.borrow_mut().take());
+                let drag = self.state.with_untracked(|s| s.drag.with_mut(Option::take));
                 if drag.is_some_and(|d| d.started && !d.aborted) {
                     self.dragging.set(false);
                     let to = gui::untracked(|| self.position());
@@ -1613,7 +1613,7 @@ impl<P: 'static> Carousel<P> {
     fn drag_move(self, e: &DragEvent, horizontal: bool, fade: bool) {
         let (dx, dy) = self
             .state
-            .with_untracked(|s| s.drag.borrow().as_ref().map(|d| (e.x - d.from.0, e.y - d.from.1)))
+            .with_untracked(|s| s.drag.with(|d| d.as_ref().map(|d| (e.x - d.from.0, e.y - d.from.1))))
             .unwrap_or_default();
         let (along, across) = if horizontal { (dx, dy) } else { (dy, dx) };
         // Pointer towards the start moves the track on; right to left the
@@ -1625,32 +1625,33 @@ impl<P: 'static> Carousel<P> {
         let (here, ..) = self.place();
         let here = here + self.shift.get_untracked();
         let moved = self.state.with_untracked(|s| {
-            let mut drag = s.drag.borrow_mut();
-            let d = drag.as_mut()?;
-            if d.aborted {
-                return None;
-            }
-            if !d.started {
-                if along.abs() < DRAG_START {
+            s.drag.with_mut(|drag| {
+                let d = drag.as_mut()?;
+                if d.aborted {
                     return None;
                 }
-                // Mostly across the axis: the page's gesture.
-                if across.abs() > along.abs() {
-                    d.aborted = true;
-                    return None;
+                if !d.started {
+                    if along.abs() < DRAG_START {
+                        return None;
+                    }
+                    // Mostly across the axis: the page's gesture.
+                    if across.abs() > along.abs() {
+                        d.aborted = true;
+                        return None;
+                    }
+                    d.started = true;
+                    d.base = here;
+                    began = true;
                 }
-                d.started = true;
-                d.base = here;
-                began = true;
-            }
-            d.distance = d.distance.max(along.abs());
-            d.travel = travel;
-            d.position = d.base + travel;
-            d.samples.push((now, d.position));
-            if d.samples.len() > 20 {
-                d.samples.remove(0);
-            }
-            Some((d.position, d.distance))
+                d.distance = d.distance.max(along.abs());
+                d.travel = travel;
+                d.position = d.base + travel;
+                d.samples.push((now, d.position));
+                if d.samples.len() > 20 {
+                    d.samples.remove(0);
+                }
+                Some((d.position, d.distance))
+            })
         });
         let Some((position, distance)) = moved else {
             return;

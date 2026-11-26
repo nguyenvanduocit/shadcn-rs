@@ -150,8 +150,8 @@ pub fn highlight_code(code: &str, language: &str) -> Option<Vec<Vec<HighlightedT
     let grammar = grammar(language)?;
     let h = highlighting();
     let key = (code.to_owned(), grammar);
-    if let Some(lines) = h.0.kept.borrow().get(&key) {
-        return Some(lines.as_ref().clone());
+    if let Some(lines) = h.0.kept.with(|kept| kept.get(&key).map(|l| l.as_ref().clone())) {
+        return Some(lines);
     }
     let highlighter = h.0.highlighter.as_ref()?;
     let lines = Rc::new(if grammar == "ansi" {
@@ -162,11 +162,12 @@ pub fn highlight_code(code: &str, language: &str) -> Option<Vec<Vec<HighlightedT
     if !h.0.kept.is_here() {
         return Some(lines.as_ref().clone());
     }
-    let mut kept = h.0.kept.borrow_mut();
-    if kept.len() >= KEPT {
-        kept.clear();
-    }
-    kept.insert(key, Rc::clone(&lines));
+    h.0.kept.with_mut(|kept| {
+        if kept.len() >= KEPT {
+            kept.clear();
+        }
+        kept.insert(key, Rc::clone(&lines));
+    });
     Some(lines.as_ref().clone())
 }
 

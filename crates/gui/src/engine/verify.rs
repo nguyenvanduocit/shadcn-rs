@@ -47,7 +47,7 @@ fn a_fork_map_in_a_check_is_the_std_map_and_live_is_untouched() {
                 model.insert(k, v);
             }
         });
-        let live = MAP.with(|m| map_seen(&m.borrow()));
+        let live = MAP.with_borrow(map_seen);
         let steps = in_cold_frame(|| {
             let mut model = model.clone();
             let mut steps = 0;
@@ -67,13 +67,13 @@ fn a_fork_map_in_a_check_is_the_std_map_and_live_is_untouched() {
                 });
                 let mut want: Vec<(u64, u32)> = model.iter().map(|(k, v)| (*k, *v)).collect();
                 want.sort_unstable();
-                assert_eq!(MAP.with(|m| map_seen(&m.borrow())), want, "seed {seed}: as a set");
+                assert_eq!(MAP.with_borrow(map_seen), want, "seed {seed}: as a set");
                 steps += 1;
             }
             steps
         });
         assert_eq!(
-            MAP.with(|m| map_seen(&m.borrow())),
+            MAP.with_borrow(map_seen),
             live,
             "seed {seed} ({steps} steps): live untouched"
         );
@@ -104,7 +104,7 @@ fn a_fork_slab_in_a_check_is_the_std_model_and_live_is_untouched() {
         });
         let before: Vec<Option<u32>> = live
             .values()
-            .map(|(id, _)| SLAB.with(|s| s.borrow().read(*id, |v| *v)))
+            .map(|(id, _)| SLAB.with_borrow(|s| s.read(*id, |v| *v)))
             .collect();
         let escaped = in_cold_frame(|| {
             // The model: each handle the check knows, and what it holds.
@@ -126,13 +126,13 @@ fn a_fork_slab_in_a_check_is_the_std_model_and_live_is_untouched() {
                     }
                     3 if !model.is_empty() => {
                         let (id, held) = model[rng.index(model.len())];
-                        assert_eq!(SLAB.with(|s| s.borrow().read(id, |x| *x)), held, "read");
-                        assert_eq!(SLAB.with(|s| s.borrow().contains(id)), held.is_some(), "contains");
+                        assert_eq!(SLAB.with_borrow(|s| s.read(id, |x| *x)), held, "read");
+                        assert_eq!(SLAB.with_borrow(|s| s.contains(id)), held.is_some(), "contains");
                     }
                     4 if !model.is_empty() => {
                         let at = rng.index(model.len());
                         let (id, held) = model[at];
-                        let wrote = SLAB.with(|s| s.borrow().write(id, |x| *x = v));
+                        let wrote = SLAB.with_borrow(|s| s.write(id, |x| *x = v));
                         assert_eq!(wrote.is_some(), held.is_some(), "write");
                         if held.is_some() {
                             model[at].1 = Some(v);
@@ -140,7 +140,7 @@ fn a_fork_slab_in_a_check_is_the_std_model_and_live_is_untouched() {
                     }
                     _ => {
                         let held = model.iter().filter(|(_, h)| h.is_some()).count();
-                        assert_eq!(SLAB.with(|s| s.borrow().len()), held, "len");
+                        assert_eq!(SLAB.with_borrow(|s| s.len()), held, "len");
                     }
                 }
             }
@@ -148,14 +148,14 @@ fn a_fork_slab_in_a_check_is_the_std_model_and_live_is_untouched() {
         });
         let after: Vec<Option<u32>> = live
             .values()
-            .map(|(id, _)| SLAB.with(|s| s.borrow().read(*id, |v| *v)))
+            .map(|(id, _)| SLAB.with_borrow(|s| s.read(*id, |v| *v)))
             .collect();
         assert_eq!(after, before, "seed {seed}: live untouched");
-        assert_eq!(SLAB.with(|s| s.borrow().len()), live.len(), "seed {seed}: live length");
+        assert_eq!(SLAB.with_borrow(|s| s.len()), live.len(), "seed {seed}: live length");
         let live_ids: Vec<SlabId> = live.values().map(|(id, _)| *id).collect();
         for id in escaped.into_iter().filter(|id| !live_ids.contains(id)) {
             assert_eq!(
-                SLAB.with(|s| s.borrow().read(id, |v| *v)),
+                SLAB.with_borrow(|s| s.read(id, |v| *v)),
                 None,
                 "seed {seed}: an escaped handle names nothing"
             );
@@ -369,7 +369,7 @@ fn run(steps: Vec<Step>, body_panics: bool) -> Expected {
         // The live releases, after the switch, as the pipeline runs them.
         let _failed = std::panic::catch_unwind(super::run_releases);
         assert!(!V3_LIVE.get(), "the live state is whole");
-        assert_eq!(V3.with(|v| v.borrow().len()), 0, "the live slab is whole");
+        assert_eq!(V3.with_borrow(|v| v.len()), 0, "the live slab is whole");
         drop(tx);
         Expected {
             outcome,
@@ -486,13 +486,19 @@ enum Probe {
         pins: bool,
     },
     /// A check whose render reaches the app's root (review r17): resolves
-    /// it (a poisoned one mounted anew in the check's world), closes it and
-    /// disposes of the scope that owns it. All of it is the check's: the
-    /// live root stays as live code left it.
+    /// it (a poisoned one mounted anew in the check's world). It is the
+    /// check's: the live root stays as live code left it.
     Speculative,
+    /// [`Probe::Speculative`], then the check closes the live root and
+    /// disposes of the live scope that owns it: a value's end outside the
+    /// world that made it, refused, the check faulted (ADR-0035, D3, as
+    /// revised by D008), and checks off from there. The live root and its
+    /// scope stand.
+    CloseRootChecked,
     /// A check whose render closes the second, live window explicitly
-    /// (`Pipeline::close`): the close is the check's world's, and the live
-    /// window stays open (review r17, decision 3; r18, decision 6).
+    /// (`Pipeline::close`): its disposal of the live window's signals is
+    /// refused and the check faults (ADR-0035, D3); the live window stays
+    /// open (review r17, decision 3; r18, decision 6).
     CloseWindowChecked,
     /// A check whose render lets go of the second, live window (the app's
     /// last owner of it): its drop queues the window's close, which runs
@@ -666,7 +672,9 @@ fn differential(inputs: &[Input], probes: &[Probe]) -> (Vec<String>, Vec<String>
             })
         })
     }));
-    let speculative = Rc::new(Cell::new(false));
+    // What a check does to the app's root: `Some(false)` resolves it,
+    // `Some(true)` resolves it, closes it and disposes of its scope.
+    let speculative: Rc<Cell<Option<bool>>> = Rc::new(Cell::new(None));
     // A second window the app holds, whose work (an effect owning an
     // hour's timer) and mailbox are its own (review r18, decision 6).
     let second: Rc<RefCell<Option<crate::app::Pipeline>>> = Rc::new(RefCell::new(None));
@@ -712,12 +720,16 @@ fn differential(inputs: &[Input], probes: &[Probe]) -> (Vec<String>, Vec<String>
         // In a check only: text no live frame shows, and the parked values
         // whose disposal faults.
         let mut only_checked = None;
-        if super::forking() && spec_ui.take() {
+        if super::forking()
+            && let Some(ends) = spec_ui.take()
+        {
             if let Some(r) = root_ui.as_ref() {
                 let _ = r.resolve();
-                r.close();
+                if ends {
+                    r.close();
+                }
             }
-            if let Some(o) = root_scope_ui {
+            if ends && let Some(o) = root_scope_ui {
                 o.dispose();
             }
         }
@@ -820,10 +832,10 @@ fn differential(inputs: &[Input], probes: &[Probe]) -> (Vec<String>, Vec<String>
                 reports.push(format!("{:?}", s.check_report()));
                 teardown.set(None);
             }
-            Probe::Speculative => {
-                speculative.set(true);
+            Probe::Speculative | Probe::CloseRootChecked => {
+                speculative.set(Some(matches!(probe, Probe::CloseRootChecked)));
                 reports.push(format!("{:?}", s.check_report()));
-                speculative.set(false);
+                speculative.set(None);
             }
             Probe::CloseWindowChecked => {
                 window_probe.set(Some(true));
@@ -1039,9 +1051,10 @@ fn checks_at_generated_boundaries_change_no_live_step() {
         }
         // The r17 sequence in every run, before any teardown fault turns
         // checks off: the app's root poisoned live, a check that resolves
-        // it (mounting it anew in its world), closes it and disposes of
-        // its scope, then the live remount; and at the end a live close
-        // (review r17, decisions 1 and 3).
+        // it (mounting it anew in its world), then the live remount; and
+        // at the end a live close (review r17, decision 1). A check that
+        // closes it and disposes of its scope faults (ADR-0035, D3), so
+        // that one runs first in the runs below that have no other fault.
         inputs[0] = Input::Poison;
         probes[1] = Probe::Speculative;
         inputs[1] = Input::Remount;
@@ -1053,8 +1066,17 @@ fn checks_at_generated_boundaries_change_no_live_step() {
         // stays open), then one that lets go of it (the live close after
         // the switch back), or a live whole-window close (review r18,
         // decision 6).
-        probes[0] = Probe::CloseWindowChecked;
-        if seed % 2 == 0 {
+        // A check that closes the live window explicitly disposes of its
+        // live signals: refused, the check faulted (ADR-0035, D3), and
+        // checks off from there; in runs with no teardown fault, its live
+        // close follows.
+        if seed % 5 == 4 {
+            probes[0] = Probe::CloseWindowChecked;
+            inputs[2] = Input::CloseWindow;
+        } else if seed % 5 == 3 {
+            probes[1] = Probe::CloseRootChecked;
+            inputs[2] = Input::CloseWindow;
+        } else if seed % 2 == 0 {
             probes[2] = Probe::DropWindow;
         } else {
             inputs[2] = Input::CloseWindow;
@@ -1062,7 +1084,7 @@ fn checks_at_generated_boundaries_change_no_live_step() {
         // A teardown fault in most runs (the panicking value first, so
         // the views are pinned, in most of those), then the owner's end
         // at or after it; the views live until then.
-        if seed % 5 != 4 {
+        if seed % 5 < 3 {
             let at = 3 + rng.index(5);
             probes[at] = Probe::Teardown { pins: seed % 3 != 2 };
             for i in &mut inputs[..at] {
@@ -1115,7 +1137,14 @@ fn checks_at_generated_boundaries_change_no_live_step() {
                     Probe::Stray => r.starts_with("Mismatch(Layout("),
                     // Its closes and dispose are its own world's: it
                     // stands, as a check whose render did nothing else.
-                    Probe::Speculative | Probe::CloseWindowChecked | Probe::DropWindow => r == "Ok",
+                    Probe::Speculative | Probe::DropWindow => r == "Ok",
+                    // Its close disposes of the live window's signals, or
+                    // of the live root's nodes and scope: refused, a fault
+                    // (ADR-0035, D3); checks off after.
+                    Probe::CloseWindowChecked | Probe::CloseRootChecked => {
+                        off = true;
+                        r.starts_with("Faulted(") && r.contains("(Foreign of")
+                    }
                     Probe::LiveDropWindow => false,
                     Probe::Teardown { .. } => {
                         off = true;
@@ -1215,6 +1244,162 @@ fn a_live_pipeline_dropped_in_a_check_ends_as_a_live_drop() {
     assert_eq!(size(), live, "a live pipeline a check let go of left nodes behind");
 }
 
+/// What a rich window left once it ended ([`rich_window_ends`]).
+#[derive(Debug, PartialEq)]
+struct Left {
+    /// The reactive graph and its cleanups left.
+    graph: (crate::reactive::Graph, usize),
+    /// `BOUND` holds its two handles, and their flags.
+    bound: (bool, bool),
+    hovered: bool,
+    focused: bool,
+    /// The workers' closures still held (their tokens' extra counts).
+    workers: usize,
+    /// A send to its mailbox after, and the handler's count of deliveries.
+    mail: (bool, u32),
+    /// Every live id cursor its end moved.
+    ids: Vec<String>,
+}
+
+/// A window with interactive nodes hovered and focused, a list with a
+/// worker and a waiting view, a mailbox and a chart series, ended live or
+/// inside a check (ADR-0035, Verification, V2), on a thread of its own: an
+/// engine of its own.
+fn rich_window_ends(in_check: bool) -> Left {
+    std::thread::spawn(move || {
+        use crate::element::{IntoElement, div};
+        use crate::list::{ListState, View, Views};
+        use crate::styled::Styled;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        let size = || (crate::reactive::graph(), crate::reactive::cleanups());
+        let (hover, focus) = (crate::Interaction::new(), crate::Interaction::new());
+        let mut s = crate::app::Scenario::measuring(
+            move || {
+                div()
+                    .display(crate::Display::Flex)
+                    .flex_direction(crate::FlexDirection::Column)
+                    .child(div().width(40.0).height(40.0).interaction(hover))
+                    .child(div().width(40.0).height(40.0).focusable().interaction(focus))
+                    .into_element()
+            },
+            100,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("settled");
+        let token = Arc::new(());
+        let delivered = Rc::new(Cell::new(0_u32));
+        let mut sender = None;
+        let mut series = None;
+        let mut views = None;
+        let arrived = Rc::new(Cell::new(false));
+        let (t, d, a) = (Arc::clone(&token), Rc::clone(&delivered), Rc::clone(&arrived));
+        s.act("the window's work", || {
+            let list = ListState::new(24.0);
+            let rows = crate::reactive::Collection::new(0..2_000_u32);
+            let shown = Views::new(&list, View::identity(2_000), move |_: View| a.set(true));
+            let t2 = Arc::clone(&t);
+            shown.spawn(
+                rows.snapshot(),
+                |v: &u32| u64::from(*v),
+                move |_: &u32| {
+                    let _ = &t2;
+                    true
+                },
+                Some(|a: &u32, b: &u32| b.cmp(a)),
+            );
+            // A second view, its result left waiting in its mailbox.
+            let waiting = Views::new(&list, View::identity(2_000), |_: View| {});
+            waiting.spawn(
+                rows.snapshot(),
+                |v: &u32| u64::from(*v),
+                move |_: &u32| {
+                    let _ = &t;
+                    true
+                },
+                Some(|a: &u32, b: &u32| a.cmp(b)),
+            );
+            views = Some((shown, waiting));
+            sender = Some(crate::mailbox::mailbox(move |n: u32| d.set(d.get() + n)));
+            let plot = crate::chunk::plot::series();
+            plot.push(1, 2.0);
+            series = Some(plot);
+        });
+        s.click(10.0, 60.0);
+        s.settle().expect("settled");
+        s.hover(10.0, 10.0);
+        s.settle().expect("settled");
+        assert_eq!(
+            (hover.hovered(), focus.focused()),
+            (true, true),
+            "hovered and focused before"
+        );
+        let sender = sender.expect("made");
+        assert!(sender.send(1));
+        // The shown view arrives (its loan of heights made), so both
+        // engines drop the same window.
+        for _ in 0..10_000 {
+            let _ = crate::mailbox::deliver();
+            if arrived.get() && delivered.get() == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(arrived.get(), "no view arrived");
+        assert_eq!(delivered.get(), 1, "the mailbox delivers while the window lives");
+        // The window, its list's views and its chart, let go of together.
+        // (How many turns the arrival took varies: ids compare from here.)
+        let made = live_ids();
+        let all = (s, views, series);
+        if in_check {
+            in_cold_frame(move || drop(all));
+        } else {
+            drop(all);
+        }
+        super::run_releases();
+        // A worker cancelled ends its closure once it sees so.
+        for _ in 0..2_000 {
+            if Arc::strong_count(&token) == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let sent = sender.send(2);
+        let _ = crate::mailbox::deliver();
+        Left {
+            graph: size(),
+            bound: (hover.is_bound(), focus.is_bound()),
+            hovered: hover.hovered(),
+            focused: focus.focused(),
+            workers: Arc::strong_count(&token) - 1,
+            mail: (sent, delivered.get()),
+            // The turns' own count aside: a turn runs as each worker's
+            // outcome arrives, which is the outside world's timing.
+            ids: live_ids()
+                .into_iter()
+                .filter(|id| !made.contains(id) && !id.starts_with("crates/gui/src/engine/turn.rs:"))
+                .collect(),
+        }
+    })
+    .join()
+    .expect("ran")
+}
+
+/// A rich window a check lets go of ends as one the app lets go of live
+/// (ADR-0035, V2): no signal, binding, flag, worker closure, delivery or
+/// id is left or made that the live drop does not leave or make.
+#[test]
+fn a_rich_window_dropped_in_a_check_ends_as_a_live_drop() {
+    let live = rich_window_ends(false);
+    assert!(
+        !live.hovered && !live.focused && live.workers == 0,
+        "the live drop itself leaves something: {live:?}"
+    );
+    assert_eq!(rich_window_ends(true), live);
+}
+
 /// The median time of `runs` checks each running `f(k)` for the next `k`.
 fn median_check(runs: usize, f: impl Fn(usize)) -> std::time::Duration {
     let mut samples: Vec<std::time::Duration> = (0..runs)
@@ -1228,33 +1413,36 @@ fn median_check(runs: usize, f: impl Fn(usize)) -> std::time::Duration {
     samples.get(samples.len() / 2).copied().unwrap_or_default()
 }
 
-/// What a check's first write to one entry of `ROOTS` and of `VIEWS`
-/// costs, with 10 and with 10,000 live entries (review r18, decision 6):
-/// the entry, not the table. A check that closes one of 10,000 live roots,
-/// or asks one of 10,000 live views for a build, copies that entry alone;
-/// its cost over an empty check stays within a small factor of the same
-/// check over 10 entries. The numbers are printed (`--nocapture`).
+/// What a check's first write to one entry of a logged slab and of
+/// `VIEWS` costs, with 10 and with 10,000 live entries (review r18,
+/// decision 6): the entry, not the table. A check that writes one of
+/// 10,000 live entries (a root's state, as `ROOTS` holds it), or asks one
+/// of 10,000 live views for a build, copies that entry alone; its cost
+/// over an empty check stays within a small factor of the same check over
+/// 10 entries. The numbers are printed (`--nocapture`). (A check that
+/// closes a live root faults since ADR-0035, D3: the slab's write is the
+/// one the close made first.)
 #[test]
 fn a_checks_first_write_costs_the_entry_not_the_table() {
-    use crate::component::Root;
     use crate::list::{ListState, View, Views};
     use crate::reactive::{Collection, Scope};
     const RUNS: usize = 41;
     let measure = |n: usize| {
         let scope = Scope::new();
         let list = ListState::new(24.0);
-        let (roots, views): (Vec<Root>, Vec<Views>) = scope.run(|| {
+        let (roots, views): (Vec<SlabId>, Vec<Views>) = scope.run(|| {
             (0..n)
                 .map(|_| {
-                    let root = Root::new(|| crate::element::Element::Empty);
-                    let _ = root.resolve();
-                    (root, Views::new(&list, View::identity(4), |_: View| {}))
+                    let entry = super::allocate(&SLAB, 0_u32);
+                    (entry, Views::new(&list, View::identity(4), |_: View| {}))
                 })
                 .unzip()
         });
         let c = Collection::new(0..4_u32);
         let empty = median_check(RUNS, |_| {});
-        let root = median_check(RUNS, |k| roots[(k * 7919) % n].close());
+        let root = median_check(RUNS, |k| {
+            SLAB.with_borrow(|s| s.write(roots[(k * 7919) % n], |v| *v = v.wrapping_add(1)));
+        });
         let view = median_check(RUNS, |k| {
             views[(k * 7919) % n].spawn(
                 c.snapshot(),
@@ -1263,7 +1451,12 @@ fn a_checks_first_write_costs_the_entry_not_the_table() {
                 None::<fn(&u32, &u32) -> std::cmp::Ordering>,
             );
         });
-        drop((roots, views));
+        SLAB.with_borrow_mut(|s| {
+            roots.into_iter().for_each(|id| {
+                let _ = s.remove(id);
+            })
+        });
+        drop(views);
         scope.dispose();
         c.dispose();
         (empty, root.saturating_sub(empty), view.saturating_sub(empty))
@@ -1327,7 +1520,7 @@ fn v6_gates() {
         in_cold_frame(|| {
             let _was = BIG.with_borrow_mut(|m| m.insert(i, 0));
             let id = ids[usize::try_from(i).unwrap_or(0)];
-            ROWS.with(|s| s.borrow().write(id, |v| *v = 0));
+            ROWS.with_borrow(|s| s.write(id, |v| *v = 0));
         });
         times.push(at.elapsed());
         touched.push(super::fork_work_done() - before);

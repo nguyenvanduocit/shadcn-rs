@@ -34,6 +34,6 @@ pub fn visually_hidden(d: Div, how: Hidden) -> Div {
         .nowrap(true);
     match how {
         Hidden::Visually => d,
-        Hidden::Fully => d.aria_hidden().tab_stop(false),
+        Hidden::Fully => d.aria_hidden(true).tab_stop(false),
     }
 }

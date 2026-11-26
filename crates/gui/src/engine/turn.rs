@@ -341,12 +341,19 @@ pub fn call_out<R>(site: Site, f: impl FnOnce() -> R) -> Option<R> {
 /// With no turn under way it opens one ([`in_turn`]): user code never runs
 /// bare, whatever path reached it.
 pub(crate) fn reach<R>(_site: Site, f: impl FnOnce() -> R) -> Option<R> {
+    // User code runs: no check opens inside it (ADR-0035, D4).
+    let f = move || super::lend(f);
     if !dispatching() {
         if super::forking() {
             return Some(f());
         }
-        return in_turn(|_| reach(_site, f)).flatten();
+        return in_turn(|_| reached(f)).flatten();
     }
+    reached(f)
+}
+
+/// Run `f`, user code inside a turn: its panic to the arbiter and `None`.
+fn reached<R>(f: impl FnOnce() -> R) -> Option<R> {
     match catch_unwind(AssertUnwindSafe(f)) {
         Ok(r) => Some(r),
         Err(p) => {
@@ -806,10 +813,5 @@ impl<T: Clone + PartialEq + std::fmt::Debug + 'static> Owned<T> {
     /// Release it with its owner (a window gone).
     pub(crate) fn dispose_quietly(self) {
         self.0.dispose_quietly();
-    }
-
-    /// Whether a fork made it.
-    pub(crate) fn made_in_fork(self) -> bool {
-        self.0.made_in_fork()
     }
 }

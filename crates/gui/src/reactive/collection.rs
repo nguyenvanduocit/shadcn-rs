@@ -257,7 +257,8 @@ impl<T: Clone + 'static> Collection<T> {
     /// Change item `at` in place.
     pub fn update(&self, at: usize, f: impl FnOnce(&mut T)) {
         self.edit(|s| {
-            if s.items.update(at, |p| f(&mut p.0)).is_some() {
+            // A lend to user code: no check opens inside it (ADR-0035, D4).
+            if s.items.update(at, |p| crate::engine::lend(|| f(&mut p.0))).is_some() {
                 s.record(Change::Update { at });
             }
         });

@@ -56,7 +56,7 @@
 //! gui::engine_local! {
 //!     [Fork(log)] static ROWS: RefCell<gui::engine::ForkMap<u64, u8>> = RefCell::default();
 //! }
-//! ROWS.with(|c| drop(std::mem::take(&mut *c.borrow_mut())));
+//! ROWS.with(|c| c.with_mut(|m| drop(std::mem::take(&mut **m))));
 //! ```
 //!
 //! ```compile_fail,E0596
@@ -66,6 +66,26 @@
 //!     [Fork(log)] static B: RefCell<gui::engine::ForkSlab<u8>> = RefCell::default();
 //! }
 //! A.with_borrow_mut(|a| B.with_borrow_mut(|b| std::mem::swap(&mut **a, &mut **b)));
+//! ```
+//!
+//! Nor does the cell lend a guard (ADR-0035, D4): it lends to a closure
+//! alone, so no borrow can be forgotten or held across a check's switch.
+//!
+//! ```compile_fail,E0599
+//! // Codex r19-1's reproducer: a guard forgotten inside a check.
+//! use std::cell::RefCell;
+//! gui::engine_local! {
+//!     [Fork(log)] static ROWS: RefCell<gui::engine::ForkMap<u64, u8>> = RefCell::default();
+//! }
+//! ROWS.with(|cell| std::mem::forget(cell.borrow()));
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use std::cell::RefCell;
+//! gui::engine_local! {
+//!     [Fork(log)] static ROWS: RefCell<gui::engine::ForkMap<u64, u8>> = RefCell::default();
+//! }
+//! ROWS.with(|cell| std::mem::forget(cell.try_borrow_mut()));
 //! ```
 //!
 //! Swapping two views swaps two borrows, not the collections. The writes
@@ -78,11 +98,11 @@
 //!     [Fork(log)] static SLAB: RefCell<gui::engine::ForkSlab<u8>> = RefCell::default();
 //! }
 //! ROWS.with_borrow_mut(|rows| rows.replace(1, 7));
-//! ROWS.with(|c| c.borrow_mut().insert(2, 8));
+//! ROWS.with(|c| c.with_mut(|r| r.insert(2, 8)));
 //! let id = SLAB.with_borrow_mut(|s| s.insert(3));
 //! SLAB.with_borrow(|s| s.write(id, |v| *v += 1));
 //! assert_eq!(ROWS.with_borrow(|r| r.len()), 2);
-//! assert_eq!(SLAB.with(|s| s.borrow().read(id, |v| *v)), Some(4));
+//! assert_eq!(SLAB.with(|s| s.with(|s| s.read(id, |v| *v))), Some(4));
 //! ```
 //!
 //! No code, `gui`'s included, reaches a logged collection mutably but
@@ -92,7 +112,7 @@
 //! are). Were a container replaced all the same, the switch finds it: its
 //! rollback finds no log it began, and the check faults (S2).
 
-use std::cell::{Ref, RefCell, RefMut};
+use std::cell::{RefCell, RefMut};
 use std::ops::Deref;
 
 use super::{EngineKey, ForkClone, ForkKey, ForkMap, ForkSlab, Logged, SlabId};
@@ -130,7 +150,7 @@ impl<L: Logged> LogKey<RefCell<L>> {
     }
 
     /// `f` given the piece's cell, which lends the collection out by
-    /// [`LogCell::borrow`] and [`LogCell::borrow_mut`] only.
+    /// [`LogCell::with`] and [`LogCell::with_mut`] only, to a closure.
     pub fn with<R>(&'static self, f: impl FnOnce(LogCell<'_, L>) -> R) -> R {
         self.key.with(|cell| f(LogCell { cell }))
     }
@@ -145,16 +165,12 @@ impl<L: Logged> LogKey<RefCell<L>> {
 
     /// `f` given the collection to read.
     pub fn with_borrow<R>(&'static self, f: impl FnOnce(&L) -> R) -> R {
-        self.key.with(|cell| f(&cell.borrow()))
+        self.with(|c| c.with(f))
     }
 
     /// `f` given the collection to write through its overlay API.
     pub fn with_borrow_mut<R>(&'static self, f: impl FnOnce(&mut LogMut<'_, L>) -> R) -> R {
-        self.key.with(|cell| {
-            f(&mut LogMut {
-                inner: cell.borrow_mut(),
-            })
-        })
+        self.with(|c| c.with_mut(f))
     }
 }
 
@@ -173,41 +189,35 @@ impl<L> Clone for LogCell<'_, L> {
 
 impl<L> Copy for LogCell<'_, L> {}
 
-impl<'a, L> LogCell<'a, L> {
-    /// The collection, to read.
+impl<L> LogCell<'_, L> {
+    /// `f` given the collection to read.
     ///
     /// # Panics
     /// It is borrowed to write.
-    #[must_use]
-    pub fn borrow(self) -> Ref<'a, L> {
-        self.cell.borrow()
+    pub fn with<R>(self, f: impl FnOnce(&L) -> R) -> R {
+        super::lend(|| f(&self.cell.borrow()))
     }
 
-    /// The collection, to write through its overlay API.
+    /// `f` given the collection to write through its overlay API.
     ///
     /// # Panics
     /// It is borrowed.
-    #[must_use]
-    pub fn borrow_mut(self) -> LogMut<'a, L> {
-        LogMut {
-            inner: self.cell.borrow_mut(),
-        }
+    pub fn with_mut<R>(self, f: impl FnOnce(&mut LogMut<'_, L>) -> R) -> R {
+        super::lend(|| {
+            f(&mut LogMut {
+                inner: self.cell.borrow_mut(),
+            })
+        })
     }
 
-    /// [`Self::borrow`], unless it is borrowed to write.
-    ///
-    /// # Errors
-    /// It is borrowed to write.
-    pub fn try_borrow(self) -> Result<Ref<'a, L>, std::cell::BorrowError> {
-        self.cell.try_borrow()
+    /// [`Self::with`], `None` while it is borrowed to write.
+    pub fn try_with<R>(self, f: impl FnOnce(&L) -> R) -> Option<R> {
+        super::lend(|| self.cell.try_borrow().ok().map(|l| f(&l)))
     }
 
-    /// [`Self::borrow_mut`], unless it is borrowed.
-    ///
-    /// # Errors
-    /// It is borrowed.
-    pub fn try_borrow_mut(self) -> Result<LogMut<'a, L>, std::cell::BorrowMutError> {
-        self.cell.try_borrow_mut().map(|inner| LogMut { inner })
+    /// [`Self::with_mut`], `None` while it is borrowed.
+    pub fn try_with_mut<R>(self, f: impl FnOnce(&mut LogMut<'_, L>) -> R) -> Option<R> {
+        super::lend(|| self.cell.try_borrow_mut().ok().map(|inner| f(&mut LogMut { inner })))
     }
 }
 

@@ -120,7 +120,8 @@ impl NodeId {
     }
 
     /// Whether a fork made it (its generation is the forks' space, its
-    /// slot in the forks' region, `FORK_NODE`).
+    /// slot in the forks' region, `FORK_NODE`). Tests.
+    #[cfg(test)]
     pub(crate) fn made_in_fork(self) -> bool {
         self.generation & crate::engine::FORK_GENERATION != 0
     }
@@ -466,6 +467,11 @@ pub(crate) struct Runtime {
     /// While a cold frame runs: its undo log ([`ColdLog`]).
     #[cfg(debug_assertions)]
     cold: Option<Box<ColdLog>>,
+    /// The one node the engine's re-run retirement disposes now
+    /// ([`Runtime::retire`]): a cold frame's disposal of any other live
+    /// node is refused (ADR-0035, D3).
+    #[cfg(debug_assertions)]
+    retiring: Option<usize>,
     /// While a component's render or setup runs ([`rendering`]), or a
     /// computed's getter: its number (from 1, one per run) and what runs. A
     /// render is pure and a getter too, so neither writes a live signal but
@@ -601,6 +607,9 @@ fn untracked_call(f: impl FnOnce()) {
 pub(crate) struct OwnerGuard {
     prev_sub: usize,
     prev_owner: Option<Option<NodeId>>,
+    /// What runs under it is user code: a check opened in it is refused
+    /// (ADR-0035 D4).
+    _user: crate::engine::UserCode,
 }
 
 /// Its steps are the engine's own scoping, which a Shared init may take
@@ -612,6 +621,7 @@ impl OwnerGuard {
             with(|rt| Self {
                 prev_sub: std::mem::replace(&mut rt.active_sub, NONE),
                 prev_owner: set_owner.then(|| std::mem::replace(&mut rt.active_owner, owner)),
+                _user: crate::engine::UserCode::enter(),
             })
         })
     }
@@ -1235,11 +1245,48 @@ impl Runtime {
         }
     }
 
-    /// Dispose `id`'s node if it is alive.
-    pub(crate) fn dispose(&mut self, id: NodeId) {
-        if self.live(id).is_some() {
-            self.dispose_index(id.index);
+    /// The engine's re-run retirement of scope `id` (ADR-0035, D3): a live
+    /// instance rendered again retires its old render scope, a failed
+    /// render's tree is torn down. In a cold frame, the arena's own
+    /// transaction, logged and rolled back with its owner still holding it.
+    /// It permits exactly this node: whatever its cascade reaches through
+    /// [`Self::dispose`] (an app value dropped, a cleanup) is refused as any
+    /// other disposal is.
+    pub(crate) fn retire(&mut self, id: NodeId) {
+        #[cfg(debug_assertions)]
+        {
+            self.retiring = Some(id.index);
         }
+        self.dispose(id);
+        #[cfg(debug_assertions)]
+        {
+            self.retiring = None;
+        }
+    }
+
+    /// Dispose `id`'s node if it is alive. Inside a cold frame, a live
+    /// node's disposal, of any kind, is refused, the frame's fault
+    /// (ADR-0035, D3), unless it is the one node the engine retires now
+    /// ([`Self::retire`]): a disposal from anywhere else is a value's end,
+    /// and a live value's ends live (rolled back, the node would come back
+    /// with no Rust owner). The discriminator is the cause, never the kind.
+    pub(crate) fn dispose(&mut self, id: NodeId) {
+        #[cfg(debug_assertions)]
+        let retired = self.retiring.take() == Some(id.index);
+        if self.live(id).is_none() {
+            return;
+        }
+        #[cfg(debug_assertions)]
+        if self.cold.is_some() && !retired && ColdLog::live(id.index) {
+            let made_at = self.live(id).map(|n| n.created_at);
+            crate::engine::foreign_disposal(format!(
+                "{} (made at {})",
+                self.signal_ref(id.index),
+                made_at.map_or_else(String::new, ToString::to_string)
+            ));
+            return;
+        }
+        self.dispose_index(id.index);
     }
 
     /// Take node `i` out of the graph: its children and owned nodes first
@@ -1479,6 +1526,8 @@ struct RunGuard {
     prev_sub: usize,
     prev_owner: Option<NodeId>,
     effect: bool,
+    /// The run is user code: a check opened in it is refused (ADR-0035 D4).
+    _user: crate::engine::UserCode,
 }
 
 impl Drop for RunGuard {
@@ -1518,6 +1567,7 @@ pub(crate) fn update_computed(i: usize) -> bool {
             prev_sub: std::mem::replace(&mut rt.active_sub, i),
             prev_owner: rt.active_owner.replace(id),
             effect: false,
+            _user: crate::engine::UserCode::enter(),
         };
         rt.cycle = rt.cycle.wrapping_add(1);
         Some((update, guard))
@@ -1548,6 +1598,7 @@ fn run_effect_body(i: usize) {
             prev_sub: std::mem::replace(&mut rt.active_sub, i),
             prev_owner: rt.active_owner.replace(id),
             effect: true,
+            _user: crate::engine::UserCode::enter(),
         };
         rt.cycle = rt.cycle.wrapping_add(1);
         rt.run_depth = rt.run_depth.saturating_add(1);
@@ -2003,7 +2054,7 @@ pub(crate) fn trigger(f: impl FnOnce(), created_at: &'static Location<'static>) 
     let _batch = BatchGuard::new();
     {
         let prev = with(|rt| std::mem::replace(&mut rt.active_sub, temp.index));
-        let _restore = RestoreSub(prev);
+        let _restore = RestoreSub(prev, crate::engine::UserCode::enter());
         f();
     }
     with(|rt| {
@@ -2024,7 +2075,9 @@ pub(crate) fn trigger(f: impl FnOnce(), created_at: &'static Location<'static>) 
     settle();
 }
 
-struct RestoreSub(usize);
+/// Restores the running subscriber; what runs meanwhile is user code
+/// (ADR-0035 D4).
+struct RestoreSub(usize, crate::engine::UserCode);
 
 impl Drop for RestoreSub {
     fn drop(&mut self) {
@@ -2049,6 +2102,7 @@ pub(crate) fn track_render<R>(i: usize, f: impl FnOnce() -> R) -> R {
             prev_sub: std::mem::replace(&mut rt.active_sub, i),
             prev_owner: rt.active_owner,
             effect: true,
+            _user: crate::engine::UserCode::enter(),
         }
     });
     let _guard = guard;
@@ -2137,7 +2191,8 @@ pub(crate) fn rendering<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
             #[cfg(debug_assertions)]
             Some(Pure::Render(name)),
         );
-        f()
+        // User code runs: no check opens inside it (ADR-0035, D4).
+        crate::engine::lend(f)
     };
     let mark = leave.0;
     drop(leave);

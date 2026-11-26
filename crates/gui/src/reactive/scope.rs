@@ -65,4 +65,13 @@ impl Scope {
         runtime::with(|rt| rt.dispose(self.id));
         runtime::settle();
     }
+
+    /// [`Self::dispose`], as the engine's re-run retirement of this scope
+    /// (ADR-0035, D3): a live instance's old render scope, a failed
+    /// render's tree. It permits this scope's disposal alone, in a check;
+    /// what its settle drops (cleanups, captured app values) is not.
+    pub(crate) fn retire(self) {
+        runtime::with(|rt| rt.retire(self.id));
+        runtime::settle();
+    }
 }

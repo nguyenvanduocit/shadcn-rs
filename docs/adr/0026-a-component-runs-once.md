@@ -203,6 +203,18 @@ are kept in signals.
 - **A control node has no box.** Its children are a contiguous range of its parent's child list, so rows of an `each`
   are direct flex or grid children. Floem's containers are views with a box of their own, which changes gaps and the
   item count of the parent.
+  - *Nested ranges* (K4a, review r1): a range splices through any number of control nodes, so `show { each }` or a
+    row whose view is an `each` gives the inner rows to the nearest box, as its direct children.
+  - *Where no box takes a range* (a component's root, a layer's content, a paragraph's inline), the range is placed
+    whole in one implicit, unstyled box, live and cold alike; nothing is dropped. The same box is kept while the
+    range is the same. The box takes the place of what it stands in for (K4a round 3): a component's root box is
+    placed by the component's key (its own, its static slot beside a range, or the row it is the root of), a
+    layer's by the layer's place, so a reorder or an opening branch leaves its path as a box root's would be. A component's root should still be a box (ADR-0027); the implicit box only keeps a
+    misplaced range whole and refereed.
+  - *A node beside a range keeps its static place.* An unkeyed sibling of a control node is placed by its position
+    in its parent's element list, not by its index after splicing, so opening a branch or inserting rows before it
+    leaves its path, scroll, motion and accessibility id as they were. (K4a marks it when its parent's body is
+    built; K4e replaces paths with `NodeId`s.)
 - **Each branch and each row has its own scope**, a child of the control node's owner. The view closure runs in it.
 - **The source closure is tracked by the control node's own tracker.** A write marks the node for the structure
   commit and nothing else.
@@ -220,9 +232,17 @@ are kept in signals.
 - **A kept key is the same row:** same nodes, same `NodeId`s, same scope and state, same focus. A move changes its
   place in the parent's order and nothing inside it.
 - **A kept key gets its new data.** `Row<T, K>` gives `item()` (a read handle on a per-row signal), `index()` and
-  `key() -> &K`. On each commit the row's item is written when it differs (`T: PartialEq`), and its index when it
-  moved. The index signal is made the first time `index()` is called, so a row that never asks pays nothing for a
-  move. `index()` counts present rows only, never leaving ones. This is the heir of `on_updated` for lists.
+  `key()`. On each commit the row's item is written when it differs, and its index when it moved. `index()` counts
+  present rows only, never leaving ones. This is the heir of `on_updated` for lists.
+  - *As built (K4a):* `key()` returns `K` by value (a `Copy` handle lends no reference). The index lives in one
+    per-row signal with the key, made at mount; it is written only when the index changed, so a row that never
+    reads it pays one comparison per move and runs nothing. Making it lazily was measured at about 5% of a
+    commit and not taken.
+  - *Items and keys are `Eq`* (`each`'s `T`, `dynamic_view`'s `K`; K4a, review r1). Equality decides whether a kept
+    row's item is written and whether the referee accepts it; a value not equal to itself (a float's NaN) would be
+    written every commit and fail every check. Such data is wrapped in a type with total equality (by bits, or an
+    ordered float). Rejected: a "reflexive" comparison (`a == b || a != a && b != b`), which calls two different
+    structs equal when both hold a NaN, and so skips a needed write.
 - **Duplicate keys are found in every build and nothing is lost.** The diff builds the key map anyway. The n-th row
   with an equal key gets the identity (key, n), every item is shown, and the commit reports an error naming the
   `each`'s call site (`#[track_caller]`) in `FrameReport` and devtools. A `Scenario` fails a frame that has reports
@@ -356,7 +376,7 @@ a K4a test:
 
 | Invariant | Held by |
 | --- | --- |
-| A commit's result is used once: `Structure::finish(self) -> Committed` | Type |
+| A commit's result is used once: `Structure::finish(self) -> Committed` | Type. Not built at K4a: the commit is one function per control node that takes its state out of the instance and puts it back, so there is no value to finish twice. It becomes a type when K5 hands the commit's log to layout |
 | Only the commit inserts, removes or moves; layout, paint and accessibility read a finished commit | Runtime check. Until K8 the old `LayoutTree::renew` is exempt, because it patches structure during layout. At K8 the structural mutators become private to the commit, and the check becomes visibility |
 | One control node's commit is never split: paint sees it whole or not at all (Floem #1052). Work still marked at the cap waits for the next frame, whole, as "At the cap" says | Runtime check |
 | `each` reports duplicate keys | Runtime, every build |
@@ -377,6 +397,11 @@ a K4a test:
 6. Its `NodeId`s are freed.
 
 After step 1 no handler of the subtree runs.
+
+**Sibling order (as built, K4a).** An instance keeps its children in the order they were placed (for a control node,
+its rows in list order after each commit), never in a hash map's order. A subtree is torn down children first, the
+last placed first, then its own scopes; the rows one commit removes go the same way, the last first. So the cleanups
+of a closed `show { each 0..16 }` run 15 down to 0, in every run, with or without the cold check.
 
 **An async job belongs to a scope and is cancelled with it.** Work leaves the UI thread only through `spawn`
 (ADR-0028). The job gets a cancel token; when its owner is disposed the token is set and its result is dropped. The
@@ -433,6 +458,21 @@ Details that belong to this record:
   relative to the legacy node.
 - **Proof required by K4a:** suppress one insert, and separately one keyed move, in the commit; the cold check fails
   both times.
+- **As built (K4a, round 2).** Before K4e there is no retained `NodeId`; the referee's physical tree is the element
+  tree the live root last gave layout, where each row's node carries the row's own key. Per control node it checks:
+  each source row (key, occurrence) is recorded; each recorded row's node is in that tree, the rows' first nodes are
+  in source order under one parent (a nested range's row is found through the instances below it); the instance
+  tree's rows under the node equal the recorded ones, so a row dropped from the records but left mounted fails; each
+  record names its own instance (by the key the instance was mounted with) and a live scope; each row's key, item
+  and index signals equal the source; no record is left that the source does not have, and no row's node is placed
+  twice; a layer is walked as standing where it wraps its content, so rows that are layers share their list's parent;
+  an implicit box is at its owner's place, holding its range's rows. It never reads the commit's order or its cached
+  ranges.
+- **Duplicate keys, as built (K4a round 3).** A node reports a key when it becomes duplicated, once while it stays
+  so, again only after it was resolved and came back; at most 64 reports wait for `take_duplicate_keys`. Routing
+  them into `FrameReport` is left to the owner of the pipeline's frame report. Tests break the commit
+  five ways (skip an insert, skip a move, drop a record, swap two records' instances, truncate a nested range) and the
+  check fails each time, and passes with the break reverted.
 - **Relation to Fork.** A cold frame is ADR-0028's `Check`: it mounts a detached tree, writes no live signal and
   never writes the retained live tree, and it is always rolled back. So the commit keeps no undo log of the retained
   tree, and K4a builds none. A fork that runs handlers is ADR-0030 (proposed); if it needs such a log, it adds it.
@@ -581,6 +621,14 @@ Not a shim (plan, "Nguyên tắc chuyển đổi").
   see half done.
 
 ## Revisit when
+
+- **Measured at K4a (release, M-series Mac, `component::control::tests::k4a_timing`):** a 10 000-row `each` whose
+  source hands over the whole list costs 7.7 to 11 ms per commit and resolve for a reverse, a rotation by one or a
+  shuffle (mount 28 to 45 ms), over a 120 Hz frame before layout and paint. The commit is O(n) in the source (every
+  key hashed, every row's output gathered) even when one row moves; allocations per commit stay flat (about 31 at
+  10 000 rows, 34 at 1 000). Acceptable because K4c hands the commit only the visible window. Revisit when a source
+  that is not windowed must reorder at display rate: feed the commit a change log from the source (K5,
+  `Collection<T>`), with the same referee.
 
 - A body's static tree is found stale in practice despite the read diagnostic: then reconsider matching state by
   creation order for the cold frame.

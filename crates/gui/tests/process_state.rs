@@ -141,6 +141,16 @@ const ALLOWED: &[(&str, &str, &str)] = &[
         "the thread's arena serial: an id set once, never written",
     ),
     (
+        "crates/gui/src/engine.rs",
+        "WORLDS",
+        "the process-wide source of world ids (ADR-0035, D5): a check takes a fresh one and writes nothing else",
+    ),
+    (
+        "crates/gui/src/engine.rs",
+        "LENDS",
+        "the registry's count of lends under way (ADR-0035, D4): a check is refused while it is non-zero, so none enters it",
+    ),
+    (
         "crates/gui/src/engine/release.rs",
         "RELEASES",
         "the one release queue (ADR-0034, S5): entered by no fork, drained live, FIFO, by one drainer, and by its owner's `shutdown`",
@@ -249,6 +259,11 @@ const HANDLES: &[(&str, &str, &str)] = &[
         "crates/gui/src/interact.rs",
         "NodeFlags",
         "Shared: what it shares is the handle bound to the node, which a cold bind never writes (`value::source::cold`)",
+    ),
+    (
+        "crates/gui/src/element.rs",
+        "AttrOp",
+        "Shared: an immutable definition of a bound attribute (its closure and its write); what it gave lives in each mount's run (`layout/attrs.rs`), so a cold build or a fork mounting it writes nothing live",
     ),
     (
         "crates/gui/src/value/source.rs",
@@ -1665,6 +1680,15 @@ fn unlisted_handles(found: &[(String, String)]) -> Vec<String> {
 const CLOSURES: &[&str] = &[
     // gui: handlers and hooks, each gated where it is called.
     "crates/gui/src/element.rs | Handler | event handler: built only by `in_owner`, which calls through `call_out`",
+    // K4a control nodes (ADR-0026): sources run tracked by their node in the structure commit, views
+    // run once per mount; both pure by the body rule.
+    "crates/gui/src/component/control.rs | Show.when | a control node's source, run tracked by its node in the structure commit: pure (ADR-0026)",
+    "crates/gui/src/component/control.rs | Show.then | a branch's view, run once per mount: pure, by the body rule",
+    "crates/gui/src/component/control.rs | Show.otherwise | the same, the other branch",
+    "crates/gui/src/component/control.rs | Desc.items | a control node's source: pure",
+    "crates/gui/src/component/control.rs | Desc.key | a row's key of its item: pure",
+    "crates/gui/src/component/control.rs | Desc.view | a row's view, run once per mount: pure, by the body rule",
+    "crates/gui/src/app.rs | Closing.root | the pipeline's own root closer, engine code ended in the world that made it (ADR-0035): no caller's closure",
     "crates/gui/src/element.rs | KeyHandler | event handler: built only by `in_owner` (gated, its fork answer `Refuse`)",
     "crates/gui/src/element.rs | WheelHandler | event handler: built only by `in_owner` (gated, its fork answer `Refuse`)",
     "crates/gui/src/element.rs | PressFocus | press handler: built only by `in_owner` (gated, its fork answer `Refuse`)",
@@ -1717,6 +1741,9 @@ const CLOSURES: &[&str] = &[
     "crates/gui/src/canvas/plan.rs | Huge | the planner's cut of a huge object, called during the plan it is lent to: the engine's own, no caller state",
     "crates/gui/src/layout/binding.rs | TextBinding | bound text, read by the layout: pure",
     "crates/gui/src/layout/binding.rs | DrawBinding | a bound drawing, read by the layout: pure",
+    "crates/gui/src/element.rs | RoleGiven.Bound | a bound role, read by the layout through the row index bound to it: pure",
+    "crates/gui/src/layout/attrs.rs | Def.read | a bound attribute, read by the layout as its node resolves: pure",
+    "crates/gui/src/layout/attrs.rs | HeldWrite | the engine's own write of a value held over a panic, in a cold build: no caller's closure, pure",
     "crates/gui/src/layout/engine/mod.rs | Job | a layout island's job, lent to the pool for one pass: the engine's own, pure",
     "crates/gui/src/list/virtual_list.rs | Hook | wrapped by `ListState::on_layout` through `call_out`",
     "crates/gui/src/list/virtual_list.rs | ActiveFrom | a derivation of the active row: pure",

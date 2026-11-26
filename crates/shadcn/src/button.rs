@@ -131,21 +131,24 @@ forward! {
     /// As on [`Div`].
     fn track_scroll(handle: &gui::scroll::ScrollHandle);
     /// As on [`Div`].
-    fn disabled(disabled: bool);
+    fn disabled<M>(disabled: impl gui::value::IntoValue<bool, M>);
     /// As on [`Div`].
-    fn role(role: gui::Role);
+    fn role<M>(role: impl gui::value::IntoValue<gui::Role, M>);
     /// As on [`Div`].
-    fn aria_label(label: impl Into<String>);
+    fn aria_label<M>(label: impl gui::value::IntoValue<String, M>);
     /// As on [`Div`].
-    fn aria_checked(checked: impl Into<gui::Toggled>);
+    fn aria_checked<M>(checked: impl gui::value::IntoValue<gui::Toggled, M>);
     /// As on [`Div`].
-    fn aria_selected(selected: bool);
+    fn aria_selected<M>(selected: impl gui::value::IntoValue<bool, M>);
     /// As on [`Div`].
-    fn aria_expanded(expanded: bool);
+    fn aria_expanded<M>(expanded: impl gui::value::IntoValue<bool, M>);
     /// As on [`Div`].
-    fn aria_pos_in_set(position: usize, size: usize);
+    fn aria_pos_in_set<M, N>(
+        position: impl gui::value::IntoValue<usize, M>,
+        size: impl gui::value::IntoValue<usize, N>
+    );
     /// As on [`Div`].
-    fn aria_hidden();
+    fn aria_hidden<M>(hidden: impl gui::value::IntoValue<bool, M>);
     /// As on [`Div`].
     fn pass_through();
     /// As on [`Div`].

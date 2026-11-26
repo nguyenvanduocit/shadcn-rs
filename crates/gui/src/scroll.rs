@@ -266,7 +266,7 @@ impl ScrollHandle {
     pub fn dispose(self) {
         // `try_with`: a holder may drop it as the thread's state is torn
         // down, when the state is gone already.
-        if let Ok(Some(s)) = HANDLES.try_with(|h| h.borrow_mut().remove(self.0)) {
+        if let Ok(Some(s)) = HANDLES.try_with(|h| h.with_mut(|h| h.remove(self.0))) {
             s.version.dispose_quietly();
             s.moved.dispose_quietly();
         }
@@ -275,7 +275,7 @@ impl ScrollHandle {
     /// Whether its owner has not ended.
     #[must_use]
     pub fn is_alive(self) -> bool {
-        HANDLES.with(|h| h.borrow().contains(self.0))
+        HANDLES.with_borrow(|h| h.contains(self.0))
     }
 
     /// How many scroll handles this thread holds (tests: what a component
@@ -283,7 +283,7 @@ impl ScrollHandle {
     #[doc(hidden)]
     #[must_use]
     pub fn live() -> usize {
-        HANDLES.with(|h| h.borrow().len())
+        HANDLES.with_borrow(|h| h.len())
     }
 
     /// Start it afresh, as a handle never laid out: at the top, read as
@@ -316,12 +316,12 @@ impl ScrollHandle {
 
     /// Read its state; `None` once it is gone. `f` reaches no handle.
     fn read<R>(self, f: impl FnOnce(&State) -> R) -> Option<R> {
-        HANDLES.with(|h| h.borrow().read(self.0, f))
+        HANDLES.with_borrow(|h| h.read(self.0, f))
     }
 
     /// Write its state (nothing once it is gone). `f` reaches no handle.
     fn write<R>(self, f: impl FnOnce(&mut State) -> R) -> Option<R> {
-        HANDLES.with(|h| h.borrow().write(self.0, f))
+        HANDLES.with_borrow(|h| h.write(self.0, f))
     }
 
     /// Its owner's code uses it: gone, that is a bug, loud in a debug build

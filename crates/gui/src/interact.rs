@@ -540,13 +540,14 @@ impl NodeInteraction {
         // The thread may be ending (its handles with it).
         let unbound = BOUND
             .try_with(|b| {
-                if let Ok(mut b) = b.try_borrow_mut()
-                    && b.get(&handle.0) == Some(flags)
-                {
-                    b.remove(&handle.0);
-                    return true;
-                }
-                false
+                b.try_with_mut(|b| {
+                    if b.get(&handle.0) == Some(flags) {
+                        b.remove(&handle.0);
+                        return true;
+                    }
+                    false
+                })
+                .unwrap_or(false)
             })
             .unwrap_or(false);
         if unbound {
@@ -559,8 +560,11 @@ impl NodeInteraction {
     }
 }
 
-impl Drop for NodeInteraction {
-    fn drop(&mut self) {
+/// Its node went: the handle unbound and the flags disposed, in the world
+/// that made it ([`crate::engine::Ends`], ADR-0035): a live node a check
+/// drops ends live, after the switch (Opus r19 I1).
+impl crate::engine::Ending for NodeInteraction {
+    fn end(mut self) {
         self.clear();
     }
 }

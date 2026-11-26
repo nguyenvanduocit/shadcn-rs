@@ -96,8 +96,10 @@ pub enum CheckReport {
     /// it (input arrived, ADR-0028); the live state is as before it.
     Cancelled,
     /// Disposing of what the check made faulted (S2): the rest was still
-    /// dropped (set aside only on a runaway), the live state is whole, and
-    /// checks on this thread are off from now on. The faults, said.
+    /// dropped, the live state whole; or, on a runaway, set aside, the live
+    /// state as the check found it but a live value it held never ending
+    /// (ADR-0035, D6). Checks on this thread are off from now on. The
+    /// faults, said.
     Faulted(String),
 }
 

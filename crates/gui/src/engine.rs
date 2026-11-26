@@ -47,6 +47,8 @@ use std::sync::atomic::AtomicUsize;
 
 #[cfg(all(test, debug_assertions))]
 mod disposal_cost;
+mod ends;
+pub(crate) use ends::{Ending, Ends};
 #[cfg(debug_assertions)]
 mod frame;
 #[cfg(all(test, debug_assertions))]
@@ -65,8 +67,8 @@ pub use frame_report::{CheckReport, Mismatch};
 mod frame_report;
 pub use log_key::{LogCell, LogKey, LogMut};
 mod log_key;
+pub(crate) use release::released;
 pub use release::shutdown;
-pub(crate) use release::{LiveDrop, dropped, released};
 #[cfg(test)]
 pub(crate) use release::{pending as releases_pending, run_releases, when_live};
 mod turn;
@@ -1082,8 +1084,8 @@ pub trait Logged: sealed::Sealed + 'static {
 ///     [Fork(log)] static D: std::cell::RefCell<gui::engine::ForkSlab<Option<(u8, u64)>>> = Default::default();
 ///     [Fork(log)] static E: std::cell::RefCell<gui::engine::ForkMap<u8, AppHandle<dyn std::any::Any>>> = Default::default();
 /// }
-/// B.with(|b| b.borrow_mut().replace(1, (7, (0., 0.), None)));
-/// assert_eq!(B.with(|b| b.borrow().get(&1).map(|r| r.0)), Some(7));
+/// B.with_borrow_mut(|b| b.replace(1, (7, (0., 0.), None)));
+/// assert_eq!(B.with_borrow(|b| b.get(&1).map(|r| r.0)), Some(7));
 /// ```
 pub trait ForkValue: value_seal::Sealed + 'static {
     /// Taken apart for a check's drain (S9): one box per value whose drop
@@ -1218,9 +1220,9 @@ impl<T: ForkData> ForkValue for T {
 /// gui::engine_local! {
 ///     [Fork(log)] static NAMES: std::cell::RefCell<gui::engine::ForkMap<u8, AppHandle<str>>> = Default::default();
 /// }
-/// NAMES.with(|n| n.borrow_mut().replace(1, AppHandle::new(Rc::from("live"))));
-/// gui::testing::in_check(|| NAMES.with(|n| n.borrow_mut().replace(1, AppHandle::new(Rc::from("checked")))));
-/// assert_eq!(NAMES.with(|n| n.borrow().get(&1).map(|h| h.to_string())), Some("live".to_owned()));
+/// NAMES.with_borrow_mut(|n| n.replace(1, AppHandle::new(Rc::from("live"))));
+/// gui::testing::in_check(|| NAMES.with_borrow_mut(|n| n.replace(1, AppHandle::new(Rc::from("checked")))));
+/// assert_eq!(NAMES.with_borrow(|n| n.get(&1).map(|h| h.to_string())), Some("live".to_owned()));
 /// ```
 pub struct AppHandle<T: ?Sized + 'static>(std::rc::Rc<T>);
 
@@ -2110,13 +2112,6 @@ pub struct SlabId {
     /// the check that made it, which no later world has ([`world`]).
     world: u64,
     thread: std::marker::PhantomData<*const ()>,
-}
-
-impl SlabId {
-    /// Whether a check made it: its entry is that check's, gone with it.
-    pub(crate) const fn made_in_fork(self) -> bool {
-        self.world != 0
-    }
 }
 
 /// The top bit of a generation: set on every entry a fork made, never on
@@ -3110,15 +3105,19 @@ struct Registry {
     /// again would be a second ([`EngineKey::stand_in`]).
     #[cfg(debug_assertions)]
     stood_down: Vec<usize>,
-    /// The serial of the last fork opened on this thread: a fork's world
-    /// ([`world`]). Only grows; nothing puts it back (an identity source,
-    /// ADR-0034, S6).
+    /// The world of the running fork, or of the last one opened on this
+    /// thread ([`world`]): taken from [`WORLDS`], so unique in the process
+    /// (ADR-0035, D5). Nothing puts it back (an identity source).
     #[cfg(debug_assertions)]
     serial: u64,
     /// Why no check opens on this thread: an earlier one faulted
     /// (ADR-0034, S2). Never cleared.
     #[cfg(debug_assertions)]
     poisoned: Option<String>,
+    /// The disposals of another world's reactive nodes the running fork
+    /// was refused (ADR-0035, D3): each a fault of the check.
+    #[cfg(debug_assertions)]
+    foreign: Vec<String>,
     /// The pieces whose exit found a value left at the switch, quarantined
     /// ([`quarantined`]).
     #[cfg(debug_assertions)]
@@ -3547,16 +3546,99 @@ pub(crate) fn is_cold() -> bool {
     REGISTRY.try_with(|r| r.borrow().cold.is_some()).unwrap_or(false)
 }
 
-/// The running world (ADR-0034, S6): 0 live; in a fork, its serial, which
-/// no other fork on the thread has had or will have.
+/// The live world's id ([`world`]).
+pub(crate) const LIVE: u64 = 0;
+
+/// The worlds' ids, process-wide (ADR-0035, D5): a fork's is taken here as
+/// it opens, so no two forks of any threads share one, and a world cell
+/// sent to another thread matches no check there. Live is [`LIVE`].
+#[cfg(debug_assertions)]
+static WORLDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A new fork's world id ([`WORLDS`]).
+#[cfg(debug_assertions)]
+pub(crate) fn new_world() -> u64 {
+    WORLDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The running world (ADR-0034, S6; ADR-0035, D5): [`LIVE`]; in a fork, its
+/// id, which no other fork in the process has had or will have. The one
+/// source of world identity in every build (world cells, [`Ends`], slab
+/// ids): it follows [`is_cold`], so a build that runs checks sets both.
 #[cfg(debug_assertions)]
 pub(crate) fn world() -> u64 {
     REGISTRY
         .try_with(|r| {
             let r = r.borrow();
-            if r.cold.is_some() { r.serial } else { 0 }
+            if r.cold.is_some() { r.serial } else { LIVE }
         })
-        .unwrap_or(0)
+        .unwrap_or(LIVE)
+}
+
+/// [`world`] in a build that runs no check: live, as [`is_cold`] is false.
+#[cfg(not(debug_assertions))]
+pub(crate) const fn world() -> u64 {
+    LIVE
+}
+
+/// How many lends of world state (a world cell's or a logged piece's
+/// `with` and `with_mut` closures) run on this thread now: a check opened
+/// meanwhile is refused (ADR-0035, D4). The registry's own, entered by no
+/// check.
+#[cfg(debug_assertions)]
+static LENDS: EngineKey<Cell<u32>> = EngineKey::new(|| Cell::new(0), None);
+
+/// One count of user code running ([`LENDS`]), held while it runs and
+/// ended however it ends. The reactive runtime holds one in each guard it
+/// switches the running subscriber or owner with (`RunGuard`:
+/// a computed's getter, an effect, a tracked render, binding or paint;
+/// `OwnerGuard`: `untracked`, `detached`, a scope's `run`), so every call
+/// from the engine into user code is counted at that one gate (ADR-0035,
+/// D4); [`lend`] holds one around a lend of world state.
+pub(crate) struct UserCode(());
+
+impl UserCode {
+    #[inline]
+    pub(crate) fn enter() -> Self {
+        #[cfg(debug_assertions)]
+        LENDS.try_with(|l| l.set(l.get().saturating_add(1))).ok();
+        Self(())
+    }
+}
+
+impl Drop for UserCode {
+    #[inline]
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        LENDS.try_with(|l| l.set(l.get().saturating_sub(1))).ok();
+    }
+}
+
+/// Run `f` as a lend of world state ([`LENDS`]), counted while it runs,
+/// however it ends.
+#[inline]
+pub(crate) fn lend<R>(f: impl FnOnce() -> R) -> R {
+    let _lent = UserCode::enter();
+    f()
+}
+
+/// Whether a lend of world state runs on this thread ([`lend`]).
+#[cfg(debug_assertions)]
+pub(crate) fn lent() -> bool {
+    LENDS.try_with(|l| l.get() > 0).unwrap_or(false)
+}
+
+/// Refuse the disposal of reactive node `what`, another world's, inside the
+/// running fork (ADR-0035, D3): the fork's fault, said at its teardown.
+#[cfg(debug_assertions)]
+pub(crate) fn foreign_disposal(what: String) {
+    REGISTRY
+        .try_with(|r| {
+            if let Ok(mut r) = r.try_borrow_mut() {
+                r.foreign.push(what);
+            }
+        })
+        .ok();
 }
 
 #[cfg(all(test, debug_assertions))]
@@ -3591,8 +3673,7 @@ mod tests {
                 m.remove(&9);
                 *m.entry_mut(11) += 1;
             });
-            BIG.with(|m| {
-                let m = m.borrow();
+            BIG.with_borrow(|m| {
                 (
                     m.get(&7).copied(),
                     m.get(&9).copied(),
@@ -3611,8 +3692,7 @@ mod tests {
             "the fork reads its writes"
         );
         assert!(work < 100, "the fork's cost is its writes: {work} steps");
-        BIG.with(|m| {
-            let m = m.borrow();
+        BIG.with_borrow(|m| {
             assert_eq!(
                 (m.get(&7), m.get(&9), m.get(&11), m.len()),
                 (Some(&7), Some(&9), Some(&11), 100_000)
@@ -4861,7 +4941,7 @@ mod tests {
         /// The live state the invariants compare: `LIVE`, the map's
         /// entries, the `[Fresh]` piece's values.
         fn live_state() -> (u32, Vec<(u32, u32)>, Vec<u32>) {
-            let mut map: Vec<(u32, u32)> = MAP.with(|m| m.borrow().iter().map(|(k, v)| (*k, v.0)).collect());
+            let mut map: Vec<(u32, u32)> = MAP.with_borrow(|m| m.iter().map(|(k, v)| (*k, v.0)).collect());
             map.sort_unstable();
             (
                 LIVE.get(),

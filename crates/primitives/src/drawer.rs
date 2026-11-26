@@ -1212,7 +1212,7 @@ impl<P: 'static> Drawer<P> {
     /// `d` as the grab handle: decoration, hidden from assistive technology.
     #[must_use]
     pub fn handle(self, d: Div) -> Div {
-        d.aria_hidden()
+        d.aria_hidden(true)
     }
 
     /// `d` as the window-sized frame of the content's layer (reka's

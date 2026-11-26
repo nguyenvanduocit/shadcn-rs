@@ -1323,3 +1323,6 @@ fn rect(b: Bounds) -> Rect {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bound;

@@ -83,11 +83,12 @@ fn a_check_that_takes_a_logged_map_leaves_live_rows() {
             SPARE.with(|spare| {
                 let (mut rows, mut spare) = (rows, spare);
                 std::mem::swap(&mut rows, &mut spare);
-                let mut spare = spare.borrow_mut();
-                let keys: Vec<u64> = spare.iter().map(|(k, _)| *k).collect();
-                for k in keys {
-                    spare.forget(&k);
-                }
+                spare.with_mut(|spare| {
+                    let keys: Vec<u64> = spare.iter().map(|(k, _)| *k).collect();
+                    for k in keys {
+                        spare.forget(&k);
+                    }
+                });
             });
         });
         assert_eq!(
@@ -98,7 +99,7 @@ fn a_check_that_takes_a_logged_map_leaves_live_rows() {
         ROWS.with_borrow_mut(|rows| rows.replace(2, 9));
     });
     assert_eq!(
-        ROWS.with(|r| (r.borrow().get(&1).copied(), r.borrow().get(&2).copied())),
+        ROWS.with_borrow(|r| (r.get(&1).copied(), r.get(&2).copied())),
         (Some(7), None)
     );
     assert_eq!(SPARE.with_borrow(|s| s.get(&5).copied()), Some(3));
@@ -288,7 +289,7 @@ fn a_scroll_shadow_pins_no_live_callback_after_a_fault() {
     });
     BOMBS16.with(|_| ());
     let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        gui::testing::in_check(|| {
+        gui::testing::in_check(move || {
             handle.scroll_to((0.0, 5.0));
             BOMBS16.with_borrow_mut(|b| b.push(Bomb));
         });
@@ -334,9 +335,9 @@ fn a_standalone_root_a_faulted_check_held_unmounts_with_its_owner() {
     let root = Rc::new(root);
     JOBS.with(|_| ());
     let fault = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        gui::testing::in_check(|| {
+        let held = Rc::clone(&root);
+        gui::testing::in_check(move || {
             let bomb = Bomb;
-            let held = Rc::clone(&root);
             JOBS.with_borrow_mut(|q| {
                 q.push(Box::new(move || {
                     let _held = &bomb;

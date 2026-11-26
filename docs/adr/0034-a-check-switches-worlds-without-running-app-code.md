@@ -1,7 +1,10 @@
 # 0034. A check switches worlds without running app code
 
 Status: accepted under delegation 2026-11-25 (F1, after review round 14 and two independent red-teams, Codex xhigh and
-Opus, which converged on this design); being built (M13, F1). Supersedes the parts of
+Opus, which converged on this design); being built (M13, F1). Partly superseded by
+[ADR-0035](0035-an-engine-value-ends-in-the-world-that-made-it.md) (accepted 2026-11-27): S4's live-drop routing, the
+`Unique`, `Private` and `Bookkeeping` drop classes, S6's per-thread serial, S7's borrow guards and the scope of "What
+a check isolates". Supersedes the parts of
 [ADR-0028](0028-a-frame-can-fork-in-release.md) that promise to recover from a failing destructor during a fork's
 teardown ("Panics, during rollback"), the drain-loop arbitration of panic payloads (its rounds 11 to 13), the public
 fork entry (`in_cold_frame`), the public release queue (`when_live`, `run_releases`) and the generic `ForkMap<K, V>`
@@ -156,6 +159,12 @@ public `Root::new` made standalone roots an app can hold behind `Rc`; it is an O
 else a debug panic ("made with no scope running and no window's code"). The answer is acted on, never dropped.
 The obligations lint fails on a direct `owned_by_window` call elsewhere.
 
+> **Superseded by [ADR-0035](0035-an-engine-value-ends-in-the-world-that-made-it.md) (built in F1b, 2026-11-26):**
+> this paragraph, the `LiveDrop` token, `engine::dropped`, the table below and its test, and the next paragraph's
+> `made_in_fork` routing. An engine value's end is held in `engine::Ends`, which routes by the world that made it;
+> an explicit close or dispose of a live node inside a check now faults (ADR-0035, D3). The table is kept as the
+> record of what was converted; no test reads it.
+
 **Only a drop reaches the live world from a check** (review r17, decision 3). An explicit lifecycle operation inside
 a check (`Pipeline::close`, `Root::close`, `Scope::dispose`, a window's close, a mailbox's retire) acts on the
 check's world: the root's state is the check's copy in `ROOTS`, the window's record its overlay of `WINDOW_WORK`,
@@ -167,7 +176,6 @@ live value a check lets go has no other moment to end, so its drop is the one pa
 are exactly these (`the_adr_names_every_drop_that_reaches_the_live_queue` fails on a drop that builds one and is
 not a row, and on a row whose drop builds none; review r18, decision 5):
 
-<!-- live-drops -->
 | Type | File | What its drop hands to the live queue |
 |---|---|---|
 | `Root` | `gui/src/component.rs` | the root's end (`end_root`): unmount, then its `ROOTS` entry |

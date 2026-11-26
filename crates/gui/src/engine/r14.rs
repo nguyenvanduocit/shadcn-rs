@@ -43,7 +43,7 @@ fn a_fork_id_names_nothing_in_the_next_fork() {
     let first = in_cold_frame(|| SLAB.with_borrow_mut(|s| s.insert(1)));
     let seen = in_cold_frame(|| {
         let second = SLAB.with_borrow_mut(|s| s.insert(2));
-        (second != first, SLAB.with(|s| s.borrow().read(first, |v| *v)))
+        (second != first, SLAB.with_borrow(|s| s.read(first, |v| *v)))
     });
     assert_eq!(seen, (true, None));
 }
@@ -110,8 +110,7 @@ fn overlay_drops() {
     // eight of the check's values are dropped.
     assert_eq!(once, (0..8).collect::<Vec<u8>>(), "every one dropped: {dropped:?}");
     assert!(!dropped.contains(&9), "the live value is not the check's to drop");
-    MAP.with(|m| {
-        let m = m.borrow();
+    MAP.with_borrow(|m| {
         assert_eq!((m.len(), m.get(&9).map(|s| s.0)), (1, Some(9)), "the live map is whole");
     });
     let next = catch_unwind(|| in_cold_frame(|| ())).unwrap_err();
@@ -207,7 +206,7 @@ fn runaway_disposal_quarantines_the_result() {
     let said = fault_of(&p);
     assert!(said.contains("a check faulted (Runaway of AGAIN"), "{said}");
     assert_eq!(rx.try_iter().collect::<Vec<_>>(), [], "the result was never dropped");
-    assert_eq!(AGAIN.with(|s| s.borrow().len()), 0, "the live slab is whole");
+    assert_eq!(AGAIN.with_borrow(|s| s.len()), 0, "the live slab is whole");
 }
 
 /// Codex r14-3, closed by S3 and S5: a losing release payload's drop
@@ -363,7 +362,7 @@ fn a_value_written_over_in_a_check_drops_in_its_drain() {
         [2, 4],
         "what the check made and kept no hold of: dropped inside it"
     );
-    assert!(MAP.with(|m| m.borrow().is_empty()));
+    assert!(MAP.with_borrow(|m| m.is_empty()));
     assert_eq!(
         was.as_ref().map(|s| s.0),
         Some(1),
@@ -394,8 +393,7 @@ fn a_replace_only_value_is_never_copied() {
         })
     });
     assert_eq!(seen, (Some(10), false, 1));
-    MAP.with(|m| {
-        let m = m.borrow();
+    MAP.with_borrow(|m| {
         assert_eq!(
             (m.get(&1).map(|v| v.0), m.get(&2).map(|v| v.0)),
             (Some(1), Some(2)),

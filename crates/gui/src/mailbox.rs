@@ -162,7 +162,7 @@ static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("mailbox");
 
 /// Whether mailbox `id` is open.
 fn is_open(id: u64) -> bool {
-    OPEN.try_with(|o| o.borrow().contains_key(&id)).unwrap_or(false)
+    OPEN.try_with(|o| o.with(|o| o.contains_key(&id))).unwrap_or(false)
 }
 
 /// Close mailbox `id` and let go of it at once (Codex r13 5): its drain
@@ -172,7 +172,7 @@ fn is_open(id: u64) -> bool {
 /// go of is dropped after the lists are let go of, so a drop that makes
 /// or closes a mailbox finds them free.
 fn retire(id: u64) {
-    OPEN.try_with(|o| o.borrow_mut().remove(&id)).ok();
+    OPEN.try_with(|o| o.with_mut(|o| o.remove(&id))).ok();
     let drain = BOXES
         .try_with(|b| {
             let mut b = b.borrow_mut();
@@ -298,7 +298,7 @@ pub fn mailbox<T: Send + 'static>(handler: impl FnMut(T) + 'static) -> Sender<T>
                         // come again, so it is let go of (a mailbox no
                         // scope owns, whose senders all went).
                         Err(true) => {
-                            OPEN.try_with(|o| o.borrow_mut().remove(&id)).ok();
+                            OPEN.try_with(|o| o.with_mut(|o| o.remove(&id))).ok();
                             return if any { Some(true) } else { None };
                         }
                         Err(false) => break,

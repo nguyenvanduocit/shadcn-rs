@@ -610,17 +610,18 @@ impl NavigationMenu {
             return;
         }
         self.with(|n| {
-            let mut boxes = n.boxes.borrow_mut();
-            match boxes.iter_mut().find(|(f, _)| *f == focus) {
-                Some(slot) => slot.1 = b,
-                None => boxes.push((focus, b)),
-            }
-            // Kept for the triggers and links laid out: those that left
-            // are let go once they outnumber them.
-            let laid = n.top.len();
-            if boxes.len() > laid.saturating_mul(2).saturating_add(8) {
-                boxes.retain(|(f, _)| n.top.index_of(*f).is_some());
-            }
+            n.boxes.with_mut(|boxes| {
+                match boxes.iter_mut().find(|(f, _)| *f == focus) {
+                    Some(slot) => slot.1 = b,
+                    None => boxes.push((focus, b)),
+                }
+                // Kept for the triggers and links laid out: those that left
+                // are let go once they outnumber them.
+                let laid = n.top.len();
+                if boxes.len() > laid.saturating_mul(2).saturating_add(8) {
+                    boxes.retain(|(f, _)| n.top.index_of(*f).is_some());
+                }
+            });
         });
     }
 
@@ -628,10 +629,11 @@ impl NavigationMenu {
     fn on_menu(self, x: f32, y: f32) -> bool {
         let top = self.with(|n| n.top.clone());
         self.with(|n| {
-            n.boxes
-                .borrow()
-                .iter()
-                .any(|(f, b)| top.index_of(*f).is_some() && x >= b.x && x <= b.right() && y >= b.y && y <= b.bottom())
+            n.boxes.with(|boxes| {
+                boxes.iter().any(|(f, b)| {
+                    top.index_of(*f).is_some() && x >= b.x && x <= b.right() && y >= b.y && y <= b.bottom()
+                })
+            })
         })
     }
 

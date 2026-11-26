@@ -685,11 +685,16 @@ impl Noted {
             return;
         }
         if self.tail.is_empty() && self.items.is_here() {
-            let mut items = self.items.borrow_mut();
-            if items.capacity() > self.len {
-                items.truncate(self.len);
-                items.push(entry);
-                self.len = items.len();
+            let len = self.len;
+            let grown = self.items.with_mut(|items| {
+                (items.capacity() > len).then(|| {
+                    items.truncate(len);
+                    items.push(entry);
+                    items.len()
+                })
+            });
+            if let Some(grown) = grown {
+                self.len = grown;
                 return;
             }
         }
@@ -725,7 +730,7 @@ impl Noted {
                 taken
             }
             None => {
-                let taken = self.items.borrow().get(..len).map(<[_]>::to_vec).unwrap_or_default();
+                let taken = self.items.with(|i| i.get(..len).map(<[_]>::to_vec).unwrap_or_default());
                 self.items = Self::fresh();
                 taken
             }
@@ -758,9 +763,7 @@ impl Noted {
     fn to_vec(&self) -> Vec<(u64, u32)> {
         let mut entries = self
             .items
-            .borrow()
-            .get(..self.len)
-            .map(<[_]>::to_vec)
+            .with(|i| i.get(..self.len).map(<[_]>::to_vec))
             .unwrap_or_default();
         entries.extend_from_slice(&self.tail);
         entries
@@ -1114,7 +1117,7 @@ impl ListState {
     /// Let its state go now: it is inert from here on.
     pub fn dispose(self) {
         // `try_with`: dropped as the thread's state is torn down, it is gone.
-        let Ok(Some(s)) = LISTS.try_with(|l| l.borrow_mut().remove(self.0)) else {
+        let Ok(Some(s)) = LISTS.try_with(|l| l.with_mut(|l| l.remove(self.0))) else {
             return;
         };
         s.version.dispose_quietly();
@@ -1129,7 +1132,7 @@ impl ListState {
     /// Whether its owner has not ended.
     #[must_use]
     pub fn is_alive(self) -> bool {
-        LISTS.with(|l| l.borrow().contains(self.0))
+        LISTS.with_borrow(|l| l.contains(self.0))
     }
 
     /// Read its state; `None` once it is gone, which its owner's code
@@ -1147,7 +1150,7 @@ impl ListState {
     /// that may run once after its owner ended (a binding of an element
     /// still in a tree being replaced, a timer it set).
     fn peek<R>(self, f: impl FnOnce(&State) -> R) -> Option<R> {
-        LISTS.with(|l| l.borrow().read(self.0, f))
+        LISTS.with_borrow(|l| l.read(self.0, f))
     }
 
     /// Write its state (nothing once it is gone, loud in a debug build as
@@ -1177,8 +1180,8 @@ impl ListState {
         // what the handle took in is clamped to its range as it came.
         debug_assert!(added.0 == 0.0, "a vertical list took in {added:?}");
         let added = added.1;
-        LISTS.with(|l| {
-            l.borrow().write(self.0, |s| {
+        LISTS.with_borrow(|l| {
+            l.write(self.0, |s| {
                 absorb(s, added);
                 f(s)
             })
@@ -2392,16 +2395,24 @@ fn thumb_ink() -> BackgroundImage {
 /// Row `i` (keyed `k`) of a list, built as `el`: when it names a row's
 /// role (a table's row, an option) it is the row and carries the index;
 /// when it names another (a heading among options) it is left as it is;
-/// else it is wrapped in a row whose role its list's implies.
+/// else it is wrapped in a row whose role its list's implies. A role given
+/// as a closure decides as it resolves: the row index is bound to it, so
+/// the node carries the index while its role is a row's.
 fn row_wrapper(i: u64, k: ElementKey, mut el: Element) -> Div {
+    use crate::element::RoleGiven;
     let index = usize::try_from(i).unwrap_or(usize::MAX);
-    let named = el.common_mut().and_then(|c| match c.semantics.role {
-        Some(role) if crate::access::is_row_role(role) => {
-            c.semantics.row_index = Some(index);
+    let named = el.common_mut().and_then(|c| match c.role_given() {
+        RoleGiven::Fixed(role) if crate::access::is_row_role(role) => {
+            c.fix("aria_row_index", |a| a.semantics.row_index = Some(index));
             Some(())
         }
-        Some(_) => Some(()),
-        None => None,
+        RoleGiven::Bound(role) => {
+            let row = move || crate::access::is_row_role(role()).then_some(index);
+            c.bind("aria_row_index", Rc::new(row), |a, v| a.semantics.row_index = v);
+            Some(())
+        }
+        RoleGiven::Fixed(_) => Some(()),
+        RoleGiven::None => None,
     });
     let d = div().key(k);
     let d = if named.is_some() { d } else { d.aria_row_index(index) };
@@ -4098,8 +4109,11 @@ mod tests {
         let room = |state: &ListState| {
             state
                 .peek(|s| {
-                    let items = s.since_lent.items.borrow();
-                    (items.as_ptr().addr(), items.capacity(), s.since_lent.len)
+                    let (at, room) = s
+                        .since_lent
+                        .items
+                        .with(|items| (items.as_ptr().addr(), items.capacity()));
+                    (at, room, s.since_lent.len)
                 })
                 .expect("alive")
         };

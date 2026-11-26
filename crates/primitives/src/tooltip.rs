@@ -187,14 +187,14 @@ static NEXT: gui::engine::IdKind = gui::engine::IdKind::new("tooltip");
 
 /// The tooltip open in `window`, if any.
 fn open_in(window: u64) -> Option<u64> {
-    OPEN.with(|o| o.borrow().get(&window).copied())
+    OPEN.with_borrow(|o| o.get(&window).copied())
 }
 
 /// Tooltip `id` is no longer the one open in its `window`; whether it was.
 fn shut(window: u64, id: u64) -> bool {
     let was = open_in(window) == Some(id);
     if was {
-        OPEN.with(|o| o.borrow_mut().remove(&window));
+        OPEN.with_borrow_mut(|o| o.remove(&window));
     }
     was
 }
@@ -204,13 +204,13 @@ fn shut(window: u64, id: u64) -> bool {
 /// with nothing borrowed). Only a tooltip of the same window is closed, so
 /// the closer runs in the turn of the window that made it.
 fn open_alone(window: u64, id: u64) {
-    let Some(other) = OPEN.with(|o| o.borrow_mut().insert(window, id)) else {
+    let Some(other) = OPEN.with_borrow_mut(|o| o.insert(window, id)) else {
         return;
     };
     if other == id {
         return;
     }
-    let close = CLOSERS.with(|c| c.borrow().get(&other).map(gui::engine::AppHandle::rc));
+    let close = CLOSERS.with_borrow(|c| c.get(&other).map(gui::engine::AppHandle::rc));
     if let Some(close) = close {
         close();
     }
@@ -382,7 +382,7 @@ impl<P: 'static> Tooltip<P> {
             let _dropped = &dropped;
             close();
         });
-        CLOSERS.with(|c| c.borrow_mut().replace(id, gui::engine::AppHandle::new(closer)));
+        CLOSERS.with_borrow_mut(|c| c.replace(id, gui::engine::AppHandle::new(closer)));
         // However it opens or closes (the caller's write included): the
         // provider's window, one open in the window, the state the look reads.
         gui::watch(
@@ -427,10 +427,10 @@ impl<P: 'static> Tooltip<P> {
             },
         );
         gui::on_unmounted(move || {
-            TRIGGERS.with(|t| t.borrow_mut().forget(&id));
+            TRIGGERS.with_borrow_mut(|t| t.forget(&id));
             // Its closer let go, dropped with nothing borrowed.
-            let closer = CLOSERS.with(|c| c.borrow().get(&id).cloned());
-            CLOSERS.with(|c| c.borrow_mut().forget(&id));
+            let closer = CLOSERS.with_borrow(|c| c.get(&id).cloned());
+            CLOSERS.with_borrow_mut(|c| c.forget(&id));
             drop(closer);
             // The provider (the window's outlives every tooltip) keeps no
             // grace area of one gone: the next tooltip's moves read it.
@@ -534,8 +534,7 @@ impl<P: 'static> Tooltip<P> {
         self.linked
             .trigger(d.track_focus(self.trigger), open)
             .on_measured(move |b| {
-                TRIGGERS.with(|t| {
-                    let mut t = t.borrow_mut();
+                TRIGGERS.with_borrow_mut(|t| {
                     if t.get(&id) != Some(b) {
                         t.replace(id, *b);
                     }
@@ -620,8 +619,8 @@ impl<P: 'static> Tooltip<P> {
             })
             .on_pointer_move(move |e| {
                 // Over another tooltip's trigger: let that one be reached.
-                let covers = TRIGGERS.with(|t| {
-                    t.borrow().iter().any(|(&i, b)| {
+                let covers = TRIGGERS.with_borrow(|t| {
+                    t.iter().any(|(&i, b)| {
                         i != id && e.x >= b.x && e.x < b.x + b.width && e.y >= b.y && e.y < b.y + b.height
                     })
                 });
@@ -671,7 +670,7 @@ mod tests {
                 delay: std::time::Duration::from_millis(5),
                 ..TooltipOptions::default()
             };
-            let cold = gui::testing::in_check(|| TooltipProvider::window(options));
+            let cold = gui::testing::in_check(move || TooltipProvider::window(options));
             assert!(!cold.options.is_alive(), "the fork's stand-in, gone with it");
             let live = TooltipProvider::window(TooltipOptions::default());
             assert!(cold != live, "the live one is made live");
@@ -700,7 +699,7 @@ mod tests {
                 delay: std::time::Duration::from_millis(5),
                 ..TooltipOptions::default()
             };
-            let _ = gui::testing::in_check(|| TooltipProvider::window(speculative));
+            let _ = gui::testing::in_check(move || TooltipProvider::window(speculative));
             let expected = TooltipOptions::default();
             assert_eq!(TooltipProvider::window(expected).options(), expected);
         })
@@ -774,14 +773,15 @@ mod tests {
             a.set_open(true);
             let w = a.window;
             assert_eq!(open_in(w), Some(a.id));
-            let strong = |id: u64| CLOSERS.with(|c| c.borrow().get(&id).map(|h| Rc::strong_count(&h.rc()) - 1));
+            let strong = |id: u64| CLOSERS.with_borrow(|c| c.get(&id).map(|h| Rc::strong_count(&h.rc()) - 1));
             assert_eq!((strong(a.id), strong(b.id)), (Some(1), Some(1)));
-            gui::testing::in_check(|| {
-                open_alone(w, b.id);
-                assert_eq!(open_in(w), Some(b.id), "b is open in the check");
-                assert!(shut(w, b.id));
+            let b_id = b.id;
+            gui::testing::in_check(move || {
+                open_alone(w, b_id);
+                assert_eq!(open_in(w), Some(b_id), "b is open in the check");
+                assert!(shut(w, b_id));
                 assert_eq!(open_in(w), None);
-                open_alone(w, b.id);
+                open_alone(w, b_id);
             });
             let dropped = || {
                 let d = CLOSERS_DROPPED.lock().expect("the probe");

@@ -140,24 +140,22 @@ impl Waiters {
     /// Wake the waiters of any of `mask`: each is flagged woken and its
     /// node's mark runs. Allocates nothing.
     pub(crate) fn wake(&self, mask: u8) {
-        let Ok(list) = self.list.try_borrow() else {
-            return;
-        };
-        for w in &list.items {
-            self.visit(w, mask);
-        }
+        self.list.try_with(|list| {
+            for w in &list.items {
+                self.visit(w, mask);
+            }
+        });
     }
 
     /// Wake the waiters of chain `id` of any of `mask`. Allocates nothing.
     pub(crate) fn wake_chain(&self, id: u64, mask: u8) {
-        let Ok(list) = self.list.try_borrow() else {
-            return;
-        };
-        let mut key = list.heads.get(&id).copied().unwrap_or(GONE);
-        while let Some(w) = list.at.get(key).and_then(|&at| list.items.get(at)) {
-            self.visit(w, mask);
-            key = w.chain.map_or(GONE, |c| c.next);
-        }
+        self.list.try_with(|list| {
+            let mut key = list.heads.get(&id).copied().unwrap_or(GONE);
+            while let Some(w) = list.at.get(key).and_then(|&at| list.items.get(at)) {
+                self.visit(w, mask);
+                key = w.chain.map_or(GONE, |c| c.next);
+            }
+        });
     }
 
     fn visit(&self, w: &Waiter, mask: u8) {
@@ -176,7 +174,17 @@ impl Waiters {
     /// Panics if the list is waking: a wake runs marks alone, which push a
     /// node to resolve and run no mount, so no mount registers during one.
     fn wait(self: &Rc<Self>, mark: &Mark, mask: u8, chain: Option<u64>, keep: Option<Rc<dyn Any>>) -> Wait {
-        let mut list = self.list.borrow_mut();
+        let key = self.list.with_mut(|list| Self::join_list(list, mark, mask, chain));
+        Wait::new(Waiting {
+            on: Some(Rc::clone(self)),
+            key,
+            keep,
+            solo: None,
+        })
+    }
+
+    /// [`Self::wait`]'s place in `list`: its key.
+    fn join_list(list: &mut List, mark: &Mark, mask: u8, chain: Option<u64>) -> usize {
         let place = list.items.len();
         let key = match list.free.pop() {
             Some(k) => {
@@ -205,26 +213,38 @@ impl Waiters {
             key,
             chain,
         });
-        Wait {
-            on: Some(Rc::clone(self)),
-            key,
-            keep,
-            solo: None,
-        }
+        key
     }
 
     /// How many mounts wait on it, and how many places its lists hold.
     #[cfg(test)]
     fn sizes(&self) -> (usize, usize) {
-        let list = self.list.borrow();
-        (list.items.len(), list.at.len())
+        self.list.with(|list| (list.items.len(), list.at.len()))
     }
 }
 
 /// A mount's registration: with a source's [`Waiters`], leaving it when
 /// dropped; or, for the one mount of a signal, its claim to read it under
-/// its own tracker.
-pub(crate) struct Wait {
+/// its own tracker. It ends in the world that made it (ADR-0035): a live
+/// mount's registration a check lets go leaves its list live, after the
+/// switch; a check's that escaped ends nowhere.
+pub(crate) struct Wait(crate::engine::Ends<Waiting>);
+
+impl Wait {
+    fn new(waiting: Waiting) -> Self {
+        Self(crate::engine::Ends::new(waiting))
+    }
+}
+
+impl std::ops::Deref for Wait {
+    type Target = Waiting;
+    fn deref(&self) -> &Waiting {
+        &self.0
+    }
+}
+
+/// What a [`Wait`] holds.
+pub(crate) struct Waiting {
     on: Option<Rc<Waiters>>,
     key: usize,
     /// What it holds alive: a signal's hub.
@@ -233,11 +253,16 @@ pub(crate) struct Wait {
     solo: Option<((usize, u32), u64)>,
 }
 
-impl Wait {
+impl Waiting {
     fn with<R>(&self, f: impl FnOnce(&Waiter) -> R) -> Option<R> {
-        let list = self.on.as_ref()?.list.try_borrow().ok()?;
-        let at = *list.at.get(self.key)?;
-        list.items.get(at).map(f)
+        self.on
+            .as_ref()?
+            .list
+            .try_with(|list| {
+                let at = *list.at.get(self.key)?;
+                list.items.get(at).map(f)
+            })
+            .flatten()
     }
 
     /// Whether the source woke it since it last ran. A solo mount's
@@ -262,16 +287,17 @@ impl Wait {
         if !self.on.as_ref().is_some_and(|on| Rc::ptr_eq(on, list)) {
             return false;
         }
-        let Ok(mut l) = list.list.try_borrow_mut() else {
-            return false;
-        };
-        match l.at.get(self.key).copied().and_then(|at| l.items.get_mut(at)) {
-            Some(w) => {
-                w.mask = mask;
-                true
-            }
-            None => false,
-        }
+        list.list
+            .try_with_mut(
+                |l| match l.at.get(self.key).copied().and_then(|at| l.items.get_mut(at)) {
+                    Some(w) => {
+                        w.mask = mask;
+                        true
+                    }
+                    None => false,
+                },
+            )
+            .unwrap_or(false)
     }
 
     /// The handle whose flag it waits on, for a flag source.
@@ -291,40 +317,39 @@ impl Wait {
         if let Some((key, id)) = self.solo {
             claim(key, id, |c| c.mark = Rc::clone(mark));
         }
-        if let Some(on) = &self.on
-            && let Ok(mut l) = on.list.try_borrow_mut()
-            && let Some(&at) = l.at.get(self.key)
-            && let Some(w) = l.items.get_mut(at)
-        {
-            w.mark = Rc::clone(mark);
+        if let Some(on) = &self.on {
+            on.list.try_with_mut(|l| {
+                if let Some(&at) = l.at.get(self.key)
+                    && let Some(w) = l.items.get_mut(at)
+                {
+                    w.mark = Rc::clone(mark);
+                }
+            });
         }
     }
 }
 
-impl Drop for Wait {
-    /// Its claim goes now (a registry piece's, the running world's). Its
-    /// place in a list goes in the list's world: a live mount's
-    /// registration a check lets go (a live pipeline dropped in a check)
-    /// leaves the live list once the check has switched back, never from
-    /// the check (review r18, decision 2).
-    fn drop(&mut self) {
+impl crate::engine::Ending for Waiting {
+    /// Its claim goes, and its place in its list, in its own world: a live
+    /// mount's registration a check lets go (a live pipeline dropped in a
+    /// check) leaves the live list once the check has switched back, never
+    /// from the check (review r18, decision 2; ADR-0035).
+    fn end(mut self) {
         if let Some((key, id)) = self.solo {
             solo_gone(key, id);
         }
-        let Some(on) = self.on.take() else { return };
-        let key = self.key;
-        let here = on.list.is_here();
-        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), here, move || leave(&on, key));
+        if let Some(on) = self.on.take() {
+            leave(&on, self.key);
+        }
     }
 }
 
 /// Take waiter `key` out of `on`'s list.
 fn leave(on: &Waiters, key: usize) {
-    {
-        // Borrowed only while it wakes, and a mark drops no registration:
-        // should one, the waiter stays, waking a node for nothing.
-        if let Ok(mut l) = on.list.try_borrow_mut()
-            && let Some(at) = l.at.get(key).copied().filter(|&a| a != GONE)
+    // Borrowed only while it wakes, and a mark drops no registration:
+    // should one, the waiter stays, waking a node for nothing.
+    on.list.try_with_mut(|l| {
+        if let Some(at) = l.at.get(key).copied().filter(|&a| a != GONE)
             && at < l.items.len()
         {
             // Out of its chain first.
@@ -353,14 +378,15 @@ fn leave(on: &Waiters, key: usize) {
             }
             l.free.push(key);
         }
-    }
+    });
 }
 
 /// One tracker standing for every mount of a source (a signal, a group):
 /// what it read changing wakes its waiters, once, and it stays marked
 /// until a mount runs again and reads anew ([`Hub::arm`]).
 pub(crate) struct Hub {
-    node: RenderNode,
+    /// Disposed in the world that made it as the hub ends (ADR-0035).
+    node: crate::engine::Ends<RenderNode>,
     waiters: Rc<Waiters>,
     armed: WorldCell<bool>,
 }
@@ -377,7 +403,7 @@ impl Hub {
             })
         });
         Self {
-            node,
+            node: crate::engine::Ends::new(node),
             waiters,
             armed: WorldCell::new("whether a source's hub read (`Hub::armed`)", false),
         }
@@ -394,12 +420,6 @@ impl Hub {
         self.node.track(read);
         self.armed.set(true);
         true
-    }
-}
-
-impl Drop for Hub {
-    fn drop(&mut self) {
-        self.node.release(crate::engine::LiveDrop::in_drop());
     }
 }
 
@@ -646,6 +666,8 @@ crate::engine::engine_local! {
 /// A signal's hub, and the signal it stands for.
 pub(crate) struct SignalHub {
     key: (usize, u32),
+    /// Its entry, forgotten first as it goes.
+    _entry: crate::engine::Ends<HubEntry>,
     hub: Hub,
 }
 
@@ -685,11 +707,15 @@ fn solo_gone(key: (usize, u32), id: u64) {
     .ok();
 }
 
-impl Drop for SignalHub {
-    fn drop(&mut self) {
+/// A signal hub's entry among the readers ([`HUBS`]): forgotten as its hub
+/// goes, in the world that made it (ADR-0035).
+struct HubEntry((usize, u32));
+
+impl crate::engine::Ending for HubEntry {
+    fn end(self) {
         HUBS.try_with(|h| {
             if let Ok(mut h) = h.try_borrow_mut() {
-                forget(&mut h, self.key);
+                forget(&mut h, self.0);
             }
         })
         .ok();
@@ -716,7 +742,11 @@ fn join(key: (usize, u32), mark: &Mark) -> Result<Rc<SignalHub>, u64> {
             });
             return (Err(id), None);
         };
-        let hub = Rc::new(SignalHub { key, hub: Hub::new() });
+        let hub = Rc::new(SignalHub {
+            key,
+            _entry: crate::engine::Ends::new(HubEntry(key)),
+            hub: Hub::new(),
+        });
         r.hub = Rc::downgrade(&hub);
         (Ok(hub), Some(first.mark))
     });
@@ -800,12 +830,12 @@ impl<S: 'static, T: 'static, F: Fn(&S) -> T + 'static> Read for Mapped<S, F> {
         let hub = match held.map_or_else(|| join(key, mark), Ok) {
             Ok(hub) => hub,
             Err(id) => {
-                *wait = Some(Wait {
+                *wait = Some(Wait::new(Waiting {
                     on: None,
                     key: 0,
                     keep: None,
                     solo: Some((key, id)),
-                });
+                }));
                 return;
             }
         };
@@ -891,12 +921,12 @@ impl<T: 'static> Group<T> {
         }
         c.hub.arm(|| {
             let v = (c.read)();
-            *c.value.borrow_mut() = Some(v);
+            c.value.with_mut(|value| *value = Some(v));
         });
-        match &*c.value.borrow() {
+        c.value.with(|value| match value {
             Some(v) => f(v),
             None => f(&crate::reactive::untracked(|| (c.read)())),
-        }
+        })
     }
 }
 
@@ -937,7 +967,7 @@ impl<G: 'static, T: 'static, F: Fn(&G) -> T + 'static> Read for Grouped<G, F> {
 /// Whether a mount of a source must run: it never ran, or a cold build
 /// mounted it (registered nowhere), or its source woke it.
 pub(crate) fn due(tracked: bool, wait: Option<&Wait>) -> bool {
-    !tracked && wait.is_none_or(Wait::woken)
+    !tracked && wait.is_none_or(|w| w.woken())
 }
 
 /// A mount of a source is about to run: registered with what it reads
@@ -970,6 +1000,27 @@ mod tests {
         (Rc::new(move || c.set(c.get().saturating_add(1))), n)
     }
 
+    /// Opus r19's nit (ADR-0035, acceptance 6): a registration a check made
+    /// on its own list, escaped into app heap and dropped live, ends
+    /// nowhere: its world expired with the check. No panic, nothing live
+    /// touched.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_checks_wait_dropped_live_neither_panics_nor_touches_live() {
+        let live = Rc::new(Waiters::default());
+        let (m, _) = mark();
+        let kept = live.wait(&m, EVERY, None, None);
+        let escaped = crate::engine::in_cold_frame(|| {
+            let own = Rc::new(Waiters::default());
+            own.wait(&m, EVERY, None, None)
+        });
+        let before = live.sizes();
+        drop(escaped);
+        assert_eq!(live.sizes(), before, "nothing live touched");
+        drop(kept);
+        assert_eq!(live.sizes().0, 0);
+    }
+
     /// A wake visits the mounts that wait now: grown to many and dropped
     /// to one, it visits one; slots freed are reused, not grown.
     #[test]
@@ -984,7 +1035,7 @@ mod tests {
         assert_eq!(w.visits.get(), 1, "one waiter visited");
         assert_eq!(woke.get(), 1, "and woken");
         assert!(
-            last.as_ref().is_some_and(super::Wait::woken),
+            last.as_ref().is_some_and(|w| w.woken()),
             "the one left is the one woken"
         );
         // Mounted and unmounted again and again: the same places.
@@ -1026,7 +1077,7 @@ mod tests {
         w.wake_chain(2, 1);
         assert_eq!(woke_b.get(), 3, "chain 2's three");
         drop(waits);
-        assert!(w.list.borrow().heads.is_empty(), "emptied, the chains go");
+        assert!(w.list.with(|l| l.heads.is_empty()), "emptied, the chains go");
     }
 
     /// A group mounted on many nodes, then on one: a change visits the one

@@ -279,6 +279,8 @@ struct Inner {
     /// heights another holder held are let go, when it refused these views
     /// ([`ListState::wait_for_heights`], which holds it weakly).
     wake: Rc<dyn Fn()>,
+    /// Their end as the last `Rc` goes ([`Gone`]).
+    _gone: crate::engine::Ends<Gone>,
 }
 
 /// What views are now, by their id ([`Inner::key`]).
@@ -457,13 +459,15 @@ impl Releaser {
     fn release(&self) {
         let loan = VIEWS
             .try_with(|v| {
-                v.borrow().write(self.key, |s| {
-                    if s.released {
-                        None
-                    } else {
-                        s.released = true;
-                        Some(s.loan.take())
-                    }
+                v.with(|v| {
+                    v.write(self.key, |s| {
+                        if s.released {
+                            None
+                        } else {
+                            s.released = true;
+                            Some(s.loan.take())
+                        }
+                    })
                 })
             })
             .ok()
@@ -491,9 +495,11 @@ impl Releaser {
     fn handle_dropped(&self) {
         let left = VIEWS
             .try_with(|v| {
-                v.borrow().write(self.key, |s| {
-                    s.handles = s.handles.saturating_sub(1);
-                    s.handles
+                v.with(|v| {
+                    v.write(self.key, |s| {
+                        s.handles = s.handles.saturating_sub(1);
+                        s.handles
+                    })
                 })
             })
             .ok()
@@ -511,18 +517,18 @@ impl crate::focus::WindowOwned for Inner {
     }
 }
 
-impl Drop for Inner {
-    /// Views a check made have no live handle: released as they go, and
-    /// their state with them. Live ones were released by their last live
-    /// handle or their owner; this is a no-op for them but for their state.
-    /// Live views a check lets go are let go once it has switched back
-    /// (the release queue): their worker is the outside world.
-    fn drop(&mut self) {
-        let releaser = self.releaser();
-        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), self.inert, move || {
-            releaser.release();
-            let _gone = VIEWS.try_with(|v| v.borrow_mut().remove(releaser.key));
-        });
+/// Views' end as their last `Rc` goes, in the world that made them
+/// ([`crate::engine::Ends`], ADR-0035). Views a check made have no live
+/// handle: released as they go, and their state with them. Live ones were
+/// released by their last live handle or their owner; this is a no-op for
+/// them but for their state. Live views a check lets go are let go once it
+/// has switched back: their worker is the outside world.
+struct Gone(Releaser);
+
+impl crate::engine::Ending for Gone {
+    fn end(self) {
+        self.0.release();
+        let _gone = VIEWS.try_with(|v| v.with_mut(|v| v.remove(self.0.key)));
     }
 }
 
@@ -541,41 +547,45 @@ impl Drop for Inner {
 /// Clones share it; the worker ends when the last live handle goes. A
 /// handle cloned while a check runs is the check's: it holds no obligation
 /// (ADR-0034, S4), so the worker's end never waits on a check's garbage.
-pub struct Views(Rc<Inner>, Handle);
+pub struct Views(Rc<Inner>, Option<crate::engine::Ends<Handle>>);
 
-/// Whether a [`Views`] handle is live: one live code made or cloned, counted
-/// in `Inner::handles`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Handle {
-    Live,
-    Check,
+/// A live [`Views`] handle, one live code made or cloned, counted in
+/// `Inner::handles`: as it goes, one fewer, in the world that made it
+/// ([`crate::engine::Ends`], ADR-0035; a live handle a check lets go is gone
+/// from the live world, so its count goes once the check has switched
+/// back), and the views released at none. A check's handle has none.
+///
+/// It holds the views themselves: a live handle a check lets go moves to
+/// the live world whole, so the views (their wake, which the list holds
+/// weakly) live on until its end there, as they do when live code lets
+/// go of it (V2: a waiting view, woken by a sibling's release, asked the
+/// list again live and not when dropped in a check).
+struct Handle(Rc<Inner>);
+
+impl crate::engine::Ending for Handle {
+    fn end(self) {
+        self.0.releaser().handle_dropped();
+    }
+}
+
+impl Views {
+    /// A live handle's count, for `inner`'s views.
+    fn live(inner: &Rc<Inner>) -> Option<crate::engine::Ends<Handle>> {
+        Some(crate::engine::Ends::new(Handle(Rc::clone(inner))))
+    }
 }
 
 impl Clone for Views {
     fn clone(&self) -> Self {
         // Which world the clone is of is fixed as it is made: one a check
         // makes is counted nowhere, so it pins nothing live.
-        let handle = if self.1 == Handle::Live && !crate::engine::is_cold() {
+        let handle = if self.1.is_some() && !crate::engine::is_cold() {
             self.0.write(|s| s.handles = s.handles.saturating_add(1));
-            Handle::Live
+            Self::live(&self.0)
         } else {
-            Handle::Check
+            None
         };
         Self(Rc::clone(&self.0), handle)
-    }
-}
-
-impl Drop for Views {
-    /// A live handle: one fewer, live (a live handle a check lets go is
-    /// gone from the live world, so its count goes once the check has
-    /// switched back), and the views released at none.
-    fn drop(&mut self) {
-        if self.1 == Handle::Live {
-            let releaser = self.0.releaser();
-            crate::engine::dropped(crate::engine::LiveDrop::in_drop(), false, move || {
-                releaser.handle_dropped();
-            });
-        }
     }
 }
 
@@ -608,6 +618,7 @@ impl Views {
                 released: false,
             },
         );
+        let holder = crate::engine::unique_id(&super::virtual_list::HOLDERS);
         let inner = Rc::new_cyclic(|me: &std::rc::Weak<Inner>| Inner {
             wake: {
                 let me = me.clone();
@@ -620,8 +631,14 @@ impl Views {
             key,
             shared: Arc::clone(&shared),
             list: *list,
-            holder: crate::engine::unique_id(&super::virtual_list::HOLDERS),
+            holder,
             inert,
+            _gone: crate::engine::Ends::new(Gone(Releaser {
+                key,
+                shared: Arc::clone(&shared),
+                list: *list,
+                holder,
+            })),
         });
         // The obligations end with the live owner, exactly once, whatever
         // still holds a handle (ADR-0034, S4): a handle an opaque value
@@ -632,7 +649,7 @@ impl Views {
         let as_owned: Rc<dyn crate::focus::WindowOwned> = Rc::<Inner>::clone(&inner);
         crate::engine::own("gui::list::Views::new", &as_owned);
         drop(as_owned);
-        let handle = if inert { Handle::Check } else { Handle::Live };
+        let handle = if inert { None } else { Self::live(&inner) };
         let weak = Rc::downgrade(&inner);
         let to = mailbox(move |outcome: Outcome| {
             let Some(inner) = weak.upgrade() else {
@@ -1186,7 +1203,8 @@ mod tests {
             made
         };
         for views in [&made, &live] {
-            assert_eq!(Arc::strong_count(&views.0.shared), 1, "no worker started");
+            // Their own two: the views', and their end's ([`Gone`]).
+            assert_eq!(Arc::strong_count(&views.0.shared), 2, "no worker started");
             assert!(views.0.unstarted());
             assert_eq!(views.0.asked(), 0, "no request counted");
         }
@@ -1312,7 +1330,8 @@ mod tests {
         };
         let id = |v: &u32| u64::from(*v);
         made.spawn(c.snapshot(), id, |_: &u32| true, Some(|a: &u32, b: &u32| a.cmp(b)));
-        assert_eq!(Arc::strong_count(&made.0.shared), 1, "no worker started");
+        // Their own two: the views', and their end's ([`Gone`]).
+        assert_eq!(Arc::strong_count(&made.0.shared), 2, "no worker started");
         assert_eq!(made.0.asked(), 0, "no request counted");
         assert!(!list.is_lent(), "nothing lent");
         let (live, shown) = views_into(&list, 3);

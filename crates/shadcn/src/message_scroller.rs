@@ -533,12 +533,13 @@ impl Engine {
             let (me, run) = (self.me.clone(), self.autoscroll_run);
             self.owner.run(|| {
                 clock::after(AUTOSCROLLING_TIMEOUT, move || {
-                    if let Some(engine) = me.upgrade()
-                        && let Ok(mut e) = engine.try_borrow_mut()
-                        && e.autoscroll_run == run
-                    {
-                        e.autoscrolling.set(false);
-                        e.commit_scroll_state();
+                    if let Some(engine) = me.upgrade() {
+                        engine.try_with_mut(|e| {
+                            if e.autoscroll_run == run {
+                                e.autoscrolling.set(false);
+                                e.commit_scroll_state();
+                            }
+                        });
                     }
                 })
             });
@@ -787,7 +788,7 @@ impl MessageScroller {
         let weak = Rc::downgrade(&engine);
         list.on_layout(move |l| {
             weak.upgrade()
-                .and_then(|e| e.try_borrow_mut().ok().map(|mut e| e.laid_out(l)))
+                .and_then(|e| e.try_with_mut(|e| e.laid_out(l)))
                 .unwrap_or(false)
         });
         Self {
@@ -818,12 +819,12 @@ impl MessageScroller {
 
     /// Jump to the start of the thread.
     pub fn scroll_to_start(&self) -> bool {
-        self.engine.try_borrow_mut().is_ok_and(|mut e| e.scroll_to_start())
+        self.engine.try_with_mut(|e| e.scroll_to_start()).unwrap_or(false)
     }
 
     /// Jump to the end of the thread, following it from there with `auto_scroll`.
     pub fn scroll_to_end(&self) -> bool {
-        self.engine.try_borrow_mut().is_ok_and(|mut e| e.scroll_to_end())
+        self.engine.try_with_mut(|e| e.scroll_to_end()).unwrap_or(false)
     }
 
     /// Bring message `index` (its place in the thread's data, built or not)
@@ -832,17 +833,15 @@ impl MessageScroller {
     pub fn scroll_to_message(&self, index: usize, options: MessageScrollerScrollOptions) -> bool {
         let row = u64::try_from(index).unwrap_or(u64::MAX);
         self.engine
-            .try_borrow_mut()
-            .is_ok_and(|mut e| e.scroll_to_message(row, options))
+            .try_with_mut(|e| e.scroll_to_message(row, options))
+            .unwrap_or(false)
     }
 
     /// Take the provider's new props: those read as the thread moves (the
     /// peek, the margin, the edge threshold, following the end).
     fn set_props(&self, props: MessageScrollerProps) {
         self.list.follow_tail(props.auto_scroll);
-        if let Ok(mut e) = self.engine.try_borrow_mut() {
-            e.props = props;
-        }
+        self.engine.try_with_mut(|e| e.props = props);
     }
 }
 
@@ -1018,7 +1017,7 @@ fn watch_data<T: 'static>(state: &MessageScroller, props: Signal<MessageScroller
     // The props go with the viewport; the engine is the provider's. Held
     // from the viewport's mount to its unmount, by its registration: a
     // viewport that replaced this one holds it after this one left.
-    let holder = state.engine.borrow().anchor_of;
+    let holder = state.engine.with(|e| e.anchor_of);
     holder.hold(mine);
     let engine = Rc::downgrade(&state.engine);
     Effect::new(move || {
@@ -1027,10 +1026,8 @@ fn watch_data<T: 'static>(state: &MessageScroller, props: Signal<MessageScroller
             let key = |i: u64| item_at(p, i).map_or(ElementKey::default(), |t| key_of((p.meta)(t).0));
             let anchor = |i: u64| is_anchor_in(p, i);
             gui::untracked(|| {
-                if let Some(engine) = engine.upgrade()
-                    && let Ok(mut e) = engine.try_borrow_mut()
-                {
-                    e.data(len, p.gap, &key, &anchor);
+                if let Some(engine) = engine.upgrade() {
+                    engine.try_with_mut(|e| e.data(len, p.gap, &key, &anchor));
                 }
             });
         });

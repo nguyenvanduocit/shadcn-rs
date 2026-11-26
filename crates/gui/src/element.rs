@@ -250,26 +250,159 @@ pub struct Common {
     /// Whether it is a Tab stop while it does not hold focus
     /// ([`Div::tab_stop`]).
     pub(crate) tab_stop: TabStop,
-    /// Tab visits its children last first ([`Div::tab_children_reversed`]).
-    pub(crate) tab_reversed: bool,
-    pub(crate) disabled: bool,
     /// Clicks pass through this node to whatever is below it.
     pub(crate) pass_through: bool,
-    /// Clicks pass through it and its subtree ([`Div::pass_through_all`]).
-    pub(crate) pass_through_all: bool,
-    /// It and its subtree take no input, no focus and no screen reader.
-    pub(crate) inert: bool,
-    /// It and its subtree are dormant ([`Div::dormant`]).
-    pub(crate) dormant: bool,
+    /// What it states beyond its style, as given fixed: what a screen
+    /// reader is told and the flags its subtree inherits. Private: a fixed
+    /// value read alone misses what a binding writes over it, so only the
+    /// node's resolve reads these ([`Self::attrs_to_resolve`]), and code
+    /// that decides by one asks in a way that follows a binding
+    /// ([`Self::role_given`]).
+    attrs: Attrs,
+    /// Those of [`Self::attrs`] given bound, each written over the fixed
+    /// ones where the node resolves ([`crate::layout`]'s attribute
+    /// binding): a signal one reads changing runs that one again, on this
+    /// node alone, and renders nothing.
+    bound_attrs: Vec<AttrOp>,
     /// Holds this scroll container's offset.
     pub(crate) scroll: Option<ScrollHandle>,
     /// What the render built the container's children from, handed to its
     /// handle's hook after layout ([`Div::track_scroll_built`]).
     pub(crate) scroll_built: Option<Rc<dyn std::any::Any>>,
-    /// What a screen reader is told this node is.
-    pub(crate) semantics: Semantics,
     /// The lists it joins when laid out ([`crate::Members`]).
     pub(crate) joins: Vec<crate::members::Join>,
+}
+
+/// What a node states beyond its style: what a screen reader is told
+/// (its [`Semantics`]) and the flags its subtree inherits. Each setter of
+/// one takes a value or a closure ([`crate::value::IntoValue`]), as a
+/// style setter does: a value is written here as the node is described; a
+/// closure (or a signal, or any source) is kept on the node as an
+/// [`AttrOp`] and written over these where the node resolves, in the
+/// accessibility binding phase of ADR-0026.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Attrs {
+    /// What a screen reader is told this node is.
+    pub(crate) semantics: Semantics,
+    /// [`Div::disabled`].
+    pub(crate) disabled: bool,
+    /// It and its subtree take no input, no focus and no screen reader.
+    pub(crate) inert: bool,
+    /// It and its subtree are dormant ([`Div::dormant`]).
+    pub(crate) dormant: bool,
+    /// Clicks pass through it and its subtree ([`Div::pass_through_all`]).
+    pub(crate) pass_through_all: bool,
+    /// Tab visits its children last first ([`Div::tab_children_reversed`]).
+    pub(crate) tab_reversed: bool,
+    /// [`Div::aria_pos_in_set`]'s position and size as each was given:
+    /// the set is told once both are.
+    set_parts: (Option<usize>, Option<usize>),
+}
+
+/// One attribute given bound: which setter (the last setter of an
+/// attribute owns it, fixed or bound), and its closure with the write of
+/// what it gives, shared by every mount of the node (what it gave is each
+/// mount's own: `crate::layout`'s attribute binding).
+#[derive(Clone)]
+pub(crate) struct AttrOp {
+    pub(crate) name: &'static str,
+    pub(crate) def: Rc<dyn crate::layout::AttrBound>,
+}
+
+impl Common {
+    /// Give the attribute `name` (its setter's name) a value, written by
+    /// `write`, as its setter given a value does: a closure it was bound to
+    /// before is dropped.
+    pub(crate) fn fix(&mut self, name: &'static str, write: impl FnOnce(&mut Attrs)) {
+        self.unbind(name);
+        write(&mut self.attrs);
+    }
+
+    /// Bind the attribute `name` to `read`, written by `write`, as its
+    /// setter given a closure does: whatever it was given before is
+    /// replaced (a fixed value it had stays under it, for as long as the
+    /// closure has given nothing).
+    pub(crate) fn bind<T: Clone + PartialEq + 'static>(
+        &mut self,
+        name: &'static str,
+        read: Rc<dyn Fn() -> T>,
+        write: fn(&mut Attrs, T),
+    ) {
+        self.unbind(name);
+        self.bound_attrs.push(AttrOp {
+            name,
+            def: crate::layout::attr_def(read, write),
+        });
+    }
+
+    /// Drop the closure the attribute `name` is bound to, if any.
+    fn unbind(&mut self, name: &'static str) {
+        if !self.bound_attrs.is_empty() {
+            self.bound_attrs.retain(|op| op.name != name);
+        }
+    }
+
+    /// Its fixed attributes and its bound ones, for the node's resolve to
+    /// write the second over the first. The one reader: anything else
+    /// that read the fixed ones would miss what a binding gives (a lint
+    /// test keeps it so: `access::bound`).
+    pub(crate) fn attrs_to_resolve(&self) -> (&Attrs, &[AttrOp]) {
+        (&self.attrs, &self.bound_attrs)
+    }
+
+    /// Its role as it was given: none, a value, or the closure that gives
+    /// it, so code that decides by the role decides as the role resolves.
+    pub(crate) fn role_given(&self) -> RoleGiven {
+        match self.bound_attrs.iter().rev().find(|op| op.name == ROLE) {
+            Some(op) => match op.def.read_any().downcast_ref::<Rc<dyn Fn() -> Role>>() {
+                Some(f) => RoleGiven::Bound(Rc::clone(f)),
+                None => RoleGiven::None,
+            },
+            None => self.attrs.semantics.role.map_or(RoleGiven::None, RoleGiven::Fixed),
+        }
+    }
+}
+
+/// The name [`Div::role`] binds by.
+const ROLE: &str = "role";
+
+/// A node's role as it was given ([`Common::role_given`]).
+#[derive(Clone)]
+pub(crate) enum RoleGiven {
+    None,
+    Fixed(Role),
+    Bound(Rc<dyn Fn() -> Role>),
+}
+
+/// The targets of a relation ([`Div::labelled_by`] and the like), in order.
+pub type Targets = Vec<crate::access::NodeRef>;
+
+/// One target given where a relation's targets are taken.
+impl crate::value::Convert<Targets> for crate::access::NodeRef {
+    fn convert(self) -> Targets {
+        vec![self]
+    }
+}
+
+/// A `bool` given where a [`Toggled`] is taken: checked or not.
+impl crate::value::Convert<Toggled> for bool {
+    fn convert(self) -> Toggled {
+        self.into()
+    }
+}
+
+/// Text given where a `String` is taken (an `aria_label`).
+impl crate::value::Convert<String> for &str {
+    fn convert(self) -> String {
+        self.to_owned()
+    }
+}
+
+/// Text given where a `String` is taken (an `aria_label`).
+impl crate::value::Convert<String> for &String {
+    fn convert(self) -> String {
+        self.clone()
+    }
 }
 
 /// What a node is to assistive technology, as the ARIA attributes say it on
@@ -1029,6 +1162,26 @@ impl<K> Node<K> {
         self
     }
 
+    /// Set the attribute `name`, which `write` writes, as every attribute
+    /// setter does: a value now, a closure (or a source) kept for the
+    /// node's accessibility binding phase. Whichever was set last owns the
+    /// attribute: a value given after a closure drops the closure.
+    fn attr<T, M>(
+        mut self,
+        name: &'static str,
+        value: impl crate::value::IntoValue<T, M>,
+        write: fn(&mut Attrs, T),
+    ) -> Self
+    where
+        T: Clone + PartialEq + 'static,
+    {
+        match value.into_value() {
+            crate::value::Value::Fixed(v) => self.common.fix(name, |a| write(a, v)),
+            crate::value::Value::Bound(read) => self.common.bind(name, read, write),
+        }
+        self
+    }
+
     /// A name the debug tools show for this node.
     #[must_use]
     pub fn named(mut self, name: &'static str) -> Self {
@@ -1106,9 +1259,8 @@ impl<K> Node<K> {
     /// goes the other way, so from outside it reaches the oldest child's
     /// last stop.
     #[must_use]
-    pub fn tab_children_reversed(mut self, reversed: bool) -> Self {
-        self.common.tab_reversed = reversed;
-        self
+    pub fn tab_children_reversed<M>(self, reversed: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("tab_children_reversed", reversed, |a, v| a.tab_reversed = v)
     }
 
     /// Disable this node and its subtree, the deferred subtrees declared in
@@ -1131,10 +1283,14 @@ impl<K> Node<K> {
     /// [`crate::DragPhase::Cancel`] or [`crate::TouchPhase::Cancelled`]
     /// once, its one call while disabled, and nothing after. Unlike
     /// [`Self::unavailable`], which keeps focus and keys.
+    ///
+    /// A value or a closure, as every attribute setter takes: a closure
+    /// (a signal, any source) runs where the node resolves, under a tracker
+    /// of its own, so a signal it reads changing resolves this node and
+    /// what it passes on to its subtree, and renders nothing.
     #[must_use]
-    pub fn disabled(mut self, disabled: bool) -> Self {
-        self.common.disabled = disabled;
-        self
+    pub fn disabled<M>(self, disabled: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("disabled", disabled, |a, v| a.disabled = v)
     }
 
     /// An unavailable node still takes focus and keys, and a screen reader
@@ -1156,174 +1312,180 @@ impl<K> Node<K> {
     /// as disabled too, as Chrome reads what an `aria-disabled` element
     /// holds.
     #[must_use]
-    pub fn unavailable(mut self, unavailable: bool) -> Self {
-        self.common.semantics.unavailable = unavailable;
-        self
+    pub fn unavailable<M>(self, unavailable: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("unavailable", unavailable, |a, v| a.semantics.unavailable = v)
     }
 
     /// What this node is to a screen reader (`role="…"`).
+    ///
+    /// This and every `aria_*` setter take a value or a closure (a
+    /// signal, any source). A closure runs in the node's accessibility
+    /// binding phase, under a tracker of its own: a signal it reads
+    /// changing runs it again on this node alone, which tells a screen
+    /// reader of this node alone, and renders, lays out and paints nothing.
     #[must_use]
-    pub fn role(mut self, role: Role) -> Self {
-        self.common.semantics.role = Some(role);
-        self
+    pub fn role<M>(self, role: impl crate::value::IntoValue<Role, M>) -> Self {
+        self.attr(ROLE, role, |a, v| a.semantics.role = Some(v))
     }
 
     /// Its name to a screen reader when its content does not say it (`aria-label`).
     #[must_use]
-    pub fn aria_label(mut self, label: impl Into<String>) -> Self {
-        self.common.semantics.label = Some(label.into());
-        self
+    pub fn aria_label<M>(self, label: impl crate::value::IntoValue<String, M>) -> Self {
+        self.attr("aria_label", label, |a, v| a.semantics.label = Some(v))
     }
 
     /// Checked, unchecked or mixed, for a checkbox, switch or radio
     /// (`aria-checked`), and pressed or not for a toggle button (`aria-pressed`).
     #[must_use]
-    pub fn aria_checked(mut self, checked: impl Into<Toggled>) -> Self {
-        self.common.semantics.checked = Some(checked.into());
-        self
+    pub fn aria_checked<M>(self, checked: impl crate::value::IntoValue<Toggled, M>) -> Self {
+        self.attr("aria_checked", checked, |a, v| a.semantics.checked = Some(v))
     }
 
     /// The chosen one of its set, for a tab or an option (`aria-selected`).
     #[must_use]
-    pub fn aria_selected(mut self, selected: bool) -> Self {
-        self.common.semantics.selected = Some(selected);
-        self
+    pub fn aria_selected<M>(self, selected: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_selected", selected, |a, v| a.semantics.selected = Some(v))
     }
 
     /// Whether what it controls is open, for a disclosure or menu trigger (`aria-expanded`).
     #[must_use]
-    pub fn aria_expanded(mut self, expanded: bool) -> Self {
-        self.common.semantics.expanded = Some(expanded);
-        self
+    pub fn aria_expanded<M>(self, expanded: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_expanded", expanded, |a, v| a.semantics.expanded = Some(v))
     }
 
     /// How many rows a virtual list or table has in all, built or not
     /// (`aria-rowcount`; each row's `aria-setsize`).
     #[must_use]
-    pub fn aria_row_count(mut self, rows: usize) -> Self {
-        self.common.semantics.row_count = Some(rows);
-        self
+    pub fn aria_row_count<M>(self, rows: impl crate::value::IntoValue<usize, M>) -> Self {
+        self.attr("aria_row_count", rows, |a, v| a.semantics.row_count = Some(v))
     }
 
     /// This row's index among all of them, from 0 (`aria-rowindex`, `aria-posinset`).
     #[must_use]
-    pub fn aria_row_index(mut self, row: usize) -> Self {
-        self.common.semantics.row_index = Some(row);
-        self
+    pub fn aria_row_index<M>(self, row: impl crate::value::IntoValue<usize, M>) -> Self {
+        self.attr("aria_row_index", row, |a, v| a.semantics.row_index = Some(v))
     }
 
-    /// Its place in its set, from 1, of `size` (`aria-posinset`, `aria-setsize`).
+    /// Its place in its set, from 1, of `size` (`aria-posinset`, `aria-setsize`):
+    /// each a value or a closure of its own. Told only once both have
+    /// given one (a closure whose first run panicked tells no place).
     #[must_use]
-    pub fn aria_pos_in_set(mut self, position: usize, size: usize) -> Self {
-        self.common.semantics.set = Some((position, size));
-        self
+    pub fn aria_pos_in_set<M, N>(
+        self,
+        position: impl crate::value::IntoValue<usize, M>,
+        size: impl crate::value::IntoValue<usize, N>,
+    ) -> Self {
+        self.attr("aria_pos_in_set.position", position, |a, v| {
+            a.set_parts.0 = Some(v);
+            a.semantics.set = a.set_parts.0.zip(a.set_parts.1);
+        })
+        .attr("aria_pos_in_set.size", size, |a, v| {
+            a.set_parts.1 = Some(v);
+            a.semantics.set = a.set_parts.0.zip(a.set_parts.1);
+        })
     }
 
     /// Which way it runs, to a screen reader (`aria-orientation`).
     #[must_use]
-    pub fn aria_orientation(mut self, orientation: crate::style::Axis) -> Self {
-        self.common.semantics.orientation = Some(orientation);
-        self
+    pub fn aria_orientation<M>(self, orientation: impl crate::value::IntoValue<crate::style::Axis, M>) -> Self {
+        self.attr("aria_orientation", orientation, |a, v| {
+            a.semantics.orientation = Some(v);
+        })
     }
 
     /// The value it holds in a range, to a screen reader (`aria-valuenow`,
     /// `aria-valuemin`, `aria-valuemax`, `aria-valuetext`).
     #[must_use]
-    pub fn aria_value_range(mut self, range: ValueRange) -> Self {
-        self.common.semantics.range = Some(range);
-        self
+    pub fn aria_value_range<M>(self, range: impl crate::value::IntoValue<ValueRange, M>) -> Self {
+        self.attr("aria_value_range", range, |a, v| a.semantics.range = Some(v))
     }
 
     /// Its level as a heading, from 1 (`aria-level`; an `h3` is 3).
     #[must_use]
-    pub fn aria_level(mut self, level: usize) -> Self {
-        self.common.semantics.announce.level = Some(level);
-        self
+    pub fn aria_level<M>(self, level: impl crate::value::IntoValue<usize, M>) -> Self {
+        self.attr("aria_level", level, |a, v| a.semantics.announce.level = Some(v))
     }
 
     /// It is the current one of its set (`aria-current`).
     #[must_use]
-    pub fn aria_current(mut self, current: AriaCurrent) -> Self {
-        self.common.semantics.announce.current = Some(current);
-        self
+    pub fn aria_current<M>(self, current: impl crate::value::IntoValue<AriaCurrent, M>) -> Self {
+        self.attr("aria_current", current, |a, v| a.semantics.announce.current = Some(v))
     }
 
     /// The text it holds, to a screen reader, when it holds text without
     /// being a text input (a pin's slot): an input's `value`.
     #[must_use]
-    pub fn aria_value(mut self, value: impl Into<String>) -> Self {
-        self.common.semantics.announce.value = Some(value.into());
-        self
+    pub fn aria_value<M>(self, value: impl crate::value::IntoValue<String, M>) -> Self {
+        self.attr("aria_value", value, |a, v| a.semantics.announce.value = Some(v))
     }
 
     /// What its role is called here (`aria-roledescription`).
     #[must_use]
-    pub fn aria_role_description(mut self, description: impl Into<String>) -> Self {
-        self.common.semantics.announce.role_description = Some(description.into());
-        self
+    pub fn aria_role_description<M>(self, description: impl crate::value::IntoValue<String, M>) -> Self {
+        self.attr("aria_role_description", description, |a, v| {
+            a.semantics.announce.role_description = Some(v);
+        })
     }
 
     /// What is read after its name (`aria-description`).
     #[must_use]
-    pub fn aria_description(mut self, description: impl Into<String>) -> Self {
-        self.common.semantics.announce.description = Some(description.into());
-        self
+    pub fn aria_description<M>(self, description: impl crate::value::IntoValue<String, M>) -> Self {
+        self.attr("aria_description", description, |a, v| {
+            a.semantics.announce.description = Some(v);
+        })
     }
 
     /// How changes inside it are told (`aria-live`).
     #[must_use]
-    pub fn aria_live(mut self, live: Live) -> Self {
-        self.common.semantics.announce.live = Some(live);
-        self
+    pub fn aria_live<M>(self, live: impl crate::value::IntoValue<Live, M>) -> Self {
+        self.attr("aria_live", live, |a, v| a.semantics.announce.live = Some(v))
     }
 
     /// Its user may choose several of its options (`aria-multiselectable`).
     #[must_use]
-    pub fn aria_multiselectable(mut self, multiple: bool) -> Self {
-        self.common.semantics.announce.multiselectable = multiple;
-        self
+    pub fn aria_multiselectable<M>(self, multiple: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_multiselectable", multiple, |a, v| {
+            a.semantics.announce.multiselectable = v;
+        })
     }
 
     /// A form needs it filled (`aria-required`).
     #[must_use]
-    pub fn aria_required(mut self, required: bool) -> Self {
-        self.common.semantics.announce.required = required;
-        self
+    pub fn aria_required<M>(self, required: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_required", required, |a, v| a.semantics.announce.required = v)
     }
 
     /// Its value is not one it accepts (`aria-invalid`).
     #[must_use]
-    pub fn aria_invalid(mut self, invalid: bool) -> Self {
-        self.common.semantics.announce.invalid = invalid;
-        self
+    pub fn aria_invalid<M>(self, invalid: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_invalid", invalid, |a, v| a.semantics.announce.invalid = v)
     }
 
     /// Its value is not changed by its user (`aria-readonly`).
     #[must_use]
-    pub fn aria_readonly(mut self, read_only: bool) -> Self {
-        self.common.semantics.announce.read_only = read_only;
-        self
+    pub fn aria_readonly<M>(self, read_only: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_readonly", read_only, |a, v| a.semantics.announce.read_only = v)
     }
 
     /// The popup it opens (`aria-haspopup`).
     #[must_use]
-    pub fn aria_has_popup(mut self, popup: HasPopup) -> Self {
-        self.common.semantics.announce.has_popup = Some(popup);
-        self
+    pub fn aria_has_popup<M>(self, popup: impl crate::value::IntoValue<HasPopup, M>) -> Self {
+        self.attr("aria_has_popup", popup, |a, v| a.semantics.announce.has_popup = Some(v))
     }
 
     /// How typing in it completes (`aria-autocomplete`).
     #[must_use]
-    pub fn aria_auto_complete(mut self, complete: AutoComplete) -> Self {
-        self.common.semantics.announce.auto_complete = Some(complete);
-        self
+    pub fn aria_auto_complete<M>(self, complete: impl crate::value::IntoValue<AutoComplete, M>) -> Self {
+        self.attr("aria_auto_complete", complete, |a, v| {
+            a.semantics.announce.auto_complete = Some(v);
+        })
     }
 
-    /// Leave this node and its subtree out of what a screen reader reads (`aria-hidden`).
+    /// While `hidden`, leave this node and its subtree out of what a screen
+    /// reader reads (`aria-hidden`).
     #[must_use]
-    pub fn aria_hidden(mut self) -> Self {
-        self.common.semantics.hidden = true;
-        self
+    pub fn aria_hidden<M>(self, hidden: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("aria_hidden", hidden, |a, v| a.semantics.hidden = v)
     }
 
     /// Let clicks through to what is below (`pointer-events: none`).
@@ -1338,9 +1500,8 @@ impl<K> Node<K> {
     /// it is hit or hovered. Focus and the screen reader are unchanged. A
     /// splitter's panels while a drag runs.
     #[must_use]
-    pub fn pass_through_all(mut self, on: bool) -> Self {
-        self.common.pass_through_all = on;
-        self
+    pub fn pass_through_all<M>(self, on: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("pass_through_all", on, |a, v| a.pass_through_all = v)
     }
 
     /// `f` as a handler of this node: run inside the component instance
@@ -1664,9 +1825,8 @@ impl<K> Node<K> {
     /// pointer, takes focus, is a layer, or is read by a screen reader. It
     /// still lays out and paints.
     #[must_use]
-    pub fn inert(mut self, inert: bool) -> Self {
-        self.common.inert = inert;
-        self
+    pub fn inert<M>(self, inert: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("inert", inert, |a, v| a.inert = v)
     }
 
     /// Make this node and its subtree dormant: laid out but not shown
@@ -1677,52 +1837,93 @@ impl<K> Node<K> {
     /// A member hidden for any other reason (`invisible`, inert, an inline
     /// a clamp hides) is in no list, its owner's included.
     #[must_use]
-    pub fn dormant(mut self, dormant: bool) -> Self {
-        self.common.dormant = dormant;
-        self
+    pub fn dormant<M>(self, dormant: impl crate::value::IntoValue<bool, M>) -> Self {
+        self.attr("dormant", dormant, |a, v| a.dormant = v)
     }
 
     /// Name this node with `node`, for other nodes' relations to it.
     #[must_use]
     pub fn node_ref(mut self, node: crate::access::NodeRef) -> Self {
-        self.common.semantics.node = Some(node);
+        self.common.attrs.semantics.node = Some(node);
         self
     }
 
-    /// The node whose text names this one (`aria-labelledby`); several add up.
-    #[must_use]
-    pub fn labelled_by(mut self, node: crate::access::NodeRef) -> Self {
-        self.common.semantics.relations.labelled_by.push(node);
+    /// Set the relation `name` to the targets `to` gives, as each relation
+    /// setter does. Values add up: each fixed call adds its targets after
+    /// those of the calls before it. A closure gives the whole list, in
+    /// order, and replaces what fixed calls before it added; a fixed call
+    /// after a closure drops the closure.
+    fn relation<M>(
+        mut self,
+        name: &'static str,
+        to: impl crate::value::IntoValue<Targets, M>,
+        list: fn(&mut Attrs) -> &mut Targets,
+        set: fn(&mut Attrs, Targets),
+    ) -> Self {
+        match to.into_value() {
+            crate::value::Value::Fixed(v) => self.common.fix(name, |a| list(a).extend(v)),
+            crate::value::Value::Bound(read) => self.common.bind(name, read, set),
+        }
         self
     }
 
-    /// The node whose text describes this one (`aria-describedby`); several add up.
+    /// The nodes whose text names this one (`aria-labelledby`): one target,
+    /// several, or a closure giving them ([`Self::relation`]'s rule: fixed
+    /// calls add up, a closure gives the whole list).
     #[must_use]
-    pub fn described_by(mut self, node: crate::access::NodeRef) -> Self {
-        self.common.semantics.relations.described_by.push(node);
-        self
+    pub fn labelled_by<M>(self, to: impl crate::value::IntoValue<Targets, M>) -> Self {
+        self.relation(
+            "labelled_by",
+            to,
+            |a| &mut a.semantics.relations.labelled_by,
+            |a, v| a.semantics.relations.labelled_by = v,
+        )
     }
 
-    /// The node this one controls (`aria-controls`: a trigger's popup).
+    /// The nodes whose text describes this one (`aria-describedby`), as
+    /// [`Self::labelled_by`] takes them.
     #[must_use]
-    pub fn controls(mut self, node: crate::access::NodeRef) -> Self {
-        self.common.semantics.relations.controls.push(node);
-        self
+    pub fn described_by<M>(self, to: impl crate::value::IntoValue<Targets, M>) -> Self {
+        self.relation(
+            "described_by",
+            to,
+            |a| &mut a.semantics.relations.described_by,
+            |a, v| a.semantics.relations.described_by = v,
+        )
     }
 
-    /// The node this one owns though it is elsewhere in the tree (`aria-owns`).
+    /// The nodes this one controls (`aria-controls`: a trigger's popup), as
+    /// [`Self::labelled_by`] takes them.
     #[must_use]
-    pub fn owns(mut self, node: crate::access::NodeRef) -> Self {
-        self.common.semantics.relations.owns.push(node);
-        self
+    pub fn controls<M>(self, to: impl crate::value::IntoValue<Targets, M>) -> Self {
+        self.relation(
+            "controls",
+            to,
+            |a| &mut a.semantics.relations.controls,
+            |a, v| a.semantics.relations.controls = v,
+        )
+    }
+
+    /// The nodes this one owns though they are elsewhere in the tree
+    /// (`aria-owns`), as [`Self::labelled_by`] takes them.
+    #[must_use]
+    pub fn owns<M>(self, to: impl crate::value::IntoValue<Targets, M>) -> Self {
+        self.relation(
+            "owns",
+            to,
+            |a| &mut a.semantics.relations.owns,
+            |a, v| a.semantics.relations.owns = v,
+        )
     }
 
     /// The descendant that is active while this node keeps focus
-    /// (`aria-activedescendant`: a listbox's highlighted option).
+    /// (`aria-activedescendant`: a listbox's highlighted option): a value
+    /// or a closure, as an `aria_*` setter takes.
     #[must_use]
-    pub fn active_descendant(mut self, node: Option<crate::access::NodeRef>) -> Self {
-        self.common.semantics.relations.active_descendant = node;
-        self
+    pub fn active_descendant<M>(self, node: impl crate::value::IntoValue<Option<crate::access::NodeRef>, M>) -> Self {
+        self.attr("active_descendant", node, |a, v| {
+            a.semantics.relations.active_descendant = v;
+        })
     }
 }
 

@@ -55,7 +55,7 @@ impl Lists {
             })
         });
         // Those that began to be watched while telling these join them.
-        watched.append(&mut self.watched.borrow_mut());
+        self.watched.with_mut(|w| watched.append(w));
         self.watched.replace(watched);
         all.finish();
     }
@@ -90,7 +90,7 @@ struct Inner<T> {
 impl<T> Inner<T> {
     /// The pass of the tree filling it, if any is.
     fn now(&self) -> Option<u64> {
-        self.lists.borrow().upgrade().map(|l| l.pass.get())
+        self.lists.with(Weak::upgrade).map(|l| l.pass.get())
     }
 
     fn current(&self) -> bool {
@@ -107,21 +107,20 @@ impl<T> Watched for Inner<T> {
         let last = self.issued.get();
         let mut after = 0;
         loop {
-            let next = {
-                let watch = self.watch.borrow();
+            let next = self.watch.with(|watch| {
                 let at = watch.partition_point(|(id, _)| *id <= after);
                 watch
                     .get(at)
                     .filter(|(id, _)| *id <= last)
                     .map(|(id, f)| (*id, Rc::clone(f)))
-            };
+            });
             let Some((id, f)) = next else { break };
             after = id;
             // A caller's closure, through the one gate (ADR-0028, rule 5).
             all.run(|| {
                 crate::engine::call_out(crate::engine::Site::LaidOut, || {
                     if self.current() {
-                        f(&self.items.borrow());
+                        self.items.with(|items| f(items));
                     } else {
                         f(&[]);
                     }
@@ -194,7 +193,7 @@ impl<T> Members<T> {
     /// Run `f` on the members' values, in tree order.
     pub fn with<R>(&self, f: impl FnOnce(&[T]) -> R) -> R {
         if self.0.current() {
-            f(&self.0.items.borrow())
+            self.0.items.with(|items| f(items))
         } else {
             f(&[])
         }
@@ -219,15 +218,15 @@ impl<T: 'static> Members<T> {
             };
             let id = inner.issued.get().wrapping_add(1);
             inner.issued.set(id);
-            inner.watch.borrow_mut().push((id, f));
+            inner.watch.with_mut(|w| w.push((id, f)));
             let me = Self(Rc::clone(&inner));
-            let lists = inner.lists.borrow().upgrade();
+            let lists = inner.lists.with(Weak::upgrade);
             if let Some(l) = lists {
                 me.watch_in(&l);
             }
             Box::new(move || {
                 if let Some(inner) = list.upgrade() {
-                    inner.watch.borrow_mut().retain(|(by, _)| *by != id);
+                    inner.watch.with_mut(|w| w.retain(|(by, _)| *by != id));
                 }
             })
         });
@@ -235,27 +234,27 @@ impl<T: 'static> Members<T> {
 
     /// Be among `lists`' watched ones, once, if watched.
     fn watch_in(&self, lists: &Lists) {
-        if !self.0.watch.borrow().is_empty() && !self.0.watched.replace(true) {
+        if !self.0.watch.with(Vec::is_empty) && !self.0.watched.replace(true) {
             let me: Rc<dyn Watched> = self.0.clone();
-            lists.watched.borrow_mut().push(Rc::downgrade(&me));
+            lists.watched.with_mut(|w| w.push(Rc::downgrade(&me)));
         }
     }
 
     fn push(&self, lists: &Rc<Lists>, value: T) {
-        let ours = std::ptr::eq(self.0.lists.borrow().as_ptr(), Rc::as_ptr(lists));
+        let ours = self.0.lists.with(|l| std::ptr::eq(l.as_ptr(), Rc::as_ptr(lists)));
         if !ours {
             // Laid out by this tree from now on.
             self.0.lists.replace(Rc::downgrade(lists));
             self.0.watched.set(false);
-            self.0.items.borrow_mut().clear();
+            self.0.items.with_mut(Vec::clear);
             self.watch_in(lists);
         }
         let now = lists.pass.get();
         if self.0.pass.get() != now || !ours {
             self.0.pass.set(now);
-            self.0.items.borrow_mut().clear();
+            self.0.items.with_mut(Vec::clear);
         }
-        self.0.items.borrow_mut().push(value);
+        self.0.items.with_mut(|i| i.push(value));
     }
 }
 
@@ -312,7 +311,7 @@ mod tests {
         lists.begin_pass();
         lists.end_pass();
         assert_eq!(seen.borrow().len(), 2);
-        assert!(lists.watched.borrow().is_empty());
+        assert!(lists.watched.with(Vec::is_empty));
     }
 
     /// Two parts watch one list: each pass runs both, in the order they
@@ -399,7 +398,7 @@ mod tests {
         lists.begin_pass();
         lists.end_pass();
         assert_eq!(told.get(), 2, "and in the next");
-        assert_eq!(lists.watched.borrow().len(), 2, "both lists still watched");
+        assert_eq!(lists.watched.with(Vec::len), 2, "both lists still watched");
         part.dispose();
     }
 

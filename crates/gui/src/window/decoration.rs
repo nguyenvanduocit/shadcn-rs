@@ -309,7 +309,7 @@ fn framed(c: &Chrome, caption: &Rc<RefCell<Caption>>, actions: &Actions, app: El
 }
 
 fn push(actions: &Actions, action: WindowAction) {
-    actions.borrow_mut().push(action);
+    actions.with_mut(|a| a.push(action));
 }
 
 /// The title bar: the title centred, the buttons at the end.
@@ -544,7 +544,7 @@ mod tests {
             eprintln!("no GPU: skipped");
             return;
         };
-        let taken = || std::mem::take(&mut *actions.borrow_mut());
+        let taken = || actions.with_mut(std::mem::take);
         assert!(s.frame("decorated").is_ok());
         let Ok((_, y)) = s.locate("content") else {
             panic!("the app is shown")

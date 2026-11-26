@@ -165,7 +165,7 @@ impl Columns {
     /// Let its state go now: it is inert from here on.
     pub fn dispose(self) {
         // `try_with`: dropped as the thread's state is torn down, it is gone.
-        if let Ok(Some(s)) = COLUMNS.try_with(|c| c.borrow_mut().remove(self.0)) {
+        if let Ok(Some(s)) = COLUMNS.try_with(|c| c.with_mut(|c| c.remove(self.0))) {
             s.version.dispose_quietly();
         }
     }
@@ -173,7 +173,7 @@ impl Columns {
     /// Whether its owner has not ended.
     #[must_use]
     pub fn is_alive(self) -> bool {
-        COLUMNS.with(|c| c.borrow().contains(self.0))
+        COLUMNS.with_borrow(|c| c.contains(self.0))
     }
 
     /// Read its state; `None` once it is gone, which its owner's code
@@ -190,7 +190,7 @@ impl Columns {
     /// [`Self::read`], quiet once it is gone: for the engine's own paths
     /// (a cell measured once more as its tree is torn down).
     fn peek<R>(self, f: impl FnOnce(&State) -> R) -> Option<R> {
-        COLUMNS.with(|c| c.borrow().read(self.0, f))
+        COLUMNS.with_borrow(|c| c.read(self.0, f))
     }
 
     /// Its owner's code uses it: gone, a loud bug in a debug build.
@@ -247,8 +247,8 @@ impl Columns {
         if !self.is_auto(column) {
             return false;
         }
-        let grew = COLUMNS.with(|c| {
-            c.borrow().write(self.0, |s| match s.seen.get(column) {
+        let grew = COLUMNS.with_borrow(|c| {
+            c.write(self.0, |s| match s.seen.get(column) {
                 Some(seen) if width > seen + 0.01 => {
                     s.seen.set(column, width);
                     Some(s.version)

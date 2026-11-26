@@ -104,18 +104,25 @@ pub(crate) enum Phase {
     /// The switch back found what the drain should have taken (a bug in
     /// gui): quarantined.
     Switch,
+    /// It disposed of another world's reactive node, which was refused
+    /// (ADR-0035, D3): a `Drop` that did engine work outside an `Ends`.
+    Foreign,
 }
 
 impl fmt::Display for Fault {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A runaway sets aside what it still held, live values among them,
+        // which then never end (ADR-0035, D6's carve-out): the live state is
+        // as the check found it, but those values' ends are lost.
         let rest = if self.phase == Phase::Runaway || self.later.iter().any(|l| l.phase == Phase::Runaway) {
-            "What it still made was set aside (never dropped: a runaway)"
+            "What it still held was set aside, never dropped (a runaway): the live state is as the check found it, \
+             but a live value among them never ends"
         } else {
-            "Everything else it made was still dropped, each on its own"
+            "Everything else it made was still dropped, each on its own; the live state is whole"
         };
         write!(
             f,
-            "gui: a check faulted ({:?} of {}): {}. {rest}; the live state is whole, and checks on this thread are off",
+            "gui: a check faulted ({:?} of {}): {}. {rest}; checks on this thread are off",
             self.phase, self.piece, self.message
         )?;
         for later in &self.later {
@@ -168,7 +175,8 @@ impl ColdFrame {
             let r = &mut *r;
             assert!(r.cold.is_none(), "a cold frame inside a cold frame");
             r.cold = Some(Vec::new());
-            r.serial = r.serial.saturating_add(1);
+            r.serial = super::new_world();
+            r.foreign.clear();
             r.doom = Doom::Kept;
             r.dropped_at = None;
             r.cancel = r.next_cancel.take();
@@ -275,6 +283,19 @@ impl ColdFrame {
                 Phase::Switch,
                 left.join(", "),
                 String::from("a value the drain should have taken was left, and quarantined"),
+            ));
+        }
+        let foreign = REGISTRY
+            .try_with(|r| std::mem::take(&mut r.borrow_mut().foreign))
+            .unwrap_or_default();
+        if !foreign.is_empty() {
+            faults.add(Fault::new(
+                Phase::Foreign,
+                foreign.join(", "),
+                String::from(
+                    "it disposed of a live reactive node, refused: a value's end ran outside the world that made it \
+                     (hold it in an `engine::Ends`, ADR-0035)",
+                ),
             ));
         }
         if let Some(mut fault) = faults.first {
@@ -507,6 +528,28 @@ fn named(slots: &[usize]) -> String {
         .unwrap_or_default()
 }
 
+/// Why a check entered while user code runs was refused (ADR-0035, D4):
+/// `Skipped(InUserCode)`, its body never run.
+pub(crate) const BORROWED: &str = "user code running, a lend of world state under way (InUserCode)";
+
+/// Why a check opened inside a check's body was refused: a check runs in
+/// the live world alone (`Skipped(InCheck)`, its body never run).
+pub(crate) const NESTED: &str = "a check already running on this thread (InCheck)";
+
+/// Whether a check opened now would run inside user code ([`super::lent`]):
+/// a closure the engine lends world state to (a signal's, a computed's, a
+/// world cell's, a logged piece's) or calls (a render, a handler, an
+/// effect, a cleanup, a timer). ADR-0035 D4's run-time rule, beside its
+/// rule by type (every check body is engine code or `'static`, so no
+/// borrow lent to user code is carried into one): a check opened inside
+/// counted user code is refused here, whether through the test hook or a
+/// second pipeline's frame driven from a handler. Compiled wherever checks
+/// are. (A piece in use otherwise is refused as the check begins, naming
+/// it.)
+fn borrowed() -> bool {
+    super::lent()
+}
+
 /// Why no check opens on this thread, if one faulted.
 pub(crate) fn poisoned() -> Option<String> {
     REGISTRY.try_with(|r| r.borrow().poisoned.clone()).ok().flatten()
@@ -519,6 +562,12 @@ pub(crate) fn poisoned() -> Option<String> {
 pub(crate) fn fork<R>(f: impl FnOnce() -> R) -> Ended<R> {
     if poisoned().is_some() {
         return Ended::Poisoned;
+    }
+    if borrowed() {
+        return Ended::Dropped(BORROWED);
+    }
+    if super::is_cold() {
+        return Ended::Dropped(NESTED);
     }
     let frame = ColdFrame::begin();
     let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));

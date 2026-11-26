@@ -139,7 +139,9 @@ impl<T: Clone + 'static> Roving<T> {
                     group.remember(f);
                 } else {
                     let pass = group.items().pass();
-                    group.state.with_untracked(|s| s.pending.borrow_mut().push((pass, f)));
+                    group
+                        .state
+                        .with_untracked(|s| s.pending.with_mut(|p| p.push((pass, f))));
                 }
             }
         });
@@ -183,7 +185,7 @@ impl<T: Clone + 'static> Roving<T> {
 
     /// `focus` is the group's last: newer than any focus still waiting.
     fn remember(self, focus: FocusId) {
-        self.state.with_untracked(|s| s.pending.borrow_mut().clear());
+        self.state.with_untracked(|s| s.pending.with_mut(Vec::clear));
         self.last.set(Some(focus));
     }
 
@@ -193,10 +195,11 @@ impl<T: Clone + 'static> Roving<T> {
     fn settle(self) {
         let pass = self.items().pass();
         let decided: Vec<FocusId> = self.state.with_untracked(|s| {
-            let mut pending = s.pending.borrow_mut();
-            let (decided, waiting) = pending.drain(..).partition::<Vec<_>, _>(|&(at, _)| at != pass);
-            *pending = waiting;
-            decided.into_iter().map(|(_, f)| f).collect()
+            s.pending.with_mut(|pending| {
+                let (decided, waiting) = pending.drain(..).partition::<Vec<_>, _>(|&(at, _)| at != pass);
+                *pending = waiting;
+                decided.into_iter().map(|(_, f)| f).collect()
+            })
         });
         if let Some(&f) = decided.iter().rev().find(|&&f| self.holds(f)) {
             self.last.set(Some(f));

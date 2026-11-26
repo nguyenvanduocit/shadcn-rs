@@ -8,6 +8,7 @@ use crate::geometry::{NodePath, PathSeg};
 use crate::style::{ContentStyle, Cursor, Display, Length, ResolvedText, Style};
 use crate::text::Run;
 
+use super::attrs::AttrBinding;
 use super::binding::{StyleBinding, Tracked, Tracker};
 use super::{
     Behaviour, BoxStyle, Extra, ImageMeasure, Inherit, LayerTodo, LayoutTree, Leaf, Len, NO_SLOT, Node, PaintStyle,
@@ -134,6 +135,7 @@ impl LayoutTree {
             style_binding: None,
             text_binding: None,
             draw_binding: None,
+            attr_binding: None,
             base: None,
             element: Element::Empty,
             inherit: None,
@@ -154,7 +156,7 @@ impl LayoutTree {
             hidden: None,
             hidden_waits: Vec::new(),
             hidden_mark: None,
-            interaction: crate::interact::NodeInteraction::default(),
+            interaction: crate::engine::Ends::default(),
         }));
         self.by_path.insert(path, u);
         let mut node = Node::new(BoxStyle::default(), None);
@@ -213,7 +215,7 @@ impl LayoutTree {
         self.visits.resolved = self.visits.resolved.saturating_add(1);
         let mut ex = self.take_extra(u)?;
         let mut tracker = std::mem::take(&mut ex.resolve);
-        let (probe, marks) = (self.probe, Rc::clone(&self.marks));
+        let (probe, marks) = (*self.probe, Rc::clone(&self.marks));
         let resolved = tracker.run(probe, &marks, u, need::RESOLVE, || {
             self.resolve_own(pass, node, el, common, inherit, layer, &mut ex)
         });
@@ -243,7 +245,7 @@ impl LayoutTree {
         if let Some(f) = ex.focus_id {
             self.by_focus.insert(f, u);
         }
-        if let Some(h) = ex.hidden {
+        if let Some(h) = ex.hidden.as_deref() {
             // Its hidden children are built again below, and say again what they read.
             h.track(|| ());
         }
@@ -315,28 +317,22 @@ impl LayoutTree {
     }
 
     /// Let go of `node`, a child of `parent` that now takes no space, keeping
-    /// what decided that (its patch's reads, its style binding's) as
-    /// `parent`'s: a change there resolves `parent` again, which builds it.
+    /// what decided that (its patch's reads and every binding's, of every
+    /// kind: [`Extra::trackers`]) as `parent`'s: a change there resolves
+    /// `parent` again, which builds it.
     fn hide(&mut self, parent: u32, node: Node) {
-        let reads: Vec<crate::reactive::RenderNode> = self.extra(node.user).map_or_else(Vec::new, |e| {
-            e.resolve
-                .0
-                .into_iter()
-                .chain(e.style_binding.iter().flat_map(|b| b.nodes()))
-                .collect()
-        });
+        let reads: Vec<crate::reactive::RenderNode> =
+            self.extra(node.user).map_or_else(Vec::new, |e| e.trackers().collect());
         if !reads.is_empty() && parent != NO_SLOT {
             let marks = Rc::clone(&self.marks);
             if let Some(p) = self.extra_mut(parent) {
-                let hidden = *p.hidden.get_or_insert_with(|| {
-                    crate::reactive::detached(|| {
+                let hidden = **p.hidden.get_or_insert_with(|| {
+                    super::binding::Node::new(crate::reactive::detached(|| {
                         crate::reactive::RenderNode::new(move || {
-                            if let Ok(mut m) = marks.try_borrow_mut() {
-                                m.push((parent, need::RESOLVE));
-                            }
+                            marks.try_with_mut(|m| m.push((parent, need::RESOLVE)));
                             crate::component::frame_due();
                         })
-                    })
+                    }))
                 });
                 for r in reads {
                     hidden.take_deps(r);
@@ -349,8 +345,8 @@ impl LayoutTree {
             && let Some(mut waits) = self.extra_mut(parent).map(|p| std::mem::take(&mut p.hidden_waits))
         {
             let from = waits.len();
-            if let Some(b) = self.extra_mut(node.user).and_then(|e| e.style_binding.as_mut()) {
-                b.take_waits(&mut waits);
+            if let Some(e) = self.extra_mut(node.user) {
+                e.take_waits(&mut waits);
             }
             // Not what reads a handle bound inside it: a hidden node is never
             // hovered nor focused, and built again it registers anew. Handed
@@ -476,7 +472,31 @@ impl LayoutTree {
         ex: &mut Extra,
     ) -> Option<Resolved> {
         let u = node.user;
-        let disabled = inherit.disabled || common.disabled;
+        // Its attributes (ADR-0026's accessibility binding phase): the
+        // fixed ones, each bound one written over them as its closure last
+        // gave, run again here only when what it read changed.
+        let (fixed, bound) = common.attrs_to_resolve();
+        let attrs_changed = if bound.is_empty() {
+            ex.attr_binding = None;
+            false
+        } else {
+            let same = el.ptr_eq(&ex.element);
+            // A cold build writes what the live node holds over a run
+            // that panicked.
+            let held = self.held.get(&ex.path).map_or(&[][..], |h| h.attrs.as_slice());
+            ex.attr_binding
+                .get_or_insert_with(|| Box::new(AttrBinding::new(&self.marks, u)))
+                .resolve(fixed, bound, same, held)
+        };
+        let attrs = ex.attr_binding.as_deref().map_or(fixed, AttrBinding::attrs);
+        let (own_disabled, own_inert, own_dormant, own_passes, tab_reversed) = (
+            attrs.disabled,
+            attrs.inert,
+            attrs.dormant,
+            attrs.pass_through_all,
+            attrs.tab_reversed,
+        );
+        let disabled = inherit.disabled || own_disabled;
         let mut style = self.resolve(pass.state, el, common, disabled, ex, u, layer);
         if style.display == Display::None {
             return None;
@@ -498,7 +518,7 @@ impl LayoutTree {
         ex.provides = style.content;
         ex.takes_decorations = style.takes_decorations();
         let invisible = inherit.invisible || style.invisible;
-        let dormant = inherit.dormant || common.dormant;
+        let dormant = inherit.dormant || own_dormant;
         if matches!(el, Element::Input(_)) && style.cursor.is_none() {
             style.cursor = Some(Cursor::Text);
         }
@@ -610,8 +630,10 @@ impl LayoutTree {
         // changed), it acts as it did unless its cursor or a bound span's
         // changed, or another span acts: the behaviour stands, and nothing
         // is allocated for it. Spans are told apart by which they are and
-        // all they cover (two may start at the same byte).
+        // all they cover (two may start at the same byte). A bound
+        // attribute that changed makes it anew.
         let same = el.ptr_eq(&ex.element)
+            && !attrs_changed
             && ex.behaviour.cursor == style.cursor
             && match el {
                 Element::Text(n) if !bound_spans.is_empty() => acting(&n.kind.spans, &bound_spans)
@@ -803,8 +825,8 @@ impl LayoutTree {
             Pending::Input(i) => Some(i.field),
             _ => None,
         };
-        let inert = inherit.inert || common.inert;
-        let passes = inherit.passes || common.pass_through_all;
+        let inert = inherit.inert || own_inert;
+        let passes = inherit.passes || own_passes;
         let pass_through = common.pass_through || inert || passes;
         // An inert node keeps its focus id: it holds no focus as one not
         // shown ([`Frame::shown`]), and focus asked for it is refused.
@@ -833,11 +855,16 @@ impl LayoutTree {
                 spans,
                 scroll: common.scroll,
                 scroll_built: common.scroll_built.clone(),
-                semantics: common.semantics.clone(),
+                semantics: ex
+                    .attr_binding
+                    .as_deref()
+                    .map_or(common.attrs_to_resolve().0, AttrBinding::attrs)
+                    .semantics
+                    .clone(),
                 interaction: ex.interaction.flags(),
                 inert,
                 tab_stop: common.tab_stop.clone(),
-                tab_reversed: common.tab_reversed,
+                tab_reversed,
             });
             ex.fresh_behaviour = true;
         }

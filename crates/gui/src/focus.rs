@@ -277,6 +277,8 @@ pub struct FocusRoot {
     /// What the platform says of this window: each window's own, so a
     /// second window's input or resize leaves this one's as it was.
     window: WindowSignals,
+    /// Its end as its last `Rc` goes ([`WindowEnd`]).
+    _ending: crate::engine::Ends<WindowEnd>,
 }
 
 /// Where a window is in its life (ADR-0015, the window state machine):
@@ -381,11 +383,9 @@ pub(crate) fn registry_summary() -> String {
 /// Write window `salt`'s work, if it is open and the table not borrowed.
 fn window_work<R>(salt: u64, f: impl FnOnce(&mut WindowWork) -> R) -> Option<R> {
     WINDOW_WORK
-        .try_with(|w| {
-            let mut w = w.try_borrow_mut().ok()?;
-            w.contains_key(&salt).then(|| f(w.entry_mut(salt)))
-        })
+        .try_with(|w| w.try_with_mut(|w| w.contains_key(&salt).then(|| f(w.entry_mut(salt)))))
         .ok()
+        .flatten()
         .flatten()
 }
 
@@ -501,12 +501,7 @@ impl FocusRoot {
         // which a caller holds: unique as they are.
         let salt = crate::engine::unique_id(&WINDOWS);
         WINDOW_WORK.with_borrow_mut(|w| w.insert(salt, WindowWork::default()));
-        let root = Rc::new(Self {
-            salt,
-            focused: Owned::labeled("focus", None),
-            visible: Owned::labeled("focus-visible", false),
-            window: WindowSignals::new(),
-        });
+        let root = Rc::new(Self::with_salt(salt));
         cx::made(&root);
         root
     }
@@ -577,7 +572,7 @@ impl FocusRoot {
     /// left belongs to no open window, so never runs.
     pub(crate) fn finish_close(&self, settled: bool) {
         let left = WINDOW_WORK
-            .try_with(|w| w.try_borrow_mut().ok().and_then(|mut w| w.remove(&self.salt)))
+            .try_with(|w| w.try_with_mut(|w| w.remove(&self.salt)).flatten())
             .ok()
             .flatten();
         if let Some(left) = &left {
@@ -592,19 +587,13 @@ impl FocusRoot {
         self.end();
     }
 
-    /// Whether a check made it: its pipeline's drop closes it in the check
-    /// then; a live one's closes live, once the check has switched back.
-    pub(crate) fn made_in_fork(&self) -> bool {
-        self.focused.made_in_fork()
-    }
-
     /// Whether it closed ([`Self::finish_close`]): its record is gone.
     pub(crate) fn is_closed(&self) -> bool {
         // The thread's own (salt 0) never closes, and keeps no work table:
         // what it owns lives as long as the thread.
         self.salt != 0
             && WINDOW_WORK
-                .try_with(|w| w.try_borrow().is_ok_and(|w| !w.contains_key(&self.salt)))
+                .try_with(|w| w.try_with(|w| !w.contains_key(&self.salt)).unwrap_or(false))
                 .unwrap_or(true)
     }
 
@@ -650,44 +639,41 @@ fn end_window(focused: Owned<Option<FocusId>>, visible: Owned<bool>, window: Win
     // table goes too (a window dropped unclosed): closed, its work never
     // runs.
     let work = WINDOW_WORK
-        .try_with(|w| w.try_borrow_mut().ok().and_then(|mut w| w.remove(&salt)))
+        .try_with(|w| w.try_with_mut(|w| w.remove(&salt)).flatten())
         .ok()
         .flatten();
     drop(work);
     let removed = WINDOW_FOCUS
-        .try_with(|w| match w.try_borrow_mut() {
-            Ok(mut w) => {
-                drop(w.remove(&salt));
-                true
-            }
-            Err(_) => false,
-        })
+        .try_with(|w| w.try_with_mut(|w| drop(w.remove(&salt))).is_some())
         .unwrap_or(true);
     if !removed {
-        GONE.try_with(|g| g.borrow_mut().insert(salt, ())).ok();
+        GONE.try_with(|g| g.with_mut(|g| g.insert(salt, ()))).ok();
     }
 }
 
-impl Drop for FocusRoot {
-    /// Its last `Rc`. A live window a check drops goes once the check has
-    /// switched back: released in the check, the rollback would put its
-    /// entry and its signals back with no window left to release them
-    /// (ADR-0028).
-    /// Its index entry ([`cx::unmade`]) goes in the same job, in its own
-    /// world: a check writes nothing live (review r18, decision 4).
-    fn drop(&mut self) {
-        let (focused, visible, window, salt) = (self.focused, self.visible, self.window, self.salt);
-        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), focused.made_in_fork(), move || {
-            cx::unmade(salt);
-            end_window(focused, visible, window, salt);
-        });
+/// A window's end, as its [`FocusRoot`]'s last `Rc` goes: its index entry
+/// ([`cx::unmade`]), its signals and its entries, in the world that made it
+/// ([`crate::engine::Ends`], ADR-0035). A live window a check drops goes
+/// once the check has switched back: released in the check, the rollback
+/// would put its entry and its signals back with no window left to release
+/// them (ADR-0028; review r18, decision 4).
+struct WindowEnd {
+    focused: Owned<Option<FocusId>>,
+    visible: Owned<bool>,
+    window: WindowSignals,
+    salt: u64,
+}
+
+impl crate::engine::Ending for WindowEnd {
+    fn end(self) {
+        cx::unmade(self.salt);
+        end_window(self.focused, self.visible, self.window, self.salt);
     }
 }
 
 /// Take out the entries of windows gone while the map was borrowed.
 fn sweep_gone() {
-    let gone: Vec<u64> = GONE.with(|g| {
-        let mut g = g.borrow_mut();
+    let gone: Vec<u64> = GONE.with_borrow_mut(|g| {
         if g.is_empty() {
             return Vec::new();
         }
@@ -710,7 +696,7 @@ fn sweep_gone() {
 fn window_focus<R>(f: impl FnOnce(Option<&WindowFocus>) -> R) -> R {
     sweep_gone();
     let salt = current().salt;
-    WINDOW_FOCUS.with(|w| f(w.borrow().get(&salt)))
+    WINDOW_FOCUS.with_borrow(|w| f(w.get(&salt)))
 }
 
 /// The current window's [`WindowFocus`], written (logged in a fork).
@@ -731,12 +717,28 @@ impl fmt::Debug for FocusRoot {
 impl FocusRoot {
     /// The thread's own, for code that runs outside any window.
     fn new_detached() -> Rc<Self> {
-        Rc::new(Self {
-            salt: 0,
-            focused: Owned::labeled("focus", None),
-            visible: Owned::labeled("focus-visible", false),
-            window: WindowSignals::new(),
-        })
+        Rc::new(Self::with_salt(0))
+    }
+
+    /// Its state, `salt` its id, ending with it ([`WindowEnd`]).
+    fn with_salt(salt: u64) -> Self {
+        let (focused, visible, window) = (
+            Owned::labeled("focus", None),
+            Owned::labeled("focus-visible", false),
+            WindowSignals::new(),
+        );
+        Self {
+            salt,
+            focused,
+            visible,
+            window,
+            _ending: crate::engine::Ends::new(WindowEnd {
+                focused,
+                visible,
+                window,
+                salt,
+            }),
+        }
     }
 }
 
@@ -1586,14 +1588,11 @@ mod tests {
         crate::engine::turn(&root, |_| window_focus_mut(|_| {}));
         let salt = root.salt;
         let other = FocusRoot::new();
-        WINDOW_FOCUS.with(|w| {
-            let _read = w.borrow();
-            drop(root);
-        });
-        assert!(WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)), "busy: deferred");
+        WINDOW_FOCUS.with_borrow(|_read| drop(root));
+        assert!(WINDOW_FOCUS.with_borrow(|w| w.contains_key(&salt)), "busy: deferred");
         crate::engine::turn(&other, |_| window_focus(|_| ()));
         assert!(
-            !WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)),
+            !WINDOW_FOCUS.with_borrow(|w| w.contains_key(&salt)),
             "taken out at the next use"
         );
     }
@@ -1618,7 +1617,7 @@ mod tests {
         }
         // The release is live work, run by the live loop after the fork.
         crate::engine::run_releases();
-        assert!(!WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)), "no entry left");
+        assert!(!WINDOW_FOCUS.with_borrow(|w| w.contains_key(&salt)), "no entry left");
         assert!(!focused.is_alive() && !visible.is_alive(), "no signal left");
         drop(other);
     }
@@ -1642,7 +1641,7 @@ mod tests {
         let settled = crate::engine::turn(&root, |_| root.settle_close());
         root.finish_close(settled == Some(Ok(())));
         drop(root);
-        assert!(!WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)), "no entry left");
+        assert!(!WINDOW_FOCUS.with_borrow(|w| w.contains_key(&salt)), "no entry left");
         assert!(!focused.is_alive() && !visible.is_alive(), "no signal left");
         assert_eq!(crate::engine::releases_pending(), 0, "nothing left pending");
     }
@@ -1708,7 +1707,7 @@ mod tests {
                 })
             });
             assert_eq!(after, live.map(|p| (p, 100_000, true)), "live is whole");
-            let unique = WINDOW_FOCUS.with(|m| m.borrow().get(&root.salt).map(|w| Rc::strong_count(&w.focusables)));
+            let unique = WINDOW_FOCUS.with_borrow(|m| m.get(&root.salt).map(|w| Rc::strong_count(&w.focusables)));
             assert_eq!(unique, Some(1), "live owns its set alone again: refilled in place");
         });
     }

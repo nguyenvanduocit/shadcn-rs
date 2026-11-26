@@ -69,7 +69,7 @@ impl<V> ByScroller<V> {
     /// How many paths the log holds (tests).
     #[cfg(test)]
     pub(crate) fn logged(&self) -> usize {
-        self.changed.borrow().len()
+        self.changed.with(|c| c.len())
     }
 
     /// Forget every value (tests).

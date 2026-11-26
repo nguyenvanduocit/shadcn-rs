@@ -1529,8 +1529,12 @@ impl World {
             if crate::engine::is_cold() {
                 return w.build_cold();
             }
-            let mut cache = w.snapshot.borrow_mut();
-            Arc::clone(cache.get_or_insert_with(|| w.build()))
+            if let Some(s) = w.snapshot.with(|c| c.as_ref().map(Arc::clone)) {
+                return s;
+            }
+            let built = w.build();
+            w.snapshot.with_mut(|c| *c = Some(Arc::clone(&built)));
+            built
         })
     }
 }
@@ -1713,12 +1717,17 @@ impl WorldState {
     }
 
     fn build(&self) -> Arc<WorldSnapshot> {
-        let base = Arc::clone(self.base.borrow_mut().get_or_insert_with(|| self.build_base()));
-        let damage = Arc::clone(
-            self.damage_list
-                .borrow_mut()
-                .get_or_insert_with(|| self.damage.iter().copied().collect()),
-        );
+        let base = match self.base.with(|b| b.as_ref().map(Arc::clone)) {
+            Some(b) => b,
+            None => {
+                let b = self.build_base();
+                self.base.with_mut(|c| *c = Some(Arc::clone(&b)));
+                b
+            }
+        };
+        let damage = self
+            .damage_list
+            .with_mut(|d| Arc::clone(d.get_or_insert_with(|| self.damage.iter().copied().collect())));
         Arc::new(WorldSnapshot {
             id: self.id,
             version: self.version,
@@ -1727,8 +1736,7 @@ impl WorldState {
             live: self.lifted.iter().map(|(i, p)| (*i, Arc::clone(p))).collect(),
             damage,
             damage_from: self.damage_from,
-            unshaped: {
-                let mut u = self.unshaped.borrow_mut();
+            unshaped: self.unshaped.with_mut(|u| {
                 LABELS.with_borrow_mut(|labels| {
                     u.retain(|i| {
                         self.objects
@@ -1740,7 +1748,7 @@ impl WorldState {
                     });
                 });
                 u.clone()
-            },
+            }),
             labels: Arc::default(),
         })
     }

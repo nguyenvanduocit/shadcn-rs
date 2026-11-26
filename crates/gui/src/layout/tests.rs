@@ -418,7 +418,7 @@ fn trackers_dropped_while_unwinding_leave_the_graph() {
     assert_eq!(after.renders, before.renders, "both trackers left the graph");
     assert_eq!(after.subscriptions, before.subscriptions, "and their reads with them");
     read.set(2);
-    assert!(marks.borrow().is_empty(), "a write marks no node");
+    assert!(marks.with(Vec::is_empty), "a write marks no node");
 }
 
 /// A parent resolved again over children hidden by a source keeps the
@@ -588,7 +588,7 @@ fn a_node_whose_last_binding_went_reads_nothing() {
     let fixed = div().child(div().named("a").height(10.0).width(50.0)).into_element();
     assert_eq!(widths(&mut tree, &fixed, ["a"]), [50.0]);
     w.set(60.0);
-    assert!(tree.marks.borrow().is_empty(), "the old closure's read marks nothing");
+    assert!(tree.marks.with(Vec::is_empty), "the old closure's read marks nothing");
 }
 
 /// A closure that gives a constant, as a component built again gives it:
@@ -797,9 +797,9 @@ fn a_binding_that_panicked_then_went_reads_nothing() {
         let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&o1, &s1, &[])));
         assert!(unwound.is_err(), "the width's closure panicked");
         sb.get(&o2, &s2, &[]);
-        marks.borrow_mut().clear();
+        marks.with_mut(Vec::clear);
         w.set(20.0);
-        assert!(marks.borrow().is_empty(), "what the closure read marks nothing");
+        assert!(marks.with(Vec::is_empty), "what the closure read marks nothing");
     });
 }
 
@@ -1587,7 +1587,7 @@ fn a_bound_paragraph_made_plain_drops_its_binding() {
     assert_eq!(Arc::strong_count(&old), 1, "the old text is held nowhere else");
     read.set(2);
     assert!(
-        tree.marks.borrow().is_empty(),
+        tree.marks.with(Vec::is_empty),
         "a write to the old signal marks no node"
     );
 }

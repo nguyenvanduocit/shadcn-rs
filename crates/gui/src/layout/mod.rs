@@ -16,6 +16,7 @@ pub mod boxstyle;
 pub mod engine;
 mod leaf;
 
+mod attrs;
 mod binding;
 mod changes;
 mod field;
@@ -34,6 +35,7 @@ pub use boxstyle::{BoxStyle, Len};
 pub use engine::{Asks, Schedule, Stats};
 pub use leaf::{ImageMeasure, Leaf};
 
+pub(crate) use attrs::{AttrBound, attr_def};
 pub(crate) use changes::{Changed, Changes, ReadAt, Since};
 pub(crate) use field::{FieldSettled, caret_reveal, field_reach, input_text};
 pub(crate) use frame::{Before, SpanTarget};
@@ -95,7 +97,7 @@ pub struct UiState {
 impl UiState {
     /// Whether a scroll was written since the last layout pass.
     fn scrolled(&self) -> bool {
-        !self.scroll.changed.borrow().is_empty() || !self.scroll_generation.changed.borrow().is_empty()
+        !self.scroll.changed.with(|c| c.is_empty()) || !self.scroll_generation.changed.with(|c| c.is_empty())
     }
 
     /// Scroll container `id` (without a handle) at `offset`: what another
@@ -208,6 +210,8 @@ struct Extra {
     style_binding: Option<Box<StyleBinding>>,
     text_binding: Option<Box<TextBinding>>,
     draw_binding: Option<Box<DrawBinding>>,
+    /// Its bound attributes, mounted: made for a node that binds one.
+    attr_binding: Option<Box<attrs::AttrBinding>>,
     /// For a root: its layout style before layout's overrides.
     base: Option<Box<BoxStyle>>,
     /// The element it was last patched from (shared, so an element a clean
@@ -243,7 +247,7 @@ struct Extra {
     fresh_behaviour: bool,
     /// What its children that took no space (`display: none`) read to
     /// decide so: a change resolves this node again, which builds them.
-    hidden: Option<crate::reactive::RenderNode>,
+    hidden: Option<binding::Node>,
     /// The same for what its hidden children's sources read
     /// ([`crate::value::source`]): their registrations, waking this node
     /// through `hidden_mark`, made once. Those of its last resolve go once
@@ -253,19 +257,41 @@ struct Extra {
     hidden_mark: Option<crate::reactive::Mark>,
     /// Its [`Interaction`](crate::Interaction) flags, made once and bound
     /// to the handle its element gives (ADR-0022): a render that makes a
-    /// new handle makes no signal.
-    interaction: crate::interact::NodeInteraction,
-}
-
-impl Drop for Extra {
-    fn drop(&mut self) {
-        if let Some(h) = self.hidden.take() {
-            h.release(crate::engine::LiveDrop::in_drop());
-        }
-    }
+    /// new handle makes no signal. Unbound, its flags disposed, in the
+    /// world that made it as the node goes (ADR-0035, Opus r19 I1).
+    interaction: crate::engine::Ends<crate::interact::NodeInteraction>,
 }
 
 impl Extra {
+    /// Every tracker its resolve and its bindings hold, of every kind
+    /// (style, spans, attributes, text, drawing): what decided what it
+    /// is. A node that takes no space hands these to its parent (the
+    /// tree's `hide`), so a binding kind added here is
+    /// handed over with no change there.
+    fn trackers(&self) -> impl Iterator<Item = crate::reactive::RenderNode> + '_ {
+        self.resolve
+            .0
+            .as_deref()
+            .copied()
+            .into_iter()
+            .chain(self.style_binding.iter().flat_map(|b| b.nodes()))
+            .chain(self.span_bindings.iter().flatten().flat_map(StyleBinding::nodes))
+            .chain(self.attr_binding.iter().flat_map(|b| b.nodes()))
+            .chain(self.text_binding.as_deref().map(binding::Tracked::tracker))
+            .chain(self.draw_binding.as_deref().map(binding::Tracked::tracker))
+    }
+
+    /// Its bindings' sources' registrations, of every kind, taken out
+    /// into `into` (as [`Self::trackers`], for a node that takes no space).
+    fn take_waits(&mut self, into: &mut Vec<crate::value::source::Wait>) {
+        if let Some(b) = self.style_binding.as_mut() {
+            b.take_waits(into);
+        }
+        for b in self.span_bindings.iter_mut().flatten() {
+            b.take_waits(into);
+        }
+    }
+
     /// Its background image or mask may paint `currentColor`.
     fn effects_read_color(&self) -> bool {
         self.style.effects.background_image.is_some() || self.style.effects.mask.is_some()
@@ -566,8 +592,9 @@ pub struct LayoutTree {
     frame: Frame,
     /// What signal writes marked since the last pass.
     marks: Marks,
-    /// Runs a phase of a node that has no tracker yet.
-    probe: crate::reactive::RenderNode,
+    /// Runs a phase of a node that has no tracker yet. Declared after
+    /// `extras`, so their trackers end before it.
+    probe: binding::Node,
     /// Nodes by path and by focus id, to mark what interactive state names.
     by_path: foldhash::HashMap<NodePath, u32>,
     by_focus: foldhash::HashMap<FocusId, u32>,
@@ -628,14 +655,6 @@ impl Default for LayoutTree {
     }
 }
 
-impl Drop for LayoutTree {
-    fn drop(&mut self) {
-        // Bindings' trackers, then the probe.
-        self.extras.clear();
-        self.probe.release(crate::engine::LiveDrop::in_drop());
-    }
-}
-
 fn set_style(node: &mut Node, style: BoxStyle) {
     if node.style != style {
         node.style = style;
@@ -657,6 +676,7 @@ impl LayoutTree {
                     &ex.span_bindings,
                     ex.text_binding.as_deref(),
                     ex.draw_binding.as_deref(),
+                    ex.attr_binding.as_deref(),
                 )
                 .map(|h| (ex.path.clone(), h))
             })
@@ -689,7 +709,7 @@ impl LayoutTree {
                 "a layout tree's marks (`LayoutTree::marks`)",
                 Vec::new(),
             )),
-            probe: crate::reactive::detached(|| crate::reactive::RenderNode::new(|| {})),
+            probe: binding::Node::new(crate::reactive::detached(|| crate::reactive::RenderNode::new(|| {}))),
             by_path: foldhash::HashMap::default(),
             by_focus: foldhash::HashMap::default(),
             by_field: foldhash::HashMap::default(),
@@ -849,7 +869,7 @@ impl LayoutTree {
             .is_some_and(|e| e.element.ptr_eq(root) && (e.own | e.below) & (need::RESOLVE | need::PLACE) == 0);
         root_same
             && self.layers.is_empty()
-            && self.marks.borrow().is_empty()
+            && self.marks.with(Vec::is_empty)
             && self.size == (width, height)
             && self.seen.as_ref().is_some_and(|s| s.same_as(state))
     }
@@ -991,18 +1011,18 @@ impl LayoutTree {
     /// Take in what signal writes marked and what of the interactive state
     /// changed since the last pass, as marks.
     fn take_marks(&mut self, state: &UiState) {
-        let marks = std::mem::take(&mut *self.marks.borrow_mut());
+        let marks = self.marks.with_mut(std::mem::take);
         for &(u, need) in &marks {
             self.mark(u, need);
         }
         // Give the buffer back, so marking allocates nothing once it has grown.
-        if let Ok(mut m) = self.marks.try_borrow_mut()
-            && m.is_empty()
-        {
-            let mut marks = marks;
-            marks.clear();
-            *m = marks;
-        }
+        let mut marks = marks;
+        marks.clear();
+        self.marks.try_with_mut(|m| {
+            if m.is_empty() {
+                *m = marks;
+            }
+        });
         // The scroll writes since the last pass, taken: this pass places
         // them (a detached tree, the cold check's, leaves them to the
         // window's own).

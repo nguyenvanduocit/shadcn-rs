@@ -1,37 +1,26 @@
-//! The lint for live obligations (ADR-0034, S4: "live obligations end with
-//! their live owner, never with a reference count"). It reads the sources
-//! of `gui`, `primitives` and `shadcn` and lists every `impl Drop for X`
-//! outside their unit tests, each with its class and reason:
+//! The lint for engine `Drop`s (ADR-0035, D2: "a plain `impl Drop` does no
+//! engine work"). It reads the sources of `gui`, `primitives` and `shadcn`
+//! and lists every `impl Drop for X` outside their unit tests, each with
+//! its class and reason:
 //!
-//! - **Guard**: a scope guard or RAII value on the stack: not `Clone`, not
+//! - **Guard**: a stack-scoped RAII value of engine code: not `Clone`, not
 //!   behind a shared pointer, so no value a check holds can reach it.
-//! - **Unique**: one owner (a field of the layout tree, the pipeline, the
-//!   GPU world), not `Clone`, not behind a shared pointer: it ends with
-//!   that owner.
-//! - **Private**: shared behind a pointer, but only by engine state no app
-//!   value and no check value reaches.
-//! - **Bookkeeping**: shared and reachable, but its drop only counts: a
-//!   pinned one keeps memory, and nothing waits on it.
-//! - **Owner**: its drop performs a live obligation (closing a worker,
-//!   ending a loan, waking waiters, unregistering, returning a resource) on
-//!   a handle that can be shared. A check's teardown fault forgets what it
-//!   held (S2), and an opaque value (a closure, a `Box<dyn Any>`) cannot be
-//!   inspected for the live handles inside it, so a count can be pinned
-//!   forever: the obligation is ended, exactly once and idempotently, by
-//!   its live owner (`engine::owned_by_scope`, `on_cleanup`, or the window
-//!   that owns it). The lint checks that registration is in the file named.
+//! - **Plumbing**: memory, OS or other-thread work only, the reason naming
+//!   it. Its drop does no engine work (it disposes no reactive node, writes
+//!   no engine state, queues nothing live).
 //! - **Test**: compiled only under `#[cfg(test)]`.
-//! - **LastRc** (forbidden, review r16): an obligation that ends on its
-//!   last `Rc` alone. A runaway check sets what it holds aside (S2), and a
-//!   handle among it pins the count forever: no entry may be listed so,
-//!   and a Private or Bookkeeping drop that releases live work through the
-//!   release queue (`engine::dropped`, `when_live`) is one.
+//!
+//! A value whose end does engine work is an `engine::Ending`, held in an
+//! `engine::Ends`, which runs that end in the world that made the value
+//! (ADR-0035, D1): it has no `impl Drop` to list. A forgotten wrapper is a
+//! `Drop` this lint does not list, or a Plumbing one that does engine work.
 //!
 //! It fails on a `Drop` impl not listed, on a listed one that is gone, on a
-//! Guard or Unique type that is `Clone` or named behind `Rc`, `Arc` or
-//! `Weak`, on an Owner whose registration is gone, and on a Test one not
-//! under `#[cfg(test)]`. It reads text, not types (the same limit as
-//! `process_state.rs`).
+//! Guard that is `Clone` or named behind `Rc`, `Arc` or `Weak`, on a
+//! Plumbing one whose body does engine work, and on a Test one not under
+//! `#[cfg(test)]`. It reads text, not types (the same limit as
+//! `process_state.rs`); the sinks' refusal (ADR-0035, D3) is the runtime
+//! layer behind it.
 
 #![expect(
     clippy::arithmetic_side_effects,
@@ -42,22 +31,12 @@
 
 use std::path::{Path, PathBuf};
 
-/// How a `Drop` impl stands to live obligations (see the module's docs).
+/// How a `Drop` impl stands (see the module's docs).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Class {
     Guard,
-    Unique,
-    Private,
-    Bookkeeping,
-    /// The obligation's owner registration: the file it is in and the text
-    /// that makes it.
-    Owner {
-        file: &'static str,
-        registration: &'static str,
-    },
+    Plumbing,
     Test,
-    /// Forbidden: ends on its last `Rc` alone (see the module's docs).
-    LastRc,
 }
 
 /// One `impl Drop for X`: the file (from the workspace root), the type, its
@@ -73,7 +52,7 @@ const fn e(file: &'static str, ty: &'static str, class: Class, why: &'static str
     Entry { file, ty, class, why }
 }
 
-use Class::{Bookkeeping, Guard, LastRc, Owner, Private, Test, Unique};
+use Class::{Guard, Plumbing, Test};
 
 /// Every `Drop` impl of the three crates' libraries.
 const ENTRIES: &[Entry] = &[
@@ -84,24 +63,12 @@ const ENTRIES: &[Entry] = &[
         Guard,
         "one dispatch's routing, ended as it returns or unwinds; borrows the pipeline",
     ),
-    e(
-        "crates/gui/src/app.rs",
-        "Trackers",
-        Unique,
-        "the pipeline's layout and paint trackers: their scope disposed with the pipeline",
-    ),
-    e(
-        "crates/gui/src/app.rs",
-        "Pipeline",
-        Unique,
-        "the window's live owner (App, Window, Scenario, Offscreen hold it): closes the window's focus and drains the release queue",
-    ),
     // canvas
     e(
         "crates/gui/src/canvas/planner.rs",
         "Planner",
-        Unique,
-        "the GPU world's tile planner: its workers stop and join with the world",
+        Plumbing,
+        "the GPU world's tile planner: tells its worker threads to stop and joins them (other threads)",
     ),
     // chunk
     e(
@@ -119,25 +86,9 @@ const ENTRIES: &[Entry] = &[
     ),
     e(
         "crates/gui/src/component.rs",
-        "Root",
-        Owner {
-            file: "crates/gui/src/component.rs",
-            registration: "crate::engine::own(",
-        },
-        "an instance tree an app can hold behind `Rc`: unmounted by the first of the scope or window it was \
-         made in (`Root::new`), its pipeline's close turn (`Pipeline::close`), and its last handle (review r16)",
-    ),
-    e(
-        "crates/gui/src/component.rs",
         "PopCurrent",
         Guard,
         "pops the instance being set up",
-    ),
-    e(
-        "crates/gui/src/component.rs",
-        "Leaving",
-        Unique,
-        "the scopes a resolve left, handed to the pipeline that disposes them",
     ),
     e(
         "crates/gui/src/component.rs",
@@ -158,6 +109,18 @@ const ENTRIES: &[Entry] = &[
         "Making",
         Guard,
         "a level of Shared inits (debug builds)",
+    ),
+    e(
+        "crates/gui/src/engine.rs",
+        "UserCode",
+        Guard,
+        "ends a count of user code running (a lend of world state, or a run the runtime switched its subscriber or owner for) as it returns or unwinds (ADR-0035, D4)",
+    ),
+    e(
+        "crates/gui/src/engine/ends.rs",
+        "Ends",
+        Plumbing,
+        "the one routing (ADR-0035, D1): hands the value to its own world's end (in place, the live release queue, or its memory alone); the end itself is the value's `Ending`",
     ),
     e(
         "crates/gui/src/engine/frame.rs",
@@ -190,16 +153,6 @@ const ENTRIES: &[Entry] = &[
         Guard,
         "puts the window current before back",
     ),
-    e(
-        "crates/gui/src/focus.rs",
-        "FocusRoot",
-        Owner {
-            file: "crates/gui/src/app.rs",
-            registration: "window.finish_close(",
-        },
-        "ends the window (its scheduled work, its signals, its entry) behind an `Rc` code clones: the pipeline's \
-         close (`Pipeline::close`, which its drop calls) settles its work in one close turn and then ends it",
-    ),
     // holder.rs
     e(
         "crates/gui/src/holder.rs",
@@ -210,72 +163,11 @@ const ENTRIES: &[Entry] = &[
     // interact.rs
     e(
         "crates/gui/src/interact.rs",
-        "NodeInteraction",
-        Unique,
-        "a layout node's interaction flags, unbound with the node",
-    ),
-    e(
-        "crates/gui/src/interact.rs",
         "Restore",
         Guard,
         "puts the outer press claim back",
     ),
-    // layout
-    e(
-        "crates/gui/src/layout/binding.rs",
-        "Tracked",
-        Unique,
-        "a node's binding tracker, released with the node",
-    ),
-    e(
-        "crates/gui/src/layout/binding.rs",
-        "Tracker",
-        Unique,
-        "a node's phase tracker, released with the node",
-    ),
-    e(
-        "crates/gui/src/layout/binding.rs",
-        "BoundRun",
-        Unique,
-        "a node's bound setter's tracker, released with the node",
-    ),
-    e(
-        "crates/gui/src/layout/binding.rs",
-        "StyleBinding",
-        Unique,
-        "a node's bound style's replay tracker, released with the node",
-    ),
-    e(
-        "crates/gui/src/layout/mod.rs",
-        "Extra",
-        Unique,
-        "a layout node's extra state: its hidden tracker released with the node",
-    ),
-    e(
-        "crates/gui/src/layout/mod.rs",
-        "LayoutTree",
-        Unique,
-        "the pipeline's layout tree (or a check's own, detached): its bindings' trackers and its probe released with it",
-    ),
     // list
-    e(
-        "crates/gui/src/list/view.rs",
-        "Inner",
-        Owner {
-            file: "crates/gui/src/list/view.rs",
-            registration: "crate::engine::own(",
-        },
-        "list views behind `Rc`: the worker's close, the loan's end, the heights claim and the waiters' wake, ended by the scope or window that made them (review r17, decision 5)",
-    ),
-    e(
-        "crates/gui/src/list/view.rs",
-        "Views",
-        Owner {
-            file: "crates/gui/src/list/view.rs",
-            registration: "crate::engine::own(",
-        },
-        "a clonable handle to list views: its live count's end releases them, and so does the scope or window that made them",
-    ),
     e(
         "crates/gui/src/list/virtual_list.rs",
         "EndLoanOnUnwind",
@@ -354,34 +246,15 @@ const ENTRIES: &[Entry] = &[
     e(
         "crates/gui/src/style.rs",
         "Link",
-        Bookkeeping,
-        "a text decoration chain's link behind `Arc`: its drop counts it let go for the interner's sweep; pinned, it stays a live chain, and nothing waits on it",
-    ),
-    // value/source.rs
-    e(
-        "crates/gui/src/value/source.rs",
-        "Wait",
-        Unique,
-        "a mount's registration on a source, held by its layout node",
-    ),
-    e(
-        "crates/gui/src/value/source.rs",
-        "Hub",
-        Unique,
-        "a signal hub's tracker, a field of its `SignalHub`",
-    ),
-    e(
-        "crates/gui/src/value/source.rs",
-        "SignalHub",
-        Private,
-        "shared behind `Rc` by the live mounts' registrations only (a check's build reads its signals directly): forgets the signal's entry",
+        Plumbing,
+        "a text decoration chain's link behind `Arc`: counts it let go in a process-wide atomic for the interner's sweep (memory only)",
     ),
     // window.rs
     e(
         "crates/gui/src/window.rs",
         "Offscreen",
-        Unique,
-        "a headless window, its own owner: tells its threads to quit",
+        Plumbing,
+        "a headless window: tells its UI and render threads to quit (other threads)",
     ),
     // primitives
     e(
@@ -558,9 +431,32 @@ fn drop_body(code: &str, at: usize) -> &str {
     &code[open..]
 }
 
-/// Whether a drop body releases live work through the release queue.
-fn releases_live(body: &str) -> bool {
-    ["dropped(", "when_live("].iter().any(|r| body.contains(r))
+/// What in a drop body is engine work (ADR-0035, D2): disposing a reactive
+/// node, writing engine state through a lend or a registry, queueing live
+/// work, ending a window, a root or a registration.
+const ENGINE_WORK: &[&str] = &[
+    "dispose",
+    "when_live(",
+    "with_borrow_mut(",
+    "with_mut(",
+    "borrow_mut(",
+    ".release(",
+    "unmount",
+    "close_window(",
+    "end_window(",
+    "end_root(",
+    "unbind(",
+    "leave(",
+    "solo_gone(",
+    "forget(&mut",
+    "unmade(",
+    "engine::",
+    "reactive::",
+];
+
+/// The engine work in a drop body, if any.
+fn engine_work(body: &str) -> Option<&'static str> {
+    ENGINE_WORK.iter().copied().find(|w| body.contains(w))
 }
 
 /// Whether the struct or enum `ty` declared in `code` is `Clone`: derived,
@@ -646,12 +542,10 @@ fn audit(files: &[(String, String)], listed: &[Entry]) -> Vec<String> {
     for (path, ty, _) in &found {
         if !listed.iter().any(|e| e.file == *path && e.ty == ty) {
             problems.push(format!(
-                "{path}: `impl Drop for {ty}` is not listed in crates/gui/tests/obligations.rs. If its drop \
-                 performs a live obligation (closes a worker, ends a loan, wakes waiters, unregisters, returns a \
-                 resource) on a handle that can be shared (`Clone`, behind `Rc`), end that obligation with its \
-                 live owner too, exactly once and idempotently, never in a check (`engine::owned_by_scope`, \
-                 `on_cleanup`, or the window that owns it), and list it as Owner with that registration; else \
-                 list it with its class and reason (ADR-0034, S4)"
+                "{path}: `impl Drop for {ty}` is not listed in crates/gui/tests/obligations.rs. If its drop does \
+                 engine work (disposes a reactive node, writes engine state, ends a window, a root, a worker or a \
+                 registration), make that work an `engine::Ending` held in an `engine::Ends`, which runs it in \
+                 the world that made the value (ADR-0035, D1); else list it Guard or Plumbing with its reason"
             ));
         }
     }
@@ -673,33 +567,32 @@ fn audit(files: &[(String, String)], listed: &[Entry]) -> Vec<String> {
             continue;
         }
         match entry.class {
-            Guard | Unique => {
+            Guard => {
                 if is_clone(c, entry.ty) {
                     problems.push(format!(
-                        "{}: `{}` is listed {:?} but is `Clone`: a clone a check holds can pin its drop; \
-                         classify it again (ADR-0034, S4)",
-                        entry.file, entry.ty, entry.class
+                        "{}: `{}` is listed Guard but is `Clone`: a clone a check holds outlives the stack it \
+                         guards; classify it again (ADR-0035, D2)",
+                        entry.file, entry.ty
                     ));
                 }
                 if shared(&all, entry.ty) {
                     problems.push(format!(
-                        "{}: `{}` is listed {:?} but is named behind a shared pointer: a count a check holds \
-                         can pin its drop; classify it again (ADR-0034, S4)",
-                        entry.file, entry.ty, entry.class
+                        "{}: `{}` is listed Guard but is named behind a shared pointer: a count a check holds \
+                         outlives the stack it guards; classify it again (ADR-0035, D2)",
+                        entry.file, entry.ty
                     ));
                 }
             }
-            Owner { file, registration } => {
-                let has = libs
-                    .iter()
-                    .find(|(p, _)| *p == file)
-                    .is_some_and(|(_, c)| c.contains(registration));
-                if !has {
-                    problems.push(format!(
-                        "{}: `{}` performs a live obligation whose owner registration `{registration}` is no \
-                         longer in {file}: end it with its live owner (ADR-0034, S4)",
-                        entry.file, entry.ty
-                    ));
+            Plumbing => {
+                for &at in &here {
+                    if let Some(work) = engine_work(drop_body(c, at)) {
+                        problems.push(format!(
+                            "{}: `{}` is listed Plumbing but its drop does engine work (`{work}`): a plain `Drop` \
+                             runs in whatever world lets the value go; make that work an `engine::Ending` held \
+                             in an `engine::Ends` (ADR-0035, D1, D2)",
+                            entry.file, entry.ty
+                        ));
+                    }
                 }
             }
             Test => {
@@ -711,21 +604,6 @@ fn audit(files: &[(String, String)], listed: &[Entry]) -> Vec<String> {
                     ));
                 }
             }
-            Private | Bookkeeping => {
-                if here.iter().any(|&at| releases_live(drop_body(c, at))) {
-                    problems.push(format!(
-                        "{}: `{}` is listed {:?} but its drop releases live work (`engine::dropped`, \
-                         `when_live`): an obligation that ends on its last `Rc` alone, which a set-aside \
-                         handle pins forever; end it with its live owner and list it Owner (ADR-0034, S4)",
-                        entry.file, entry.ty, entry.class
-                    ));
-                }
-            }
-            LastRc => problems.push(format!(
-                "{}: `{}` is listed LastRc: an obligation never ends on its last `Rc` alone (a runaway check \
-                 sets its handles aside, S2); end it with its live owner and list it Owner (ADR-0034, S4)",
-                entry.file, entry.ty
-            )),
         }
         if entry.why.is_empty() {
             problems.push(format!("{}: `{}` has no reason", entry.file, entry.ty));
@@ -872,60 +750,36 @@ fn fns(code: &str) -> Vec<(String, usize)> {
     out
 }
 
-/// What is wrong with the paths to the live world in `files` (review r17,
-/// decisions 3, 4 and 5), each a line of the failure message:
+/// The files that route a value's end to the live world (ADR-0035, D1):
+/// the release queue and the one routing.
+const LIVE_QUEUE: &[&str] = &["/engine/release.rs", "/engine/ends.rs"];
+
+/// What is wrong with the paths to the live world in `files`, each a line
+/// of the failure message:
 ///
-/// - **Decision 3:** a `LiveDrop` token is made (`LiveDrop::in_drop()`)
-///   only in the `Drop` impl of a type `listed` in the same file. Only a
-///   drop reaches the live release queue from inside a check, and
-///   `engine::dropped` takes the token. `when_live` is called only in the
-///   release queue's own file.
-/// - **Decision 4:** no drain (a `fn` named `drain`, `*_drain` or
-///   `take_fork`) boxes a value whole (`Box::new(`) but those in
-///   [`WHOLE_DRAINS`]: a drain splits through `Parts`.
-/// - **Decision 5:** a live obligation's window is registered only
-///   through the engine's one path (`engine::own`, which acts on the
-///   answer): `owned_by_window` is called nowhere else.
-fn live_paths(files: &[(String, String)], listed: &[Entry], whole: &[(&str, &str, &str)]) -> Vec<String> {
+/// - **One routing (ADR-0035, D1):** `when_live` is called only by the
+///   release queue and `Ends`, so no other code picks a world for a
+///   cleanup.
+/// - **Drains split (review r17, decision 4):** no drain (a `fn` named
+///   `drain`, `*_drain` or `take_fork`) boxes a value whole (`Box::new(`)
+///   but those in [`WHOLE_DRAINS`]: a drain splits through `Parts`.
+/// - **One registration path (review r17, decision 5):** a live
+///   obligation's window is registered only through the engine's one path
+///   (`engine::own`, which acts on the answer): `owned_by_window` is
+///   called nowhere else.
+fn live_paths(files: &[(String, String)], whole: &[(&str, &str, &str)]) -> Vec<String> {
     let mut problems = Vec::new();
     for (path, src) in files {
         if path.ends_with("/tests.rs") || TEST_FILES.contains(&path.as_str()) {
             continue;
         }
         let c = library(src);
-        // Decision 3: tokens only in the listed drops.
-        let bodies: Vec<(String, usize, usize)> = drops(&c)
-            .into_iter()
-            .map(|(ty, at)| {
-                let body = drop_body(&c, at);
-                let start = c[at..].find('{').map_or(at, |o| at + o);
-                (ty, start, start + body.len())
-            })
-            .collect();
-        let mut from = 0;
-        while let Some(at) = c[from..].find("LiveDrop::in_drop()") {
-            let at = from + at;
-            from = at + 1;
-            let inside = bodies
-                .iter()
-                .find(|(_, start, end)| (*start..*end).contains(&at))
-                .map(|(ty, ..)| ty.as_str());
-            let ok = inside.is_some_and(|ty| listed.iter().any(|e| e.file == path && e.ty == ty));
-            if !ok {
-                problems.push(format!(
-                    "{path}: a `LiveDrop` token made outside the `Drop` of a type listed in \
-                     crates/gui/tests/obligations.rs: only a drop reaches the live release queue from a check; an \
-                     explicit close, dispose or retire acts on the running world (review r17, decision 3)"
-                ));
-            }
-        }
-        if !path.ends_with("/engine/release.rs") && c.contains("when_live(") {
+        if !LIVE_QUEUE.iter().any(|q| path.ends_with(q)) && c.contains("when_live(") {
             problems.push(format!(
-                "{path}: `when_live` called outside the release queue: queue live work through \
-                 `engine::dropped` with a `LiveDrop` token, from a listed drop (review r17, decision 3)"
+                "{path}: `when_live` called outside the release queue and `Ends`: a value's end runs in the world \
+                 that made it through `engine::Ends` alone (ADR-0035, D1)"
             ));
         }
-        // Decision 4: drains split.
         for (name, at) in fns(&c) {
             if !(name == "drain" || name.ends_with("_drain") || name == "take_fork") {
                 continue;
@@ -941,7 +795,6 @@ fn live_paths(files: &[(String, String)], listed: &[Entry], whole: &[(&str, &str
                 ));
             }
         }
-        // Decision 5: one registration path.
         let defines = path.ends_with("/src/focus.rs") || path.ends_with("/src/engine.rs");
         if !defines && c.contains("owned_by_window(") {
             problems.push(format!(
@@ -966,31 +819,23 @@ fn live_paths(files: &[(String, String)], listed: &[Entry], whole: &[(&str, &str
     problems
 }
 
-/// Only a listed drop makes a `LiveDrop` token, no drain boxes a value
-/// whole, and a live obligation's owner is registered on the one path
-/// (review r17, decisions 3 to 5).
+/// Only the one routing queues live work, no drain boxes a value whole,
+/// and a live obligation's owner is registered on the one path.
 #[test]
-fn only_drops_queue_live_drains_split_and_owners_register_on_one_path() {
-    let problems = live_paths(&workspace(), ENTRIES, WHOLE_DRAINS);
+fn one_routing_drains_split_and_owners_register_on_one_path() {
+    let problems = live_paths(&workspace(), WHOLE_DRAINS);
     assert!(
         problems.is_empty(),
-        "paths to the live world (ADR-0034, S4, S9):\n  {}",
+        "paths to the live world (ADR-0035, D1; ADR-0034, S9):\n  {}",
         problems.join("\n  ")
     );
 }
 
-/// The mutants the r17 review names: an explicit close queueing live in a
-/// check, a drain boxing a value whole, a constructor registering its
-/// window by hand; each caught, and their sound forms not.
+/// Each mutant caught, and the sound forms not.
 #[test]
 fn the_live_paths_lint_catches_each_mutant() {
     let path = "crates/gui/src/fixture.rs";
     let fixture = r#"
-        struct Listed;
-        impl Drop for Listed { fn drop(&mut self) { dropped(crate::engine::LiveDrop::in_drop(), false, || {}); } }
-        struct Unlisted;
-        impl Drop for Unlisted { fn drop(&mut self) { dropped(LiveDrop::in_drop(), false, || {}); } }
-        fn close(&self) { crate::engine::dropped(crate::engine::LiveDrop::in_drop(), false, || {}); }
         fn retire() { crate::engine::when_live(|| {}); }
         fn log_drain(v: Vec<u8>) -> Vec<Box<dyn Any>> { vec![Box::new(v)] }
         fn fresh_drain(v: Vec<u8>, out: &mut Vec<Box<dyn Any>>) { v.parts(out); }
@@ -998,10 +843,8 @@ fn the_live_paths_lint_catches_each_mutant() {
         fn sound() { crate::engine::own("x", &owned); }
     "#;
     let files = [(path.to_owned(), fixture.to_owned())];
-    let listed = [e(path, "Listed", Bookkeeping, "a fixture")];
-    let problems = live_paths(&files, &listed, &[]);
+    let problems = live_paths(&files, &[]);
     let expect = [
-        "a `LiveDrop` token made outside",
         "`when_live` called outside",
         "the drain `log_drain` boxes a value whole",
         "`owned_by_window` called directly",
@@ -1012,10 +855,10 @@ fn the_live_paths_lint_catches_each_mutant() {
             "the lint misses {x:?}:\n{problems:#?}"
         );
     }
-    // Two tokens out of place (the unlisted drop's and the close's), one
-    // each of the rest.
-    assert_eq!(problems.len(), 5, "{problems:#?}");
-    let gone = live_paths(&files, &listed, &[(path, "gone_drain", "said one element")]);
+    assert_eq!(problems.len(), 3, "{problems:#?}");
+    let routing = [(String::from("crates/gui/src/engine/ends.rs"), String::from(fixture))];
+    assert_eq!(live_paths(&routing, &[]).len(), 2, "the routing may queue live");
+    let gone = live_paths(&files, &[(path, "gone_drain", "said one element")]);
     assert!(
         gone.iter()
             .any(|p| p.contains("`gone_drain` is in WHOLE_DRAINS but gone")),
@@ -1023,20 +866,21 @@ fn the_live_paths_lint_catches_each_mutant() {
     );
 }
 
-/// Every `Drop` of the three libraries is classified, and those that end a
-/// live obligation have a live owner (ADR-0034, S4).
+/// Every `Drop` of the three libraries is classified, and none but a
+/// guard's does engine work (ADR-0035, D2).
 #[test]
-fn every_drop_is_classified_and_obligations_have_a_live_owner() {
+fn every_drop_is_classified_and_none_does_engine_work() {
     let problems = audit(&workspace(), ENTRIES);
     assert!(
         problems.is_empty(),
-        "live obligations (ADR-0034, S4):\n  {}",
+        "engine drops (ADR-0035, D2):\n  {}",
         problems.join("\n  ")
     );
 }
 
 /// The lint sees what a `Drop` impl is, and catches each way a list goes
-/// wrong.
+/// wrong: among them a plain `Drop` that does engine work (ADR-0035,
+/// acceptance 7), listed Plumbing or not listed at all.
 #[test]
 fn the_lint_catches_unlisted_gone_and_misclassified_drops() {
     let fixture = r#"
@@ -1052,11 +896,14 @@ fn the_lint_catches_unlisted_gone_and_misclassified_drops() {
         struct Pointed;
         impl Drop for Pointed { fn drop(&mut self) {} }
         type Held = std::rc::Rc<std::cell::RefCell<crate::fixture::Pointed>>;
-        struct Handle;
-        impl Drop for Handle { fn drop(&mut self) {} }
-        fn make() { crate::engine::owned_by_scope(move || {}); }
-        struct Probe;
-        impl Drop for Probe { fn drop(&mut self) {} }
+        struct Disposes { node: RenderNode }
+        impl Drop for Disposes { fn drop(&mut self) { self.node.dispose(); } }
+        struct Unbinds { flags: NodeInteraction }
+        impl Drop for Unbinds { fn drop(&mut self) { BOUND.with_borrow_mut(|b| b.remove(&1)); } }
+        struct Stops;
+        impl Drop for Stops { fn drop(&mut self) { self.tx.send(Quit).ok(); } }
+        struct Sneaks;
+        impl Drop for Sneaks { fn drop(&mut self) { self.flags.clear(); } }
         #[cfg(test)]
         struct Counted;
         #[cfg(test)]
@@ -1069,31 +916,18 @@ fn the_lint_catches_unlisted_gone_and_misclassified_drops() {
     let found: Vec<String> = drops(&library(fixture)).into_iter().map(|(t, _)| t).collect();
     assert_eq!(
         found,
-        ["Guarded", "Gen", "Cloned", "Pointed", "Handle", "Probe", "Counted"]
+        [
+            "Guarded", "Gen", "Cloned", "Pointed", "Disposes", "Unbinds", "Stops", "Sneaks", "Counted"
+        ]
     );
     let files = [(path.to_owned(), fixture.to_owned())];
     let listed = [
         e(path, "Guarded", Guard, "a guard"),
-        e(path, "Cloned", Unique, "said unique"),
+        e(path, "Cloned", Guard, "said a guard"),
         e(path, "Pointed", Guard, "said a guard"),
-        e(
-            path,
-            "Handle",
-            Owner {
-                file: path,
-                registration: "crate::engine::owned_by_scope(move || {",
-            },
-            "ended by its scope",
-        ),
-        e(
-            path,
-            "Probe",
-            Owner {
-                file: path,
-                registration: "on_cleanup(",
-            },
-            "said owned",
-        ),
+        e(path, "Disposes", Plumbing, "said memory only"),
+        e(path, "Unbinds", Plumbing, "said memory only"),
+        e(path, "Stops", Plumbing, "stops a thread"),
         e(path, "Counted", Test, "a probe"),
         e(path, "Gone", Guard, "no longer there"),
         e("crates/gui/src/gone.rs", "Moved", Guard, "its file went"),
@@ -1101,9 +935,12 @@ fn the_lint_catches_unlisted_gone_and_misclassified_drops() {
     let problems = audit(&files, &listed);
     let expect = [
         "`impl Drop for Gen` is not listed",
-        "`Cloned` is listed Unique but is `Clone`",
+        // An `Ending` turned back into a plain `Drop`, not listed.
+        "`impl Drop for Sneaks` is not listed",
+        "`Cloned` is listed Guard but is `Clone`",
         "`Pointed` is listed Guard but is named behind a shared pointer",
-        "`Probe` performs a live obligation whose owner registration `on_cleanup(`",
+        "`Disposes` is listed Plumbing but its drop does engine work (`dispose`)",
+        "`Unbinds` is listed Plumbing but its drop does engine work (`with_borrow_mut(`)",
         "no `impl Drop for Gone` any more",
         "crates/gui/src/gone.rs: gone",
     ];
@@ -1115,29 +952,6 @@ fn the_lint_catches_unlisted_gone_and_misclassified_drops() {
     }
     assert_eq!(problems.len(), expect.len(), "{problems:#?}");
     // A Test entry not under `#[cfg(test)]` is caught.
-    // An obligation that ends on its last `Rc` (review r16): listed so, or
-    // hidden as Bookkeeping while its drop releases live work.
-    let last = "struct L;\nimpl Drop for L { fn drop(&mut self) {} }\n\
-                struct Q;\nimpl Drop for Q { fn drop(&mut self) { if true { crate::engine::dropped(false, || {}); } } }\n\
-                struct Fine;\nimpl Drop for Fine { fn drop(&mut self) { count(); } }\n";
-    let problems = audit(
-        &[(path.to_owned(), last.to_owned())],
-        &[
-            e(path, "L", LastRc, "ends on its last Rc"),
-            e(path, "Q", Bookkeeping, "said to count"),
-            e(path, "Fine", Bookkeeping, "counts"),
-        ],
-    );
-    for x in [
-        "`L` is listed LastRc",
-        "`Q` is listed Bookkeeping but its drop releases live work",
-    ] {
-        assert!(
-            problems.iter().any(|p| p.contains(x)),
-            "the lint misses {x:?}:\n{problems:#?}"
-        );
-    }
-    assert_eq!(problems.len(), 2, "{problems:#?}");
     let plain = "struct P;\nimpl Drop for P { fn drop(&mut self) {} }\n";
     let problems = audit(&[(path.to_owned(), plain.to_owned())], &[e(path, "P", Test, "a probe")]);
     assert!(
@@ -1146,200 +960,239 @@ fn the_lint_catches_unlisted_gone_and_misclassified_drops() {
     );
 }
 
-// ── Review r18, decisions 4 and 5 ────────────────────────────────────────
+// ── Lends to user code (ADR-0035, D4) ────────────────────────────────────────
 
-/// The live owners of the S4 table, each with its explicit operations
-/// (review r18, decision 4): a drop of one never calls them itself, only
-/// inside the job it hands `engine::dropped`, which runs it in the owner's
-/// world (live once a check has switched back, for a live owner a check
-/// lets go). The explicit operation acts on the running world, so a live
-/// owner's drop that called it in a check would end the check's copy and
-/// leave the live one (Codex r18 1: a live pipeline's mail stayed open).
-const OWNER_DROPS: &[(&str, &str, &[&str])] = &[
-    ("crates/gui/src/app.rs", "Pipeline", &["close(", "close_window("]),
-    // The pipeline's trackers: a check that lets go of a live pipeline
-    // drops them in its world too (V2, review r18).
-    ("crates/gui/src/app.rs", "Trackers", &["dispose("]),
+/// A public `gui` function that runs a caller's closure on a reference and
+/// neither counts it as user code (`engine::lend`) nor hands it to one that
+/// does: (file, function, why no check can open inside it).
+const UNCOUNTED_LENDS: &[(&str, &str, &str)] = &[
     (
-        "crates/gui/src/focus.rs",
-        "FocusRoot",
-        &[
-            "close(",
-            "finish_close(",
-            "settle_close(",
-            "end_window(",
-            ".end(",
-            "unmade(",
-        ],
+        "crates/gui/src/engine.rs",
+        "with",
+        "an engine piece's lend: a check opened inside it is refused as it begins, naming the piece",
     ),
-    ("crates/gui/src/component.rs", "Root", &["close(", "end_root(", ".end("]),
-    ("crates/gui/src/list/view.rs", "Inner", &[".end(", ".release("]),
+    (
+        "crates/gui/src/engine.rs",
+        "try_with",
+        "an engine piece's lend: a check opened inside it is refused as it begins, naming the piece",
+    ),
+    (
+        "crates/gui/src/engine.rs",
+        "with_borrow_mut",
+        "an engine piece's lend: a check opened inside it is refused as it begins, naming the piece",
+    ),
+    (
+        "crates/gui/src/engine.rs",
+        "read",
+        "a logged slab's entry: reached only inside a logged key's counted lend",
+    ),
+    (
+        "crates/gui/src/engine.rs",
+        "write",
+        "a logged slab's entry: reached only inside a logged key's counted lend",
+    ),
+    (
+        "crates/gui/src/value/source.rs",
+        "with",
+        "a value `read` makes now, owned by the call: no world state is lent",
+    ),
+    (
+        "crates/gui/src/sum_tree.rs",
+        "update",
+        "a plain value its caller owns (`&mut self`): no world state",
+    ),
+    (
+        "crates/gui/src/sum_tree.rs",
+        "seek",
+        "a plain value's totals: no world state",
+    ),
+    (
+        "crates/gui/src/holder.rs",
+        "retain",
+        "a caller's own map of keys and values: no world state",
+    ),
+    (
+        "crates/gui/src/shape.rs",
+        "with_radii",
+        "a value being built: no world state",
+    ),
+    (
+        "crates/gui/src/component/control.rs",
+        "with_item",
+        "a row's item, read through its signal's counted lend",
+    ),
+    (
+        "crates/gui/src/component.rs",
+        "update",
+        "a copy of its value (`get_untracked`), set back after: no world state is lent",
+    ),
     (
         "crates/gui/src/list/view.rs",
-        "Views",
-        &[".end(", ".release(", "handle_dropped("],
+        "build",
+        "a snapshot's rows: immutable, shared, built off the UI thread",
     ),
 ];
 
-/// `body` with the argument list of each `dropped(` call cut out.
-fn outside_dropped(body: &str) -> String {
-    let mut out = String::new();
-    let mut rest = body;
-    while let Some(at) = rest.find("dropped(") {
-        let open = at + "dropped".len();
-        out.push_str(&rest[..open]);
-        let mut depth = 0_usize;
-        let mut end = rest.len();
-        for (i, ch) in rest[open..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = open + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    out
-}
+/// A `pub fn` of a world-state file that returns a reference, with why it
+/// reaches no app code outside a counted lend: (file, function, why).
+const LENT_RETURNS: &[(&str, &str, &str)] = &[
+    (
+        "crates/gui/src/engine/log_key.rs",
+        "entry_mut",
+        "a `LogMut` exists only inside a logged key's counted `with_borrow_mut`",
+    ),
+    (
+        "crates/gui/src/chunk/series.rs",
+        "pages",
+        "a page's identity and start: its data is the engine's alone",
+    ),
+];
 
-/// The argument lists of `body`'s `dropped(` calls.
-fn dropped_args(body: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut from = 0;
-    while let Some(at) = body[from..].find("dropped(") {
-        let open = from + at + "dropped".len();
-        let mut depth = 0_usize;
-        let mut end = body.len();
-        for (i, ch) in body[open..].char_indices() {
-            match ch {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = open + i + 1;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        out.push(&body[open..end]);
-        from = end;
-    }
-    out
-}
+/// What hands the closure to a counted lend, in a body.
+const COUNTED: &[&str] = &[
+    "lend(",
+    ".with(",
+    ".with_untracked(",
+    ".with_mut(",
+    ".try_with(",
+    ".try_with_mut(",
+    ".with_borrow(",
+    ".with_borrow_mut(",
+];
 
-/// Whether `text` names `ident` as a whole word.
-fn names(text: &str, ident: &str) -> bool {
-    let word = |c: char| c.is_alphanumeric() || c == '_';
-    text.match_indices(ident).any(|(i, _)| {
-        let before = text[..i].chars().next_back().is_none_or(|c| !word(c));
-        let after = text[i + ident.len()..].chars().next().is_none_or(|c| !word(c));
-        before && after
-    })
-}
-
-/// `body` with each closure bound by `let NAME = [move] || ..;` that is
-/// handed to a `dropped(` call cut out (it runs as the queued job), and the
-/// names of those closures: a call of one outside `dropped(` runs it now.
-fn handed_lets(body: &str) -> (String, Vec<String>) {
-    let handed = dropped_args(body);
-    let mut out = String::new();
-    let mut names_cut = Vec::new();
-    let mut rest = body;
-    while let Some(at) = rest.find("let ") {
-        let after = &rest[at + 4..];
-        let ident: String = after.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
-        let tail = after[ident.len()..].trim_start();
-        let Some(closure) = tail
-            .strip_prefix('=')
-            .map(str::trim_start)
-            .filter(|t| t.starts_with("move ||") || t.starts_with("||"))
-        else {
-            out.push_str(&rest[..at + 4]);
-            rest = &rest[at + 4..];
-            continue;
-        };
-        if ident.is_empty() || !handed.iter().any(|a| names(a, &ident)) {
-            out.push_str(&rest[..at + 4]);
-            rest = &rest[at + 4..];
-            continue;
-        }
-        // The closure runs to the `;` at depth 0.
-        let start = rest.len() - closure.len();
-        let mut depth = 0_isize;
-        let mut end = rest.len();
-        for (i, ch) in rest[start..].char_indices() {
-            match ch {
-                '(' | '{' | '[' => depth += 1,
-                ')' | '}' | ']' => depth -= 1,
-                ';' if depth == 0 => {
-                    end = start + i + 1;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        out.push_str(&rest[..start]);
-        names_cut.push(ident);
-        rest = &rest[end..];
-    }
-    out.push_str(rest);
-    (out, names_cut)
-}
-
-/// What is wrong with the owners' drops in `files` (decision 4).
-fn owner_drops(files: &[(String, String)], owners: &[(&str, &str, &[&str])]) -> Vec<String> {
+/// What is wrong with the lends to user code in `files`, each a line of the
+/// failure message: a `pub fn` that runs a caller's closure now (not one
+/// kept, `'static`) on a reference must count it as user code, so no check
+/// opens inside it (ADR-0035, D4: a check opens only at the engine's own
+/// points), or be listed with why; and no `pub fn` returns a reference, a
+/// `Ref` or a guard into a world cell, a logged piece or a page.
+fn lends(files: &[(String, String)], listed: &[(&str, &str, &str)]) -> Vec<String> {
     let mut problems = Vec::new();
-    for (file, ty, ops) in owners {
-        let Some((_, src)) = files.iter().find(|(p, _)| p == file) else {
-            problems.push(format!("{file}: gone: take `{ty}` off OWNER_DROPS"));
-            continue;
-        };
-        let c = library(src);
-        let Some(at) = drops(&c).into_iter().find(|(t, _)| t == ty).map(|(_, at)| at) else {
-            problems.push(format!(
-                "{file}: `{ty}` has no `Drop` any more: take it off OWNER_DROPS"
-            ));
-            continue;
-        };
-        let body = drop_body(&c, at);
-        if !body.contains("dropped(") {
-            problems.push(format!(
-                "{file}: the drop of `{ty}` hands nothing to `engine::dropped`: a live owner's drop ends it in \
-                 its own world through the release queue (review r18, decision 4)"
-            ));
+    for (path, src) in files {
+        let code = library(src);
+        for (name, at) in fns(&code) {
+            let line = code[..at].rfind('\n').map_or(0, |i| i + 1);
+            let head = &code[line..at];
+            if !head.contains("pub ") || head.contains("pub(") {
+                continue;
+            }
+            let Some(open) = code[at..].find(['{', ';']).map(|o| at + o) else {
+                continue;
+            };
+            let sig = &code[at..open];
+            let lends_now = ["FnOnce(&", "FnMut(&", "Fn(&"].iter().any(|f| sig.contains(f)) && !sig.contains("'static");
+            if lends_now {
+                let body = drop_body(&code, at);
+                let counted = COUNTED.iter().any(|c| body.contains(c));
+                let excused = listed.iter().any(|(f, n, _)| *f == path && *n == name);
+                if !counted && !excused {
+                    problems.push(format!(
+                        "{path}: `{name}` runs a caller's closure on a reference uncounted: run it through `engine::lend` (ADR-0035, D4), or list it in UNCOUNTED_LENDS with why"
+                    ));
+                }
+            }
+            let world = [
+                "/engine/world_cell.rs",
+                "/engine/log_key.rs",
+                "/chunk/series.rs",
+                "/reactive/signal.rs",
+                "/reactive/computed.rs",
+            ];
+            if world.iter().any(|w| path.ends_with(w)) {
+                let ret = sig.split("->").nth(1).unwrap_or("");
+                let lent = (ret.contains('&') && !ret.contains("&'static"))
+                    || ["Ref<", "RefMut<", "Guard<"].iter().any(|g| ret.contains(g));
+                if lent && !LENT_RETURNS.iter().any(|(f, n, _)| *f == path && *n == name) {
+                    problems.push(format!(
+                        "{path}: `{name}` returns a reference into world state: lend it through a closure (ADR-0035, D4)"
+                    ));
+                }
+            }
         }
-        let (unbound, handed) = handed_lets(body);
-        let outside = outside_dropped(&unbound);
-        for name in &handed {
-            let call = format!("{name}(");
-            let called = outside.match_indices(&call).any(|(i, _)| {
-                outside[..i]
-                    .chars()
-                    .next_back()
-                    .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.'))
+    }
+    for (f, n, _) in listed {
+        if !files
+            .iter()
+            .any(|(p, src)| p == f && fns(&library(src)).iter().any(|(m, _)| m == n))
+        {
+            problems.push(format!("{f}: no `{n}` any more: take it out of UNCOUNTED_LENDS"));
+        }
+    }
+    problems
+}
+
+#[test]
+fn every_lend_to_user_code_is_counted() {
+    let files: Vec<(String, String)> = workspace()
+        .into_iter()
+        .filter(|(p, _)| p.starts_with("crates/gui/"))
+        .collect();
+    let problems = lends(&files, UNCOUNTED_LENDS);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn the_lend_lint_catches_an_uncounted_lend_and_a_returned_reference() {
+    let fixture = r"
+        impl<T> Cell<T> {
+            pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R { f(&self.cell.borrow()) }
+            pub fn counted<R>(&self, f: impl FnOnce(&T) -> R) -> R { super::lend(|| f(&self.v)) }
+            pub fn on_change(&self, f: impl Fn(&T) + 'static) { self.keep(f) }
+            pub fn get_mut(&mut self) -> &mut T { self.cell.get_mut() }
+            pub(crate) fn inner(&mut self) -> &mut T { self.cell.get_mut() }
+        }
+    ";
+    let files = [("crates/gui/src/engine/world_cell.rs".to_owned(), fixture.to_owned())];
+    let problems = lends(&files, &[]);
+    assert_eq!(problems.len(), 2, "{problems:#?}");
+    assert!(problems[0].contains("`with` runs a caller's closure"), "{problems:#?}");
+    assert!(problems[1].contains("`get_mut` returns a reference"), "{problems:#?}");
+}
+
+// ── Check admission (ADR-0035 D4) ───────────────────────────────────────────
+
+/// The public functions that open a check from a caller's closure: the
+/// test hooks, each taking a `'static` body (no lent borrow can ride in).
+/// Every other check opens at an engine point (`Root::check`, from the
+/// frame loop), crate-private.
+const CHECK_ENTRIES: &[(&str, &str)] = &[
+    ("crates/gui/src/testing.rs", "in_check"),
+    ("crates/gui/src/testing.rs", "check"),
+];
+
+/// Every `pub fn` whose body opens a check (`fork(` or `in_cold_frame(`):
+/// listed in `entries`, and its signature `'static` in every closure.
+fn admissions(files: &[(String, String)], entries: &[(&str, &str)]) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (path, src) in files {
+        let code = library(src);
+        for (name, at) in fns(&code) {
+            let line = code[..at].rfind('\n').map_or(0, |i| i + 1);
+            let head = &code[line..at];
+            if !head.contains("pub ") || head.contains("pub(") {
+                continue;
+            }
+            let body = drop_body(&code, at);
+            let opens = ["fork(", "in_cold_frame("].iter().any(|o| {
+                body.match_indices(o)
+                    .any(|(i, _)| !body[..i].ends_with(|c: char| is_ident(c)))
             });
-            if called {
+            if !opens {
+                continue;
+            }
+            let Some(open) = code[at..].find('{').map(|o| at + o) else {
+                continue;
+            };
+            let sig = &code[at..open];
+            if !entries.iter().any(|(f, n)| *f == path && *n == name) {
                 problems.push(format!(
-                    "{file}: the drop of `{ty}` runs `{name}` itself as well as handing it to `engine::dropped` \
-                     (review r18, decision 4)"
+                    "{path}: `{name}` is public and opens a check: a check opens only at an engine point (ADR-0035, D4)"
                 ));
             }
-        }
-        for op in *ops {
-            if outside.contains(op) {
+            let closures = sig.matches("FnOnce(").count() + sig.matches("FnMut(").count() + sig.matches("Fn(").count();
+            if sig.matches("+ 'static").count() < closures {
                 problems.push(format!(
-                    "{file}: the drop of `{ty}` calls `{op}..)` itself: the explicit operation acts on the running \
-                     world, a check's copy inside a check; call it inside the job handed to `engine::dropped` \
-                     (review r18, decision 4)"
+                    "{path}: `{name}` opens a check on a closure that is not `'static`: a lent borrow can ride into it (ADR-0035, D4)"
                 ));
             }
         }
@@ -1347,159 +1200,90 @@ fn owner_drops(files: &[(String, String)], owners: &[(&str, &str, &[&str])]) -> 
     problems
 }
 
-/// No live owner's drop takes its explicit operation's path (review r18,
-/// decision 4).
 #[test]
-fn no_owner_drop_takes_the_explicit_close() {
-    let problems = owner_drops(&workspace(), OWNER_DROPS);
+fn a_check_opens_only_at_an_engine_point_or_on_a_static_body() {
+    let files: Vec<(String, String)> = workspace()
+        .into_iter()
+        .filter(|(p, _)| p.starts_with("crates/gui/"))
+        .collect();
+    let problems = admissions(&files, CHECK_ENTRIES);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn the_admission_lint_catches_a_public_entry_and_a_borrowing_body() {
+    let fixture = r"
+        pub fn in_check<R>(f: impl FnOnce() -> R) -> R { crate::engine::in_cold_frame(f) }
+        pub fn check_frame<R: 'static>(f: impl FnOnce() -> R + 'static) -> R { crate::engine::in_cold_frame(f) }
+        pub(crate) fn inner<R>(f: impl FnOnce() -> R) -> R { crate::engine::fork(f) }
+        pub fn unforked() { prefork(); }
+    ";
+    let files = [("crates/gui/src/testing.rs".to_owned(), fixture.to_owned())];
+    let problems = admissions(&files, &[("crates/gui/src/testing.rs", "in_check")]);
+    assert_eq!(problems.len(), 2, "{problems:#?}");
     assert!(
-        problems.is_empty(),
-        "owner drops (ADR-0034, S4):\n  {}",
-        problems.join("\n  ")
+        problems[0].contains("`in_check` opens a check on a closure that is not"),
+        "{problems:#?}"
+    );
+    assert!(
+        problems[1].contains("`check_frame` is public and opens a check"),
+        "{problems:#?}"
     );
 }
 
-/// The owner-drop lint catches the r18 form (a pipeline's drop calling its
-/// close) and one that queues nothing; the sound form passes.
-#[test]
-fn the_owner_drop_lint_catches_a_drop_that_closes_itself() {
-    let path = "crates/gui/src/fixture.rs";
-    let src = r#"
-        struct Pipeline;
-        impl Drop for Pipeline {
-            fn drop(&mut self) {
-                if let Err(said) = self.close() { eprintln!("{said}"); }
-            }
-        }
-        struct Quiet;
-        impl Drop for Quiet { fn drop(&mut self) { forget(); } }
-        struct Sound;
-        impl Drop for Sound {
-            fn drop(&mut self) {
-                let w = self.w.clone();
-                crate::engine::dropped(crate::engine::LiveDrop::in_drop(), false, move || { close_window(&w, || ()); });
-            }
-        }
-        struct Bound;
-        impl Drop for Bound {
-            fn drop(&mut self) {
-                let key = self.key;
-                let end = move || { end_root(key); };
-                crate::engine::dropped(crate::engine::LiveDrop::in_drop(), false, end);
-            }
-        }
-        struct Twice;
-        impl Drop for Twice {
-            fn drop(&mut self) {
-                let key = self.key;
-                let end = move || { end_root(key); };
-                end();
-                crate::engine::dropped(crate::engine::LiveDrop::in_drop(), false, end);
-            }
-        }
-        struct Unhanded;
-        impl Drop for Unhanded {
-            fn drop(&mut self) {
-                let key = self.key;
-                let end = move || { end_root(key); };
-                crate::engine::dropped(crate::engine::LiveDrop::in_drop(), false, || ());
-            }
-        }
-    "#;
-    let files = [(path.to_owned(), src.to_owned())];
-    let owners: &[(&str, &str, &[&str])] = &[
-        (path, "Pipeline", &["close(", "close_window("]),
-        (path, "Quiet", &["close("]),
-        (path, "Sound", &["close(", "close_window("]),
-        (path, "Bound", &["end_root("]),
-        (path, "Twice", &["end_root("]),
-        (path, "Unhanded", &["end_root("]),
-    ];
-    let problems = owner_drops(&files, owners);
-    assert!(
-        problems
-            .iter()
-            .any(|p| p.contains("`Pipeline` calls `close(..)` itself")),
-        "{problems:#?}"
-    );
-    assert!(
-        problems.iter().any(|p| p.contains("`Quiet` hands nothing")),
-        "{problems:#?}"
-    );
-    assert!(
-        problems.iter().any(|p| p.contains("`Twice` runs `end` itself")),
-        "{problems:#?}"
-    );
-    assert!(
-        problems
-            .iter()
-            .any(|p| p.contains("`Unhanded` calls `end_root(..)` itself")),
-        "{problems:#?}"
-    );
-    assert!(!problems.iter().any(|p| p.contains("`Bound`")), "{problems:#?}");
-    // Pipeline twice (it hands nothing, and closes), Quiet, Twice, Unhanded.
-    assert_eq!(problems.len(), 5, "{problems:#?}");
-}
-
-/// The `Drop` impls that build a `LiveDrop` token, from `files`:
-/// `(file, type)`.
-fn token_drops(files: &[(String, String)]) -> std::collections::BTreeSet<(String, String)> {
-    let mut out = std::collections::BTreeSet::new();
+/// The one gate (ADR-0035 D4): every guard that restores the runtime's
+/// running subscriber or owner as it drops (what the engine switches to
+/// run user code: a getter, an effect, a tracked render, binding or paint,
+/// `untracked`, `detached`, a scope's `run`, `trigger`) holds a
+/// `UserCode` count, so a check opened in what runs under it is refused.
+fn gates(files: &[(String, String)]) -> Vec<String> {
+    let mut problems = Vec::new();
     for (path, src) in files {
-        if path.ends_with("/tests.rs") || TEST_FILES.contains(&path.as_str()) {
-            continue;
-        }
-        let c = library(src);
-        for (ty, at) in drops(&c) {
-            if drop_body(&c, at).contains("LiveDrop::in_drop()") {
-                out.insert((path.clone(), ty));
+        let code = library(src);
+        for (ty, at) in drops(&code) {
+            let body = drop_body(&code, at);
+            if !body.contains("active_sub") && !body.contains("active_owner") {
+                continue;
+            }
+            let def = [format!("struct {ty} {{"), format!("struct {ty}(")]
+                .iter()
+                .find_map(|d| code.find(d.as_str()))
+                .map_or("", |s| {
+                    let end = code[s..].find(['}', ';']).map_or(code.len(), |e| s + e);
+                    &code[s..end]
+                });
+            if !def.contains("UserCode") {
+                problems.push(format!(
+                    "{path}: `{ty}` switches the running subscriber or owner for user code but holds no `UserCode`: a check opened under it is admitted (ADR-0035, D4)"
+                ));
             }
         }
     }
-    out
+    problems
 }
 
-/// The ADR's list of the drops that reach the live release queue (S4,
-/// "Only a drop reaches the live world"): each row of the table under the
-/// `<!-- live-drops -->` mark, `(file, type)`.
-fn adr_live_drops(adr: &str) -> std::collections::BTreeSet<(String, String)> {
-    let mut out = std::collections::BTreeSet::new();
-    let Some(at) = adr.find("<!-- live-drops -->") else {
-        return out;
-    };
-    for line in adr[at..].lines().skip(1) {
-        let line = line.trim();
-        if line.is_empty() {
-            break;
-        }
-        let cells: Vec<&str> = line.split('|').map(str::trim).filter(|c| !c.is_empty()).collect();
-        if let [ty, file, ..] = cells[..]
-            && ty.starts_with('`')
-        {
-            out.insert((
-                format!("crates/{}", file.trim_matches('`')),
-                ty.trim_matches('`').to_owned(),
-            ));
-        }
-    }
-    out
-}
-
-/// The ADR and the lint name the same drops as reaching the live release
-/// queue (review r18, decision 5): every `Drop` that builds a `LiveDrop`
-/// token is a row of ADR-0034's table, and every row is such a drop.
 #[test]
-fn the_adr_names_every_drop_that_reaches_the_live_queue() {
-    let adr = std::fs::read_to_string(root().join("docs/adr/0034-a-check-switches-worlds-without-running-app-code.md"))
-        .expect("ADR-0034");
-    let listed = adr_live_drops(&adr);
-    assert!(!listed.is_empty(), "ADR-0034 has no `<!-- live-drops -->` table");
-    let built = token_drops(&workspace());
-    let unlisted: Vec<_> = built.difference(&listed).collect();
-    let stale: Vec<_> = listed.difference(&built).collect();
-    assert!(
-        unlisted.is_empty() && stale.is_empty(),
-        "drops that build a `LiveDrop` token, not in ADR-0034's table: {unlisted:#?}\n\
-         rows of the table that build none: {stale:#?}"
-    );
+fn every_switch_into_user_code_is_counted() {
+    let files: Vec<(String, String)> = workspace()
+        .into_iter()
+        .filter(|(p, _)| p.starts_with("crates/gui/"))
+        .collect();
+    let problems = gates(&files);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn the_gate_lint_catches_a_switch_without_a_count() {
+    let fixture = r"
+        struct RunGuard { prev_sub: usize, _user: crate::engine::UserCode }
+        impl Drop for RunGuard { fn drop(&mut self) { try_with(|rt| rt.active_sub = self.prev_sub); } }
+        struct Bare(usize);
+        impl Drop for Bare { fn drop(&mut self) { try_with(|rt| rt.active_sub = self.0); } }
+        struct Other;
+        impl Drop for Other { fn drop(&mut self) { tidy(); } }
+    ";
+    let files = [("crates/gui/src/reactive/runtime.rs".to_owned(), fixture.to_owned())];
+    let problems = gates(&files);
+    assert_eq!(problems.len(), 1, "{problems:#?}");
+    assert!(problems[0].contains("`Bare` switches"), "{problems:#?}");
 }

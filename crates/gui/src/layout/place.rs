@@ -135,7 +135,7 @@ impl LayoutTree {
                 Write::Changed => usize::try_from(ex.index).unwrap_or(usize::MAX),
             };
             let mut tracker = std::mem::take(&mut ex.place);
-            let (probe, marks) = (self.probe, Rc::clone(&self.marks));
+            let (probe, marks) = (*self.probe, Rc::clone(&self.marks));
             let boxes = std::mem::take(&mut ex.spare_boxes);
             let (fresh, kids) = tracker.run(probe, &marks, u, need::PLACE, || {
                 self.frame_node(&ex, node, from, index, state, boxes, text)
@@ -302,7 +302,7 @@ impl LayoutTree {
             // Run once its tree's lists are filled (`join_lists`), which it
             // may read; what it writes is read again by the pass it asks
             // for, not by this one.
-            self.measured_due.borrow_mut().push((Rc::clone(f), bounds));
+            self.measured_due.with_mut(|d| d.push((Rc::clone(f), bounds)));
         }
         let padding_box = bounds.inset(l.border.top, l.border.right, l.border.bottom, l.border.left);
         let content_box = padding_box.inset(l.padding.top, l.padding.right, l.padding.bottom, l.padding.left);
@@ -447,15 +447,16 @@ impl LayoutTree {
             }
             let offset = crate::compositor::motion::px2(pos);
             if (pos != want || reveal) && !self.detached {
-                let mut fields = self.fields.borrow_mut();
-                #[cfg(test)]
-                if fields.len() == fields.capacity() {
-                    crate::edit::FIELD_GROWS.with(|n| n.set(n.get().saturating_add(1)));
-                }
-                fields.push(FieldSettled {
-                    field: input.field,
-                    pos,
-                    applied: asked,
+                self.fields.with_mut(|fields| {
+                    #[cfg(test)]
+                    if fields.len() == fields.capacity() {
+                        crate::edit::FIELD_GROWS.with(|n| n.set(n.get().saturating_add(1)));
+                    }
+                    fields.push(FieldSettled {
+                        field: input.field,
+                        pos,
+                        applied: asked,
+                    });
                 });
             }
             scroll = Some(Scroll {

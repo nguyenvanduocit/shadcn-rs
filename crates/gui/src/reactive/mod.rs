@@ -208,17 +208,11 @@ impl RenderNode {
         }
     }
 
-    /// [`Self::dispose`], from the `Drop` of its owner: a live node whose
-    /// owner a fork drops is disposed once the fork has rolled back
-    /// ([`crate::engine::dropped`]), never in it.
-    pub(crate) fn release(self, live: crate::engine::LiveDrop) {
-        crate::engine::dropped(live, self.0.made_in_fork(), move || self.dispose());
-    }
-
     /// Run `f`, its reads becoming this render's dependencies.
     pub(crate) fn track<R>(self, f: impl FnOnce() -> R) -> R {
         if runtime::with(|rt| rt.live(self.0).is_none()) {
-            return f();
+            // Untracked, still user code: counted as the tracked run is.
+            return crate::engine::lend(f);
         }
         runtime::track_render(self.0.index, f)
     }

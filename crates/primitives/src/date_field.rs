@@ -1149,7 +1149,7 @@ impl<P: 'static> DateField<P> {
     /// `d` as a literal between segments: hidden from assistive technology.
     #[must_use]
     pub fn literal(self, d: Div) -> Div {
-        d.aria_hidden()
+        d.aria_hidden(true)
     }
 
     /// The strings it names its parts with: the options' own, else its

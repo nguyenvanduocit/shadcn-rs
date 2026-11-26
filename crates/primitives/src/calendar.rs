@@ -889,7 +889,7 @@ impl CalendarGrid {
     /// (`Calendar/CalendarGridHead.vue:16`).
     #[must_use]
     pub fn head(self, d: Div) -> Div {
-        d.aria_hidden()
+        d.aria_hidden(true)
     }
 
     /// `d` as a week's row.

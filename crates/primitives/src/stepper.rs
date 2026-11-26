@@ -423,7 +423,7 @@ impl<P: 'static> Stepper<P> {
     ) -> Div {
         let labels = self.labels(step);
         self.trigger_part(
-            d.aria_label(label).described_by(labels.description),
+            d.aria_label(label.into()).described_by(labels.description),
             step,
             focus,
             availability,

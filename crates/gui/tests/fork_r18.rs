@@ -71,7 +71,8 @@ fn a_tree_laid_out_in_a_check_leaves_live_members() {
     let mut live = LayoutTree::new();
     lay_out(&mut live, &members, 1);
     assert_eq!(members.get(), [1]);
-    gui::testing::in_check(|| lay_out(&mut LayoutTree::new(), &members, 2));
+    let held = members.clone();
+    gui::testing::in_check(move || lay_out(&mut LayoutTree::new(), &held, 2));
     assert_eq!(members.get(), [1], "the check's tree took the live list over");
     lay_out(&mut live, &members, 3);
     assert_eq!(members.get(), [3], "the live tree still fills it");
@@ -95,7 +96,7 @@ fn a_check_reading_a_live_registry_leaves_its_count() {
     gui::engine::shutdown();
     assert_eq!(registry.to_vec_untracked(), [7]);
     let before = registry.visits();
-    let seen = gui::testing::in_check(|| registry.to_vec_tracked());
+    let seen = gui::testing::in_check(move || registry.to_vec_tracked());
     assert_eq!(seen, [7], "the check reads the live entries");
     assert_eq!(
         registry.visits(),

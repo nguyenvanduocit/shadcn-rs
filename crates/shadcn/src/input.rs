@@ -471,7 +471,7 @@ fn render_time(segments: TimeField<TimeInput>, p: &TimeInput) -> Div {
         let s = match piece {
             Piece::Literal(t) => {
                 // Hidden from assistive technology, as the field's literals are.
-                fields = fields.child(text(t).aria_hidden());
+                fields = fields.child(text(t).aria_hidden(true));
                 sizer = sizer.child(text(t));
                 continue;
             }

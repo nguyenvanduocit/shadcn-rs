@@ -13,22 +13,50 @@
 //! A copy (`Clone`) is the copier's world's: a check's copy of a live value
 //! holding one is the check's own.
 //!
-//! A release build runs no check ([`super::forking`] is `false`), so every
-//! cell is live there and the test is `0 == 0`.
+//! A world is named by [`super::world`], the one source in every build
+//! (ADR-0035, D5): process-wide, so a cell sent to another thread matches
+//! no check there.
+//!
+//! A [`WorldRefCell`] lends its value only to a closure (`with`,
+//! `with_mut`), never as a guard or a reference, not even to its one
+//! owner (ADR-0035, D4): no borrow outlives the call, so none can be
+//! forgotten or held across a check's switch. A check's body is `'static`
+//! (`gui::testing::in_check`), so no lent borrow can be carried into one,
+//! and a check opened inside a lend is refused (`Skipped(InUserCode)`,
+//! ADR-0035 D4's run-time rule). Its `Debug` names it and runs no payload
+//! code.
+//!
+//! ```compile_fail,E0599
+//! // Codex r19-3's reproducer: a guard taken live and written in a check.
+//! let actions = gui::window::decoration::Actions::default();
+//! let mut queue = actions.borrow_mut();
+//! gui::testing::in_check(|| queue.push(gui::window::decoration::WindowAction::Close));
+//! ```
+//!
+//! ```compile_fail,E0599
+//! let actions = gui::window::decoration::Actions::default();
+//! let sampled = gui::testing::in_check(|| actions.borrow());
+//! ```
+//!
+//! ```compile_fail,E0599
+//! let cell = gui::engine::WorldRefCell::new("a list", vec![1]);
+//! std::mem::forget(cell.try_borrow_mut());
+//! ```
+//!
+//! ```compile_fail,E0624
+//! // Codex F1b r1-1's reproducer: its owner's `&mut` held into a check.
+//! use gui::window::decoration::{Actions, WindowAction};
+//! let mut actions = Actions::default();
+//! let queue = std::rc::Rc::get_mut(&mut actions).unwrap().get_mut();
+//! let _ = gui::testing::check(|| queue.push(WindowAction::Close));
+//! ```
 
-use std::cell::{Cell, Ref, RefCell, RefMut};
+use std::cell::{Cell, RefCell};
 use std::fmt;
 
-/// The running world: 0 live, else the running check's serial.
-#[cfg(debug_assertions)]
+/// The running world ([`super::world`]).
 fn now() -> u64 {
     super::world()
-}
-
-/// A release build runs live alone.
-#[cfg(not(debug_assertions))]
-const fn now() -> u64 {
-    0
 }
 
 /// The refusal of a write from another world.
@@ -47,10 +75,11 @@ fn refused(what: &str) -> ! {
 /// handlers write, which a check must never write live.
 ///
 /// ```
-/// let count = gui::engine::WorldCell::new("clicks", 0_u32);
+/// let count = std::rc::Rc::new(gui::engine::WorldCell::new("clicks", 0_u32));
 /// count.set(count.get() + 1);
-/// let refused = gui::testing::in_check(|| {
-///     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| count.set(9))).is_err()
+/// let held = std::rc::Rc::clone(&count);
+/// let refused = gui::testing::in_check(move || {
+///     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| held.set(9))).is_err()
 /// });
 /// assert!(refused);
 /// assert_eq!(count.get(), 1);
@@ -176,50 +205,35 @@ impl<T> WorldRefCell<T> {
         }
     }
 
-    /// A read: free in every world.
+    /// `f` given the value to read: free in every world.
     ///
     /// # Panics
     /// While it is written.
-    pub fn borrow(&self) -> Ref<'_, T> {
-        self.cell.borrow()
+    pub fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        super::lend(|| f(&self.cell.borrow()))
     }
 
-    /// [`Self::borrow`], `Err` while it is written.
-    ///
-    /// # Errors
-    /// While it is written.
-    pub fn try_borrow(&self) -> Result<Ref<'_, T>, std::cell::BorrowError> {
-        self.cell.try_borrow()
+    /// [`Self::with`], `None` while it is written.
+    pub fn try_with<R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        super::lend(|| self.cell.try_borrow().ok().map(|v| f(&v)))
     }
 
-    /// A write.
+    /// `f` given the value to write.
     ///
     /// # Panics
     /// From a world that did not make it, or while it is borrowed.
-    pub fn borrow_mut(&self) -> RefMut<'_, T> {
+    pub fn with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
         self.writes();
-        self.cell.borrow_mut()
+        super::lend(|| f(&mut self.cell.borrow_mut()))
     }
 
-    /// Its value, written through its one owner.
+    /// [`Self::with_mut`], `None` while it is borrowed.
     ///
     /// # Panics
     /// From a world that did not make it.
-    pub fn get_mut(&mut self) -> &mut T {
+    pub fn try_with_mut<R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
         self.writes();
-        self.cell.get_mut()
-    }
-
-    /// [`Self::borrow_mut`], `Err` while it is borrowed.
-    ///
-    /// # Errors
-    /// While it is borrowed.
-    ///
-    /// # Panics
-    /// From a world that did not make it.
-    pub fn try_borrow_mut(&self) -> Result<RefMut<'_, T>, std::cell::BorrowMutError> {
-        self.writes();
-        self.cell.try_borrow_mut()
+        super::lend(|| self.cell.try_borrow_mut().ok().map(|mut v| f(&mut v)))
     }
 
     /// Store `value`, giving back the old one.
@@ -229,6 +243,17 @@ impl<T> WorldRefCell<T> {
     pub fn replace(&self, value: T) -> T {
         self.writes();
         self.cell.replace(value)
+    }
+
+    /// Its value, written through its one owner: the engine's alone (no
+    /// reference reaches app code, ADR-0035, D4; engine code opens no
+    /// check while it holds one).
+    ///
+    /// # Panics
+    /// From a world that did not make it.
+    pub(crate) fn get_mut(&mut self) -> &mut T {
+        self.writes();
+        self.cell.get_mut()
     }
 
     /// Take the value, leaving the default.
@@ -247,7 +272,7 @@ impl<T> WorldRefCell<T> {
 impl<T: Clone> Clone for WorldRefCell<T> {
     /// The copier's world's.
     fn clone(&self) -> Self {
-        Self::new(self.what, self.borrow().clone())
+        Self::new(self.what, self.with(T::clone))
     }
 }
 
@@ -258,9 +283,14 @@ impl<T: Default> Default for WorldRefCell<T> {
     }
 }
 
-impl<T: fmt::Debug> fmt::Debug for WorldRefCell<T> {
+/// By its name and world alone: formatting runs no payload code (nor the
+/// caller's writer) while the value is borrowed (ADR-0035 D4).
+impl<T> fmt::Debug for WorldRefCell<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.cell.fmt(f)
+        f.debug_struct("WorldRefCell")
+            .field("what", &self.what)
+            .field("world", &self.world)
+            .finish_non_exhaustive()
     }
 }
 
@@ -275,13 +305,13 @@ mod tests {
         let live = WorldCell::new("live count", 1_u32);
         let list = WorldRefCell::new("live list", vec![1]);
         live.set(2);
-        list.borrow_mut().push(2);
+        list.with_mut(|l| l.push(2));
         let wrote = crate::engine::in_cold_frame(|| {
-            assert_eq!((live.get(), list.borrow().len()), (2, 2), "a check reads live");
+            assert_eq!((live.get(), list.with(Vec::len)), (2, 2), "a check reads live");
             let own = WorldCell::new("the check's", 0_u32);
             own.set(1);
             let cell = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| live.set(9)));
-            let vec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| list.borrow_mut().push(9)));
+            let vec = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| list.with_mut(|l| l.push(9))));
             (own.get(), cell.is_err(), vec.is_err(), live.is_here())
         });
         assert_eq!(
@@ -290,10 +320,35 @@ mod tests {
             "the check wrote its own and was refused the live"
         );
         assert_eq!(
-            (live.get(), list.borrow().clone()),
+            (live.get(), list.with(Clone::clone)),
             (2, vec![1, 2]),
             "nothing live changed"
         );
+    }
+
+    /// A check opened inside a lend is refused, its body never run.
+    #[test]
+    fn a_check_inside_a_lend_is_refused() {
+        let list = WorldRefCell::new("live list", vec![1]);
+        let ended = list.with_mut(|l| crate::engine::fork(|| l.push(9)));
+        assert!(
+            matches!(ended, crate::engine::Ended::Dropped(why) if why == super::super::frame::BORROWED),
+            "refused"
+        );
+        assert_eq!(list.with(Clone::clone), vec![1]);
+        assert!(
+            matches!(crate::engine::fork(|| 1), crate::engine::Ended::Kept(1)),
+            "free again"
+        );
+    }
+
+    /// The world follows the check (one source, ADR-0035, D5).
+    #[test]
+    fn the_world_follows_the_check() {
+        assert_eq!(super::super::world(), super::super::LIVE);
+        let inside = crate::engine::in_cold_frame(|| (super::super::world(), crate::engine::is_cold()));
+        assert!(inside.0 != super::super::LIVE && inside.1);
+        assert_eq!(super::super::world(), super::super::LIVE);
     }
 
     /// A check's copy of a live cell is the check's.

@@ -66,15 +66,9 @@ impl LayoutTree {
         self.by_field.clear();
         self.mounting.clear();
         self.joining.clear();
-        if let Ok(mut m) = self.marks.try_borrow_mut() {
-            m.clear();
-        }
-        if let Ok(mut m) = self.measured_due.try_borrow_mut() {
-            m.clear();
-        }
-        if let Ok(mut f) = self.fields.try_borrow_mut() {
-            f.clear();
-        }
+        self.marks.try_with_mut(Vec::clear);
+        self.measured_due.try_with_mut(Vec::clear);
+        self.fields.try_with_mut(Vec::clear);
         self.focused = None;
         self.motion_seen = 0;
         self.frame = Frame::default();
@@ -460,7 +454,7 @@ impl LayoutTree {
         }
         self.joining = joining;
         self.joining.clear();
-        let due = std::mem::take(&mut *self.measured_due.borrow_mut());
+        let due = self.measured_due.with_mut(std::mem::take);
         // Callers' closures, through the one gate (ADR-0028, rule 5).
         for (f, bounds) in &due {
             crate::engine::call_out(crate::engine::Site::Measured, || {
@@ -469,6 +463,6 @@ impl LayoutTree {
         }
         let mut due = due;
         due.clear();
-        *self.measured_due.borrow_mut() = due;
+        self.measured_due.with_mut(|d| *d = due);
     }
 }

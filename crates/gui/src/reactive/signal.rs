@@ -29,7 +29,12 @@ fn changed<T: PartialEq + 'static>(value: &dyn std::any::Any) -> bool {
     };
     let forced = std::mem::take(&mut slot.forced);
     let before = slot.before.take();
-    forced || before.is_none_or(|b| b != slot.value)
+    // `T::eq` is app code run with the slot borrowed: a lend; and the old
+    // value's drop (app code too) runs once the slot is let go.
+    let changed = forced || crate::engine::lend(|| before.as_ref().is_none_or(|b| *b != slot.value));
+    drop(slot);
+    drop(before);
+    changed
 }
 
 /// A reactive cell. Reading it in an effect, a computed or a render
@@ -223,7 +228,8 @@ impl<T: 'static> Signal<T> {
         let cell = self.read(true);
         let _batch = runtime::BatchGuard::new();
         let slot = borrow(&cell, self.created_at);
-        f(&slot.value)
+        // A lend to user code: no check opens inside it (ADR-0035, D4).
+        crate::engine::lend(|| f(&slot.value))
     }
 
     /// Borrow the value without subscribing anything.
@@ -231,7 +237,8 @@ impl<T: 'static> Signal<T> {
         let cell = self.read(false);
         let _batch = runtime::BatchGuard::new();
         let slot = borrow(&cell, self.created_at);
-        f(&slot.value)
+        // A lend to user code: no check opens inside it (ADR-0035, D4).
+        crate::engine::lend(|| f(&slot.value))
     }
 
     /// The value, subscribing the running reader.
@@ -259,7 +266,8 @@ impl<T: 'static> Signal<T> {
         let (cell, dirty) = self.slot();
         let old = {
             let mut slot = borrow_mut(&cell, self.created_at);
-            if slot.value == value {
+            // `T::eq` is app code run with the slot borrowed: a lend.
+            if crate::engine::lend(|| slot.value == value) {
                 return;
             }
             runtime::check_write(self.id.index);
@@ -338,7 +346,8 @@ impl<T: 'static> Signal<T> {
         {
             let mut slot = borrow_mut(&cell, self.created_at);
             slot.forced = true;
-            f(&mut slot.value);
+            // A lend to user code: no check opens inside it (ADR-0035, D4).
+            crate::engine::lend(|| f(&mut slot.value));
         }
         self.notify();
     }
@@ -354,7 +363,8 @@ impl<T: 'static> Signal<T> {
         self.notify();
     }
 
-    /// Whether a fork made it ([`crate::engine::dropped`]).
+    /// Whether a fork made it (tests).
+    #[cfg(test)]
     pub(crate) fn made_in_fork(self) -> bool {
         self.id.made_in_fork()
     }

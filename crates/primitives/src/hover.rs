@@ -457,7 +457,7 @@ mod tests {
         });
         s.frame("waiting")
             .expect("the cold frame renders it as the live one does");
-        assert!(gui::testing::in_check(|| delay.pending()), "pending, read cold");
+        assert!(gui::testing::in_check(move || delay.pending()), "pending, read cold");
         delay.cancel();
     }
 

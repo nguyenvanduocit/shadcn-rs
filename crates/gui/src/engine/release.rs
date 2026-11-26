@@ -62,34 +62,6 @@ pub(crate) fn when_live(f: impl FnOnce() + 'static) {
     }
 }
 
-/// The proof that a release is asked for by a `Drop` (review r17, decision
-/// 3): only a value's drop reaches the live world from inside a check, as
-/// a live value a check lets go has no other moment to end in. An explicit
-/// operation inside a check (a close, a dispose, a retire) acts on the
-/// check's world, never queues live work: it takes no token. Built only by
-/// [`Self::in_drop`], which only the `Drop` impls of the S4 table call
-/// (the obligations lint, `crates/gui/tests/obligations.rs`, checks it).
-pub(crate) struct LiveDrop(());
-
-impl LiveDrop {
-    /// The token, in a `Drop` impl of the S4 table and nowhere else.
-    pub(crate) const fn in_drop() -> Self {
-        Self(())
-    }
-}
-
-/// What a value's `Drop` releases of the engine or the outside world, by
-/// its world: a check's own value is released now, with the check; a live
-/// one goes through the queue ([`when_live`]), so it is released live and
-/// in order, never by the check (ADR-0034, S4).
-pub(crate) fn dropped(_drop: LiveDrop, made_in_fork: bool, f: impl FnOnce() + 'static) {
-    if made_in_fork {
-        f();
-    } else {
-        when_live(f);
-    }
-}
-
 /// Run what is queued now (a test, or a live step that needs it done).
 ///
 /// # Panics

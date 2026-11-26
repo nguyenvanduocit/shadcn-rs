@@ -65,7 +65,7 @@ const FIELDS: &[(&str, &str, Why, &str)] = &[
     // One thread's plumbing, or the pipeline's own: no check runs on it or reaches it.
     ("gui:canvas/planner.rs", "Shared.queue", Why::Plumbing, "the planner's worker pool: the UI thread hands work to its workers"),
     ("gui:chunk/readback.rs", "Flight.state", Why::Plumbing, "a readback's map state, set by the GPU's map callback (the render thread's device)"),
-    ("gui:chunk/series.rs", "Page.data", Why::Plumbing, "a page the render thread reads to upload; written only through `&mut SeriesState`, its signal's, which a check cannot write live"),
+    ("gui:chunk/series.rs", "Page.data", Why::Plumbing, "a page the render thread reads to upload; private (ADR-0035, D5), read through `Page::with`, written only through `&mut SeriesState`, its signal's, which a check cannot write live"),
     ("gui:chunk/timing.rs", "Set.done", Why::Plumbing, "a timing query set's map state, set by the GPU's map callback (the render thread)"),
     ("gui:chunk/timing.rs", "Set.mapped", Why::Plumbing, "a timing query set's map state, set by the GPU's map callback (the render thread)"),
     ("gui:clip.rs", "HitView.walks", Why::Plumbing, "the compositor's count of chains walked, lent to one hit query (the compositor thread)"),

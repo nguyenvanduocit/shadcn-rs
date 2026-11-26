@@ -667,9 +667,10 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
         }
         let parts = self.parts();
         let hit = self.items().with(|list| {
-            let boxes = parts.boxes.borrow();
-            list.iter()
-                .position(|i| boxes.get(&i.focus.id()).is_some_and(|b| b.contains(ev.x, ev.y)))
+            parts.boxes.with(|boxes| {
+                list.iter()
+                    .position(|i| boxes.get(&i.focus.id()).is_some_and(|b| b.contains(ev.x, ev.y)))
+            })
         });
         match hit {
             Some(i) => self.pick(i, false),
@@ -797,7 +798,7 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
     /// highlighted.
     #[must_use]
     pub fn scroll_button(self, d: Div, up: bool) -> Div {
-        d.aria_hidden().on_hover(move |inside| {
+        d.aria_hidden(true).on_hover(move |inside| {
             if inside {
                 gui::focus::set_focus(Some(self.content.id()), false);
                 self.step(up);
@@ -813,11 +814,12 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
         let value = self.value.get_untracked();
         let h = self.items().with(|list| {
             let known: Vec<Known<T>> = list.iter().map(known_of).collect();
-            let boxes = parts.boxes.borrow();
-            anchor_of(&known, &value)
-                .and_then(|i| list.get(i))
-                .or_else(|| list.first())
-                .and_then(|i| boxes.get(&i.focus.id()).map(|b| b.height))
+            parts.boxes.with(|boxes| {
+                anchor_of(&known, &value)
+                    .and_then(|i| list.get(i))
+                    .or_else(|| list.first())
+                    .and_then(|i| boxes.get(&i.focus.id()).map(|b| b.height))
+            })
         });
         h.unwrap_or(0.0)
     }
@@ -890,15 +892,16 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
             .aria_selected(chosen)
             .tab_stop(false)
             .on_measured(move |b| {
-                let mut boxes = measured.boxes.borrow_mut();
-                boxes.insert(id, *b);
-                // Kept for the options laid out: those that left are let
-                // go once they outnumber them, so the boxes grow with the
-                // options shown, never with every option ever shown.
-                let laid = measured.items.len();
-                if boxes.len() > laid.saturating_mul(2).saturating_add(8) {
-                    boxes.retain(|f, _| measured.items.index_of(*f).is_some());
-                }
+                measured.boxes.with_mut(|boxes| {
+                    boxes.insert(id, *b);
+                    // Kept for the options laid out: those that left are let
+                    // go once they outnumber them, so the boxes grow with the
+                    // options shown, never with every option ever shown.
+                    let laid = measured.items.len();
+                    if boxes.len() > laid.saturating_mul(2).saturating_add(8) {
+                        boxes.retain(|f, _| measured.items.index_of(*f).is_some());
+                    }
+                });
             });
         if !availability.focusable() {
             return d.on_hover(move |inside| {
@@ -945,7 +948,7 @@ pub fn group_label(d: Div, label: gui::NodeRef) -> Div {
 /// it.
 #[must_use]
 pub fn separator(d: Div) -> Div {
-    d.aria_hidden().pass_through()
+    d.aria_hidden(true).pass_through()
 }
 
 /// Where a select's list opens in popper mode: below, at the start, as wide
@@ -966,7 +969,7 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
     #[must_use]
     pub fn arrow(d: Div, popper: &Popper, placed: Option<&Placement>) -> Div {
         let (w, h) = popper.arrow.unwrap_or(crate::popper::ARROW);
-        let d = d.aria_hidden().position(Position::Absolute).width(w).height(h);
+        let d = d.aria_hidden(true).position(Position::Absolute).width(w).height(h);
         let Some(at) = placed.and_then(|p| popper.arrow_at(p)) else {
             return d.invisible(true);
         };

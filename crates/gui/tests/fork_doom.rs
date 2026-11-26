@@ -452,9 +452,10 @@ mod codex_r11 {
     fn result_before_stand_in() {
         let matched = Rc::new(Cell::new(None));
         let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            in_cold_frame(|| {
+            let matched = Rc::clone(&matched);
+            in_cold_frame(move || {
                 QUEUE.with_borrow_mut(|q| q.push(Fails));
-                ResultGuard(S.with(|s| *s), Rc::clone(&matched))
+                ResultGuard(S.with(|s| *s), matched)
             })
         }));
         let said = super::said(&*failed.map(drop).expect_err("the check faulted"));
@@ -476,7 +477,7 @@ mod codex_r11 {
     fn liveness() {
         let s = LIVES.with(|s| *s);
         let result = std::panic::catch_unwind(|| {
-            in_cold_frame(|| {
+            in_cold_frame(move || {
                 s.dispose();
                 ALIVE.with(|v| *v)
             })

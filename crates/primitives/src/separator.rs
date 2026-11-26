@@ -42,7 +42,7 @@ impl Separator {
     #[must_use]
     pub fn apply(self, d: Div) -> Div {
         if self.decorative {
-            d.aria_hidden()
+            d.aria_hidden(true)
         } else {
             let d = d.role(Role::Splitter);
             match self.orientation {
