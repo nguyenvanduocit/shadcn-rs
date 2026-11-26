@@ -213,7 +213,10 @@ fn a_provided_content_style_reaches_only_what_it_does_not_set() {
         .find(|n| matches!(n.content, Content::Icon { .. }))
         .expect("the icon");
     assert_eq!(
-        (i.bounds.width, i.bounds.height),
+        (
+            i.bounds(gui::inspect::OUTSIDE).width,
+            i.bounds(gui::inspect::OUTSIDE).height
+        ),
         (24.0, 24.0),
         "the provided icon size"
     );

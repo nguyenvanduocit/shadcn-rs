@@ -81,8 +81,10 @@ fn scenario(f: impl Fn() -> Element + 'static) -> Scenario {
     s
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// Whether `h` holds focus in `s`'s window: read in a turn of it (outside
+/// any, focus is the thread window's, ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
 }
 
 fn at(s: &Scenario, name: &str) -> (f32, f32) {
@@ -141,7 +143,7 @@ fn a_dismiss_request_carries_its_reason_and_the_owner_may_veto_it() {
 
     s.act("open", || open.set(true));
     s.settle().expect("settled");
-    assert!(focused(inside), "a scope focuses its first stop as it opens");
+    assert!(focused(&mut s, inside), "a scope focuses its first stop as it opens");
 
     let (x, y) = at(&s, "Outside");
     s.secondary_click(x, y);
@@ -153,7 +155,7 @@ fn a_dismiss_request_carries_its_reason_and_the_owner_may_veto_it() {
     );
     assert!(!open.get_untracked());
     assert_eq!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         None,
         "a press outside a layer that is not modal gives no focus back (reka's hasInteractedOutside)"
     );
@@ -183,7 +185,7 @@ fn a_dismiss_request_carries_its_reason_and_the_owner_may_veto_it() {
         "a vetoed press still presses what it is on, and focus moving there is asked too"
     );
     assert!(open.get_untracked(), "vetoed");
-    assert!(focused(outside));
+    assert!(focused(&mut s, outside));
     veto.set(false);
 
     click(&mut s, "Inside");
@@ -207,12 +209,12 @@ fn a_dismiss_request_carries_its_reason_and_the_owner_may_veto_it() {
     // on after its owner, and focus outside closes it.
     s.act("open", || open.set(true));
     s.settle().expect("settled");
-    assert!(focused(inside));
+    assert!(focused(&mut s, inside));
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(outside), "after the owner's subtree comes Outside");
+    assert!(focused(&mut s, outside), "after the owner's subtree comes Outside");
     assert_eq!(taken(&log), ["popover: focus"]);
     assert!(!open.get_untracked());
-    assert!(focused(outside), "focus taken elsewhere is not taken back");
+    assert!(focused(&mut s, outside), "focus taken elsewhere is not taken back");
 }
 
 #[test]
@@ -248,7 +250,7 @@ fn escape_goes_to_the_top_layer_alone_and_never_while_an_input_method_composes()
         div().child(text("Page")).child(d).into_element()
     });
     assert_eq!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         Some(field.focus.id()),
         "the dialog focused its field"
     );
@@ -293,7 +295,7 @@ fn a_modal_layer_stops_hit_testing_hover_and_the_wheel_below_it() {
     let clicks = Rc::new(Cell::new(0));
     let page = Interaction::new();
     let scroll = ScrollHandle::new();
-    let (l, v, c, sc) = (Rc::clone(&log), Rc::clone(&veto), Rc::clone(&clicks), scroll.clone());
+    let (l, v, c, sc) = (Rc::clone(&log), Rc::clone(&veto), Rc::clone(&clicks), scroll);
     let pointer_outside = Rc::new(Cell::new(false));
     let po = Rc::clone(&pointer_outside);
     let mut s = scenario(move || {
@@ -404,38 +406,41 @@ fn focus_scopes_stack_take_focus_as_they_open_and_give_it_back_unless_taken() {
     });
 
     click(&mut s, "Open");
-    assert!(focused(d1), "auto focus: its first stop");
+    assert!(focused(&mut s, d1), "auto focus: its first stop");
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(d2));
+    assert!(focused(&mut s, d2));
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(close));
+    assert!(focused(&mut s, close));
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(d1), "a trapped scope cycles Tab");
+    assert!(focused(&mut s, d1), "a trapped scope cycles Tab");
     key(&mut s, NamedKey::Tab, true);
-    assert!(focused(close), "and Shift+Tab");
+    assert!(focused(&mut s, close), "and Shift+Tab");
     key(&mut s, NamedKey::Tab, true);
-    assert!(focused(d2));
+    assert!(focused(&mut s, d2));
 
     s.act("panel", || panel.set(true));
     s.settle().expect("settled");
     assert!(
-        focused(p2),
+        focused(&mut s, p2),
         "the chosen node; the dialog's trap is paused by the scope above it"
     );
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(p1), "Tab goes round the top scope");
+    assert!(focused(&mut s, p1), "Tab goes round the top scope");
     s.act("close panel", || panel.set(false));
     s.settle().expect("settled");
-    assert!(focused(d2), "closing gives focus back to what held it as it opened");
+    assert!(
+        focused(&mut s, d2),
+        "closing gives focus back to what held it as it opened"
+    );
 
     // Code moving focus out of the trapped scope is undone.
     s.act("steal", || opener.focus());
     s.settle().expect("settled");
-    assert!(focused(d2), "pulled back to the node inside that had it last");
+    assert!(focused(&mut s, d2), "pulled back to the node inside that had it last");
 
     click(&mut s, "Close");
     assert!(!dialog.get_untracked());
-    assert!(focused(opener), "back to its trigger");
+    assert!(focused(&mut s, opener), "back to its trigger");
     assert!(taken(&log).is_empty());
 }
 
@@ -464,24 +469,27 @@ fn a_scope_focuses_as_it_is_told_and_a_trapped_one_that_does_not_cycle_stops_at_
     });
     s.act("open", || open.set(true));
     s.settle().expect("settled");
-    assert!(focused(a));
+    assert!(focused(&mut s, a));
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(b));
+    assert!(focused(&mut s, b));
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(b), "trapped without cycling: Tab stops at the last stop");
+    assert!(
+        focused(&mut s, b),
+        "trapped without cycling: Tab stops at the last stop"
+    );
     key(&mut s, NamedKey::Tab, true);
     key(&mut s, NamedKey::Tab, true);
-    assert!(focused(a), "and Shift+Tab at the first");
+    assert!(focused(&mut s, a), "and Shift+Tab at the first");
 
     s.act("close", || open.set(false));
-    field.focus.focus();
+    s.act("focus the field", || field.focus.focus());
     s.act("keep", || {
         mode.set(1);
         open.set(true);
     });
     s.settle().expect("settled");
     assert_eq!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         Some(field.focus.id()),
         "Keep leaves focus in the field that opened it"
     );
@@ -493,13 +501,13 @@ fn a_scope_focuses_as_it_is_told_and_a_trapped_one_that_does_not_cycle_stops_at_
         open.set(true);
     });
     s.settle().expect("settled");
-    assert!(focused(region_focus), "the region itself, which is no Tab stop");
+    assert!(focused(&mut s, region_focus), "the region itself, which is no Tab stop");
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(a));
+    assert!(focused(&mut s, a));
     s.act("close", || open.set(false));
     s.settle().expect("settled");
     assert_eq!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         Some(field.focus.id()),
         "focus returns to the field, its text all selected"
     );
@@ -534,7 +542,7 @@ fn a_touch_is_a_tap_within_10_px_and_a_long_press_at_700_ms() {
         Rc::clone(&longs),
         Rc::clone(&log),
         Rc::clone(&veto),
-        scroll.clone(),
+        scroll,
     );
     let mut s = scenario(move || {
         let lp = Rc::clone(&lp);
@@ -625,7 +633,7 @@ fn a_scroll_of_its_owners_container_asks_a_layer_on_the_ui_and_on_the_compositor
     let log: Log = Rc::default();
     let veto = Rc::new(Cell::new(false));
     let scroll = ScrollHandle::new();
-    let (l, v, sc) = (Rc::clone(&log), Rc::clone(&veto), scroll.clone());
+    let (l, v, sc) = (Rc::clone(&log), Rc::clone(&veto), scroll);
     let mut s = scenario(move || {
         let scrolls = Layer::new().dismiss(DismissPolicy::NONE.scroll(true));
         let tip_layer = tip.get().then(|| {
@@ -715,21 +723,16 @@ fn an_inert_subtree_takes_no_pointer_no_focus_no_layer_and_no_reader() {
     click(&mut s, "Ghost");
     assert_eq!(clicks.get(), 0, "no hit");
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(live));
+    assert!(focused(&mut s, live));
     key(&mut s, NamedKey::Tab, false);
-    assert!(focused(live), "the only stop is Live");
+    assert!(focused(&mut s, live), "the only stop is Live");
     key(&mut s, NamedKey::Escape, false);
     assert!(
         taken(&log).is_empty(),
         "the layer declared in it is inert too: no Escape reaches it"
     );
-    let tree = gui::access::tree(
-        s.last(),
-        gui::focus::focused(),
-        1.0,
-        "w",
-        &mut gui::text::TextSystem::new(),
-    );
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut gui::text::TextSystem::new());
     let names: Vec<String> = tree.nodes.iter().filter_map(|(_, n)| name(n)).collect();
     assert!(names.iter().any(|n| n == "Live"));
     assert!(
@@ -841,12 +844,14 @@ fn relations_name_their_targets_and_a_modal_hides_the_rest_from_assistive_techno
     });
     let mut reader = gui::access::Accessibility::default();
     let mut ts = gui::text::TextSystem::new();
-    let first = reader.update(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let first = reader.update(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("layers_open", dump(&first));
 
     s.act("close", || open.set(false));
     s.settle().expect("settled");
-    let update = reader.update(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let update = reader.update(s.last(), focus, 1.0, "w", &mut ts);
     let edit = update
         .nodes
         .iter()
@@ -854,7 +859,8 @@ fn relations_name_their_targets_and_a_modal_hides_the_rest_from_assistive_techno
         .map(|(_, n)| n)
         .expect("the trigger is sent again: its target went");
     assert!(edit.controls().is_empty(), "no relation to a node that is not there");
-    let whole = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let whole = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("layers_closed", dump(&whole));
 }
 
@@ -921,6 +927,35 @@ fn layers_paint_and_take_escape_in_the_order_they_opened() {
     assert_eq!(taken(&log), ["Early: escape"]);
 }
 
+/// One panel shared by two triggers puts its Tab stops after the trigger
+/// it shows for (`tab_after`). Switched to the other in place (no node
+/// came or went, as a navigation menu's viewport follows its trigger),
+/// Tab from that trigger enters the panel: the layers the input side keeps
+/// are read again with the frame's change log, not only its nodes.
+#[test]
+fn a_panels_tab_stops_follow_the_trigger_it_switches_to() {
+    let which = Signal::new(1_u64);
+    let (one, two, inside) = (FocusHandle::new(), FocusHandle::new(), FocusHandle::new());
+    let clicks = Rc::new(Cell::new(0));
+    let c = Rc::clone(&clicks);
+    let mut s = scenario(move || {
+        let panel = div().layer(Layer::new()).child(button("Inside", inside, &c));
+        div()
+            .child(button("One", one, &c).key(1))
+            .child(button("Two", two, &c).key(2))
+            .child(deferred(Positioning::At { x: 300.0, y: 300.0 }, panel).tab_after(which.get()))
+            .into_element()
+    });
+    s.act("focus two", || two.focus());
+    key(&mut s, NamedKey::Tab, false);
+    assert!(!focused(&mut s, inside), "after One, the panel is not after Two");
+    s.act("to two", || which.set(2));
+    s.settle().expect("settled");
+    s.act("focus two", || two.focus());
+    key(&mut s, NamedKey::Tab, false);
+    assert!(focused(&mut s, inside), "after Two now, Tab from Two enters it");
+}
+
 #[test]
 fn input_modality_is_one_fact_and_decides_the_ring_of_every_focus_move() {
     use gui::focus::{Modality, focus_visible, modality};
@@ -942,15 +977,15 @@ fn input_modality_is_one_fact_and_decides_the_ring_of_every_focus_move() {
 
     key(&mut s, NamedKey::Tab, false);
     assert_eq!(modality(), Modality::Keyboard, "a key makes it Keyboard");
-    assert!(focused(page) && focus_visible(), "Tab shows the ring");
+    assert!(focused(&mut s, page) && s.read(focus_visible), "Tab shows the ring");
     click(&mut s, "Page");
     assert_eq!(modality(), Modality::Pointer, "a press makes it Pointer");
-    assert!(focused(page) && !focus_visible());
+    assert!(focused(&mut s, page) && !s.read(focus_visible));
 
     s.act("open", || open.set(true));
     s.settle().expect("settled");
     assert!(
-        focused(inside) && !focus_visible(),
+        focused(&mut s, inside) && !s.read(focus_visible),
         "an engine move under Pointer shows no ring"
     );
     s.act("close", || open.set(false));
@@ -958,7 +993,10 @@ fn input_modality_is_one_fact_and_decides_the_ring_of_every_focus_move() {
     key(&mut s, NamedKey::Shift, false);
     s.act("open", || open.set(true));
     s.settle().expect("settled");
-    assert!(focused(inside) && focus_visible(), "and under Keyboard it does");
+    assert!(
+        focused(&mut s, inside) && s.read(focus_visible),
+        "and under Keyboard it does"
+    );
     s.act("close", || open.set(false));
     s.settle().expect("settled");
 
@@ -969,11 +1007,11 @@ fn input_modality_is_one_fact_and_decides_the_ring_of_every_focus_move() {
         Modality::Keyboard,
         "a keyboard focus move is the keyboard's: the two agree"
     );
-    assert!(focus_visible());
+    assert!(s.read(focus_visible));
     s.act("blur", || page.blur());
     s.act("a handle focused", || page.focus());
     assert!(
-        focus_visible(),
+        s.read(focus_visible),
         "code focusing under Keyboard shows the ring, as `:focus-visible` after a key"
     );
 }

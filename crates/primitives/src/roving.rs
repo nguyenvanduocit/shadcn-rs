@@ -24,12 +24,7 @@
 //! - The pointer focuses an item it presses (a disabled one takes no
 //!   focus), which makes it the group's last.
 
-use std::cell::Cell;
-#[expect(
-    clippy::disallowed_types,
-    reason = "focus the group's own focus watch saw before layout, its own"
-)]
-use std::cell::RefCell;
+use gui::engine::{WorldCell, WorldRefCell};
 
 use gui::focus::FocusId;
 use gui::{Div, FocusHandle, KeyEvent, Signal};
@@ -65,10 +60,8 @@ impl<T> Nav<T> {
 /// from, the node holding focus, and the item that held it last.
 type StopInputs = (u64, Option<FocusId>, Option<FocusId>);
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "focus the group's own focus watch saw before layout, its own"
-)]
+/// Its cells are the world's that made the group ([`WorldCell`]): a check
+/// writes none of a live group's (ADR-0034, S7).
 struct State<T: 'static> {
     items: Collection<T>,
     keymap: Keymap,
@@ -76,12 +69,12 @@ struct State<T: 'static> {
     /// The Tab stop as last worked out, kept while what it was worked out
     /// from holds: Tab asks every item of the group in one look, and one
     /// walk of the items answers them all.
-    stop: Cell<Option<(StopInputs, Option<FocusId>)>>,
+    stop: WorldCell<Option<(StopInputs, Option<FocusId>)>>,
     /// Focus that reached a node the items as last laid out do not hold,
     /// with the pass they are from, oldest first: an item focused from code
     /// in the tick it mounts, before layout lays it out. Each is decided
     /// once a later pass is laid out ([`Roving::settle`]).
-    pending: RefCell<Vec<(u64, FocusId)>>,
+    pending: WorldRefCell<Vec<(u64, FocusId)>>,
 }
 
 /// A roving focus group: made once in its root's setup (its watcher lives
@@ -123,10 +116,6 @@ impl<T: Clone + 'static> Roving<T> {
     /// [`crate::use_direction`]'s, read at each key); called in setup.
     #[must_use]
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "focus the group's own focus watch saw before layout, its own"
-    )]
     pub fn new(keymap: Keymap, direction: impl Into<ReadDirection>) -> Self {
         let direction = direction.into();
         let group = Self {
@@ -134,8 +123,8 @@ impl<T: Clone + 'static> Roving<T> {
                 items: Collection::new(),
                 keymap,
                 direction,
-                stop: Cell::new(None),
-                pending: RefCell::new(Vec::new()),
+                stop: WorldCell::new("a roving group's Tab stop", None),
+                pending: WorldRefCell::new("a roving group's pending focus", Vec::new()),
             }),
             last: Signal::new(None),
         };

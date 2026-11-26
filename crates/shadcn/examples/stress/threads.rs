@@ -281,5 +281,134 @@ pub fn run() -> (Vec<String>, bool) {
         if goal { "met" } else { "missed" },
         if works { "" } else { "  FAIL: the compositor did not draw without the UI" }
     ));
+    drop(off);
+    for hz in [60_u32, 120] {
+        lines.extend(forwarding(hz));
+        lines.extend(forwarding_idle(hz));
+    }
     (lines, failed)
+}
+
+/// p50, p99 and max of `d`, sorted here.
+fn spread(mut d: Vec<Duration>) -> String {
+    d.sort();
+    format!(
+        "p50 {} p99 {} max {} ({})",
+        ms(percentile(&d, 50)),
+        ms(percentile(&d, 99)),
+        ms(d.last().copied().unwrap_or(Duration::MAX)),
+        d.len()
+    )
+}
+
+/// The render thread's hop alone (ADR-0033: sent to handed on), on a
+/// still page that draws nothing: pointer moves 2 to 6 ms apart, and a
+/// press and release. Its budget: under 1 ms at p99.
+fn forwarding_idle(hz: u32) -> Vec<String> {
+    let interval = Duration::from_secs(1).checked_div(hz).unwrap_or(INTERVAL);
+    let started = gui::offscreen(
+        || || div().size(pct(100.0)).into_element(),
+        gui::RunOptions::default(),
+        SIZE,
+        1.0,
+        interval,
+    );
+    let mut off = match started {
+        Ok(o) => o,
+        Err(e) => return vec![format!("  forwarding at {hz} Hz, idle: could not start: {e}")],
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    drop(off.take_forward_latencies());
+    drop(off.take_input_latencies());
+    for k in 0..400_u16 {
+        off.input(Input::PointerMoved {
+            x: 300.0 + f32::from(k % 50),
+            y: 20.0,
+        });
+        if k % 4 == 0 {
+            off.input(Input::MouseDown { x: 300.0, y: 20.0 });
+            off.input(Input::MouseUp { x: 300.0, y: 20.0 });
+        }
+        std::thread::sleep(Duration::from_millis(2).saturating_add(Duration::from_millis(u64::from(k % 5))));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let hops = off.take_forward_latencies().into_iter().map(|(_, d)| d).collect();
+    let taken = off.take_input_latencies().into_iter().map(|(_, d)| d).collect();
+    vec![format!(
+        "  forwarding at {hz} Hz, idle  render hop {}  to the UI's take {}",
+        spread(hops),
+        spread(taken)
+    )]
+}
+
+/// The `p`th percentile of `sorted`.
+fn percentile(sorted: &[Duration], p: usize) -> Duration {
+    let i = (sorted.len().saturating_mul(p) / 100).min(sorted.len().saturating_sub(1));
+    sorted.get(i).copied().unwrap_or(Duration::MAX)
+}
+
+/// How long input waits from the platform's send to the UI taking it
+/// (ADR-0033), frames drawn at `hz` all the while (the box spins), the UI
+/// idle: pointer moves alone, and a click sent right after a wheel the
+/// render thread scrolls with. Reported, never failed: it is a measure.
+fn forwarding(hz: u32) -> Vec<String> {
+    let interval = Duration::from_secs(1).checked_div(hz).unwrap_or(INTERVAL);
+    let started = gui::offscreen(
+        move || {
+            shadcn::install(shadcn::Theme::default(), shadcn::VEGA);
+            app(Arc::new(AtomicBool::new(false)))
+        },
+        gui::RunOptions::default(),
+        SIZE,
+        1.0,
+        interval,
+    );
+    let mut off = match started {
+        Ok(o) => o,
+        Err(e) => return vec![format!("  forwarding at {hz} Hz: could not start: {e}")],
+    };
+    std::thread::sleep(Duration::from_millis(400));
+    drop(off.take_input_latencies());
+    drop(off.take_forward_latencies());
+    // Moves alone, 2 to 6 ms apart.
+    for k in 0..400_u16 {
+        off.input(Input::PointerMoved {
+            x: 300.0 + f32::from(k % 50),
+            y: 20.0,
+        });
+        std::thread::sleep(Duration::from_millis(2).saturating_add(Duration::from_millis(u64::from(k % 5))));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let mut moves: Vec<Duration> = off.take_input_latencies().into_iter().map(|(_, d)| d).collect();
+    moves.sort();
+    // A wheel over the list, then a click there at once.
+    for _ in 0..100 {
+        off.input(Input::PointerMoved { x: 200.0, y: 300.0 });
+        std::thread::sleep(Duration::from_millis(5));
+        off.wheel((0.0, 3.0), false);
+        off.input(Input::MouseDown { x: 200.0, y: 300.0 });
+        off.input(Input::MouseUp { x: 200.0, y: 300.0 });
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let mut clicks: Vec<Duration> = off
+        .take_input_latencies()
+        .into_iter()
+        .filter(|(i, _)| matches!(i, Input::MouseDown { .. }))
+        .map(|(_, d)| d)
+        .collect();
+    clicks.sort();
+    let hops = off.take_forward_latencies().into_iter().map(|(_, d)| d).collect();
+    vec![format!(
+        "  forwarding at {hz} Hz, drawing every frame  moves p50 {} p99 {} max {} ({})  click after wheel p50 {} p99 {} max {} ({})  render hop {}",
+        ms(percentile(&moves, 50)),
+        ms(percentile(&moves, 99)),
+        ms(moves.last().copied().unwrap_or(Duration::MAX)),
+        moves.len(),
+        ms(percentile(&clicks, 50)),
+        ms(percentile(&clicks, 99)),
+        ms(clicks.last().copied().unwrap_or(Duration::MAX)),
+        clicks.len(),
+        spread(hops),
+    )]
 }

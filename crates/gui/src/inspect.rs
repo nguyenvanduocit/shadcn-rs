@@ -15,6 +15,23 @@ pub use crate::layout::Stats as LayoutStats;
 use crate::layout::{Content, FrameNode};
 use crate::reactive::{Graph, ReactiveTrace};
 
+/// The inspector's reader of laid-out geometry ([`crate::layout::Sight`]):
+/// what its reports and diffs say of each box.
+#[derive(Clone, Copy)]
+pub(crate) struct Sight(());
+
+/// The inspector's [`Sight`].
+const SIGHT: Sight = Sight(());
+
+/// A reader of laid-out geometry for code outside the engine (tests,
+/// tools; [`crate::layout::Sight`]). The input side never holds it
+/// (`tests/shown_reads.rs`): it reads what the screen showed.
+#[derive(Clone, Copy, Debug)]
+pub struct Outside(());
+
+/// The one [`Outside`].
+pub const OUTSIDE: Outside = Outside(());
+
 /// Positions closer than this are treated as equal, so float noise from the
 /// layout engine never reads as a shift.
 const EPSILON: f32 = 0.5;
@@ -241,7 +258,9 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
     for now in new_mid {
         seen.insert(&now.path);
         let change = match old.get(&now.path) {
-            None => Some(Change::Added { after: now.bounds }),
+            None => Some(Change::Added {
+                after: now.bounds(SIGHT),
+            }),
             Some(&(at, was)) => {
                 let change = updated(was, now);
                 stayed.push((at, now, change.is_none()));
@@ -277,7 +296,7 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
     moved_among.sort_unstable();
     for k in moved_among {
         if let Some(&(_, now, _)) = stayed.get(k) {
-            push(now, Some(Change::Reordered { at: now.bounds }));
+            push(now, Some(Change::Reordered { at: now.bounds(SIGHT) }));
         }
     }
     pairs(
@@ -286,7 +305,12 @@ pub fn diff(before: &[FrameNode], after: &[FrameNode]) -> LayoutDiff {
         &mut push,
     );
     for was in old_mid.iter().filter(|r| !seen.contains(&r.path)) {
-        push(was, Some(Change::Removed { before: was.bounds }));
+        push(
+            was,
+            Some(Change::Removed {
+                before: was.bounds(SIGHT),
+            }),
+        );
     }
 
     LayoutDiff {
@@ -379,13 +403,13 @@ pub(crate) fn logged(
         let Some(now) = usize::try_from(i).ok().and_then(|i| frame.nodes.get(i)) else {
             continue;
         };
-        if repainted || moved(&now.bounds, &before) || resized(&now.bounds, &before) {
+        if repainted || moved(&now.bounds(SIGHT), &before) || resized(&now.bounds(SIGHT), &before) {
             out.push(NodeChange {
                 path: now.path.clone(),
                 what: What::of(now),
                 change: Change::Updated {
                     before,
-                    after: now.bounds,
+                    after: now.bounds(SIGHT),
                     repainted,
                 },
             });
@@ -396,11 +420,12 @@ pub(crate) fn logged(
 /// How a node that stayed changed, if it did.
 fn updated(was: &FrameNode, now: &FrameNode) -> Option<Change> {
     let repainted = was.look != now.look || was.content != now.content;
-    (repainted || moved(&now.bounds, &was.bounds) || resized(&now.bounds, &was.bounds)).then_some(Change::Updated {
-        before: was.bounds,
-        after: now.bounds,
-        repainted,
-    })
+    (repainted || moved(&now.bounds(SIGHT), &was.bounds(SIGHT)) || resized(&now.bounds(SIGHT), &was.bounds(SIGHT)))
+        .then_some(Change::Updated {
+            before: was.bounds(SIGHT),
+            after: now.bounds(SIGHT),
+            repainted,
+        })
 }
 
 /// A short name for a node: its debug name, or what it shows
@@ -549,7 +574,7 @@ pub fn dump(nodes: &[FrameNode]) -> String {
             "{indent}{:<12} {} {}{detail}{layer}\n",
             r.path.to_string(),
             describe(r),
-            r.bounds
+            r.bounds(SIGHT)
         ));
     }
     out

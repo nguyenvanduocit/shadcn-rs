@@ -155,7 +155,7 @@ impl LayoutTree {
 
     /// The first scroll handle in `node`'s subtree, in tree order.
     fn first_scroll(&self, node: &Node) -> Option<ScrollHandle> {
-        if let Some(h) = self.extra(node.user).and_then(|e| e.behaviour.scroll.clone()) {
+        if let Some(h) = self.extra(node.user).and_then(|e| e.behaviour.scroll) {
             return Some(h);
         }
         node.children.iter().find_map(|c| self.first_scroll(c))

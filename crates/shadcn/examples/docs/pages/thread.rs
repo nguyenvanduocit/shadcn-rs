@@ -247,7 +247,11 @@ pub fn wait(s: &mut crate::Shot, ms: u64) {
 
 /// The box of the demo `file` on the last frame.
 fn demo_bounds(s: &crate::Shot, file: &str) -> Option<gui::Bounds> {
-    s.last().nodes.iter().find(|n| n.name == Some(file)).map(|n| n.bounds)
+    s.last()
+        .nodes
+        .iter()
+        .find(|n| n.name == Some(file))
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
 }
 
 /// Click the last node named `name` inside the demo `file` (an icon button
@@ -260,8 +264,12 @@ pub fn click_named(s: &mut crate::Shot, file: &str, name: &str) -> Result<(), gu
         .last()
         .nodes
         .iter()
-        .rfind(|n| n.name == Some(name) && inside.contains(n.bounds.x + 1.0, n.bounds.y + 1.0))
-        .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
+        .rfind(|n| {
+            let b = n.bounds(gui::inspect::OUTSIDE);
+            n.name == Some(name) && inside.contains(b.x + 1.0, b.y + 1.0)
+        })
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
+        .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
         .ok_or_else(|| gui::ScenarioError::TextNotFound(name.to_owned()))?;
     s.click(at.0, at.1);
     s.settle()

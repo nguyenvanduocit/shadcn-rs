@@ -12,11 +12,8 @@ fn spot(s: &Shot, name: &str, nth: usize) -> Result<(f32, f32, f32), ScenarioErr
         .filter(|n| n.name == Some(name))
         .nth(nth)
         .map(|n| {
-            (
-                n.bounds.x + n.bounds.width / 2.0,
-                n.bounds.y + n.bounds.height / 2.0,
-                n.bounds.width,
-            )
+            let b = n.bounds(gui::inspect::OUTSIDE);
+            (b.x + b.width / 2.0, b.y + b.height / 2.0, b.width)
         })
         .ok_or_else(|| ScenarioError::TextNotFound(format!("{name} #{nth}")))
 }

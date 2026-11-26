@@ -172,9 +172,10 @@ impl Boxes {
 gui::engine_local! {
     /// The grace area whose trigger the pointer is on, by its number.
     [Fork] static ON_TRIGGER: Cell<Option<u64>> = Cell::new(None);
-    /// The next grace area's number.
-    [Fork] static NEXT_GRACE: Cell<u64> = Cell::new(0);
 }
+
+/// The grace areas made, numbered.
+static NEXT_GRACE: gui::engine::IdKind = gui::engine::IdKind::new("hover grace");
 
 /// A grace area as one floating part holds it: made once in its root's
 /// setup (`Copy`).
@@ -201,11 +202,7 @@ impl Grace {
     #[track_caller]
     pub fn new(on_exit: impl Into<gui::Callback<()>>) -> Self {
         let on_exit = on_exit.into();
-        let id = NEXT_GRACE.with(|n| {
-            let id = n.get();
-            n.set(id.wrapping_add(1));
-            id
-        });
+        let id = gui::engine::unique_id(&NEXT_GRACE);
         let g = Self {
             id,
             held: Signal::labeled("grace area", None),
@@ -427,7 +424,9 @@ mod tests {
     }
 
     /// A cold frame sees the live timers waiting: a delay waiting live
-    /// renders as waiting in both frames (the check compares them).
+    /// renders as waiting in both frames (the check compares them). Forks
+    /// are built in debug builds only (ADR-0028, F2).
+    #[cfg(debug_assertions)]
     #[test]
     fn a_waiting_delay_renders_the_same_cold() {
         use gui::{IntoElement, div, text};
@@ -458,7 +457,7 @@ mod tests {
         });
         s.frame("waiting")
             .expect("the cold frame renders it as the live one does");
-        assert!(gui::engine::in_cold_frame(|| delay.pending()), "pending, read cold");
+        assert!(gui::testing::in_check(|| delay.pending()), "pending, read cold");
         delay.cancel();
     }
 

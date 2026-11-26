@@ -692,6 +692,7 @@ mod plots {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn chunks_drawn_after_changes_equal_ones_built_cold() {
         let s = series();
         ramp(s, 2000);
@@ -811,7 +812,7 @@ impl super::ChunkKind for Doubler {
 fn a_user_chunk_reads_back_what_its_compute_wrote() {
     super::register::<Doubler>();
     let mut gpu = gpu();
-    let rb = super::readback();
+    let rb = crate::engine::owned(super::readback);
     let item = |tag: u32, reading: bool| {
         let mut words = [0_u32; 64];
         words[0] = tag;

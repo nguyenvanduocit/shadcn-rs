@@ -79,9 +79,8 @@ trait Parts {
     fn can_scroll(&self) -> (bool, bool);
     fn refresh(&self);
     fn content(&self, d: Div, open: bool) -> Div;
-    fn viewport(&self, d: Div) -> Div;
+    fn viewport(&self, d: Div, aligned: bool) -> Div;
     fn scroll_button(&self, d: Div, up: bool) -> Div;
-    fn set_aligned(&self, aligned: bool);
     fn direction(&self) -> gui::Direction;
     fn aligned_min_height(&self) -> f32;
     fn item(&self, d: Div, value: String, label: Rc<str>, focus: FocusHandle, availability: Availability) -> Div;
@@ -120,8 +119,8 @@ impl<M: SelectModel> Parts for Select<String, M> {
         Select::content(*self, d, open)
     }
 
-    fn viewport(&self, d: Div) -> Div {
-        Select::viewport(*self, d)
+    fn viewport(&self, d: Div, aligned: bool) -> Div {
+        Select::viewport(*self, d, aligned)
     }
 
     fn scroll_button(&self, d: Div, up: bool) -> Div {
@@ -130,10 +129,6 @@ impl<M: SelectModel> Parts for Select<String, M> {
 
     fn item(&self, d: Div, value: String, label: Rc<str>, focus: FocusHandle, availability: Availability) -> Div {
         Select::item(*self, d, value, label, focus, availability)
-    }
-
-    fn set_aligned(&self, aligned: bool) {
-        Select::set_aligned(*self, aligned);
     }
 
     fn direction(&self) -> gui::Direction {
@@ -440,7 +435,6 @@ impl Part<SelectContentProps> {
 /// layer is no step of an instance's identity).
 fn list(select: &SelectContext, position: SelectPosition, root: Div) -> Element {
     let s = &select.0;
-    s.set_aligned(position == SelectPosition::ItemAligned);
     let open = s.is_open();
     let (up, down) = if open { s.can_scroll() } else { (false, false) };
     // The root's column stretches the viewport across it (`w-full`): a
@@ -453,6 +447,7 @@ fn list(select: &SelectContext, position: SelectPosition, root: Div) -> Element 
             .overflow_x(Overflow::Hidden)
             .scrollbar_hidden(true)
             .padding(4.0),
+        position == SelectPosition::ItemAligned,
     );
     // The opening animation plays as the list opens: closed, the list is
     // laid out with none, so none has played.

@@ -288,7 +288,7 @@ mod tests {
             .iter()
             .find(|n| n.name == Some(name))
             .expect("the button");
-        n.content_box.x - n.bounds.x
+        n.content_box(gui::inspect::OUTSIDE).x - n.bounds(gui::inspect::OUTSIDE).x
     }
 
     #[test]

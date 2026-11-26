@@ -273,7 +273,10 @@ impl PartialEq for SeriesSnapshot {
 impl SeriesSnapshot {
     /// Whether it holds the same points as `other` (each x, and y to the
     /// bit), whichever series and pages hold them: the cold check's
-    /// compare ([`super::Source`]'s).
+    /// compare ([`super::Source`]'s). Where its first point lies among all
+    /// the series was ever given ([`Self::start`]) is the series' history,
+    /// not what it draws (nothing drawn reads it): a series built again
+    /// from the same points, from 0, holds the same content.
     pub(crate) fn same_points(&self, other: &Self) -> bool {
         self.same_points_counted(other, &mut 0)
     }
@@ -282,7 +285,7 @@ impl SeriesSnapshot {
     /// both sides walked page by page, contiguous runs compared as slices,
     /// one lock a page and no search.
     fn same_points_counted(&self, other: &Self, locks: &mut usize) -> bool {
-        if (self.0.start, self.0.len, self.0.precise) != (other.0.start, other.0.len, other.0.precise) {
+        if (self.0.len, self.0.precise) != (other.0.len, other.0.precise) {
             return false;
         }
         let (mut a, mut b) = (Run::new(&self.0.pages), Run::new(&other.0.pages));
@@ -714,8 +717,9 @@ pub struct SeriesState {
     last_x: i64,
 }
 
-static NEXT_SERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static NEXT_PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// The series and the pages made, numbered ([`crate::engine::unique_id`]).
+static NEXT_SERIES: crate::engine::IdKind = crate::engine::IdKind::new("series");
+static NEXT_PAGE: crate::engine::IdKind = crate::engine::IdKind::new("series page");
 
 impl SeriesState {
     /// An empty series keeping its last `retain` points (all with `None`);
@@ -729,7 +733,7 @@ impl SeriesState {
                 .clamp(MIN_PAGE, MAX_PAGE)
         });
         Self {
-            id: NEXT_SERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: crate::engine::unique_id(&NEXT_SERIES),
             version: 0,
             generation: 0,
             pages: Vec::new(),
@@ -804,7 +808,7 @@ impl SeriesState {
             };
             self.next_seq = self.next_seq.saturating_add(1);
             self.pages.push(Arc::new(Page {
-                seq: NEXT_PAGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                seq: crate::engine::unique_id(&NEXT_PAGE),
                 start,
                 data: RwLock::new(data),
             }));
@@ -873,6 +877,25 @@ mod tests {
         let mut s = SeriesState::new(Some(1_000_000), false);
         s.append(&xs, &other);
         assert!(!a.same_points(&s.snapshot()), "a point apart");
+    }
+
+    /// A kept window that dropped its first pages holds the same points as
+    /// a series built afresh from those points (what a cold build makes):
+    /// where they lie in the series' history is not content.
+    #[test]
+    fn a_series_built_again_from_its_points_holds_the_same_content() {
+        let xs: Vec<i64> = (0..10_000).collect();
+        let ys: Vec<f64> = (0..10_000_u32).map(|i| f64::from(i % 31)).collect();
+        let mut live = SeriesState::new(Some(1_000), false);
+        live.append(&xs, &ys);
+        let live = live.snapshot();
+        assert!(live.start() > 0, "pages dropped before it");
+        let first = usize::try_from(live.start()).unwrap();
+        let mut cold = SeriesState::new(None, false);
+        cold.append(&xs[first..], &ys[first..]);
+        let cold = cold.snapshot();
+        assert_eq!(cold.start(), 0, "built from its first point");
+        assert!(live.same_points(&cold), "the same points, the same content");
     }
 
     fn series(ys: &[f64]) -> SeriesState {

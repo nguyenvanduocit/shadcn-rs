@@ -1536,8 +1536,8 @@ fn nested_clips(n: u16) -> (Scene, Vec<u32>) {
 /// Sixty-six nested clips: the shaders walk each chain to its end (no
 /// depth they stop at), so the second, 64 clips up the innermost's chain,
 /// still cuts at 1 and 40; the outermost, left out of the chains it
-/// contains, moving to cut alone cuts what the innermost holds (the clips
-/// that looked at it decided again).
+/// contains, moving to cut alone cuts what the innermost holds (its
+/// children decided again, and theirs as they changed).
 #[test]
 fn sixty_six_nested_clips_intersect_and_the_outermost_moving_moves_the_leaf() {
     let mut gpu = gpu();
@@ -2375,3 +2375,1034 @@ fn a_fill_an_even_odd_fill_and_a_stroke_are_told_apart_on_the_gpu() {
     assert_eq!(at(&stroked, 48, 9)[0], 255, "and covers its outline at the point");
     assert_eq!(at(&stroked, 48, 20), [0, 0, 0, 255], "and not the inside");
 }
+
+/// Curve text (`slug.wgsl`) in a layer a filter keeps, under a turned
+/// rounded clip of the canvas: drawn into the layer, it is cut by the clip
+/// tested in the clip's own space, as it is with no layer.
+#[test]
+fn curve_text_in_a_filter_layer_under_a_turned_clip_is_cut_as_without_the_layer() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let (plain, key) = glyph_scene(&mut text, 200.0, None);
+    let Some(Item::Glyph { x, y, .. }) = plain.items().next().cloned() else {
+        panic!()
+    };
+    let size = plain.size;
+    let (w, h) = (crate::convert::u32_to_f32(size.0), crate::convert::u32_to_f32(size.1));
+    let scene_of = |layered: bool| {
+        let mut scene = Scene::new(size, 1.0, Some(Color::WHITE));
+        let t = scene.add_transform(
+            (0.0, 0.0),
+            Some(GroupTransform {
+                origin: (w / 2.0, h / 2.0),
+                scale: 1.0,
+                rotate: 30.0,
+            }),
+        );
+        let clip = scene.add_clip(
+            Clip {
+                bounds: rect(w * 0.25, h * 0.25, w * 0.5, h * 0.5),
+                radius: Corners::all(12.0),
+                curve: crate::shape::ROUND,
+            },
+            t,
+        );
+        let effect = if layered {
+            scene.add_effect(EffectNode {
+                filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+                region: Some(PixelRect {
+                    x: 0,
+                    y: 0,
+                    width: size.0,
+                    height: size.1,
+                }),
+                ..EffectNode::default()
+            })
+        } else {
+            0
+        };
+        scene.push_under(
+            State {
+                clip,
+                effect,
+                ..State::default()
+            },
+            vec![Item::Glyph {
+                key,
+                x,
+                y,
+                color: Color::BLACK,
+            }],
+        );
+        scene
+    };
+    let whole = gpu.capture(&plain, None, &mut text).expect("read back");
+    let bare = gpu.capture(&scene_of(false), None, &mut text).expect("read back");
+    let layered = gpu.capture(&scene_of(true), None, &mut text).expect("read back");
+    let ink = |p: &Pixels| {
+        p.data()
+            .chunks(4)
+            .filter(|c| c.first().is_some_and(|r| *r < 128))
+            .count()
+    };
+    assert!(ink(&bare) > 0 && ink(&bare) < ink(&whole), "the clip cuts the ink");
+    let most = bare
+        .data()
+        .iter()
+        .zip(layered.data())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(most <= 2, "in the layer as without it: {most} levels apart");
+}
+
+/// A clip inside a filter layer moved from one rounded parent of the
+/// canvas to another, nothing else changed: the frame from what changed
+/// draws what a whole redraw does, and the old parent, changing after, no
+/// longer reaches it.
+#[test]
+fn a_clip_moved_to_another_parent_across_a_layer_draws_as_a_whole_redraw() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let rounded = |b: Bounds| Clip {
+        bounds: b,
+        radius: Corners::all(8.0),
+        curve: crate::shape::ROUND,
+    };
+    let left = scene.add_clip(rounded(rect(0.0, 0.0, 32.0, 64.0)), 0);
+    let top = scene.add_clip(rounded(rect(0.0, 0.0, 64.0, 32.0)), 0);
+    let inner = scene.add_clip(
+        Clip {
+            bounds: rect(4.0, 4.0, 56.0, 56.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let parent = |scene: &mut Scene, p: u32| {
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(inner).unwrap_or(0)) {
+            n.parent = p;
+        }
+    };
+    parent(&mut scene, left);
+    let effect = scene.add_effect(EffectNode {
+        filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+        region: Some(PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        }),
+        ..EffectNode::default()
+    });
+    scene.push_under(
+        State {
+            clip: inner,
+            effect,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    assert_eq!(at(&gpu.read_canvas().expect("a canvas"), 16, 48), [0, 0, 0, 255]);
+    parent(&mut scene, top);
+    gpu.render(
+        &scene,
+        &Changed {
+            clips: vec![inner],
+            ..Changed::default()
+        },
+        &mut text,
+    );
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 48, 16), [0, 0, 0, 255], "in the new parent");
+    assert_eq!(at(&p, 16, 48), [255; 4], "out of it, in the old");
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(left).unwrap_or(0)) {
+        n.clip.bounds = rect(0.0, 0.0, 16.0, 64.0);
+    }
+    gpu.render(
+        &scene,
+        &Changed {
+            clips: vec![left],
+            ..Changed::default()
+        },
+        &mut text,
+    );
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 48, 16), [0, 0, 0, 255], "the old parent no longer cuts it");
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A filtered layer turned under the clip its group lies in (its output
+/// clip, the canvas's left half), holding a black square: `turn` its
+/// turn, `clipped` whether the effect names the clip it lies in.
+fn turned_layer_under_its_output_clip(turn: f32, clipped: bool) -> (Scene, u32, u32) {
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let t = scene.add_transform(
+        (0.0, 0.0),
+        Some(GroupTransform {
+            origin: (32.0, 32.0),
+            scale: 1.0,
+            rotate: turn,
+        }),
+    );
+    let clip = scene.add_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 32.0, 64.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let effect = scene.add_effect(EffectNode {
+        filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+        transform: t,
+        transformed: true,
+        region: Some(PixelRect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        }),
+        clip: if clipped { clip } else { 0 },
+        ..EffectNode::default()
+    });
+    scene.push_under(
+        State {
+            transform: t,
+            clip,
+            effect,
+        },
+        vec![Item::Rect {
+            bounds: rect(8.0, 8.0, 48.0, 48.0),
+            color: Color::BLACK,
+        }],
+    );
+    (scene, t, effect)
+}
+
+/// A layer turned a twelfth round under its output clip, a square edge at
+/// x = 32 of the canvas: the clip cuts the composite in the canvas, after
+/// the layer is resampled, so the edge is the canvas's pixel edge, whole
+/// on one side and empty on the other; cut in the layer's texels first,
+/// resampling would smear it.
+#[test]
+fn a_turned_layers_output_clip_cuts_its_composite_on_the_canvas_pixel_edge() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let (scene, ..) = turned_layer_under_its_output_clip(30.0, true);
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    for y in [24, 32, 40] {
+        assert_eq!(at(&p, 31, y), [0, 0, 0, 255], "left of the edge at y {y}");
+        assert_eq!(at(&p, 32, y), [255; 4], "right of it at y {y}");
+    }
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A filtered layer turned under its output clip, which stays: its texels
+/// hold nothing the clip decides (the clip cuts its composite), so its
+/// texture is kept and only composited again, and the canvas is what a
+/// whole redraw draws.
+#[test]
+fn a_layer_turned_under_its_output_clip_keeps_its_texture() {
+    for whole in [true, false] {
+        let mut gpu = gpu();
+        let mut text = Glyphs::for_os();
+        let (mut scene, t, effect) = turned_layer_under_its_output_clip(0.0, true);
+        gpu.render(&scene, &Changed::all(), &mut text);
+        gpu.end_frame();
+        if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(t).unwrap_or(0)) {
+            n.matrix = Some(GroupTransform {
+                origin: (32.0, 32.0),
+                scale: 1.0,
+                rotate: 90.0,
+            });
+        }
+        let changed = if whole {
+            Changed::all()
+        } else {
+            Changed {
+                transforms: vec![t],
+                effects: vec![effect],
+                ..Changed::default()
+            }
+        };
+        gpu.render(&scene, &changed, &mut text);
+        let d = gpu.drawn();
+        gpu.end_frame();
+        assert_eq!((d.layers, d.layers_kept), (0, 1), "kept (whole: {whole}): {d}");
+        let p = gpu.read_canvas().expect("a canvas");
+        assert_eq!(at(&p, 16, 32), [0, 0, 0, 255], "left: kept (whole: {whole})");
+        assert_eq!(at(&p, 48, 32), [255; 4], "right: clipped (whole: {whole})");
+        canvas_is_whole(&mut gpu, &scene, &mut text);
+    }
+}
+
+fn filtered(effect: EffectNode) -> EffectNode {
+    EffectNode {
+        filters: crate::style::Filters::repeat(1, crate::style::Filter::Brightness(1.0)),
+        ..effect
+    }
+}
+
+fn whole_region(side: u32) -> Option<PixelRect> {
+    Some(PixelRect {
+        x: 0,
+        y: 0,
+        width: side,
+        height: side,
+    })
+}
+
+/// A layer whose output clip (the canvas's left half) is not one its
+/// chunk's clip (the top half, another branch) lies in: its walk would end
+/// at once, losing the top half, and the bottom left quarter would show.
+/// The scene breaks the output clip's contract, and planning says so.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "does not lie in the layer's output clip")]
+fn an_output_clip_its_chunks_clips_do_not_lie_in_stops_a_debug_build() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let square = |b: Bounds| Clip {
+        bounds: b,
+        radius: Corners::default(),
+        curve: crate::shape::ROUND,
+    };
+    let left = scene.add_clip(square(rect(0.0, 0.0, 32.0, 64.0)), 0);
+    let top = scene.add_clip(square(rect(0.0, 0.0, 64.0, 32.0)), 0);
+    let effect = scene.add_effect(filtered(EffectNode {
+        region: whole_region(64),
+        clip: left,
+        ..EffectNode::default()
+    }));
+    scene.push_under(
+        State {
+            clip: top,
+            effect,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+}
+
+/// A layer whose output clip alone changes, from a rounded clip to the
+/// square one it lies in: the rounded one now lies inside the layer, its
+/// corners in the texels, so the texture is drawn again (a texture kept
+/// would show them square, the square parent alone cutting the composite).
+#[test]
+fn a_layers_output_clip_moved_out_to_its_parent_draws_its_texture_again() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let outer = scene.add_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let rounded = scene.add_clip(
+        Clip {
+            bounds: rect(8.0, 8.0, 48.0, 48.0),
+            radius: Corners::all(16.0),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let inner = scene.add_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    for (c, p) in [(rounded, outer), (inner, rounded)] {
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(c).unwrap_or(0)) {
+            n.parent = p;
+        }
+    }
+    let effect = scene.add_effect(filtered(EffectNode {
+        region: whole_region(64),
+        clip: rounded,
+        ..EffectNode::default()
+    }));
+    scene.push_under(
+        State {
+            clip: inner,
+            effect,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 9, 9), [255; 4], "the rounded corner cuts the composite");
+    assert_eq!(at(&p, 32, 32), [0, 0, 0, 255]);
+    if let Some(n) = scene.properties.effects.get_mut(usize::try_from(effect).unwrap_or(0)) {
+        n.clip = outer;
+    }
+    gpu.render(
+        &scene,
+        &Changed {
+            effects: vec![effect],
+            ..Changed::default()
+        },
+        &mut text,
+    );
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    assert_eq!(at(&p, 9, 9), [255; 4], "the rounded corner cuts the texels now");
+    assert_eq!(at(&p, 32, 32), [0, 0, 0, 255]);
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// A black square cut by a rounded clip in a filtered layer scaled twice,
+/// drawn as a quad and as a path: each is cut in the layer's texels, by
+/// the same coverage one texel wide, so every pixel matches (the quad was
+/// cut in the canvas's pixels, half a texel wide, the path in texels).
+#[test]
+fn a_quad_and_a_path_cut_by_one_rounded_clip_in_a_layer_scaled_twice_cover_alike() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let scene_of = |as_path: bool| {
+        let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+        let t = scene.add_transform(
+            (0.0, 0.0),
+            Some(GroupTransform {
+                origin: (0.0, 0.0),
+                scale: 2.0,
+                rotate: 0.0,
+            }),
+        );
+        let clip = scene.add_clip(
+            Clip {
+                bounds: rect(4.0, 4.0, 24.0, 24.0),
+                radius: Corners::all(7.0),
+                curve: crate::shape::ROUND,
+            },
+            t,
+        );
+        let effect = scene.add_effect(filtered(EffectNode {
+            transform: t,
+            transformed: true,
+            region: whole_region(32),
+            ..EffectNode::default()
+        }));
+        let item = if as_path {
+            Item::Path {
+                origin: (0.0, 0.0),
+                path: Path::builder()
+                    .move_to(0.0, 0.0)
+                    .line_to(32.0, 0.0)
+                    .line_to(32.0, 32.0)
+                    .line_to(0.0, 32.0)
+                    .close()
+                    .build(),
+                style: PathStyle::fill(Gradient::Solid(Color::BLACK)),
+            }
+        } else {
+            Item::Rect {
+                bounds: rect(0.0, 0.0, 32.0, 32.0),
+                color: Color::BLACK,
+            }
+        };
+        scene.push_under(
+            State {
+                transform: t,
+                clip,
+                effect,
+            },
+            vec![item],
+        );
+        scene
+    };
+    let quad = gpu.capture(&scene_of(false), None, &mut text).expect("read back");
+    let path = gpu.capture(&scene_of(true), None, &mut text).expect("read back");
+    let partly = quad
+        .data()
+        .chunks(4)
+        .filter(|c| c.first().is_some_and(|r| (16..240).contains(r)))
+        .count();
+    assert!(partly > 0, "the corners are cut part way");
+    let most = quad
+        .data()
+        .iter()
+        .zip(path.data())
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .unwrap_or(0);
+    assert!(most <= 2, "a quad and a path cut alike: {most} levels apart");
+}
+
+fn square_clip(b: Bounds) -> Clip {
+    Clip {
+        bounds: b,
+        radius: Corners::default(),
+        curve: crate::shape::ROUND,
+    }
+}
+
+/// A filtered layer of 64 by 64 canvas pixels scaled twice about the
+/// canvas's corner (its texel 10 spans canvas pixels 20 and 21), a black
+/// square in it: its region and transform.
+fn scaled_twice(scene: &mut Scene) -> (u32, u32) {
+    let t = scene.add_transform(
+        (0.0, 0.0),
+        Some(GroupTransform {
+            origin: (0.0, 0.0),
+            scale: 2.0,
+            rotate: 0.0,
+        }),
+    );
+    let effect = scene.add_effect(filtered(EffectNode {
+        transform: t,
+        transformed: true,
+        region: whole_region(32),
+        ..EffectNode::default()
+    }));
+    (t, effect)
+}
+
+/// The black square of a layer scaled twice ([`scaled_twice`]), under `clip`.
+fn square_in(scene: &mut Scene, (t, effect): (u32, u32), clip: u32) {
+    scene.push_under(
+        State {
+            transform: t,
+            clip,
+            effect,
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 32.0, 32.0),
+            color: Color::BLACK,
+        }],
+    );
+}
+
+/// Codex's fixture: clips of the canvas, an inner (x 21 to 30) in an
+/// outer (x 21 to 64), cutting the square of a layer scaled twice: the
+/// outer and the inner clip.
+fn coincident_edges_scaled_twice() -> (Scene, (u32, u32)) {
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let layer = scaled_twice(&mut scene);
+    let outer = scene.add_clip(square_clip(rect(21.0, 0.0, 43.0, 64.0)), 0);
+    let inner = scene.add_clip(square_clip(rect(21.0, 8.0, 30.0, 48.0)), 0);
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(inner).unwrap_or(0)) {
+        n.parent = outer;
+    }
+    square_in(&mut scene, layer, inner);
+    (scene, (outer, inner))
+}
+
+/// Codex's fixture after a frame, `change` made: drawn from what changed,
+/// the canvas is what a whole redraw draws.
+fn redrawn_as_whole(mut scene: Scene, change: impl FnOnce(&mut Scene) -> Changed) {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let changed = change(&mut scene);
+    gpu.render(&scene, &changed, &mut text);
+    gpu.end_frame();
+    canvas_is_whole(&mut gpu, &scene, &mut text);
+}
+
+/// The outer clip of Codex's fixture moved out a pixel (left edge 21 to
+/// 20): the canvas leaves it out of the inner's walk before and after (it
+/// keeps each canvas pixel the inner touches whole), so the inner's
+/// revision holds; but the layer walks it, and its texel 10 goes from a
+/// quarter to half. The layer read the outer clip: it is drawn again.
+#[test]
+fn an_outer_clip_the_canvas_leaves_out_moved_draws_a_scaled_layer_again() {
+    let (scene, (outer, _)) = coincident_edges_scaled_twice();
+    redrawn_as_whole(scene, |scene| {
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(outer).unwrap_or(0)) {
+            n.clip.bounds = rect(20.0, 0.0, 44.0, 64.0);
+        }
+        Changed {
+            clips: vec![outer],
+            ..Changed::default()
+        }
+    });
+}
+
+/// The outer clip of Codex's fixture under a transform of its own, which
+/// scales it about x = 41 so its left edge moves from 21 to 20: it is
+/// moved, not reshaped, still left out of the inner's walk on the canvas,
+/// and nothing else changes; the layer that read it is drawn again.
+#[test]
+fn an_outer_clip_the_canvas_leaves_out_moved_by_its_transform_draws_a_scaled_layer_again() {
+    let about = |scale: f32| GroupTransform {
+        origin: (41.0, 0.0),
+        scale,
+        rotate: 0.0,
+    };
+    let (mut scene, (outer, _)) = coincident_edges_scaled_twice();
+    let space = scene.add_transform((0.0, 0.0), Some(about(1.0)));
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(outer).unwrap_or(0)) {
+        n.transform = space;
+    }
+    redrawn_as_whole(scene, |scene| {
+        if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(space).unwrap_or(0)) {
+            n.matrix = Some(about(1.05));
+        }
+        Changed {
+            transforms: vec![space],
+            ..Changed::default()
+        }
+    });
+}
+
+/// A clip lying under a transform within a layer scaled twice, that
+/// transform moved out to the root: the clip now lies in the canvas, so
+/// the texels it keeps move. The layer's keys composed through that
+/// transform: they go, and the layer is drawn again (the transform no
+/// longer lies under the layer, so asking where it lies now misses it).
+#[test]
+fn a_clips_transform_moved_from_under_a_scaled_layer_to_the_root_draws_it_again() {
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let layer = scaled_twice(&mut scene);
+    let u = scene.add_transform(
+        (0.0, 0.0),
+        Some(GroupTransform {
+            origin: (0.0, 0.0),
+            scale: 1.0,
+            rotate: 0.0,
+        }),
+    );
+    if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(u).unwrap_or(0)) {
+        n.parent = layer.0;
+    }
+    let c = scene.add_clip(square_clip(rect(4.0, 4.0, 8.0, 8.0)), u);
+    square_in(&mut scene, layer, c);
+    redrawn_as_whole(scene, |scene| {
+        if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(u).unwrap_or(0)) {
+            n.parent = 0;
+        }
+        Changed {
+            transforms: vec![u],
+            ..Changed::default()
+        }
+    });
+}
+
+/// A layer scaled twice under a clip of the canvas (no output clip): its
+/// key went through the canvas, so it read the layer's own map there. The
+/// layer scaled to 1.5, its region as it was, the clip cuts other texels:
+/// it is drawn again.
+#[test]
+fn a_layer_scaled_under_a_clip_of_the_canvas_draws_its_texels_again() {
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let layer = scaled_twice(&mut scene);
+    let c = scene.add_clip(square_clip(rect(20.0, 20.0, 4.0, 4.0)), 0);
+    // Drawn in the canvas's space, so the layer's motion signs no chunk
+    // again: what draws the layer again is what its key read.
+    square_in(&mut scene, (0, layer.1), c);
+    redrawn_as_whole(scene, |scene| {
+        if let Some(n) = scene
+            .properties
+            .transforms
+            .get_mut(usize::try_from(layer.0).unwrap_or(0))
+        {
+            n.matrix = Some(GroupTransform {
+                origin: (0.0, 0.0),
+                scale: 1.5,
+                rotate: 0.0,
+            });
+        }
+        Changed {
+            transforms: vec![layer.0],
+            effects: vec![layer.1],
+            ..Changed::default()
+        }
+    });
+}
+
+/// A layer under its output clip (the left half), its chunk's clip in it;
+/// that clip moved to a sibling branch (the top half) by its parent alone:
+/// the contract breaks, and the frame drawn from what changed says so.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "does not lie in the layer's output clip")]
+fn a_clip_moved_to_a_sibling_branch_of_its_layers_output_clip_stops_a_debug_build() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let left = scene.add_clip(square_clip(rect(0.0, 0.0, 32.0, 64.0)), 0);
+    let top = scene.add_clip(square_clip(rect(0.0, 0.0, 64.0, 32.0)), 0);
+    let c = scene.add_clip(square_clip(rect(4.0, 4.0, 20.0, 20.0)), 0);
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(c).unwrap_or(0)) {
+        n.parent = left;
+    }
+    let effect = scene.add_effect(filtered(EffectNode {
+        region: whole_region(64),
+        clip: left,
+        ..EffectNode::default()
+    }));
+    scene.push_under(
+        State {
+            clip: c,
+            effect,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 64.0, 64.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(c).unwrap_or(0)) {
+        n.parent = top;
+    }
+    gpu.render(
+        &scene,
+        &Changed {
+            clips: vec![c],
+            ..Changed::default()
+        },
+        &mut text,
+    );
+}
+
+/// Two clips of the canvas, one in the other, their left edges both at
+/// x = 21, cutting a filtered layer scaled twice: the outer keeps each
+/// canvas pixel the inner touches whole, so the canvas's chain leaves it
+/// out; but the layer's texel 10 spans canvas pixels 20 and 21, and each
+/// clip keeps half of it, a quarter in all. Walking parents in the
+/// layer's pixels, the texel holds a quarter (the effective chain's half
+/// would show past the edge as darker than half).
+#[test]
+fn coincident_edges_in_a_layer_scaled_twice_each_cut_its_texels() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let (scene, _) = coincident_edges_scaled_twice();
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    // Texels 9, 10 and 11 hold 0, a quarter and all: pixel 21 samples
+    // texel 10 with some of 11, under half either way.
+    let [r, ..] = at(&p, 21, 32);
+    assert!(r > 135, "pixel 21 keeps {} of black", 255 - u16::from(r));
+    assert_eq!(at(&p, 30, 32), [0, 0, 0, 255]);
+}
+
+/// A clip of no width, under a transform scaling two and a half times
+/// about the canvas's corner, at x = 9 (22.5 on the canvas: pixel 22's
+/// centre), cutting a black square: it keeps nothing, not even half of the
+/// pixel whose centre lies on the line it collapsed to.
+#[test]
+fn a_collapsed_clip_in_a_scaled_space_paints_nothing() {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+    let t = scene.add_transform(
+        (0.0, 0.0),
+        Some(GroupTransform {
+            origin: (0.0, 0.0),
+            scale: 2.5,
+            rotate: 0.0,
+        }),
+    );
+    let c = scene.add_clip(square_clip(rect(9.0, 0.0, 0.0, 20.0)), t);
+    scene.push_under(
+        State {
+            transform: t,
+            clip: c,
+            ..State::default()
+        },
+        vec![Item::Rect {
+            bounds: rect(0.0, 0.0, 20.0, 20.0),
+            color: Color::BLACK,
+        }],
+    );
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    let p = gpu.read_canvas().expect("a canvas");
+    for x in 20..26 {
+        assert_eq!(at(&p, x, 20), [255; 4], "pixel {x}");
+    }
+}
+
+/// A filtered layer turned or scaled under its output clip, holding a
+/// rounded clip in its own space and a clip in that: the clips move with
+/// it, so their keys in its texels (through its space, not the canvas)
+/// hold, none is keyed again, and its texture is kept, composited again.
+#[test]
+fn a_layer_moved_with_the_clips_inside_it_keeps_its_texture() {
+    for (from, to) in [((30.0, 1.0), (75.0, 1.0)), ((0.0, 0.9), (0.0, 1.3))] {
+        let mut gpu = gpu();
+        let mut text = Glyphs::for_os();
+        let mut scene = Scene::new((64, 64), 1.0, Some(Color::WHITE));
+        let g = |(rotate, scale): (f32, f32)| GroupTransform {
+            origin: (32.0, 32.0),
+            scale,
+            rotate,
+        };
+        let t = scene.add_transform((0.0, 0.0), Some(g(from)));
+        let out = scene.add_clip(
+            Clip {
+                bounds: rect(0.0, 0.0, 64.0, 64.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            0,
+        );
+        let card = scene.add_clip(
+            Clip {
+                bounds: rect(12.0, 12.0, 40.0, 40.0),
+                radius: Corners::all(9.0),
+                curve: crate::shape::ROUND,
+            },
+            t,
+        );
+        let row = scene.add_clip(
+            Clip {
+                bounds: rect(8.0, 20.0, 48.0, 10.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            t,
+        );
+        for (c, p) in [(card, out), (row, card)] {
+            if let Some(n) = scene.properties.clips.get_mut(usize::try_from(c).unwrap_or(0)) {
+                n.parent = p;
+            }
+        }
+        let effect = scene.add_effect(filtered(EffectNode {
+            transform: t,
+            transformed: true,
+            region: whole_region(64),
+            clip: out,
+            ..EffectNode::default()
+        }));
+        scene.push_under(
+            State {
+                transform: t,
+                clip: row,
+                effect,
+            },
+            vec![Item::Rect {
+                bounds: rect(0.0, 0.0, 64.0, 64.0),
+                color: Color::BLACK,
+            }],
+        );
+        gpu.render(&scene, &Changed::all(), &mut text);
+        gpu.end_frame();
+        gpu.clip_keys_walked();
+        if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(t).unwrap_or(0)) {
+            n.matrix = Some(g(to));
+        }
+        gpu.render(
+            &scene,
+            &Changed {
+                transforms: vec![t],
+                effects: vec![effect],
+                ..Changed::default()
+            },
+            &mut text,
+        );
+        let d = gpu.drawn();
+        gpu.end_frame();
+        assert_eq!((d.layers, d.layers_kept), (0, 1), "kept ({from:?} to {to:?}): {d}");
+        assert_eq!(gpu.clip_keys_walked(), 0, "keyed again ({from:?} to {to:?})");
+        canvas_is_whole(&mut gpu, &scene, &mut text);
+    }
+}
+
+/// A dialog's layer fading and growing (its opacity and its scale moving
+/// each frame) over `rows` rows, each clipped in a rounded panel inside
+/// it: the dialog's scene, and its transform, effect and panel's clip.
+fn dialog(rows: u16) -> (Scene, [u32; 3]) {
+    let mut scene = Scene::new((400, 400), 1.0, Some(Color::WHITE));
+    let t = scene.add_transform(
+        (0.0, 0.0),
+        Some(GroupTransform {
+            origin: (200.0, 200.0),
+            scale: 0.9,
+            rotate: 0.0,
+        }),
+    );
+    let out = scene.add_clip(
+        Clip {
+            bounds: rect(0.0, 0.0, 400.0, 400.0),
+            radius: Corners::default(),
+            curve: crate::shape::ROUND,
+        },
+        0,
+    );
+    let panel = scene.add_clip(
+        Clip {
+            bounds: rect(50.0, 50.0, 300.0, 300.0),
+            radius: Corners::all(12.0),
+            curve: crate::shape::ROUND,
+        },
+        t,
+    );
+    if let Some(n) = scene.properties.clips.get_mut(usize::try_from(panel).unwrap_or(0)) {
+        n.parent = out;
+    }
+    let effect = scene.add_effect(filtered(EffectNode {
+        opacity: 0.5,
+        transform: t,
+        transformed: true,
+        region: whole_region(400),
+        clip: out,
+        ..EffectNode::default()
+    }));
+    for k in 0..rows {
+        let y = 50.0 + f32::from(k % 300);
+        let row = scene.add_clip(
+            Clip {
+                bounds: rect(50.0, y, 300.0, 1.0),
+                radius: Corners::default(),
+                curve: crate::shape::ROUND,
+            },
+            t,
+        );
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(row).unwrap_or(0)) {
+            n.parent = panel;
+        }
+        scene.push_under(
+            State {
+                transform: t,
+                clip: row,
+                effect,
+            },
+            vec![Item::Rect {
+                bounds: rect(40.0, y, 320.0, 1.0),
+                color: Color::BLACK,
+            }],
+        );
+    }
+    (scene, [t, effect, panel])
+}
+
+/// The dialog fading and growing: frame `f`'s change.
+fn grow(scene: &mut Scene, [t, effect, _]: [u32; 3], f: u16) -> Changed {
+    let k = f32::from(f);
+    if let Some(n) = scene.properties.transforms.get_mut(usize::try_from(t).unwrap_or(0)) {
+        n.matrix = Some(GroupTransform {
+            origin: (200.0, 200.0),
+            scale: 0.9 + 0.015 * k,
+            rotate: 0.0,
+        });
+    }
+    if let Some(n) = scene.properties.effects.get_mut(usize::try_from(effect).unwrap_or(0)) {
+        n.opacity = 0.5 + 0.08 * k;
+    }
+    Changed {
+        transforms: vec![t],
+        effects: vec![effect],
+        ..Changed::default()
+    }
+}
+
+/// The dialog's frames after the first, `rows` rows in it, each made by
+/// `change`: the clips keyed and the allocations made in each, from the
+/// frame's start through its submission.
+fn dialog_frames(rows: u16, change: impl Fn(&mut Scene, [u32; 3], u16) -> Changed) -> Vec<(usize, Option<u64>)> {
+    let mut gpu = gpu();
+    let mut text = Glyphs::for_os();
+    let (mut scene, ids) = dialog(rows);
+    gpu.render(&scene, &Changed::all(), &mut text);
+    gpu.end_frame();
+    gpu.clip_keys_walked();
+    let mut out = Vec::new();
+    for f in 1..=5_u16 {
+        let changed = change(&mut scene, ids, f);
+        // Each frame begins with the GPU's work done, as the last left it.
+        drop(gpu.device.poll(wgpu::PollType::wait_indefinitely()));
+        let ((), spent) = crate::heap::allocations(|| {
+            gpu.render(&scene, &changed, &mut text);
+            gpu.end_frame();
+        });
+        // Under `GUI_COLD_CHECK` a frame also plans whole to check itself:
+        // its allocations are the check's, not the frame's.
+        out.push((gpu.clip_keys_walked(), (!gpu.cold_plan).then_some(spent)));
+    }
+    out
+}
+
+/// A dialog fading and growing over thousands of clipped rows: its own
+/// motion moves no clip within it, so after the first frame no clip is
+/// keyed again, and each frame after the second makes a few allocations,
+/// whatever the rows (each row's walk was keyed anew a frame, each into a
+/// vector of its own, the keys into a map made anew).
+#[test]
+fn a_dialog_growing_over_thousands_of_clipped_rows_keys_no_clip_and_allocates_alike() {
+    for rows in [1000, 4000] {
+        let frames = dialog_frames(rows, grow);
+        for (f, (keyed, _)) in frames.iter().enumerate() {
+            assert_eq!(*keyed, 0, "frame {f} over {rows} rows: clips keyed again");
+        }
+        allocates_little(&frames, rows);
+    }
+}
+
+/// The panel of the dialog rounding (its radius animated) over thousands
+/// of rows: every row's walk reads the panel, in the layer's texels, so
+/// each is keyed again a frame and the layer drawn again, and still a
+/// frame from its start through its submission allocates a few times,
+/// whatever the rows.
+#[test]
+fn a_radius_animated_in_a_layer_over_thousands_of_rows_allocates_alike() {
+    let round = |scene: &mut Scene, [_, _, panel]: [u32; 3], f: u16| {
+        if let Some(n) = scene.properties.clips.get_mut(usize::try_from(panel).unwrap_or(0)) {
+            n.clip.radius = Corners::all(12.0 + f32::from(f));
+        }
+        Changed {
+            clips: vec![panel],
+            ..Changed::default()
+        }
+    };
+    for rows in [1000, 4000] {
+        let frames = dialog_frames(rows, round);
+        for (f, (keyed, _)) in frames.iter().enumerate() {
+            assert!(*keyed > usize::from(rows), "frame {f} over {rows} rows: {keyed} keyed");
+        }
+        allocates_little(&frames, rows);
+    }
+}
+
+/// Every frame after the first of `frames` (over `rows` rows) made no more
+/// than [`FRAME_ALLOCATIONS`]: the first sizes what later ones reuse, and
+/// none is made per row (a frame under `GUI_COLD_CHECK` is not counted).
+fn allocates_little(frames: &[(usize, Option<u64>)], rows: u16) {
+    for (f, frame) in frames.iter().enumerate().skip(1) {
+        if let Some(spent) = frame.1 {
+            assert!(
+                spent <= FRAME_ALLOCATIONS,
+                "frame {f} over {rows} rows: {spent} allocations"
+            );
+        }
+    }
+}
+
+/// The most allocations a frame that moves, fades or reshapes what is
+/// drawn, and adds nothing, may make from its start through its
+/// submission: wgpu's own per-submission bookkeeping (some 130 to 160
+/// here, a thousand rows or four), with room for a frame that meets
+/// the device's housekeeping.
+const FRAME_ALLOCATIONS: u64 = 192;

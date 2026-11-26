@@ -620,6 +620,6 @@ fn centre(s: &mut Shot, inside: Option<&str>, name: &str) -> Result<(f32, f32), 
         })
         .and_then(|i| nodes.get(i))
         .ok_or_else(|| ScenarioError::TextNotFound(name.to_owned()))?;
-    let b = found.bounds;
+    let b = found.bounds(gui::inspect::OUTSIDE);
     Ok((b.x + b.width / 2.0, b.y + b.height / 2.0))
 }

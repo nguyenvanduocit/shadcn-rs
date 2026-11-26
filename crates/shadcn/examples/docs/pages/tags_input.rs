@@ -136,7 +136,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .nodes
         .iter()
         .find(|n| n.name == Some("tags-input-item-delete"))
-        .map(|n| n.bounds);
+        .map(|n| n.bounds(gui::inspect::OUTSIDE));
     let Some(b) = delete else {
         return Err(ScenarioError::TextNotFound("tags-input-item-delete".to_owned()));
     };
@@ -156,7 +156,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .iter()
         .filter(|n| n.name == Some("command-item"))
         .nth(3)
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .ok_or_else(|| ScenarioError::TextNotFound("remix option".to_owned()))?;
     s.click(remix.x + remix.width / 2.0, remix.y + remix.height / 2.0);
     s.frame("clicking the remix option removes its tag")?;

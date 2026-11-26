@@ -106,8 +106,9 @@ pub(crate) struct Fonts {
     bits: Vec<i16>,
     coords: Vec<NormalizedCoord>,
     /// Whether each glyph has colour, by face and glyph. Shared with a cold
-    /// frame: append-only and result-neutral, an entry a pure function of
-    /// its key (the face's bytes), never changed or removed.
+    /// frame: result-neutral, an entry a pure function of its key (the
+    /// face's bytes), never changed; those of faces a check interned go
+    /// with them ([`Fonts::forget_since`]).
     color: HashMap<(u32, u32), bool>,
     /// Each glyph's skip-ink intercept with an underline's band, by
     /// [`InkKey`]: an outline is read once for a size and band.
@@ -737,12 +738,57 @@ impl Glyphs {
     }
 }
 
+/// How many faces and coordinate sets were interned when a check began
+/// ([`Fonts::interned`]): those it interns past them are its own.
+#[cfg(debug_assertions)]
+#[derive(Clone, Copy)]
+pub(crate) struct Interned {
+    faces: usize,
+    axes: usize,
+}
+
+#[cfg(debug_assertions)]
 impl Fonts {
     /// Swap the ink cache for `ink` (a cold frame reads and warms no
-    /// cache; the faces and their ids stay, append-only).
-    #[cfg(debug_assertions)]
+    /// cache).
     pub(crate) fn swap_ink(&mut self, ink: InkCache) -> InkCache {
         std::mem::replace(&mut self.ink, ink)
+    }
+
+    /// How many faces and coordinate sets are interned now.
+    pub(crate) fn interned(&self) -> Interned {
+        Interned {
+            faces: self.faces.len(),
+            axes: self.axes.len(),
+        }
+    }
+
+    /// Forget the faces and coordinate sets interned since `at` (a check
+    /// ending, ADR-0034's engine isolation): ids are handed out in order of
+    /// first use, so live text interns next what a never-checked system
+    /// would, under the same ids. A face the check used that live text
+    /// had used before keeps its id: the check's scene and the live one
+    /// name it alike. Nothing outside the check holds an id it handed out:
+    /// its glyph tables were never sent ([`Self::glyph_tables`]) and its
+    /// caches went with it, but for the colour answers kept by id, dropped
+    /// here.
+    pub(crate) fn forget_since(&mut self, at: Interned) {
+        debug_assert!(
+            self.sent.0 <= at.faces && self.sent.1 <= at.axes,
+            "a check sent its glyph tables to a renderer"
+        );
+        if self.faces.len() > at.faces {
+            for font in self.faces.drain(at.faces..) {
+                self.face_ids.remove(&(font.data.id(), font.index));
+            }
+            self.colored.truncate(at.faces);
+            let first = u32::try_from(at.faces).unwrap_or(u32::MAX);
+            self.color.retain(|(font, _), _| *font < first);
+        }
+        for coords in self.axes.drain(at.axes.min(self.axes.len())..) {
+            self.axes_ids.remove(&coords);
+        }
+        self.sent = (self.sent.0.min(at.faces), self.sent.1.min(at.axes));
     }
 }
 

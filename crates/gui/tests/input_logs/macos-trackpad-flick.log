@@ -1,141 +1,141 @@
-gui-input-log 1
+gui-input-log 2
 platform macos
 window 480 320 2
-source synthesized, not recorded: a two-finger flick on a macOS trackpad and its momentum, as AppKit sends it (NSEvent scrollWheel: phase MayBegin, then Began and Changed with precise scrollingDeltaY in points while the fingers move, Ended with no delta at the lift, then momentumPhase Began, Changed and Ended, with phase None) and winit 0.30 maps it (src/platform_impl/macos/view.rs scroll_wheel: momentum phase first, MayBegin and Began are started, Ended and Cancelled ended, the rest moved; PixelDelta in logical points). The finger phase is sampled every 8-9 ms (a trackpad's report rate as AppKit coalesces it), the momentum every 16.7 ms decaying by 0.998 a millisecond (UIScrollView.DecelerationRate.normal, the system's documented deceleration) until under half a point; deltas are made up within those rules. A click lands on the list during the momentum.
-0.000 move 150 160
-10.000 move 150 161
-20.000 move 150 162
-30.000 move 150 163
-40.000 move 150 164
-100.000 wheel pixels 0 0 started
-112.000 wheel pixels 0 -2 started
-120.245 wheel pixels 0 -4 moved
-128.664 wheel pixels 0 -7 moved
-137.363 wheel pixels 0 -11 moved
-145.527 wheel pixels 0 -15 moved
-154.523 wheel pixels 0 -19 moved
-162.924 wheel pixels 0 -22 moved
-171.432 wheel pixels 0 -24 moved
-178.956 wheel pixels 0 -25 moved
-188.041 wheel pixels 0 -25 moved
-195.833 wheel pixels 0 -24 moved
-204.729 wheel pixels 0 -22 moved
-213.201 wheel pixels 0 -20 moved
-221.673 wheel pixels 0 0 ended
-230.073 wheel pixels 0 -19.6 started
-246.596 wheel pixels 0 -18.96 moved
-263.061 wheel pixels 0 -18.35 moved
-279.931 wheel pixels 0 -17.74 moved
-296.541 wheel pixels 0 -17.16 moved
-313.269 wheel pixels 0 -16.59 moved
-330.037 wheel pixels 0 -16.05 moved
-346.469 wheel pixels 0 -15.53 moved
-363.432 wheel pixels 0 -15.01 moved
-380.486 wheel pixels 0 -14.5 moved
-397.195 wheel pixels 0 -14.03 moved
-413.963 wheel pixels 0 -13.56 moved
-430.542 wheel pixels 0 -13.12 moved
-447.443 wheel pixels 0 -12.68 moved
-464.185 wheel pixels 0 -12.27 moved
-480.499 wheel pixels 0 -11.87 moved
-497.541 wheel pixels 0 -11.47 moved
-514.521 wheel pixels 0 -11.09 moved
-531.018 wheel pixels 0 -10.73 moved
-547.800 wheel pixels 0 -10.38 moved
-564.326 wheel pixels 0 -10.04 moved
-581.034 wheel pixels 0 -9.71 moved
-597.736 wheel pixels 0 -9.39 moved
-614.204 wheel pixels 0 -9.08 moved
-631.114 wheel pixels 0 -8.78 moved
-647.531 wheel pixels 0 -8.5 moved
-663.815 wheel pixels 0 -8.22 moved
-680.330 wheel pixels 0 -7.96 moved
-696.780 wheel pixels 0 -7.7 moved
-700.000 move 150 160
-701.000 down
-713.560 wheel pixels 0 -7.45 moved
-730.619 wheel pixels 0 -7.2 moved
-747.176 wheel pixels 0 -6.96 moved
-763.912 wheel pixels 0 -6.73 moved
-771.000 up
-780.412 wheel pixels 0 -6.51 moved
-796.831 wheel pixels 0 -6.3 moved
-813.548 wheel pixels 0 -6.09 moved
-829.829 wheel pixels 0 -5.9 moved
-846.245 wheel pixels 0 -5.71 moved
-862.882 wheel pixels 0 -5.52 moved
-879.382 wheel pixels 0 -5.34 moved
-896.160 wheel pixels 0 -5.17 moved
-912.433 wheel pixels 0 -5 moved
-929.181 wheel pixels 0 -4.84 moved
-946.230 wheel pixels 0 -4.67 moved
-962.784 wheel pixels 0 -4.52 moved
-979.804 wheel pixels 0 -4.37 moved
-996.743 wheel pixels 0 -4.22 moved
-1013.072 wheel pixels 0 -4.09 moved
-1029.567 wheel pixels 0 -3.95 moved
-1046.346 wheel pixels 0 -3.82 moved
-1062.805 wheel pixels 0 -3.7 moved
-1079.748 wheel pixels 0 -3.58 moved
-1096.546 wheel pixels 0 -3.46 moved
-1112.887 wheel pixels 0 -3.35 moved
-1129.582 wheel pixels 0 -3.24 moved
-1146.031 wheel pixels 0 -3.13 moved
-1163.032 wheel pixels 0 -3.03 moved
-1179.401 wheel pixels 0 -2.93 moved
-1196.072 wheel pixels 0 -2.83 moved
-1212.510 wheel pixels 0 -2.74 moved
-1229.056 wheel pixels 0 -2.65 moved
-1246.111 wheel pixels 0 -2.56 moved
-1263.010 wheel pixels 0 -2.48 moved
-1280.050 wheel pixels 0 -2.4 moved
-1296.350 wheel pixels 0 -2.32 moved
-1312.912 wheel pixels 0 -2.24 moved
-1329.672 wheel pixels 0 -2.17 moved
-1346.399 wheel pixels 0 -2.1 moved
-1363.049 wheel pixels 0 -2.03 moved
-1379.398 wheel pixels 0 -1.96 moved
-1396.019 wheel pixels 0 -1.9 moved
-1412.349 wheel pixels 0 -1.84 moved
-1428.731 wheel pixels 0 -1.78 moved
-1445.207 wheel pixels 0 -1.72 moved
-1462.011 wheel pixels 0 -1.66 moved
-1478.296 wheel pixels 0 -1.61 moved
-1494.635 wheel pixels 0 -1.56 moved
-1500.000 move 150 220
-1501.000 down
-1511.340 wheel pixels 0 -1.51 moved
-1528.153 wheel pixels 0 -1.46 moved
-1541.000 up
-1544.457 wheel pixels 0 -1.41 moved
-1561.449 wheel pixels 0 -1.36 moved
-1578.404 wheel pixels 0 -1.32 moved
-1595.228 wheel pixels 0 -1.27 moved
-1611.915 wheel pixels 0 -1.23 moved
-1628.475 wheel pixels 0 -1.19 moved
-1645.433 wheel pixels 0 -1.15 moved
-1662.266 wheel pixels 0 -1.11 moved
-1678.901 wheel pixels 0 -1.08 moved
-1695.623 wheel pixels 0 -1.04 moved
-1712.051 wheel pixels 0 -1.01 moved
-1728.896 wheel pixels 0 -0.98 moved
-1745.961 wheel pixels 0 -0.94 moved
-1762.407 wheel pixels 0 -0.91 moved
-1779.196 wheel pixels 0 -0.88 moved
-1795.792 wheel pixels 0 -0.85 moved
-1812.298 wheel pixels 0 -0.83 moved
-1828.822 wheel pixels 0 -0.8 moved
-1845.324 wheel pixels 0 -0.77 moved
-1861.755 wheel pixels 0 -0.75 moved
-1878.711 wheel pixels 0 -0.72 moved
-1895.578 wheel pixels 0 -0.7 moved
-1912.569 wheel pixels 0 -0.68 moved
-1929.064 wheel pixels 0 -0.65 moved
-1945.676 wheel pixels 0 -0.63 moved
-1962.243 wheel pixels 0 -0.61 moved
-1979.246 wheel pixels 0 -0.59 moved
-1996.215 wheel pixels 0 -0.57 moved
-2012.979 wheel pixels 0 -0.55 moved
-2029.730 wheel pixels 0 -0.53 moved
-2046.115 wheel pixels 0 -0.52 moved
-2062.943 wheel pixels 0 0 ended
+source synthesized, not recorded: a two-finger flick on a macOS trackpad and its momentum, as AppKit sends it (NSEvent scrollWheel: phase MayBegin, then Began and Changed with precise scrollingDeltaY in points while the fingers move, Ended with no delta at the lift, then momentumPhase Began, Changed and Ended, with phase None), its phases as the window reads them off the NSEvent (gui-display's scroll phases: MayBegin and Began are began, Ended ended, momentumPhase Began, Changed and Ended are momentum-began, momentum and momentum-ended), its delta as winit 0.30 gives it (PixelDelta in logical points). The finger phase is sampled every 8-9 ms (a trackpad's report rate as AppKit coalesces it), the momentum every 16.7 ms decaying by 0.998 a millisecond (UIScrollView.DecelerationRate.normal, the system's documented deceleration) until under half a point; deltas are made up within those rules. A click lands on the list during the momentum.
+0.000000 move 150 160
+10.000000 move 150 161
+20.000000 move 150 162
+30.000000 move 150 163
+40.000000 move 150 164
+100.000000 wheel pixels 0 0 began
+112.000000 wheel pixels 0 -2 began
+120.245000 wheel pixels 0 -4 changed
+128.664000 wheel pixels 0 -7 changed
+137.363000 wheel pixels 0 -11 changed
+145.527000 wheel pixels 0 -15 changed
+154.523000 wheel pixels 0 -19 changed
+162.924000 wheel pixels 0 -22 changed
+171.432000 wheel pixels 0 -24 changed
+178.956000 wheel pixels 0 -25 changed
+188.041000 wheel pixels 0 -25 changed
+195.833000 wheel pixels 0 -24 changed
+204.729000 wheel pixels 0 -22 changed
+213.201000 wheel pixels 0 -20 changed
+221.673000 wheel pixels 0 0 ended
+230.073000 wheel pixels 0 -19.6 momentum-began
+246.596000 wheel pixels 0 -18.96 momentum
+263.061000 wheel pixels 0 -18.35 momentum
+279.931000 wheel pixels 0 -17.74 momentum
+296.541000 wheel pixels 0 -17.16 momentum
+313.269000 wheel pixels 0 -16.59 momentum
+330.037000 wheel pixels 0 -16.05 momentum
+346.469000 wheel pixels 0 -15.53 momentum
+363.432000 wheel pixels 0 -15.01 momentum
+380.486000 wheel pixels 0 -14.5 momentum
+397.195000 wheel pixels 0 -14.03 momentum
+413.963000 wheel pixels 0 -13.56 momentum
+430.542000 wheel pixels 0 -13.12 momentum
+447.443000 wheel pixels 0 -12.68 momentum
+464.185000 wheel pixels 0 -12.27 momentum
+480.499000 wheel pixels 0 -11.87 momentum
+497.541000 wheel pixels 0 -11.47 momentum
+514.521000 wheel pixels 0 -11.09 momentum
+531.018000 wheel pixels 0 -10.73 momentum
+547.800000 wheel pixels 0 -10.38 momentum
+564.326000 wheel pixels 0 -10.04 momentum
+581.034000 wheel pixels 0 -9.71 momentum
+597.736000 wheel pixels 0 -9.39 momentum
+614.204000 wheel pixels 0 -9.08 momentum
+631.114000 wheel pixels 0 -8.78 momentum
+647.531000 wheel pixels 0 -8.5 momentum
+663.815000 wheel pixels 0 -8.22 momentum
+680.330000 wheel pixels 0 -7.96 momentum
+696.780000 wheel pixels 0 -7.7 momentum
+700.000000 move 150 160
+701.000000 down
+713.560000 wheel pixels 0 -7.45 momentum
+730.619000 wheel pixels 0 -7.2 momentum
+747.176000 wheel pixels 0 -6.96 momentum
+763.912000 wheel pixels 0 -6.73 momentum
+771.000000 up
+780.412000 wheel pixels 0 -6.51 momentum
+796.831000 wheel pixels 0 -6.3 momentum
+813.548000 wheel pixels 0 -6.09 momentum
+829.829000 wheel pixels 0 -5.9 momentum
+846.245000 wheel pixels 0 -5.71 momentum
+862.882000 wheel pixels 0 -5.52 momentum
+879.382000 wheel pixels 0 -5.34 momentum
+896.160000 wheel pixels 0 -5.17 momentum
+912.433000 wheel pixels 0 -5 momentum
+929.181000 wheel pixels 0 -4.84 momentum
+946.230000 wheel pixels 0 -4.67 momentum
+962.784000 wheel pixels 0 -4.52 momentum
+979.804000 wheel pixels 0 -4.37 momentum
+996.743000 wheel pixels 0 -4.22 momentum
+1013.072000 wheel pixels 0 -4.09 momentum
+1029.567000 wheel pixels 0 -3.95 momentum
+1046.346000 wheel pixels 0 -3.82 momentum
+1062.805000 wheel pixels 0 -3.7 momentum
+1079.748000 wheel pixels 0 -3.58 momentum
+1096.546000 wheel pixels 0 -3.46 momentum
+1112.887000 wheel pixels 0 -3.35 momentum
+1129.582000 wheel pixels 0 -3.24 momentum
+1146.031000 wheel pixels 0 -3.13 momentum
+1163.032000 wheel pixels 0 -3.03 momentum
+1179.401000 wheel pixels 0 -2.93 momentum
+1196.072000 wheel pixels 0 -2.83 momentum
+1212.510000 wheel pixels 0 -2.74 momentum
+1229.056000 wheel pixels 0 -2.65 momentum
+1246.111000 wheel pixels 0 -2.56 momentum
+1263.010000 wheel pixels 0 -2.48 momentum
+1280.050000 wheel pixels 0 -2.4 momentum
+1296.350000 wheel pixels 0 -2.32 momentum
+1312.912000 wheel pixels 0 -2.24 momentum
+1329.672000 wheel pixels 0 -2.17 momentum
+1346.399000 wheel pixels 0 -2.1 momentum
+1363.049000 wheel pixels 0 -2.03 momentum
+1379.398000 wheel pixels 0 -1.96 momentum
+1396.019000 wheel pixels 0 -1.9 momentum
+1412.349000 wheel pixels 0 -1.84 momentum
+1428.731000 wheel pixels 0 -1.78 momentum
+1445.207000 wheel pixels 0 -1.72 momentum
+1462.011000 wheel pixels 0 -1.66 momentum
+1478.296000 wheel pixels 0 -1.61 momentum
+1494.635000 wheel pixels 0 -1.56 momentum
+1500.000000 move 150 220
+1501.000000 down
+1511.340000 wheel pixels 0 -1.51 momentum
+1528.153000 wheel pixels 0 -1.46 momentum
+1541.000000 up
+1544.457000 wheel pixels 0 -1.41 momentum
+1561.449000 wheel pixels 0 -1.36 momentum
+1578.404000 wheel pixels 0 -1.32 momentum
+1595.228000 wheel pixels 0 -1.27 momentum
+1611.915000 wheel pixels 0 -1.23 momentum
+1628.475000 wheel pixels 0 -1.19 momentum
+1645.433000 wheel pixels 0 -1.15 momentum
+1662.266000 wheel pixels 0 -1.11 momentum
+1678.901000 wheel pixels 0 -1.08 momentum
+1695.623000 wheel pixels 0 -1.04 momentum
+1712.051000 wheel pixels 0 -1.01 momentum
+1728.896000 wheel pixels 0 -0.98 momentum
+1745.961000 wheel pixels 0 -0.94 momentum
+1762.407000 wheel pixels 0 -0.91 momentum
+1779.196000 wheel pixels 0 -0.88 momentum
+1795.792000 wheel pixels 0 -0.85 momentum
+1812.298000 wheel pixels 0 -0.83 momentum
+1828.822000 wheel pixels 0 -0.8 momentum
+1845.324000 wheel pixels 0 -0.77 momentum
+1861.755000 wheel pixels 0 -0.75 momentum
+1878.711000 wheel pixels 0 -0.72 momentum
+1895.578000 wheel pixels 0 -0.7 momentum
+1912.569000 wheel pixels 0 -0.68 momentum
+1929.064000 wheel pixels 0 -0.65 momentum
+1945.676000 wheel pixels 0 -0.63 momentum
+1962.243000 wheel pixels 0 -0.61 momentum
+1979.246000 wheel pixels 0 -0.59 momentum
+1996.215000 wheel pixels 0 -0.57 momentum
+2012.979000 wheel pixels 0 -0.55 momentum
+2029.730000 wheel pixels 0 -0.53 momentum
+2046.115000 wheel pixels 0 -0.52 momentum
+2062.943000 wheel pixels 0 0 momentum-ended

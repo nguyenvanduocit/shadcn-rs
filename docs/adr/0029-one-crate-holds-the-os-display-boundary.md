@@ -210,7 +210,25 @@ ticks.latest(); ticks.wait(after, timeout); ticks.run(wanted); ticks.generation(
   (`a_link_whose_callback_could_not_be_set_is_released`, through a fault hook on the setter).
 - The link's output time becomes an `Instant` by reading both clocks at once (they are one clock in two units).
 
-**Its `unsafe` sites: ten blocks and one declaration, in `src/macos.rs`** (1 to 9 and 12; X11 has two more, below).
+**Its `unsafe` sites: thirteen blocks and one declaration, in `src/macos.rs`** (1 to 9, 12 and 13 to 15; X11 has
+two more, below).
+
+**The scroll tap (sites 13 to 15, wave C (a) round 6).** winit 0.30 folds a macOS scroll event's two phases
+(`phase`, `momentumPhase`) into one `TouchPhase` and drops its timestamp, and hands on nothing that identifies
+the `NSEvent`. Round 5 read them off `NSApplication.currentEvent` while winit's handler ran and matched by window
+and delta; a match is a guess (a zero-delta end and a zero-delta begin look alike, and a queued winit event sees
+another current event). Round 6 takes the events instead: `gui_display::tap_scrolls` installs a local event
+monitor for scroll events; for an event to the tapped window it hands the event, read whole (both phases, the
+OS's time, where it is in the content view), to the toolkit and returns nil, so AppKit dispatches nothing. winit
+0.30 makes a `MouseWheel` (window and device event) only in its view's `scrollWheel:` (`platform_impl/macos/
+view.rs`), and its `sendEvent:` override (`app.rs`) makes no device event of a scroll, so each scroll event
+reaches the toolkit once, by the tap. The toolkit queues the tapped event and takes it in before the next event
+winit hands on (and on a wake through the event-loop proxy), so input keeps the OS's order; the pointer's move to
+the event's place, which winit's `scrollWheel:` reported, is forwarded from the event itself. Elsewhere there is no
+tap, and winit's event stands (Wayland's phases come through whole). `macos::tests::
+a_zero_delta_end_and_begin_of_two_windows_never_cross_and_go_once` and `window::tests::
+a_tapped_zero_delta_end_then_begin_routes_each_with_its_own_phase` pin it; the tap itself is exercised by the
+running app, as the live check does not create a window.
 
 | # | Function | Operation | Why it is sound |
 |---|---|---|---|
@@ -224,6 +242,9 @@ ticks.latest(); ticks.wait(after, timeout); ticks.run(wanted); ticks.generation(
 | 8 | `set_callback` | `CVDisplayLinkSetOutputCallback` | the callback has the C signature and catches unwinds; the context is a number Core Video never reads |
 | 9 | `stamp` | read the callback's `CVTimeStamp` | valid and unwritten for the callback's length, plain data |
 | 12 | `colour_space_changed` | read AppKit's extern static `NSScreenColorSpaceDidChangeNotification` | as site 1 |
+| 13 | `monitor` | `addLocalMonitorForEventsMatchingMask:handler:` for scroll events | the handler returns the event it was given or null, the two returns AppKit takes; local monitors run on the main thread, which its captured `MainThreadMarker` assumes; AppKit copies the block |
+| 14 | `event_of` | `NonNull::as_ref` on the event a monitor is handed | AppKit keeps it alive for the handler's call; the borrow ends with the call |
+| 15 | `untap` | `removeMonitor:` | the object the add returned, removed once by the one `Tap` holding it |
 | – | declaration | `unsafe extern "C"` for the one ColorSync function no binding crate in the tree has | its C signature from `ColorSyncDevice.h` |
 
 Everything else goes through objc2's generated bindings, which check each message's signature.

@@ -26,7 +26,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use super::chunks::{Seg, line_and_stops};
-use super::clips::{ClipTree, ENTRY, IDENTITY, compose, intersect, mapped};
+use super::clips::{ClipKeys, ClipTree, ENTRY, IDENTITY, KeyTarget, compose, intersect, mapped};
 use super::damage::{Rect, group};
 use super::path::{self, Paint};
 use super::record;
@@ -53,7 +53,9 @@ pub(super) struct FrameData {
     /// its draw's target and naming the entry of the next clip of its
     /// effective chain; clip 0 is none.
     pub pclips: Vec<f32>,
-    pclip_ids: foldhash::HashMap<(u32, u32), u32>,
+    pclip_ids: foldhash::HashMap<(u32, u32, u32), u32>,
+    /// The clips of a walk being written, kept across frames.
+    walk: Vec<u32>,
     pub stops: Vec<f32>,
     pub slugs: Vec<f32>,
     /// What lies below, read back by this frame's passes (`read.rs`).
@@ -65,6 +67,7 @@ impl Default for FrameData {
         Self {
             pclips: vec![0.0; ENTRY],
             pclip_ids: foldhash::HashMap::default(),
+            walk: Vec::new(),
             stops: Vec::new(),
             slugs: Vec::new(),
             reads: Vec::new(),
@@ -84,39 +87,49 @@ impl FrameData {
     }
 
     /// The entry of clip `id`'s walk for a target in the space of
-    /// transform `until`, which `to_canvas` maps to the canvas: its walk
-    /// followed up to the first clip already written for that target,
-    /// then each clip written from there down, after its next.
+    /// transform `until`, which `to_canvas` maps to the canvas, up to its
+    /// first clip at depth `stop` or less (the target's output clip's):
+    /// its walk ([`ClipTree::step`]) followed up to the first clip already
+    /// written for that target, then each clip written from there down,
+    /// after the one it steps to.
     pub(super) fn pclip(
         &mut self,
         tree: &ClipTree,
         id: u32,
-        until: u32,
+        (until, stop): (u32, u32),
         to_canvas: impl FnOnce() -> Option<[f32; 6]>,
     ) -> u32 {
-        let mut walk = Vec::new();
+        // Up to the target's output clip ([`ClipTree::key_in`]).
+        let ends = |at: u32| at == 0 || tree.depth(at) <= stop;
+        if ends(id) {
+            return 0;
+        }
+        if let Some(e) = self.pclip_ids.get(&(id, until, stop)) {
+            return *e;
+        }
+        let to = to_canvas();
+        let own = super::clips::own_grid(to);
+        let mut walk = std::mem::take(&mut self.walk);
+        walk.clear();
         let mut at = id;
         let mut next = loop {
-            if at == 0 {
+            if ends(at) {
                 break 0;
             }
-            if let Some(e) = self.pclip_ids.get(&(at, until)) {
+            if let Some(e) = self.pclip_ids.get(&(at, until, stop)) {
                 break *e;
             }
             walk.push(at);
-            at = tree.next(at);
+            at = tree.step(at, own);
         };
-        if walk.is_empty() {
-            return next;
-        }
-        let to = to_canvas();
-        for c in walk.into_iter().rev() {
+        for &c in walk.iter().rev() {
             let mut entry = tree.entry_in(c, to);
             entry[16] = f32::from_bits(next);
             next = u32::try_from(self.pclips.len() / ENTRY).unwrap_or(0);
             self.pclips.extend_from_slice(&entry);
-            self.pclip_ids.insert((c, until), next);
+            self.pclip_ids.insert((c, until, stop), next);
         }
+        self.walk = walk;
         next
     }
 }
@@ -391,6 +404,11 @@ struct LayerPlan {
     /// The layer it composites into (0: the canvas), and where its entry is.
     outer: u32,
     place: EntryAt,
+    /// Its output clip ([`crate::scene::EffectNode::clip`]): where its
+    /// walks end, and what clips its composite.
+    clip: u32,
+    /// Its walks' keys, kept while it is ([`ClipTree::key_in`]).
+    keys: ClipKeys,
 }
 
 /// A frame's decisions, kept across frames: a frame planned from what
@@ -415,10 +433,17 @@ pub(super) struct Plan {
     /// The chunks drawn under each transform and effect (their state).
     by_transform: foldhash::HashMap<u32, Vec<usize>>,
     by_effect: foldhash::HashMap<u32, Vec<usize>>,
-    /// The layers holding chunks drawn under each clip, drawn again when
-    /// its revision changes, and the canvas's chunk entries under each,
-    /// keyed again ([`Shown::rev`]): a clip changing signs no chunk.
-    clip_layers: foldhash::HashMap<u32, Vec<u32>>,
+    /// What each layer's texels read ([`ClipKeys`]), by what was read: the
+    /// layers whose keys walked each clip, and those whose keys composed
+    /// through each transform. A layer is drawn again when anything it
+    /// read changes. An index may name a layer that read it once and no
+    /// longer does (its keys then have nothing of it to forget), never
+    /// miss one that does.
+    clip_readers: foldhash::HashMap<u32, Vec<u32>>,
+    through_readers: foldhash::HashMap<u32, Vec<u32>>,
+    /// The canvas's entries under each clip (a chunk's, or a layer's
+    /// composite under its output clip), keyed again ([`Shown::rev`]): a
+    /// clip changing signs no chunk.
     by_clip: foldhash::HashMap<u32, Vec<usize>>,
     /// The chunks showing canvases, and what their tiles were at.
     canvases: Vec<(usize, u64)>,
@@ -431,6 +456,80 @@ pub(super) struct Plan {
     seen: Marks,
     seen_fx: Marks,
     seen_t: Marks,
+    /// Each transform's own part of the space it makes ([`space_of`]):
+    /// a frame tells the transforms that moved what lies under them from
+    /// those moved with what lies above.
+    spaces: Vec<(u32, [u32; 4])>,
+    /// The chunks a frame reaches ([`GpuRenderer::replan`]), kept so a
+    /// frame that reaches as many allocates nothing for them.
+    dirty: Vec<usize>,
+}
+
+/// Transform `t`'s parent and its own matrix (bits; all ones for none):
+/// what a clip under it, read from a space above it, moves with.
+fn space_of(props: &Properties, t: u32) -> (u32, [u32; 4]) {
+    let n = props.transform(t);
+    let m = n.matrix.map_or([u32::MAX; 4], |g| {
+        [g.origin.0, g.origin.1, g.scale, g.rotate].map(f32::to_bits)
+    });
+    (n.parent, m)
+}
+
+/// Layer `lp`'s output clip in the index of the canvas entries a clip's
+/// change reaches: composited on the canvas, its entry is keyed again
+/// (in a layer, that layer's keys read it, [`Plan::clip_readers`]). The
+/// index may name more than a clip reaches now (an output clip changed
+/// leaves the old one's), never less.
+fn index_output_clip(by_clip: &mut foldhash::HashMap<u32, Vec<usize>>, lp: &LayerPlan) {
+    if lp.clip == 0 {
+        return;
+    }
+    if let EntryAt::Root(k) = lp.place {
+        let list = by_clip.entry(lp.clip).or_default();
+        if !list.contains(&k) {
+            list.push(k);
+        }
+    }
+}
+
+/// `l` among the readers of `id` (once).
+fn index_reader(readers: &mut foldhash::HashMap<u32, Vec<u32>>, id: u32, l: u32) {
+    let list = readers.entry(id).or_default();
+    if !list.contains(&l) {
+        list.push(l);
+    }
+}
+
+/// The contract of an output clip ([`crate::scene::EffectNode::clip`]):
+/// every clip a chunk of layer `l` is drawn under is it or lies in it. A
+/// pass into the layer walks each chain up to the first clip as shallow
+/// (its depth), so a chain off to another branch would lose the clips it
+/// has there. Checked in debug builds and under `GUI_COLD_CHECK`.
+fn check_output_clip(scene: &Scene, plan: &Plan, l: u32) {
+    let props = &scene.properties;
+    let Some(o) = plan.layers.get(&l).map(|lp| lp.clip).filter(|o| *o != 0) else {
+        return;
+    };
+    let members = usize::try_from(l).ok().and_then(|e| plan.members.get(e));
+    for &i in members.into_iter().flatten() {
+        let Some(c) = scene.chunks.get(i) else { continue };
+        let mut at = c.state.clip;
+        let mut steps = 0_usize;
+        while at != 0 && at != o && steps <= props.clips.len() {
+            steps = steps.saturating_add(1);
+            at = usize::try_from(at)
+                .ok()
+                .and_then(|a| props.clips.get(a))
+                .map_or(0, |n| n.parent);
+        }
+        assert!(
+            at == o,
+            "chunk {:?} is drawn in layer {l} under clip {}, which does not lie in the layer's output clip {o}: \
+             an effect's output clip must be a clip every clip of what it holds lies in",
+            c.id,
+            c.state.clip
+        );
+    }
 }
 
 /// A canvas entry as planned: its key, the signature of what it draws
@@ -474,6 +573,9 @@ struct PassPlan {
     /// The map from its target's space to the canvas's, which clip
     /// entries map from (a layer's under a scale or turn).
     to_canvas: [f32; 6],
+    /// A layer's: its output clip's depth, where its draws' clip chains
+    /// end ([`super::clips::ClipTree::depth`]); 0 for any other target.
+    stop: u32,
     origin: (i32, i32),
     size: (u32, u32),
     clear: Option<wgpu::Color>,
@@ -751,6 +853,8 @@ impl GpuRenderer {
                             content: 0,
                             outer,
                             place: at,
+                            clip: props.effect(l).map_or(0, |n| n.clip),
+                            keys: ClipKeys::default(),
                         },
                     );
                 }
@@ -769,26 +873,18 @@ impl GpuRenderer {
         }
         // What each chunk is drawn under, to find it from what changed.
         let mut by_transform: foldhash::HashMap<u32, Vec<usize>> = foldhash::HashMap::default();
-        let mut clip_layers: foldhash::HashMap<u32, Vec<u32>> = foldhash::HashMap::default();
         let mut by_effect: foldhash::HashMap<u32, Vec<usize>> = foldhash::HashMap::default();
         let mut canvases = Vec::new();
         let mut by_clip: foldhash::HashMap<u32, Vec<usize>> = foldhash::HashMap::default();
         for (i, c) in scene.chunks.iter().enumerate() {
             by_transform.entry(c.state.transform).or_default().push(i);
-            // Under a clip: drawn into a layer, the layer is drawn again
-            // when the clip's revision changes (its chain's, whatever in it
-            // changed); on the canvas, its entry is keyed again.
-            if c.state.clip != 0 {
-                match place.get(i) {
-                    Some(EntryAt::Layer(l)) => {
-                        let list = clip_layers.entry(c.state.clip).or_default();
-                        if !list.contains(l) {
-                            list.push(*l);
-                        }
-                    }
-                    Some(EntryAt::Root(k)) => by_clip.entry(c.state.clip).or_default().push(*k),
-                    _ => {}
-                }
+            // Under a clip on the canvas: its entry is keyed again when the
+            // clip's revision changes (its chain's, whatever in it changed).
+            // In a layer, the layer's keys read the clip.
+            if c.state.clip != 0
+                && let Some(EntryAt::Root(k)) = place.get(i)
+            {
+                by_clip.entry(c.state.clip).or_default().push(*k);
             }
             by_effect.entry(c.state.effect).or_default().push(i);
             if let Some(k) = self.kept.get(&c.id)
@@ -796,6 +892,11 @@ impl GpuRenderer {
             {
                 canvases.push((i, self.canvas_revision(k)));
             }
+        }
+        // A layer's output clip clips its composite: on the canvas its
+        // entry is keyed again when the clip's revision changes.
+        for lp in layers.values() {
+            index_output_clip(&mut by_clip, lp);
         }
         let mut plan = Plan {
             fx,
@@ -810,7 +911,8 @@ impl GpuRenderer {
             states: scene.chunks.iter().map(|c| c.state).collect(),
             by_transform,
             by_effect,
-            clip_layers,
+            clip_readers: foldhash::HashMap::default(),
+            through_readers: foldhash::HashMap::default(),
             by_clip,
             canvases,
             folded,
@@ -819,9 +921,18 @@ impl GpuRenderer {
             seen: Marks::default(),
             seen_fx: Marks::default(),
             seen_t: Marks::default(),
+            spaces: (0..props.transforms.len())
+                .map(|t| space_of(props, u32::try_from(t).unwrap_or(0)))
+                .collect(),
+            dirty: Vec::new(),
         };
-        // Signatures: layers inside out, then the canvas's entries.
         let ids: Vec<u32> = plan.layers.keys().copied().collect();
+        if cfg!(debug_assertions) || self.cold_plan {
+            for &l in &ids {
+                check_output_clip(scene, &plan, l);
+            }
+        }
+        // Signatures: layers inside out, then the canvas's entries.
         for l in ids {
             self.layer_content(scene, &mut plan, l, 0);
         }
@@ -856,11 +967,14 @@ impl GpuRenderer {
                 scene.chunks.get(i).map_or(0, |c| self.clip_tree.rev(c.state.clip)),
                 self.chunk_rect(scene, plan, i),
             ),
-            Entry::Layer(l) => (
-                self.composite_sig(scene, plan, l, (0.0, 0.0)),
-                0,
-                self.layer_rect(plan, l),
-            ),
+            Entry::Layer(l) => {
+                let clip = scene.properties.effect(l).map_or(0, |n| n.clip);
+                (
+                    self.composite_sig(scene, plan, l, (0.0, 0.0)),
+                    self.clip_tree.rev(clip),
+                    self.composite_rect(scene, plan, l),
+                )
+            }
         };
         let mut h = DefaultHasher::new();
         (sig, pred).hash(&mut h);
@@ -898,7 +1012,9 @@ impl GpuRenderer {
         let u = |i: usize| u32::try_from(i).unwrap_or(u32::MAX);
         // The chunks reached.
         plan.seen.begin(n);
-        let mut dirty: Vec<usize> = Vec::new();
+        // The chunks reached, in a list kept across frames.
+        let mut dirty = std::mem::take(&mut plan.dirty);
+        dirty.clear();
         for &i in &changed.chunks {
             let c = scene.chunks.get(i)?;
             if plan.ids.get(i) != Some(&c.id) || plan.states.get(i) != Some(&c.state) {
@@ -1013,9 +1129,34 @@ impl GpuRenderer {
             self.tables.set_clip(&mut self.props, c, self.clip_tree.entry(c));
             self.drawn.clips_written = self.drawn.clips_written.saturating_add(1);
         }
+        // A layer is drawn again when a clip its keys read changed what
+        // they read of it ([`ClipKeys::forget`]): its shape, or where the
+        // canvas has it for a key made through the canvas.
         let mut clip_stale: Vec<u32> = Vec::new();
-        for c in &clips.moved {
-            clip_stale.extend(plan.clip_layers.get(c).into_iter().flatten());
+        let changes = (clips.moved.iter().map(|&c| (c, false))).chain(clips.reshaped.iter().map(|&c| (c, true)));
+        for (c, reshaped) in changes {
+            for &l in plan.clip_readers.get(&c).into_iter().flatten() {
+                if let Some(lp) = plan.layers.get_mut(&l)
+                    && lp.keys.forget(&self.clip_tree, c, reshaped)
+                {
+                    clip_stale.push(l);
+                }
+            }
+        }
+        // A transform whose own matrix or parent changed: the keys
+        // composed through it go (wherever it now lies).
+        for &t in &changed.transforms {
+            let now = space_of(props, t);
+            let slot = usize::try_from(t).ok().and_then(|i| plan.spaces.get_mut(i))?;
+            if *slot != now {
+                *slot = now;
+                for &l in plan.through_readers.get(&t).into_iter().flatten() {
+                    if let Some(lp) = plan.layers.get_mut(&l) {
+                        lp.keys.clear();
+                        clip_stale.push(l);
+                    }
+                }
+            }
         }
         // Routes: a chunk keeps its layer, or the plan is made whole.
         for &i in &dirty {
@@ -1036,6 +1177,7 @@ impl GpuRenderer {
         let viewport = plan.viewport;
         let mut stale: Vec<u32> = Vec::new();
         let mut moved: Vec<u32> = Vec::new();
+        let mut republish = false;
         let ids: Vec<u32> = plan.layers.keys().copied().collect();
         for l in ids {
             let Some(node) = props.effect(l) else { continue };
@@ -1045,19 +1187,31 @@ impl GpuRenderer {
             }
             let outer = plan.layers.get(&l).map_or(0, |lp| lp.outer);
             let (region, m) = self.layer_shape(scene, l, outer, viewport);
-            if let Some(lp) = plan.layers.get_mut(&l) {
-                // Its texels: where it lies changed, or what clips them
-                // when it moved against the canvas, where clips are.
-                let clipped = || {
-                    lp.entries.iter().any(
-                        |e| matches!(e, Entry::Chunk(i) if scene.chunks.get(*i).is_some_and(|c| c.state.clip != 0)),
-                    )
-                };
-                if lp.region != region || clipped() {
-                    stale.push(l);
+            let to_canvas = compose(props, node.transform, 0);
+            let own = super::clips::own_grid(to_canvas);
+            // What hit testing reads of it may have changed (its map, its
+            // output clip): published again, a new list only if it did.
+            republish = true;
+            let Some(lp) = plan.layers.get_mut(&l) else { continue };
+            // Its texels: where it lies changed, or its pixels became the
+            // canvas's or left them (its walks step otherwise), or a key
+            // read its map to the canvas, which moved. What clips them in
+            // its space moves with it; what clips it where it is
+            // composited clips the composite ([`Self::stop`]).
+            if lp.region != region || lp.keys.made_own().is_some_and(|o| o != own) || lp.keys.moved_with(to_canvas) {
+                stale.push(l);
+            }
+            lp.region = region;
+            lp.m = m;
+            // Another output clip: its walks end elsewhere (drawn again),
+            // its composite is clipped by another, and that one's changes
+            // reach it from now on.
+            if lp.clip != node.clip {
+                lp.clip = node.clip;
+                stale.push(l);
+                if let Some(lp) = plan.layers.get(&l) {
+                    index_output_clip(&mut plan.by_clip, lp);
                 }
-                lp.region = region;
-                lp.m = m;
             }
             moved.push(l);
         }
@@ -1066,7 +1220,8 @@ impl GpuRenderer {
         for &i in &dirty {
             match plan.place.get(i) {
                 Some(EntryAt::Root(k)) => roots.push(*k),
-                Some(EntryAt::Layer(l)) => stale.push(*l),
+                // Once a layer: a thousand rows of one are one stale layer.
+                Some(EntryAt::Layer(l)) if stale.last() != Some(l) && !stale.contains(l) => stale.push(*l),
                 _ => {}
             }
         }
@@ -1086,6 +1241,14 @@ impl GpuRenderer {
         stale.dedup();
         moved.sort_unstable();
         moved.dedup();
+        // A layer drawn again may hold chunks under clips that changed
+        // (moved to another branch, say), or have another output clip:
+        // its contract is checked again.
+        if cfg!(debug_assertions) || self.cold_plan {
+            for &l in &stale {
+                check_output_clip(scene, plan, l);
+            }
+        }
         for l in &stale {
             if let Some(lp) = plan.layers.get_mut(l) {
                 lp.content = 0;
@@ -1115,11 +1278,18 @@ impl GpuRenderer {
             if roots.binary_search(&k).is_ok() {
                 continue;
             }
-            let Some(Entry::Chunk(i)) = plan.root.get(k).copied() else {
-                continue;
+            let (rev, rect) = match plan.root.get(k).copied() {
+                Some(Entry::Chunk(i)) => (
+                    scene.chunks.get(i).map_or(0, |c| self.clip_tree.rev(c.state.clip)),
+                    self.chunk_rect(scene, plan, i),
+                ),
+                // A layer composited under its output clip.
+                Some(Entry::Layer(l)) => (
+                    self.clip_tree.rev(props.effect(l).map_or(0, |n| n.clip)),
+                    self.composite_rect(scene, plan, l),
+                ),
+                None => continue,
             };
-            let rev = scene.chunks.get(i).map_or(0, |c| self.clip_tree.rev(c.state.clip));
-            let rect = self.chunk_rect(scene, plan, i);
             let Some(slot) = plan.shown.get_mut(k) else { continue };
             let next = Shown { rev, rect, ..*slot };
             self.reshow(slot, next, &mut rects);
@@ -1129,7 +1299,39 @@ impl GpuRenderer {
             let Some(slot) = plan.shown.get_mut(k) else { continue };
             self.reshow(slot, next, &mut rects);
         }
+        plan.dirty = dirty;
+        if republish {
+            self.publish_layers(scene, plan);
+        }
         Some(rects)
+    }
+
+    /// The layers `plan` draws, each as a stage into the target it is
+    /// composited into, published for hit testing
+    /// ([`GpuRenderer::shown_stages`]): a new list only when it differs.
+    fn publish_layers(&mut self, scene: &Scene, plan: &Plan) {
+        let props = &scene.properties;
+        let mut now = std::mem::take(&mut self.stage_work);
+        now.clear();
+        now.extend(plan.layers.iter().map(|(&l, lp)| crate::scene::LayerStage {
+            effect: l,
+            outer: lp.outer,
+            transform: props.effect(l).map_or(0, |n| n.transform),
+            map: lp.m.unwrap_or(IDENTITY),
+            clip: lp.clip,
+        }));
+        now.sort_unstable_by_key(|s| s.effect);
+        if *now != *self.shown_stages {
+            self.shown_stages = Arc::from(now.as_slice());
+        }
+        self.stage_work = now;
+    }
+
+    /// No layer is drawn: hit testing reads none.
+    fn publish_none(&mut self) {
+        if !self.shown_stages.is_empty() {
+            self.shown_stages = Arc::from(Vec::new());
+        }
     }
 
     /// Canvas entry `slot` becomes `next`: its damage when it changed.
@@ -1210,43 +1412,61 @@ impl GpuRenderer {
         {
             return lp.content;
         }
-        let Some((entries, region)) = plan.layers.get(&l).map(|lp| (lp.entries.clone(), lp.region)) else {
+        let Some(lp) = plan.layers.get_mut(&l) else {
             return 0;
         };
-        let origin = (
-            crate::convert::i32_to_f32(region.x),
-            crate::convert::i32_to_f32(region.y),
-        );
+        // Taken out while the layers it holds are signed, and put back.
+        let entries = std::mem::take(&mut lp.entries);
+        let mut keys = std::mem::take(&mut lp.keys);
+        let (region, o) = (lp.region, lp.clip);
+        let props = &scene.properties;
         // The layer's space, which its texture holds whatever moves, scales
-        // or turns it.
-        let to_canvas = scene
-            .properties
-            .effect(l)
-            .and_then(|n| compose(&scene.properties, n.transform, 0));
-        let mut walks = foldhash::HashMap::default();
+        // or turns it. Its chains end at its output clip: what lies within
+        // it alone decides its texels, so a layer moved with what it holds
+        // keys the same, whatever clips it where it is composited.
+        let until = props.effect(l).map_or(0, |n| n.transform);
+        let target = KeyTarget {
+            until,
+            to_canvas: compose(props, until, 0),
+            origin: (
+                crate::convert::i32_to_f32(region.x),
+                crate::convert::i32_to_f32(region.y),
+            ),
+            stop: self.clip_tree.depth(o),
+        };
         let mut h = DefaultHasher::new();
-        (region.width, region.height).hash(&mut h);
-        for e in entries {
-            match e {
+        (region.width, region.height, o, target.stop).hash(&mut h);
+        for e in &entries {
+            match *e {
                 Entry::Chunk(i) => {
-                    self.chunk_sig(scene, plan, i, origin).hash(&mut h);
+                    self.chunk_sig(scene, plan, i, target.origin).hash(&mut h);
                     // Its clip chain as the layer's texels see it (clips
                     // are placed in the canvas, the texels in the layer).
                     let clip = scene.chunks.get(i).map_or(0, |c| c.state.clip);
                     if clip != 0 {
-                        self.clip_tree.key_in(clip, to_canvas, origin, &mut walks).hash(&mut h);
+                        self.clip_tree.key_in(props, clip, &target, &mut keys).hash(&mut h);
                     }
                 }
                 Entry::Layer(c) if depth < 64 => {
                     self.layer_content(scene, plan, c, depth.saturating_add(1));
-                    self.composite_sig(scene, plan, c, origin).hash(&mut h);
+                    self.composite_sig(scene, plan, c, target.origin).hash(&mut h);
+                    // The inner layer's output clip, as these texels see it.
+                    let clip = props.effect(c).map_or(0, |n| n.clip);
+                    if clip != 0 {
+                        self.clip_tree.key_in(props, clip, &target, &mut keys).hash(&mut h);
+                    }
                 }
                 Entry::Layer(_) => {}
             }
         }
         let sig = h.finish().max(1);
+        // What its keys read, indexed to reach it when that changes.
+        let (by_clip, by_through) = (&mut plan.clip_readers, &mut plan.through_readers);
+        keys.take_reads(|c| index_reader(by_clip, c, l), |t| index_reader(by_through, t, l));
         if let Some(lp) = plan.layers.get_mut(&l) {
             lp.content = sig;
+            lp.entries = entries;
+            lp.keys = keys;
         }
         sig
     }
@@ -1317,8 +1537,17 @@ impl GpuRenderer {
         Some([q[0] - 1.0, q[1] - 1.0, q[2] + 1.0, q[3] + 1.0])
     }
 
-    fn layer_rect(&self, plan: &Plan, l: u32) -> Option<Rect> {
-        Rect::covering(self.layer_quad(plan, l)?)
+    /// The canvas pixels layer `l`'s composite may touch: its quad cut to
+    /// what its output clip's chain keeps (a change of the chain is
+    /// damage of its own).
+    fn composite_rect(&self, scene: &Scene, plan: &Plan, l: u32) -> Option<Rect> {
+        let q = self.layer_quad(plan, l)?;
+        let clip = scene.properties.effect(l).map_or(0, |n| n.clip);
+        let r = match self.clip_tree.bounds(clip) {
+            Some(k) => intersect(q, [k[0] - 1.0, k[1] - 1.0, k[2] + 1.0, k[3] + 1.0]),
+            None => q,
+        };
+        Rect::covering(r)
     }
 
     /// Everything that decides layer `l`'s composite, its target's origin at `origin`.
@@ -1407,6 +1636,8 @@ impl GpuRenderer {
             self.canvas = None;
             self.shown.clear();
             self.planned = None;
+            // Nothing drew it: a capture in bands publishes what it reads.
+            self.publish_none();
             return;
         }
         let fresh = self.ensure_canvas(scene.size, bg);
@@ -1432,7 +1663,7 @@ impl GpuRenderer {
             .filter(|p| !changed.all && !fresh && text_was == self.text_generation && p.viewport == viewport);
         // The clip tree first: both planners read it, and its damage.
         self.unpark_tree();
-        let clips = self.clip_tree.update(
+        let mut clips = self.clip_tree.update(
             &scene.properties,
             scene.scale,
             planned.is_none(),
@@ -1460,10 +1691,12 @@ impl GpuRenderer {
                 self.drawn.clips_written = scene.properties.clips.len();
                 self.tables.write_whole(scene, &plan, &self.kept, &self.clip_tree);
                 self.layered = plan.layers.keys().copied().collect();
-                let rects = self.damage(&plan, clips.damage, screen, whole, fresh);
+                self.publish_layers(scene, &plan);
+                let rects = self.damage(&plan, std::mem::take(&mut clips.damage), screen, whole, fresh);
                 (plan, rects)
             }
         };
+        self.clip_tree.recycle(clips);
         // A blurred backdrop on the canvas reads all of its box: damage
         // that meets it holds it whole (`read.rs`).
         let rects = if whole || self.blurring == 0 {
@@ -1536,6 +1769,7 @@ impl GpuRenderer {
             passes.push(PassPlan {
                 target: PassTarget::Canvas,
                 to_canvas: IDENTITY,
+                stop: 0,
                 origin: (0, 0),
                 size: (w, h),
                 clear: whole.then(|| clear_color(scene.background)),
@@ -1566,6 +1800,14 @@ impl GpuRenderer {
 
     /// The incremental plan `plan` against one made whole from `scene`
     /// (`GUI_COLD_CHECK`): the same decisions, signatures and tables.
+    /// Clips keyed in layers since last asked (the plan kept).
+    #[cfg(test)]
+    pub(super) fn clip_keys_walked(&mut self) -> usize {
+        self.planned
+            .as_mut()
+            .map_or(0, |p| p.layers.values_mut().map(|lp| lp.keys.walked()).sum())
+    }
+
     fn check_plan(&mut self, scene: &Scene, plan: &Plan) {
         // The whole plan and tables from a clip tree decided anew from the
         // scene, not the one this frame brought up to it.
@@ -1597,6 +1839,13 @@ impl GpuRenderer {
             cold.folded == plan.folded,
             "frame {frame}: folds differ from a whole plan"
         );
+        for (l, lp) in &cold.layers {
+            let mine = plan.layers.get(l).map(|p| (p.content, p.clip));
+            assert!(
+                mine == Some((lp.content, lp.clip)),
+                "frame {frame}: layer {l}'s content or output clip differs from a whole plan"
+            );
+        }
         let same = tables.transforms == self.tables.transforms
             && tables.clips == self.tables.clips
             && tables.effects == self.tables.effects;
@@ -1630,6 +1879,7 @@ impl GpuRenderer {
         PassPlan {
             target: PassTarget::Blit,
             to_canvas: IDENTITY,
+            stop: 0,
             origin: (0, 0),
             size,
             clear: other.then(|| {
@@ -1677,6 +1927,7 @@ impl GpuRenderer {
         passes.push(PassPlan {
             target: PassTarget::Surface,
             to_canvas: IDENTITY,
+            stop: 0,
             origin: (0, 0),
             size,
             clear: None,
@@ -1759,6 +2010,11 @@ impl GpuRenderer {
         self.parked_tree.get_or_insert(canvas_tree);
         self.clip_tree.update(&scene.properties, scene.scale, true, &[], &[]);
         let plan = self.plan(scene, whole);
+        // Without a canvas (a page taller than a texture) what is read
+        // back is what shows: its layers are the ones input reads.
+        if self.canvas.is_none() {
+            self.publish_layers(scene, &plan);
+        }
         // The frame's tables stay the canvas's: the capture's are its own.
         let tables = self.tables.clone();
         self.tables.write_whole(scene, &plan, &self.kept, &self.clip_tree);
@@ -1794,6 +2050,7 @@ impl GpuRenderer {
             passes.push(PassPlan {
                 target: PassTarget::External,
                 to_canvas: IDENTITY,
+                stop: 0,
                 origin,
                 size: (w, band),
                 clear: Some(clear_color(scene.background)),
@@ -1832,6 +2089,7 @@ impl GpuRenderer {
             .map(|(tex, ops, first)| PassPlan {
                 target: PassTarget::Tile(tex),
                 to_canvas: IDENTITY,
+                stop: 0,
                 origin: (0, 0),
                 size: (super::world::TILE, super::world::TILE),
                 clear: first.then_some(wgpu::Color::TRANSPARENT),
@@ -1847,6 +2105,7 @@ impl GpuRenderer {
             .map(|m| PassPlan {
                 target: PassTarget::Mask(m.chunk, m.k),
                 to_canvas: IDENTITY,
+                stop: 0,
                 origin: m.origin,
                 size: m.size,
                 clear: Some(wgpu::Color::TRANSPARENT),
@@ -1873,7 +2132,8 @@ impl GpuRenderer {
                 if let Some(ops) = built.ops.get(&i) {
                     return ops.clone();
                 }
-                let ops = self.chunk_ops(scene, plan, i, visible, text);
+                let mut ops = Vec::new();
+                self.chunk_ops(scene, plan, i, visible, text, &mut ops);
                 built.ops.insert(i, ops.clone());
                 ops
             }
@@ -1912,10 +2172,17 @@ impl GpuRenderer {
         } else {
             let visible = rect_of(region);
             let mut ops = Vec::new();
+            // Each entry once, its draws straight into the layer's (a layer
+            // of thousands of chunks redrawn makes no list for each).
             let mut inner = Built::default();
             for e in entries {
-                for op in self.entry_ops(scene, plan, e, visible, &mut inner, passes, text) {
-                    push_op(&mut ops, op);
+                match e {
+                    Entry::Chunk(i) => self.chunk_ops(scene, plan, i, visible, text, &mut ops),
+                    Entry::Layer(c) => {
+                        if let Some(op) = self.layer_op(scene, plan, c, &mut inner, passes, text) {
+                            push_op(&mut ops, op);
+                        }
+                    }
                 }
             }
             let texture = match self.layers.remove(&l) {
@@ -1937,6 +2204,7 @@ impl GpuRenderer {
                     .effect(l)
                     .and_then(|n| compose(&scene.properties, n.transform, 0))
                     .unwrap_or(IDENTITY),
+                stop: self.stop(&scene.properties, l),
                 origin: (region.x, region.y),
                 size,
                 clear: Some(wgpu::Color::TRANSPARENT),
@@ -2009,8 +2277,10 @@ impl GpuRenderer {
                 Filter::Grayscale(a) => [2.0, *a],
             };
         }
-        // What clips it clipped its content, inside the layer.
-        let slot = self.transient_slot([0, 0, node.parent, 0]);
+        // Its output clip clips it here, in its target, after its filters
+        // and resampling (Chrome's output clip); its content's clips below
+        // that one clipped its content inside it.
+        let slot = self.transient_slot([0, node.clip, node.parent, 0]);
         let mut words = Vec::new();
         record::Layer {
             slot,
@@ -2029,19 +2299,48 @@ impl GpuRenderer {
         })
     }
 
-    /// Chunk `i`'s draws this frame, where `visible` (its target's pixels) shows.
-    fn chunk_ops(&mut self, scene: &Scene, plan: &Plan, i: usize, visible: [f32; 4], text: &mut Glyphs) -> Vec<Op> {
+    /// Chunk `i`'s draws this frame, where `visible` (its target's pixels)
+    /// shows, added to `ops`.
+    fn chunk_ops(
+        &mut self,
+        scene: &Scene,
+        plan: &Plan,
+        i: usize,
+        visible: [f32; 4],
+        text: &mut Glyphs,
+        ops: &mut Vec<Op>,
+    ) {
+        let Some(c) = scene.chunks.get(i) else { return };
+        // Its runs, taken out while its draws are made and put back.
+        let Some(segs) = self.kept.get_mut(&c.id).map(|k| std::mem::take(&mut k.segs)) else {
+            return;
+        };
+        self.chunk_segs_ops(scene, plan, i, &segs, visible, text, ops);
+        if let Some(k) = self.kept.get_mut(&c.id) {
+            k.segs = segs;
+        }
+    }
+
+    /// [`Self::chunk_ops`], chunk `i`'s runs `segs`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a chunk, its runs, where it is drawn, and the list drawn into"
+    )]
+    fn chunk_segs_ops(
+        &mut self,
+        scene: &Scene,
+        plan: &Plan,
+        i: usize,
+        segs: &[Seg],
+        visible: [f32; 4],
+        text: &mut Glyphs,
+        ops: &mut Vec<Op>,
+    ) {
         let props = &scene.properties;
         let s = scene.scale;
-        let mut ops = Vec::new();
-        let Some(c) = scene.chunks.get(i) else { return ops };
-        let Some(k) = self.kept.get(&c.id) else { return ops };
-        let (segs, base, display, slot) = (
-            k.segs.clone(),
-            k.index.map_or(0, |i| i.start),
-            Arc::clone(&k.display),
-            k.slot,
-        );
+        let Some(c) = scene.chunks.get(i) else { return };
+        let Some(k) = self.kept.get(&c.id) else { return };
+        let (base, display, slot) = (k.index.map_or(0, |i| i.start), Arc::clone(&k.display), k.slot);
         let fold = usize::try_from(c.state.effect)
             .ok()
             .and_then(|e| plan.fx.get(e))
@@ -2052,10 +2351,10 @@ impl GpuRenderer {
             Route::Quads { target } => {
                 let until = props.effect(target).map_or(0, |n| n.transform);
                 let mut device = None;
-                for seg in segs {
+                for &seg in segs {
                     match seg {
                         Seg::Quads { extra, start, end } => push_op(
-                            &mut ops,
+                            ops,
                             Op::Quads {
                                 extra,
                                 instances: base.saturating_add(start)..base.saturating_add(end),
@@ -2068,40 +2367,54 @@ impl GpuRenderer {
                             if matches!(item, Item::Backdrop { .. } | Item::Blended { .. }) {
                                 // Read in its box, whatever clips it: the
                                 // draw is clipped by its slot.
-                                self.read_ops(&mut ops, item, s, off, slot, visible);
+                                self.read_ops(ops, item, s, off, slot, visible);
                                 continue;
                             }
-                            let clip = *device.get_or_insert_with(|| self.pclip(props, c.state.clip, until));
-                            // Cut to what its chain keeps where the target
-                            // is the canvas's space.
-                            let shown = match self.clip_tree.bounds(c.state.clip) {
+                            let clip = *device.get_or_insert_with(|| self.pclip(props, c.state.clip, target));
+                            // Cut to what its chain keeps in the target
+                            // (up to its output clip) where the target is
+                            // the canvas's space.
+                            let kept = self.clip_tree.bounds_until(c.state.clip, self.stop(props, target));
+                            let shown = match kept {
                                 Some(k) if compose(props, until, 0).is_none() => intersect(visible, k),
                                 _ => visible,
                             };
-                            self.item_ops(&mut ops, item, s, off, shown, clip, fold, text);
+                            self.item_ops(ops, item, s, off, shown, clip, fold, text);
                         }
                     }
                 }
             }
             Route::Matrix { target, m } => {
-                let until = props.effect(target).map_or(0, |n| n.transform);
                 let g = path::then([1.0, 0.0, 0.0, 1.0, off.0, off.1], m);
                 // Its one chain, across the scales and turns: each clip
                 // tested in its own space.
-                let clip = self.pclip(props, c.state.clip, until);
+                let clip = self.pclip(props, c.state.clip, target);
                 for item in &display.items {
-                    self.matrix_ops(&mut ops, item, s, g, visible, clip, 0, fold, text);
+                    self.matrix_ops(ops, item, s, g, visible, clip, 0, fold, text);
                 }
             }
         }
-        ops
     }
 
-    /// The path-and-curve clip entry of clip `id`'s walk, for a target in
-    /// the space of transform `until` (the clip tree's entry, mapped from
-    /// that target rather than the canvas; its next's entry after it).
-    fn pclip(&mut self, props: &Properties, id: u32, until: u32) -> u32 {
-        self.fr.pclip(&self.clip_tree, id, until, || compose(props, until, 0))
+    /// The path-and-curve clip entry of clip `id`'s walk, for target
+    /// `target` (a layer's effect, 0 for the canvas): the clip tree's
+    /// entry mapped from the target's space rather than the canvas's, its
+    /// next's entry after it, up to the target's output clip ([`Self::stop`]).
+    fn pclip(&mut self, props: &Properties, id: u32, target: u32) -> u32 {
+        let until = props.effect(target).map_or(0, |n| n.transform);
+        let stop = self.stop(props, target);
+        self.fr
+            .pclip(&self.clip_tree, id, (until, stop), || compose(props, until, 0))
+    }
+
+    /// Where a draw into target `target` (a layer's effect, 0 for the
+    /// canvas) ends its clip chains: the depth of the layer's output clip
+    /// (Chrome's), which clips its composite instead; 0, the whole chain.
+    fn stop(&self, props: &Properties, target: u32) -> u32 {
+        if target == 0 {
+            return 0;
+        }
+        props.effect(target).map_or(0, |n| self.clip_tree.depth(n.clip))
     }
 
     /// The draws of a chunk's path or curve glyph moved by `off`, drawn this frame.
@@ -2397,7 +2710,7 @@ impl GpuRenderer {
         );
         let stride = usize::try_from(self.uniform_stride).unwrap_or(256);
         let mut globals = Vec::new();
-        let mut block = |size: (u32, u32), origin: (i32, i32), to_canvas: [f32; 6]| {
+        let mut block = |size: (u32, u32), origin: (i32, i32), to_canvas: [f32; 6], stop: u32| {
             let mut b = vec![0_u8; stride];
             let [a, b_, c, d, e, f] = to_canvas;
             let block = super::contract::Globals {
@@ -2409,7 +2722,8 @@ impl GpuRenderer {
                 bases,
                 to_canvas: [a, b_, c, d],
                 to_canvas_t: [e, f],
-                pad: [0.0; 2],
+                stop,
+                grid: u32::from(super::clips::own_grid(Some(to_canvas))),
             };
             for (d, v) in b.iter_mut().zip(bytemuck::bytes_of(&block)) {
                 *d = *v;
@@ -2417,11 +2731,11 @@ impl GpuRenderer {
             globals.extend(b);
         };
         for pass in passes {
-            block(pass.size, pass.origin, pass.to_canvas);
+            block(pass.size, pass.origin, pass.to_canvas, pass.stop);
         }
         // The icon coverage pages' passes, after the frame's.
         let side = self.mono.side();
-        block((side, side), (0, 0), IDENTITY);
+        block((side, side), (0, 0), IDENTITY, 0);
         if globals != self.globals_shown {
             self.globals.write(device, queue, &globals);
             bytes = bytes.saturating_add(u64::try_from(globals.len()).unwrap_or(0));
@@ -2906,6 +3220,7 @@ impl GpuRenderer {
                 &[PassPlan {
                     target: PassTarget::External,
                     to_canvas: IDENTITY,
+                    stop: 0,
                     origin: (0, 0),
                     size: (64, 64),
                     clear: Some(wgpu::Color::WHITE),

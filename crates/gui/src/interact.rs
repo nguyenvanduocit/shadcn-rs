@@ -10,8 +10,10 @@ use std::collections::HashSet;
 use accesskit::{Action, ActionData, ActionRequest};
 
 use crate::access;
+use crate::compositor::motion;
 use crate::edit::TextField;
 use crate::element::{InputMode, InputType};
+use crate::engine::{Commit, Owned};
 use crate::events::{
     ClickEvent, DragEvent, DragPhase, ImeEvent, Key, KeyEvent, Modifiers, NamedKey, PointerId, TouchEvent, TouchPhase,
 };
@@ -67,15 +69,18 @@ pub struct Interaction(u64);
 /// for that flag alone, through `bound`.
 #[derive(Clone)]
 pub(crate) struct NodeFlags {
-    hovered: Signal<bool>,
-    pressed: Signal<bool>,
-    focused: Signal<bool>,
-    focus_visible: Signal<bool>,
-    focus_within: Signal<bool>,
-    disabled: Signal<bool>,
-    /// The handle bound to them, shared by every copy.
-    bound: std::rc::Rc<std::cell::Cell<Option<Interaction>>>,
+    hovered: Owned<bool>,
+    pressed: Owned<bool>,
+    focused: Owned<bool>,
+    focus_visible: Owned<bool>,
+    focus_within: Owned<bool>,
+    disabled: Owned<bool>,
+    /// The handle bound to them, shared by every copy: the world's that
+    /// made the flags (a check binds none of the live ones, review r18).
+    bound: std::rc::Rc<crate::engine::WorldCell<Option<Interaction>>>,
 }
+
+crate::engine::fork_clone_by_clone!(NodeFlags);
 
 impl PartialEq for NodeFlags {
     fn eq(&self, other: &Self) -> bool {
@@ -129,56 +134,27 @@ impl Flag {
     }
 }
 
-/// What the handles of this thread are bound to. A cold frame forks it by
-/// undo log: its maps log the keys written, its scalars are kept whole.
-#[derive(Default)]
-struct Handles {
-    /// The last number handed out.
-    last: u64,
-    bound: crate::engine::ForkMap<u64, NodeFlags>,
-    /// Handles read before they were bound, outside a render, each with
-    /// when it was first read (the oldest goes past [`EARLY`]); and what
-    /// those readers subscribed to: bumped when one of them is bound.
-    early: crate::engine::ForkMap<u64, u64>,
-    reads: u64,
-    bind: Option<Signal<u64>>,
-    /// The scalars as they were when a cold frame began.
-    #[cfg(debug_assertions)]
-    was: Option<(u64, u64, Option<Signal<u64>>)>,
-}
+/// The handles made, numbered ([`crate::engine::unique_id`]): a number a
+/// fork hands out is never handed out again live.
+static INTERACTIONS: crate::engine::IdKind = crate::engine::IdKind::new("interaction");
 
-impl crate::engine::Logged for Handles {
-    fn begin(&mut self) {
-        #[cfg(debug_assertions)]
-        {
-            self.was = Some((self.last, self.reads, self.bind));
-            crate::engine::fork_work(1);
-        }
-        self.bound.begin();
-        self.early.begin();
-    }
-
-    fn drain(&mut self) -> Box<dyn std::any::Any> {
-        Box::new((self.bound.drain(), self.early.drain()))
-    }
-
-    fn rollback(&mut self) -> Box<dyn std::any::Any> {
-        #[cfg(debug_assertions)]
-        if let Some((last, reads, bind)) = self.was.take() {
-            self.last = last;
-            self.reads = reads;
-            self.bind = bind;
-        }
-        Box::new((self.bound.rollback(), self.early.rollback()))
-    }
-}
-
+// What the handles of this thread are bound to: a piece each, so a cold
+// frame forks each by its own policy (its maps by overlay, its scalars
+// whole) and no composite log needs a mutable path to its maps (ADR-0034,
+// S7: a logged map is written through its overlay API alone).
 crate::engine::engine_local! {
-    [Fork(log)] static HANDLES: std::cell::RefCell<Handles> = std::cell::RefCell::default();
-    /// Where the pointer is over the window, as [`pointer_position`] reads it.
-    [Shared("a handle made live; the value is the reactive arena's, which forks")] static POINTER: Signal<Option<(f32, f32)>> = crate::reactive::detached(|| Signal::labeled("pointer", None));
-    /// Whether the window has the keyboard focus, as [`window_active`] reads it.
-    [Shared("a handle made live; the value is the reactive arena's, which forks")] static ACTIVE: Signal<bool> = crate::reactive::detached(|| Signal::labeled("window active", true));
+    /// The flags each handle is bound to.
+    [Fork(log)] static BOUND: std::cell::RefCell<crate::engine::ForkMap<u64, NodeFlags>> =
+        std::cell::RefCell::default();
+    /// Handles read before they were bound, outside a render, each with
+    /// when it was first read (the oldest goes past [`EARLY`]).
+    [Fork(log)] static EARLY_READ: std::cell::RefCell<crate::engine::ForkMap<u64, u64>> =
+        std::cell::RefCell::default();
+    /// The clock dating [`EARLY_READ`]'s reads.
+    [Fork] static READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// What the early readers subscribed to: bumped when one of them is
+    /// bound.
+    [Fork] static BIND: std::cell::Cell<Option<Signal<u64>>> = const { std::cell::Cell::new(None) };
     /// The drag handler running now claimed its pointer's press
     /// ([`claim_press`]); read and cleared around each drag event.
     [Fork] static CLAIMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -199,17 +175,14 @@ pub fn claim_press() {
 /// `pauseOnWindowBlur`), a drag ends where it is when it loses it.
 #[must_use]
 pub fn window_active() -> bool {
-    ACTIVE.with(Signal::get)
+    crate::focus::window_signals().active.get()
 }
 
 /// Record whether the window has the keyboard focus, written only when it
 /// changed (the platform's focus event, a scenario's [`crate::app::Scenario::set_window_active`]).
-pub(crate) fn set_window_active(active: bool) {
-    ACTIVE.with(|a| {
-        if a.get_untracked() != active {
-            a.set(active);
-        }
-    });
+pub(crate) fn set_window_active(t: &crate::engine::Turn, active: bool) {
+    let a = crate::focus::window_signals().active;
+    crate::engine::commit(t, |c| a.put(active, c));
 }
 
 /// Where the pointer is over the window, in window pixels, `None` while it
@@ -218,16 +191,19 @@ pub(crate) fn set_window_active(active: bool) {
 /// both (reka's `pointermove` on the document).
 #[must_use]
 pub fn pointer_position() -> Option<(f32, f32)> {
-    POINTER.with(Signal::get)
+    crate::focus::window_signals().pointer.get()
 }
 
 /// Record where the pointer is, written only when it moved.
 fn track_pointer(at: Option<(f32, f32)>) {
-    POINTER.with(|p| {
-        if p.get_untracked() != at {
-            p.set(at);
-        }
-    });
+    let p = crate::focus::window_signals().pointer;
+    crate::engine::commit_here(|c| p.put(at, c));
+}
+
+/// The user acts by `m` now, as the input that shows it comes in, before
+/// any handler of it runs.
+fn acts_by(m: Modality) {
+    crate::engine::commit_here(|c| focus::set_modality(m, c));
 }
 
 /// How many handles read before they were bound are remembered.
@@ -339,7 +315,7 @@ fn on_control(frame: &Frame, chain: &[usize], drag: usize) -> bool {
 /// Whether scroll container `i` can still scroll by `pan` along the axis
 /// the pan mostly goes (down and right positive).
 fn can_scroll_toward(frame: &Frame, i: usize, pan: (f32, f32)) -> bool {
-    let Some(s) = frame.nodes.get(i).and_then(|n| n.scroll) else {
+    let Some(s) = frame.nodes.get(i).and_then(laid_scroll) else {
         return false;
     };
     let (d, offset, max) = if pan.1.abs() >= pan.0.abs() {
@@ -351,7 +327,7 @@ fn can_scroll_toward(frame: &Frame, i: usize, pan: (f32, f32)) -> bool {
 }
 
 /// A flag, tracked; off once its node has gone.
-fn read(flag: Signal<bool>) -> bool {
+fn read(flag: Owned<bool>) -> bool {
     flag.is_alive() && flag.get()
 }
 
@@ -365,17 +341,13 @@ impl Interaction {
     /// A handle bound to no node yet: every flag off.
     #[must_use]
     pub fn new() -> Self {
-        HANDLES.with(|h| {
-            let mut h = h.borrow_mut();
-            h.last = h.last.saturating_add(1);
-            Self(h.last)
-        })
+        Self(crate::engine::unique_id(&INTERACTIONS))
     }
 
     /// Whether a node's flags are bound to it (a cold layout binds only
     /// the handles no live node holds: those its own renders made).
     pub(crate) fn is_bound(self) -> bool {
-        HANDLES.with(|h| h.borrow().bound.contains_key(&self.0))
+        BOUND.with_borrow(|b| b.contains_key(&self.0))
     }
 
     /// The flags it is bound to; unbound, `None`, and a reader outside a
@@ -393,7 +365,7 @@ impl Interaction {
     /// `flag` as it is now, untracked (a source's mount, woken through
     /// [`Self::sources`], not by its binding): one lookup.
     pub(crate) fn peek(self, flag: Flag) -> bool {
-        let signal = HANDLES.with(|h| h.borrow().bound.get(&self.0).map(|f| f.signal(flag)));
+        let signal = BOUND.with_borrow(|b| b.get(&self.0).map(|f| f.signal(flag)));
         signal.is_some_and(|s| s.is_alive() && s.get_untracked())
     }
 
@@ -410,31 +382,32 @@ impl Interaction {
     /// The flags it is bound to, and, unbound and read outside a render,
     /// what is written when it is bound (it is recorded as read early).
     fn lookup(self) -> (Option<NodeFlags>, Option<Signal<u64>>) {
-        HANDLES.with(|h| {
-            let mut h = h.borrow_mut();
-            if let Some(f) = h.bound.get(&self.0) {
-                return (Some(f.clone()), None);
-            }
-            if crate::reactive::phase() == crate::reactive::Phase::Render {
-                return (None, None);
-            }
-            if !h.early.contains_key(&self.0) {
+        if let Some(f) = BOUND.with_borrow(|b| b.get(&self.0).cloned()) {
+            return (Some(f), None);
+        }
+        if crate::reactive::phase() == crate::reactive::Phase::Render {
+            return (None, None);
+        }
+        EARLY_READ.with_borrow_mut(|early| {
+            if !early.contains_key(&self.0) {
                 // A handle read early and never bound (its node never came)
                 // goes once others are.
-                if h.early.len() >= EARLY
-                    && let Some(oldest) = h.early.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k)
+                if early.len() >= EARLY
+                    && let Some(oldest) = early.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k)
                 {
-                    h.early.remove(&oldest);
+                    early.remove(&oldest);
                 }
-                h.reads = h.reads.wrapping_add(1);
-                let at = h.reads;
-                h.early.insert(self.0, at);
+                let at = READS.get().wrapping_add(1);
+                READS.set(at);
+                early.insert(self.0, at);
             }
-            let bind = *h
-                .bind
-                .get_or_insert_with(|| crate::reactive::detached(|| Signal::new(0_u64)));
-            (None, Some(bind))
-        })
+        });
+        let bind = BIND.get().unwrap_or_else(|| {
+            let made = crate::reactive::detached(|| Signal::new(0_u64));
+            BIND.set(Some(made));
+            made
+        });
+        (None, Some(bind))
     }
 
     /// The pointer is over the node or one of its descendants, and the node
@@ -496,16 +469,17 @@ impl NodeInteraction {
     pub(crate) fn bind(&mut self, handle: Interaction) -> NodeFlags {
         let flags = self
             .flags
-            .get_or_insert_with(|| {
-                crate::reactive::detached(|| NodeFlags {
-                    hovered: Signal::new(false),
-                    pressed: Signal::new(false),
-                    focused: Signal::new(false),
-                    focus_visible: Signal::new(false),
-                    focus_within: Signal::new(false),
-                    disabled: Signal::new(false),
-                    bound: std::rc::Rc::default(),
-                })
+            .get_or_insert_with(|| NodeFlags {
+                hovered: Owned::labeled("hovered", false),
+                pressed: Owned::labeled("pressed", false),
+                focused: Owned::labeled("focused", false),
+                focus_visible: Owned::labeled("focus visible", false),
+                focus_within: Owned::labeled("focus within", false),
+                disabled: Owned::labeled("disabled", false),
+                bound: std::rc::Rc::new(crate::engine::WorldCell::new(
+                    "the handle bound to a node's flags",
+                    None,
+                )),
             })
             .clone();
         if self.bound != Some(handle) {
@@ -515,18 +489,19 @@ impl NodeInteraction {
             if !cold {
                 flags.bound.set(Some(handle));
             }
-            let bumped = HANDLES.with(|h| {
-                let mut h = h.borrow_mut();
+            BOUND.with_borrow_mut(|b| {
                 // The node it named before (given to two, it names the
                 // last) writes it no more.
-                if let Some(was) = h.bound.insert(handle.0, flags.clone())
+                if let Some(was) = b.insert(handle.0, flags.clone())
                     && was != flags
                     && !cold
                 {
                     was.bound.set(None);
                 }
-                h.early.remove(&handle.0).map(|_| h.bind)
             });
+            let bumped = EARLY_READ
+                .with_borrow_mut(|early| early.remove(&handle.0))
+                .map(|_| BIND.get());
             // Who read it before it was bound reads it again (a closure,
             // through the signal); its sources read the node it names now.
             if let Some(Some(bind)) = bumped
@@ -563,12 +538,12 @@ impl NodeInteraction {
             return;
         };
         // The thread may be ending (its handles with it).
-        let unbound = HANDLES
-            .try_with(|h| {
-                if let Ok(mut h) = h.try_borrow_mut()
-                    && h.bound.get(&handle.0) == Some(flags)
+        let unbound = BOUND
+            .try_with(|b| {
+                if let Ok(mut b) = b.try_borrow_mut()
+                    && b.get(&handle.0) == Some(flags)
                 {
-                    h.bound.remove(&handle.0);
+                    b.remove(&handle.0);
                     return true;
                 }
                 false
@@ -594,39 +569,37 @@ impl NodeFlags {
     /// Write the flags that differ from `flags` (the layout tree, building
     /// the node).
     pub(crate) fn write(&self, flags: Flags) {
-        let changed = crate::reactive::batch(|| {
-            self.put(Flag::Hovered, flags.hovered)
-                | self.put(Flag::Pressed, flags.pressed)
-                | self.put(Flag::Focused, flags.focused)
-                | self.put(Flag::FocusVisible, flags.focus_visible)
-                | self.put(Flag::FocusWithin, flags.focus_within)
-                | self.put(Flag::Disabled, flags.disabled)
+        let changed = crate::engine::commit_here(|c| {
+            self.put(Flag::Hovered, flags.hovered, c)
+                | self.put(Flag::Pressed, flags.pressed, c)
+                | self.put(Flag::Focused, flags.focused, c)
+                | self.put(Flag::FocusVisible, flags.focus_visible, c)
+                | self.put(Flag::FocusWithin, flags.focus_within, c)
+                | self.put(Flag::Disabled, flags.disabled, c)
         });
         self.wake(changed);
     }
 
     /// Hit testing: the pointer came over the node or left it.
-    pub(crate) fn set_hovered(&self, on: bool) {
-        self.wake(self.put(Flag::Hovered, on));
+    pub(crate) fn set_hovered(&self, on: bool, c: &Commit) {
+        self.wake(self.put(Flag::Hovered, on, c));
     }
 
     /// Hit testing: the button went down on the node or came up.
-    pub(crate) fn set_pressed(&self, on: bool) {
-        self.wake(self.put(Flag::Pressed, on));
+    pub(crate) fn set_pressed(&self, on: bool, c: &Commit) {
+        self.wake(self.put(Flag::Pressed, on, c));
     }
 
     /// Focus moved, or came to show or hide.
-    pub(crate) fn set_focus(&self, focused: bool, visible: bool, within: bool) {
-        let changed = crate::reactive::batch(|| {
-            self.put(Flag::Focused, focused)
-                | self.put(Flag::FocusVisible, visible)
-                | self.put(Flag::FocusWithin, within)
-        });
+    pub(crate) fn set_focus(&self, focused: bool, visible: bool, within: bool, c: &Commit) {
+        let changed = self.put(Flag::Focused, focused, c)
+            | self.put(Flag::FocusVisible, visible, c)
+            | self.put(Flag::FocusWithin, within, c);
         self.wake(changed);
     }
 
     /// The signal of `flag`.
-    const fn signal(&self, flag: Flag) -> Signal<bool> {
+    const fn signal(&self, flag: Flag) -> Owned<bool> {
         match flag {
             Flag::Hovered => self.hovered,
             Flag::Pressed => self.pressed,
@@ -638,8 +611,8 @@ impl NodeFlags {
     }
 
     /// Write `on` to `flag`; its bit when that changed it, else 0.
-    fn put(&self, flag: Flag, on: bool) -> u8 {
-        if put(self.signal(flag), on) { flag.bit() } else { 0 }
+    fn put(&self, flag: Flag, on: bool, c: &Commit) -> u8 {
+        if self.signal(flag).put(on, c) { flag.bit() } else { 0 }
     }
 
     /// The sources of the handle bound to them registered for any of
@@ -663,16 +636,6 @@ impl NodeFlags {
             s.dispose_quietly();
         }
     }
-}
-
-/// Write `on` to `flag` if it holds something else and still lives;
-/// whether it wrote.
-fn put(flag: Signal<bool>, on: bool) -> bool {
-    let differs = flag.is_alive() && flag.get_untracked() != on;
-    if differs {
-        flag.set(on);
-    }
-    differs
 }
 
 /// The value of each of an [`Interaction`]'s flags.
@@ -721,8 +684,9 @@ struct Held {
     path: NodePath,
     /// The instance that made it ([`owner_of`]).
     owner: Option<crate::reactive::OwnerId>,
-    /// The frame epoch and index it was last found at.
-    at: std::cell::Cell<(u64, usize)>,
+    /// The frame epoch and index it was last found at: the world's that
+    /// made it, a check finding a live one keeps nothing (ADR-0034, S7).
+    at: crate::engine::WorldCell<(u64, usize)>,
 }
 
 impl Held {
@@ -732,13 +696,14 @@ impl Held {
         Some(Self {
             path: n.path.clone(),
             owner: owner_of(frame, i),
-            at: std::cell::Cell::new((frame.epoch(), i)),
+            at: crate::engine::WorldCell::new("where a held node was last found", (frame.epoch(), i)),
         })
     }
 
     /// Its index in `frame`, if `frame` holds it. Looked for once per
     /// rebuild of the frame: while nodes are only written in place it is
-    /// where (or, gone, as absent as) it was last found.
+    /// where (or, gone, as absent as) it was last found; after one, by its
+    /// key in the frame's index ([`NODES`]), not a walk of the frame.
     fn find(&self, frame: &Frame) -> Option<usize> {
         const GONE: usize = usize::MAX;
         let (epoch, i) = self.at.get();
@@ -750,9 +715,16 @@ impl Held {
         let found = if here(i) {
             Some(i)
         } else {
-            (0..frame.nodes.len()).find(|&i| here(i))
+            let key = crate::compositor::NodeKey::of(&self.path);
+            NODES.with(|n| {
+                let mut n = n.borrow_mut();
+                n.refresh(frame);
+                n.keyed(key, here)
+            })
         };
-        self.at.set((frame.epoch(), found.unwrap_or(GONE)));
+        if self.at.is_here() {
+            self.at.set((frame.epoch(), found.unwrap_or(GONE)));
+        }
         found
     }
 }
@@ -774,7 +746,8 @@ pub(crate) fn owner_of(frame: &Frame, i: usize) -> Option<crate::reactive::Owner
 struct Grip<E> {
     node: Held,
     handler: crate::element::Handler<E>,
-    bounds: Bounds,
+    /// Its box as the frame shown last showed it ([`Shown::bounds`]).
+    shown_box: Bounds,
     /// The nodes captured with it ([`crate::Div::capture_group`]).
     group: Option<crate::events::CaptureGroup>,
 }
@@ -791,12 +764,13 @@ fn touch_of(b: &Behaviour) -> Option<&crate::element::Handler<TouchEvent>> {
 }
 
 impl<E> Grip<E> {
-    /// Node `i` of `frame` and its handler `pick` finds.
-    fn of(frame: &Frame, i: usize, pick: Pick<E>) -> Option<Self> {
+    /// Node `i` of `frame` and its handler `pick` finds, its box as
+    /// `shown` showed it ([`Shown::bounds`]).
+    fn of(frame: &Frame, shown: &Shown, i: usize, pick: Pick<E>) -> Option<Self> {
         let b = frame.behaviour(i)?;
         Some(Self {
             handler: std::rc::Rc::clone(pick(b)?),
-            bounds: frame.nodes.get(i)?.bounds,
+            shown_box: shown.bounds(i),
             node: Held::of(frame, i)?,
             group: b.handlers.capture_group,
         })
@@ -811,22 +785,22 @@ impl<E> Grip<E> {
     /// Its node's index in `frame` while it still takes the gesture: there,
     /// neither disabled nor unavailable (the test a gesture starts by,
     /// [`Reach::runs_on`]), and with a handler of its kind, which it keeps,
-    /// with its box as `frame` has it. `None` once it does not: the
+    /// with its box as `shown` showed it. `None` once it does not: the
     /// gesture is cancelled.
-    fn live(&mut self, frame: &Frame, pick: Pick<E>) -> Option<usize> {
+    fn live(&mut self, frame: &Frame, shown: &Shown, pick: Pick<E>) -> Option<usize> {
         let i = self.node.find(frame)?;
-        self.bounds = frame.nodes.get(i)?.bounds;
+        self.shown_box = shown.bounds(i);
         let b = frame.behaviour(i).filter(|b| b.takes_clicks())?;
         self.handler = std::rc::Rc::clone(pick(b)?);
         Some(i)
     }
 
-    /// Its node's box as `frame` has it, or, gone, as it was last found.
-    fn bounds_in(&mut self, frame: &Frame) -> Bounds {
-        if let Some(n) = self.node.find(frame).and_then(|i| frame.nodes.get(i)) {
-            self.bounds = n.bounds;
+    /// Its node's box as `shown` showed it, or, gone, as it was last found.
+    fn bounds_in(&mut self, frame: &Frame, shown: &Shown) -> Bounds {
+        if let Some(i) = self.node.find(frame) {
+            self.shown_box = shown.bounds(i);
         }
-        self.bounds
+        self.shown_box
     }
 
     /// What the log calls its node in `frame`: as the frame has it, or by
@@ -889,7 +863,15 @@ struct Pointer {
     /// The container a contact's pan latched to: its own, which no other
     /// contact going down or lifting ends.
     latch: crate::compositor::WheelGesture<Held>,
+    /// Its press's number, new for each pointer that goes down: its pan's
+    /// gesture identity ([`crate::compositor::WheelStep::gesture`]), an
+    /// identity alone, never an order.
+    press: u64,
 }
+
+/// Where presses take their numbers ([`Pointer::press`]): an identity, so
+/// from the source a fork does not roll back (ADR-0028).
+static PRESSES: crate::engine::IdKind = crate::engine::IdKind::new("press");
 
 impl Pointer {
     fn new(id: PointerId, kind: PointerKind, at: (f32, f32)) -> Self {
@@ -911,6 +893,7 @@ impl Pointer {
             panning: false,
             long: false,
             latch: crate::compositor::WheelGesture::default(),
+            press: crate::engine::unique_id(&PRESSES),
         }
     }
 
@@ -943,6 +926,9 @@ fn claiming(f: impl FnOnce()) -> bool {
     mine
 }
 
+/// A node's hover handler, told whether the pointer is over it.
+type HoverHandler = std::rc::Rc<dyn Fn(bool)>;
+
 /// The window's input state that lives between frames: hover, the pointers
 /// down, focus.
 #[derive(Default)]
@@ -961,33 +947,38 @@ pub struct InputState {
     /// What the screen shows, as last known ([`Self::show`]): input lands
     /// where it shows each node, and a frame compares against it.
     shown: Option<std::sync::Arc<crate::compositor::Presented>>,
-    /// What it moved, scrolled and turned, by node, made once as it is
-    /// shown rather than searched for each node of each input.
-    shown_by_key: ShownIndex,
+    /// Its boxes by node, made once per hit table rather than searched for
+    /// each node of each input ([`Shown`]).
+    hit_keys: HitKeys,
+    /// While one input is routed in another frame than the one on screen
+    /// ([`Self::route_in`]): the frame on screen and its boxes by node,
+    /// set aside for that dispatch. Hover and the cursor read the frame on
+    /// screen alone; only the dispatch reads the one routed in.
+    screen: Option<(Option<std::sync::Arc<crate::compositor::Presented>>, HitKeys)>,
+    /// The buffer of the boxes by node the last such dispatch made, kept.
+    routed_keys: HitKeys,
+    /// What the input method's area last worked out of the focused field's
+    /// text, kept while the screen shows the same record of it.
+    ime_text: Option<ImeText>,
     /// The scroll container the wheel's gesture under way latched to, by
     /// the compositor's rules ([`crate::compositor::WheelGesture`]); a
     /// contact's pan keeps its own ([`Pointer::latch`]).
     scroll_latch: crate::compositor::WheelGesture<Held>,
+    /// That gesture's motion as the UI routed it (its recent events, its
+    /// lift), handed with its latch ([`Self::hand_gesture`]).
+    scroll_motion: crate::compositor::GestureMotion,
     /// When a drag selecting in a text field held past its edge last
     /// scrolled it ([`Self::autoscroll`]).
     autoscrolled: Option<std::time::Duration>,
     /// The wakeup it queued for its next step, cancelled when it stops.
     autoscroll_timer: Option<crate::clock::TimerId>,
-    /// How far each node of the frame last taken in shows from where it
-    /// was laid out ([`Self::take_in`], ADR-0015: the compositor scrolled
-    /// or moved it since); empty when nothing does. What its children are
-    /// moved by is kept beside it, so taking a frame in allocates nothing.
-    shift: Vec<(f32, f32)>,
-    shift_inner: Vec<(f32, f32)>,
-    /// What undoes, for each node of the frame last taken in, the scales
-    /// and turns it and its ancestors show at (the frame's, or the
-    /// compositor's as it sampled a moving node's): a point on screen to
-    /// where the node lies before them. `None` for a node under one that
-    /// does not invert (a scale of 0): it takes no pointer. Empty when no
-    /// node scales or turns.
-    undo: Vec<Option<Affine>>,
     /// The scroll handles the last main frame gave a reach (ADR-0015).
     reaching: Vec<ScrollHandle>,
+    /// The frame's scroll containers by key: what a compositor delta finds
+    /// its container in ([`Self::take_scroll`]).
+    scrollers: ScrollIndex,
+    /// The containers the last compositor deltas moved, kept as room.
+    scrolled: Vec<usize>,
     /// What placing text fields last said of their scroll, swapped with
     /// the layout's own list each settle ([`LayoutTree::swap_fields`]).
     fields: Vec<crate::layout::FieldSettled>,
@@ -1003,6 +994,9 @@ pub struct InputState {
     /// Room for a chain of nodes, kept so a pointer move allocates nothing.
     chain: Vec<usize>,
     was: Vec<usize>,
+    /// The hover handlers a change tells, gathered after the change is
+    /// written ([`Self::commit_hover`]); kept so a move allocates nothing.
+    told: Vec<(HoverHandler, bool)>,
     /// The layers of the frame input goes to (ADR-0024).
     layers: Stack,
     /// The open focus scopes.
@@ -1130,118 +1124,326 @@ fn label(frame: &Frame, i: usize) -> String {
         .unwrap_or_default()
 }
 
-/// A map of the plane: `(x, y)` to `(a·x + c·y + e, b·x + d·y + f)`.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Affine([f32; 6]);
+pub(crate) mod shown;
+use shown::{HitKeys, Shown, ShownField, laid_bounds, laid_content_box, laid_scroll, painted, shown_node};
 
-impl Affine {
-    const IDENTITY: Self = Self([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-
-    fn apply(self, (x, y): (f32, f32)) -> (f32, f32) {
-        let [a, b, c, d, e, f] = self.0;
-        (a * x + c * y + e, b * x + d * y + f)
-    }
-
-    /// This map, then `next`.
-    fn then(self, next: Self) -> Self {
-        let [a, b, c, d, e, f] = self.0;
-        let [na, nb, nc, nd, ne, nf] = next.0;
-        Self([
-            na * a + nc * b,
-            nb * a + nd * b,
-            na * c + nc * d,
-            nb * c + nd * d,
-            na * e + nc * f + ne,
-            nb * e + nd * f + nf,
-        ])
-    }
-
-    /// The map that undoes this one; `None` when none does.
-    fn inverse(self) -> Option<Self> {
-        let [a, b, c, d, e, f] = self.0;
-        let det = a * d - b * c;
-        if !det.is_finite() || det.abs() < 1e-12 {
-            return None;
-        }
-        let (na, nb, nc, nd) = (d / det, -b / det, -c / det, a / det);
-        Some(Self([na, nb, nc, nd, -(na * e + nc * f), -(nb * e + nd * f)]))
-    }
-
-    /// What undoes scaling by `t.scale` and turning by `t.rotate` about
-    /// `origin`; `None` when nothing does (a scale of 0 folds the plane
-    /// onto a point).
-    fn undoing(t: &crate::style::Painted, origin: (f32, f32)) -> Option<Self> {
-        if !t.scale.is_finite() || t.scale.abs() < 1e-6 {
-            return None;
-        }
-        let (sin, cos) = t.rotate.to_radians().sin_cos();
-        let k = t.scale.recip();
-        let (a, b, c, d) = (cos * k, -sin * k, sin * k, cos * k);
-        let (ox, oy) = origin;
-        Some(Self([a, b, c, d, ox - (a * ox + c * oy), oy - (b * ox + d * oy)]))
-    }
+/// The part of the input method's area a field's shown text alone decides
+/// ([`InputState::ime_target`]), kept by the record it was worked out of.
+/// A record is shared, unchanged, by every frame that shows the field the
+/// same, and a new one is made when its text, caret, selection,
+/// composition, box or type changes: so the same record (held weakly, its
+/// address never another's) means the same answer, and a 20k-line field
+/// that shows unchanged is laid out once, not on every wake. The text
+/// settings ([`crate::text::settings::TextSettings`], reloaded as the window regains
+/// focus) are not part of the key: they decide only how glyphs rasterize
+/// (antialiasing, subpixel order, gamma, stem darkening, read by the
+/// renderer alone), never where text or its caret lies.
+struct ImeText {
+    record: std::sync::Weak<crate::compositor::ShownText>,
+    focus: FocusId,
+    /// Where its text sits from its box's corner, unscrolled.
+    rel: (f32, f32),
+    /// Its caret with the composition, or the selection on the caret's
+    /// line, in its text.
+    caret: Bounds,
 }
 
-/// The scale and turn node `n` shows at, when it scales or turns: as the
-/// frame shown (`shown`, the one the input came under) sampled it, when
-/// it did, whether or not the node still moves in the frame now (an
-/// animation the UI ended after that frame was shown still showed there);
-/// else as the frame painted it.
-fn turn_of(n: &crate::layout::FrameNode, shown: Option<&ShownIndex>) -> Option<crate::style::Painted> {
-    let sampled = shown.and_then(|s| ShownIndex::find(&s.turned, crate::compositor::NodeKey::of(&n.path)));
-    Some(sampled.unwrap_or(n.look.transform)).filter(|t| !t.is_identity())
+/// Lays out `field`'s text as it showed and works out [`ImeText::rel`]
+/// and [`ImeText::caret`].
+fn ime_text_of(text: &mut TextSystem, field: &ShownField) -> ((f32, f32), Bounds) {
+    let (content, area) = (&field.content, field.area);
+    let it = input_text(
+        text,
+        content,
+        &field.text,
+        area,
+        field.multiline,
+        field.focused,
+        (0.0, 0.0),
+    );
+    let caret = text.caret(content, &it.t, it.width, field.caret);
+    let (from, to, composing) = match field.preedit {
+        Some((a, b)) => (a, b, true),
+        None => (field.selection.0, field.selection.1, false),
+    };
+    let mut bounds = Bounds {
+        x: caret.x,
+        y: caret.y,
+        width: 0.0,
+        height: caret.height,
+    };
+    for b in text.selection(&**content, &it.t, it.width, from, to) {
+        // All of a composition; of a selection, its part on the caret's line.
+        if composing || (b.y - caret.y).abs() < 0.5 {
+            bounds = union(bounds, b);
+        }
+    }
+    ((it.origin.0 - area.x, it.origin.1 - area.y), bounds)
 }
 
-/// A scroll container's offset as shown: the instance it is, and the offset.
-type ShownOffset = (Option<crate::reactive::OwnerId>, (f32, f32));
+#[cfg(test)]
+crate::engine::engine_local! {
+    /// Frame nodes the input side's indexes looked at on this thread
+    /// ([`ScrollIndex`], the layer stack's refresh).
+    [Fork] static SCROLL_INDEX_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
-/// A frame shown's moves, scrolls and turns ([`crate::compositor::Presented`]),
-/// each sorted by node key: found by a binary search per node, made once
-/// per frame shown, its buffers kept.
+/// Frame nodes the input side's indexes looked at on this thread so far.
+#[cfg(test)]
+pub(crate) fn index_visits() -> u64 {
+    SCROLL_INDEX_VISITS.with(std::cell::Cell::get)
+}
+
+/// One frame node looked at by an index the input side keeps of a frame
+/// ([`ScrollIndex`], [`crate::layer::Stack`]): counted in tests, so a
+/// cost test sees every walk on its path.
+pub(crate) fn visited() {
+    #[cfg(test)]
+    SCROLL_INDEX_VISITS.with(|n| n.set(n.get().saturating_add(1)));
+}
+
+/// A frame's scroll containers (those with an offset: containers and
+/// text fields) by node key, sorted: a compositor delta finds its
+/// container by a binary search. Kept up to date from what the frame says
+/// changed since it last read it ([`Frame::changes`]): a frame written in
+/// place costs what was written, one rebuilt a walk of its nodes (as the
+/// rebuild walked them), and taking in a delta costs no walk at all.
 #[derive(Default)]
-struct ShownIndex {
-    moved: Vec<(crate::compositor::NodeKey, (f32, f32))>,
-    /// Each scroll container's applied offset, with the instance it is
-    /// (its identity, with the key).
-    scroll: Vec<(crate::compositor::NodeKey, ShownOffset)>,
-    turned: Vec<(crate::compositor::NodeKey, crate::style::Painted)>,
+struct ScrollIndex {
+    read: crate::layout::ReadAt,
+    by_key: Vec<(crate::compositor::NodeKey, usize)>,
 }
 
-impl ShownIndex {
-    /// What `shown` shows (nothing for the frame as laid out).
-    fn fill(&mut self, shown: Option<&crate::compositor::Presented>) {
-        self.moved.clear();
-        self.scroll.clear();
-        self.turned.clear();
-        let Some(shown) = shown else { return };
-        self.moved.extend_from_slice(&shown.moved);
-        self.scroll
-            .extend(shown.scroll.iter().map(|s| (s.key, (s.owner, s.applied))));
-        self.turned.extend_from_slice(&shown.turned);
-        self.moved.sort_unstable_by_key(|e| e.0);
-        self.scroll.sort_unstable_by_key(|e| e.0);
-        self.turned.sort_unstable_by_key(|e| e.0);
-    }
-
-    fn find<T: Copy>(v: &[(crate::compositor::NodeKey, T)], key: crate::compositor::NodeKey) -> Option<T> {
-        let i = v.binary_search_by_key(&key, |e| e.0).ok()?;
-        v.get(i).map(|e| e.1)
-    }
-}
-
-/// `p` on screen where `frame` lays node `i` out, each scale and turn on
-/// it and its ancestors undone (outermost first, composed from the node
-/// up: nothing is allocated); `None` under a scale of 0.
-fn frame_to_node(frame: &Frame, i: usize, p: (f32, f32)) -> Option<(f32, f32)> {
-    let mut undo = Affine::IDENTITY;
-    for a in frame.ancestors(i) {
-        let Some(n) = frame.nodes.get(a) else { continue };
-        if let Some(t) = turn_of(n, None) {
-            let origin = (n.bounds.x + t.origin.0, n.bounds.y + t.origin.1);
-            undo = Affine::undoing(&t, origin)?.then(undo);
+impl ScrollIndex {
+    /// Bring it up to `frame`.
+    fn refresh(&mut self, frame: &Frame) {
+        use crate::compositor::NodeKey;
+        match frame.changes.since(&mut self.read) {
+            crate::layout::Since::Logged(log) => {
+                for c in log {
+                    let Ok(i) = usize::try_from(c.index) else { continue };
+                    visited();
+                    // Written in place: the node is the one it was (its
+                    // path too), only whether it scrolls may have changed.
+                    let Some(n) = frame.nodes.get(i) else { continue };
+                    let entry = (NodeKey::of(&n.path), i);
+                    match (self.by_key.binary_search(&entry), laid_scroll(n).is_some()) {
+                        (Err(at), true) => self.by_key.insert(at, entry),
+                        (Ok(at), false) => {
+                            self.by_key.remove(at);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            crate::layout::Since::Rebuilt | crate::layout::Since::FellBehind => {
+                self.by_key.clear();
+                for (i, n) in frame.nodes.iter().enumerate() {
+                    visited();
+                    if laid_scroll(n).is_some() {
+                        self.by_key.push((NodeKey::of(&n.path), i));
+                    }
+                }
+                self.by_key.sort_unstable();
+            }
         }
     }
-    Some(undo.apply(p))
+
+    /// The container of `frame` keyed `key` made by `owner`: the one a
+    /// delta naming both scrolled, by identity (one another instance
+    /// replaced at its path while the delta was on its way is another).
+    fn find(
+        &self,
+        frame: &Frame,
+        key: crate::compositor::NodeKey,
+        owner: Option<crate::reactive::OwnerId>,
+    ) -> Option<usize> {
+        let from = self.by_key.partition_point(|e| e.0 < key);
+        self.by_key
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|e| e.0 == key)
+            .map(|e| e.1)
+            .find(|&i| {
+                visited();
+                owner_of(frame, i) == owner
+            })
+    }
+}
+
+/// Every node of a frame by its key, sorted: a wheel the compositor hands
+/// on finds the node it was over ([`crate::compositor::HitTarget`]) by a
+/// binary search, not a walk of the frame. Kept from what the frame says
+/// changed since it last read it, as [`ScrollIndex`] is: a write in place
+/// keeps every node's path, so it costs what was written; a rebuild costs
+/// a walk of the nodes, once, on the next lookup. The last node found is
+/// kept with it, so the rest of a gesture handed on over the same node of
+/// the same build looks nothing up.
+#[derive(Default)]
+struct NodeIndex {
+    read: crate::layout::ReadAt,
+    by_key: Vec<(crate::compositor::NodeKey, usize)>,
+    last: Option<(crate::compositor::HitTarget, usize)>,
+}
+
+impl crate::engine::parts_seal::Sealed for NodeIndex {}
+impl crate::engine::Parts for NodeIndex {
+    /// The engine's own index: no user value in it.
+    fn parts(self, out: &mut Vec<Box<dyn std::any::Any>>) {
+        out.push(Box::new(self));
+    }
+}
+
+impl NodeIndex {
+    /// The node of `frame` that `target` names, by identity: its key and
+    /// the instance that made it.
+    fn find(&mut self, frame: &Frame, target: crate::compositor::HitTarget) -> Option<usize> {
+        self.refresh(frame);
+        if let Some((t, i)) = self.last
+            && t == target
+        {
+            return Some(i);
+        }
+        let found = self.keyed(target.key, |i| owner_of(frame, i) == target.owner);
+        self.last = found.map(|i| (target, i));
+        found
+    }
+
+    /// Brought up to `frame` (a rebuild since is read once, a write in
+    /// place costs what was written).
+    fn refresh(&mut self, frame: &Frame) {
+        use crate::compositor::NodeKey;
+        match frame.changes.since(&mut self.read) {
+            crate::layout::Since::Logged(log) => {
+                for c in log {
+                    visited();
+                    // Written in place: its path is the one it had, but
+                    // what made it is asked again.
+                    if self
+                        .last
+                        .is_some_and(|(_, i)| usize::try_from(c.index).is_ok_and(|c| c == i))
+                    {
+                        self.last = None;
+                    }
+                }
+            }
+            crate::layout::Since::Rebuilt | crate::layout::Since::FellBehind => {
+                self.last = None;
+                self.by_key.clear();
+                for (i, n) in frame.nodes.iter().enumerate() {
+                    visited();
+                    self.by_key.push((NodeKey::of(&n.path), i));
+                }
+                self.by_key.sort_unstable();
+            }
+        }
+    }
+
+    /// The first node keyed `key` that `accept` takes.
+    fn keyed(&self, key: crate::compositor::NodeKey, accept: impl Fn(usize) -> bool) -> Option<usize> {
+        let from = self.by_key.partition_point(|e| e.0 < key);
+        self.by_key
+            .get(from..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|e| e.0 == key)
+            .map(|e| e.1)
+            .find(|&i| {
+                visited();
+                accept(i)
+            })
+    }
+}
+
+crate::engine::engine_local! {
+    /// The last frame's nodes by key, for the input side's lookups by
+    /// identity ([`Held::find`], a wheel handed on): one index per thread,
+    /// kept up to date from the frame's change log. A cache: a cold frame
+    /// starts its own.
+    [Fresh] static NODES: std::cell::RefCell<NodeIndex> = std::cell::RefCell::new(NodeIndex::default());
+}
+
+/// Who holds a scroll container's offset, each by one rule: code, through
+/// its [`ScrollHandle`]; a text field, through its view
+/// ([`TextField::scroll_generation`]); or else the window's interaction
+/// state, by the container's identity. Each keeps a generation the UI's
+/// own writes bump and the compositor's scroll taken in does not.
+enum Holder<'f> {
+    Handle(&'f ScrollHandle),
+    Field(TextField),
+    State(&'f NodePath, Option<crate::reactive::OwnerId>),
+}
+
+impl<'f> Holder<'f> {
+    /// Who holds the offset of `frame`'s node `i` (a scroll container or a
+    /// text field).
+    fn of(frame: &'f Frame, i: usize) -> Option<Self> {
+        let b = frame.behaviour(i);
+        // A text input takes no scroll handle ([`crate::Div::track_scroll`]):
+        // its field's view is the one owner of its offset.
+        if let Some(f) = b.and_then(|b| b.field) {
+            return Some(Self::Field(f));
+        }
+        if let Some(h) = b.and_then(|b| b.scroll.as_ref()) {
+            return Some(Self::Handle(h));
+        }
+        frame.nodes.get(i).map(|n| Self::State(&n.path, owner_of(frame, i)))
+    }
+
+    fn id(path: &NodePath, owner: Option<crate::reactive::OwnerId>) -> crate::layout::ScrollId {
+        (path.clone(), owner)
+    }
+
+    /// How many times the UI jumped it, as of now (not as last laid out):
+    /// what the compositor's fling is compared with as it is taken in.
+    fn generation(&self, state: &UiState) -> u64 {
+        match self {
+            Self::Handle(h) => h.generation(),
+            Self::Field(f) => f.scroll_generation(),
+            Self::State(p, o) => state
+                .scroll_generation
+                .get(&Self::id(p, *o))
+                .copied()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Move it by `delta`: the compositor's scroll taken in, or the UI's
+    /// own wheel (`wheel`, counted as one step on a handle, its overlay
+    /// scrollbar shown against an edge too). Added to where the UI holds it
+    /// now, what it took in or wrote since `laid` (its last layout)
+    /// included, clamped to that layout's range (ADR-0032, I2 and I5): a
+    /// displacement, never a jump, so no generation starts and what the
+    /// compositor moves by itself goes on. Whether it moved. Exactly
+    /// ([`crate::compositor::motion`]): what is added is what it moves,
+    /// up to the range's end.
+    fn add(&self, state: &mut UiState, laid: crate::layout::Scroll, delta: motion::Exact, wheel: bool) -> bool {
+        let clamp = |at: motion::Exact| motion::clamp2(motion::add2(at, delta), laid.end);
+        match self {
+            Self::Handle(h) if wheel => {
+                let was = h.offset_now();
+                h.wheel(delta);
+                h.offset_now() != was
+            }
+            Self::Handle(h) => h.add(delta),
+            Self::Field(f) => {
+                let (was, next) = (f.pos(), clamp(f.pos()));
+                f.synced(next);
+                next != was
+            }
+            Self::State(p, o) => {
+                let id = Self::id(p, *o);
+                let was = state.scroll.get(&id).copied().unwrap_or(laid.pos);
+                let next = clamp(was);
+                if next == was {
+                    return false;
+                }
+                state.set_scroll(id, next);
+                true
+            }
+        }
+    }
 }
 
 /// Whether `path` is the node at `down` or above it: its segments begin
@@ -1272,56 +1474,65 @@ fn click_target(frame: &Frame, from: usize, h: usize) -> Option<usize> {
     Reach::Activation.target(frame, common, |b| b.handlers.click.is_some())
 }
 
-/// The topmost node under `(x, y)` that takes the pointer, as the frame
-/// lays it out, scaled and turned; nothing below the top modal layer does
-/// (ADR-0024).
+/// The topmost node under `(x, y)` that takes the pointer in `frame`
+/// before any frame of it was presented: by the one hit rule
+/// ([`crate::clip::hit_in`]) on the frame as paint makes it, no layer
+/// drawn ([`painted`]); nothing below the top modal layer does (ADR-0024).
 #[must_use]
 pub fn hit(frame: &Frame, x: f32, y: f32) -> Option<usize> {
-    let to_node = |i: usize, p: (f32, f32)| frame_to_node(frame, i, p);
-    hit_above(frame, Stack::of(frame).floor, &to_node, x, y).map(|(i, ..)| i)
+    let laid = painted(frame);
+    shown_node(frame, &laid, (x, y), Stack::of(frame).floor, false)
 }
 
-/// The topmost node from `floor` on (those above the top modal layer)
-/// that takes the pointer at `(x, y)` on screen, each node tested where
-/// `to_node` maps the point into it (what the compositor scrolled, moved,
-/// scaled and turned undone); the node and the point where it lies in
-/// it. A node `to_node` maps nothing into (under a scale of 0) is missed.
-fn hit_above(
-    frame: &Frame,
-    floor: usize,
-    to_node: &impl Fn(usize, (f32, f32)) -> Option<(f32, f32)>,
-    x: f32,
-    y: f32,
-) -> Option<(usize, f32, f32)> {
-    frame.nodes.iter().enumerate().skip(floor).rev().find_map(|(i, n)| {
-        if !(frame.behaviour(i).is_some_and(|b| !b.pass_through) && !n.look.invisible) {
-            return None;
-        }
-        let (lx, ly) = to_node(i, (x, y))?;
-        // Its shape decides, corners included, grown by its hit slop; and
-        // the clip it paints under, rounded corners included, as Chrome
-        // clips hit testing to a rounded `overflow: hidden`, in the space
-        // of the node that clips.
-        if !crate::shape::takes_pointer(&n.look.shape, n.bounds, n.look.hit_slop, lx, ly) {
-            return None;
-        }
-        // Each clip of its chain in its own space, by the rule paint keeps
-        // pixels by ([`crate::clip::chain_keeps`]).
-        if n.clipper.is_some() {
-            if !crate::clip::chain_keeps(frame, i, to_node, x, y)? {
-                return None;
-            }
-        } else if n.clip.is_some_and(|c| !c.contains(x, y)) {
-            return None;
-        }
-        Some((i, lx, ly))
-    })
+/// The node of `frame` under `(x, y)` on screen while `presented` shows:
+/// the devtools' pick, by the rule a click lands by ([`crate::clip::hit_in`]
+/// on what was presented, its node found in `frame` by path and instance).
+/// Without a frame presented, the frame as paint makes it ([`hit`]).
+#[must_use]
+pub fn hit_presented(frame: &Frame, presented: Option<&crate::compositor::Presented>, x: f32, y: f32) -> Option<usize> {
+    match presented {
+        Some(p) => shown_node(frame, p, (x, y), Stack::of(frame).floor, false),
+        None => hit(frame, x, y),
+    }
+}
+
+/// The node `frame` has for `target`: the one at its path that the same
+/// component instance made, found by a binary search of the frame's key
+/// index ([`NODES`]), not a walk of the frame: a click, a hover and each
+/// candidate under a modal layer cost a lookup, at any frame size. One
+/// another instance made at that path since is another node: input meant
+/// for the one shown is not delivered to it (as Blink never reuses a hit
+/// target across a change of the document, `HitTestCache`).
+fn node_of(frame: &Frame, target: crate::compositor::HitTarget) -> Option<usize> {
+    NODES.with(|n| n.borrow_mut().find(frame, target))
+}
+
+#[cfg(test)]
+impl InputState {
+    /// An input state that took `frame` in as `shown` presents it, as the
+    /// window's input does before it routes a point.
+    pub(crate) fn showing(frame: &Frame, shown: std::sync::Arc<crate::compositor::Presented>) -> Self {
+        let mut s = Self::default();
+        s.show(Some(shown));
+        s.take_in(frame);
+        s
+    }
+
+    /// The node input at `(x, y)` lands on ([`Self::locate`]).
+    pub(crate) fn hit_shown(&self, frame: &Frame, x: f32, y: f32) -> Option<usize> {
+        self.locate(frame, x, y).0
+    }
 }
 
 impl InputState {
     #[must_use]
     pub fn state(&self) -> &UiState {
         &self.state
+    }
+
+    /// The layers open, bottom first: the node of each in `frame`.
+    pub(crate) fn layer_nodes(&self) -> impl Iterator<Item = usize> + '_ {
+        self.layers.entries.iter().map(|e| e.node)
     }
 
     /// The screen shows `presented` now (`None`: the frame as laid out,
@@ -1334,244 +1545,170 @@ impl InputState {
             (None, None) => true,
             _ => false,
         };
-        if !same {
-            self.shown_by_key.fill(presented.as_deref());
+        if !same && let Some(p) = &presented {
+            self.hit_keys.fill(&p.hits);
         }
         self.shown = presented;
     }
 
-    /// Read `frame` before input goes to it: its layers, when it changed,
-    /// and where the screen shows each of its nodes against where it laid
-    /// it out ([`Self::show`]): the scroll the compositor did since
-    /// (content moves by the difference in the applied offset), the
-    /// motion it ran, and the scales and turns, the frame's and those the
-    /// compositor sampled.
+    /// Route the input dispatched next in `routed`, the frame it came under
+    /// (ADR-0015), until [`Self::routed`]: one frame per question. The
+    /// frame on screen ([`Self::show`]) is set aside meanwhile and is what
+    /// hover and the cursor read after, so an input routed in an older
+    /// frame never rolls them back to it (a key, a modifier, a press where
+    /// the pointer rests).
+    pub(crate) fn route_in(&mut self, routed: std::sync::Arc<crate::compositor::Presented>) {
+        debug_assert!(self.screen.is_none(), "one dispatch at a time");
+        if self.shown.as_ref().is_some_and(|s| std::sync::Arc::ptr_eq(s, &routed)) {
+            return;
+        }
+        let keys = std::mem::replace(&mut self.hit_keys, std::mem::take(&mut self.routed_keys));
+        self.screen = Some((self.shown.take(), keys));
+        self.show(Some(routed));
+    }
+
+    /// The dispatch [`Self::route_in`] began is over. A move or a leave
+    /// (`hovers`) worked hover out where it put the pointer, in the frame
+    /// it was routed in: that frame is what hover was last worked out in,
+    /// until the frame on screen is checked against it. Anything else
+    /// leaves the frame on screen as it was.
+    pub(crate) fn routed(&mut self, hovers: bool) {
+        let Some((shown, keys)) = self.screen.take() else {
+            return;
+        };
+        if hovers {
+            self.routed_keys = keys;
+        } else {
+            self.routed_keys = std::mem::replace(&mut self.hit_keys, keys);
+            self.shown = shown;
+        }
+    }
+
+    /// Read `frame` before input goes to it: its layers, when it changed.
+    /// Where the screen shows each of its nodes is the frame shown's
+    /// ([`Self::show`], [`Shown`]).
     fn take_in(&mut self, frame: &Frame) {
         self.layers.refresh(frame);
-        self.take_shift(frame);
-        self.take_turns(frame);
     }
 
-    /// [`Self::shift`] for `frame`.
-    fn take_shift(&mut self, frame: &Frame) {
-        use crate::compositor::NodeKey;
-        self.shift.clear();
-        let shown = &self.shown_by_key;
-        if shown.scroll.is_empty() && shown.moved.is_empty() {
-            return;
-        }
-        // What each node moves its children by, and what it moves itself by.
-        let inner = &mut self.shift_inner;
-        inner.clear();
-        let mut any = false;
-        for (i, n) in frame.nodes.iter().enumerate() {
-            let up = n.parent.and_then(|p| inner.get(p)).copied().unwrap_or_default();
-            let key = (n.scroll.is_some() || n.moving.is_some()).then(|| NodeKey::of(&n.path));
-            let m = key
-                .filter(|_| n.moving.is_some())
-                .and_then(|k| ShownIndex::find(&shown.moved, k))
-                .unwrap_or_default();
-            let me = (up.0 + m.0, up.1 + m.1);
-            // A container's scroll as shown, if it is the one shown: by its
-            // identity, path and instance.
-            let shown_scroll = key
-                .filter(|_| n.scroll.is_some())
-                .and_then(|k| ShownIndex::find(&shown.scroll, k))
-                .filter(|(owner, _)| *owner == owner_of(frame, i))
-                .map(|(_, applied)| applied);
-            let content = match (n.scroll, shown_scroll) {
-                (Some(s), Some(applied)) => (me.0 + applied.0 - s.applied.0, me.1 + applied.1 - s.applied.1),
-                _ => me,
-            };
-            any |= me != (0.0, 0.0) || content != (0.0, 0.0);
-            self.shift.push(me);
-            inner.push(content);
-        }
-        if !any {
-            self.shift.clear();
-        }
-    }
-
-    /// [`Self::undo`] for `frame`, its shift taken in: each node's scale
-    /// and turn is about its origin where the screen shows it before the
-    /// scales and turns above it, and undoing them goes outermost first,
-    /// as Chrome maps a point into a transformed element's space.
-    fn take_turns(&mut self, frame: &Frame) {
-        self.undo.clear();
-        let shown = Some(&self.shown_by_key).filter(|s| !s.turned.is_empty());
-        let turns = shown.is_some() || frame.nodes.iter().any(|n| !n.look.transform.is_identity());
-        if !turns {
-            return;
-        }
-        for (i, n) in frame.nodes.iter().enumerate() {
-            let up = match n.parent {
-                Some(p) => self.undo.get(p).copied().flatten(),
-                None => Some(Affine::IDENTITY),
-            };
-            let me = up.and_then(|up| match turn_of(n, shown) {
-                None => Some(up),
-                Some(t) => {
-                    let (dx, dy) = self.shift.get(i).copied().unwrap_or_default();
-                    let origin = (n.bounds.x + t.origin.0 + dx, n.bounds.y + t.origin.1 + dy);
-                    Affine::undoing(&t, origin).map(|undo| up.then(undo))
-                }
-            });
-            self.undo.push(me);
-        }
+    /// What the screen showed, for `frame`'s nodes ([`Shown`]): the frame
+    /// input is routed in during a dispatch, the frame on screen
+    /// otherwise; with none shown to this state (the devtools' frame as
+    /// laid out; a pipeline always shows one), the frame laid out. The
+    /// only way input reads geometry.
+    fn shown<'s>(&'s self, frame: &'s Frame) -> Shown<'s> {
+        Shown::new(frame, self.shown.as_deref(), &self.hit_keys)
     }
 
     /// The node under `(x, y)` on screen and the point where it lies in
     /// it, above the top modal layer of the frame last taken in.
     fn locate(&self, frame: &Frame, x: f32, y: f32) -> (Option<usize>, f32, f32) {
-        let to_node = |i: usize, p: (f32, f32)| self.mapped(i, p);
-        match hit_above(frame, self.layers.floor, &to_node, x, y) {
-            Some((i, x, y)) => (Some(i), x, y),
+        let shown = self.shown(frame);
+        match shown.hit(self.layers.floor, false, (x, y)) {
+            Some(i) => {
+                let (lx, ly) = shown.to_node(i, (x, y));
+                (Some(i), lx, ly)
+            }
             None => (None, x, y),
         }
     }
 
-    /// `p` on screen where the frame last taken in lays node `i` out: the
-    /// scales and turns it and its ancestors show at undone, then the
-    /// shift the compositor showed it at; `None` under a scale of 0. What
-    /// hit testing and every event's point use alike.
-    fn mapped(&self, i: usize, p: (f32, f32)) -> Option<(f32, f32)> {
-        let (x, y) = match self.undo.get(i) {
-            Some(Some(undo)) => undo.apply(p),
-            Some(None) => return None,
-            None => p,
-        };
-        let (dx, dy) = self.shift.get(i).copied().unwrap_or_default();
-        Some((x - dx, y - dy))
+    /// The frame shown, when input is routed through one.
+    #[must_use]
+    pub(crate) fn presented(&self) -> Option<&crate::compositor::Presented> {
+        self.shown.as_deref()
     }
 
-    /// `(x, y)` on screen where the frame has it for node `i`
-    /// ([`Self::mapped`]); under a scale of 0, where nothing maps, the
-    /// point with only the shift taken off.
-    fn to_node(&self, i: usize, x: f32, y: f32) -> (f32, f32) {
-        self.mapped(i, (x, y)).unwrap_or_else(|| {
-            let (dx, dy) = self.shift.get(i).copied().unwrap_or_default();
-            (x - dx, y - dy)
-        })
-    }
-
-    /// Where `(x, y)` of node `i`'s space (as laid out) shows on screen:
-    /// [`Self::mapped`] undone, the compositor's shift, scales and turns
-    /// and all, so what is placed by it lands where it is drawn.
-    fn to_screen(&self, i: usize, (x, y): (f32, f32)) -> (f32, f32) {
-        let (dx, dy) = self.shift.get(i).copied().unwrap_or_default();
-        let p = (x + dx, y + dy);
-        match self.undo.get(i) {
-            Some(Some(undo)) => undo.inverse().map_or(p, |m| m.apply(p)),
-            _ => p,
-        }
-    }
-
-    /// `(x, y)` on screen in the own space of node `i`: from its box's
-    /// corner as laid out (scroll offsets and translations above it
-    /// included), as the compositor shows it and as scaled and turned;
-    /// `None` under a scale of 0.
-    fn local(&self, frame: &Frame, i: usize, x: f32, y: f32) -> Option<(f32, f32)> {
-        let (fx, fy) = self.mapped(i, (x, y))?;
-        let b = frame.nodes.get(i).map(|n| n.bounds).unwrap_or_default();
-        Some((fx - b.x, fy - b.y))
-    }
-
-    /// Take in the scroll the compositor did (a main frame brought it,
-    /// ADR-0015): each container's offset moves by its delta. Whether any moved.
-    pub fn apply_scroll(&mut self, frame: &Frame, deltas: &[crate::compositor::ScrollDelta]) -> bool {
-        use crate::compositor::NodeKey;
-        // A reach holds for one frame: a container no longer moving has none.
+    /// How far each container moving may scroll before the commit after
+    /// this frame's shows (a main frame brought it, ADR-0015): what a
+    /// virtual list builds beyond its viewport. A reach holds for one
+    /// frame: a container no longer moving has none. Whether any was set.
+    pub fn reach(&mut self, frame: &Frame, reach: &[crate::compositor::ScrollDelta]) -> bool {
         for h in self.reaching.drain(..) {
             h.set_reach((0.0, 0.0));
         }
-        if deltas.is_empty() {
+        if reach.is_empty() {
             return false;
         }
-        let mut moved = false;
-        let mut scrolled = Vec::new();
-        for (i, n) in frame.nodes.iter().enumerate() {
-            let Some(s) = n.scroll else { continue };
-            let key = NodeKey::of(&n.path);
-            // By identity: a container another instance replaced at its
-            // path while the delta was on its way is another.
-            let Some(d) = deltas.iter().find(|d| d.key == key && d.owner == owner_of(frame, i)) else {
-                continue;
-            };
-            let handle = frame.behaviour(i).and_then(|b| b.scroll.as_ref());
-            // Scrolled from an offset the UI set since (a program's
-            // `scroll_to`, its own wheel): the UI's write is newer and wins,
-            // as in Chrome; the compositor drops its own as it commits.
-            // Rejected, the delta changes nothing, its reach neither (a
-            // stale fling's speed would build rows around where it no
-            // longer scrolls).
-            let id = || (n.path.clone(), owner_of(frame, i));
-            let local = handle.map_or_else(
-                || self.state.scroll_generation.get(&id()).copied().unwrap_or_default(),
-                ScrollHandle::generation,
-            );
-            if d.generation != local {
-                continue;
-            }
-            if let Some(h) = handle
+        self.scrollers.refresh(frame);
+        for d in reach {
+            if let Some(i) = self.scrollers.find(frame, d.key, d.owner)
+                && let Some(Holder::Handle(h)) = Holder::of(frame, i)
                 && d.reach != (0.0, 0.0)
             {
                 h.set_reach(d.reach);
-                self.reaching.push(h.clone());
+                self.reaching.push(*h);
             }
-            if d.delta == (0.0, 0.0) {
+        }
+        !self.reaching.is_empty()
+    }
+
+    /// Take in what the compositor moved (ADR-0032, I2: before an input is
+    /// handled, and before a frame is built): each container's offset
+    /// moves by its delta, added to where the UI holds it now, once, in the
+    /// order taken; nothing is refused, so a jump the UI made since stays
+    /// and what the compositor moved after it lands on top. Its wheel steps
+    /// are counted, each once. Whether any moved or counted.
+    pub fn take_scroll(&mut self, frame: &Frame, deltas: &[crate::compositor::ScrollDelta]) -> bool {
+        if deltas.is_empty() {
+            return false;
+        }
+        // Each delta finds its container by key, not by a walk of the
+        // frame: what it costs is the deltas', whatever the frame's size.
+        self.scrollers.refresh(frame);
+        let mut moved = false;
+        let mut scrolled = std::mem::take(&mut self.scrolled);
+        scrolled.clear();
+        for d in deltas {
+            // By identity: a container another instance replaced at its
+            // path while the delta was on its way is another.
+            let Some(i) = self.scrollers.find(frame, d.key, d.owner) else {
                 continue;
+            };
+            let (Some(s), Some(holder)) = (frame.nodes.get(i).and_then(laid_scroll), Holder::of(frame, i)) else {
+                continue;
+            };
+            // Each wheel step the compositor took counts once, moved or
+            // held against its edge (its overlay scrollbar shows).
+            if let Holder::Handle(h) = &holder
+                && d.steps > 0
+            {
+                h.wheeled_by(d.steps);
+                moved = true;
             }
-            let next = (
-                (s.offset.0 + d.delta.0).clamp(0.0, s.max.0),
-                (s.offset.1 + d.delta.1).clamp(0.0, s.max.1),
-            );
-            match handle {
-                Some(h) => h.synced(next),
-                None => match frame.behaviour(i).and_then(|b| b.field) {
-                    // A text field's scroll is its handle's ([`TextField::offset`]).
-                    Some(f) => f.scroll_to(next),
-                    None => self.state.set_scroll((n.path.clone(), owner_of(frame, i)), next),
-                },
+            // The compositor's fling, moved before a jump the UI made since,
+            // is left out: the jump stops it (cc's clobbering commit). The
+            // reader's own input is taken whole (ADR-0032 I4).
+            let delta = if d.synthetic != (0, 0) && holder.generation(&self.state) != d.generation {
+                motion::sub2(d.delta, d.synthetic)
+            } else {
+                d.delta
+            };
+            if holder.add(&mut self.state, s, delta, false) {
+                moved = true;
+                scrolled.push(i);
             }
-            moved = true;
-            scrolled.push(i);
         }
         if !scrolled.is_empty() {
-            self.take_in(frame);
-            for i in scrolled {
+            // What a scroll dismisses is read from the layers alone.
+            self.layers.refresh(frame);
+            for &i in &scrolled {
                 self.dismiss_scrolled(frame, i);
             }
         }
+        self.scrolled = scrolled;
         moved
     }
 
-    /// Set the offset of the scroll container `node` (at `i`) as the UI's
-    /// own scroll does: the compositor drops what it scrolled before.
-    fn set_scroll(&mut self, frame: &Frame, i: usize, next: (f32, f32)) {
-        let Some(node) = frame.nodes.get(i) else { return };
-        match frame.behaviour(i).and_then(|b| b.scroll.as_ref()) {
-            Some(handle) => handle.wheel(next),
-            None => {
-                let id = (node.path.clone(), owner_of(frame, i));
-                let field = frame.behaviour(i).and_then(|b| b.field);
-                let at = match field {
-                    Some(f) => f.offset(),
-                    None => self.state.scroll.get(&id).copied().unwrap_or_default(),
-                };
-                // Where it is already: nothing written, no new generation
-                // (what the compositor scrolled from here still lands).
-                if at == next {
-                    return;
-                }
-                match field {
-                    // A text field's scroll is its handle's.
-                    Some(f) => f.scroll_to(next),
-                    None => self.state.set_scroll(id.clone(), next),
-                }
-                let g = self.state.scroll_generation.get(&id).copied().unwrap_or_default();
-                // One entry a path: what another instance left there goes.
-                self.state.scroll_generation.insert(id, g.wrapping_add(1));
-            }
+    /// Scroll the container at `i` by `delta` from where it was laid out,
+    /// exactly ([`crate::compositor::motion`]), as the UI's own scroll does
+    /// (its wheel, a drag past its edge, a node brought into view): added
+    /// to where the UI holds it now ([`Holder::add`]), so what the
+    /// compositor moved and the UI took in since stays, and what it moves
+    /// by itself goes on.
+    fn scroll_by(&mut self, frame: &Frame, i: usize, delta: motion::Exact) {
+        if let (Some(holder), Some(s)) = (Holder::of(frame, i), frame.nodes.get(i).and_then(laid_scroll)) {
+            holder.add(&mut self.state, s, delta, true);
         }
     }
 
@@ -1620,7 +1757,7 @@ impl InputState {
             frame.behaviour(i).is_some_and(|b| b.interaction.is_some())
         });
         let keyboard = self.state.focus_visible;
-        let write = |i: usize| {
+        let write = |i: usize, c: &Commit| {
             let (Some(b), Some(node)) = (frame.behaviour(i), frame.nodes.get(i)) else {
                 return;
             };
@@ -1633,19 +1770,26 @@ impl InputState {
                 focus_at,
                 keyboard,
             );
-            it.set_focus(focused, visible, within);
+            it.set_focus(focused, visible, within, c);
         };
-        for &i in &was {
-            if !chain.contains(&i) {
-                write(i);
+        // One step: effects reading the flags run once all are written,
+        // and the marks with them (the hover transaction, ADR-0015).
+        let marks = &mut self.focus_marks;
+        crate::engine::commit_here(|c| {
+            for &i in &was {
+                if !chain.contains(&i) {
+                    write(i, c);
+                }
             }
-        }
-        // Whether focus shows may have changed without it moving.
-        for &i in &chain {
-            write(i);
-        }
-        self.focus_marks.mark(frame, &chain);
-        (self.chain, self.was) = (chain, was);
+            // Whether focus shows may have changed without it moving.
+            for &i in &chain {
+                write(i, c);
+            }
+            marks.mark(frame, &chain);
+            // Kept inside: an effect that panics as the batch ends finds
+            // the chain and the marks as one.
+            (self.chain, self.was) = (chain, was);
+        });
     }
 
     /// The chain of nodes from `h` up, in `self.chain`.
@@ -1694,16 +1838,20 @@ impl InputState {
         self.press_marks.take(frame, &mut was, |i| {
             frame.nodes.get(i).is_some_and(|n| active.contains(&n.path))
         });
-        each_change_sorted(&was, &self.chain, |i, on| {
-            if let Some(b) = frame.behaviour(i)
-                && let Some(it) = &b.interaction
-            {
-                it.set_pressed(on && !b.disabled);
-            }
+        // One step: the flags, the paths and the marks, effects reading
+        // the flags run after all of them (the hover transaction, ADR-0015).
+        crate::engine::commit_here(|c| {
+            each_change_sorted(&was, &self.chain, |i, on| {
+                if let Some(b) = frame.behaviour(i)
+                    && let Some(it) = &b.interaction
+                {
+                    it.set_pressed(on && !b.disabled, c);
+                }
+            });
+            Self::set_paths(frame, &self.chain, &mut self.state.active);
+            self.press_marks.mark(frame, &self.chain);
+            self.was = was;
         });
-        Self::set_paths(frame, &self.chain, &mut self.state.active);
-        self.press_marks.mark(frame, &self.chain);
-        self.was = was;
     }
 
     /// The pointer's position, if it is over the window.
@@ -1715,34 +1863,32 @@ impl InputState {
     /// The cursor the pointer should show. While a press drags a node, the
     /// cursor of that node (or the nearest ancestor with one) shows
     /// wherever the pointer is, as a captured pointer keeps it: a splitter
-    /// dragged past its handle keeps its resize cursor.
+    /// dragged past its handle keeps its resize cursor. Otherwise the one
+    /// the frame on screen shows under the pointer ([`Shown::cursor_at`]),
+    /// a value of that frame: a node removed since shows its cursor until
+    /// a frame without it does.
     #[must_use]
     pub fn cursor(&self, frame: &Frame) -> Cursor {
+        let shown = self.shown(frame);
         if let Some(i) = self
             .pointers
             .iter()
             .find(|p| p.id == PointerId::Mouse)
             .and_then(|p| p.drag.as_ref())
             .and_then(|g| g.node.find(frame))
-            && let Some(c) = frame
-                .ancestors(i)
-                .find_map(|i| frame.behaviour(i).and_then(|b| b.cursor))
+            && let Some(c) = shown.cursor_of(i)
         {
             return c;
         }
-        let Some((x, y)) = self.pointer else {
-            return Cursor::Default;
-        };
-        let (Some(h), x, y) = self.locate(frame, x, y) else {
-            return Cursor::Default;
-        };
-        if let Some(c) = frame.behaviour(h).and_then(|b| b.span_at(x, y)).and_then(|s| s.cursor) {
-            return c;
-        }
-        frame
-            .ancestors(h)
-            .find_map(|i| frame.behaviour(i).and_then(|b| b.cursor))
-            .unwrap_or_default()
+        self.pointer.map_or(Cursor::Default, |p| shown.cursor_at(p))
+    }
+
+    /// The pointer is at `(x, y)`, from input that is routed nowhere (made
+    /// under a frame no longer kept): its place is taken, nothing is done,
+    /// and the next hover check works it out there ([`Self::rehover`]).
+    pub(crate) fn pointer_at(&mut self, x: f32, y: f32) {
+        self.pointer = Some((x, y));
+        track_pointer(self.pointer);
     }
 
     /// Re-run hover against a new frame (the pointer has not moved but the
@@ -1760,7 +1906,7 @@ impl InputState {
 
     /// The pointer moved to `(x, y)`: the user acts by pointer now.
     pub fn pointer_moved(&mut self, frame: &Frame, text: &mut TextSystem, x: f32, y: f32) -> Outcome {
-        focus::set_modality(Modality::Pointer);
+        acts_by(Modality::Pointer);
         self.hover_at(frame, text, x, y, true)
     }
 
@@ -1781,34 +1927,24 @@ impl InputState {
             self.hover_marks.take(frame, &mut was, |i| {
                 frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
             });
-            // The flags first, then the handlers, which may read them.
-            each_change(&was, &self.chain, |i, on| {
-                if let Some(b) = frame.behaviour(i)
-                    && let Some(it) = &b.interaction
-                {
-                    it.set_hovered(on && !b.disabled);
-                }
-            });
-            each_change(&was, &self.chain, |i, on| {
-                if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.hover.clone()) {
-                    f(on);
-                }
-            });
-            Self::set_paths(frame, &self.chain, &mut self.state.hovered);
-            self.was = was;
+            self.commit_hover(frame, was);
+            self.tell_hover();
             out = out.merge(Outcome::redraw());
+        } else {
+            self.hover_marks.mark(frame, &self.chain);
         }
-        self.hover_marks.mark(frame, &self.chain);
         // Only a move the pointer made is a pointer move, as Chrome's
         // `pointermove`: boxes moving under a resting pointer change what
         // it hovers (above), nothing more.
+        // Every handler up the chain is told, though one panics (the
+        // dispatch keeps its panic for its end), as Chrome still
+        // dispatches to the next.
         if moved && let Some(h) = h {
+            let shown = self.shown(frame);
             for i in frame.ancestors(h) {
-                if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.pointer.clone())
-                    && let Some(n) = frame.nodes.get(i)
-                {
-                    let (x, y) = self.to_node(i, x, y);
-                    f(&crate::events::PointerEvent { x, y, bounds: n.bounds });
+                if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.pointer.clone()) {
+                    let ((x, y), bounds) = shown.event(i, (x, y));
+                    f(&crate::events::PointerEvent { x, y, bounds });
                 }
             }
         }
@@ -1823,8 +1959,8 @@ impl InputState {
         // a resting pointer (a field's focus frame expanding its text)
         // extend nothing.
         if moved && let Some(i) = selecting {
-            let (x, y) = self.to_node(i, x, y);
-            Self::place_caret(frame, text, i, x, y, true);
+            let (x, y) = self.shown(frame).to_node(i, (x, y));
+            self.place_caret(frame, text, i, x, y, true);
             out = out.merge(Outcome::redraw());
         }
         out.merge(self.follow_drags(frame, moved.then_some(PointerId::Mouse)))
@@ -1841,19 +1977,20 @@ impl InputState {
             let Some(p) = self.pointers.get_mut(k) else { break };
             let (id, kind, on_control, at) = (p.id, p.kind, p.on_control, p.last);
             // Lost since (gone or disabled): cancelled before this.
+            let shown = Shown::new(frame, self.shown.as_deref(), &self.hit_keys);
             let Some((i, f, bounds)) = p.drag.as_mut().and_then(|g| {
-                let i = g.live(frame, drag_of)?;
-                Some((i, std::rc::Rc::clone(&g.handler), g.bounds))
+                let i = g.live(frame, &shown, drag_of)?;
+                Some((i, std::rc::Rc::clone(&g.handler), g.shown_box))
             }) else {
                 continue;
             };
             // Under a scale of 0 it lies nowhere in the node: no frame
             // moves it until it shows again.
-            let local = self.local(frame, i, at.0, at.1);
+            let local = shown.local(i, at);
             let Some(p) = self.pointers.get_mut(k) else { break };
             let seen = std::mem::replace(&mut p.seen, local);
             if moved == Some(id) || (local.is_some() && seen != local) {
-                let (x, y) = self.to_node(i, at.0, at.1);
+                let (x, y) = self.shown(frame).to_node(i, at);
                 let ev = DragEvent {
                     x,
                     y,
@@ -1885,20 +2022,56 @@ impl InputState {
         self.hover_marks.take(frame, &mut was, |i| {
             frame.nodes.get(i).is_some_and(|n| hovered.contains(&n.path))
         });
-        each_change(&was, &[], |i, _| {
-            if let Some(it) = frame.behaviour(i).and_then(|b| b.interaction.as_ref()) {
-                it.set_hovered(false);
-            }
-        });
-        each_change(&was, &[], |i, _| {
-            if let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.hover.clone()) {
-                f(false);
-            }
-        });
-        self.was = was;
-        self.hover_marks.mark(frame, &[]);
-        self.state.hovered.clear();
+        self.chain.clear();
+        self.commit_hover(frame, was);
+        self.tell_hover();
         Outcome::redraw()
+    }
+
+    /// Hover moves from the nodes `was` to [`Self::chain`]: everything it
+    /// keeps is written here, as one step, before any handler runs — the
+    /// nodes' hovered flags, the hovered paths, the marks the next change
+    /// is found by — and the handlers that change tells are gathered
+    /// ([`Self::told`]) for [`Self::tell_hover`] to run after. The one
+    /// rule of hover (ADR-0015): no user code runs between steps that must
+    /// agree, so a handler that panics leaves hover whole, as it was
+    /// written, and the next check (the key it is worked out by,
+    /// `app::Pipeline::checked`, is written by its caller before this too)
+    /// starts from it.
+    fn commit_hover(&mut self, frame: &Frame, was: Vec<usize>) {
+        let mut told = std::mem::take(&mut self.told);
+        told.clear();
+        // A flag is a signal: writing it runs the effects reading it. In
+        // one batch, they run once every write below is done, so none sees
+        // part of the chain, and one that panics finds hover whole.
+        crate::engine::commit_here(|c| {
+            each_change(&was, &self.chain, |i, on| {
+                let Some(b) = frame.behaviour(i) else { return };
+                if let Some(it) = &b.interaction {
+                    it.set_hovered(on && !b.disabled, c);
+                }
+                if let Some(f) = &b.handlers.hover {
+                    told.push((std::rc::Rc::clone(f), on));
+                }
+            });
+            Self::set_paths(frame, &self.chain, &mut self.state.hovered);
+            self.hover_marks.mark(frame, &self.chain);
+            self.was = was;
+            self.told = told;
+        });
+    }
+
+    /// Run the hover handlers [`Self::commit_hover`] gathered, in order: the
+    /// state they may read is written already. Every one is told, though
+    /// one panics: inside the dispatch ([`crate::engine::dispatch`]) a
+    /// handler's panic is kept for its end, as Chrome reports a listener's
+    /// exception and still dispatches to the next element.
+    fn tell_hover(&mut self) {
+        let told = std::mem::take(&mut self.told);
+        for (f, on) in &told {
+            f(*on);
+        }
+        self.told = told;
     }
 
     /// Whether `i` is `ancestor` or below it.
@@ -2009,7 +2182,7 @@ impl InputState {
     /// The mouse's primary button went down at `(x, y)`.
     pub fn mouse_down(&mut self, frame: &Frame, text: &mut TextSystem, x: f32, y: f32) -> Outcome {
         self.take_in(frame);
-        focus::set_modality(Modality::Pointer);
+        acts_by(Modality::Pointer);
         self.pointer = Some((x, y));
         // A press while the button is held (its release never came) ends
         // that press first, as lost.
@@ -2070,8 +2243,8 @@ impl InputState {
                 .copied()
                 .find(|&i| frame.behaviour(i).is_some_and(|b| b.field.is_some()))
         {
-            let (fx, fy) = self.to_node(i, x, y);
-            Self::place_caret(frame, text, i, fx, fy, self.modifiers.shift);
+            let (fx, fy) = self.shown(frame).to_node(i, (x, y));
+            self.place_caret(frame, text, i, fx, fy, self.modifiers.shift);
             if let Some(p) = self.pointers.iter_mut().find(|p| p.id == id) {
                 p.selecting = Held::of(frame, i);
             }
@@ -2082,37 +2255,36 @@ impl InputState {
         let gesture = |has: fn(&Behaviour) -> bool| h.and_then(|h| Reach::Gesture.target(frame, h, has));
         if let Some(i) = gesture(|b| b.handlers.mouse_down.is_some())
             && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.mouse_down.clone())
-            && let Some(n) = frame.nodes.get(i)
         {
-            let (fx, fy) = self.to_node(i, x, y);
+            let ((fx, fy), bounds) = self.shown(frame).event(i, (x, y));
             f(&ClickEvent {
                 x: fx,
                 y: fy,
-                bounds: n.bounds,
+                bounds,
                 modifiers: self.modifiers,
             });
             out = out.merge(Outcome::by(format!("mouse down -> {}", label(frame, i))));
         }
         if let Some(i) = gesture(|b| b.handlers.drag.is_some())
             && !self.captured(frame, i, id)
-            && let Some(grip) = Grip::of(frame, i, drag_of)
+            && let Some(grip) = Grip::of(frame, &self.shown(frame), i, drag_of)
         {
             let on_control = on_control(frame, &chain, i);
             // Where the frame has the press for the node it drags (which
             // the compositor may show otherwise than the node hit), as its
             // moves will have it.
-            let (dx, dy) = self.to_node(i, x, y);
+            let (dx, dy) = self.shown(frame).to_node(i, (x, y));
             let ev = DragEvent {
                 x: dx,
                 y: dy,
-                bounds: grip.bounds,
+                bounds: grip.shown_box,
                 phase: DragPhase::Start,
                 pointer: id,
                 kind,
                 on_control,
             };
             let claimed = claiming(|| (grip.handler)(&ev));
-            let seen = self.local(frame, i, x, y);
+            let seen = self.shown(frame).local(i, (x, y));
             if let Some(p) = self.pointers.iter_mut().find(|p| p.id == id) {
                 p.on_control = on_control;
                 p.drag = Some(grip);
@@ -2149,13 +2321,13 @@ impl InputState {
         let mut out = Outcome::redraw();
         // Lost since (gone or disabled): cancelled before this.
         if let Some(grip) = p.drag.as_mut()
-            && let Some(i) = grip.live(frame, drag_of)
+            && let Some(i) = grip.live(frame, &self.shown(frame), drag_of)
         {
-            let (fx, fy) = self.to_node(i, x, y);
+            let (fx, fy) = self.shown(frame).to_node(i, (x, y));
             let ev = DragEvent {
                 x: fx,
                 y: fy,
-                bounds: grip.bounds,
+                bounds: grip.shown_box,
                 phase: DragPhase::End,
                 pointer: p.id,
                 kind: p.kind,
@@ -2172,17 +2344,23 @@ impl InputState {
         let pressed_at = p.hit.and_then(|p| p.find(frame));
         // A link inside a paragraph takes the click before the paragraph's
         // ancestors: the paragraph's own activation.
-        let (hx, hy) = self.to_node(h, x, y);
-        if pressed_at == Some(h)
-            && Reach::Activation.target(frame, h, |_| true) == Some(h)
-            && let Some(span) = frame.behaviour(h).and_then(|b| b.span_at(hx, hy))
+        let shown = self.shown(frame);
+        let ((hx, hy), h_bounds) = shown.event(h, (x, y));
+        let shown_span = (pressed_at == Some(h) && Reach::Activation.target(frame, h, |_| true) == Some(h))
+            .then(|| shown.span_at(h, (hx, hy)))
+            .flatten();
+        // A span the frame showed there and gone since takes the click and
+        // does nothing, as a node gone since clicks nothing.
+        if shown_span.as_ref().is_some_and(|s| s.live.is_none()) {
+            return out;
+        }
+        if let Some(span) = shown_span.and_then(|s| s.live)
             && let Some(f) = span.click.clone()
-            && let Some(n) = frame.nodes.get(h)
         {
             f(&ClickEvent {
                 x: hx,
                 y: hy,
-                bounds: n.bounds,
+                bounds: h_bounds,
                 modifiers: self.modifiers,
             });
             let range = &span.range;
@@ -2197,13 +2375,12 @@ impl InputState {
         // above it presses that instead ([`Self::tap`]).
         if let Some(i) = pressed_at.and_then(|d| click_target(frame, d, h))
             && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.click.clone())
-            && let Some(n) = frame.nodes.get(i)
         {
-            let (fx, fy) = self.to_node(i, x, y);
+            let ((fx, fy), bounds) = shown.event(i, (x, y));
             f(&ClickEvent {
                 x: fx,
                 y: fy,
-                bounds: n.bounds,
+                bounds,
                 modifiers: self.modifiers,
             });
             out = Outcome::by(format!("click ({fx:.0},{fy:.0}) -> {}", label(frame, i)));
@@ -2219,13 +2396,12 @@ impl InputState {
         if let Some(i) = target
             && !pressed_at.is_some_and(|p| Self::within(frame, p, i))
             && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.release.clone())
-            && let Some(n) = frame.nodes.get(i)
         {
-            let (x, y) = self.to_node(i, x, y);
+            let ((x, y), bounds) = self.shown(frame).event(i, (x, y));
             f(&ClickEvent {
                 x,
                 y,
-                bounds: n.bounds,
+                bounds,
                 modifiers: self.modifiers,
             });
             return Outcome::by(format!("release ({x:.0},{y:.0}) -> {}", label(frame, i)));
@@ -2238,7 +2414,7 @@ impl InputState {
     /// the secondary one also runs `on_secondary_click`.
     pub fn button_down(&mut self, frame: &Frame, x: f32, y: f32, button: PointerButton) -> Outcome {
         self.take_in(frame);
-        focus::set_modality(Modality::Pointer);
+        acts_by(Modality::Pointer);
         self.pointer = Some((x, y));
         let (h, ..) = self.locate(frame, x, y);
         let (outside, closed_modal) =
@@ -2257,8 +2433,7 @@ impl InputState {
                         .and_then(|i| self.layers.entries.get(i))
                         .map_or(0, |e| crate::layer::layer_start(frame, e.layer))
                 });
-                let to_node = |i: usize, p: (f32, f32)| self.mapped(i, p);
-                let h = hit_above(frame, below, &to_node, x, y).map(|(i, ..)| i);
+                let h = self.shown(frame).hit(below, true, (x, y));
                 self.secondary_at(frame, h, x, y).merge(outside)
             }
             PointerButton::Secondary => self.secondary_at(frame, h, x, y).merge(outside),
@@ -2274,13 +2449,12 @@ impl InputState {
         let target = Reach::Gesture.target(frame, h, |b| b.handlers.secondary_click.is_some());
         if let Some(i) = target
             && let Some(f) = frame.behaviour(i).and_then(|b| b.handlers.secondary_click.clone())
-            && let Some(n) = frame.nodes.get(i)
         {
-            let (x, y) = self.to_node(i, x, y);
+            let ((x, y), bounds) = self.shown(frame).event(i, (x, y));
             f(&ClickEvent {
                 x,
                 y,
-                bounds: n.bounds,
+                bounds,
                 modifiers: self.modifiers,
             });
             out = Outcome::by(format!("secondary click ({x:.0},{y:.0}) -> {}", label(frame, i)));
@@ -2295,7 +2469,9 @@ impl InputState {
             Some(point) => {
                 let step = crate::compositor::WheelStep {
                     point,
-                    at: crate::clock::current_seconds(),
+                    // The frame clock's now: a notched turn's latch times
+                    // turns of this one source alone.
+                    time: crate::clock::current_nanos(),
                     ..crate::compositor::WheelStep::default()
                 };
                 self.wheel_at(frame, step, (dx, dy), None)
@@ -2324,21 +2500,96 @@ impl InputState {
         // the target is gone, and what is at the point now takes it.
         let reaches = |h: &usize| frame.shown(*h) && !self.layers.blocked(*h);
         let h = target
-            .and_then(|t| {
-                (0..frame.nodes.len()).find(|&i| {
-                    frame
-                        .nodes
-                        .get(i)
-                        .is_some_and(|n| crate::compositor::NodeKey::of(&n.path) == t.key)
-                        && owner_of(frame, i) == t.owner
-                })
-            })
+            .and_then(|t| NODES.with(|n| n.borrow_mut().find(frame, t)))
             .filter(reaches)
             .or_else(|| self.locate(frame, x, y).0.filter(reaches));
         let Some(h) = h else {
             return Outcome::default();
         };
         self.scroll_from(frame, h, step, dx, dy, PointerId::Mouse)
+    }
+
+    /// The wheel gesture the compositor latched to a container goes on
+    /// here (ADR-0033: input goes straight to the UI from now on): the
+    /// wheel's latch is that gesture, latched to that container as `frame`
+    /// holds it, so the rest of it scrolls there and passes nothing on.
+    /// A container `frame` no longer holds leaves the latch as it was.
+    pub(crate) fn take_gesture(&mut self, frame: &Frame, gesture: crate::compositor::HandedGesture) {
+        let held = gesture.0.map(
+            |t| {
+                NODES
+                    .with(|n| n.borrow_mut().find(frame, *t))
+                    .and_then(|i| Held::of(frame, i))
+            },
+            Some,
+        );
+        if let Some(held) = held {
+            self.scroll_latch = held;
+            // Its motion goes on here: the rest of its events and its lift.
+            self.scroll_motion = gesture.2.unwrap_or_default();
+        } else if let Some(lifted) = gesture.2.filter(|m| m.lifted.is_some()) {
+            // A lift with no latch left (its own handed back to it, on its
+            // way when input was diverted again): kept to go back again.
+            self.scroll_motion = lifted;
+        }
+    }
+
+    /// The wheel's gesture it latched, by identity (tests: one side holds
+    /// a gesture at a time).
+    #[cfg(test)]
+    pub(crate) fn holds_gesture(&self) -> Option<u64> {
+        self.scroll_latch.holds().map(|(id, _)| id)
+    }
+
+    /// The wheel's gesture under way, handed back to the compositor as
+    /// input comes through it again (ADR-0033, Codex r12 1): its latch from
+    /// then on, so the rest of the gesture stays on its container. One
+    /// side latches a gesture at a time: the UI keeps none it hands, unless
+    /// the compositor would route the gesture to it anyway (a wheel handler
+    /// on the container, or between it and the one around it, the paint's
+    /// `ScrollNode::wheel` and `wheel_above`), where it keeps it (`.1`).
+    pub(crate) fn hand_gesture(&mut self, frame: &Frame) -> Option<crate::compositor::HandedGesture> {
+        let mut keeps = false;
+        let handed = self.scroll_latch.map(
+            |held| {
+                let i = held.find(frame)?;
+                keeps = frame
+                    .ancestors(i)
+                    .take_while(|&a| a == i || frame.nodes.get(a).is_some_and(|n| laid_scroll(n).is_none()))
+                    .any(|a| frame.behaviour(a).is_some_and(|b| b.handlers.wheel.is_some()));
+                Some(crate::compositor::HitTarget {
+                    key: crate::compositor::NodeKey::of(&held.path),
+                    owner: held.owner,
+                })
+            },
+            Some,
+        );
+        if !keeps {
+            self.scroll_latch.end();
+        }
+        // Its motion with it, for the compositor to fling from (none it
+        // keeps: the UI routes that gesture on). A lift whose latch ended
+        // here since (the platform's momentum over, or a latch the frame
+        // no longer holds) still flings, and goes back alone, to the
+        // container it moved, unless another gesture is latched since
+        // (fingers down, a notched wheel), which stopped its fling.
+        let motion = std::mem::take(&mut self.scroll_motion);
+        match handed {
+            Some(g) if g.holds().is_some() => {
+                let mine = g.holds().is_some_and(|(began, _)| began == motion.began);
+                Some(crate::compositor::HandedGesture(
+                    g,
+                    keeps,
+                    (mine && !keeps).then_some(motion),
+                ))
+            }
+            other if motion.lifted.is_some() && motion.to.is_some() => Some(crate::compositor::HandedGesture(
+                other.unwrap_or_default(),
+                false,
+                Some(motion),
+            )),
+            other => other.map(|g| crate::compositor::HandedGesture(g, keeps, None)),
+        }
     }
 
     /// Whether a scroll gesture may reach node `i` now, by one rule for
@@ -2375,19 +2626,24 @@ impl InputState {
         whose: PointerId,
     ) -> Outcome {
         let at = step.point;
+        // The compositor's rules, the same functions: what can move that
+        // way, and what takes it at all (held against its edge).
+        let along_of = |n: &crate::layout::FrameNode| {
+            if n.look.text.direction == crate::style::Direction::Rtl {
+                -dx
+            } else {
+                dx
+            }
+        };
         let can_scroll = |i: usize| {
             frame.nodes.get(i).is_some_and(|n| {
-                let along = if n.look.text.direction == crate::style::Direction::Rtl {
-                    -dx
-                } else {
-                    dx
-                };
-                n.scroll.is_some_and(|s| {
-                    (dy > 0.0 && s.offset.1 < s.max.1)
-                        || (dy < 0.0 && s.offset.1 > 0.0)
-                        || (along > 0.0 && s.offset.0 < s.max.0)
-                        || (along < 0.0 && s.offset.0 > 0.0)
-                })
+                laid_scroll(n)
+                    .is_some_and(|s| crate::compositor::wheel_moves(s.pos, s.end, motion::units2((along_of(n), dy))))
+            })
+        };
+        let takes = |i: usize| {
+            frame.nodes.get(i).is_some_and(|n| {
+                laid_scroll(n).is_some_and(|s| crate::compositor::wheel_takes(s.end, motion::units2((along_of(n), dy))))
             })
         };
         // The innermost container under it: moved onto another, a notched
@@ -2395,11 +2651,11 @@ impl InputState {
         let under = frame
             .ancestors(h)
             .filter_map(|i| frame.nodes.get(i))
-            .find(|n| n.scroll.is_some())
+            .find(|n| laid_scroll(n).is_some())
             .map(|n| crate::compositor::NodeKey::of(&n.path));
         let held = self
             .latch_of(whose)
-            .and_then(|l| l.held(&step, Some(under)))
+            .and_then(|l| l.held(&step, || Some(under)))
             .map(|held| held.find(frame));
         // What it latched to takes it while input could still reach it
         // ([`Self::reaches_scroll`]): a modal opened over a list mid-gesture
@@ -2428,17 +2684,9 @@ impl InputState {
         // By the same rule: what went down before a modal opened (a pan's
         // contact) finds nothing below it.
         for i in frame.ancestors(h).filter(|&i| self.reaches_scroll(frame, i)) {
-            if let Some(f) = wheel(i)
-                && let Some(n) = frame.nodes.get(i)
-            {
-                let (x, y) = self.to_node(i, at.0, at.1);
-                let consumed = f(&crate::events::WheelEvent {
-                    x,
-                    y,
-                    dx,
-                    dy,
-                    bounds: n.bounds,
-                });
+            if let Some(f) = wheel(i) {
+                let ((x, y), bounds) = self.shown(frame).event(i, at);
+                let consumed = f(&crate::events::WheelEvent { x, y, dx, dy, bounds });
                 if consumed {
                     return Outcome::redraw();
                 }
@@ -2448,6 +2696,14 @@ impl InputState {
                 break;
             }
         }
+        // None can move that way: the innermost that scrolls along that
+        // axis takes it against its edge, as the compositor's route has it.
+        if target.is_none() {
+            target = frame
+                .ancestors(h)
+                .filter(|&i| self.reaches_scroll(frame, i))
+                .find(|&i| takes(i));
+        }
         let Some((i, node)) = target.and_then(|i| Some((i, frame.nodes.get(i)?))) else {
             return Outcome::default();
         };
@@ -2455,7 +2711,20 @@ impl InputState {
         if let Some(l) = self.latch_of(whose) {
             l.went(&step, under, to, latched.is_some());
         }
-        let Some(scroll) = node.scroll else {
+        // A precise gesture's motion, as the compositor keeps it: its fling
+        // at the lift is the same whichever side took the lift.
+        if whose == PointerId::Mouse
+            && step.precise
+            && let Some((began, _)) = self.scroll_latch.holds()
+        {
+            let to = crate::compositor::HitTarget {
+                key: crate::compositor::NodeKey::of(&node.path),
+                owner: owner_of(frame, i),
+            };
+            self.scroll_motion
+                .record(began, step.time, motion::units2((dx, dy)), step.phase.lifted(), to);
+        }
+        let Some(scroll) = laid_scroll(node) else {
             return Outcome::default();
         };
         // Offsets run from the inline start: a right-to-left container
@@ -2465,14 +2734,25 @@ impl InputState {
         } else {
             dx
         };
-        let next = (
-            (scroll.offset.0 + along).clamp(0.0, scroll.max.0),
-            (scroll.offset.1 + dy).clamp(0.0, scroll.max.1),
-        );
-        if next == scroll.offset {
-            return Outcome::default();
+        // Exactly ([`crate::compositor::motion`]): the router handed the
+        // step on in whole units.
+        let step = motion::units2((along, dy));
+        let next = motion::clamp2(motion::add2(scroll.pos, step), scroll.end);
+        if next == scroll.pos {
+            // Against its edge: along an axis it scrolls it took the wheel
+            // all the same, so a handle's overlay scrollbar shows, but
+            // nothing moves, so nothing is dismissed; along one it does not
+            // scroll (a latched list's sideways step) it took nothing.
+            return match Holder::of(frame, i) {
+                Some(Holder::Handle(h)) if takes(i) => {
+                    h.wheeled_by(1);
+                    Outcome::redraw()
+                }
+                _ => Outcome::default(),
+            };
         }
-        self.set_scroll(frame, i, next);
+        // Its own scroll: a displacement on where the UI holds it.
+        self.scroll_by(frame, i, motion::sub2(next, scroll.pos));
         Outcome::redraw().merge(self.dismiss_scrolled(frame, i))
     }
 
@@ -2491,7 +2771,7 @@ impl InputState {
     pub fn touch(&mut self, frame: &Frame, text: &mut TextSystem, ev: &TouchEvent) -> Outcome {
         self.take_in(frame);
         let cancelled = self.cancel_lost(frame);
-        focus::set_modality(Modality::Pointer);
+        acts_by(Modality::Pointer);
         let out = match ev.phase {
             TouchPhase::Started => self.contact_down(frame, ev),
             TouchPhase::Moved => self.contact_moved(frame, ev),
@@ -2504,9 +2784,10 @@ impl InputState {
     /// The raw touch handler contact `id` captured, as the frame has it
     /// now (lost since, it was cancelled before this).
     fn raw_of(&mut self, frame: &Frame, id: PointerId) -> Option<crate::element::Handler<TouchEvent>> {
+        let shown = Shown::new(frame, self.shown.as_deref(), &self.hit_keys);
         let p = self.pointers.iter_mut().find(|p| p.id == id)?;
         let g = p.raw.as_mut()?;
-        g.live(frame, touch_of)?;
+        g.live(frame, &shown, touch_of)?;
         Some(std::rc::Rc::clone(&g.handler))
     }
 
@@ -2535,8 +2816,9 @@ impl InputState {
                 p.hit = None;
                 unpressed |= p.pressing;
             }
-            let drag = p.drag.take_if(|g| g.live(frame, drag_of).is_none());
-            let raw = p.raw.take_if(|g| g.live(frame, touch_of).is_none());
+            let shown = Shown::new(frame, self.shown.as_deref(), &self.hit_keys);
+            let drag = p.drag.take_if(|g| g.live(frame, &shown, drag_of).is_none());
+            let raw = p.raw.take_if(|g| g.live(frame, &shown, touch_of).is_none());
             let (id, contact, kind, last, on_control) = (p.id, p.contact(), p.kind, p.last, p.on_control);
             if let Some(mut grip) = drag {
                 out = out.merge(self.cancel_drag(frame, &mut grip, last, id, kind, on_control));
@@ -2579,7 +2861,7 @@ impl InputState {
             }
             let contact = p.contact();
             if let Some(grip) = p.raw.as_mut() {
-                grip.live(frame, touch_of);
+                grip.live(frame, &self.shown(frame), touch_of);
                 (grip.handler)(&TouchEvent {
                     id: contact,
                     kind: p.kind,
@@ -2683,9 +2965,10 @@ impl InputState {
         kind: PointerKind,
         on_control: bool,
     ) -> Outcome {
-        let bounds = grip.bounds_in(frame);
+        let shown = self.shown(frame);
+        let bounds = grip.bounds_in(frame, &shown);
         let (x, y) = match grip.node.find(frame) {
-            Some(i) => self.to_node(i, at.0, at.1),
+            Some(i) => shown.to_node(i, at),
             None => at,
         };
         (grip.handler)(&DragEvent {
@@ -2716,7 +2999,7 @@ impl InputState {
         let raw = h
             .and_then(|h| Reach::Gesture.target(frame, h, |b| b.handlers.touch.is_some()))
             .filter(|&i| !self.captured(frame, i, id))
-            .and_then(|i| Grip::of(frame, i, touch_of));
+            .and_then(|i| Grip::of(frame, &self.shown(frame), i, touch_of));
         if let Some(g) = &raw {
             (g.handler)(ev);
         }
@@ -2802,17 +3085,17 @@ impl InputState {
             if drags.is_some() && free.is_none() {
                 return Outcome::redraw();
             }
-            match free.and_then(|i| Some((i, Grip::of(frame, i, drag_of)?))) {
+            match free.and_then(|i| Some((i, Grip::of(frame, &self.shown(frame), i, drag_of)?))) {
                 Some((i, grip)) => {
                     let on_control = hit.is_some_and(|h| {
                         let chain: Vec<usize> = frame.ancestors(h).collect();
                         on_control(frame, &chain, i)
                     });
-                    let (sx, sy) = self.to_node(i, start.0, start.1);
+                    let (sx, sy) = self.shown(frame).to_node(i, start);
                     let ev = DragEvent {
                         x: sx,
                         y: sy,
-                        bounds: grip.bounds,
+                        bounds: grip.shown_box,
                         phase: DragPhase::Start,
                         pointer: id,
                         kind,
@@ -2843,14 +3126,17 @@ impl InputState {
         };
         let on_control = p.on_control;
         let panning = p.panning;
+        let press = p.press;
         // Lost since (gone or disabled): cancelled before this.
+        let shown = Shown::new(frame, self.shown.as_deref(), &self.hit_keys);
         let drag = p.drag.as_mut().and_then(|g| {
-            let i = g.live(frame, drag_of)?;
-            Some((i, std::rc::Rc::clone(&g.handler), g.bounds))
+            let i = g.live(frame, &shown, drag_of)?;
+            Some((i, std::rc::Rc::clone(&g.handler), g.shown_box))
         });
         if let Some((i, f, bounds)) = drag {
-            let (fx, fy) = self.to_node(i, x, y);
-            let seen = self.local(frame, i, x, y);
+            let shown = self.shown(frame);
+            let (fx, fy) = shown.to_node(i, (x, y));
+            let seen = shown.local(i, (x, y));
             let ev = DragEvent {
                 x: fx,
                 y: fy,
@@ -2867,12 +3153,14 @@ impl InputState {
             }
             out = out.merge(Outcome::redraw());
         } else if panning && let Some(h) = hit {
-            // A pan is one gesture from its contact down to its lift.
+            // A pan is one gesture from its contact down to its lift: its
+            // moves are the fingers', the press its identity.
             let step = crate::compositor::WheelStep {
                 point: (x, y),
-                at: crate::clock::current_seconds(),
+                time: crate::clock::current_nanos(),
                 precise: true,
-                ..crate::compositor::WheelStep::default()
+                phase: crate::compositor::WheelPhase::Changed,
+                gesture: Some(press),
             };
             out = out.merge(self.scroll_from(frame, h, step, delta.0, delta.1, id));
         }
@@ -2892,12 +3180,12 @@ impl InputState {
         let (x, y) = (ev.x, ev.y);
         let gesture = p.gesture.as_mut().map(|g| g.up(x, y));
         let out = if let Some(grip) = p.drag.as_mut() {
-            if let Some(i) = grip.live(frame, drag_of) {
-                let (fx, fy) = self.to_node(i, x, y);
+            if let Some(i) = grip.live(frame, &self.shown(frame), drag_of) {
+                let (fx, fy) = self.shown(frame).to_node(i, (x, y));
                 (grip.handler)(&DragEvent {
                     x: fx,
                     y: fy,
-                    bounds: grip.bounds,
+                    bounds: grip.shown_box,
                     phase: DragPhase::End,
                     pointer: p.id,
                     kind: p.kind,
@@ -3020,8 +3308,7 @@ impl InputState {
             });
             let ran = match long {
                 Some((i, f)) => {
-                    let bounds = frame.nodes.get(i).map(|n| n.bounds).unwrap_or_default();
-                    let (fx, fy) = self.to_node(i, x, y);
+                    let ((fx, fy), bounds) = self.shown(frame).event(i, (x, y));
                     f(&ClickEvent {
                         x: fx,
                         y: fy,
@@ -3084,7 +3371,7 @@ impl InputState {
     fn settle_fields(&mut self, tree: &LayoutTree) -> bool {
         tree.swap_fields(&mut self.fields);
         for f in &self.fields {
-            f.field.settled(f.offset, f.applied);
+            f.field.settled(f.pos, f.applied);
         }
         !self.fields.is_empty()
     }
@@ -3106,7 +3393,7 @@ impl InputState {
             } => Some((
                 std::sync::Arc::clone(&edit.text),
                 text.clone(),
-                node.content_box,
+                laid_content_box(node),
                 edit.caret,
                 *mode,
                 *multiline,
@@ -3115,13 +3402,20 @@ impl InputState {
         }
     }
 
-    /// Whether the input at `i` was painted focused (its text not cut
-    /// short), and how far its content is scrolled ([`Scroll::applied`]):
-    /// its text as this frame shows it.
-    fn input_shown(frame: &Frame, i: usize) -> (bool, (f32, f32)) {
-        let node = frame.nodes.get(i);
-        let focused = matches!(node.map(|n| &n.content), Some(Content::Input { focused: true, .. }));
-        (focused, node.and_then(|n| n.scroll).map_or((0.0, 0.0), |s| s.applied))
+    /// How the input at `i` takes edits, and whether it takes lines: what
+    /// it does, none of where it is.
+    fn input_mode(frame: &Frame, i: usize) -> Option<(InputMode, bool)> {
+        match &frame.nodes.get(i)?.content {
+            Content::Input { mode, multiline, .. } => Some((*mode, *multiline)),
+            _ => None,
+        }
+    }
+
+    /// The scroll model of field `i` (where the UI holds its offset, and
+    /// how far it goes), which autoscroll steps: the scroll machinery's
+    /// state, not where anything shows.
+    fn field_scroll(frame: &Frame, i: usize) -> Option<crate::layout::Scroll> {
+        laid_scroll(frame.nodes.get(i)?)
     }
 
     /// Queue autoscroll's next step a frame from now, in place of any queued.
@@ -3173,9 +3467,19 @@ impl InputState {
             self.stop_autoscroll();
             return false;
         };
-        let Some(scroll) = node.scroll else { return false };
-        let (px, py) = self.to_node(i, x, y);
-        let a = node.content_box;
+        let Some(scroll) = Self::field_scroll(frame, i) else {
+            return false;
+        };
+        // Past the edge of the field as the frame on screen shows it, and
+        // the text the selection reaches into scrolled as it shows: what
+        // the compositor scrolled since the commit included.
+        let shown = self.shown(frame);
+        let (px, py) = shown.to_node(i, (x, y));
+        let Some(field) = shown.field(i) else {
+            self.stop_autoscroll();
+            return false;
+        };
+        let a = field.area;
         let past = |p: f32, lo: f32, hi: f32| {
             if p < lo {
                 p - lo
@@ -3207,8 +3511,8 @@ impl InputState {
         };
         // At its limit every way it is pulled: no wakeup until something
         // moves, from the first tick on.
-        let room = |d: f32, o: f32, max: f32| (d > 0.0 && o < max) || (d < 0.0 && o > 0.0);
-        if !room(along, scroll.offset.0, scroll.max.0) && !room(dy, scroll.offset.1, scroll.max.1) {
+        let room = |d: f32, o: i64, end: i64| (d > 0.0 && o < end) || (d < 0.0 && o > 0);
+        if !room(along, scroll.pos.0, scroll.end.0) && !room(dy, scroll.pos.1, scroll.end.1) {
             self.stop_autoscroll();
             return false;
         }
@@ -3223,56 +3527,80 @@ impl InputState {
             return false;
         };
         let step = |d: f32| sign(d) * (AUTOSCROLL_BASE + d.abs() * AUTOSCROLL_PER_PX) * dt;
-        let next = (
-            (scroll.offset.0 + step(along)).clamp(0.0, scroll.max.0),
-            (scroll.offset.1 + step(dy)).clamp(0.0, scroll.max.1),
+        // Exactly ([`crate::compositor::motion`]), on the grid.
+        let next = motion::clamp2(
+            motion::add2(scroll.pos, motion::units2((step(along), step(dy)))),
+            scroll.end,
         );
-        if next == scroll.offset {
+        if next == scroll.pos {
             // At its limit that way: no wakeup until something moves.
             if let Some(t) = self.autoscroll_timer.take() {
                 crate::clock::cancel(t);
             }
             return false;
         }
+        // The selection reaches what the scroll brings under the pointer,
+        // kept in the box: the text as shown, moved by the step.
+        let by = motion::sub2(next, scroll.pos);
+        let moved = motion::px2(by);
+        let rtl = node.look.text.direction == crate::style::Direction::Rtl;
+        let scroll_by = (
+            field.scrolled.0 + if rtl { moved.0 } else { -moved.0 },
+            field.scrolled.1 - moved.1,
+        );
+        let it = input_text(
+            text,
+            &field.content,
+            &field.text,
+            a,
+            field.multiline,
+            field.focused,
+            scroll_by,
+        );
+        let (hx, hy) = (px.clamp(a.x, a.right()), py.clamp(a.y, a.bottom()));
+        let at = text.hit(&field.content, &it.t, it.width, hx - it.origin.0, hy - it.origin.1);
+        let offsets = field.offsets;
         // Again in a frame's time.
         self.queue_autoscroll();
-        self.set_scroll(frame, i, next);
-        // The selection reaches what the scroll brings under the pointer,
-        // kept in the box.
-        let (Some((content, t, area, _, mode, multiline)), Some(f)) =
-            (Self::input_geometry(frame, i), frame.behaviour(i).and_then(|b| b.field))
-        else {
+        self.scroll_by(frame, i, by);
+        let Some(f) = frame.behaviour(i).and_then(|b| b.field) else {
             return true;
         };
-        let moved = (next.0 - scroll.offset.0, next.1 - scroll.offset.1);
-        let (focused, applied) = Self::input_shown(frame, i);
-        let rtl = node.look.text.direction == crate::style::Direction::Rtl;
-        let scroll_by = (applied.0 + if rtl { moved.0 } else { -moved.0 }, applied.1 - moved.1);
-        let it = input_text(text, &content, &t, area, multiline, focused, scroll_by);
-        let (hx, hy) = (px.clamp(a.x, a.right()), py.clamp(a.y, a.bottom()));
-        let at = text.hit(&content, &it.t, it.width, hx - it.origin.0, hy - it.origin.1);
         f.edit.update(|e| {
-            let offset = mode.value_offset(e, at);
+            let offset = offsets.value_offset(e.text(), at);
             e.place(offset, true);
         });
         true
     }
 
-    fn place_caret(frame: &Frame, text: &mut TextSystem, i: usize, x: f32, y: f32, extend: bool) {
-        let Some((content, t, area, _, mode, multiline)) = Self::input_geometry(frame, i) else {
-            return;
-        };
+    fn place_caret(&self, frame: &Frame, text: &mut TextSystem, i: usize, x: f32, y: f32, extend: bool) {
         let Some(field) = frame.behaviour(i).and_then(|b| b.field) else {
             return;
         };
-        // Hit what this frame painted: a press on a field not yet focused
-        // finds its text as cut short (over its ellipsis: the end), not
-        // the text its focus will expand to; scrolled as it shows.
-        let (painted, scroll) = Self::input_shown(frame, i);
-        let it = input_text(text, &content, &t, area, multiline, painted, scroll);
-        let at = text.hit(&content, &it.t, it.width, x - it.origin.0, y - it.origin.1);
+        // Hit what the frame the event was routed in showed ([`Shown::field`]):
+        // its text, its type and its box as that frame showed them, not as
+        // laid out since; a press on a field not yet focused finds its
+        // text as cut short (over its ellipsis: the end), not the text its
+        // focus will expand to; scrolled as it shows, the compositor's
+        // scroll since the commit included. A field that frame showed no
+        // text of (made since) is placed nothing. The offset hit falls in
+        // the value as that frame showed it too (masked, a composition in
+        // it: [`crate::edit::Offsets`]).
+        let Some(shown) = self.shown(frame).field(i) else {
+            return;
+        };
+        let it = input_text(
+            text,
+            &shown.content,
+            &shown.text,
+            shown.area,
+            shown.multiline,
+            shown.focused,
+            shown.scrolled,
+        );
+        let at = text.hit(&shown.content, &it.t, it.width, x - it.origin.0, y - it.origin.1);
         field.edit.update(|e| {
-            let offset = mode.value_offset(e, at);
+            let offset = shown.offsets.value_offset(e.text(), at);
             e.place(offset, extend);
         });
     }
@@ -3290,7 +3618,7 @@ impl InputState {
     /// Escape to the top layer that takes it, then the top layer's root.
     pub fn key(&mut self, frame: &Frame, text: &mut TextSystem, ev: &KeyEvent) -> Outcome {
         self.take_in(frame);
-        focus::set_modality(Modality::Keyboard);
+        acts_by(Modality::Keyboard);
         self.modifiers = ev.modifiers;
         let focused = focus::focused()
             .and_then(|id| focused_node(frame, id))
@@ -3385,7 +3713,7 @@ impl InputState {
         let activates = ev.is(NamedKey::Enter) || (space && !self.repeating);
         if activates
             && let Some(i) = focused
-            && Self::press(frame, i, ev.modifiers)
+            && self.press(frame, i, ev.modifiers)
         {
             return Outcome::by(format!("key {:?} pressed {}", ev.key, label(frame, i)));
         }
@@ -3395,20 +3723,20 @@ impl InputState {
     /// Run the click handler of the node at `i` as a click at its centre
     /// does, for a press that is not the pointer's; whether it had one (an
     /// unavailable node's does not run).
-    fn press(frame: &Frame, i: usize, modifiers: Modifiers) -> bool {
-        let (Some(f), Some(n)) = (
-            frame
-                .behaviour(i)
-                .filter(|b| Reach::Activation.runs_on(b))
-                .and_then(|b| b.handlers.click.clone()),
-            frame.nodes.get(i),
-        ) else {
+    fn press(&self, frame: &Frame, i: usize, modifiers: Modifiers) -> bool {
+        let Some(f) = frame
+            .behaviour(i)
+            .filter(|b| Reach::Activation.runs_on(b))
+            .and_then(|b| b.handlers.click.clone())
+        else {
             return false;
         };
+        // At the middle of its box as the frame on screen shows it.
+        let b = self.shown(frame).bounds(i);
         f(&ClickEvent {
-            x: n.bounds.x + n.bounds.width / 2.0,
-            y: n.bounds.y + n.bounds.height / 2.0,
-            bounds: n.bounds,
+            x: b.x + b.width / 2.0,
+            y: b.y + b.height / 2.0,
+            bounds: b,
             modifiers,
         });
         true
@@ -3435,7 +3763,7 @@ impl InputState {
             return Outcome::default();
         };
         let done = match (request.action, &request.data) {
-            (Action::Click, _) => Self::press(frame, i, Modifiers::default()),
+            (Action::Click, _) => self.press(frame, i, Modifiers::default()),
             (Action::Focus, _) => b.focus.is_some_and(|h| {
                 focus::set_focus(Some(h.id()), true);
                 self.state.focused = Some(h.id());
@@ -3463,7 +3791,7 @@ impl InputState {
             }),
             (Action::SetTextSelection, Some(ActionData::SetTextSelection(sel))) => {
                 let shown = access::selection_in(frame, i, sel, text);
-                let mode = Self::input_geometry(frame, i).map(|g| g.4);
+                let mode = Self::input_mode(frame, i).map(|g| g.0);
                 match (b.field.as_ref(), shown, mode) {
                     (Some(f), Some((anchor, caret)), Some(mode)) => {
                         f.edit.update(|e| {
@@ -3492,14 +3820,14 @@ impl InputState {
     /// is in (built or only pinned); any other container by as little as
     /// shows it. Whether anything scrolled.
     fn scroll_into_view(&mut self, frame: &Frame, i: usize) -> bool {
-        let Some(b) = frame.nodes.get(i).map(|n| n.bounds) else {
+        let Some(b) = frame.nodes.get(i).map(laid_bounds) else {
             return false;
         };
         let mut child = i;
         let mut scrolled = false;
         for a in frame.ancestors(i).skip(1) {
             let Some(node) = frame.nodes.get(a) else { break };
-            let (Some(scroll), handle) = (node.scroll, frame.behaviour(a).and_then(|b| b.scroll.as_ref())) else {
+            let (Some(scroll), handle) = (laid_scroll(node), frame.behaviour(a).and_then(|b| b.scroll.as_ref())) else {
                 child = a;
                 continue;
             };
@@ -3515,7 +3843,7 @@ impl InputState {
                 child = a;
                 continue;
             }
-            let c = node.content_box;
+            let c = laid_content_box(node);
             let delta = |lo: f32, hi: f32, start: f32, end: f32| {
                 if end - start > hi - lo || start < lo {
                     start - lo
@@ -3525,12 +3853,15 @@ impl InputState {
                     0.0
                 }
             };
-            let next = (
-                (scroll.offset.0 + delta(c.x, c.right(), b.x, b.right())).clamp(0.0, scroll.max.0),
-                (scroll.offset.1 + delta(c.y, c.bottom(), b.y, b.bottom())).clamp(0.0, scroll.max.1),
-            );
-            if next != scroll.offset {
-                self.set_scroll(frame, a, next);
+            // Exactly ([`crate::compositor::motion`]): by what it is off by,
+            // on the grid, so an axis it is not off along does not move.
+            let by = motion::units2((
+                delta(c.x, c.right(), b.x, b.right()),
+                delta(c.y, c.bottom(), b.y, b.bottom()),
+            ));
+            let next = motion::clamp2(motion::add2(scroll.pos, by), scroll.end);
+            if next != scroll.pos {
+                self.scroll_by(frame, a, motion::sub2(next, scroll.pos));
                 scrolled = true;
             }
             child = a;
@@ -3543,7 +3874,7 @@ impl InputState {
         let Some(i) = focus::focused().and_then(|id| focused_node(frame, id)) else {
             return Outcome::default();
         };
-        let Some((.., mode, multiline)) = Self::input_geometry(frame, i) else {
+        let Some((mode, multiline)) = Self::input_mode(frame, i) else {
             // Not a text input: the nearest `on_ime` takes it.
             if let Some((at, f)) = Self::ime_handler(frame, i) {
                 f(ev);
@@ -3584,69 +3915,64 @@ impl InputState {
         }
         let id = focused?;
         let i = focused_node(frame, id)?;
-        let Some((content, t, area, caret_at, mode, multiline)) = Self::input_geometry(frame, i) else {
+        // Borrowed apart from the kept text below.
+        let shown = Shown::new(frame, self.shown.as_deref(), &self.hit_keys);
+        let Some((mode, _)) = Self::input_mode(frame, i) else {
             // A node an input method types into through `on_ime`: its
             // candidates go by the focused node.
             Self::ime_handler(frame, i)?;
-            let area = self.rect_on_screen(i, frame.nodes.get(i)?.bounds);
+            let area = shown.rect_on_screen(i, shown.bounds(i));
             return Some(ImeTarget { field: id, area });
         };
         if !mode.composes() {
             return None;
         }
-        // The text as the frame shows it, scrolled.
-        let (_, scroll) = Self::input_shown(frame, i);
-        let it = input_text(text, &content, &t, area, multiline, true, scroll);
-        let caret = text.caret(&content, &it.t, it.width, caret_at);
-        let (from, to, composing) = match frame.nodes.get(i).map(|n| &n.content) {
-            Some(Content::Input {
-                preedit: Some((a, b)), ..
-            }) => (*a, *b, true),
-            Some(Content::Input { edit, .. }) => (edit.selection().0, edit.selection().1, false),
-            _ => (caret_at, caret_at, false),
+        // The caret the frame on screen shows, in its text as it shows it,
+        // scrolled as it shows (the compositor's scroll included): the
+        // candidate window goes where the caret is drawn, and moves when a
+        // frame that moved it does. A field focused since that frame,
+        // which showed none of its text, has it by the field's box.
+        let Some(field) = shown.field(i) else {
+            let area = shown.rect_on_screen(i, shown.bounds(i));
+            return Some(ImeTarget { field: id, area });
         };
-        let mut bounds = Bounds {
-            x: caret.x,
-            y: caret.y,
-            width: 0.0,
-            height: caret.height,
-        };
-        for b in text.selection(&*content, &it.t, it.width, from, to) {
-            // All of a composition; of a selection, its part on the caret's line.
-            if composing || (b.y - caret.y).abs() < 0.5 {
-                bounds = union(bounds, b);
+        let area = field.area;
+        // What its text alone decides (where the text sits in the box,
+        // the caret and its selection or composition in the text) is the
+        // record's, kept while the screen shows that record: an unchanged
+        // field is not laid out again on each wake (ADR-0015). Where the
+        // box is and how far it scrolled come from the frame each time.
+        let kept = self
+            .ime_text
+            .as_ref()
+            .filter(|k| k.focus == id && field.record.as_ref().is_some_and(|r| r.ptr_eq(&k.record)));
+        let (rel, bounds) = match kept {
+            Some(k) => (k.rel, k.caret),
+            None => {
+                let (rel, caret) = ime_text_of(text, &field);
+                self.ime_text = field.record.clone().map(|record| ImeText {
+                    record,
+                    focus: id,
+                    rel,
+                    caret,
+                });
+                (rel, caret)
             }
-        }
-        let inflate = 3.0 * 0.6 * t.size;
-        let left = (it.origin.0 + bounds.x - inflate).max(area.x);
-        let right = (it.origin.0 + bounds.right() + inflate).min(area.right()).max(left);
+        };
+        let origin = (area.x + field.scrolled.0 + rel.0, area.y + field.scrolled.1 + rel.1);
+        let inflate = 3.0 * 0.6 * field.text.size;
+        let left = (origin.0 + bounds.x - inflate).max(area.x);
+        let right = (origin.0 + bounds.right() + inflate).min(area.right()).max(left);
         let laid = Bounds {
             x: left,
-            y: it.origin.1 + bounds.y,
+            y: origin.1 + bounds.y,
             width: right - left,
             height: bounds.height,
         };
         Some(ImeTarget {
             field: id,
-            area: self.rect_on_screen(i, laid),
+            area: shown.rect_on_screen(i, laid),
         })
-    }
-
-    /// The box around rectangle `b` of node `i`'s space as it shows on
-    /// screen ([`Self::to_screen`]: moved, scaled and turned as drawn).
-    fn rect_on_screen(&self, i: usize, b: Bounds) -> Bounds {
-        let corners =
-            [(b.x, b.y), (b.right(), b.y), (b.x, b.bottom()), (b.right(), b.bottom())].map(|p| self.to_screen(i, p));
-        let (mut x0, mut y0, mut x1, mut y1) = (f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-        for (x, y) in corners {
-            (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
-        }
-        Bounds {
-            x: x0,
-            y: y0,
-            width: x1 - x0,
-            height: y1 - y0,
-        }
     }
 
     /// The nearest `on_ime` of the focused node `i` (itself first).
@@ -3866,6 +4192,7 @@ mod tests {
     use super::*;
     use crate::edit::TextField;
     use crate::element::{IntoElement, text_input};
+    use crate::inspect::OUTSIDE;
     use crate::layout::layout;
     use crate::styled::Styled;
 
@@ -4090,7 +4417,7 @@ mod tests {
     fn notched(point: (f32, f32)) -> crate::compositor::WheelStep {
         crate::compositor::WheelStep {
             point,
-            at: crate::clock::current_seconds(),
+            time: crate::clock::current_nanos(),
             ..crate::compositor::WheelStep::default()
         }
     }
@@ -4783,7 +5110,7 @@ mod tests {
         assert_eq!(taken(&log), ["Move 30,15"], "by the wheel");
 
         // Scrolled by the program: the same.
-        ui.state.scroll.insert((container, None), (0.0, 12.0));
+        ui.state.scroll.insert((container, None), motion::units2((0.0, 12.0)));
         let jumped = laid_out(&scrolled_slider(&log), &ui, &mut text);
         ui.rehover(&jumped, &mut text);
         ui.rehover(&jumped, &mut text);
@@ -4839,13 +5166,13 @@ mod tests {
     }
 
     /// What the compositor showed of `frame`'s scroll containers.
-    fn presented(frame: &Frame) -> std::sync::Arc<crate::compositor::Presented> {
+    fn presented(frame: &Frame, text: &mut TextSystem) -> std::sync::Arc<crate::compositor::Presented> {
         let scroll = frame
             .nodes
             .iter()
             .enumerate()
             .filter_map(|(i, n)| {
-                let s = n.scroll?;
+                let s = n.scroll(OUTSIDE)?;
                 Some(crate::compositor::ShownScroll {
                     key: crate::compositor::NodeKey::of(&n.path),
                     owner: owner_of(frame, i),
@@ -4854,9 +5181,31 @@ mod tests {
                 })
             })
             .collect();
+        showing(
+            frame,
+            text,
+            crate::compositor::Presented {
+                scroll,
+                ..crate::compositor::Presented::default()
+            },
+        )
+    }
+
+    /// `shown`, with what `frame` (the frame as the compositor showed it)
+    /// gives input to hit: its boxes and property trees, painted.
+    fn showing(
+        frame: &Frame,
+        text: &mut TextSystem,
+        shown: crate::compositor::Presented,
+    ) -> std::sync::Arc<crate::compositor::Presented> {
+        let size = (400, 400);
+        let scene = crate::paint::Painter::fresh(frame, text, size, 1.0);
         std::sync::Arc::new(crate::compositor::Presented {
-            scroll,
-            ..crate::compositor::Presented::default()
+            hits: std::sync::Arc::clone(&scene.compositing.hits),
+            texts: std::sync::Arc::clone(&scene.compositing.texts),
+            properties: scene.properties.clone(),
+            scale: scene.scale,
+            ..shown
         })
     }
 
@@ -4872,10 +5221,14 @@ mod tests {
             laid.nodes[keyed(&laid, 9)].path.clone(),
             laid.nodes[keyed(&laid, 3)].path.clone(),
         );
-        ui.state.scroll.insert((outer.clone(), None), (0.0, 10.0));
-        ui.state.scroll.insert((inner.clone(), None), (0.0, 5.0));
+        ui.state
+            .scroll
+            .insert((outer.clone(), None), motion::units2((0.0, 10.0)));
+        ui.state
+            .scroll
+            .insert((inner.clone(), None), motion::units2((0.0, 5.0)));
         let scrolled = laid_out(&nested_scrolls(&log), &ui, &mut text);
-        let shown = presented(&scrolled);
+        let shown = presented(&scrolled, &mut text);
         ui.state.scroll.clear();
         let frame = laid_out(&nested_scrolls(&log), &ui, &mut text);
 
@@ -4884,8 +5237,8 @@ mod tests {
         ui.take_in(&frame);
         let (hit, owner) = (keyed(&frame, 4), keyed(&frame, 2));
         assert_ne!(
-            ui.shift.get(hit),
-            ui.shift.get(owner),
+            ui.shown(&frame).to_node(hit, (30.0, 20.0)),
+            ui.shown(&frame).to_node(owner, (30.0, 20.0)),
             "the node hit and the drag's owner show shifted apart"
         );
         assert_eq!(
@@ -4909,14 +5262,128 @@ mod tests {
 
         // The UI takes the scroll in: laid out where the screen showed it,
         // nothing moved under the pointer.
-        ui.state.scroll.insert((outer, None), (0.0, 10.0));
-        ui.state.scroll.insert((inner, None), (0.0, 5.0));
+        ui.state.scroll.insert((outer, None), motion::units2((0.0, 10.0)));
+        ui.state.scroll.insert((inner, None), motion::units2((0.0, 5.0)));
         let caught_up = laid_out(&nested_scrolls(&log), &ui, &mut text);
         ui.show(Some(shown.clone()));
         ui.rehover(&caught_up, &mut text);
         ui.show(Some(shown));
         ui.mouse_up(&caught_up, 40.0, 20.0);
         assert_eq!(taken(&log), ["End 40,30"], "taken in, it is where it showed");
+    }
+
+    /// A container the compositor scrolled, of 20,000 rows that each take
+    /// the pointer: a hover, a click and a rehover under a frame the
+    /// compositor scrolled further (the same hit table) each look at a few
+    /// frame nodes and compose a few transform chains, not one per row or
+    /// node. The per-frame facts a hit reads (a node's scroll shift, a
+    /// turn above it) are found up its ancestor chain, and the hit table's
+    /// boxes are found through a grid made once per table (RC5).
+    #[test]
+    fn a_hit_among_twenty_thousand_rows_visits_a_few_nodes_and_composes_a_few_chains() {
+        const ROWS: u64 = 20_000;
+        let clicked = std::rc::Rc::new(std::cell::Cell::new(None::<u64>));
+        let rows = |clicked: &std::rc::Rc<std::cell::Cell<Option<u64>>>| {
+            crate::element::div()
+                .width(400.0)
+                .height(100.0)
+                .child(
+                    crate::element::div()
+                        .key(9)
+                        .width(400.0)
+                        .height(100.0)
+                        .overflow_y(crate::style::Overflow::Scroll)
+                        .children((0..ROWS).map(|k| {
+                            let clicked = std::rc::Rc::clone(clicked);
+                            crate::element::div()
+                                .key(100 + k)
+                                .width(400.0)
+                                .height(1.0)
+                                .on_click(move |_| clicked.set(Some(k)))
+                        })),
+                )
+                .into_element()
+        };
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        let at = |frame: &Frame| {
+            let list = keyed(frame, 9);
+            (frame.nodes[list].path.clone(), owner_of(frame, list))
+        };
+        // What the compositor scrolled to and shows: the list 10 down.
+        let frame = laid_out(&rows(&clicked), &ui, &mut text);
+        let (list, owner) = at(&frame);
+        ui.state.scroll.insert((list, owner), motion::units2((0.0, 10.0)));
+        let scrolled = laid_out(&rows(&clicked), &ui, &mut text);
+        let shown = presented(&scrolled, &mut text);
+        assert!(
+            shown.hits.len() >= 20_000,
+            "every row is a hit box: {}",
+            shown.hits.len()
+        );
+        ui.state.scroll.clear();
+        let frame = laid_out(&rows(&clicked), &ui, &mut text);
+        ui.show(Some(shown.clone()));
+        // The hit table's grid, made once for the table at its first hit.
+        ui.pointer_moved(&frame, &mut text, 200.0, 5.5);
+
+        let cost = || (index_visits(), crate::clip::composed());
+        let since = |(v, c): (u64, u64)| (index_visits() - v, crate::clip::composed() - c);
+        let (visits, composed) = {
+            let before = cost();
+            let candidates = crate::clip::candidates();
+            ui.show(Some(shown.clone()));
+            ui.pointer_moved(&frame, &mut text, 200.0, 50.5);
+            // Every box and index node the hit weighed, not only the frame
+            // nodes it read: the logarithm of the 20,000 rows, not a walk.
+            let weighed = crate::clip::candidates() - candidates;
+            assert!(weighed <= 128, "a hover weighed {weighed} candidates");
+            since(before)
+        };
+        assert!(
+            visits <= 16 && composed <= 8,
+            "a hover: {visits} nodes, {composed} chains"
+        );
+
+        let (visits, composed) = {
+            let before = cost();
+            ui.show(Some(shown.clone()));
+            ui.mouse_down(&frame, &mut text, 200.0, 50.5);
+            ui.show(Some(shown.clone()));
+            ui.mouse_up(&frame, 200.0, 50.5);
+            since(before)
+        };
+        assert_eq!(clicked.get(), Some(60), "the row the screen shows under the pointer");
+        assert!(
+            visits <= 32 && composed <= 16,
+            "a click: {visits} nodes, {composed} chains"
+        );
+
+        // The compositor scrolls on, 5 more: the same hit table, another
+        // frame on screen; the pointer rests.
+        let further = std::sync::Arc::new(crate::compositor::Presented {
+            scroll: shown
+                .scroll
+                .iter()
+                .map(|s| crate::compositor::ShownScroll {
+                    offset: (s.offset.0, s.offset.1 + 5.0),
+                    applied: (s.applied.0, s.applied.1 + 5.0),
+                    ..*s
+                })
+                .collect(),
+            frame: shown.frame + 1,
+            ..(*shown).clone()
+        });
+        let (visits, composed) = {
+            let before = cost();
+            ui.show(Some(further));
+            ui.rehover(&frame, &mut text);
+            since(before)
+        };
+        assert!(
+            visits <= 16 && composed <= 8,
+            "a rehover: {visits} nodes, {composed} chains"
+        );
     }
 
     /// A box at 0..100 by 0..40 taking drags, logging where they are in its
@@ -4962,6 +5429,55 @@ mod tests {
         ui.pointer_moved(&doubled, &mut text, 50.0, 30.0);
         ui.mouse_up(&doubled, 50.0, 30.0);
         assert_eq!(taken(&log), ["Start 30,10", "Move 15,5", "Move 25,15", "End 25,15"]);
+    }
+
+    /// A paragraph of two spans, "aaaa" and "bbbb", each logging its
+    /// clicks, scaled `scale` about its top-left corner.
+    fn two_spans(log: &Log, scale: f32) -> crate::element::Element {
+        let (a, b) = (log.clone(), log.clone());
+        crate::element::div()
+            .width(400.0)
+            .height(100.0)
+            .child(
+                crate::element::text("")
+                    .key(1)
+                    .span(crate::element::span("aaaa").on_click(move |_| a.borrow_mut().push("a".to_owned())))
+                    .span(crate::element::span("bbbb").on_click(move |_| b.borrow_mut().push("b".to_owned())))
+                    .scale(scale)
+                    .origin(crate::style::Origin::At([
+                        crate::style::Calc::fraction(0.0),
+                        crate::style::Calc::fraction(0.0),
+                    ])),
+            )
+            .into_element()
+    }
+
+    /// A click routed in frame A, where a paragraph shows unscaled, lands
+    /// on the span A showed under it, though the frame laid out since (B)
+    /// scales the paragraph twice: the point is mapped into the node by
+    /// A's property trees, the frame it was hit in, never by B's
+    /// transform (which would put it half as far in, on the other span).
+    #[test]
+    fn a_click_routed_in_a_frame_maps_into_the_span_that_frame_showed() {
+        let log = Log::default();
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        let plain = laid_out(&two_spans(&log, 1.0), &ui, &mut text);
+        let doubled = laid_out(&two_spans(&log, 2.0), &ui, &mut text);
+        let p = keyed(&plain, 1);
+        let spans = &plain.behaviour(p).expect("the paragraph's behaviour").spans;
+        let b = spans[1].boxes[0];
+        let (x, y) = (b.x + b.width / 2.0, b.y + b.height / 2.0);
+        assert!(
+            spans[0].boxes[0].contains(x / 2.0, y / 2.0),
+            "B's scale would put the point on the first span"
+        );
+        // The screen showed A as the press came; the UI laid out B since.
+        ui.show(Some(presented(&plain, &mut text)));
+        ui.take_in(&doubled);
+        ui.mouse_down(&doubled, &mut text, x, y);
+        ui.mouse_up(&doubled, x, y);
+        assert_eq!(taken(&log), ["b"], "the span A showed under the click");
     }
 
     /// A keyed button of 100 by 40 at the top, scaled by `scale` about its
@@ -5223,13 +5739,22 @@ mod tests {
         };
         let laid = laid_out(&page(false), &ui, &mut text);
         let list = laid.nodes[keyed(&laid, 2)].path.clone();
-        let offset = |ui: &InputState| ui.state.scroll.get(&(list.clone(), None)).map_or(0.0, |o| o.1);
+        let offset = |ui: &InputState| {
+            ui.state
+                .scroll
+                .get(&(list.clone(), None))
+                .map_or(0.0, |o| motion::px(o.1))
+        };
         let pad = |point: (f32, f32), began: bool| crate::compositor::WheelStep {
             point,
-            at: crate::clock::current_seconds(),
+            time: crate::clock::current_nanos(),
             precise: true,
-            began,
-            ended: false,
+            phase: if began {
+                crate::compositor::WheelPhase::Began
+            } else {
+                crate::compositor::WheelPhase::Changed
+            },
+            gesture: None,
         };
         ui.wheel_at(&laid, pad((50.0, 20.0), true), (0.0, 30.0), None);
         assert_eq!(offset(&ui), 30.0, "the list took the gesture");
@@ -5274,26 +5799,33 @@ mod tests {
         let delta = |owner| crate::compositor::ScrollDelta {
             key,
             owner,
-            delta: (0.0, 30.0),
-            generation: 0,
+            delta: motion::units2((0.0, 30.0)),
             reach: (0.0, 0.0),
+            steps: 1,
+            ..Default::default()
         };
-        ui.apply_scroll(&replaced, &[delta(owner_a)]);
+        ui.take_scroll(&replaced, &[delta(owner_a)]);
         assert_eq!(
             ui.state.scroll.get(&(path.clone(), owner_b)),
             None,
             "B took none of A's"
         );
-        ui.apply_scroll(&replaced, &[delta(owner_b)]);
-        assert_eq!(ui.state.scroll.get(&(path, owner_b)), Some(&(0.0, 30.0)), "B's is B's");
+        ui.take_scroll(&replaced, &[delta(owner_b)]);
+        assert_eq!(
+            ui.state.scroll.get(&(path, owner_b)),
+            Some(&motion::units2((0.0, 30.0))),
+            "B's is B's"
+        );
     }
 
     /// The last frame showed a list at 0 and the compositor scrolled it 30
-    /// on from there; before the next layout the program scrolls it to
-    /// 200. The program's write is the newer: the list is at 200, not 230
-    /// nor 30.
+    /// on from there; the program scrolls it to 200 before the UI takes
+    /// that in (ADR-0032: the UI took in before the input that jumped
+    /// whatever wheels came before it, so this is of wheels after the
+    /// jump). The jump is an assignment, the take a displacement on it:
+    /// the list is at 230, from the jump, not 30 nor 200.
     #[test]
-    fn a_program_scroll_after_the_compositors_wins() {
+    fn the_compositors_scroll_taken_after_a_jump_moves_from_it() {
         let mut text = TextSystem::new();
         let mut ui = InputState::default();
         let list = |h: &ScrollHandle| {
@@ -5312,39 +5844,380 @@ mod tests {
         // The compositor's scroll of the list `handle` shows in `frame`.
         let scrolled = |frame: &Frame| {
             let i = keyed(frame, 2);
-            let s = frame.nodes[i].scroll.expect("a scroll container");
+            let s = frame.nodes[i].scroll(OUTSIDE).expect("a scroll container");
             assert_eq!(s.offset, (0.0, 0.0), "shown at 0");
             crate::compositor::ScrollDelta {
                 key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
                 owner: owner_of(frame, i),
-                delta: (0.0, 30.0),
-                generation: s.generation,
+                delta: motion::units2((0.0, 30.0)),
                 reach: (0.0, 0.0),
+                steps: 1,
+                ..Default::default()
             }
         };
         // Alone, it moves the list.
         let handle = ScrollHandle::new();
         let frame = laid_out(&list(&handle), &ui, &mut text);
         let delta = scrolled(&frame);
-        ui.apply_scroll(&frame, &[delta]);
+        ui.take_scroll(&frame, &[delta]);
         assert_eq!(handle.offset(), (0.0, 30.0), "the compositor's scroll is taken");
-        // After it, the program scrolls.
+        // After the jump, it moves from it.
         let handle = ScrollHandle::new();
         let frame = laid_out(&list(&handle), &ui, &mut text);
         let delta = scrolled(&frame);
         handle.scroll_to((0.0, 200.0));
-        ui.apply_scroll(&frame, &[delta]);
-        assert_eq!(handle.offset(), (0.0, 200.0), "the program's scroll wins");
+        ui.take_scroll(&frame, &[delta]);
+        assert_eq!(handle.offset(), (0.0, 230.0), "from the jump");
         let next = laid_out(&list(&handle), &ui, &mut text);
-        let s = next.nodes[keyed(&next, 2)].scroll.expect("a scroll container");
-        assert_eq!(s.offset, (0.0, 200.0), "and is laid out");
-        // A scroll to where it is changes nothing: the compositor's lands.
+        let s = next.nodes[keyed(&next, 2)].scroll(OUTSIDE).expect("a scroll container");
+        assert_eq!(s.offset, (0.0, 230.0), "and is laid out");
+        // Taken twice before a layout: each lands once, in order.
+        ui.take_scroll(&next, &[scrolled_from(&next, 2, 10.0)]);
+        ui.take_scroll(&next, &[scrolled_from(&next, 2, 10.0)]);
+        assert_eq!(handle.offset(), (0.0, 250.0), "two takes, each once");
+    }
+
+    /// The compositor's scroll of the container keyed `key` in `frame`, by
+    /// `dy`.
+    fn scrolled_from(frame: &Frame, key: u64, dy: f32) -> crate::compositor::ScrollDelta {
+        let i = keyed(frame, key);
+        crate::compositor::ScrollDelta {
+            key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+            owner: owner_of(frame, i),
+            delta: motion::units2((0.0, dy)),
+            reach: (0.0, 0.0),
+            steps: 0,
+            ..Default::default()
+        }
+    }
+
+    /// The last frame showed a text field at 0 and the compositor scrolled
+    /// it 30 on from there; before the UI takes that in, an edit brought
+    /// the field's caret into view (a jump, the UI's own write, an
+    /// assignment). What the UI takes after lands on top of it, as on a
+    /// program's scroll (ADR-0032); an offset only clamped is no jump.
+    #[test]
+    fn the_compositors_scroll_taken_after_a_reveal_moves_from_it() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        let field = TextField::new("a long value that runs well past the end of its narrow box, and on");
+        let root = crate::element::div()
+            .child(text_input(&field).width(60.0))
+            .into_element();
+        let delta = |frame: &Frame| {
+            let i = frame
+                .nodes
+                .iter()
+                .position(|n| matches!(n.content, Content::Input { .. }))
+                .expect("the field");
+            let s = frame.nodes[i].scroll(OUTSIDE).expect("a field scrolls");
+            assert!(s.max.0 > 100.0, "its text runs past its box");
+            crate::compositor::ScrollDelta {
+                key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+                owner: owner_of(frame, i),
+                delta: motion::units2((30.0, 0.0)),
+                reach: (0.0, 0.0),
+                steps: 1,
+                ..Default::default()
+            }
+        };
+        let frame = laid_out(&root, &ui, &mut text);
+        let d = delta(&frame);
+        let before = field.scroll_generation();
+        field.reveal();
+        let asked = field.view.with_untracked(|v| v.reveal);
+        field.settled(motion::units2((12.0, 0.0)), asked);
+        assert_eq!(
+            field.scroll_generation(),
+            before.wrapping_add(1),
+            "the reveal is a jump"
+        );
+        ui.take_scroll(&frame, &[d]);
+        assert_eq!(field.offset(), (42.0, 0.0), "from the reveal");
+        // Only clamped (no reveal): no jump, and a take lands from there.
+        let frame = laid_out(&root, &ui, &mut text);
+        let d = delta(&frame);
+        let before = field.scroll_generation();
+        field.settled(motion::units2((10.0, 0.0)), asked);
+        assert_eq!(field.scroll_generation(), before, "a clamp is no jump");
+        ui.take_scroll(&frame, &[d]);
+        assert_eq!(field.offset(), (40.0, 0.0), "the delta lands");
+    }
+
+    /// A notched wheel's gesture that took a list to its end turns on
+    /// against it, through the UI's own wheel: nothing moves, but the list
+    /// was scrolled (its overlay scrollbar shows, [`ScrollHandle::wheels`]).
+    #[test]
+    fn the_uis_wheel_against_an_edge_counts_as_a_scroll() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        crate::clock::script(std::time::Duration::from_secs(10));
         let handle = ScrollHandle::new();
-        let frame = laid_out(&list(&handle), &ui, &mut text);
-        let delta = scrolled(&frame);
-        handle.scroll_to((0.0, 0.0));
-        ui.apply_scroll(&frame, &[delta]);
-        assert_eq!(handle.offset(), (0.0, 30.0), "a scroll to where it was writes nothing");
+        let list = crate::element::div()
+            .child(
+                crate::element::div()
+                    .width(100.0)
+                    .height(60.0)
+                    .overflow_y(crate::style::Overflow::Scroll)
+                    .track_scroll(&handle)
+                    .child(crate::element::div().width(100.0).height(400.0)),
+            )
+            .into_element();
+        let frame = laid_out(&list, &ui, &mut text);
+        assert!(ui.wheel_at(&frame, notched((10.0, 10.0)), (0.0, 500.0), None).redraw);
+        assert_eq!(handle.offset(), (0.0, 340.0), "at its end");
+        let wheels = handle.wheels();
+        let frame = laid_out(&list, &ui, &mut text);
+        let out = ui.wheel_at(&frame, notched((10.0, 10.0)), (0.0, 40.0), None);
+        assert!(out.redraw, "taken");
+        assert_eq!(handle.offset(), (0.0, 340.0), "nothing moved");
+        assert_eq!(handle.wheels(), wheels + 1, "but it was scrolled");
+    }
+
+    /// The edge rule the compositor's route has, through the UI's own
+    /// wheel: a fresh gesture against the end of a lone list (no container
+    /// around it can move that way) is the list's, held against its edge,
+    /// and counts as a scroll; a sideways step of a gesture latched to it,
+    /// along the axis it does not scroll, is not its and counts for
+    /// nothing.
+    #[test]
+    fn the_uis_wheel_takes_an_edge_by_the_compositors_rule() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        crate::clock::script(std::time::Duration::from_secs(10));
+        let handle = ScrollHandle::new();
+        handle.scroll_to((0.0, f32::MAX));
+        let list = crate::element::div()
+            .child(
+                crate::element::div()
+                    .width(100.0)
+                    .height(60.0)
+                    .overflow_y(crate::style::Overflow::Scroll)
+                    .track_scroll(&handle)
+                    .child(crate::element::div().width(100.0).height(400.0)),
+            )
+            .into_element();
+        let frame = laid_out(&list, &ui, &mut text);
+        let offset = |frame: &Frame| frame.nodes.iter().find_map(|n| n.scroll(OUTSIDE)).map(|s| s.offset);
+        assert_eq!(offset(&frame), Some((0.0, 340.0)), "at its end");
+        let wheels = handle.wheels();
+        let out = ui.wheel_at(&frame, notched((10.0, 10.0)), (0.0, 40.0), None);
+        assert!(out.redraw, "a fresh wheel against the end is taken");
+        assert_eq!(
+            offset(&laid_out(&list, &ui, &mut text)),
+            Some((0.0, 340.0)),
+            "nothing moved"
+        );
+        assert_eq!(handle.wheels(), wheels + 1, "but it was scrolled");
+        let frame = laid_out(&list, &ui, &mut text);
+        let out = ui.wheel_at(&frame, notched((10.0, 10.0)), (40.0, 0.0), None);
+        assert!(!out.redraw, "a sideways step is not the list's");
+        assert_eq!(handle.wheels(), wheels + 1, "and counts for nothing");
+    }
+
+    /// Taking in the compositor's deltas finds each container by its key:
+    /// over a frame of 2,000 nodes with one list, the first delta reads the
+    /// frame once (its index), and every later one, the frame unchanged,
+    /// looks at the list's node alone and allocates nothing.
+    #[test]
+    fn a_compositor_delta_costs_its_container_not_the_frame() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        let handle = ScrollHandle::new();
+        let root = crate::element::div()
+            .child(
+                crate::element::div()
+                    .width(100.0)
+                    .height(60.0)
+                    .overflow_y(crate::style::Overflow::Scroll)
+                    .track_scroll(&handle)
+                    .child(crate::element::div().width(100.0).height(40_000.0)),
+            )
+            .children((0..2_000).map(|_| crate::element::div().width(1.0).height(1.0)))
+            .into_element();
+        let frame = laid_out(&root, &ui, &mut text);
+        assert!(frame.nodes.len() > 2_000);
+        let i = frame
+            .nodes
+            .iter()
+            .position(|n| laid_scroll(n).is_some())
+            .expect("the list");
+        let delta = crate::compositor::ScrollDelta {
+            key: crate::compositor::NodeKey::of(&frame.nodes[i].path),
+            owner: owner_of(&frame, i),
+            delta: motion::units2((0.0, 1.0)),
+            reach: (0.0, 0.0),
+            steps: 1,
+            ..Default::default()
+        };
+        let visits = || SCROLL_INDEX_VISITS.with(std::cell::Cell::get);
+        let before = visits();
+        assert!(ui.take_scroll(&frame, &[delta]));
+        assert!(visits() - before > 2_000, "the first reads the frame");
+        // Warm: what it keeps has grown.
+        ui.take_scroll(&frame, &[delta]);
+        for k in 0..100 {
+            let before = visits();
+            let (moved, allocations) = crate::heap::allocations(|| ui.take_scroll(&frame, &[delta]));
+            assert!(moved, "delta {k} moves the list");
+            assert_eq!(visits() - before, 1, "delta {k} looks at the list alone");
+            assert_eq!(allocations, 0, "delta {k} allocates nothing");
+        }
+        // Each added once to where the UI holds it, no layout between.
+        assert_eq!(handle.offset(), (0.0, 102.0));
+        // A pass wrote a node in place since (the frame's log has news no
+        // reader of it read): every reader on the delta's path, the
+        // layers' stack and the containers' index, reads that node alone.
+        let mut frame = frame;
+        frame.changes.log.push(crate::layout::Changed {
+            index: u32::try_from(i).unwrap_or(0),
+            before: frame.nodes[i].bounds(OUTSIDE),
+            repainted: true,
+        });
+        let before = visits();
+        assert!(ui.take_scroll(&frame, &[delta]));
+        let read = visits() - before;
+        assert!(
+            read <= 3,
+            "a change logged costs its node, not the frame: {read} visits"
+        );
+    }
+
+    /// A box that clicks ahead of 20,000 others, on the frame the screen
+    /// shows: once the frame's key index is read, each press, release and
+    /// move finds the node the screen shows by a lookup, not a walk of the
+    /// frame (a walk from the end visits all 20,000 to find the first).
+    #[test]
+    fn a_click_and_a_hover_over_a_large_page_cost_a_lookup() {
+        let mut text = TextSystem::new();
+        let log = Log::default();
+        let l = log.clone();
+        let root = crate::element::div()
+            .child(
+                crate::element::div()
+                    .width(200.0)
+                    .height(60.0)
+                    .on_click(move |_| l.borrow_mut().push("click".to_owned())),
+            )
+            .children((0..20_000).map(|_| crate::element::div().width(1.0).height(1.0)))
+            .into_element();
+        let frame = laid_out(&root, &InputState::default(), &mut text);
+        assert!(frame.nodes.len() > 20_000);
+        let mut ui = InputState::showing(&frame, std::sync::Arc::new(painted(&frame)));
+        let visits = || SCROLL_INDEX_VISITS.with(std::cell::Cell::get);
+        // Warm: the first reads the frame into the index.
+        ui.pointer_moved(&frame, &mut text, 20.0, 15.0);
+        assert!(ui.hit_shown(&frame, 20.0, 15.0).is_some(), "the box is shown");
+        for k in 0..20_u8 {
+            let (x, y) = (20.0 + f32::from(k), 15.0);
+            let before = visits();
+            ui.pointer_moved(&frame, &mut text, x, y);
+            ui.mouse_down(&frame, &mut text, x, y);
+            ui.mouse_up(&frame, x, y);
+            let read = visits() - before;
+            assert!(read <= 16, "click {k} costs lookups, not the frame: {read} visits");
+        }
+        assert_eq!(taken(&log).len(), 20, "each click reached the box");
+    }
+
+    /// A menu open over a page of 20,000 nodes: the layer stack reads the
+    /// frame once; a write in place since, of a node no layer is, costs
+    /// that node (and the layers' roots it may be), not the frame nor a
+    /// walk for each layer's owner; one of the menu's root, its Tab owner
+    /// asked for unchanged, costs no walk either.
+    #[test]
+    fn a_write_in_place_under_an_open_menu_costs_what_was_written() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        let root = crate::element::div()
+            .children((0..20_000).map(|_| crate::element::div().width(1.0).height(1.0)))
+            .child(crate::element::deferred(
+                crate::element::Positioning::At { x: 10.0, y: 10.0 },
+                crate::element::div()
+                    .layer(crate::layer::Layer::new())
+                    .width(100.0)
+                    .height(100.0),
+            ))
+            .into_element();
+        let frame = laid_out(&root, &ui, &mut text);
+        assert!(frame.nodes.len() > 20_000);
+        assert_eq!(frame.layers.len(), 1, "the menu");
+        let visits = || SCROLL_INDEX_VISITS.with(std::cell::Cell::get);
+        let before = visits();
+        ui.layers.refresh(&frame);
+        assert!(visits() - before > 20_000, "the first reads the frame");
+        let mut frame = frame;
+        for (what, index) in [
+            ("an unrelated node", 5_usize),
+            ("the menu's root", frame.layers[0].root),
+        ] {
+            frame.changes.log.push(crate::layout::Changed {
+                index: u32::try_from(index).unwrap_or(0),
+                before: frame.nodes[index].bounds(OUTSIDE),
+                repainted: true,
+            });
+            let before = visits();
+            ui.layers.refresh(&frame);
+            let read = visits() - before;
+            assert!(read <= 2, "{what} written costs what was written: {read} visits");
+            assert_eq!(ui.layers.entries.len(), 1, "the menu still open ({what})");
+        }
+    }
+
+    /// A trackpad gesture the compositor hands on over a wheel handler on
+    /// a page of 20,000 nodes: the first event finds the node it was over
+    /// through the frame's index, read once, and every later one, the
+    /// frame unchanged, looks at a constant number of nodes, not the frame.
+    #[test]
+    fn a_wheel_handed_on_over_a_large_frame_finds_its_node_by_an_index() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        // The handler last in the frame: no walk from its start finds it
+        // cheaply.
+        let root = crate::element::div()
+            .width(400.0)
+            .children((0..20_000).map(|_| crate::element::div().width(1.0).height(1.0)))
+            .child(
+                crate::element::div()
+                    .key(1)
+                    .on_wheel(|_| true)
+                    .width(200.0)
+                    .height(50.0),
+            )
+            .into_element();
+        let frame = laid_out(&root, &ui, &mut text);
+        assert!(frame.nodes.len() > 20_000);
+        let at = frame
+            .nodes
+            .last()
+            .map(|n| (n.bounds(OUTSIDE).x + 10.0, n.bounds(OUTSIDE).y + 10.0))
+            .unwrap_or_default();
+        let target = crate::compositor::HitTarget {
+            key: crate::compositor::NodeKey::of(&path_at(&frame, at.0, at.1)),
+            owner: None,
+        };
+        let sample = |k: u64| crate::compositor::WheelStep {
+            point: at,
+            time: crate::clock::current_nanos().saturating_add(k),
+            precise: true,
+            phase: if k == 0 {
+                crate::compositor::WheelPhase::Began
+            } else {
+                crate::compositor::WheelPhase::Changed
+            },
+            gesture: Some(1),
+        };
+        let visits = || SCROLL_INDEX_VISITS.with(std::cell::Cell::get);
+        let before = visits();
+        assert!(ui.wheel_at(&frame, sample(0), (0.0, 4.0), Some(target)).redraw);
+        assert!(visits() - before > 20_000, "the first reads the frame");
+        for k in 1..20 {
+            let before = visits();
+            let out = ui.wheel_at(&frame, sample(k), (0.0, 4.0), Some(target));
+            assert!(out.redraw, "sample {k} reaches the handler");
+            let read = visits() - before;
+            assert!(read <= 2, "sample {k} looks at {read} nodes, not the frame");
+        }
     }
 
     /// A wheel gesture over a list when a modal layer opens over it, with
@@ -5388,16 +6261,20 @@ mod tests {
         };
         let pad = |began: bool| crate::compositor::WheelStep {
             point: (50.0, 20.0),
-            at: crate::clock::current_seconds(),
+            time: crate::clock::current_nanos(),
             precise: true,
-            began,
-            ended: false,
+            phase: if began {
+                crate::compositor::WheelPhase::Began
+            } else {
+                crate::compositor::WheelPhase::Changed
+            },
+            gesture: None,
         };
         ui.wheel_at(&laid, pad(true), (0.0, 30.0), Some(list));
         let modal = laid_out(&page(true), &ui, &mut text);
         let inner = modal.nodes[keyed(&modal, 3)].path.clone();
         ui.wheel_at(&modal, pad(false), (0.0, 30.0), Some(list));
-        let offset = ui.state.scroll.get(&(inner, None)).map_or(0.0, |o| o.1);
+        let offset = ui.state.scroll.get(&(inner, None)).map_or(0.0, |o| motion::px(o.1));
         assert_eq!(offset, 30.0, "the modal's scroller took the gesture on");
     }
 
@@ -5434,7 +6311,12 @@ mod tests {
         };
         let laid = laid_out(&page(false), &ui, &mut text);
         let list = laid.nodes[keyed(&laid, 2)].path.clone();
-        let offset = |ui: &InputState| ui.state.scroll.get(&(list.clone(), None)).map_or(0.0, |o| o.1);
+        let offset = |ui: &InputState| {
+            ui.state
+                .scroll
+                .get(&(list.clone(), None))
+                .map_or(0.0, |o| motion::px(o.1))
+        };
         ui.touch(&laid, &mut text, &contact(1, TouchPhase::Started, 50.0, 50.0));
         ui.touch(&laid, &mut text, &contact(1, TouchPhase::Moved, 50.0, 20.0));
         let panned = offset(&ui);
@@ -5522,7 +6404,8 @@ mod tests {
             laid.nodes[keyed(&laid, 9)].path.clone(),
             laid.nodes[keyed(&laid, 3)].path.clone(),
         );
-        let offset = |ui: &InputState, p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| o.1);
+        let offset =
+            |ui: &InputState, p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| motion::px(o.1));
         let wheel = |ui: &mut InputState, text: &mut TextSystem| {
             let frame = laid_out(&nested_lists(), ui, text);
             ui.wheel_at(&frame, notched((20.0, 20.0)), (0.0, 100.0), None);
@@ -5553,7 +6436,8 @@ mod tests {
             laid.nodes[keyed(&laid, 9)].path.clone(),
             laid.nodes[keyed(&laid, 3)].path.clone(),
         );
-        let offset = |ui: &InputState, p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| o.1);
+        let offset =
+            |ui: &InputState, p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| motion::px(o.1));
         let touch = |ui: &mut InputState, text: &mut TextSystem, ev: TouchEvent| {
             let frame = laid_out(&nested_lists(), ui, text);
             ui.touch(&frame, text, &ev);
@@ -5571,6 +6455,40 @@ mod tests {
         touch(&mut ui, &mut text, contact(2, TouchPhase::Started, 50.0, 80.0));
         touch(&mut ui, &mut text, contact(1, TouchPhase::Moved, 20.0, -200.0));
         assert_eq!((offset(&ui, &inner), offset(&ui, &outer)), (140.0, 30.0));
+    }
+
+    /// A finger pan handled after the program's `scroll_to` (queued while
+    /// the UI ran it): writes are ordered as the UI makes them (ADR-0032,
+    /// I5), no clock between them, so the pan moves the list from where
+    /// the jump put it, and the jump refuses nothing.
+    #[test]
+    fn a_pan_handled_after_a_jump_moves_from_it() {
+        let mut text = TextSystem::new();
+        let mut ui = InputState::default();
+        crate::clock::script(std::time::Duration::from_secs(10));
+        let h = ScrollHandle::new();
+        let list = |h: &ScrollHandle| {
+            crate::element::div()
+                .child(
+                    crate::element::div()
+                        .key(2)
+                        .width(100.0)
+                        .height(60.0)
+                        .overflow_y(crate::style::Overflow::Scroll)
+                        .track_scroll(h)
+                        .child(crate::element::div().width(100.0).height(400.0)),
+                )
+                .into_element()
+        };
+        h.scroll_to((0.0, 100.0));
+        for ev in [
+            contact(1, TouchPhase::Started, 20.0, 50.0),
+            contact(1, TouchPhase::Moved, 20.0, 20.0),
+        ] {
+            let frame = laid_out(&list(&h), &ui, &mut text);
+            ui.touch(&frame, &mut text, &ev);
+        }
+        assert!(h.offset().1 > 100.0, "from where the program put it: {:?}", h.offset());
     }
 
     /// Two lists side by side, each 100 px wide and 60 px tall (200 px of
@@ -5612,7 +6530,7 @@ mod tests {
             laid.nodes[keyed(&laid, 2)].path.clone(),
         );
         let offsets = |ui: &InputState| {
-            let of = |p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| o.1);
+            let of = |p: &NodePath| ui.state.scroll.get(&(p.clone(), None)).map_or(0.0, |o| motion::px(o.1));
             (of(&a), of(&b))
         };
         let wheel = |ui: &mut InputState, text: &mut TextSystem, step: crate::compositor::WheelStep| {
@@ -5628,10 +6546,14 @@ mod tests {
         // A's gesture still.
         let pad = |point: (f32, f32), began: bool| crate::compositor::WheelStep {
             point,
-            at: crate::clock::current_seconds(),
+            time: crate::clock::current_nanos(),
             precise: true,
-            began,
-            ended: false,
+            phase: if began {
+                crate::compositor::WheelPhase::Began
+            } else {
+                crate::compositor::WheelPhase::Changed
+            },
+            gesture: None,
         };
         crate::clock::advance_to(std::time::Duration::from_secs(12));
         wheel(&mut ui, &mut text, pad((50.0, 20.0), true));
@@ -5900,6 +6822,43 @@ mod tests {
         assert!(got.iter().all(|e| e.starts_with('A')), "{got:?}");
     }
 
+    /// A box that clicks, made by component A, is on screen; B, another
+    /// component, replaces it at the same path in a commit not yet
+    /// presented. A click on what the screen shows is A's: B, which the
+    /// screen never showed there, is not clicked.
+    #[test]
+    fn a_click_on_a_box_another_instance_replaced_since_it_was_shown_reaches_neither() {
+        use crate::component::component;
+        let log = Log::default();
+        let which = Signal::new("A");
+        let l = log.clone();
+        let mut s = crate::app::Scenario::measuring(
+            move || {
+                let clickable = |who: &'static str, l: Log| {
+                    crate::element::div()
+                        .width(200.0)
+                        .height(60.0)
+                        .on_click(move |_| l.borrow_mut().push(format!("{who} click")))
+                        .into_element()
+                };
+                let (a, b) = (l.clone(), l.clone());
+                match which.get() {
+                    "A" => component((), move |_| move || clickable("A", a.clone())).into_element(),
+                    _ => component((0_u8,), move |_| move || clickable("B", b.clone())).into_element(),
+                }
+            },
+            400,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        s.settle().expect("A presented");
+        s.act("B replaces A", || which.set("B"));
+        s.click(20.0, 15.0);
+        let got = taken(&log);
+        assert!(got.is_empty(), "B is not clicked: {got:?}");
+    }
+
     #[test]
     fn a_press_on_a_bare_node_whose_component_was_replaced_clicks_nothing() {
         use crate::component::component;
@@ -6121,10 +7080,16 @@ mod tests {
             rotate: 0.0,
             origin: (0.0, 0.0),
         };
-        ui.show(Some(std::sync::Arc::new(crate::compositor::Presented {
-            turned: vec![(key, turned)],
-            ..crate::compositor::Presented::default()
-        })));
+        // The frame shown: the button at 2x, as the compositor sampled it.
+        let showed = laid_out(&scaled_button(&log, 2.0), &ui, &mut text);
+        ui.show(Some(showing(
+            &showed,
+            &mut text,
+            crate::compositor::Presented {
+                turned: vec![(key, turned)],
+                ..crate::compositor::Presented::default()
+            },
+        )));
         // 150 in, past the box at 1x, on it as shown: 75 into it.
         ui.mouse_down(&rested, &mut text, 150.0, 10.0);
         ui.mouse_up(&rested, 150.0, 10.0);
@@ -7102,7 +8067,7 @@ mod tests {
             target.area.x + target.area.width / 2.0,
             target.area.y + target.area.height / 2.0,
         );
-        let (hx, hy) = ui.to_node(i, mid.0, mid.1);
+        let (hx, hy) = ui.shown(&f).to_node(i, mid);
         assert!(
             (hy - cy).abs() < 1.5 && hx >= area.x - 1.0 && hx <= cx + 1.0,
             "the area {target:?} maps back to ({hx}, {hy}), the caret at ({cx}, {cy})"

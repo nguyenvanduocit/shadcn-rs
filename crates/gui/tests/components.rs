@@ -81,7 +81,7 @@ fn a_binding_changes_the_frame_without_rendering() {
         .nodes
         .iter()
         .find(|n| n.name == Some("box"))
-        .map(|n| n.bounds.width);
+        .map(|n| n.bounds(gui::inspect::OUTSIDE).width);
     assert_eq!(w, Some(160.0));
 }
 
@@ -238,7 +238,7 @@ fn a_parent_restyles_a_components_root_through_every_render() {
             .nodes
             .iter()
             .find(|n| n.name == Some("own"))
-            .map(|n| n.bounds.width)
+            .map(|n| n.bounds(gui::inspect::OUTSIDE).width)
     };
     s.frame("first").expect("a frame");
     assert_eq!(
@@ -258,7 +258,7 @@ fn own_width(s: &Scenario) -> Option<f32> {
         .nodes
         .iter()
         .find(|n| n.name == Some("own"))
-        .map(|n| n.bounds.width)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE).width)
 }
 
 #[test]

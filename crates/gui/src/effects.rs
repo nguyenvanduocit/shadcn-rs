@@ -12,6 +12,13 @@ use crate::scene::{Gradient, Item, PixelRect};
 use crate::style::{Axis, BackgroundClip, BackgroundImage, Direction, LinearGradient, MaskImage, ResolvedText};
 use crate::text::{Paragraph, Target, TextSystem};
 
+/// The effects' reader of laid-out geometry ([`crate::layout::Sight`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Sight(());
+
+/// The effects' [`Sight`].
+const SIGHT: Sight = Sight(());
+
 /// Pixels per `ch` for `t`: the advance of its `0`.
 fn ch(text: &mut TextSystem, t: &ResolvedText) -> f32 {
     text.measure("0", t, None).0
@@ -51,7 +58,7 @@ pub(crate) fn gradient(g: &LinearGradient, tile: Bounds, current: Color, ch: f32
 /// Where the background tile sits in `node`'s padding box.
 fn tile(img: &BackgroundImage, node: &FrameNode, ch: f32) -> Bounds {
     let b = node.look.border;
-    let area = node.bounds.inset(b.top, b.right, b.bottom, b.left);
+    let area = node.bounds(SIGHT).inset(b.top, b.right, b.bottom, b.left);
     let [w, h] = img.size;
     let [x, y] = img.position;
     let (width, height) = (w.resolve(area.width, ch), h.resolve(area.height, ch));
@@ -87,7 +94,7 @@ pub(crate) fn record_background(
     let Some(gradient) = gradient(&img.gradient, tile, node.look.text.color, ch) else {
         return;
     };
-    let b = target.snapped(node.bounds);
+    let b = target.snapped(node.bounds(SIGHT));
     target.items.push(Item::Gradient {
         bounds: b.intersect(&tile),
         radius: node.look.shape.used(b.width, b.height),
@@ -150,10 +157,10 @@ pub(crate) fn record_text_through(
     t: &ResolvedText,
     width: Option<f32>,
 ) {
-    let area = node.content_box;
+    let area = node.content_box(SIGHT);
     let scale = target.scale;
     // In the chunk's paint space, which the window's edges do not bound.
-    let Some(region) = pixel_cover(node.bounds.outset(t.line_height), scale) else {
+    let Some(region) = pixel_cover(node.bounds(SIGHT).outset(t.line_height), scale) else {
         return;
     };
     // Glyph coverage only: the text's colour shows nowhere.
@@ -178,7 +185,7 @@ pub(crate) fn record_text_through(
     );
     let ch = ch(text, t);
     let tile = tile(img, node, ch);
-    let shown = node.bounds.intersect(&tile);
+    let shown = node.bounds(SIGHT).intersect(&tile);
     target.items.push(Item::TextThrough {
         region,
         mask,
@@ -186,7 +193,7 @@ pub(crate) fn record_text_through(
             .look
             .background
             .filter(|c| !c.is_transparent())
-            .map(|c| (node.bounds, c)),
+            .map(|c| (node.bounds(SIGHT), c)),
         fill: gradient(&img.gradient, tile, t.color, ch).map(|g| (g, shown)),
     });
 }
@@ -197,18 +204,18 @@ fn mask(node: &FrameNode) -> Option<LinearGradient> {
     match node.look.effects.mask.as_ref()? {
         MaskImage::Linear(g) => Some(g.clone()),
         MaskImage::ScrollFade(fade) => {
-            let scroll = node.scroll?;
+            let scroll = node.scroll(SIGHT)?;
             match fade.axis {
                 // `scroll-fade-x` under `dir="rtl"` runs its gradient `to left`:
                 // the start fade sits on the right, where right to left
                 // content starts.
                 Axis::Horizontal => fade
-                    .gradient(node.bounds.width, scroll.offset.0, scroll.max.0)
+                    .gradient(node.bounds(SIGHT).width, scroll.offset.0, scroll.max.0)
                     .map(|g| match node.look.text.direction {
                         Direction::Ltr => g,
                         Direction::Rtl => LinearGradient { angle: 270.0, ..g },
                     }),
-                Axis::Vertical => fade.gradient(node.bounds.height, scroll.offset.1, scroll.max.1),
+                Axis::Vertical => fade.gradient(node.bounds(SIGHT).height, scroll.offset.1, scroll.max.1),
             }
         }
     }
@@ -231,7 +238,7 @@ pub(crate) fn group_region(node: &FrameNode, scale: f32, size: (u32, u32)) -> Op
     } else {
         reach(node)
     };
-    physical_rect(node.bounds.outset(reach), scale, size)
+    physical_rect(node.bounds(SIGHT).outset(reach), scale, size)
 }
 
 /// How far past its border box `node` paints: its ring (at its offset)
@@ -250,10 +257,10 @@ fn reach(node: &FrameNode) -> f32 {
 /// The physical region the nodes of a subtree paint, `nodes[0]` its root:
 /// every box with its ring and shadows, inside the clips set within it.
 pub(crate) fn subtree_region(nodes: &[FrameNode], scale: f32, size: (u32, u32)) -> Option<PixelRect> {
-    let outer = nodes.first()?.clip;
+    let outer = nodes.first()?.clip(SIGHT);
     let painted = nodes.iter().filter(|n| !n.look.invisible).map(|n| {
-        let b = n.bounds.outset(reach(n));
-        match n.clip.filter(|_| n.clip != outer) {
+        let b = n.bounds(SIGHT).outset(reach(n));
+        match n.clip(SIGHT).filter(|_| n.clip(SIGHT) != outer) {
             Some(c) => c.intersect(&b),
             None => b,
         }
@@ -272,5 +279,5 @@ pub(crate) fn subtree_region(nodes: &[FrameNode], scale: f32, size: (u32, u32)) 
 
 /// The mask gradient over `node`'s group, placed over its border box.
 pub(crate) fn mask_gradient(node: &FrameNode) -> Option<Gradient> {
-    gradient(&mask(node)?, node.bounds, node.look.text.color, 0.0)
+    gradient(&mask(node)?, node.bounds(SIGHT), node.look.text.color, 0.0)
 }

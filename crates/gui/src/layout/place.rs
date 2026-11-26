@@ -356,6 +356,9 @@ impl LayoutTree {
                     (e.down + l.padding.bottom + l.border.bottom - l.size.height).max(0.0),
                 );
                 let id = || (ex.path.clone(), self.owner_of(ex));
+                // Exactly ([`crate::compositor::motion`]): the place held,
+                // clamped to the range's end on the same grid; its pixels
+                // are what is drawn.
                 let want = match &ex.behaviour.scroll {
                     Some(h) => h.wanted(),
                     None => state.scroll.get(&id()).copied().unwrap_or_default(),
@@ -364,10 +367,14 @@ impl LayoutTree {
                     Some(h) => h.generation(),
                     None => state.scroll_generation.get(&id()).copied().unwrap_or_default(),
                 };
+                let end = crate::compositor::motion::units2(max);
+                let pos = crate::compositor::motion::clamp2(want, end);
                 Scroll {
-                    offset: (want.0.clamp(0.0, max.0), want.1.clamp(0.0, max.1)),
+                    offset: crate::compositor::motion::px2(pos),
                     applied: (0.0, 0.0),
                     max,
+                    pos,
+                    end,
                     generation,
                     thumb: if ex.style.scrollbar_hidden {
                         Color::TRANSPARENT
@@ -389,6 +396,8 @@ impl LayoutTree {
                     offset: s.offset,
                     max: s.max,
                     children: tracked,
+                    pos: s.pos,
+                    end: s.end,
                 };
                 if !self.detached {
                     crate::reactive::untracked(|| h.laid_out(laid));
@@ -400,6 +409,8 @@ impl LayoutTree {
         // as its text reaches past its content box (`field_reach`), with no
         // scrollbar; paint draws its text under the offset, clipped.
         if let Pending::Input(input) = &ex.content {
+            // A text field's scroll has one owner, its field's view: a text
+            // input takes no scroll handle ([`crate::Div::track_scroll`]).
             let edit = &input.shown;
             let focused = ex.focus_id.is_some() && ex.focus_id == state.focused;
             let max = field_reach(text, &edit.text, &ex.text, content_box, input.multiline, focused);
@@ -410,13 +421,16 @@ impl LayoutTree {
             // box and value); the window's own tree, not a cold one, takes
             // it. Placing reads the view: a change of it places the node
             // again (not resolves it).
-            let (asked, want, applied) = input.field.view.with(|v| (v.reveal, v.offset, v.applied));
-            let mut offset = (want.0.clamp(0.0, max.0), want.1.clamp(0.0, max.1));
+            let (asked, want, applied, generation) =
+                input.field.view.with(|v| (v.reveal, v.pos, v.applied, v.generation));
+            // Exactly, as a scroll container's ([`crate::compositor::motion`]).
+            let end = crate::compositor::motion::units2(max);
+            let mut pos = crate::compositor::motion::clamp2(want, end);
             let reveal = asked != applied;
             if reveal && !self.detached {
                 let t = &ex.text;
-                let reveal = (offset, max);
-                offset = caret_reveal(
+                let reveal = (crate::compositor::motion::px2(pos), max);
+                let shown = caret_reveal(
                     text,
                     &edit.text,
                     edit.caret,
@@ -426,8 +440,13 @@ impl LayoutTree {
                     focused,
                     reveal,
                 );
+                // A reveal that kept it there keeps it exactly.
+                if shown != reveal.0 {
+                    pos = crate::compositor::motion::clamp2(crate::compositor::motion::units2(shown), end);
+                }
             }
-            if (offset != want || reveal) && !self.detached {
+            let offset = crate::compositor::motion::px2(pos);
+            if (pos != want || reveal) && !self.detached {
                 let mut fields = self.fields.borrow_mut();
                 #[cfg(test)]
                 if fields.len() == fields.capacity() {
@@ -435,7 +454,7 @@ impl LayoutTree {
                 }
                 fields.push(FieldSettled {
                     field: input.field,
-                    offset,
+                    pos,
                     applied: asked,
                 });
             }
@@ -443,11 +462,10 @@ impl LayoutTree {
                 offset,
                 applied: (0.0, 0.0),
                 max,
-                generation: state
-                    .scroll_generation
-                    .get(&(ex.path.clone(), self.owner_of(ex)))
-                    .copied()
-                    .unwrap_or_default(),
+                pos,
+                end,
+                // Its view's own: what the UI wrote, each write a new one.
+                generation,
                 thumb: Color::TRANSPARENT,
             });
         }

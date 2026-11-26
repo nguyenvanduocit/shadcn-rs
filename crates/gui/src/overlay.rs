@@ -13,6 +13,13 @@ use crate::scene::Scene;
 use crate::style::{FontFamily, ResolvedText};
 use crate::text::{Target, TextSystem};
 
+/// The overlay's reader of laid-out geometry ([`crate::layout::Sight`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Sight(());
+
+/// The overlay's [`Sight`].
+const SIGHT: Sight = Sight(());
+
 const OUTLINE: u32 = 0x0093_99b2;
 const ADDED: u32 = 0x00a6_e3a1;
 const MOVED: u32 = 0x00f9_e2af;
@@ -108,7 +115,7 @@ pub fn record_overlay(size: (u32, u32), scale: f32, text: &mut TextSystem, overl
         snap: true,
     };
     for n in overlay.nodes {
-        stroke(&mut target, n.bounds, 1.0, Color::hex(OUTLINE).opacity(0.3));
+        stroke(&mut target, n.bounds(SIGHT), 1.0, Color::hex(OUTLINE).opacity(0.3));
     }
     for c in overlay.diff.changes.iter() {
         let color = Color::hex(change_color(&c.change));
@@ -125,13 +132,13 @@ pub fn record_overlay(size: (u32, u32), scale: f32, text: &mut TextSystem, overl
         }
     }
     if let Some(n) = overlay.hovered {
-        stroke(&mut target, n.bounds, 2.0, Color::hex(HOVER));
-        let label = format!("{}  {}  {}", n.path, describe(n), n.bounds);
+        stroke(&mut target, n.bounds(SIGHT), 2.0, Color::hex(HOVER));
+        let label = format!("{}  {}  {}", n.path, describe(n), n.bounds(SIGHT));
         chip(
             &mut target,
             text,
             &label,
-            (n.bounds.x, n.bounds.bottom() + 4.0),
+            (n.bounds(SIGHT).x, n.bounds(SIGHT).bottom() + 4.0),
             viewport,
             None,
         );

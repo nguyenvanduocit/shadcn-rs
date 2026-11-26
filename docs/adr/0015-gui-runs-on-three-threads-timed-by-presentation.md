@@ -1,6 +1,8 @@
 # 0015. `gui` runs on three threads, timed by presentation
 
-Status: accepted, 2026-11-21; built 2026-11-21 (M5c, P6 and P7, see "As built"); input log replay built 2026-11-22
+Status: accepted, 2026-11-21; built 2026-11-21 (M5c, P6 and P7, see "As built"); scroll's generation rule (a
+program's offset drops older deltas) superseded 2026-11-25 by
+[ADR-0032](0032-scroll-is-ordered-by-what-the-ui-has-seen.md); input log replay built 2026-11-22
 on logs synthesized from documented event streams (no log from real hardware is checked in yet); the upstream work is
 not done. Supersedes ADR-0007's time source (the window "runs on the frame clock
 and asks for frames while anything moves" with a 16 ms timer) and ADR-0011's single-threaded renderer in a window
@@ -201,8 +203,8 @@ compositing tables), `interact.rs` (`shift_of`, `hit_shifted`, `apply_scroll`), 
   reactive runtime stays thread-local and `!Send`. The docs and the stress `--window` provide their theme inside
   `setup`.
 - The **platform thread** (main) runs winit, the AccessKit adapter, the input method and the cursor. Each event is
-  stamped with `Instant::now()` and the current `Arc<Presented>` (read from a `Mutex<Arc<_>>` the render thread
-  replaces after each frame). The wheel goes to the render thread; everything else goes to the UI thread.
+  stamped with `Instant::now()` and what the screen showed then (`Shown`, a query of the presentation timeline the
+  render thread appends each present to). The wheel goes to the render thread; everything else goes to the UI thread.
   AccessKit's requests are forwarded to the UI thread, and the UI thread sends back each frame's `TreeUpdate`, which
   the platform applies with `update_if_active`. The cursor and the input method's area travel the same way.
 - The **UI thread** loop (`window::ui_loop`) sleeps on its channel or until the next timer. It asks for a frame
@@ -247,8 +249,8 @@ compositing tables), `interact.rs` (`shift_of`, `hit_shifted`, `apply_scroll`), 
   - a retry is not news (`news_until`): that frame waits for the next vblank, so a window whose acquires keep failing
     does not spin. A commit or wheel that came before a frame's deadline is news, whether the frame's own wait or the
     thread's turn (`serve`) took it in;
-  - input stays stamped with the frame the window shows: the `Presented` snapshot is published only when the frame
-    left nothing owed.
+  - input stays stamped with the frame the window shows: a frame whose present could not be made (no texture)
+    never enters the presentation timeline.
 
   An out-of-date surface is configured again. A lost one is made again from its window, then configured. A surface
   that says the window cannot be shown (wgpu's `Occluded`: minimized, covered) is not a timeout. Nothing more is tried
@@ -283,8 +285,8 @@ compositing tables), `interact.rs` (`shift_of`, `hit_shifted`, `apply_scroll`), 
   - Metal drawables and their one-second acquire timeout;
   - the refresh rate read again after a `Moved` onto another monitor.
 
-  **Input snapshot.** Input is stamped with the frame on screen as it came (`Presented`, swapped by the render thread
-  after each frame). The UI routes a click by the frame the user saw, not the one being drawn.
+  **Input snapshot.** Input is stamped with the frame on screen as it came (`Shown`, from the presentation
+  timeline, below). The UI routes a click by the frame the user saw, not the one being drawn.
 
 **Commit.**
 
@@ -372,10 +374,749 @@ compositing tables), `interact.rs` (`shift_of`, `hit_shifted`, `apply_scroll`), 
   - the frame and commit numbers and the present time;
   - each scroll container's offset and applied shift;
   - each moving node's shift.
-- `interact::shift_of(frame, presented)` turns it into a per-node shift. Hit testing (`hit_shifted`) and drag
-  positions use it, so a click while the compositor scrolls hits the row that was there
+  - the frame's hit-test data, all of one frame: its hit table, its property trees as composed, its scale and
+    the layers the renderer drew it with (`scene::LayerStage`: each layer's map into its parent target, its outer
+    layer and its output clip). The tables are `Arc`s shared while unchanged. The property trees are the frame's
+    own copy, kept in a recycled `Presented`: it takes in only the entries the composes since its buffer's frame
+    wrote (each compose records them by id, as cc carries changed-node lists rather than whole trees), so the cost
+    is what changed (`compose_alloc::a_frames_property_trees_copy_what_changed_not_the_trees`: a radius change over
+    20,000 clips copies a few entries, a compositor scroll a few and allocates nothing). The stages are set when the
+    frame is drawn, before it is handed to input; a page taller than a texture publishes the layers its banded
+    capture drew.
+- The snapshot follows the frame on the display, through one presentation timeline (`compositor::OnScreen`). The
+  compositor owns it and the platform thread reads it. It is append-only:
+  - The render thread enters a frame at the vblank it was drawn for whether or not pixels changed: a present made,
+    or a draw with nothing to blit (its pixels are those on screen). A commit that changed only what takes the
+    pointer is on screen from that vblank all the same, and a click after it lands on the new box
+    (`thread::tests::a_commit_that_changes_only_what_takes_the_pointer_shows_from_the_next_vblank`). Tiles still
+    rastering do not hold it back: the hit table is the frame's, not its pixels', as cc builds a frame's
+    `HitTestRegionList` from the active tree whether or not its tiles are ready (`layer_tree_host_impl.cc:3892-3895`)
+    and a checkerboarded frame (`frame_data.h:49-50`) is hit-tested like any other. A present
+    that could not be made (no texture) is owed and enters nothing, so it never pushes out the frame on screen
+    (`thread::tests::five_failed_presents_leave_the_frame_shown_stamped_and_kept`,
+    `failed_presents_never_push_out_the_frame_on_screen`). Without a window, each frame drawn is the image.
+  - A frame entered is never changed, and its number is given as it is published: a snapshot with other contents
+    is another frame. A capture drawn with other layers (a page taller than a texture, read back in bands) is a
+    copy with a new number and an empty record of what it wrote; the frame drawn before keeps its own
+    (`clip::tests::on_a_page_taller_than_a_texture_input_reads_the_layers_its_capture_drew`,
+    `clip::tests::a_capture_aside_leaves_the_frame_presented_as_it_was`). Entries go forward in number and vblank
+    (a debug assertion).
+  - What showed at a time `t` is a pure query, `OnScreen::at(t)`: the last frame entered whose vblank had come by
+    `t`, not the frame whose `present` returned (`a_frame_presented_shows_from_its_vblank_not_from_its_present`).
+    A display keeps its image until the next is latched, as SurfaceFlinger keeps a layer's buffer until a new one is
+    ready (`Layer.cpp:1470-1483`). Asking about a later time never changes the answer for an earlier one: a wheel
+    stamped before B's vblank and handled after it lands in A.
+  - Retention is by time. Every frame shown within `RETAIN` (250 ms) of the newest frame's vblank is kept, plus the
+    one showing at its start, each a whole `Presented`, and never more than `KEPT` (64: a quarter second at 250 Hz).
+    Event Timing reports interactions slower than 104 ms by default and INP calls 200 ms or less good, so input
+    later than a quarter second is a stall, not the norm. A count of frames would mean 17 ms at 240 Hz; a time
+    holds at every rate (`a_wheel_after_a_50_ms_stall_at_240_hz_still_routes`). A time older than every frame kept
+    answers `Shown::Gone` (`a_wheel_is_routed_in_any_frame_kept_as_it_showed_and_one_no_longer_kept_nowhere`).
+  - Input from a frame gone is never a hit. A press, a wheel, a button or a touch that starts is dropped, not taken
+    for a press on nothing, which would dismiss what opened since
+    (`app::tests::a_press_from_a_frame_no_longer_kept_does_not_dismiss_what_opened_since`). A move only has hover
+    worked out again in the frame on screen. Input that is not over anything (keys, a release ending a captured
+    press) goes on. Limit: a UI stalled longer than a quarter second while the compositor keeps presenting drops
+    the positional input it held.
+  - A render thread made again after a panic goes on with the same timeline, numbering its frames after the last
+    presented, so no stamp names two frames.
+  - There is no per-present feedback from the GPU API (wgpu exposes none): the vblank a present was aimed at stands
+    for it, so a present the GPU finishes late is taken as shown up to one refresh early.
+- The stamp is a type, not a number. Input carries `Seen::BeforeFirst | Frame(id)`, which holds nothing, and every
+  queue and message carries only that. It is resolved on the timeline as the input is handled, into
+  `Shown::BeforeFirst | Frame(Arc<Presented>) | Gone(id)`. `FromRender::Presented` carries nothing and is sent once
+  until the UI looks (`OnScreen::tell`/`look`). Frame number 0 means nothing.
+- Input is routed against that snapshot, not the frame laid out since: Chromium's viz keeps a hit-test region
+  list per `CompositorFrame` for the same reason. One rule (`clip::hit_in`) answers for a click, the devtools pick
+  and the wheel's first target: a point hits a box where the device pixel shows at least half of it, read through
+  each resampling layer as the composite samples it (`presented_routing::input_before_b_is_presented_lands_as_as_pixels_show_by_click_devtools_and_wheel`,
+  `clip::tests::input_before_a_frame_is_presented_lands_by_the_frame_shown`). The texels of each level are measured
+  once, so the cost is the texels each level holds under the point, not four to the power of the depth
+  (`clip::tests::twelve_resampling_layers_measure_each_texel_once`).
+- An event point is mapped into its node through the frame it was routed in, never through the live tree:
+  - one owner (`InputState::placing`) undoes that frame's composed matrices to the box the frame showed the node
+    as, for a click, a span, a text offset and a drag alike
+    (`interact::tests::a_click_routed_in_a_frame_maps_into_the_span_that_frame_showed`);
+  - Blink records a hit's local point in the same walk that picks the node (`hit_test_result.cc:210-219`) and maps
+    between spaces through one mapper over the property trees (`geometry_mapper.h:43`).
+- Text is hit in the frame that showed it, as its box is. Chrome, Flutter and Android hit text in the layout as
+  it is when the event is handled (`local_frame_view.cc:2402-2409` brings the lifecycle up to date before a hit),
+  and we diverge from them here on purpose. Hitting the box in the frame shown and its text as laid out since gives
+  an answer that is in neither frame.
+  - Each frame carries `Presented::texts`: for every box that shows text input hits into, a `ShownText`, either a
+    paragraph's span boxes or a field's text, type, content box, focus and scroll, as paint laid it out.
+  - Paint keeps each record in an `Arc` while it shows the same. A frame shares the table with the frame before
+    until a text changes, and a change of text alone (its box the same) rebuilds the tables.
+  - A span or caret hit for an event routed in frame F reads F's record through `interact::shown::Shown`. A node that
+    F showed no text for takes no span and no caret. Under a frame no longer kept, positional input is handled as
+    any other.
+  - The records hold no shaped glyphs. A field's record shares its text with the edit (`Arc<str>`) and copies its
+    `ResolvedText`; a paragraph's holds 20 bytes per span line box. The table is 16 bytes per entry, built only
+    when the compositor's tables are. Steady frames allocate nothing (`text_alloc`, `compose_alloc`).
+  - Tests: `shown_frames::a_click_queued_under_a_picks_the_span_a_showed`,
+    `…_puts_the_caret_where_a_showed_the_text`, `…_picks_the_span_it_showed_when_only_the_spans_text_changed`,
+    `…_puts_the_caret_in_the_text_that_frame_showed`.
+- One rule decides what a hit reads (review r10). What was shown comes from the frame the event was routed in, or
+  the frame on screen for hover: geometry, the text and how its offsets map to the value, the cursor, and which span
+  is which. Only behaviour, the handlers, is looked up in the frame laid out, by stable identity, never by place. This
+  extends Chrome's model, where a hit and the values it reads come from one up-to-date layout; ours is the frame shown
+  instead.
+  - Offsets: a field's record carries `edit::Offsets` (plain, masked, or a composition standing in for the selection),
+    a pure function of what was shown. `TextEdit::unmasked`/`uncomposed` are that function too. A press queued under
+    a masked frame and handled after the value is revealed, or after a composition was cancelled, puts the caret where
+    the frame showed it (`shown_frames::a_press_queued_under_a_masked_frame_…`, `…_password_frame_…`,
+    `…_clear_frame_…_after_masking`, `…_composing_frame_…`; without the record: 18 vs 6, 9 vs 3, 2 vs 6, 2 vs 0).
+  - Cursor: each `Hit` carries the cursor its node showed (its own or its nearest ancestor's), each `ShownSpan` its
+    span's. `InputState::cursor` reads the frame shown; a cursor changed alone shows when its frame does, as its
+    pixels do (`shown_frames::a_cursor_changed_alone_shows_with_its_frame`). Paint rebuilds the tables when a visited
+    node's resolved cursor changes, and the hover key (`compositor::Under`) includes the cursor, so such a frame wakes
+    the UI under a resting pointer (`compositor::tests::a_cursor_changed_alone_under_a_resting_pointer_wakes_the_ui`).
+  - Span identity: a span is `SpanId::Keyed` when the app gives it a key (`Span::key`), else its place (`SpanId::At`),
+    as an unkeyed child is. The handler is the frame laid out's span of that identity; a span gone since takes the
+    click and does nothing, as a node gone since (`shown_frames::a_click_queued_under_a_keyed_span_reaches_it_…`).
+    Unkeyed spans keep positional identity: a span put before one since takes its place, as Compose and React treat
+    unkeyed children.
+  - A dispatch in another frame than the one on screen is scoped by a guard (`app::Routing`) that puts the frame on
+    screen back as the dispatch ends, by return or by a handler's panic unwinding through it
+    (`shown_frames::a_dispatch_that_unwinds_leaves_the_frame_on_screen`).
+  - The pointer `next_change` weighs is the platform's latest; the UI's own may be a resampled move a frame behind it
+    during a drag (`HeldMoves` samples 5 ms before present). The two differ by at most the motion of one frame, and
+    while the pointer moves every frame brings a move that works hover out again, so the bound is one frame.
+- One reader of what was shown (review r11). The rule above was written down in rounds 9 and 10, and each review
+  still found a site that read the frame laid out where the frame shown was meant: in round 9 the hover key and
+  the span, in round 10 the offsets, the cursor and the span identity, in round 11 a click's bounds, a removed
+  node's cursor, the input method's caret and a text area's scroll copied at paint. A rule kept beside each
+  reader is missed by the next reader, so the rule is now a type.
+  - `interact::shown::Shown` is the only way input reads geometry and presentation. It covers boxes, event bounds,
+    local points, the screen rectangle of a laid-out box, text records and offsets, scroll, the cursor and span
+    identity. It reads them from one frame: the frame the event was routed in, or the frame on screen for hover,
+    the cursor and the input method. With no frame shown (the devtools' frame as laid out), it reads the frame
+    laid out as paint draws it.
+  - What maps a point (`Anchor`, `Placing`) and the hit-table index (`HitKeys`) are private to that module. The
+    frame laid out answers only identity and behaviour: which node a target is, and its handlers, field and spans,
+    found by identity.
+  - Event payloads come from `Shown::event`, one lookup giving the point and the box. The box has the size the
+    frame showed, at the node's laid-out origin, so the point and its box belong to one frame
+    (`shown_frames::a_click_routed_in_a_frame_gets_the_bounds_that_frame_showed`). Drag grips take their bounds
+    from it too.
+  - The cursor is `Shown::cursor_at`, a pure function of the frame on screen (`compositor::under`, the same rule as
+    the hover key). It needs no node laid out now, so a node removed since keeps its frame's cursor until a frame
+    without it shows (`…_removed_since_shows_its_frames_cursor_…`). A drag's cursor is `Shown::cursor_of` for its
+    node.
+  - A field's record (`ShownText::Field`) holds its content transform (`scrolls`). `ShownText::scrolled` reads
+    the scroll from the property trees of the frame asked, as the content transform's offset from the field box's
+    transform, both from that frame. Paint writes the content transform at the box's offset plus the scroll
+    applied, and whatever moves the box (an ancestor's scroll, the compositor's) moves both alike, so the
+    difference is the field's own scroll alone. A text area the compositor scrolled since its commit is hit as it
+    showed (`…_text_area_the_compositor_scrolled_lands_where_it_showed`: line 1 instead of 4 before). So is one
+    inside a container the compositor scrolled (`…_text_area_in_a_scrolled_container_keeps_its_text_…`, review
+    r12: byte 15 instead of 1 when the scroll was measured from a base fixed at commit). The record also
+    holds the caret, the selection and the composition range it showed. The input method's window follows the
+    caret on screen and moves when a frame that moved it shows (`the_input_methods_area_follows_the_caret_on_screen`).
+    Caret placement, drag-select and autoscroll read the same `Shown::field`. A field the frame showed no text of
+    is placed nothing.
+  - A span hit reads the frame's spans without the node's behaviour. Only the handler is looked up, by `SpanId`.
+  - Hover and the key it was last worked out by change together. When a move or a leave unwinds, `app::Routing`
+    drops the key as it puts the frame on screen back, so the next check works hover out again
+    (`…_a_move_that_unwinds_leaves_hover_and_its_key_together`).
+  - The input method's area is a value of the frame on screen, as the cursor is. The window's UI loop tells the
+    platform both from one place (`window::ui_loop`'s `follow`), after a frame is built, after each input and
+    after each idle wake, when either differs from what it last told. A frame only the compositor made that comes
+    on screen as the UI idles moves the candidate window too
+    (`window::tests::the_ui_wakes_at_the_vblank_a_frame_entered_shows_from`, review r12: told nothing before).
+  - Working the area out is O(1) while the field shows unchanged (review r13: `follow` runs on every wake, and
+    laying a 20,000-line field out on each cost 3.81 ms per call in release). What the field's text alone
+    decides is kept by the record it was worked out of (`interact::ImeText`): where the text sits from the box's
+    corner, unscrolled, and the caret with its composition, or the selection on the caret's line, in the text.
+    A record is shared, unchanged, by every frame that shows the field the same, and a new one is made when its
+    text, caret, selection, composition, box or type changes, so the same record means the same answer. It is
+    held weakly, so its address is never another record's. The box and the scroll are read from the frame on
+    screen each time, as `input_text` places the text linearly in both. The frame laid out (no record) is not
+    kept. Measured by `shown_frames::an_unchanged_input_method_area_is_not_worked_out_again`, 20 equal asks
+    after the first, Apple M4: without the record kept, 1.02 s at 20,000 lines against 2.0 ms at 20 lines
+    (debug); with it, 66 µs and 129 µs (debug), 7.4 µs and 4.6 µs (release), about 0.4 µs per ask.
+- One rule for hover (review r12): commit, then tell. Every hover entry point (a move, a leave, a converge or
+  rehover, a drag following its node) writes everything hover keeps as one step before any user code runs: the
+  nodes' hovered flags, the hovered paths, the marks the next change is found by, and the key `checked` (written
+  by `converge` and `input_shown` before they dispatch). Only then does it run the handlers that change tells,
+  from a list gathered with the write (`InputState::commit_hover`, `tell_hover`). A handler that panics leaves
+  hover whole as written, and it is not called again for the same change. The next change tells the next
+  handlers, so a hover entered under a panicking handler is still left, with its handler told
+  (`…_a_hover_handler_that_panics_leaves_hover_state_whole`,
+  `…_a_converge_whose_hover_handler_panics_hovers_on_the_next`). A drag following its node already writes the
+  point it last saw (`Pointer::seen`) before it calls the drag handler. `app::Routing` keeps dropping the key on
+  unwind only as a defence. Rounds 10, 11 and 12 each found this class at another entry point, because each
+  ordered its own writes and callbacks. The F1 reactive work reached the same principle independently: no user
+  code runs between state steps that must agree.
+- The hover transaction (review r13). Round 12's rule missed two kinds of user code. Writing a flag is a signal
+  write, and a signal write runs the effects reading it at once, so an effect ran between two writes of the
+  commit and saw half a chain (`shown_frames::an_effect_on_hover_sees_the_whole_chain_and_cannot_tear_it`:
+  `(true, false)` after leaving, before the fix). And a handler that panicked stopped the handlers after it, so
+  an enter gathered in the same change was never told, and no later change tells it
+  (`…_a_panicking_leave_does_not_skip_the_next_enter`: B never entered). The order is now:
+  1. Commit every write hover keeps (flags, paths, marks, `was`) in one `reactive::batch`. Effects run once, as
+     the batch ends, and see the whole chain. One that panics finds hover whole.
+  2. Tell every gathered handler. Every one is told, though one panics, and the first panic goes on once the
+     dispatch is done. Chrome does the same: it reports a listener's exception and dispatches to the next
+     element and the next phase.
+
+  The pressed flags (`write_pressed`) and the focus flags commit in one batch with their paths, marks and
+  chain the same way.
+- One dispatch is one transaction for the user code it reaches (review r13 addendum: close the class, not the
+  site). The two PoCs above were the last of a series in which each round found another ordering point in
+  another dispatcher, so the rule is held in one place, `engine::dispatch`, rather than at each site. Round 13
+  still placed it at the public entries (`input_shown`, `converge`) and caught at `in_owner`; review r14 found
+  each of those one level too high (the devtools' `Showing::send` reached `input_on` with no dispatch; a
+  layer's dismiss answer, a scroll handle's reveal and the other hooks reach user code through
+  `engine::call_out` without `in_owner`). The final rule (review r14), after research into how the references isolate
+  listeners, nest dispatch and keep focus (the DOM's listener loop as Ladybird implements it,
+  `DOM/EventDispatcher.cpp:72,141`, and its microtask checkpoint, `HTML/Scripting/Environments.cpp:229`;
+  Flutter's `PointerRouter` and `GestureBinding`, `pointer_router.dart:93-118`, `binding.dart:506`, and
+  `FocusManager.applyFocusChangesIfNeeded`, `focus_manager.dart:2083-2101`; Compose's
+  `PointerInputEventProcessor` and focus owner per `Owner`):
+  1. **One turn owns every entry from outside** (review r15: a rule each site opted into left every site that
+     did not outside it). `engine::turn(window, work)` (`engine/turn.rs`) is the only way work from outside
+     reaches the UI thread: it enters the window (the one guard, rule 4) and opens the dispatch. The pipeline
+     reaches it through `Pipeline::turn`, which first takes in what the compositor scrolled that was handed on
+     with the input or frame (`take_pulled` only queues it), so the pull and the work it rides with are one
+     turn and a dismiss answer that panics as the scroll is taken in drops none of the input. The turns:
+     input (`input_shown`, `input_on`: the platform's, a scenario's, the devtools'), a frame (`draw_with`),
+     hover converging (`converge`), mail (`mail_waiting` for the platform and a replay, the frame's delivery
+     in `Scenario::render_for`), timers (`idle`, and `Scenario::at`, `finish_raster` and `compositor_wheel`
+     advancing the clock), a caller's act (`act`), the window's activation (`set_window_active`), what the
+     platform told (`Scenario::told`), accessibility (`access_update`, `access_tree`, `access_probe`), the
+     IME's target (`ime_target`) and a devtools command (`devtools::execute`). Making a window makes nothing
+     current (`FocusRoot::new`): only its turns do. A turn inside another (input sent to a second window from
+     a handler) shares the outer dispatch. `engine::dispatch` and the window guard are private to the module.
+  2. **One gate catches.** Inside a dispatch, `engine::call_out`, the gate every caller's closure is reached
+     through (ADR-0028), catches its panic, hands it to the dispatch and answers `None`: no answer. A handler
+     answers as no handler would (`R::default()`: a key not taken goes on up), a dismiss answer is a request
+     not taken (the press outside goes on to its target, focus moves, it clicks, as a DOM listener that throws
+     has not called `preventDefault`), a hook asks for no pass. `in_owner` and `Callback::call` tell this
+     `None` from a fork's by `engine::forking`. After the catch, what the closure's own batch left queued as it
+     unwound runs (`reactive::flush_unbatched`), as the web runs its microtask checkpoint after a listener
+     however it ended; the dispatch's end runs it too.
+  3. **One arbiter, total over unwinds, first in time.** The turn keeps the first panic handed to it
+     (`raise`), whatever reaches it: the gate's catch, the turn's own catch of its work and of its closing
+     flush, a render's (`attempt`), and every place that runs several pieces of user code though one panics
+     (the flush's effects, the hooks after a layout, cleanups, an unmount's children and scopes, effects run
+     first after a batch, a members list's watchers, mail values, timers), which runs each under
+     `engine::Gather` and hands each panic to the arbiter as it catches it, not after its loop: a later effect
+     may dispatch to another window and panic there, and the first in time must stay first. A later panic's
+     payload is dropped outside the arbiter's borrow, under a catch of its own (`drop_quietly`): user data
+     whose drop reaches the gate again neither aborts nor replaces the first. No other place catches or raises
+     an unwind of the UI thread: `tests/dispatch_kinds.rs` (`catching_lives_in_the_engine`) fails one outside
+     the engine module unless a reviewed list names it with its reason (the render, list worker and canvas
+     planner threads, which no turn runs on; the seeded test harness; a replay fixture; F1's check verdicts).
+     The DOM and Flutter report and never rethrow, so they do not meet this; we rethrow, so a test or a
+     caller sees it. Outside a turn (a unit test driving the runtime directly), each place raises its own
+     first once all have run.
+  4. **A window's ambient state is scoped, and work keeps the window it was scheduled in.** The current window
+     (its focus, its ring, and its own ambient signals, `focus::WindowSignals`: where the pointer is, whether it
+     is active, its size, whether it can be seen) lives in a module of `focus.rs` of its own (`cx`), written only
+     by the guard (`enter_window` → `Entered`, which needs the engine's `Entering`, made only by a turn and by
+     `Here::within`) and by a window closing; `the_window_current_is_written_by_the_guard_alone` checks it. A
+     turn's guard puts back the window current before when it ran inside another's code; at the top, its
+     window stays current. Work scheduled in a window (a timer, an effect, a mailbox's handler) captures the
+     window current where it is scheduled (`engine::here`, kept next to its reactive owner) and runs in it
+     (`Here::within`, which always puts back the one before), whichever window's turn runs it. Modality and
+     reduced motion are the user's, one per app. Focus is per document, binding or owner in all three
+     references; ours is per window too, and so is what was thread-wide.
+  5. **Commit is the only writer of engine signals.** Focus and its ring, the modality, a node's flags, a
+     window's pointer, activation, size and visibility, and reduced motion are `engine::Owned` signals: anyone
+     reads them; `put` takes the `Commit` that only `engine::commit` makes, so a write outside a commit step
+     does not compile. A step that writes several (focus with its ring and the modality, `focus::set_focus`;
+     focus with the selection of the field it lands in, `engine_focus`; the focus chain; press; hover) is one
+     `reactive::batch`: what reads them sees all or none, Flutter's commit-then-notify. In a debug build an
+     effect that runs while a commit step runs panics (`flush` asserts `!engine::in_commit()`).
+  6. **A failing component does not blank the window** (review r15, superseding the round's first answer,
+     which tore the root down and showed nothing for the rest of the turn). The user-visible goal decides
+     it: a panic of user code inside a render or a layout costs the one piece that failed, never the rest
+     of the window. The references: Chrome keeps showing the page when a script throws, and goes on with
+     the event loop; Flutter's `ComponentElement.performRebuild`
+     (`references/flutter/packages/flutter/lib/src/widgets/framework.dart`, the `catch` around `build()`)
+     puts an `ErrorWidget` in place of the one element whose build threw, keeps its state, and builds it
+     again when it is next marked; React unmounts the whole root on an uncaught render error, the failure
+     this rule exists to avoid. The pieces, each held by what failed alone, in a turn:
+     - **A render** (any instance's, the app's root among them; a list's rows and a `Derive` run inside
+       one) is pure: one that panicked changed nothing of its instance but what it made in its own render
+       scope, disposed at once. The instance keeps its last output (none before its first render) and its
+       state, and renders again when what it read before the panic changes (`component::render`,
+       `Fault::Render`). We keep the last output where Flutter draws an error box: the last output is still
+       a true view of the instance's state as it last rendered, and its handlers still answer, so the
+       window looks and acts as it did (Chrome's page after a throw).
+     - **Props compared** (user `PartialEq`, run as a parent passes them) that panic leave the child its
+       props and its output; the next props passed reach it (`Fault::Props`). It is never mounted again for
+       this: a mount compares nothing and would keep the props the comparison refused, for the next to
+       fail on (the coordinator's r15 report, `components.rs`).
+     - **A setup** that panics leaves an instance half made: that instance alone is torn down, its slot
+       empty, its siblings and parent drawn; the slot mounts anew when its parent's output is expanded
+       again (`Fault::Setup`).
+     - **A layout's bindings** (`Value::Bound`, a bound text, a drawing's `make`) that panic hold what they
+       last gave (a style, a text, a drawing; nothing before their first value) and run again when what they
+       read before the panic changes (`layout::binding`); a bound Tab stop answers as no closure would, a
+       stop (`TabStop::get`).
+     Each panic goes to the arbiter as it is caught; the turn goes on, and its input is routed into the
+     window as it is. What a panic left held is part of its root's state (rule 12) and the cold check
+     reuses it as opaque, never switching off. Outside a turn (a unit test driving a root directly) and in a fork, a panic goes on to the caller
+     and the root is torn down (`Root::resolve`), as before. A panic of the engine's own inside a resolve or
+     a layout (no user code left outside these) tears the root down for the rest of the turn
+     (`engine::ThisTurn`), the frame stale, mounted again at the next turn's refresh.
+     Tests (`tests/dispatch_turn.rs`): a root render that panics keeps the window as it was; one component
+     keeps its last output while the rest draws; props whose comparison panics leave the child as it was; a
+     child whose setup panics leaves its slot empty and the rest drawn; a bound text keeps what it gave; a
+     binding panicking as input lays out drops no input; a bound Tab stop that panics drops no Tab.
+  7. **The kinds are structural.** The gate takes the kind of user code it reaches (`engine::Site`: every
+     handler registration, a span's click, a dismiss answer, the scroll and list hooks, a members watcher, a
+     callback, a timer, a mailbox's handler, a hook after layout, an effect, a cleanup), declared with its
+     list (`Site::ALL`) by one macro. Effects and cleanups, which the reactive runtime runs of its own, pass
+     the same gate's turn half (`engine::reach`: the runtime, not the gate, says whether a fork runs one), so
+     every path that runs one (an effect's first run in a turn's work or after the setup that made it, a
+     rerun by a user's write or in an engine commit's flush; a cleanup before a rerun, as an instance
+     unmounts, as an effect is disposed) goes on past its panic. The fault harness matches the kinds without
+     a wildcard (`case`), so a kind added does not compile there until it has a case,
+     `sites_are_all_in_the_harness` fails until the script reaches it, and every runtime path is a case
+     of its own (`RUNTIME_PATHS`).
+
+  Review r16 found rules 1, 4 and 6 still held by convention at the places that mattered: the live UI loop
+  wrote the window's size and visibility with no turn (`window.rs`, while the replay's `Scenario::told` had
+  one, so live and replay differed), the app's setup ran before its window existed, a window's close ran its
+  unmount hooks after it had stopped being current, a timer kept its closed window alive and re-entered it,
+  hooks after layout and cleanups carried no window at all, one held fault anywhere switched every window's
+  cold check off, and `Derive` was missing from the hand-declared kind list. Each was a list or a convention
+  kept at a call site; rules 8 to 12 make each a type or a single constructor, so a new site cannot miss it.
+  The alternative, adding the missing sites to the lists, is what rounds 14 to 16 did; each round's review
+  found the next site.
+
+  8. **A turn is a capability** (`engine::Turn`, a zero-sized value only `engine/turn.rs` makes, lent by
+     reference to a turn's work). `engine::commit` takes `&Turn`, so every write of an engine-owned signal
+     (rule 5) is inside a turn or does not compile. The platform's writes go through the window's own turn:
+     `WindowHandler::resized` and `visible` (`Pipeline::told_size`, `told_visible`), `chrome` (activity and
+     decorations in one turn), `focused`, `renderer_lost`, `take_gesture` and `hand_gesture` each open the
+     pipeline's turn, and the replay (`Scenario::told`) writes through the same `put_*` functions with the
+     turn it opened, so live and replay are one path. The public setters (`environment::set_window_size`,
+     `set_window_visible`, `set_reduced_motion`, `focus::set_focus`) are for code that runs inside a turn
+     (a handler's); called from outside any turn, they open a turn of the thread's own window
+     (`engine::in_turn`, rule 15), never of the window a turn last ran in.
+     Nothing runs bare: `reach` with no turn under way opens one, and so does the reactive runtime's flush
+     of effects a write outside any turn queued (`reactive::flush`). The app's setup runs in its window's
+     first turn, after the window exists (`Pipeline::made`, which `live` uses), so its ambient reads and
+     what it schedules are that window's (Opus r16 I2: it ran against a stand-in window that the first
+     turn replaced and disposed, leaving its effects on dead signals). Code with no window current runs in
+     the thread's own window (`focus` `NOWHERE`), made once and never closed or replaced. It is made only
+     when its state is read: work kept or run with no window current names none (`Here(None)`), and a turn
+     opened with none current enters none, so the reactive core used alone allocates no window's signals
+     and its graph counts and the recompute oracle see only the user's nodes.
+  9. **A window owns what is scheduled in it, and its close is one of its turns, in a fixed order.** Every
+     piece of user code the engine keeps to run later is made by one constructor, `engine::Stored::new(kind,
+     f)`: timers, effects (`Effect::new`), cleanups and unmount hooks (`on_cleanup`, `on_unmounted`),
+     hooks after layout (`after_layout`, `on_mounted`, `on_updated`, the stage hooks) and mailbox handlers.
+     It registers the kind (rule 11), keeps the window current at that moment weakly (work never keeps a
+     closed window alive, Opus r16 I4), and runs the work in that window, inside a turn (`Stored::run`, or
+     `call`, which never runs in a fork). Once the window has closed, the work does not run. `Here` is
+     private to `turn.rs`; the engine's own bookkeeping cleanups (a timer cancelled, a mailbox retired, a
+     memo freed) use `reactive::on_release` and run as their owner ends. `Pipeline::close` (also called by
+     `Pipeline::drop`, which logs and never panics) is the window state machine of rule 13: one turn of
+     the window in which the root unmounts and the close settles to a fixed point, every window-owned drop
+     inside it.
+  10. **The arbiter orders panics by when their unwind began.** A panic caught while the thread is already
+      unwinding (`std::thread::panicking()`) came from a destructor that the earlier unwind ran, so it began
+      later. It always loses: it is dropped quietly and never resumed, even if the earlier panic has not yet
+      reached the arbiter (`raise`, `caught`). Proof: Rust runs destructors only during an unwind that has
+      already begun. A panic raised in one of them while `panicking()` is true therefore began after the
+      unwinding panic, and every panic caught when `panicking()` is false began before any panic that is
+      still unwinding at that point. So ordering by arrival, with secondary panics always losing, is
+      ordering by start time. Rust aborts when a panic leaves a destructor during an unwind; we keep the
+      first panic, as Rust does, and drop the second without aborting. Tests: Codex r16 2, and the same
+      inside a nested turn (`tests/window_owns_work.rs`).
+  11. **A contained getter runs once per pass, and failure has a defined value.** A binding's replay writes
+      only what its mount gave in this pass. A held write that never gave a value is absent: the property
+      keeps what the earlier writes left. Replay never falls back to running the closure again (Codex r16
+      1: a first-use width panicked twice and left the window empty). The kinds come from the type:
+      `engine::stored_kinds()` reads the registry that `Stored::new` and `Derive::new` fill, so
+      `every_kind_the_engine_stores_is_a_case` fails for any kind the script stores without a case of its
+      own. `Site` gains `Derive`.
+  12. **Holds belong to their root, and a hold never switches the oracle off.** What an instance holds
+      (`component::Holds`: its render, its props, the slots whose setup panicked) is a field of the
+      instance, so it belongs to its root and is forked with it. One window's hold means nothing to another
+      window (Codex r16 7, Opus I5). What a node's bindings hold (`layout::binding::HeldNode`: a style, a
+      span's style, a text, a drawing) is read from the live layout tree by path. The cold rebuild treats
+      every held piece as opaque: it reuses the live held output, props, empty slot or value and never
+      runs that user code again (`component::opaque`, `LayoutTree::held`). Everything else in the tree is
+      checked, so a sibling's missed dependency is still caught while another sibling is held, and a held
+      render with no dependencies leaves the check on. A cold frame changes no hold. `Skipped` no longer
+      happens because of a hold. Any remaining skip (a fork that reached a site that cannot answer inside
+      one) is counted, and more than `SKIP_FLOOR` (32) in a row fails the check, so a checker that only
+      ever skips checks nothing.
+
+  Alternatives considered, per rule:
+  - Rule 8. Keep wrapping each entry point in a turn by convention (rounds 14 to 16): each review found an
+    entry with none (the devtools, the live loop's `Told` arms, chrome, setup). Or let `reach` keep a bare
+    mode outside a turn: user code would again run with no arbiter. The capability makes a missed entry a
+    compile error, and `in_turn` gives what has no turn one, so no bare mode remains. Rejected too: a debug
+    panic for work kept with no window current. The reactive core is used alone (its tests and the
+    recompute oracle make effects with no window); the thread's own window (`Here(None)`) is a defined
+    owner, never "whatever window is current when it fires".
+  - Rule 9. Attach a window to each queue (timers had it, round 15): hooks, cleanups and unmount hooks did
+    not. `Stored::new` is the one constructor, and `tests/kept_closures.rs`
+    `every_closure_kept_is_stored_or_said_why` (rule 18) fails on a kept closure that neither is `Stored` nor
+    says why it runs only inside its window's turn. Holding the window by `Rc` (round 15) kept a closed
+    window alive and let its work re-enter it. Finding dead work when it fires, rather than cancelling it
+    at close, would keep what it captured alive until then (`a_timer_of_a_window_closed_but_still_held_never_runs`).
+  - Rule 10. Order by arrival at the arbiter (round 15): a destructor's panic during the first unwind
+    arrives first and won. Aborting as Rust does on a double panic would take the app down for a panic in
+    user cleanup.
+  - Rule 11. Fall back to running the closure again when its mount gave nothing (round 15): the getter
+    ran twice in a pass, uncontained the second time, and took the root down.
+  - Rule 12. Skip the cold check while anything holds (round 15): one held fault switched every window's
+    check off for good. Per-root skipping would still leave the held root unchecked; the opaque rebuild
+    checks everything but the held pieces.
+
+  Review r17 found that a window's life was still a set of steps and saved pointers rather than one state
+  machine. Close ran in phases, so work a cleanup scheduled after its phase (a timer, mail, a hook after
+  layout) outlived the close (Codex 1, 2; Opus I2). Turn guards saved the `Rc` of the window they entered
+  from and put it back, so a window closed inside a nested turn became current again (Codex 3, Opus I1).
+  Code outside any turn ran in "the last" window. A nested close's panic was lost to the outer arbiter.
+  Rule 12's whole-node style hold hid a stale height under a held width. Rules 13 to 17 replace each of
+  these with one mechanism.
+
+  13. **A window is a state machine: Open → Closing → Closed, and close is one turn run to a fixed point.**
+
+      ```
+      Open ──Pipeline::close──▶ Closing ──its close turn settled──▶ Closed (no record)
+       │                          │  round: dispose owned effects (their cleanups run),
+       │                          │  cancel timers, hooks after layout, mailboxes, end
+       │                          │  WindowOwned; what a round's user code schedules in
+       │                          │  the window joins the next round
+       │                          └─ past focus::CLOSE_ROUNDS (64) rounds: a fault of the close
+       └─ work registered: kept in its record
+      ```
+
+      A window's record (`focus::WindowWork`, `[Fork(log)]` in `WINDOW_WORK`) holds its life (`Life::Open`
+      or `Closing`), the effects it owns and its `WindowOwned` obligations. Closed is the absence of the
+      record. `Pipeline::close` is one `engine::turn_own` of the window: `begin_close` (Open → Closing,
+      `false` if it was already closing or closed, so a second close or a close from inside its own close
+      does nothing), the root unmounts, then `settle_close` loops `close_round` until a round finds
+      nothing. Each round runs under one `Gather`, so every piece of user code a round runs (and every drop
+      of what it scheduled) runs inside the close turn, its panics ordered by the turn's arbiter. Then
+      `finish_close` removes the record, strikes the window off the stack (rule 14) and ends its signals.
+      A close that does not settle within `CLOSE_ROUNDS` is reported as a fault of the close ("did not settle
+      in 64 rounds"), never a hang. In a debug build, removing a record after a settled close that still
+      holds live effects or obligations panics.
+      Registration follows the state. Work registered in an Open or Closing window joins its record, and a
+      Closing window's next round takes it. Work registered with no record (Closed) is dropped at once by
+      its registrar: `own_effect` disposes the effect, `owned_by_window` refuses the obligation. A Drop
+      that reads window state while a close drops it runs inside the close turn and sees the closing
+      window: the `Says` probe reads `window_visible` from such a Drop and gets the closing window's
+      hidden state, not another window's (`cancellation_drops_timer_capture_in_its_window`,
+      `work_scheduled_as_a_window_closes_is_dropped_by_the_close_in_it`). Work handed to an already-closed
+      window is dropped where its caller runs, never in the closed window: the thread window at a test's
+      top level (`closed_pipeline_rejects_new_work`).
+      **A Closed window is never entered again.** `engine::turn` and `turn_own` on a closed window drop
+      the work unrun and answer `None` or `Err(None)`. `Stored::run` and `Here::run` find no window (the
+      weak handle fails to upgrade) and run nothing. The public entries `Pipeline::act`, `read` and every
+      `turn_with` user drop the work and debug-panic ("a turn of a closed window"), because using a closed
+      pipeline is the caller's bug. In release they do nothing.
+      Tests (`tests/window_owns_work.rs`):
+      - `cancellation_drops_timer_capture_in_its_window`;
+      - `close_disposes_effect_made_by_cleanup`;
+      - `work_scheduled_as_a_window_closes_is_dropped_by_the_close_in_it`;
+      - `a_close_that_never_settles_is_a_fault_not_a_hang`;
+      - `closed_pipeline_rejects_new_work`.
+  14. **One engine-owned window stack; guards hold no window.** `focus::cx::STACK` is a `[Fork]`
+      `Cell<Stack>` of plain entries: `Thread`, `Window(salt)`, `Gone`. Each turn pushes its entry through
+      `enter_window` or `enter_thread`. The guard (`Entered`) holds only its index, and dropping it on
+      return or unwind cuts the stack back below it. It restores nothing it saved, so it can never bring
+      back a window. The top entry, skipping `Gone`, is the current window. A salt finds its window through
+      `WINDOW_OF`, a `[Shared]` weak index written only by `FocusRoot::new` and its `Drop`. A close strikes
+      every entry of its window to `Gone` (`cx::forget`), so a pop that would expose a closed window
+      exposes the next open entry below it. Implicit turns push too: `in_turn`, `Here::run`, and
+      `Stored::run` entering their own window inside another's turn. The stack is bounded (64 entries);
+      deeper nesting is runaway recursion and an engine fault. Because the stack is plain data in a
+      `[Fork]` cell, a check's pushes and strikes are undone by the switch.
+      Tests: `nested_turn_restores_thread_window` (Codex 3),
+      `a_window_closed_inside_a_scheduled_entry_is_put_back_current` (Opus I1) and
+      `a_window_closed_but_held_inside_another_turn_is_never_current_again` (the strike: a closed window
+      whose handle still upgrades is never the top again).
+  15. **Outside work runs in the thread window, never in the last one.** Code that runs with no turn under
+      way (a test's top level, a background callback reaching the UI thread outside a dispatch) runs in
+      the thread's own window, `NOWHERE` (salt 0, never closed). That covers its reads
+      (`focus::focused`, `environment::window_visible`, and the rest) and its setters
+      (`environment::set_window_visible` and the others open a turn of the thread window). Window setters
+      called with no turn are not a debug panic; they write the thread window. The reactive core and its
+      tests use setters with no window, and a debug panic there would make the thread window unusable. A
+      test that reads a window's state names the window: `Pipeline::read` and `Scenario::read` run a read
+      in one turn of it. `focus::window_id()` returns the current window's id, `WindowId(0)` outside any.
+      Test: `an_outside_write_lands_in_the_thread_window` (two windows plus an outside write; neither
+      window sees it).
+  16. **Close reports its own panic, nested or not.** `Pipeline::close` returns `Err(message)` for the first
+      panic of its own turn in every case. At the top level, the panic is dropped after its message is
+      taken. When nested inside another turn, the close turn has its own arbiter slot (`dispatch_own`
+      swaps `TELLING`), so the close's panic is not lost to, or merged into, the outer turn. After the
+      close the panic is also raised to the outer arbiter, so the outer turn reports it once, as its first
+      if it was first.
+      Test: `close_reports_its_own_panic_at_the_top_and_nested`.
+  17. **Holds are per setter.** A node's held style is no longer one whole-style flag. `HeldNode.style`
+      holds `(run index, mount snapshot)` pairs, one per binding run whose closure panicked
+      (`StyleBinding::held`, `Mounted::snapshot`). The replay writes each held run's snapshot in its place
+      and evaluates every other run fresh, on the live path and in the cold rebuild alike. A held width no
+      longer hides a stale height on the same node.
+      Test: `a_held_width_hides_no_stale_height_on_the_same_node`. It reproduced the r17 plausible finding
+      before the fix ("differs from a cold one" was not raised).
+  18. **The kept-closure lint is by type.** `tests/kept_closures.rs` parses the gui, primitives and shadcn
+      sources with `syn` and flags:
+      - fields of structs, enum variants and statics whose type holds `dyn Fn`, `dyn FnMut` or `dyn FnOnce`
+        outside a `Stored<…>`;
+      - type parameters of a type definition bounded by `Fn*`, in the generics or a where clause;
+      - type aliases to either;
+      - statics declared inside a macro (`engine_local!`, `thread_local!`) whose tokens hold `dyn Fn*`.
+
+      Test modules and `tests.rs` files are skipped. Each hit names its item (`crate:file: Type.field`),
+      not its line, and must appear in `ALLOWED` with a reason (handler, pure read, render, layout hook,
+      borrowed, or engine plumbing, each said). An entry that matches no hit fails.
+      `the_lint_finds_each_kind_and_passes_stored` checks every kind and the `Stored` exemption.
+      The tooltip closers (`primitives` `CLOSERS`) run in their own window. The open tooltip is kept per
+      window (`OPEN` keyed by `window_id`), so opening a tooltip closes only the one open in its own
+      window, in a turn of that window.
+      Test: `a_tooltip_opened_in_one_window_closes_none_of_another`.
+
+  Alternatives considered (r17):
+  - **Saved-pointer guards** (rounds 15 and 16): each guard saved the window it entered from and put it
+    back. That was correct until a close happened while the guard lived. The guard then restored a closed
+    window, and every fix added another "is it closed?" check at a restore site. An engine-owned stack
+    whose entries a close strikes has no restore site to miss.
+  - **A single-pass close** (round 16, phases in a fixed order): any work a later phase's user code
+    schedules in an earlier phase's queue outlives the close. A fixed point covers what any cleanup
+    schedules, however deep, with a bound so a runaway is a fault rather than a hang.
+  - **The last window as the default**: convenient for single-window tests, but outside code then writes
+    whichever window ran last, which depends on history. The thread window is a fixed, named owner.
+  - **A debug panic for window setters outside a turn** was rejected for the reason in rule 15.
+  - **Text matching for the lint** (round 16) saw only the line's text. It missed generic bounds, aliases
+    and other crates, and went stale on reformatting. Parsing the types fixes all four.
+  - **Whole-node style hold** (rule 12 as first built): simpler, but hid any other setter's staleness.
+
+  Revisit when: a kind of user code needs to outlive its window (a cross-window service), which would need
+  an owner other than a window; or a binding's held value must be checked against a fresh run (it cannot
+  be, while the closure keeps panicking).
+
+  A panic of the engine's own unwinds at once, and what user code raised is dropped with it. The text
+  settings a window reloads as it regains focus decide only how glyphs rasterize, never where text or its
+  caret lies, so the IME cache's key needs none of them (`interact::ImeText`).
+
+  Review r14's reproducers are regression tests (`tests/dispatch_rules.rs`): the devtools' hover tells the
+  move after a panicking enter; a panicking dismiss answer leaves the press to go on; input sent to another
+  window leaves this window's focus; Tab publishes focus and its ring at once; the first panic in time goes
+  on. Each fails without its part of the rule.
+
+  The fault-injection test `tests/dispatch_faults.rs` checks the class. Over a script of 23 inputs and frames
+  (moves between siblings and along a nested chain, a click, a drag and its release, a secondary press, focus
+  by a press and by Tab, a key, frames that move a node under a resting pointer so that `converge` rehovers,
+  leaving and coming back), every call of user code the script makes panics in its own run. That is 116
+  cases: `on_hover`, `on_pointer_move`, `on_mouse_down`, `on_click`, `on_release`, `on_secondary_click`,
+  `on_drag` start, move and end, `on_key_down`, and effects reading each node's hovered, pressed, focused and
+  focus-within flags (focus in and out). Each run is compared with the run where nothing panics:
+  - exactly one input unwinds;
+  - every callback, the one that panicked included, is told exactly what it is told without the panic, in
+    the same order;
+  - every node's five flags and the cursor end the same.
+
+  Without the dispatch, 71 of the 116 cases differ (a panicking effect skipped the hover handlers after it, a
+  panicking hover handler skipped the pointer-move phase, a panicking press effect skipped `on_mouse_down` and
+  the drag start). With it, none differ.
+- The compiler keeps dispatch off the frame laid out (review r13 addendum, which brought this forward from the
+  open issues). A laid-out node's geometry fields (`bounds`, `content_box`, `space`, `space_content`, `offset`,
+  `clip`, `scroll`) and the frame's `viewport` are `pub(in crate::layout)`: layout writes them, and every other
+  reader goes through an accessor that takes a reader's token (`layout::Sight`, a sealed trait). Each reading
+  module (paint, accessibility, clip, effects, the overlay, the devtools, the inspector) makes its own token,
+  which only it can make. The input side's token is made in `interact::shown` alone: `interact.rs` reads what
+  the screen showed through `Shown`, and the scroll model, keyboard editing and scroll-into-view read the frame
+  laid out through the three `laid_` readers there (`laid_scroll`, `laid_content_box`, `laid_bounds`), each
+  named for the model it serves. A dispatch that reads `n.bounds` does not compile (shown by a probe in
+  `pointer_left`: `E0616`). Code outside the engine (tests, tools, the docs' scripts) holds the public
+  `inspect::OUTSIDE`. Rust cannot make that one public item unreachable from inside the crate, so the source
+  check below fails `interact.rs` naming any token.
+  - The source check `tests/shown_reads.rs` is the second line. It fails `interact.rs` naming a token
+    (`OUTSIDE`, `Outside`, `Sight`, `SIGHT`), and any function of `interact.rs` that reads a laid-out node's
+    geometry outside `Shown`, unless an allowlist entry gives the reason. Geometry here means `bounds`,
+    `content_box`, `scroll`, `viewport`, `offset`, `clip`, `space`, `space_content` and `look.transform`, read on
+    any expression: a binding of any name, an index, a call or a chain (review r12; its fixtures include
+    `frame.nodes[i].bounds`). A pattern of a frame type binding one, `FrameNode { bounds, .. }` on one line or
+    several, is a read too, and so is a call of the clip and hit helpers (`hit_in`, `clip_box`, `hit_box`) or
+    of a `laid_` reader, called or handed on by name (review r13). A field of another type spelled the same is renamed or listed with what it is, so the check
+    fails closed. A listed read exempts only its own span of the line, not the rest of it. The allowed
+    readers are the scroll model (the offset and range the UI holds, which wheels, autoscroll and the compositor's
+    deltas step), keyboard editing, scroll-into-view and the devtools' pick before any frame. Like ADR-0028's lint,
+    it reads text, not types.
+- A hit costs `O(log N + k)`. Each transform space has an R-tree of its boxes, bulk-loaded by Sort-Tile-Recursive
+  (Guttman 1984; Leutenegger, Lopez and Edgington 1997), built once per hit table. A second R-tree indexes the spaces
+  by where they lie on screen. Its bounds are refitted once per frame, as dynamic BVHs refit (Wald, Boulos and
+  Shirley 2007), so a hit composes chains only for spaces under the point. Measured on 20,000 boxes
+  (`clip::tests::a_hit_and_a_miss_cost_the_logarithm_of_the_boxes_and_the_spaces`), bound `8·log2 N + 16k + 32`:
+  - 400×1 rows: 57 candidates for a hit, 6 for a miss;
+  - 1200×24 rows: 57 and 6;
+  - 20,000 transformed controls: 108 and 57.
+
+  The refit is `O(spaces)` at the first hit of each frame. It is exact against a walk of the table
+  (`clip::tests::the_index_finds_what_a_walk_of_the_table_finds`).
+
+  A refit keeps the shape of the last pack, so a frame is packed again (`O(S log S)`, in buffers of its own while
+  older frames keep theirs) when that shape no longer fits it (`SpaceTree::fits`). This happens in two cases:
+  - A space came onto or left the canvas: its bounds became finite, or stopped being. Otherwise the space would be
+    neither in the tree nor among those mapped for every point, and a warm index would miss what a fresh one hits.
+    This was round 9's Codex 4, pinned by `shown_frames::a_space_whose_bounds_become_finite_is_hit_as_a_fresh_index_hits_it`.
+  - The refit's expected cost of a point in the window grew past twice the packed tree's, both weighed over the
+    window the frame was drawn for (`Presented::viewport`; `clip::expected_cost`). The cost is
+    `1 + Σ_nodes count(node) · area(node ∩ window) / area(window)`: the entries a query tests for a point drawn evenly
+    from the window, which is what a hit counts as candidates. It is MacDonald and Booth's (1990) surface-area
+    heuristic for points, with its assumption about where queries fall made explicit and ours: a pointer is only in
+    the window. A changed window weighs the packed tree again under the new one.
+
+    Round 9 weighed nodes over the current root's bounds instead. One space far off (x = 1e8, or -1e6) then made the
+    root so large that nodes scattered across the window weighed nothing, and the refit was kept. That was round 10's
+    Codex 3 and Opus I1, now pinned by `clip::tests::one_distant_space_does_not_hide_spaces_that_scattered` and
+    `clip::tests::a_shuffle_with_one_far_space_is_packed_again`. Without the window weighting, a miss tests 21,335 and
+    14,647 candidates, against at most 152 with it. In release, 1,000 misses took 610 ms and 413 ms with the refit kept,
+    against 0.41 ms and 0.39 ms repacked (fresh index: 0.70 ms and 0.66 ms; counters on).
+
+    The refit-or-rebuild structure is Lauterbach et al.'s RT-DEFORM (2006). The cost and the threshold of 2 are our
+    own, checked by the counted tests:
+    - Box2D's `b2DynamicTree_GetAreaRatio` (box3d `dynamic_tree.rs:808-829`) is a diagnostic that nothing in its
+      maintenance reads.
+    - box3d's hybrid rebuilds on a fixed cadence of 8 steps (`broad_phase.rs:153-172`). A cadence would repack rigid
+      scrolls for nothing and still leave bad frames.
+
+    Box2D's rotations and Kopta et al.'s (2012) would bound the cost per frame further, but they need a pointer tree
+    instead of packed STR levels. A rigid scroll never repacks unless it carries dense content into a window that was
+    sparse when the tree was packed: that costs one repack, and the window cost is then measured afresh.
+
+  `clip::tests::spaces_that_scattered_since_the_tree_was_packed_are_packed_again` covers the second case. It packs
+  20,000 spaces in a row 50 px apart, then moves them into two piles 200 px apart. A miss between the piles then
+  tests 21,335 candidates refit-only, and at most 152 after the repack.
+
+  Timings come from a release run of `shown_frames::the_space_tree_over_twenty_thousand_spaces_costs_what_adr_0015_records`
+  on 20,000 spaces, on an M-series Mac shared with other builds, so the numbers are noisy by about 2×:
+
+  | Stage | Time | Miss after it |
+  |---|---|---|
+  | First hit of the table (index built, frame placed) | 3.9–9.5 ms (round 10: 7.4 ms) | 0.13–0.32 µs |
+  | Fresh frame scrolling all spaces (refit) | 0.3–0.8 ms (round 10: 0.51 ms) | 0.13–0.32 µs |
+  | Frame scattering them (packed again) | 0.9–1.9 ms (round 10: 1.9 ms) | 0.11–0.34 µs |
+
+  With the cost check removed, the scattered frame's miss takes 73 µs. Round 9's Codex 5 measured 17.6 ms against
+  0.109 ms per 1,000 misses.
+- There is no other hit rule. Before any frame is presented (`Seen::BeforeFirst`), every kind of input runs the
+  same function on one snapshot of the commit, built by one constructor (`Presented::of`: its hit table, scroll
+  containers, property trees and scale, no layer stage, since none was drawn) and keyed by the commit on either
+  thread: a click on the UI thread and a wheel on the render thread. An ordinary list scrolls on its first wheel
+  (`compositor::tests::a_list_scrolls_on_a_wheel_made_before_the_first_present`). The canvas's pixels decide, and the first frame presented through a layer switches to that
+  layer's composite. A click and a wheel at the same pixel pick the same target
+  (`clip::tests::input_before_the_first_present_lands_by_the_canvas_and_after_it_by_the_layer`). `interact::hit`
+  paints the frame it is given from nothing and goes through the same function.
+- Hover is a derived value: a function of the pointer's latest position and the frame shown now, worked out again
+  when either input changes, like a memo keyed by its inputs. `Pipeline::checked` is exactly the key of the last
+  real evaluation, `(position, frame)`, set only by a move or a leave routed and by `Pipeline::converge` itself:
+  - a modifier or a key routed in the frame on screen works out no hover and leaves the key alone
+    (`app::tests::a_modifier_stamped_with_the_frame_on_screen_leaves_hover_to_converge`);
+  - a move routed late in an older frame keys hover to that frame, so idle works it out again in the newest
+    (`app::tests::a_move_from_an_older_frame_leaves_hover_on_the_frame_on_screen`);
+  - a move from a frame gone is routed nowhere, but its position is kept, and hover is worked out there
+    (`app::tests::a_move_from_a_frame_gone_is_hovered_where_it_went`).
+
+  One frame per question (review r9, Codex 3): an input is dispatched in the frame it came under
+  (`InputState::route_in`, for that dispatch alone), while hover and the cursor read the frame they were last
+  worked out in. A modifier, a key or a press routed in an older frame never rolls the cursor back to it
+  (`shown_frames::a_late_modifier_leaves_the_cursor_of_the_frame_on_screen`). Flutter's `MouseTracker` keeps the
+  same line: a signal event, or one at the same position, does not touch hover state
+  (`mouse_tracker.dart:212-228`).
+
+  When to work it out again is one pure function, `compositor::next_change(pointer, frame on screen, frames
+  waiting)`: the vblank of the first frame waiting whose hit under the pointer differs from the frame on screen.
+  It is evaluated when it is read (`OnScreen::sample`, `Compose::shown_and_next`), from the pointer and the frames
+  as they are then. Nothing is predicted when a frame enters and kept (review r9, Codex 1 and Opus I1: a frame that
+  entered while the pointer was elsewhere, before the pointer moved onto its box, was never looked at again;
+  `compositor::tests::a_frame_entered_before_the_pointer_moved_onto_its_box_is_rechecked_at_its_vblank`,
+  `shown_frames::a_frame_entered_before_the_pointer_moved_onto_its_box_is_hovered_at_its_vblank`). It is the
+  model of Flutter's `updateAllDevices` after each frame (`rendering/binding.dart:565-583`, `mouse_tracker.dart:358-384`)
+  and of Blink's fake mouse move after layout: a re-hit at the last pointer position. It differs in one way: it runs
+  only when something can have changed, not at every frame, because compositor frames are not UI frames (see
+  `/tmp/m10/research-clip.md`). The pointer is noted on the timeline before the input that moved it goes on, so
+  the UI handling a move samples with it. The UI's idle timer wakes it at that vblank: a timer, not a message, so
+  it holds however late the UI hears (`window::tests::the_ui_wakes_at_the_vblank_a_frame_entered_shows_from`). The
+  window loop reads the cursor after every idle, as Blink's fake move updates the cursor with hover, so a hover
+  worked out at a vblank, with no input and no frame drawn, shows its cursor (the same test).
+
+  What is compared under the pointer is everything hover and the cursor are decided by there (`compositor::Under`):
+  the box, the span of its text the frame showed under the point, and the modal flag. A scroll that brings another
+  span of one paragraph under a resting pointer changes its cursor and hover
+  (`compositor::tests::another_span_of_one_paragraph_under_a_resting_pointer_wakes_the_ui`).
+
+  Energy: the UI is woken only when the key can change. As the render thread enters a frame, it compares the hit
+  under the pointer where it is now with the frame before (`O(log N + k)`), and tells the UI only on a change; with
+  no pointer in the window, never. This is a wake, not a prediction: what the UI then waits for comes from
+  `next_change` when it samples. Both frames are hit outside the timeline's lock, so the platform stamping input
+  never waits for an index being made: entering a frame with a new table of 20,000 boxes takes 19–53 ms in a debug
+  build (two indexes made). A stamp made meanwhile waited at most 0.2–1.7 ms, which is scheduling noise. With the
+  hit under the lock, a stamp waited the whole entry, 35–53 ms
+  (`compositor::tests::a_frame_entering_hits_its_boxes_outside_the_timelines_lock`). A UI stalled 100 frames under a
+  resting pointer, with frames that change what is under it (10 of them), has one message waiting, holding no frame
+  (`compositor::tests::a_stalled_ui_keeps_a_bounded_number_of_frames_alive`). Measured over a compositor scroll of
+  120 frames at 120 Hz
+  (`compositor::tests::a_compositor_scroll_wakes_the_ui_only_when_what_is_under_the_pointer_changes`):
+  - pointer outside the window: 0 wakes (0/s);
+  - pointer at rest over a box the scroll leaves: 0 wakes;
+  - pointer over the rows, 10 px each, scrolled 1 px a frame: 12 wakes, one per row under it, about 12/s at that
+    speed, against 120/s for one a frame.
+
+  Moves and leaves wake the UI as input does. Comparing the box, its span and the modal flag stands for the whole
+  hover chain: a frame that changes a hovered node's ancestors and not the node under the pointer is not seen until the
+  next input. It is not checked when
+  layout commits, because the frame before still shows then
+  (`app::tests::a_box_moved_under_a_resting_pointer_is_hovered_once_its_frame_presents`). Blink marks hover dirty
+  after layout (`local_frame_view.cc:2146-2150`, "Fire a fake a mouse move event to update hover state") and
+  recomputes it at the next `BeginMainFrame` (`web_frame_widget_impl.cc:3310-3315`). It hit-tests the main
+  thread's new layout there, before that layout's frame is drawn. A frame the compositor scrolls alone does not
+  move hover until a main frame comes. Here the check is keyed to the frame that shows, scrolled frames included.
+- Memory: each `Presented` holds its own property trees. At 20,000 clips that is 20,003 clip entries of 44 bytes
+  plus a few transforms and effects, about 0.88 MB a copy (measured in `compose_alloc`). The strong holders are
+  the timeline, the pool (`POOL` = 3), the frame composed last, and at most two on the UI (`InputState`'s frame and
+  one being routed). Queues hold ids only. The frames alive are at most `min(ceil(RETAIN / interval) + 1, KEPT) +
+  POOL + 1 + 2`: 22 at 60 Hz (19 MB at 20,000 clips), 38 at 120 Hz (33 MB), 68 at 240 Hz (60 MB), however long the
+  UI stalls (`compositor::tests::a_stalled_ui_keeps_a_bounded_number_of_frames_alive`). That test counts each
+  snapshot alive by a token it holds, not by weak references, which would keep frames from being used again. The
+  records of what each compose wrote are capped at `KEPT + POOL + 2`. A frame older than them, or one behind by
+  more writes than the trees have entries, is copied whole when it comes back
+  (`compose::tests::catching_up_through_more_writes_than_entries_copies_the_trees_whole`). Each thread's hit indexes
+  add at most 4, about 0.45 MB each at 20,000 boxes; one whose table is gone is dropped at that thread's next hit.
+
+  Measured at display rate (`compose_alloc::the_first_quarter_second_at_240_hz_makes_at_most_the_bound_of_copies`,
+  a list scrolled over trees of 20,009 entries at 240 Hz, debug build):
+  - While the timeline fills (66 frames), each frame is a new snapshot: 655 allocations, 55.6 MB and 1.26 M entries
+    copied in all.
+  - After that, frames come back from the timeline: 0 allocations, 162 entries copied over 54 frames.
+
+  This
+  bound is not sharing: the cost grows with the refresh rate and the trees. Open: share unchanged chunks of the
+  trees between frames (a persistent vector), so that a frame kept costs what it changed. Revisit before trees
+  pass about 100,000 entries at 240 Hz. Gradient stops are shared (`Arc<[_]>`), so copying a masked effect
+  allocates nothing.
+- The snapshot names a node by path and by the component instance that made it. Dispatch delivers to the live node
+  only when both match; a node another instance made at that path since is another node and takes nothing
+  (`interact::tests::a_click_on_a_box_another_instance_replaced_since_it_was_shown_reaches_neither`), as Blink
+  never reuses a hit target across a change of the document (`HitTestCache`).
+- A click while the compositor scrolls therefore hits the row that was there
   (`a_click_while_the_compositor_scrolls_hits_what_was_on_screen`).
-- The devtools read positions off the UI's frame and send input unshifted.
+- A wheel stamped with an older frame still kept for routing reads that frame's own `Presented`: its tables,
+  property trees (effects included) and layers together
+  (`presented_routing::a_wheel_stamped_under_an_older_frame_reads_that_frames_layers`).
+- The devtools pick and send input through the same snapshot (`devtools::Showing`); there is no route against the
+  frame as laid out. A command that scrolls its node into view runs again once a frame showing the node there is
+  presented (`Done::Again`, for click, drag, reveal and hover alike;
+  `presented_routing::the_devtools_send_input_through_the_frame_shown`). A live window that presents none within 2 s
+  answers with an error. The deadline is a timer on the UI clock, so it fires with no other activity
+  (`devtools::tests::a_rerun_a_stopped_window_never_presents_for_is_answered_with_an_error`). A command naming a
+  node acts only where the frame on screen shows that node, a node inside it, or the box that takes the pointer for
+  it. Where the screen shows nothing there, or a box around the node, the command fails and names what the screen
+  shows (`devtools::tests::a_named_click_where_the_screen_shows_nothing_or_what_is_around_it_is_refused`).
 
 **Time.**
 

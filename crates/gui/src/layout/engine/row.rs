@@ -114,6 +114,8 @@ fn take_scratch() -> Vec<Item> {
         .unwrap_or_default()
 }
 
+crate::engine::parts_whole!(Item);
+
 /// Drop this thread's kept buffers: a pool thread lets go of them when its
 /// job group ends, so what is held after a pass does not depend on which
 /// threads the pool happened to run it on.

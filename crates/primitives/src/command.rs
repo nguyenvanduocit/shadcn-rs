@@ -679,7 +679,6 @@ impl Command {
         state.splice(0, 0, u64::try_from(first.0.rows.len()).unwrap_or(u64::MAX));
         state.scroll_to_row(0);
         {
-            let state = state.clone();
             watch(
                 move || flat.get(),
                 move |new, old| {

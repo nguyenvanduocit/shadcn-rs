@@ -110,7 +110,7 @@ fn spot(s: &Scenario, name: &str, nth: usize) -> (f32, f32) {
         .iter()
         .filter(|n| n.name == Some(name) && !n.look.invisible)
         .nth(nth)
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .expect("the node on screen");
     (b.x + b.width / 2.0, b.y + b.height / 2.0)
 }
@@ -122,7 +122,7 @@ fn scrolled(s: &Scenario) -> f32 {
             .nodes
             .iter()
             .find(|n| n.name == Some(name))
-            .map(|n| n.bounds.y)
+            .map(|n| n.bounds(gui::inspect::OUTSIDE).y)
             .expect("the node")
     };
     top("viewport") - top("option")
@@ -136,8 +136,17 @@ fn visible(s: &Scenario, name: &str) -> usize {
         .count()
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// Whether `h` holds focus in `s`'s window, read in a turn of it (outside
+/// any turn, focus is the thread window's: ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
+}
+
+/// The accessibility tree of `s`'s last frame, with its window's focus
+/// (read in a turn of it: ADR-0015).
+fn access_tree(s: &mut Scenario, ts: &mut gui::text::TextSystem) -> accesskit::TreeUpdate {
+    let focus = s.read(gui::focus::focused);
+    gui::access::tree(s.last(), focus, 1.0, "w", ts)
 }
 
 fn name(n: &Node) -> Option<String> {
@@ -225,17 +234,17 @@ fn dump(update: &TreeUpdate) -> String {
 
 /// The name of the node assistive technology is told has focus (its own,
 /// else its first named child's).
-fn focused_label(s: &Scenario) -> Option<String> {
+fn focused_label(s: &mut Scenario) -> Option<String> {
     let mut ts = gui::text::TextSystem::new();
-    let update = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let update = access_tree(s, &mut ts);
     let nodes: HashMap<NodeId, &Node> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let n = nodes.get(&update.focus)?;
     name(n).or_else(|| n.children().iter().find_map(|c| nodes.get(c).and_then(|c| name(c))))
 }
 
-fn a11y(s: &Scenario) -> String {
+fn a11y(s: &mut Scenario) -> String {
     let mut ts = gui::text::TextSystem::new();
-    dump(&gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts))
+    dump(&access_tree(s, &mut ts))
 }
 
 // ---------------------------------------------------------------- Select
@@ -321,6 +330,7 @@ fn select_ui<M: Stash>(props: SelectProps<M>) -> Element {
                     .flex(Flex::grow(1.0))
                     .min_height(0.0)
                     .children(options),
+                false,
             );
             let content = select.content(
                 div()
@@ -385,11 +395,11 @@ fn select_scenario(value: Signal<Option<String>>, open: Signal<bool>) -> Scenari
     })
 }
 
-fn focused_option(s: &Scenario) -> Option<String> {
+fn focused_option(s: &mut Scenario) -> Option<String> {
     // The node assistive technology is told has focus, when it is an
     // option: focus, not the list's highlight.
     let mut ts = gui::text::TextSystem::new();
-    let update = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let update = access_tree(s, &mut ts);
     let nodes: HashMap<NodeId, &Node> = update.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let n = nodes.get(&update.focus)?;
     if n.role() != gui::Role::ListBoxOption {
@@ -413,6 +423,71 @@ impl<M: primitives::listbox::Choice<String>> Highlighted for Select<String, M> {
             .map(|(v, ..)| (*v).to_owned())
             .find(|v| gui::untracked(|| self.is_highlighted(v)))
     }
+}
+
+/// Codex (F1 review 1): a select owns its scroll through its scope, with
+/// no cycle through the scroll's layout hook: an opened select (its list
+/// scrolling, so the hook runs) mounted and unmounted again and again
+/// leaves no scroll handle and no parts behind.
+#[test]
+fn an_opened_select_mounted_and_unmounted_leaves_nothing_behind() {
+    let value = Signal::new(None);
+    let open = Signal::new(true);
+    let mounted = Signal::new(false);
+    let mut s = scenario(move || {
+        if mounted.get() {
+            select_ui(SelectProps {
+                value: Bind::default().with_model(value),
+                open: Bind::default().with_model(open),
+                height: Some(60.0),
+            })
+        } else {
+            div().into_element()
+        }
+    });
+    let baseline = gui::ScrollHandle::live();
+    for _ in 0..5 {
+        open.set(true);
+        mounted.set(true);
+        s.settle().expect("settled");
+        assert!(one().can_scroll().1, "its list scrolls");
+        let parts = one().parts_held();
+        assert_eq!(gui::ScrollHandle::live(), baseline + 1, "one scroll, the select's");
+        mounted.set(false);
+        s.settle().expect("settled");
+        assert_eq!(parts.strong_count(), 0, "the parts went with the select");
+        assert_eq!(gui::ScrollHandle::live(), baseline, "and its scroll");
+    }
+}
+
+/// Coordinator (F1 review 1): a render in a fork that asks for the other
+/// alignment writes nothing live. Item-aligned, the list is placed again
+/// (its scroll started afresh) as its up button first comes; this one
+/// floats, so a wheel that brings the up button keeps it scrolled, even
+/// after a fork rendered its viewport item-aligned.
+#[test]
+#[cfg(debug_assertions)] // Forks are built in debug builds only (ADR-0028, F2).
+fn a_fork_rendering_the_other_alignment_leaves_the_live_select_as_it_was() {
+    let open = Signal::new(false);
+    let mut s = scenario(move || {
+        select_ui::<Option<String>>(SelectProps {
+            value: Bind::default(),
+            open: Bind::default().with_model(open),
+            height: Some(80.0),
+        })
+    });
+    s.act("open", || one().open(false));
+    s.settle().expect("settled");
+    s.settle().expect("settled");
+    assert_eq!(gui::untracked(|| one().can_scroll()), (false, true));
+    gui::testing::in_check(|| {
+        drop(one().viewport(div(), true));
+    });
+    let down = spot(&s, "down", 0);
+    s.hover(down.0, down.1);
+    s.settle().expect("settled");
+    assert!(scrolled(&s) > 0.5, "a step down, not placed again from the top");
+    assert!(gui::untracked(|| one().can_scroll()).0, "the up button came");
 }
 
 #[test]
@@ -444,41 +519,41 @@ fn the_select_keyboard_table() {
     plain(&mut s, NamedKey::ArrowDown);
     s.settle().expect("settled");
     assert!(open.get_untracked());
-    assert_eq!(focused_option(&s).as_deref(), Some("apple"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("apple"));
     plain(&mut s, NamedKey::ArrowDown);
-    assert_eq!(focused_option(&s).as_deref(), Some("banana"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("banana"));
     plain(&mut s, NamedKey::ArrowDown);
     assert_eq!(
-        focused_option(&s).as_deref(),
+        focused_option(&mut s).as_deref(),
         Some("cherry"),
         "the disabled one is skipped"
     );
     plain(&mut s, NamedKey::End);
-    assert_eq!(focused_option(&s).as_deref(), Some("grapes"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("grapes"));
     plain(&mut s, NamedKey::ArrowDown);
-    assert_eq!(focused_option(&s).as_deref(), Some("grapes"), "stops at the end");
+    assert_eq!(focused_option(&mut s).as_deref(), Some("grapes"), "stops at the end");
     plain(&mut s, NamedKey::Home);
-    assert_eq!(focused_option(&s).as_deref(), Some("apple"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("apple"));
     // Tab stays in the list.
     plain(&mut s, NamedKey::Tab);
     assert!(open.get_untracked());
-    assert_eq!(focused_option(&s).as_deref(), Some("apple"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("apple"));
     // Typeahead in the open list.
     typed(&mut s, "c");
-    assert_eq!(focused_option(&s).as_deref(), Some("cherry"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("cherry"));
     // Enter chooses, closes and focuses the trigger.
     plain(&mut s, NamedKey::Enter);
     assert_eq!(value.get_untracked().as_deref(), Some("cherry"));
     assert!(!open.get_untracked());
-    assert!(focused(select.trigger_focus()));
+    assert!(focused(&mut s, select.trigger_focus()));
     // Opening again focuses the chosen one.
     plain(&mut s, NamedKey::Enter);
     s.settle().expect("settled");
-    assert_eq!(focused_option(&s).as_deref(), Some("cherry"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("cherry"));
     // Escape closes and focuses the trigger, the value kept.
     plain(&mut s, NamedKey::Escape);
     assert!(!open.get_untracked());
-    assert!(focused(select.trigger_focus()));
+    assert!(focused(&mut s, select.trigger_focus()));
     assert_eq!(value.get_untracked().as_deref(), Some("cherry"));
 }
 
@@ -503,10 +578,10 @@ fn a_select_never_reaches_an_option_hidden_on_its_own() {
     );
     plain(&mut s, NamedKey::ArrowDown);
     assert!(open.get_untracked());
-    assert_eq!(focused_option(&s).as_deref(), Some("apple"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("apple"));
     plain(&mut s, NamedKey::ArrowDown);
     assert_eq!(
-        focused_option(&s).as_deref(),
+        focused_option(&mut s).as_deref(),
         Some("cherry"),
         "the hidden banana is passed"
     );
@@ -539,15 +614,15 @@ fn a_select_opened_by_its_caller_focuses_its_anchor_option() {
     s.settle().expect("settled");
     s.act("open", || open.set(true));
     s.settle().expect("settled");
-    assert_eq!(focused_option(&s).as_deref(), Some("cherry"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("cherry"));
     plain(&mut s, NamedKey::ArrowDown);
-    assert_eq!(focused_option(&s).as_deref(), Some("grapes"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("grapes"));
     // Open from the start (shadcn's default_open).
     let value = Signal::new(Some("banana".to_owned()));
     let open = Signal::new(true);
     let mut s = select_scenario(value, open);
     s.settle().expect("settled");
-    assert_eq!(focused_option(&s).as_deref(), Some("banana"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("banana"));
 }
 
 #[test]
@@ -728,7 +803,6 @@ fn placed_select(props: PlacedProps) -> Element {
         select.refresh();
         move || {
             let (aligned, at) = props.with(|p| (p.aligned, p.at));
-            select.set_aligned(aligned);
             let open = select.is_open();
             let anchor = select.anchor();
             let options = FRUITS.iter().zip(&focus).map(|((v, l, disabled), f)| {
@@ -757,6 +831,7 @@ fn placed_select(props: PlacedProps) -> Element {
                     .display(Display::Flex)
                     .flex_direction(FlexDirection::Column)
                     .children(options),
+                aligned,
             );
             let popper = primitives::select::POPPER.side_offset(4.0).arrow();
             let list = div()
@@ -817,7 +892,7 @@ fn bounds_of(s: &Scenario, name: &str) -> gui::Bounds {
         .nodes
         .iter()
         .find(|n| n.name == Some(name) && !n.look.invisible)
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .expect("the node on screen")
 }
 
@@ -838,6 +913,43 @@ fn placed_scenario(direction: Direction, aligned: bool, value: Option<&str>, at:
     s.settle().expect("settled");
     s.settle().expect("settled");
     s
+}
+
+/// Coordinator (F1 review 1): mounted floating (A), its parts built
+/// item-aligned (B) in a cold frame and rolled back, the list then opens
+/// through the real layout where A puts it, as a control that only ran A,
+/// in geometry where A and B differ.
+#[test]
+#[cfg(debug_assertions)] // Forks are built in debug builds only (ADR-0028, F2).
+fn a_select_opens_where_its_live_alignment_puts_it_after_a_check_built_the_other() {
+    let at = (300.0, 250.0);
+    let control = bounds_of(&placed_scenario(Direction::Ltr, false, Some("cherry"), at), "list");
+    let other = bounds_of(&placed_scenario(Direction::Ltr, true, Some("cherry"), at), "list");
+    assert!(
+        (control.y - other.y).abs() > 1.0,
+        "A and B differ: {control:?} vs {other:?}"
+    );
+    let value = Signal::new(Some("cherry".to_owned()));
+    let open = Signal::new(false);
+    let mut s = scenario(move || {
+        placed_select(PlacedProps {
+            value: Bind::default().with_model(value),
+            open: Bind::default().with_model(open),
+            direction: Direction::Ltr,
+            aligned: false,
+            at,
+        })
+    });
+    gui::testing::in_check(|| {
+        let select = one();
+        drop(select.viewport(div(), true));
+        drop(select.content(div(), true));
+    });
+    s.act("open", || open.set(true));
+    for _ in 0..3 {
+        s.settle().expect("settled");
+    }
+    assert_eq!(bounds_of(&s, "list"), control, "where A puts it");
 }
 
 #[test]
@@ -873,7 +985,7 @@ fn an_item_aligned_list_lines_the_chosen_label_up_on_the_value_by_reading_direct
             .iter()
             .filter(|n| n.name == Some("label") && !n.look.invisible)
             .nth(3)
-            .map(|n| n.bounds)
+            .map(|n| n.bounds(gui::inspect::OUTSIDE))
             .expect("cherry's label");
         let trigger = bounds_of(&s, "trigger");
         assert!(
@@ -954,7 +1066,7 @@ fn a_press_outside_the_open_select_closes_it_reaching_nothing_below() {
     plain(&mut s, NamedKey::Enter);
     s.settle().expect("settled");
     assert!(open.get_untracked());
-    assert_eq!(focused_option(&s).as_deref(), Some("apple"), "focus on an option");
+    assert_eq!(focused_option(&mut s).as_deref(), Some("apple"), "focus on an option");
     // The press outside: closed, the node below untouched, focus back on
     // the trigger (not left on an option that is now inert).
     let below = spot(&s, "below", 0);
@@ -962,7 +1074,7 @@ fn a_press_outside_the_open_select_closes_it_reaching_nothing_below() {
     s.settle().expect("settled");
     assert!(!open.get_untracked(), "a press outside closes it");
     assert_eq!(clicks.get(), 0, "and reaches nothing below (modal)");
-    assert!(focused(select.trigger_focus()), "focus returns to the trigger");
+    assert!(focused(&mut s, select.trigger_focus()), "focus returns to the trigger");
     assert_eq!(value.get_untracked(), None, "nothing chosen");
     // With the list closed, the node below takes its clicks again.
     s.click(below.0, below.1);
@@ -988,7 +1100,7 @@ fn a_press_dragged_past_the_slop_and_released_outside_the_list_closes_it() {
     assert!(!open.get_untracked(), "released outside the list: closed");
     assert_eq!(value.get_untracked(), None);
     assert_eq!(clicks.get(), 0, "the release reaches nothing below");
-    assert!(focused(one().trigger_focus()));
+    assert!(focused(&mut s, one().trigger_focus()));
 }
 
 #[test]
@@ -1125,9 +1237,9 @@ fn a_value_controlled_select_opened_by_keyboard_shows_focus_as_keyboard_focus() 
     s.act("open by keyboard", || select.open(true));
     s.settle().expect("settled");
     assert!(open.get_untracked(), "the caller took the open");
-    assert_eq!(focused_option(&s).as_deref(), Some("banana"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("banana"));
     assert!(
-        gui::untracked(gui::focus::focus_visible),
+        s.read(gui::focus::focus_visible),
         "the opener's keyboard modality reaches the anchor option"
     );
 }
@@ -1148,11 +1260,8 @@ fn a_refused_keyboard_select_open_leaves_no_modality_for_the_caller_s_own_open()
     // The caller opens it itself later: not from the keyboard.
     s.act("open", || open.set(true));
     s.settle().expect("settled");
-    assert_eq!(focused_option(&s).as_deref(), Some("banana"));
-    assert!(
-        !gui::untracked(gui::focus::focus_visible),
-        "a refused open's modality is gone"
-    );
+    assert_eq!(focused_option(&mut s).as_deref(), Some("banana"));
+    assert!(!s.read(gui::focus::focus_visible), "a refused open's modality is gone");
 }
 
 #[test]
@@ -1202,7 +1311,7 @@ fn select_a11y() {
     // inside it) carries too, for AT-SPI, which reads no text values; no
     // option shows.
     let mut ts = gui::text::TextSystem::new();
-    let update = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let update = access_tree(&mut s, &mut ts);
     let combo = update
         .nodes
         .iter()
@@ -1223,11 +1332,11 @@ fn select_a11y() {
         !inside.iter().any(|n| n.role() == gui::Role::ListBox),
         "closed, no list is read"
     );
-    insta::assert_snapshot!("select_a11y_closed", a11y(&s));
+    insta::assert_snapshot!("select_a11y_closed", a11y(&mut s));
     let at = spot(&s, "trigger", 0);
     s.click(at.0, at.1);
     s.settle().expect("settled");
-    insta::assert_snapshot!("select_a11y_open", a11y(&s));
+    insta::assert_snapshot!("select_a11y_open", a11y(&mut s));
 }
 
 /// A closed select's choice changing, Banana to Cherry: the update sends
@@ -1241,10 +1350,12 @@ fn a_closed_select_s_new_choice_is_sent_as_a_change() {
     let mut s = select_scenario(value, open);
     let mut ts = gui::text::TextSystem::new();
     let mut access = gui::access::Accessibility::default();
-    let _ = access.update(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let _ = access.update(s.last(), focus, 1.0, "w", &mut ts);
     s.act("choose", || value.set(Some("cherry".to_owned())));
     s.settle().expect("settled");
-    let update = access.update(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let update = access.update(s.last(), focus, 1.0, "w", &mut ts);
     let sent = |role: gui::Role| {
         update
             .nodes
@@ -1427,6 +1538,12 @@ struct Refusing {
 }
 
 impl Keeps<bool> for Refusing {
+    /// A signal; `accept`, which a write only reads, is set by the test
+    /// between frames.
+    fn fork_policy(&self) -> primitives::listbox::HeldFork {
+        primitives::listbox::HeldFork::Signals
+    }
+
     fn get(&self) -> bool {
         self.open.get()
     }
@@ -1681,7 +1798,7 @@ fn a_combobox_of_several_toggles_and_stays_open_by_click() {
     s.settle().expect("settled");
     assert_eq!(value.get_untracked(), ["cherry", "apple"]);
     assert!(open.get_untracked());
-    assert!(focused(c.field().focus), "focus back in the field");
+    assert!(focused(&mut s, c.field().focus), "focus back in the field");
     s.click(cherry.0, cherry.1);
     s.settle().expect("settled");
     assert_eq!(value.get_untracked(), ["apple"]);
@@ -1697,11 +1814,11 @@ fn combobox_a11y() {
     let open = Signal::new(false);
     let mut s = scenario(move || combobox_ui(value, open));
     let c = combo();
-    insta::assert_snapshot!("combobox_a11y_closed", a11y(&s));
+    insta::assert_snapshot!("combobox_a11y_closed", a11y(&mut s));
     s.act("focus", || c.field().focus.focus());
     plain(&mut s, NamedKey::ArrowDown);
     s.settle().expect("settled");
-    insta::assert_snapshot!("combobox_a11y_open", a11y(&s));
+    insta::assert_snapshot!("combobox_a11y_open", a11y(&mut s));
 }
 
 #[test]
@@ -1732,19 +1849,19 @@ fn a_combobox_trigger_controls_the_open_list_and_is_disabled_with_it() {
         .into_element()
     });
     let c = held.get().expect("the combobox");
-    let trigger_line = |s: &Scenario| {
+    let trigger_line = |s: &mut Scenario| {
         a11y(s)
             .lines()
             .find(|l| l.contains("\"Show popup\""))
             .map(str::to_owned)
             .expect("the trigger")
     };
-    assert!(!trigger_line(&s).contains("controls="), "closed: controls nothing");
+    assert!(!trigger_line(&mut s).contains("controls="), "closed: controls nothing");
     let t = spot(&s, "trigger", 0);
     s.click(t.0, t.1);
     s.settle().expect("settled");
     assert!(open.get_untracked());
-    let line = trigger_line(&s);
+    let line = trigger_line(&mut s);
     assert!(
         line.contains("expanded=true") && line.contains("controls=ListBox"),
         "{line}"
@@ -1754,7 +1871,7 @@ fn a_combobox_trigger_controls_the_open_list_and_is_disabled_with_it() {
     assert!(!open.get_untracked());
     s.act("disable", || c.set_availability(Availability::Disabled));
     s.settle().expect("settled");
-    assert!(trigger_line(&s).contains(" disabled"), "disabled with the combobox");
+    assert!(trigger_line(&mut s).contains(" disabled"), "disabled with the combobox");
     s.click(t.0, t.1);
     s.settle().expect("settled");
     assert!(!open.get_untracked(), "a disabled combobox does not open");
@@ -1851,7 +1968,7 @@ fn an_autocomplete_value_is_its_text() {
         Some("grape"),
         "the combobox's own value is the text"
     );
-    insta::assert_snapshot!("autocomplete_a11y", a11y(&s));
+    insta::assert_snapshot!("autocomplete_a11y", a11y(&mut s));
 }
 
 // ---------------------------------------------------------------- TagsInput
@@ -2007,7 +2124,7 @@ fn a_tags_input_adds_on_tab_and_blur_up_to_its_limit() {
     typed(&mut s, " a ");
     plain(&mut s, NamedKey::Tab);
     assert_eq!(tags.get_untracked(), ["a"], "Tab adds, trimmed");
-    assert!(focused(input.field().focus), "and focus stays");
+    assert!(focused(&mut s, input.field().focus), "and focus stays");
     let empty_tab = gui::KeyEvent {
         key: gui::Key::Named(NamedKey::Tab),
         text: None,
@@ -2156,7 +2273,7 @@ fn a_tag_s_delete_button_is_named_for_its_action_and_removes_it() {
     let (mut s, input) = tags_scenario(tags, TagsConfig::default());
     s.act("focus", || input.field().focus.focus());
     plain(&mut s, NamedKey::Backspace);
-    insta::assert_snapshot!("tags_input_a11y", a11y(&s));
+    insta::assert_snapshot!("tags_input_a11y", a11y(&mut s));
     let at = spot(&s, "delete", 0);
     s.click(at.0, at.1);
     s.settle().expect("settled");
@@ -2438,17 +2555,21 @@ fn a_tree_s_shift_range_leaves_disabled_rows_out_and_a_click_toggles() {
     assert_eq!(value.get_untracked(), ["a.md", "c.md"], "b.md cannot be chosen");
     // The highlight is the focus: the range's end has both.
     assert!(gui::untracked(|| tree.is_highlighted(&"c.md")));
-    assert_eq!(focused_label(&s).as_deref(), Some("c.md"), "focus went with the range");
+    assert_eq!(
+        focused_label(&mut s).as_deref(),
+        Some("c.md"),
+        "focus went with the range"
+    );
     shift(&mut s, NamedKey::ArrowDown);
     assert_eq!(value.get_untracked(), ["a.md", "c.md", "readme"]);
-    assert_eq!(focused_label(&s).as_deref(), Some("readme"));
+    assert_eq!(focused_label(&mut s).as_deref(), Some("readme"));
     shift(&mut s, NamedKey::ArrowUp);
     assert_eq!(
         value.get_untracked(),
         ["a.md", "c.md"],
         "the range shrinks from its end"
     );
-    assert_eq!(focused_label(&s).as_deref(), Some("c.md"));
+    assert_eq!(focused_label(&mut s).as_deref(), Some("c.md"));
     // No select-all in a tree (reka's has none): Control + A is the page's.
     select_all(&mut s);
     assert_eq!(value.get_untracked(), ["a.md", "c.md"]);
@@ -2458,7 +2579,7 @@ fn a_tree_s_shift_range_leaves_disabled_rows_out_and_a_click_toggles() {
     s.settle().expect("settled");
     assert_eq!(value.get_untracked(), ["docs"]);
     assert!(expanded.get_untracked().is_empty());
-    insta::assert_snapshot!("tree_a11y", a11y(&s));
+    insta::assert_snapshot!("tree_a11y", a11y(&mut s));
 }
 
 // ---------------------------------------------------------------- Command
@@ -2631,7 +2752,7 @@ fn command_a11y() {
     s.settle().expect("settled");
     typed(&mut s, "number 12");
     plain(&mut s, NamedKey::ArrowDown);
-    insta::assert_snapshot!("command_a11y", a11y(&s));
+    insta::assert_snapshot!("command_a11y", a11y(&mut s));
 }
 
 #[test]
@@ -2673,7 +2794,7 @@ fn choosing_the_chosen_option_keeps_a_select_s_value() {
     // Opening focuses the chosen option; Enter on it keeps it.
     plain(&mut s, NamedKey::Enter);
     s.settle().expect("settled");
-    assert_eq!(focused_option(&s).as_deref(), Some("cherry"));
+    assert_eq!(focused_option(&mut s).as_deref(), Some("cherry"));
     plain(&mut s, NamedKey::Enter);
     assert_eq!(value.get_untracked().as_deref(), Some("cherry"), "Enter keeps it");
     assert!(!open.get_untracked(), "and closes");
@@ -2803,13 +2924,13 @@ fn listbox_highlight() -> Option<String> {
 fn a_listbox_is_entered_by_tab_and_remembers_what_it_left() {
     let value = Signal::new(Some("cherry".to_owned()));
     let mut s = listbox_scenario(value, false);
-    let before = gui::untracked(gui::focus::focused);
+    let before = s.read(gui::focus::focused);
     assert_eq!(
         listbox_highlight().as_deref(),
         Some("cherry"),
         "mounting highlights the chosen one"
     );
-    assert_eq!(gui::untracked(gui::focus::focused), before, "and moves no focus");
+    assert_eq!(s.read(gui::focus::focused), before, "and moves no focus");
     // Tab from the button lands on the highlighted option, the one stop.
     let b = spot(&s, "before", 0);
     s.click(b.0, b.1);
@@ -2848,7 +2969,7 @@ fn a_listbox_is_entered_by_tab_and_remembers_what_it_left() {
     s.hover(700.0, 500.0);
     s.settle().expect("settled");
     assert_eq!(listbox_highlight(), None, "the pointer left the root");
-    insta::assert_snapshot!("listbox_a11y", a11y(&s));
+    insta::assert_snapshot!("listbox_a11y", a11y(&mut s));
 }
 
 #[test]
@@ -2858,7 +2979,7 @@ fn a_listbox_with_a_filter_keeps_focus_in_its_field() {
     let f = spot(&s, "filter", 0);
     s.click(f.0, f.1);
     s.settle().expect("settled");
-    let field = gui::untracked(gui::focus::focused);
+    let field = s.read(gui::focus::focused);
     typed(&mut s, "b");
     assert_eq!(
         listbox_highlight().as_deref(),
@@ -2873,11 +2994,11 @@ fn a_listbox_with_a_filter_keeps_focus_in_its_field() {
     );
     plain(&mut s, NamedKey::Enter);
     assert_eq!(value.get_untracked().as_deref(), Some("banana"));
-    assert_eq!(gui::untracked(gui::focus::focused), field, "focus stays in the field");
+    assert_eq!(s.read(gui::focus::focused), field, "focus stays in the field");
     s.act("write", || value.set(Some("cherry".to_owned())));
     s.settle().expect("settled");
     assert_eq!(
-        gui::untracked(gui::focus::focused),
+        s.read(gui::focus::focused),
         field,
         "a caller's value moves no focus with a filter"
     );
@@ -2917,7 +3038,7 @@ fn virtual_listbox(
             let list: Listbox<usize, Option<usize>> = Listbox::new(Bound::new(value), ListConfig::LISTBOX.hover(hover));
             h.set(Some(list));
             let state = gui::list::ListState::new(30.0);
-            list.set_virtual(state.clone(), Rc::new(million));
+            list.set_virtual(state, Rc::new(million));
             move || {
                 let options = million();
                 let n = u64::try_from(options.len()).unwrap_or(u64::MAX);
@@ -3005,21 +3126,21 @@ fn a_virtual_listbox_keeps_the_listbox_guarantees_over_its_data() {
     // into the list's own view; focus does not move.
     assert_eq!(hl(), Some(500_000), "the mount highlight reads the data");
     assert!(s.locate("option 500000").is_ok(), "brought into view");
-    assert_eq!(gui::untracked(gui::focus::focused), None, "no focus moved");
+    assert_eq!(s.read(gui::focus::focused), None, "no focus moved");
     // A caller's value: highlighted, brought into view, focused.
     s.act("write", || value.set(Some(900_000)));
     s.settle().expect("settled");
     assert_eq!(hl(), Some(900_000));
     assert!(s.locate("option 900000").is_ok(), "brought into view");
-    let content = gui::untracked(gui::focus::focused).expect("focus came to the list");
+    let content = s.read(gui::focus::focused).expect("focus came to the list");
     // Leaving lets the highlight go and remembers it; Tab back restores it.
     plain(&mut s, NamedKey::ArrowDown);
     assert_eq!(hl(), Some(900_001));
     shift(&mut s, NamedKey::Tab);
-    assert_ne!(gui::untracked(gui::focus::focused), Some(content), "focus left");
+    assert_ne!(s.read(gui::focus::focused), Some(content), "focus left");
     assert_eq!(hl(), None, "focus left: nothing highlighted");
     plain(&mut s, NamedKey::Tab);
-    assert_eq!(gui::untracked(gui::focus::focused), Some(content));
+    assert_eq!(s.read(gui::focus::focused), Some(content));
     assert_eq!(hl(), Some(900_001), "Tab back: the option focus left");
     // A caller emptying the value: the first usable option, at the top.
     s.act("clear", || value.set(None));
@@ -3114,13 +3235,13 @@ fn a_combobox_popup_holding_focus_gives_it_to_the_trigger_as_it_goes() {
     s.click(b.0, b.1);
     s.settle().expect("settled");
     assert!(open.get_untracked());
-    assert!(focused(c.field().focus), "opening focuses the field");
+    assert!(focused(&mut s, c.field().focus), "opening focuses the field");
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::Enter);
     assert_eq!(value.get_untracked().as_deref(), Some("banana"));
     assert!(!open.get_untracked());
     assert!(
-        focused(c.trigger_focus()),
+        focused(&mut s, c.trigger_focus()),
         "the popup went with focus: the trigger has it"
     );
 }
@@ -3311,7 +3432,7 @@ fn a_virtual_tree_scrolled_through_keeps_focus_for_the_rows_it_shows() {
             h.set(Some(tree));
             let state = gui::list::ListState::new(24.0);
             tree.attach_list(&state);
-            l.set(Some(state.clone()));
+            l.set(Some(state));
             move || {
                 let rows = tree.rows();
                 tree.virtual_list(&state, &rows, |r, _| {
@@ -3543,10 +3664,9 @@ fn a_virtual_listbox_list_replaced_in_one_update_keeps_its_data() {
             let state = gui::list::ListState::new(30.0);
             let source: Rc<dyn Fn() -> Rc<dyn Options<usize>>> = Rc::new(million);
             let part = move || {
-                let (state, source) = (state.clone(), Rc::clone(&source));
+                let source = Rc::clone(&source);
                 component((), move |_| {
-                    list.set_virtual(state.clone(), Rc::clone(&source));
-                    let state = state.clone();
+                    list.set_virtual(state, Rc::clone(&source));
                     move || {
                         let options = million();
                         let n = u64::try_from(options.len()).unwrap_or(u64::MAX);
@@ -3607,13 +3727,13 @@ fn a_list_state_reused_after_its_listbox_left_calls_nothing_of_it() {
     let value: Signal<Option<usize>> = Signal::new(None);
     let boxed = Signal::new(true);
     let state = gui::list::ListState::new(30.0);
-    let st = state.clone();
+    let st = state;
     let mut s = scenario(move || {
-        let state = st.clone();
+        let state = st;
         if boxed.get() {
             component((), move |_| {
                 let list: Listbox<usize, Option<usize>> = Listbox::new(Bound::new(value), ListConfig::LISTBOX);
-                list.set_virtual(state.clone(), Rc::new(million));
+                list.set_virtual(state, Rc::new(million));
                 move || {
                     let options = million();
                     let body = virtual_list_in(
@@ -3652,7 +3772,6 @@ fn a_list_state_reused_after_its_listbox_left_calls_nothing_of_it() {
     s.act("the listbox leaves", || boxed.set(false));
     s.settle().expect("settled");
     assert!(visible(&s, "row") > 0, "the plain list shows its rows");
-    drop(state);
 }
 
 /// An option the listbox highlights, replaced in one update by one of the
@@ -3800,7 +3919,7 @@ fn a_tree_whose_virtual_list_left_keeps_its_keys_off_that_list() {
                     component((), move |_| {
                         let state = gui::list::ListState::new(24.0);
                         tree.attach_list(&state);
-                        l.set(Some(state.clone()));
+                        l.set(Some(state));
                         move || {
                             let rows = tree.rows();
                             tree.virtual_list(&state, &rows, |r, _| {
@@ -3835,7 +3954,9 @@ fn a_tree_whose_virtual_list_left_keeps_its_keys_off_that_list() {
         gui::untracked(|| tree.is_highlighted(&(99, usize::MAX))),
         "End reached the last row"
     );
-    assert_eq!(old.anchor().row, 0, "the old list was not asked to scroll");
+    // The old list went with its component: the tree asking it to scroll
+    // would have failed loudly (a list used after its owner ended).
+    assert!(!old.is_alive(), "the old list ended with its component");
 }
 
 /// A key whose `Hash` writes the same bytes for every value: two of them
@@ -3939,13 +4060,13 @@ fn rows_whose_keys_hash_alike_are_focused_apart() {
     let tree = held.get().expect("the tree");
     plain(&mut s, NamedKey::Tab);
     assert!(gui::untracked(|| tree.is_highlighted(&Twin(1))));
-    let first = gui::focus::focused();
+    let first = s.read(gui::focus::focused);
     plain(&mut s, NamedKey::ArrowDown);
     assert!(
         gui::untracked(|| tree.is_highlighted(&Twin(2))),
         "the second row holds the highlight"
     );
-    assert_ne!(gui::focus::focused(), first, "focus moved to another handle");
+    assert_ne!(s.read(gui::focus::focused), first, "focus moved to another handle");
 }
 
 /// A row's key leaves the data and comes back: the handle saved from the
@@ -3959,7 +4080,7 @@ fn a_row_added_again_is_not_focused_through_the_handle_of_the_one_that_left() {
     plain(&mut s, NamedKey::Tab);
     plain(&mut s, NamedKey::ArrowDown);
     assert!(gui::untracked(|| tree.is_highlighted(&Twin(2))));
-    let saved = gui::focus::focused().expect("a row focused");
+    let saved = s.read(gui::focus::focused).expect("a row focused");
     plain(&mut s, NamedKey::ArrowDown);
     s.act("row 2 leaves", || roots.set(vec![1, 3]));
     s.settle().expect("settled");
@@ -3968,7 +4089,7 @@ fn a_row_added_again_is_not_focused_through_the_handle_of_the_one_that_left() {
     s.act("focus the saved handle", || gui::focus::set_focus(Some(saved), true));
     s.settle().expect("settled");
     assert_ne!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         Some(saved),
         "the old handle reaches nothing, not the row that came back"
     );

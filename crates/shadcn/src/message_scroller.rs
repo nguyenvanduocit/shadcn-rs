@@ -21,11 +21,7 @@
 //! list's offsets are its rows' boxes exactly. Scrolls jump: `gui` animates
 //! no scroll, so `behavior: "smooth"` lands at once.
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
-)]
-use std::cell::RefCell;
+use gui::engine::WorldRefCell;
 use std::collections::HashSet;
 use std::ops::Range;
 use std::rc::{Rc, Weak};
@@ -172,14 +168,10 @@ struct Change {
 }
 
 /// Vue's `createEngine`: the scroller's state between layouts.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
-)]
 struct Engine {
     props: MessageScrollerProps,
     list: ListState,
-    me: Weak<RefCell<Engine>>,
+    me: Weak<WorldRefCell<Engine>>,
     /// Owns the engine's timers: they are cancelled with the provider.
     owner: gui::Scope,
     scrollable: Signal<MessageScrollerScrollable>,
@@ -733,24 +725,21 @@ impl Engine {
 /// [`message_scroller_provider`] read it ([`use_message_scroller`], Vue's
 /// `useMessageScroller`). It is the provider's: it lives while the provider
 /// is mounted.
+///
+/// Its engine is the world's that made the provider: a check writes none of
+/// a live one's (ADR-0034, S7). It is written only by its layout hook and by
+/// the scroll commands (`scroll_to_*`) parts run from their handlers, never
+/// by a setup or render.
 #[derive(Clone)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
-)]
 pub struct MessageScroller {
     list: ListState,
-    engine: Rc<RefCell<Engine>>,
+    engine: Rc<WorldRefCell<Engine>>,
     scrollable: Signal<MessageScrollerScrollable>,
     visibility: Signal<MessageScrollerVisibility>,
 }
 
 impl MessageScroller {
     /// Made in the provider's setup: what it makes belongs to the provider.
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the provider's engine, reached by its descendants through context: written only by its layout hook and by the scroll commands (`scroll_to_*`) parts run from their handlers, as `ListState`'s commands, never by a setup or render"
-    )]
     fn new(props: MessageScrollerProps) -> Self {
         let list = ListState::new(ROW_ESTIMATE);
         list.follow_tail(props.auto_scroll);
@@ -759,9 +748,9 @@ impl MessageScroller {
         let autoscrolling = Signal::labeled("message scroller autoscrolling", false);
         let owner = gui::Scope::new();
         let engine = Rc::new_cyclic(|me| {
-            RefCell::new(Engine {
+            let engine = Engine {
                 props,
-                list: list.clone(),
+                list,
                 me: me.clone(),
                 owner,
                 scrollable,
@@ -790,11 +779,11 @@ impl MessageScroller {
                 handled_anchors: HashSet::new(),
                 autoscroll_run: 0,
                 dirty: false,
-            })
+            };
+            WorldRefCell::new("a message scroller's engine", engine)
         });
         // No scrollbar while the engine scrolls the thread itself.
-        let hidden = list.clone();
-        Effect::new(move || hidden.hide_scrollbar(autoscrolling.get()));
+        Effect::new(move || list.hide_scrollbar(autoscrolling.get()));
         let weak = Rc::downgrade(&engine);
         list.on_layout(move |l| {
             weak.upgrade()
@@ -1265,7 +1254,9 @@ mod tests {
             .nodes
             .iter()
             .filter_map(|n| match &n.content {
-                Content::Text { content, .. } if content.starts_with('m') => Some((content.to_string(), n.bounds.y)),
+                Content::Text { content, .. } if content.starts_with('m') => {
+                    Some((content.to_string(), n.bounds(gui::inspect::OUTSIDE).y))
+                }
                 _ => None,
             })
             .collect()

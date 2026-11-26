@@ -111,12 +111,30 @@ impl<A: 'static, R: 'static> Callback<A, R> {
         }
     }
 
-    /// Call it, untracked, in the instance that made it.
-    pub fn call(&self, arg: A) -> R {
-        match self.owner {
+    /// Call it, untracked, in the instance that made it; through the one
+    /// gate a caller's closure is reached by ([`crate::engine::call_out`]):
+    /// inside a fork it does not run (what it writes is the outside
+    /// world's, which no rollback puts back, ADR-0028 rule 5). An event's
+    /// callback answers nothing, and a fork calls it to no effect. One
+    /// whose answer the fork would need (a veto) is a bug there, loud in a
+    /// debug build, and answers `R::default()`.
+    pub fn call(&self, arg: A) -> R
+    where
+        R: Default,
+    {
+        let called = crate::engine::call_out(crate::engine::Site::Callback, || match self.owner {
             Some(owner) => crate::reactive::run_owned(Some(owner), || (self.f)(arg)),
             None => crate::reactive::untracked(|| (self.f)(arg)),
-        }
+        });
+        // `None` live: it panicked inside a dispatch, which keeps the panic
+        // ([`crate::engine::call_out`]), and answers as no callback would.
+        called.unwrap_or_else(|| {
+            debug_assert!(
+                !crate::engine::forking() || std::any::TypeId::of::<R>() == std::any::TypeId::of::<()>(),
+                "a fork needs the answer of a caller's callback, which it never calls"
+            );
+            R::default()
+        })
     }
 }
 
@@ -156,7 +174,11 @@ impl<A: 'static, R: 'static, F: Fn(A) -> R + 'static> From<F> for Callback<A, R>
 pub struct Derive<A: 'static, R: 'static = ()>(Rc<dyn Fn(A) -> R>);
 
 impl<A: 'static, R: 'static> Derive<A, R> {
+    /// Its kind is registered ([`crate::engine::Site::Derive`]): a render
+    /// calls it inline, and its panic is that render's, contained at the
+    /// instance (ADR-0015).
     pub fn new(f: impl Fn(A) -> R + 'static) -> Self {
+        crate::engine::stored_kind(crate::engine::Site::Derive);
         Self(Rc::new(f))
     }
 
@@ -820,15 +842,19 @@ struct InstanceKey {
     type_id: TypeId,
 }
 
-/// An instance: its slot and the generation the slot had when it was
-/// made. A slot freed and used again has a new generation, so an id kept
-/// past its instance (a parent's, a root's) finds nothing, never the
-/// instance made in its place.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct Id {
-    slot: usize,
-    generation: u32,
+crate::engine::fork_data_struct! {
+    /// An instance: its slot and the generation the slot had when it was
+    /// made. A slot freed and used again has a new generation, so an id kept
+    /// past its instance (a parent's, a root's) finds nothing, never the
+    /// instance made in its place.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    struct Id {
+        slot: usize,
+        generation: u32,
+    }
 }
+
+crate::engine::parts_whole!(Id);
 
 type Context = Rc<HashMap<TypeId, Rc<dyn Any>>>;
 
@@ -883,6 +909,27 @@ struct Instance {
     /// render reused it), it keeps the props it has. Kept here, in the
     /// instance tree, not on the placeholder its parent's output shares.
     met: std::rc::Weak<ComponentElement>,
+    /// What panics of user code caught at it in turns left it holding
+    /// ([`contain`]): part of its root's state, so one root's hold is
+    /// nothing to another's, and what a cold frame of its root reuses as
+    /// it is ([`Holds`]).
+    holds: Holds,
+}
+
+/// What an instance holds over panics of its user code caught in turns
+/// ([`contain`], ADR-0015). A cold frame treats each as opaque: it
+/// reuses what the live tree holds (the output, the props, the empty
+/// slot), never running the code again, and checks everything else.
+#[derive(Clone, Default, Debug, PartialEq, Eq)]
+struct Holds {
+    /// Its render panicked: it shows its last output.
+    render: bool,
+    /// The comparison of the props passed to it panicked: it keeps its
+    /// props (and its output).
+    props: bool,
+    /// The setups of the children made at these slots of its output
+    /// panicked: each slot is empty until its output is expanded again.
+    setups: Vec<InstanceKey>,
 }
 
 #[cfg(debug_assertions)]
@@ -914,6 +961,7 @@ impl Instance {
             updated: self.updated.clone(),
             renders: self.renders,
             met: self.met.clone(),
+            holds: self.holds.clone(),
         }
     }
 }
@@ -921,23 +969,35 @@ impl Instance {
 #[derive(Default)]
 struct Tree {
     slab: Vec<Option<Instance>>,
-    generations: Vec<u32>,
+    /// Each slot's next generations, by the one slot rule of every arena
+    /// ([`crate::engine::Generations`], ADR-0028 rule 3): never put back,
+    /// so an instance id a cold frame made names nothing after it, and the
+    /// live ids are as without it.
+    generations: crate::engine::Generations,
     free: Vec<usize>,
     /// The instance whose setup or render runs now.
     current: Vec<Id>,
     /// While a cold frame runs: its undo log ([`TreeLog`]).
     #[cfg(debug_assertions)]
     cold: Option<Box<TreeLog>>,
+    /// The instances cold frames make, in a region of their own (slots
+    /// numbered `FORK_INSTANCE | index`), so the live slots, the free ones
+    /// and their numbering are as without the frame; emptied by each
+    /// rollback, their next generations never put back.
+    #[cfg(debug_assertions)]
+    fork_slab: Vec<Option<Instance>>,
+    #[cfg(debug_assertions)]
+    fork_generations: crate::engine::Generations,
 }
+
+/// The top bit of a slot: an instance a cold frame made.
+const FORK_INSTANCE: usize = 1 << (usize::BITS - 1);
 
 /// One step a cold frame took on the instances, undone at its end.
 #[cfg(debug_assertions)]
 enum TreeUndo {
-    /// A slot that was there before the frame, and its generation, as
-    /// they were then.
-    Slot(usize, Option<Box<Instance>>, u32),
-    FreePop(usize),
-    FreePush,
+    /// A slot that was there before the frame, as it was then.
+    Slot(usize, Option<Box<Instance>>),
 }
 
 /// What a cold frame did to the instance tree (decision B): each slot that
@@ -946,7 +1006,7 @@ enum TreeUndo {
 struct TreeLog {
     undo: Vec<TreeUndo>,
     logged: std::collections::HashSet<usize>,
-    len: usize,
+    /// The live instances running while the frame runs.
     current: Vec<Id>,
 }
 
@@ -957,7 +1017,6 @@ fn tree_cold_enter() -> Box<dyn Any> {
         t.cold = Some(Box::new(TreeLog {
             undo: Vec::new(),
             logged: std::collections::HashSet::new(),
-            len: t.slab.len(),
             current: std::mem::take(&mut t.current),
         }));
     });
@@ -967,16 +1026,19 @@ fn tree_cold_enter() -> Box<dyn Any> {
 /// What the frame made, taken out of the tree while it still runs: the
 /// instances in the slots it wrote or added.
 #[cfg(debug_assertions)]
-fn tree_cold_drain(_: &dyn Any) -> Box<dyn Any> {
+fn tree_cold_drain(_: &dyn Any) -> Vec<Box<dyn Any>> {
     let made = TREE.try_with(|t| t.try_borrow_mut().map(|mut t| t.drain_cold()).unwrap_or_default());
-    Box::new(made.unwrap_or_default())
+    made.unwrap_or_default()
 }
 
-/// The tree put back as it was; what the frame made, to drop.
+/// The tree put back as it was, by moves (ADR-0034, S1).
 #[cfg(debug_assertions)]
-fn tree_cold_exit(_: Box<dyn Any>) -> Box<dyn Any> {
-    let made = TREE.try_with(|t| t.try_borrow_mut().map(|mut t| t.rollback()).unwrap_or_default());
-    Box::new(made.unwrap_or_default())
+fn tree_cold_exit(_: Box<dyn Any>) {
+    TREE.switch_with(|t| {
+        if let Ok(mut t) = t.try_borrow_mut() {
+            t.rollback();
+        }
+    });
 }
 
 /// How many steps the running cold frame's tree log holds (its cost).
@@ -990,7 +1052,10 @@ type Mark = (Id, u32, Option<SignalRef>, Priority);
 
 /// A hook due after layout, and the scope that owns it: the instance's, or
 /// the owner a handler runs in. Disposed meanwhile, it never runs.
-type PostHook = (crate::reactive::OwnerId, Box<dyn FnOnce()>);
+/// A hook due after layout: its owner (disposed, it never runs), and the
+/// hook, kept in the window it was queued in (it runs there; once that
+/// window closed, never: [`crate::engine::Stored`]).
+type PostHook = (crate::reactive::OwnerId, crate::engine::Stored<Box<dyn FnOnce()>>);
 
 crate::engine::engine_local! {
     /// The instances. A cold frame writes them in place, each slot's live
@@ -1021,6 +1086,103 @@ crate::engine::engine_local! {
     /// The instances rendered since the last [`take_rendered`].
     [Fresh] static RENDERED: RefCell<Vec<Rendered>> = const { RefCell::new(Vec::new()) };
     [Fork] static STATS: Cell<Stats> = const { Cell::new(Stats { renders: 0, setups: 0, unmounts: 0 }) };
+}
+
+/// A panic of user code the layout ran (a binding) caught in a turn: to
+/// the arbiter, the binding to hold what it last gave; outside a turn,
+/// on to the caller. A cold frame runs no binding the live tree holds
+/// (it reuses what it holds, [`crate::layout`]'s held values), so one
+/// that panics there panicked where the live one did not: on, a mismatch.
+pub(crate) fn contain_binding(failed: crate::engine::Failed) {
+    if !crate::engine::dispatching() {
+        failed.go_on();
+    }
+    failed.report();
+}
+
+/// What a panic of user code caught at an instance, in a turn, left it
+/// holding ([`contain`], [`Holds`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    /// Its render panicked: it shows its last output.
+    Render,
+    /// The comparison of the props passed to it panicked: it keeps its
+    /// props (and its output).
+    Props,
+    /// The setup of the child at this slot of its output panicked: the
+    /// slot is empty until its output is expanded again.
+    Setup(InstanceKey),
+}
+
+/// A panic of user code caught at instance `id` (`fault`, ADR-0015, the
+/// turn rule). In a turn, as Flutter puts an error widget in the place of
+/// the one element whose build threw and draws the rest: the panic goes
+/// to the arbiter, and what it left is held by the instance alone
+/// ([`Holds`]): the rest of the tree resolves, lays out and draws as it
+/// would. Outside a turn, on to the caller: the root is torn down. A cold
+/// frame never runs what the live tree holds (it reuses it), so a panic
+/// it catches is one the live tree did not have: on, a mismatch.
+fn contain(failed: crate::engine::Failed, id: Id, fault: Fault) {
+    if !crate::engine::dispatching() {
+        failed.go_on();
+    }
+    failed.report();
+    with_tree(|t| {
+        let Some(i) = t.get_mut(id) else { return };
+        match fault {
+            Fault::Render => i.holds.render = true,
+            Fault::Props => i.holds.props = true,
+            Fault::Setup(slot) => {
+                if !i.holds.setups.contains(&slot) {
+                    i.holds.setups.push(slot);
+                }
+            }
+        }
+    });
+}
+
+/// Instance `id` no longer holds `fault`: it rendered, or was passed
+/// props, through. A cold frame changes no hold: it reads the live ones.
+fn cleared(id: Id, fault: Fault) {
+    if crate::engine::is_cold() {
+        return;
+    }
+    with_tree(|t| {
+        let Some(i) = t.get_mut(id) else { return };
+        match fault {
+            Fault::Render => i.holds.render = false,
+            Fault::Props => i.holds.props = false,
+            Fault::Setup(slot) => i.holds.setups.retain(|s| *s != slot),
+        }
+    });
+}
+
+/// Instance `id`'s output is expanded again: every slot a setup's panic
+/// left empty mounts anew ([`cleared`], a cold frame's excepted).
+fn cleared_setups(id: Id) {
+    if crate::engine::is_cold() {
+        return;
+    }
+    with_tree(|t| {
+        if let Some(i) = t.get_mut(id)
+            && !i.holds.setups.is_empty()
+        {
+            i.holds.setups.clear();
+        }
+    });
+}
+
+/// Whether a cold frame reuses what instance `id` holds (`fault`) rather
+/// than run its user code: the live tree holds it ([`Holds`]).
+fn opaque(id: Id, fault: Fault) -> bool {
+    crate::engine::is_cold()
+        && with_tree(|t| {
+            t.get(id).is_some_and(|i| match fault {
+                Fault::Render => i.holds.render,
+                Fault::Props => i.holds.props,
+                Fault::Setup(slot) => i.holds.setups.contains(&slot),
+            })
+        })
 }
 
 /// How soon a render a write causes must show (ADR-0013's scheduler).
@@ -1151,33 +1313,53 @@ fn with_tree<R>(f: impl FnOnce(&mut Tree) -> R) -> R {
 }
 
 impl Tree {
+    /// Slot `slot`, in the live region or the frames'.
+    fn slot(&self, slot: usize) -> Option<&Option<Instance>> {
+        if slot & FORK_INSTANCE != 0 {
+            #[cfg(debug_assertions)]
+            return self.fork_slab.get(slot & !FORK_INSTANCE);
+            #[cfg(not(debug_assertions))]
+            return None;
+        }
+        self.slab.get(slot)
+    }
+
+    fn slot_mut(&mut self, slot: usize) -> Option<&mut Option<Instance>> {
+        if slot & FORK_INSTANCE != 0 {
+            #[cfg(debug_assertions)]
+            return self.fork_slab.get_mut(slot & !FORK_INSTANCE);
+            #[cfg(not(debug_assertions))]
+            return None;
+        }
+        self.slab.get_mut(slot)
+    }
+
     fn get(&self, id: Id) -> Option<&Instance> {
-        self.slab
-            .get(id.slot)
+        self.slot(id.slot)
             .and_then(Option::as_ref)
             .filter(|i| i.generation == id.generation)
     }
 
     fn get_mut(&mut self, id: Id) -> Option<&mut Instance> {
         self.log(id.slot);
-        self.slab
-            .get_mut(id.slot)
+        self.slot_mut(id.slot)
             .and_then(Option::as_mut)
             .filter(|i| i.generation == id.generation)
     }
 
-    /// In a cold frame, slot `id` as it was, kept on its first write.
+    /// In a cold frame, live slot `id` as it
+    /// was, kept on its first write.
     #[cfg(debug_assertions)]
     fn log(&mut self, id: usize) {
-        if let Some(log) = self.cold.as_deref_mut()
-            && id < log.len
+        if crate::engine::forking()
+            && let Some(log) = self.cold.as_deref_mut()
+            && id & FORK_INSTANCE == 0
             && log.logged.insert(id)
             && let Some(slot) = self.slab.get_mut(id)
         {
             let copy = slot.as_ref().map(Instance::cold_copy);
             let old = std::mem::replace(slot, copy).map(Box::new);
-            let generation = self.generations.get(id).copied().unwrap_or(0);
-            log.undo.push(TreeUndo::Slot(id, old, generation));
+            log.undo.push(TreeUndo::Slot(id, old));
             crate::engine::fork_work(1);
         }
     }
@@ -1186,14 +1368,6 @@ impl Tree {
     #[inline]
     fn log(&mut self, _: usize) {}
 
-    #[cfg(debug_assertions)]
-    fn step(&mut self, step: TreeUndo) {
-        if let Some(log) = self.cold.as_deref_mut() {
-            log.undo.push(step);
-            crate::engine::fork_work(1);
-        }
-    }
-
     /// The instances the cold frame wrote or added, taken out while it
     /// still runs (each slot's live instance is in the log).
     #[cfg(debug_assertions)]
@@ -1201,81 +1375,97 @@ impl Tree {
         let Some(log) = self.cold.as_deref() else {
             return Vec::new();
         };
-        let slots: Vec<usize> = log.logged.iter().copied().chain(log.len..self.slab.len()).collect();
-        slots
+        let slots: Vec<usize> = log.logged.iter().copied().collect();
+        let mut made: Vec<Box<dyn Any>> = slots
             .into_iter()
             .filter_map(|i| self.slab.get_mut(i).and_then(Option::take))
             .map(|i| -> Box<dyn Any> { Box::new(i) })
-            .collect()
-    }
-
-    /// Put back what the cold frame changed; what it made, to drop.
-    #[cfg(debug_assertions)]
-    fn rollback(&mut self) -> Vec<Box<dyn Any>> {
-        let mut made: Vec<Box<dyn Any>> = Vec::new();
-        let Some(log) = self.cold.take() else { return made };
-        let TreeLog { undo, len, current, .. } = *log;
-        for step in undo.into_iter().rev() {
-            match step {
-                TreeUndo::Slot(id, old, generation) => {
-                    if let Some(slot) = self.slab.get_mut(id) {
-                        made.push(Box::new(std::mem::replace(slot, old.map(|b| *b))));
-                    }
-                    if let Some(g) = self.generations.get_mut(id) {
-                        *g = generation;
-                    }
-                }
-                TreeUndo::FreePop(id) => self.free.push(id),
-                TreeUndo::FreePush => {
-                    self.free.pop();
-                }
-            }
-        }
+            .collect();
         made.extend(
-            self.slab
-                .drain(len.min(self.slab.len())..)
+            self.fork_slab
+                .iter_mut()
+                .filter_map(Option::take)
                 .map(|i| -> Box<dyn Any> { Box::new(i) }),
         );
-        self.generations.truncate(len);
-        made.push(Box::new(std::mem::replace(&mut self.current, current)));
         made
     }
 
-    /// Take instance `id` out (it unmounts): its slot freed, with a new
-    /// generation.
+    /// Put back what the cold frame changed, by moves (ADR-0034, S1): the
+    /// slots it wrote and its own were emptied by the drain, so what is
+    /// replaced holds no instance; one left is quarantined, never dropped
+    /// here.
+    #[cfg(debug_assertions)]
+    fn rollback(&mut self) {
+        let Some(log) = self.cold.take() else { return };
+        let TreeLog { undo, current, .. } = *log;
+        for step in undo.into_iter().rev() {
+            let TreeUndo::Slot(id, old) = step;
+            if let Some(slot) = self.slab.get_mut(id)
+                && let Some(left) = std::mem::replace(slot, old.map(|b| *b))
+            {
+                crate::engine::quarantined("TREE", Box::new(left));
+            }
+        }
+        // The live free slots were never touched; the frame's own go.
+        let own: Vec<Instance> = self.fork_slab.drain(..).flatten().collect();
+        if !own.is_empty() {
+            crate::engine::quarantined("TREE", Box::new(own));
+        }
+        // Ids of the instances current: data.
+        self.current = current;
+    }
+
+    /// Take instance `id` out (it unmounts): its slot freed; the next
+    /// instance there takes a generation none had.
     fn take(&mut self, id: Id) -> Option<Instance> {
         self.get(id)?;
         self.log(id.slot);
-        let inst = self.slab.get_mut(id.slot).and_then(Option::take)?;
-        // A slot whose generations ran out is retired, never reused: an id
-        // from before could not be told from one issued after.
-        let next = self.generations.get(id.slot).and_then(|g| g.checked_add(1));
-        if let (Some(g), Some(next)) = (self.generations.get_mut(id.slot), next) {
-            *g = next;
+        let inst = self.slot_mut(id.slot).and_then(Option::take)?;
+        // The frame's own slots, and a live one a running frame empties
+        // (the log puts it back), are never freed: the live free slots
+        // are as without the frame. A slot whose generations ran out is
+        // retired, never reused: an id from before could not be told from
+        // one issued after.
+        if id.slot & FORK_INSTANCE == 0 && !crate::engine::forking() && self.generations.reusable(id.slot) {
             self.free.push(id.slot);
-            #[cfg(debug_assertions)]
-            self.step(TreeUndo::FreePush);
         }
         Some(inst)
     }
 
     fn insert(&mut self, inst: Instance) -> Id {
-        if let Some(slot) = self.free.pop() {
-            #[cfg(debug_assertions)]
-            self.step(TreeUndo::FreePop(slot));
-            self.log(slot);
-            let generation = self.generations.get(slot).copied().unwrap_or(0);
+        // The frame's if one runs (the one answer, at the moment it is
+        // made): in its own region, under the forks' generations.
+        #[cfg(debug_assertions)]
+        if crate::engine::forking() && self.cold.is_some() {
+            loop {
+                let index = self.fork_slab.len();
+                if let Some(generation) = self.fork_generations.take(index, true) {
+                    self.fork_slab.push(Some(Instance { generation, ..inst }));
+                    return Id {
+                        slot: index | FORK_INSTANCE,
+                        generation,
+                    };
+                }
+                self.fork_slab.push(None);
+            }
+        }
+        while let Some(slot) = self.free.pop() {
+            let Some(generation) = self.generations.take(slot, false) else {
+                continue;
+            };
             if let Some(s) = self.slab.get_mut(slot) {
                 *s = Some(Instance { generation, ..inst });
             }
-            Id { slot, generation }
-        } else {
-            self.slab.push(Some(Instance { generation: 0, ..inst }));
-            self.generations.push(0);
-            Id {
-                slot: self.slab.len().saturating_sub(1),
-                generation: 0,
+            return Id { slot, generation };
+        }
+        loop {
+            let slot = self.slab.len();
+            if let Some(generation) = self.generations.take(slot, false) {
+                self.slab.push(Some(Instance { generation, ..inst }));
+                return Id { slot, generation };
             }
+            // Retired (a rollback cut it off after its generations ran out).
+            self.slab.push(None);
         }
     }
 
@@ -1319,27 +1509,87 @@ fn apply_marks() {
 
 /// A tree of instances under one root, which a pipeline resolves each frame.
 ///
-/// A panic out of user code as it resolves (a setup, a render, an effect,
-/// a cleanup, props compared) poisons the root, as an uncaught render
-/// error unmounts a React root: its whole tree is torn down at once, every
-/// cleanup run, and the panic goes on to the caller, once. The next
-/// resolve mounts the tree again from the root's render, fresh: nothing a
-/// frame left half done is ever reused (ADR-0013).
+/// In a turn, a panic of user code as it resolves is held by the one
+/// instance it failed at ([`contain`]): a render keeps its last output,
+/// props compared keep the props, a setup's half-made instance is torn
+/// down alone (ADR-0015, the turn rule: a failing component does not
+/// blank the window). Outside a turn (and for the engine's own panics) it
+/// poisons the root: its whole tree is torn down at once, every cleanup
+/// run, and the panic goes on to the caller, once; the next resolve mounts
+/// the tree again from the root's render, fresh. Either way nothing a
+/// frame left half done is reused (ADR-0013): a render and a comparison
+/// are pure, and what a setup half made is gone.
+///
+/// A handle: an id and its render, both fixed as it is made. What changes
+/// (the root instance, whether it is poisoned or ended) is the registry's
+/// ([`ROOTS`], ADR-0034, S1; review r17, decision 1), so what a check does
+/// to a root it reaches is the check's, by construction.
 pub struct Root {
-    id: Cell<Id>,
+    life: Rc<Life>,
     render: Render,
-    poisoned: Cell<bool>,
+}
+
+crate::engine::fork_data_struct! {
+    /// What a root is now, by its id ([`Root`]).
+    #[derive(Clone, Copy)]
+    struct RootState {
+        /// The tree's root instance (a poisoned root mounts a new one).
+        id: Id,
+        /// Unmounted, for good: a resolve after gives nothing.
+        ended: bool,
+        /// A panic tore the tree down since the last resolve.
+        poisoned: bool,
+        /// The turn a panic tore the tree down in: down until it is done.
+        down: crate::engine::ThisTurn,
+    }
+}
+
+crate::engine::engine_local! {
+    /// Every root's state, by its id: a check's writes are its own.
+    [Fork(log)] static ROOTS: RefCell<crate::engine::ForkSlab<RootState>> = RefCell::default();
 }
 
 impl Root {
-    /// A root instance rendering `render` (owned by nothing).
+    /// A root instance rendering `render`, owned by what runs now: the
+    /// scope running, else the window whose code runs. Its tree unmounts
+    /// as the first of that owner and its last handle ends ([`Life`],
+    /// ADR-0034 S4), so a handle something else pins (a value a runaway
+    /// check set aside) never keeps it mounted past its owner. One a check
+    /// makes is the check's own.
+    ///
+    /// # Panics
+    /// In a debug build, with neither a scope running nor a window's code
+    /// (a test's top level): make it in a [`Scope`], whose `dispose` ends
+    /// it, or in a window.
+    #[track_caller]
     pub fn new(render: impl Fn() -> Element + 'static) -> Self {
-        let render: Render = Rc::new(render);
+        let root = Self::made(Rc::new(render));
+        let as_owned: Rc<dyn crate::focus::WindowOwned> = Rc::<Life>::clone(&root.life);
+        crate::engine::own("gui::Root::new", &as_owned);
+        drop(as_owned);
+        root
+    }
+
+    /// A pipeline's root: its pipeline is its owner, and unmounts it as
+    /// its window closes ([`Self::close`]).
+    pub(crate) fn of_pipeline(render: impl Fn() -> Element + 'static) -> Self {
+        Self::made(Rc::new(render))
+    }
+
+    fn made(render: Render) -> Self {
         let id = create(None, Scope::detached(), Box::new(()), Rc::clone(&render), "app");
+        let key = crate::engine::allocate(
+            &ROOTS,
+            RootState {
+                id,
+                ended: false,
+                poisoned: false,
+                down: crate::engine::ThisTurn::default(),
+            },
+        );
         Self {
-            id: Cell::new(id),
+            life: Rc::new(Life { key }),
             render,
-            poisoned: Cell::new(false),
         }
     }
 
@@ -1347,28 +1597,85 @@ impl Root {
     /// mounts it again.
     #[must_use]
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.get()
+        self.life.state().is_some_and(|s| s.poisoned)
+    }
+
+    /// The tree's root instance now (a stale id, naming nothing, once the
+    /// root's state is gone).
+    fn id(&self) -> Id {
+        self.life.state().map_or(
+            Id {
+                slot: usize::MAX,
+                generation: 0,
+            },
+            |s| s.id,
+        )
     }
 
     /// Expand the tree: render what is dirty, reuse what is not. The root's
-    /// output with every placeholder replaced. A panic out of user code
-    /// poisons the root ([`Root`]) and goes on.
+    /// output with every placeholder replaced.
+    ///
+    /// In a turn, a panic of user code is held by the instance it failed
+    /// at ([`contain`], ADR-0015, the turn rule): the rest of the tree
+    /// resolves as it would, and nothing unwinds here. What does (outside
+    /// a turn, any panic; in one, the engine's own) poisons the root
+    /// ([`Root`]). In a turn, its panic goes to the arbiter and the tree
+    /// stays down, its output empty, for the rest of that turn, mounted
+    /// again at the first resolve of a later one: never in the turn that
+    /// failed, which would run the same code over the same state again.
+    /// Outside a turn, the panic goes on to the caller, once, and the next
+    /// resolve mounts the tree again.
     pub fn resolve(&self) -> Element {
-        if self.poisoned.replace(false) {
-            let id = create(None, Scope::detached(), Box::new(()), Rc::clone(&self.render), "app");
-            self.id.set(id);
-        }
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.resolve_live())) {
+        match crate::engine::attempt(|| self.resolve_fresh()) {
             Ok(out) => out,
-            Err(p) => {
-                self.poison();
-                std::panic::resume_unwind(p)
+            Err(failed) => {
+                self.failed(failed);
+                Element::Empty
             }
         }
     }
 
+    /// Resolve, the tree mounted again first if a panic tore it down in
+    /// an earlier turn (or outside any); empty while the turn it failed in
+    /// runs.
+    fn resolve_fresh(&self) -> Element {
+        let Some(state) = self.life.state() else {
+            return Element::Empty;
+        };
+        // Its owner ended it: nothing is mounted again.
+        if state.ended {
+            return Element::Empty;
+        }
+        if state.poisoned {
+            if state.down.is_now() {
+                return Element::Empty;
+            }
+            let id = create(None, Scope::detached(), Box::new(()), Rc::clone(&self.render), "app");
+            self.life.write(|s| {
+                s.poisoned = false;
+                s.id = id;
+            });
+        }
+        self.resolve_live()
+    }
+
+    /// A resolve, or the layout of what it built, panicked: the root
+    /// poisoned, the panic to the arbiter first, as it came before any of
+    /// its teardown's (inside a turn; outside one, it goes on once the tree
+    /// is down).
+    pub(crate) fn failed(&self, failed: crate::engine::Failed) {
+        if crate::engine::dispatching() {
+            failed.report();
+            self.poison();
+        } else {
+            self.poison();
+            failed.report();
+        }
+    }
+
     /// Tear the whole tree down in one pass, every teardown run though one
-    /// panics (those panics dropped: the one that poisoned it goes on).
+    /// panics (those panics later than the one that poisoned it: to the
+    /// arbiter after it, inside a turn; dropped outside one).
     fn poison(&self) {
         DEADLINE.set(None);
         STRANDED.set(false);
@@ -1376,11 +1683,11 @@ impl Root {
         // rest: nothing of the tree outlives it.
         let left = LEAVING.with(|l| l.borrow_mut().as_mut().map(std::mem::take));
         let outer = LEAVING.with(|l| l.borrow_mut().take());
-        let id = self.id.get();
-        drop(std::panic::catch_unwind(|| unmount(id)));
-        drop(std::panic::catch_unwind(|| {
+        let id = self.id();
+        crate::engine::contained(|| unmount(id));
+        crate::engine::contained(|| {
             each_to_completion(left.unwrap_or_default(), Scope::dispose);
-        }));
+        });
         LEAVING.with(|l| *l.borrow_mut() = outer);
         // The hooks queued for the instances torn down are cancelled.
         let queued = POST.with(|p| std::mem::take(&mut *p.borrow_mut()));
@@ -1393,11 +1700,14 @@ impl Root {
             let since = std::mem::replace(&mut *p, live);
             p.extend(since);
         });
-        self.poisoned.set(true);
+        self.life.write(|s| {
+            s.poisoned = true;
+            s.down = crate::engine::ThisTurn::now();
+        });
     }
 
     fn resolve_live(&self) -> Element {
-        let root = self.id.get();
+        let root = self.id();
         // What the last resolve left for later is due again.
         let deferred = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
         with_tree(|t| {
@@ -1428,31 +1738,79 @@ impl Root {
         (out, Leaving(left))
     }
 
-    /// Start a cold frame of this tree ([`ColdFrame`]), the debug check
-    /// that incremental equals cold.
+    /// Run `f` in a cold frame of this tree ([`ColdFrame`]), the debug
+    /// check that incremental equals cold: its result if it stands, `None`
+    /// if the fork was doomed. The frame is scoped by the closure (ADR-0028,
+    /// F1 review 11): `f` gets it by reference, so no use of engine state
+    /// it made can outlast the fork, which ends as `f` returns or unwinds.
+    /// The frame cannot leave the closure (its lifetime is the closure's),
+    /// so no fork ends inside a use of a piece it made. Engine-private
+    /// (ADR-0034, S10): the pipeline's check of a frame is the production
+    /// operation.
+    ///
+    /// `None` too when the thread's checks are off: an earlier one faulted
+    /// (ADR-0034, S2).
+    ///
+    /// # Panics
+    /// `f` panicked: its panic goes on, as a string, once the fork has
+    /// ended. Or disposing of what the fork made faulted (ADR-0034, S2).
+    /// The tests' form of [`Self::check`].
+    #[cfg(all(test, debug_assertions))]
+    #[expect(
+        clippy::panic,
+        reason = "a faulted check fails the debug build's check, as a mismatch does"
+    )]
+    pub(crate) fn cold<R>(&self, f: impl FnOnce(&ColdFrame) -> R) -> Option<R> {
+        match self.check(f) {
+            Ok(out) => Some(out),
+            Err(crate::engine::CheckReport::Mismatch(crate::engine::Mismatch::Panicked(said))) => {
+                std::panic::resume_unwind(Box::new(said))
+            }
+            Err(crate::engine::CheckReport::Faulted(fault)) => panic!("{fault}"),
+            Err(_) => None,
+        }
+    }
+
+    /// Run `f` in a cold frame of this tree, as [`Self::cold`], its end
+    /// said in the closed report (ADR-0034, S10): its result if it stands,
+    /// else why not. Never panics for what the check did.
     #[cfg(debug_assertions)]
-    pub fn cold(&self) -> ColdFrame {
-        ColdFrame::begin(self.id.get())
+    pub(crate) fn check<R>(&self, f: impl FnOnce(&ColdFrame) -> R) -> Result<R, crate::engine::CheckReport> {
+        use crate::engine::{CheckReport, Ended, Mismatch};
+        // What an instance holds over a panic of its user code, the cold
+        // frame reuses as the live tree holds it ([`Holds`]): a hold never
+        // switches the check off, and checks the rest of the tree.
+        let root = self.id();
+        match crate::engine::fork(|| f(&ColdFrame::begin(root))) {
+            Ended::Kept(out) => Ok(out),
+            Ended::Dropped(site) => Err(CheckReport::Skipped(format!(
+                "the check reached `{site}`, which cannot answer inside one"
+            ))),
+            Ended::Cancelled => Err(CheckReport::Cancelled),
+            Ended::Poisoned => Err(CheckReport::Skipped(String::from(
+                "checks are off on this thread: an earlier one faulted",
+            ))),
+            Ended::Panicked(said) => Err(CheckReport::Mismatch(Mismatch::Panicked(said))),
+            Ended::Faulted(fault) => Err(CheckReport::Faulted(fault.to_string())),
+        }
     }
 }
 
-/// A frame built cold, from [`Root::cold`] until it drops: one transaction
-/// over every piece of per-thread engine state
-/// ([`crate::engine::ColdFrame`]), the root's instances all due to render.
-/// Whatever it does (renders, props passed, instances mounted or
-/// unmounted, hooks and cleanups registered, its layout, bindings and
-/// paint) is undone when it drops, on return or unwind, running nothing.
+/// A frame built cold, inside [`Root::cold`]: one transaction over every
+/// piece of per-thread engine state ([`crate::engine::fork`]), the root's
+/// instances all due to render. Whatever it does (renders, props passed,
+/// instances mounted or unmounted, hooks and cleanups registered, its
+/// layout, bindings and paint) is undone as the closure ends, on return or
+/// unwind. Engine-private (ADR-0034, S10): no caller outside `gui` holds
+/// one, so none can keep one past its check.
 #[cfg(debug_assertions)]
-#[must_use]
-pub struct ColdFrame {
+pub(crate) struct ColdFrame {
     root: Id,
-    engine: crate::engine::ColdFrame,
 }
 
 #[cfg(debug_assertions)]
 impl ColdFrame {
     fn begin(root: Id) -> Self {
-        let engine = crate::engine::ColdFrame::begin();
         // Every instance under the root renders, as a tree built from
         // nothing does; another root's are not touched.
         with_tree(|t| {
@@ -1464,7 +1822,7 @@ impl ColdFrame {
                 t.mark(id, generation, Why::Props, Priority::Input);
             }
         });
-        Self { root, engine }
+        Self { root }
     }
 
     /// The root's output, the tree resolved cold.
@@ -1477,22 +1835,124 @@ impl ColdFrame {
     /// getter or a binding is pure).
     #[must_use]
     pub fn wrote(&self) -> Vec<String> {
-        let _ = &self.engine;
         crate::reactive::cold_wrote()
     }
 }
 
+impl Root {
+    /// Unmount the tree now, as its window closes inside its own turn
+    /// (`Pipeline::close`): every instance's cleanups and unmount hooks
+    /// run there, in that window. Its drop then finds nothing to unmount.
+    /// In a check, in the check's world: its state and tree are the
+    /// check's copies (review r17, decision 3).
+    pub(crate) fn close(&self) {
+        self.life.end();
+    }
+
+    /// [`Self::close`], for later: what its pipeline's drop queues to run
+    /// live, as the window's close turn runs (review r18, decision 4).
+    pub(crate) fn closer(&self) -> impl FnOnce() + 'static {
+        let life = Rc::clone(&self.life);
+        move || life.end()
+    }
+}
+
+/// What a root owes the live world: its tree's unmount, once, by the first
+/// of its owners to end (ADR-0034, S4): the scope or window it was made
+/// in ([`Root::new`]), its pipeline ([`Root::of_pipeline`]), or its last
+/// handle's drop. Never only the last: a handle a runaway check set aside
+/// pins the count, not the unmount (review r16, Codex 2). It holds only the
+/// root's id: whether it ended is the registry's ([`ROOTS`]).
+struct Life {
+    key: crate::engine::SlabId,
+}
+
+impl Life {
+    /// The root's state as the running world sees it (`None`: gone).
+    fn state(&self) -> Option<RootState> {
+        ROOTS.with_borrow(|s| s.read(self.key, |s| *s))
+    }
+
+    /// Change the root's state, in the running world.
+    fn write(&self, f: impl FnOnce(&mut RootState)) {
+        ROOTS.with_borrow(|s| s.write(self.key, f));
+    }
+
+    /// Unmount the tree, once, in the running world: an explicit end (its
+    /// scope's dispose, its window's close, `Root::close`) a check makes
+    /// ends the check's copy of the root, and unmounts the check's tree
+    /// (review r17, decision 3).
+    fn end(&self) {
+        end_root(self.key);
+    }
+}
+
+/// Unmount root `key`'s tree, once, in the running world.
+fn end_root(key: crate::engine::SlabId) {
+    // The thread's engine torn down (a root an app's thread-local held):
+    // nothing is left to unmount.
+    let id = ROOTS
+        .try_with(|s| {
+            s.borrow().write(key, |s| {
+                if s.ended {
+                    None
+                } else {
+                    s.ended = true;
+                    Some(s.id)
+                }
+            })
+        })
+        .ok()
+        .flatten()
+        .flatten();
+    let Some(id) = id else { return };
+    if std::thread::panicking() {
+        // Ended as a panic unwinds: torn down all the same, a panic of
+        // its teardown dropped, never raised over the one going on.
+        if let Err(later) = crate::engine::attempt(|| unmount(id)) {
+            later.dismiss();
+        }
+    } else {
+        unmount(id);
+    }
+}
+
+impl crate::focus::WindowOwned for Life {
+    /// Its window closed: in a check, the check's copy of the window
+    /// (review r17, decision 3).
+    fn end_with_window(&self) {
+        self.end();
+    }
+}
+
 impl Drop for Root {
+    /// Its last handle: the tree unmounted, then its state let go. A live
+    /// root a check lets go is ended once the check has switched back
+    /// ([`crate::engine::dropped`]), never in the check's world, however
+    /// the check lets it go, by a normal drop or as its body unwinds
+    /// (Codex r15-4).
     fn drop(&mut self) {
-        let id = self.id.get();
+        let key = self.life.key;
+        let end = move || {
+            end_root(key);
+            let _gone = ROOTS.try_with(|s| s.borrow_mut().remove(key));
+        };
+        let live = crate::engine::LiveDrop::in_drop();
         if std::thread::panicking() {
-            // Dropped as a panic unwinds: torn down all the same, a panic
-            // of its teardown dropped, never raised over the one going on.
-            drop(std::panic::catch_unwind(|| unmount(id)));
+            if let Err(later) = crate::engine::attempt(|| crate::engine::dropped(live, key.made_in_fork(), end)) {
+                later.dismiss();
+            }
         } else {
-            unmount(id);
+            crate::engine::dropped(live, key.made_in_fork(), end);
         }
     }
+}
+
+/// The hooks due after layout as the live registry holds them: what V2
+/// compares between two engines (review r18, decision 6).
+#[cfg(test)]
+pub(crate) fn post_summary() -> usize {
+    POST.with(|p| p.borrow().len())
 }
 
 /// Make an instance (its setup runs in [`mount_child`]).
@@ -1529,6 +1989,7 @@ fn create(parent: Option<Id>, scope: Scope, props: Box<dyn Any>, render: Render,
             updated: Vec::new(),
             renders: 0,
             met: std::rc::Weak::new(),
+            holds: Holds::default(),
         })
     });
     let generation = id.generation;
@@ -1593,12 +2054,10 @@ fn unmount(id: Id) {
         return;
     };
     // Each child, then each scope, though one's hooks panic: the first
-    // panic goes on once all are down.
-    let mut first = None;
+    // panic goes on once all are down (inside a turn, to its arbiter).
+    let mut all = crate::engine::Gather::new();
     for child in inst.children.values() {
-        if let Err(p) = std::panic::catch_unwind(|| unmount(*child)) {
-            first.get_or_insert(p);
-        }
+        all.run(|| unmount(*child));
     }
     let mut scopes = inst.render_scopes;
     scopes.push(inst.scope);
@@ -1611,13 +2070,11 @@ fn unmount(id: Id) {
         }
         None => false,
     });
-    if !kept && let Err(p) = std::panic::catch_unwind(|| each_to_completion(scopes, Scope::dispose)) {
-        first.get_or_insert(p);
+    if !kept {
+        all.run(|| each_to_completion(scopes, Scope::dispose));
     }
     count(|s| s.unmounts = s.unmounts.saturating_add(1));
-    if let Some(p) = first {
-        std::panic::resume_unwind(p);
-    }
+    all.finish();
 }
 
 /// The instances a resolve unmounted, their scopes not yet disposed
@@ -1636,7 +2093,7 @@ impl Leaving {
     /// Whether `owner` (as [`handler_owner`] gives it) is what a leaving
     /// instance owns its handlers by.
     pub(crate) fn holds(&self, owner: crate::reactive::OwnerId) -> bool {
-        self.0.iter().any(|s| s.id() == owner)
+        self.0.iter().any(|s| s.id().owner_id() == owner)
     }
 }
 
@@ -1646,9 +2103,10 @@ impl Drop for Leaving {
         // panic unwinds, a cleanup's panic is dropped: raised over the one
         // going on, it would abort the process.
         if std::thread::panicking() {
-            drop(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                each_to_completion(self.0.drain(..), Scope::dispose);
-            })));
+            let scopes = &mut self.0;
+            if let Err(later) = crate::engine::attempt(|| each_to_completion(scopes.drain(..), Scope::dispose)) {
+                later.dismiss();
+            }
         } else {
             each_to_completion(self.0.drain(..), Scope::dispose);
         }
@@ -1658,15 +2116,11 @@ impl Drop for Leaving {
 /// Run `f` on every item, though one panics: the first panic goes on once
 /// all have run (a teardown a panic skipped would never run).
 pub(crate) fn each_to_completion<T>(items: impl IntoIterator<Item = T>, mut f: impl FnMut(T)) {
-    let mut first = None;
+    let mut all = crate::engine::Gather::new();
     for item in items {
-        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(item))) {
-            first.get_or_insert(p);
-        }
+        all.run(|| f(item));
     }
-    if let Some(p) = first {
-        std::panic::resume_unwind(p);
-    }
+    all.finish();
 }
 
 /// Puts back the disposal a resolve left to its caller, should it unwind.
@@ -1718,6 +2172,8 @@ fn resolve(id: Id) -> Element {
     // A component that is the root of this output is placed by this
     // instance's key, its own nested in it.
     let chain = with_tree(|t| t.get(id).map(|i| Chain::Root(i.key, i.at))).unwrap_or(Chain::Child(0));
+    // Expanded again: a slot a setup's panic left empty mounts anew.
+    cleared_setups(id);
     let out = expand(id, &raw, 0, chain, &before, &mut seen).unwrap_or_else(|| raw.clone());
     each_to_completion(
         before.iter().filter(|(slot, child)| seen.get(*slot) != Some(*child)),
@@ -1821,13 +2277,44 @@ fn expand(
                     let props = fresh
                         .then(|| with_tree(|t| t.get(child).map(|i| Rc::clone(&i.props))))
                         .flatten();
-                    if let Some(props) = props {
-                        c.mount.update(&*props);
+                    // Their comparison is user code: one that panics in a
+                    // turn leaves the child its props and its output
+                    // ([`contain`]); the next props passed reach it.
+                    // A cold frame keeps the props the live child holds.
+                    if let Some(props) = props
+                        && !opaque(child, Fault::Props)
+                    {
+                        let passed = crate::engine::attempt(|| c.mount.update(&*props));
+                        match passed {
+                            Ok(()) => cleared(child, Fault::Props),
+                            Err(failed) => contain(failed, child, Fault::Props),
+                        }
                     }
                     child
                 }
                 None => {
-                    let child = mount_child(parent, slot, &*c.mount, c.name);
+                    // A setup that panics in a turn leaves nothing of the
+                    // instance it was making: torn down, its slot empty
+                    // until its parent's output is expanded again. A cold
+                    // frame leaves empty the slot the live one holds empty.
+                    if opaque(parent, Fault::Setup(slot)) {
+                        return Some(Element::Empty);
+                    }
+                    let made = crate::engine::attempt(|| mount_child(parent, slot, &*c.mount, c.name));
+                    let child = match made {
+                        Ok(child) => child,
+                        Err(failed) => {
+                            // Outside a turn, on to the caller first: the
+                            // root's teardown reaches the half-made one
+                            // through its parent.
+                            contain(failed, parent, Fault::Setup(slot));
+                            let half = with_tree(|t| t.get_mut(parent).and_then(|p| p.children.remove(&slot)));
+                            if let Some(half) = half {
+                                unmount(half);
+                            }
+                            return Some(Element::Empty);
+                        }
+                    };
                     with_tree(|t| {
                         if let Some(i) = t.get_mut(child) {
                             i.met = Rc::downgrade(c);
@@ -1849,7 +2336,7 @@ fn expand(
                     // again (a root component of its takes the new chain),
                     // with no render.
                     if let Some(raw) = i.raw.take() {
-                        i.raw = Some(mark_root(&mut i.marked, raw, key, i.scope.id()));
+                        i.raw = Some(mark_root(&mut i.marked, raw, key, i.scope.id().owner_id()));
                         i.below = true;
                     }
                 }
@@ -1991,9 +2478,17 @@ fn child_step(el: &Element, index: usize) -> u64 {
 
 /// Run instance `id`'s render, tracked, inside a fresh render scope.
 fn render(id: Id) {
+    // A cancellation point per instance a check renders (ADR-0028).
+    crate::engine::cancel_point();
+    // A cold frame reuses the output the live instance holds over its
+    // render's panic, never running it again ([`Holds`]).
+    let held = opaque(id, Fault::Render);
     let Some((f, node, scope, rendered)) = with_tree(|t| {
         let i = t.get_mut(id)?;
         i.dirty = false;
+        if held {
+            return None;
+        }
         let rendered = Rendered {
             name: i.name,
             why: i.why,
@@ -2007,13 +2502,27 @@ fn render(id: Id) {
     let pop = PopCurrent;
     let name = rendered.as_ref().map_or("component", |r| r.name);
     // Running already (a render that resolves itself), it gives nothing.
-    let raw = rs.run(|| crate::reactive::rendering(name, || node.track(|| f())));
+    let ran = crate::engine::attempt(|| rs.run(|| crate::reactive::rendering(name, || node.track(|| f()))));
     drop(pop);
+    let raw = match ran {
+        Ok(raw) => raw,
+        Err(failed) => {
+            // A render is pure: one that panicked changed nothing of the
+            // instance but what it made in its own scope, disposed now.
+            // In a turn the instance keeps its last output (none before
+            // its first render) and renders again when what it read
+            // before the panic changes ([`contain`]).
+            contain(failed, id, Fault::Render);
+            rs.dispose();
+            return;
+        }
+    };
+    cleared(id, Fault::Render);
     let (old, first, updated, scope) = with_tree(|t| {
         let Some(i) = t.get_mut(id) else {
             return (Vec::new(), true, Vec::new(), None);
         };
-        let (key, owner) = (i.key, i.scope.id());
+        let (key, owner) = (i.key, i.scope.id().owner_id());
         i.raw = Some(mark_root(&mut i.marked, raw, key, owner));
         i.renders = i.renders.saturating_add(1);
         i.render_scopes.push(rs);
@@ -2023,7 +2532,13 @@ fn render(id: Id) {
         let updated = if first { Vec::new() } else { i.updated.clone() };
         if first {
             let mounted = std::mem::take(&mut i.mounted);
-            POST.with(|p| p.borrow_mut().extend(mounted.into_iter().map(|f| (owner, f))));
+            POST.with(|p| {
+                p.borrow_mut().extend(
+                    mounted
+                        .into_iter()
+                        .map(|f| (owner, crate::engine::Stored::new(crate::engine::Site::AfterLayout, f))),
+                );
+            });
         }
         (old, first, updated, Some(owner))
     });
@@ -2032,11 +2547,12 @@ fn render(id: Id) {
         && !first
     {
         POST.with(|p| {
-            p.borrow_mut().extend(
-                updated
-                    .into_iter()
-                    .map(|f| -> PostHook { (owner, Box::new(move || f())) }),
-            );
+            p.borrow_mut().extend(updated.into_iter().map(|f| -> PostHook {
+                (
+                    owner,
+                    crate::engine::Stored::new(crate::engine::Site::AfterLayout, Box::new(move || f())),
+                )
+            }));
         });
     }
     count(|s| s.renders = s.renders.saturating_add(1));
@@ -2052,26 +2568,53 @@ pub fn take_rendered() -> Vec<Rendered> {
 }
 
 /// Run the hooks due after the frame was laid out; whether there were any.
+/// In a fork, none runs: a hook is a caller's closure, writing what it
+/// captured, which no rollback puts back (ADR-0028, rule 5). The fork's
+/// own hooks go with it (`POST` is Fresh).
 pub fn run_post() -> bool {
+    if crate::engine::forking() {
+        return false;
+    }
     let hooks = POST.with(|p| std::mem::take(&mut *p.borrow_mut()));
     let any = !hooks.is_empty();
     // Every one runs, though one panics: the first panic goes on once all
-    // have (taken out, a hook a panic skipped would never run).
-    let mut first = None;
+    // have (taken out, a hook a panic skipped would never run); inside a
+    // turn, to its arbiter as it is caught (`engine::Gather`).
+    let mut all = crate::engine::Gather::new();
     for (owner, f) in hooks {
         // Its owner was disposed since it was queued (its instance
         // unmounted): cancelled.
         if !crate::reactive::is_live(owner) {
             continue;
         }
-        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
-            first.get_or_insert(p);
-        }
+        // In the window it was queued in, whichever window's layout runs
+        // the hooks (ADR-0015); never once that window closed.
+        all.run(|| f.call_once(|f| f()));
     }
-    if let Some(p) = first {
-        std::panic::resume_unwind(p);
-    }
+    all.finish();
     any
+}
+
+/// `window` closes: the hooks queued in it are cancelled (ADR-0015, the
+/// close order), dropped once out of the queue, each under a catch, in its
+/// close turn. How many were.
+pub(crate) fn cancel_hooks(window: &crate::focus::FocusRoot) -> usize {
+    let gone: Vec<PostHook> = POST
+        .try_with(|p| {
+            p.try_borrow_mut()
+                .map(|mut p| {
+                    let (gone, kept) = std::mem::take(&mut *p).into_iter().partition(|(_, f)| f.is_of(window));
+                    *p = kept;
+                    gone
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let n = gone.len();
+    for hook in gone {
+        crate::engine::contained(move || drop(hook));
+    }
+    n
 }
 
 fn current() -> Option<Id> {
@@ -2084,7 +2627,7 @@ fn current() -> Option<Id> {
 /// replaces); else what owns what is made now.
 pub(crate) fn handler_owner() -> Option<crate::reactive::OwnerId> {
     current()
-        .and_then(|id| with_tree(|t| t.get(id).map(|i| i.scope.id())))
+        .and_then(|id| with_tree(|t| t.get(id).map(|i| i.scope.id().owner_id())))
         .or_else(crate::reactive::owner)
 }
 
@@ -2127,7 +2670,9 @@ impl Owner {
     /// [`after_layout`], for this owner: `f` never runs if it is disposed
     /// before the layout.
     pub fn after_layout(self, f: impl FnOnce() + 'static) {
-        POST.with(|p| p.borrow_mut().push((self.0, Box::new(f))));
+        let f: Box<dyn FnOnce()> = Box::new(f);
+        let f = crate::engine::Stored::new(crate::engine::Site::AfterLayout, f);
+        POST.with(|p| p.borrow_mut().push((self.0, f)));
     }
 }
 
@@ -2168,7 +2713,10 @@ pub fn provide<T: 'static>(value: T) {
     crate::engine::no_component_context();
     let value: Rc<dyn Any> = Rc::new(value);
     let Some(id) = current() else {
-        GLOBAL.with(|g| g.borrow_mut().insert(TypeId::of::<T>(), value));
+        GLOBAL.with(|g| {
+            g.borrow_mut()
+                .insert(TypeId::of::<T>(), crate::engine::AppHandle::new(value));
+        });
         return;
     };
     with_tree(|t| {
@@ -2179,7 +2727,9 @@ pub fn provide<T: 'static>(value: T) {
 }
 
 crate::engine::engine_local! {
-    [Fork(log)] static GLOBAL: RefCell<crate::engine::ForkMap<TypeId, Rc<dyn Any>>> = RefCell::default();
+    /// What [`provide`] gave outside any instance: app objects by handle
+    /// (ADR-0034 S7, "What a check isolates").
+    [Fork(log)] static GLOBAL: RefCell<crate::engine::ForkMap<TypeId, crate::engine::AppHandle<dyn Any>>> = RefCell::default();
 }
 
 /// The nearest value provided for `T` above this instance (or globally).
@@ -2189,7 +2739,7 @@ pub fn use_context<T: Clone + 'static>() -> Option<T> {
     crate::engine::no_component_context();
     let key = TypeId::of::<T>();
     let local = current().and_then(|id| with_tree(|t| t.get(id).and_then(|i| i.context.get(&key).cloned())));
-    let any = local.or_else(|| GLOBAL.with(|g| g.borrow().get(&key).cloned()))?;
+    let any = local.or_else(|| GLOBAL.with(|g| g.borrow().get(&key).map(crate::engine::AppHandle::rc)))?;
     any.downcast_ref::<T>().cloned()
 }
 

@@ -38,6 +38,35 @@ fn changed<T: PartialEq + 'static>(value: &dyn std::any::Any) -> bool {
 /// A `Signal` is a `Copy` handle. Its value lives as long as the scope that
 /// was running when it was made (or forever, made outside any). Using it
 /// after that scope ended is an error that names where it was made.
+///
+/// It names a node of this thread's arena, so it is neither `Send` nor
+/// `Sync`, nor is any reactive handle: on another thread its id would name
+/// that thread's node.
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<gui::Signal<u32>>();
+/// ```
+///
+/// ```compile_fail
+/// fn sync<T: Sync>() {}
+/// sync::<gui::Signal<u32>>();
+/// ```
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<gui::Scope>();
+/// ```
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<gui::Computed<u32>>();
+/// ```
+///
+/// ```compile_fail
+/// fn send<T: Send>() {}
+/// send::<gui::Effect>();
+/// ```
 pub struct Signal<T> {
     id: NodeId,
     created_at: &'static Location<'static>,
@@ -107,14 +136,17 @@ impl<T: 'static> Signal<T> {
             before: None,
             forced: false,
         }));
-        let id = runtime::with(|rt| {
-            let id = rt.alloc(Kind::Signal, flag::MUTABLE, created_at);
-            if let Some(n) = rt.live_mut(id) {
-                n.value = Some(cell);
-                n.label = label;
-            }
-            rt.adopt(id);
-            id
+        // Making a handle: the arena's own bookkeeping ([`crate::engine::allocating`]).
+        let id = crate::engine::allocating(|| {
+            runtime::with(|rt| {
+                let id = rt.alloc(Kind::Signal, flag::MUTABLE, created_at);
+                if let Some(n) = rt.live_mut(id) {
+                    n.value = Some(cell);
+                    n.label = label;
+                }
+                rt.adopt(id);
+                id
+            })
         });
         Self {
             id,
@@ -153,7 +185,9 @@ impl<T: 'static> Signal<T> {
         self.created_at
     }
 
-    /// The slot, and whether the signal was written since it was last checked.
+    /// The slot, and whether the signal was written since it was last
+    /// checked. A Shared init reads none: [`runtime::with`] refuses it
+    /// (ADR-0028, R4).
     fn slot(&self) -> (Rc<RefCell<Slot<T>>>, bool) {
         let found = runtime::with(|rt| {
             let value = rt.live(self.id)?.value.clone()?;
@@ -320,16 +354,27 @@ impl<T: 'static> Signal<T> {
         self.notify();
     }
 
-    /// Take the signal out of the graph now, before its scope ends.
+    /// Whether a fork made it ([`crate::engine::dropped`]).
+    pub(crate) fn made_in_fork(self) -> bool {
+        self.id.made_in_fork()
+    }
+
+    /// Its node's id (tests: the id streams of ADR-0034, S6).
+    #[cfg(test)]
+    pub(crate) fn node_id(self) -> NodeId {
+        self.id
+    }
+
     /// Dispose it if the runtime can be reached now (from a `Drop`, which
-    /// may run while the thread ends).
-    /// While the thread unwinds, what leaving runs waits for the next settle.
+    /// may run while the thread ends). While the thread unwinds, what
+    /// leaving runs waits for the next settle.
     pub(crate) fn dispose_quietly(self) {
         if runtime::try_with(|rt| rt.dispose(self.id)).is_some() && !std::thread::panicking() {
             runtime::settle();
         }
     }
 
+    /// Take the signal out of the graph now, before its scope ends.
     pub fn dispose(self) {
         runtime::with(|rt| rt.dispose(self.id));
         runtime::settle();

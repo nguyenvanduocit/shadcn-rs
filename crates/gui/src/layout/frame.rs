@@ -95,6 +95,7 @@ pub enum Content {
 /// Scroll state of a scroll container.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Scroll {
+    /// The offset as laid out and drawn: [`Self::pos`] in pixels.
     pub offset: (f32, f32),
     /// What the offset moves its children by, in whole device pixels
     /// (ADR-0020): their paint space is the container's, this applied as a
@@ -102,10 +103,16 @@ pub struct Scroll {
     pub applied: (f32, f32),
     /// The largest offset on each axis.
     pub max: (f32, f32),
+    /// The offset exactly ([`crate::compositor::motion`]): what motion
+    /// moves it from, on the UI's side and the compositor's.
+    pub(crate) pos: crate::compositor::motion::Exact,
+    /// The largest offset exactly: [`Self::max`] on the grid.
+    pub(crate) end: crate::compositor::motion::Exact,
     /// Colour of the scrollbar thumb: the container's text colour, faded.
     pub thumb: Color,
-    /// How many times the offset was set other than by the compositor's
-    /// scroll: what it scrolled before is then dropped (ADR-0015).
+    /// How many times the UI jumped the offset ([`crate::scroll::Move`]):
+    /// another in a commit stops what the compositor moves by itself there
+    /// (a fling), never the reader's input (ADR-0032, I4).
     pub generation: u64,
 }
 
@@ -129,31 +136,32 @@ impl PartialEq for Moving {
     }
 }
 
-/// One laid-out node.
+/// One laid-out node. Its geometry (its boxes, offset, clip and scroll)
+/// is layout's to write and read only through a [`Sight`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct FrameNode {
     pub path: NodePath,
     pub name: Option<&'static str>,
     /// The border box in window pixels: `space` moved by `offset`.
-    pub bounds: Bounds,
+    pub(in crate::layout) bounds: Bounds,
     /// The box inside padding and border, where text is laid out.
-    pub content_box: Bounds,
+    pub(in crate::layout) content_box: Bounds,
     /// The border box in the node's paint space (ADR-0016): where its paint
     /// chunk records it, without the scroll offsets and moving translations
     /// above it, which are transforms of the property tree.
-    pub space: Bounds,
+    pub(in crate::layout) space: Bounds,
     /// The content box in the paint space.
-    pub space_content: Bounds,
+    pub(in crate::layout) space_content: Bounds,
     /// What takes the paint space to the window: `bounds` is `space` moved
     /// by it.
-    pub offset: (f32, f32),
+    pub(in crate::layout) offset: (f32, f32),
     /// Its translation is moving (a transition or animation): it is in
     /// `offset`, not in `space`.
     pub translating: bool,
     /// The compositor moves its opacity and transform (ADR-0015).
     pub moving: Option<Moving>,
     /// What this node may paint into, when an ancestor clips.
-    pub clip: Option<Bounds>,
+    pub(in crate::layout) clip: Option<Bounds>,
     /// The corner radii of that clip (the clipping ancestor's inner corners).
     pub clip_radius: Corners,
     /// Those corners' curve (the clipping ancestor's [`crate::Shape::curve`]).
@@ -166,7 +174,131 @@ pub struct FrameNode {
     pub parent: Option<usize>,
     pub look: Look,
     pub content: Content,
-    pub scroll: Option<Scroll>,
+    pub(in crate::layout) scroll: Option<Scroll>,
+}
+
+/// A reader allowed a laid-out node's geometry (ADR-0015, "One reader of
+/// what was shown"): its boxes, its offset, its clip and its scroll, and
+/// the frame's viewport are read only through accessors that take one.
+/// Each module that reads them holds its own, which only it can make
+/// (a field private to it): layout writes them, paint, the compositor,
+/// clip, effects, the overlay, accessibility and the devtools read them,
+/// and the input side reads them through `interact::shown` alone, so a
+/// dispatch that read the frame laid out where the frame shown was meant
+/// does not compile. Code outside the engine (tests, tools) holds
+/// [`crate::inspect::Outside`]; `tests/shown_reads.rs` checks the input
+/// side names none but its own.
+pub trait Sight: sight::Sealed + Copy {}
+
+mod sight {
+    /// The modules a [`super::Sight`] may be made in, named here alone.
+    pub trait Sealed {}
+}
+
+/// Seal each reader's token in.
+macro_rules! sights {
+    ($($t:ty),* $(,)?) => {
+        $(
+            impl sight::Sealed for $t {}
+            impl Sight for $t {}
+        )*
+    };
+}
+
+sights!(
+    crate::paint::Sight,
+    crate::access::Sight,
+    crate::clip::Sight,
+    crate::effects::Sight,
+    crate::overlay::Sight,
+    crate::devtools::Sight,
+    crate::inspect::Sight,
+    crate::inspect::Outside,
+    crate::interact::shown::Sight,
+);
+
+impl FrameNode {
+    /// The border box in window pixels ([`Sight`]).
+    #[must_use]
+    pub fn bounds(&self, _: impl Sight) -> Bounds {
+        self.bounds
+    }
+
+    /// The box inside padding and border ([`Sight`]).
+    #[must_use]
+    pub fn content_box(&self, _: impl Sight) -> Bounds {
+        self.content_box
+    }
+
+    /// The border box in the node's paint space ([`Sight`]).
+    #[must_use]
+    pub fn space(&self, _: impl Sight) -> Bounds {
+        self.space
+    }
+
+    /// The content box in the paint space ([`Sight`]).
+    #[must_use]
+    pub fn space_content(&self, _: impl Sight) -> Bounds {
+        self.space_content
+    }
+
+    /// What takes the paint space to the window ([`Sight`]).
+    #[must_use]
+    pub fn offset(&self, _: impl Sight) -> (f32, f32) {
+        self.offset
+    }
+
+    /// What it may paint into, when an ancestor clips ([`Sight`]).
+    #[must_use]
+    pub fn clip(&self, _: impl Sight) -> Option<Bounds> {
+        self.clip
+    }
+
+    /// Its scroll, as a scroll container ([`Sight`]).
+    #[must_use]
+    pub fn scroll(&self, _: impl Sight) -> Option<Scroll> {
+        self.scroll
+    }
+
+    /// A test's stale or forced clip.
+    #[cfg(test)]
+    pub(crate) fn set_clip(&mut self, clip: Option<Bounds>) {
+        self.clip = clip;
+    }
+
+    /// A test's content box moved by `dx` behind layout's back (in the
+    /// window and in its paint space).
+    #[cfg(test)]
+    pub(crate) fn move_content(&mut self, dx: f32) {
+        self.content_box.x += dx;
+        self.space_content.x += dx;
+    }
+
+    /// The node in its paint space with `look`, as its chunk records it:
+    /// at its space's place, unclipped and unscrolled (those are the
+    /// chunk's state), unmoved, with no content and no parent.
+    pub(crate) fn in_space(&self, look: Look) -> Self {
+        Self {
+            path: self.path.clone(),
+            name: self.name,
+            bounds: self.space,
+            content_box: self.space_content,
+            space: self.space,
+            space_content: self.space_content,
+            offset: (0.0, 0.0),
+            translating: false,
+            moving: None,
+            clip: None,
+            clip_radius: Corners::default(),
+            clip_curve: crate::shape::ROUND,
+            clipper: None,
+            layer: self.layer,
+            parent: None,
+            look,
+            content: Content::None,
+            scroll: None,
+        }
+    }
 }
 
 /// What a node does, kept beside [`FrameNode`] because closures cannot be compared.
@@ -208,11 +340,23 @@ pub struct Behaviour {
 pub(crate) struct SpanTarget {
     /// Which of its paragraph's spans it is.
     pub(crate) index: usize,
+    /// Its key ([`crate::element::Span::key`]), if it has one.
+    pub(crate) key: Option<crate::element::ElementKey>,
     pub(crate) range: std::ops::Range<usize>,
     pub(crate) click: Option<Handler<ClickEvent>>,
     pub(crate) cursor: Option<Cursor>,
     /// Where its text lies in the window, one box per line it takes.
     pub(crate) boxes: Vec<Bounds>,
+}
+
+impl SpanTarget {
+    /// What it is across builds: its key, or its place.
+    pub(crate) fn id(&self) -> crate::compositor::SpanId {
+        match self.key {
+            Some(k) => crate::compositor::SpanId::Keyed(k),
+            None => crate::compositor::SpanId::At(u32::try_from(self.index).unwrap_or(u32::MAX)),
+        }
+    }
 }
 
 impl Behaviour {
@@ -247,7 +391,12 @@ pub struct Frame {
     /// Shared with the layout tree, which keeps each node's.
     pub(crate) behaviour: Vec<Rc<Behaviour>>,
     pub layers: Vec<Layer>,
-    pub viewport: Bounds,
+    pub(in crate::layout) viewport: Bounds,
+    /// The device pixels to the logical one it was laid out at
+    /// ([`crate::layout::UiState::scale`]; zero when not known, logical pixels taken
+    /// for device ones): hit testing keeps a device pixel of a clip as
+    /// paint does.
+    pub scale: f32,
     /// What changed since each reader last looked.
     pub(crate) changes: Changes,
     /// The nodes from an index on as they were when the frame was last
@@ -322,8 +471,23 @@ impl Before {
 }
 
 impl Frame {
+    /// The window's box it was laid out in ([`Sight`]).
+    #[must_use]
+    pub fn viewport(&self, _: impl Sight) -> Bounds {
+        self.viewport
+    }
+
     pub(crate) fn behaviour(&self, i: usize) -> Option<&Behaviour> {
         self.behaviour.get(i).map(|b| &**b)
+    }
+
+    /// Whether node `i` takes the pointer, the one rule the compositor's
+    /// hit table and the tools that name what is hit both read: it lets
+    /// no pointer through (not `pass_through`, which inert and
+    /// `pass_through_all` imply) and is drawn (not `look.invisible`).
+    #[must_use]
+    pub(crate) fn takes_pointer(&self, i: usize) -> bool {
+        self.behaviour(i).is_some_and(|b| !b.pass_through) && self.nodes.get(i).is_some_and(|n| !n.look.invisible)
     }
 
     /// Whether node `i` is shown, the one rule for whether a node can act:

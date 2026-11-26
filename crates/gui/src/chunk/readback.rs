@@ -76,13 +76,14 @@ impl Readback {
 /// next frame.
 #[must_use]
 pub fn readback() -> Readback {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    /// The readbacks made, numbered.
+    static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("readback");
     let latest = Signal::new(None);
     let tx = crate::mailbox::mailbox(move |r: Readout| latest.set(Some(Arc::new(r))));
     Readback {
         latest,
         to: ReadbackTo {
-            id: NEXT.fetch_add(1, Ordering::Relaxed),
+            id: crate::engine::unique_id(&NEXT),
             tx,
         },
     }

@@ -584,7 +584,7 @@ impl<N: Clone + 'static, K: Clone + PartialEq + Eq + Hash + 'static, M: Choice<K
     /// [`Tree::virtual_list`]; its leaving lets go of the list.
     #[track_caller]
     pub fn attach_list(self, state: &ListState) {
-        self.state.with_untracked(|s| s.virtual_rows).hold(state.clone());
+        self.state.with_untracked(|s| s.virtual_rows).hold(*state);
         state.active_from(move || {
             if !self.rows.is_alive() {
                 return None;

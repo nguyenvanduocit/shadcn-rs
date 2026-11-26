@@ -1258,7 +1258,7 @@ pub(crate) fn paint_of(g: &Gradient, stops: &mut Vec<f32>) -> ([f32; 4], Option<
         Gradient::Solid(c) => (super::rgba(*c), None),
         Gradient::Linear { start, end, stops: s } => {
             let first = u32::try_from(stops.len() / 8).unwrap_or(0);
-            for (offset, c) in s {
+            for (offset, c) in s.iter() {
                 stops.extend_from_slice(&[*offset, 0.0, 0.0, 0.0]);
                 stops.extend_from_slice(&super::rgba(*c));
             }

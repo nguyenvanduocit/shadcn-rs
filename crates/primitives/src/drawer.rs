@@ -682,13 +682,11 @@ impl DrawerProvider {
     }
 }
 
-gui::engine_local! {
-    /// The next drawer's number.
-    [Fork] static NEXT: Cell<u64> = Cell::new(1);
-    /// The next opening's number: nested drawers are frontmost in the
-    /// order they open.
-    [Fork] static OPENED: Cell<u64> = Cell::new(1);
-}
+/// The drawers made, numbered.
+static NEXT: gui::engine::IdKind = gui::engine::IdKind::new("drawer");
+/// The openings, numbered: nested drawers are frontmost in the order they
+/// open.
+static OPENED: gui::engine::IdKind = gui::engine::IdKind::new("drawer opening");
 
 /// The swipe in `slot`, taken out: the slot holds none after.
 fn take_swipe(slot: Signal<Option<Swipe>>) -> Option<Swipe> {
@@ -710,11 +708,9 @@ fn move_swipe(slot: Signal<Option<Swipe>>, at: (f32, f32), now: Duration) -> Opt
 
 /// The number of an opening, later than every one before it.
 fn next_opening() -> u64 {
-    OPENED.with(|n| {
-        let at = n.get();
-        n.set(at.saturating_add(1));
-        at
-    })
+    // Increasing on a thread, live and fork alike (a fork's come after
+    // every live one), and never given twice (ADR-0028, rule 3).
+    gui::engine::unique_id(&OPENED)
 }
 
 /// Write `v` to `s` only when it changed (a signal read per frame).
@@ -794,11 +790,7 @@ impl<P: 'static> Drawer<P> {
         let provider = gui::use_context::<DrawerProvider>();
         let nest = Nest::new();
         gui::provide(nest);
-        let id = NEXT.with(|n| {
-            let id = n.get();
-            n.set(id.wrapping_add(1));
-            id
-        });
+        let id = gui::engine::unique_id(&NEXT);
         let d = Self {
             open,
             snap,

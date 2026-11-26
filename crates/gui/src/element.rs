@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use crate::color::Color;
 use crate::edit::{TextEdit, TextField};
+use crate::engine::Site;
 use crate::events::{ClickEvent, DragEvent, KeyEvent};
 use crate::figure::Figure;
 use crate::focus::FocusHandle;
@@ -136,19 +137,59 @@ fn or_consumed<E: ?Sized + 'static>(before: Option<Consumes<E>>, f: Consumes<E>)
 /// owned there, and goes with the instance. The engine cancels what a node
 /// captured before its instance is disposed; a call that still comes after
 /// (a stray one) runs nothing.
-fn in_owner<E: ?Sized + 'static, R: Default + 'static>(
+fn in_owner<E: ?Sized + 'static, R: Default + Clone + 'static>(
+    site: crate::engine::Site,
     owner: Option<crate::reactive::OwnerId>,
     f: impl Fn(&E) -> R + 'static,
+    fork: InFork<R>,
 ) -> Rc<dyn Fn(&E) -> R> {
-    match owner {
-        Some(owner) => Rc::new(move |e| {
-            if crate::reactive::is_live(owner) {
-                crate::reactive::run_owned(Some(owner), || f(e))
-            } else {
-                R::default()
+    // A caller's handler: reached only through the one gate, so a fork
+    // (a check, or input replayed in one) never runs it (ADR-0028, rule 5)
+    // and takes the answer its site states ([`InFork`]). A stray call after
+    // the owner ended is live, and answers as no handler would.
+    // Inside a dispatch, one that panics answers as no handler would, and
+    // its panic goes on once the dispatch is done (the gate catches it).
+    let call = move |e: &E| match owner {
+        Some(owner) if crate::reactive::is_live(owner) => crate::reactive::run_owned(Some(owner), || f(e)),
+        Some(_) => R::default(),
+        None => f(e),
+    };
+    Rc::new(move |e| match crate::engine::call_out(site, || call(e)) {
+        Some(r) => r,
+        None if crate::engine::forking() => fork.answer(),
+        None => R::default(),
+    })
+}
+
+/// What a handler answers when a fork dispatches to it, stated at each
+/// site (Opus nit 2, F1 review 7): never a blanket default, which for a
+/// consumed flag would send the fork down the engine's default action
+/// while live took the handler's.
+#[derive(Clone)]
+pub(crate) enum InFork<R> {
+    /// The answer under which the engine takes the same path as live,
+    /// whatever the handler would have done: a handler with no answer
+    /// (`()`), whose effects are the outside world's.
+    Same(R),
+    /// No answer keeps the fork on live's path (what the engine does next
+    /// is the caller's to say: consumed, which node to focus), so a fork
+    /// that dispatches here is doomed and dropped (ADR-0028): its result
+    /// is thrown away, never taken with a default answer. It runs on to
+    /// its end with `inert`, the answer under which the engine does
+    /// nothing more (nothing unwinds through the sites that catch a
+    /// panic); `site` names where, for whoever asks why it was dropped.
+    Refuse { site: &'static str, inert: R },
+}
+
+impl<R: Clone> InFork<R> {
+    fn answer(&self) -> R {
+        match self {
+            Self::Same(r) => r.clone(),
+            Self::Refuse { site, inert } => {
+                crate::engine::drop_fork(site);
+                inert.clone()
             }
-        }),
-        None => Rc::new(f),
+        }
     }
 }
 
@@ -164,12 +205,21 @@ pub(crate) enum TabStop {
 }
 
 impl TabStop {
-    /// Whether it is a stop now; a closure runs untracked.
+    /// Whether it is a stop now; a closure runs untracked. One that panics
+    /// in a turn (user code, ADR-0015, the turn rule) is to the arbiter and
+    /// answers as no closure would, the default: a stop (outside a turn,
+    /// its panic goes on).
     pub(crate) fn get(&self) -> bool {
         match self {
             Self::Always => true,
             Self::Never => false,
-            Self::Bound(f) => crate::untracked(|| f()),
+            Self::Bound(f) => match crate::engine::attempt(|| crate::untracked(|| f())) {
+                Ok(on) => on,
+                Err(failed) => {
+                    crate::component::contain_binding(failed);
+                    true
+                }
+            },
         }
     }
 }
@@ -401,6 +451,9 @@ pub(crate) struct SpanSpec {
     /// Its bound properties, replayed where its paragraph resolves.
     pub(crate) bindings: crate::value::Bindings,
     pub(crate) click: Option<Handler<ClickEvent>>,
+    /// What it is across builds ([`Span::key`]): its key, or with none,
+    /// its place among its paragraph's spans.
+    pub(crate) key: Option<ElementKey>,
 }
 
 /// Text inside a paragraph in an inline style of its own, wrapping with the
@@ -419,6 +472,7 @@ pub struct Span {
     style: Style,
     bindings: crate::value::Bindings,
     click: Option<Handler<ClickEvent>>,
+    key: Option<ElementKey>,
 }
 
 impl crate::styled::Fluent for Span {}
@@ -433,8 +487,25 @@ impl Span {
     /// Called on a click on the span's text (a link).
     #[must_use]
     pub fn on_click(mut self, f: impl Fn(&ClickEvent) + 'static) -> Self {
-        let f = in_owner(crate::component::handler_owner(), f);
+        let f = in_owner(
+            crate::engine::Site::SpanClick,
+            crate::component::handler_owner(),
+            f,
+            InFork::Same(()),
+        );
         self.click = Some(then(self.click.take(), f));
+        self
+    }
+
+    /// What this span is across builds of its paragraph, as a node's key
+    /// is among its siblings: an input routed in a frame that showed it
+    /// reaches its handler however spans were added or taken away before
+    /// it since, and none once it is gone. Without one, a span is its
+    /// place among its paragraph's spans (as an unkeyed child is), so a
+    /// span put before it since takes its place.
+    #[must_use]
+    pub fn key(mut self, key: ElementKey) -> Self {
+        self.key = Some(key);
         self
     }
 }
@@ -459,6 +530,7 @@ pub fn span(content: impl Into<String>) -> Span {
         style: Style::default(),
         bindings: crate::value::Bindings::default(),
         click: None,
+        key: None,
     }
 }
 
@@ -1039,25 +1111,6 @@ impl<K> Node<K> {
         self
     }
 
-    /// Keep this scroll container's offset in `handle`, which reads its
-    /// layout and moves it.
-    #[must_use]
-    pub fn track_scroll(mut self, handle: &ScrollHandle) -> Self {
-        self.common.scroll = Some(handle.clone());
-        self
-    }
-
-    /// [`Self::track_scroll`], with what this render built the children
-    /// from (the rows a virtual list chose): handed to the handle's hook
-    /// after each layout of the frame, where state is written, so the
-    /// render that chose it writes nothing (a render is pure, ADR-0013).
-    #[must_use]
-    pub(crate) fn track_scroll_built(mut self, handle: &ScrollHandle, built: Rc<dyn std::any::Any>) -> Self {
-        self.common.scroll = Some(handle.clone());
-        self.common.scroll_built = Some(built);
-        self
-    }
-
     /// Disable this node and its subtree, the deferred subtrees declared in
     /// it included, as [`Self::inert`] is inherited and as a disabled
     /// `<fieldset>` disables what it holds: every node in it takes no
@@ -1292,20 +1345,30 @@ impl<K> Node<K> {
 
     /// `f` as a handler of this node: run inside the component instance
     /// rendering now, which the node records as its own ([`in_owner`]).
-    fn owned<E: ?Sized + 'static, R: Default + 'static>(
+    /// A handler with no answer: in a fork, not called, and the engine goes
+    /// on as live does ([`InFork::Same`]).
+    fn owned<E: ?Sized + 'static>(&mut self, site: Site, f: impl Fn(&E) + 'static) -> Rc<dyn Fn(&E)> {
+        self.answered(site, f, InFork::Same(()))
+    }
+
+    /// A handler whose answer the engine acts on, with what a fork takes
+    /// for it, stated here ([`InFork`]); `site` is its kind.
+    fn answered<E: ?Sized + 'static, R: Default + Clone + 'static>(
         &mut self,
+        site: Site,
         f: impl Fn(&E) -> R + 'static,
+        fork: InFork<R>,
     ) -> Rc<dyn Fn(&E) -> R> {
         let owner = crate::component::handler_owner();
         self.common.handlers.owner = owner;
-        in_owner(owner, f)
+        in_owner(site, owner, f, fork)
     }
 
     /// Called on a click (press and release on this node); bubbles to the
     /// nearest ancestor that has one.
     #[must_use]
     pub fn on_click(mut self, f: impl Fn(&ClickEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::Click, f);
         self.common.handlers.click = Some(then(self.common.handlers.click.take(), f));
         self
     }
@@ -1313,7 +1376,7 @@ impl<K> Node<K> {
     /// Called when the primary button goes down on this node.
     #[must_use]
     pub fn on_mouse_down(mut self, f: impl Fn(&ClickEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::MouseDown, f);
         self.common.handlers.mouse_down = Some(then(self.common.handlers.mouse_down.take(), f));
         self
     }
@@ -1345,7 +1408,7 @@ impl<K> Node<K> {
     /// layout (a table's `Auto` columns learn their cells' widths so).
     #[must_use]
     pub fn on_measured(mut self, f: impl Fn(&Bounds) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::Measured, f);
         self.common.handlers.measured = Some(then(self.common.handlers.measured.take(), f));
         self
     }
@@ -1361,7 +1424,7 @@ impl<K> Node<K> {
     /// whichever item came to its place.
     #[must_use]
     pub fn on_drag(mut self, f: impl Fn(&DragEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::Drag, f);
         self.common.handlers.drag = Some(then(self.common.handlers.drag.take(), f));
         self
     }
@@ -1391,7 +1454,14 @@ impl<K> Node<K> {
     /// `true` when handled.
     #[must_use]
     pub fn on_key_down(mut self, f: impl Fn(&KeyEvent) -> bool + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.answered(
+            Site::KeyDown,
+            f,
+            InFork::Refuse {
+                site: "on_key_down",
+                inert: true,
+            },
+        );
         self.common.handlers.key_down = Some(or_consumed(self.common.handlers.key_down.take(), f));
         self
     }
@@ -1402,7 +1472,14 @@ impl<K> Node<K> {
     /// `true` when handled. A node below a modal layer is not told.
     #[must_use]
     pub fn on_window_key(mut self, f: impl Fn(&KeyEvent) -> bool + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.answered(
+            Site::WindowKey,
+            f,
+            InFork::Refuse {
+                site: "on_window_key",
+                inert: true,
+            },
+        );
         self.common.handlers.window_key = Some(or_consumed(self.common.handlers.window_key.take(), f));
         self
     }
@@ -1410,7 +1487,7 @@ impl<K> Node<K> {
     /// Called when the secondary (right) button goes down on this node; bubbles.
     #[must_use]
     pub fn on_secondary_click(mut self, f: impl Fn(&ClickEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::SecondaryClick, f);
         self.common.handlers.secondary_click = Some(then(self.common.handlers.secondary_click.take(), f));
         self
     }
@@ -1418,7 +1495,7 @@ impl<K> Node<K> {
     /// Called with `true` when the pointer enters this node and `false` when it leaves.
     #[must_use]
     pub fn on_hover(mut self, f: impl Fn(bool) + 'static) -> Self {
-        let f = self.owned(move |on: &bool| f(*on));
+        let f = self.owned(Site::Hover, move |on: &bool| f(*on));
         let before = self.common.handlers.hover.take();
         self.common.handlers.hover = Some(Rc::new(move |on| {
             if let Some(b) = &before {
@@ -1433,7 +1510,7 @@ impl<K> Node<K> {
     /// where it is; [`Self::on_hover`] says when it leaves.
     #[must_use]
     pub fn on_pointer_move(mut self, f: impl Fn(&crate::events::PointerEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::PointerMove, f);
         self.common.handlers.pointer = Some(then(self.common.handlers.pointer.take(), f));
         self
     }
@@ -1446,7 +1523,14 @@ impl<K> Node<K> {
     /// wheel event handler region).
     #[must_use]
     pub fn on_wheel(mut self, f: impl Fn(&crate::events::WheelEvent) -> bool + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.answered(
+            Site::Wheel,
+            f,
+            InFork::Refuse {
+                site: "on_wheel",
+                inert: true,
+            },
+        );
         self.common.handlers.wheel = Some(or_consumed(self.common.handlers.wheel.take(), f));
         self
     }
@@ -1457,7 +1541,14 @@ impl<K> Node<K> {
     /// a node without one.
     #[must_use]
     pub fn focus_on_press(mut self, f: impl Fn(&crate::events::Modifiers) -> bool + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.answered(
+            Site::FocusOnPress,
+            f,
+            InFork::Refuse {
+                site: "focus_on_press",
+                inert: false,
+            },
+        );
         // Each one registered may refuse: it focuses when all allow it.
         self.common.handlers.press_focus = Some(match self.common.handlers.press_focus.take() {
             Some(before) => Rc::new(move |m| before(m) && f(m)),
@@ -1475,7 +1566,14 @@ impl<K> Node<K> {
     /// not, and not on a disabled one.
     #[must_use]
     pub fn press_focuses(mut self, f: impl Fn() -> Option<crate::focus::FocusHandle> + 'static) -> Self {
-        let f = self.owned(move |(): &()| f());
+        let f = self.answered(
+            Site::PressFocuses,
+            move |(): &()| f(),
+            InFork::Refuse {
+                site: "press_focuses",
+                inert: None,
+            },
+        );
         // The first registered that names a focus has it.
         let before = self.common.handlers.press_focuses.take();
         self.common.handlers.press_focuses =
@@ -1490,7 +1588,7 @@ impl<K> Node<K> {
     /// menu on it.
     #[must_use]
     pub fn on_long_press(mut self, f: impl Fn(&ClickEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::LongPress, f);
         self.common.handlers.long_press = Some(then(self.common.handlers.long_press.take(), f));
         self
     }
@@ -1512,7 +1610,7 @@ impl<K> Node<K> {
     /// releasing picks it (reka's `MenuItem` `pointerup`).
     #[must_use]
     pub fn on_release(mut self, f: impl Fn(&ClickEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::Release, f);
         self.common.handlers.release = Some(then(self.common.handlers.release.take(), f));
         self
     }
@@ -1529,7 +1627,7 @@ impl<K> Node<K> {
     /// `usePressedHold`).
     #[must_use]
     pub fn on_touch(mut self, f: impl Fn(&crate::events::TouchEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::Touch, f);
         self.common.handlers.touch = Some(then(self.common.handlers.touch.take(), f));
         self
     }
@@ -1541,7 +1639,7 @@ impl<K> Node<K> {
     /// itself and does not call it.
     #[must_use]
     pub fn on_ime(mut self, f: impl Fn(&crate::events::ImeEvent) + 'static) -> Self {
-        let f = self.owned(f);
+        let f = self.owned(Site::Ime, f);
         self.common.handlers.ime = Some(then(self.common.handlers.ime.take(), f));
         self
     }
@@ -1629,6 +1727,32 @@ impl<K> Node<K> {
 }
 
 impl Div {
+    /// Keep this scroll container's offset in `handle`, which reads its
+    /// layout and moves it. A box of children only: a text input's offset
+    /// has one owner, its field ([`crate::TextField`]), so it has no such
+    /// method:
+    ///
+    /// ```compile_fail,E0599
+    /// use gui::{ScrollHandle, TextField, text_input};
+    /// let _ = text_input(&TextField::new("")).track_scroll(&ScrollHandle::new());
+    /// ```
+    #[must_use]
+    pub fn track_scroll(mut self, handle: &ScrollHandle) -> Self {
+        self.common.scroll = Some(*handle);
+        self
+    }
+
+    /// [`Self::track_scroll`], with what this render built the children
+    /// from (the rows a virtual list chose): handed to the handle's hook
+    /// after each layout of the frame, where state is written, so the
+    /// render that chose it writes nothing (a render is pure, ADR-0013).
+    #[must_use]
+    pub(crate) fn track_scroll_built(mut self, handle: &ScrollHandle, built: Rc<dyn std::any::Any>) -> Self {
+        self.common.scroll = Some(*handle);
+        self.common.scroll_built = Some(built);
+        self
+    }
+
     #[must_use]
     pub fn child(mut self, child: impl IntoElement) -> Self {
         self.kind.push(child.into_element());
@@ -1655,6 +1779,7 @@ impl Text {
                 style: span.style,
                 bindings: span.bindings,
                 click: span.click,
+                key: span.key,
             });
         }
         self

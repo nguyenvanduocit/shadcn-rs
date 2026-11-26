@@ -129,12 +129,7 @@
 //! has come to rest on it, once per change (reka's `@settle`); not while an
 //! auto-scroll runs.
 
-use std::cell::Cell;
-#[expect(
-    clippy::disallowed_types,
-    reason = "the carousel's own press, written by its own handlers"
-)]
-use std::cell::RefCell;
+use gui::engine::{WorldCell, WorldRefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
@@ -562,10 +557,8 @@ struct Drag {
     travel: f32,
 }
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the carousel's own press, written by its own handlers"
-)]
+/// Its cells are the world's that made the carousel: a check writes none
+/// of a live one's (ADR-0034, S7).
 struct State {
     options: Rc<dyn Fn() -> CarouselOptions>,
     direction: ReadDirection,
@@ -574,29 +567,29 @@ struct State {
     /// The root's focus: its keys act only while it has it.
     focus: FocusHandle,
     interaction: Interaction,
-    drag: RefCell<Option<Drag>>,
+    drag: WorldRefCell<Option<Drag>>,
     /// The wheel gesture's delta so far, and whether it has paged.
-    wheel: Cell<(f32, bool)>,
+    wheel: WorldCell<(f32, bool)>,
     /// The snap last settled, and who hears it.
-    settled: Cell<usize>,
+    settled: WorldCell<usize>,
     on_settle: Option<gui::Callback<usize>>,
     /// A release, a fling or an auto-scroll set where the track goes and
     /// how: the next change of snap keeps that.
-    rest: Cell<bool>,
+    rest: WorldCell<bool>,
     /// Where the track was last sent, in viewports among every lap.
-    at: Cell<f32>,
+    at: WorldCell<f32>,
     /// The snap a move asked for, waiting for the model to take it: its
     /// lap (the shorter way round for none), and whether it moves the track
     /// on its way (a fling, an auto-scroll), settling nothing.
-    pending: Cell<Option<(usize, Option<i32>, bool)>>,
+    pending: WorldCell<Option<(usize, Option<i32>, bool)>>,
     /// An auto-scroll runs: its last frame (ms).
-    scrolling: Cell<Option<f32>>,
+    scrolling: WorldCell<Option<f32>>,
     /// The slides laid out, as a set, kept from pass to pass for letting go
     /// of the heights of those that left.
-    present: Cell<HashSet<SlideKey>>,
+    present: WorldCell<HashSet<SlideKey>>,
     /// The slides and heights those passes stepped through: the measure of
     /// their work, for tests.
-    prune_work: Cell<u64>,
+    prune_work: WorldCell<u64>,
 }
 
 /// A carousel's state: made once in its root's setup, `Copy`.
@@ -677,10 +670,6 @@ impl<P: 'static> Carousel<P> {
     /// from the start, its keys turning in `direction`. Called in setup.
     #[must_use]
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the carousel's own press, written by its own handlers"
-    )]
     pub fn new(
         index: UseModel<P, usize>,
         options: impl Fn() -> CarouselOptions + 'static,
@@ -723,16 +712,16 @@ impl<P: 'static> Carousel<P> {
                 content: NodeRef::new(),
                 focus: FocusHandle::new(),
                 interaction: Interaction::new(),
-                drag: RefCell::new(None),
-                wheel: Cell::new((0.0, false)),
-                settled: Cell::new(0),
+                drag: WorldRefCell::new("a carousel's drag", None),
+                wheel: WorldCell::new("a carousel's wheel gesture", (0.0, false)),
+                settled: WorldCell::new("a carousel's settled snap", 0),
                 on_settle: None,
-                rest: Cell::new(false),
-                at: Cell::new(0.0),
-                pending: Cell::new(None),
-                scrolling: Cell::new(None),
-                present: Cell::default(),
-                prune_work: Cell::new(0),
+                rest: WorldCell::new("whether a carousel's track rests", false),
+                at: WorldCell::new("where a carousel's track was sent", 0.0),
+                pending: WorldCell::new("a carousel's pending snap", None),
+                scrolling: WorldCell::new("a carousel's auto-scroll", None),
+                present: WorldCell::new("a carousel's slides laid out", HashSet::new()),
+                prune_work: WorldCell::new("a carousel's prune work (tests)", 0),
             }),
         };
         let at = gui::untracked(|| me.index());

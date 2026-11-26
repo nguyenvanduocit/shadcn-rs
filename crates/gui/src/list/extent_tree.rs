@@ -133,6 +133,16 @@ impl ExtentTree {
         &self.runs.totals().summary
     }
 
+    /// Whether `other` is this very tree, unwritten: a clone shares its
+    /// root, and a write to either copies the path it walks (a persistent
+    /// tree, [`SumTree`]), so a tree written since a clone was taken is no
+    /// longer the same. O(1): what a reorder's commit checks the heights it
+    /// read by ([`crate::ListState::reorder`]).
+    #[must_use]
+    pub(crate) fn same(&self, other: &Self) -> bool {
+        self.runs.ptr_eq(&other.runs) && self.initial == other.initial
+    }
+
     /// How many rows.
     #[must_use]
     pub fn len(&self) -> u64 {

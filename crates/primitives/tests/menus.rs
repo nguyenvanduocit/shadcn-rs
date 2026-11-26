@@ -66,8 +66,17 @@ fn scenario(f: impl Fn() -> Element + 'static) -> Scenario {
     s
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// The accessibility tree of `s`'s last frame, with its window's focus
+/// (read in a turn of it: ADR-0015).
+fn access_tree(s: &mut Scenario, ts: &mut gui::text::TextSystem) -> accesskit::TreeUpdate {
+    let focus = s.read(gui::focus::focused);
+    gui::access::tree(s.last(), focus, 1.0, "w", ts)
+}
+
+/// Whether `h` holds focus in `s`'s window, read in a turn of it (outside
+/// any turn, focus is the thread window's: ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
 }
 
 fn key(s: &mut Scenario, k: NamedKey, modifiers: Modifiers) {
@@ -223,52 +232,52 @@ fn the_menu_keyboard_table() {
 
     plain(&mut s, NamedKey::Enter);
     assert!(d.open.get_untracked(), "Enter on the trigger opens it");
-    assert!(focused(d.foci[0]), "on its first item");
+    assert!(focused(&mut s, d.foci[0]), "on its first item");
     plain(&mut s, NamedKey::ArrowUp);
-    assert!(focused(d.foci[0]), "no wrap past the first");
+    assert!(focused(&mut s, d.foci[0]), "no wrap past the first");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(d.foci[1]));
+    assert!(focused(&mut s, d.foci[1]));
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(d.foci[3]), "the disabled item is passed");
+    assert!(focused(&mut s, d.foci[3]), "the disabled item is passed");
     plain(&mut s, NamedKey::End);
-    assert!(focused(d.foci[4]), "End: the last");
+    assert!(focused(&mut s, d.foci[4]), "End: the last");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(d.foci[4]), "no wrap past the last");
+    assert!(focused(&mut s, d.foci[4]), "no wrap past the last");
     plain(&mut s, NamedKey::Home);
-    assert!(focused(d.foci[0]), "Home: the first");
+    assert!(focused(&mut s, d.foci[0]), "Home: the first");
     plain(&mut s, NamedKey::PageDown);
-    assert!(focused(d.foci[4]), "PageDown: the last, from an item too");
+    assert!(focused(&mut s, d.foci[4]), "PageDown: the last, from an item too");
     plain(&mut s, NamedKey::PageUp);
-    assert!(focused(d.foci[0]), "PageUp: the first");
+    assert!(focused(&mut s, d.foci[0]), "PageUp: the first");
 
     type_char(&mut s, "d");
-    assert!(focused(d.foci[3]), "typeahead reaches Date");
+    assert!(focused(&mut s, d.foci[3]), "typeahead reaches Date");
     type_char(&mut s, "c");
-    assert!(focused(d.foci[3]), "Dc matches nothing: the highlight stays");
+    assert!(focused(&mut s, d.foci[3]), "Dc matches nothing: the highlight stays");
     wait(&mut s, 1100);
     type_char(&mut s, "c");
-    assert!(focused(d.foci[3]), "a disabled item is not typed to");
+    assert!(focused(&mut s, d.foci[3]), "a disabled item is not typed to");
 
     plain(&mut s, NamedKey::Escape);
     assert!(!d.open.get_untracked(), "Escape closes");
-    assert!(focused(trigger), "and focus is back on the trigger");
-    assert!(gui::focus::focus_visible(), "with its ring");
+    assert!(focused(&mut s, trigger), "and focus is back on the trigger");
+    assert!(s.read(gui::focus::focus_visible), "with its ring");
 
     plain(&mut s, NamedKey::ArrowDown);
     assert!(d.open.get_untracked(), "ArrowDown on the trigger opens it");
-    assert!(focused(d.foci[0]));
+    assert!(focused(&mut s, d.foci[0]));
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::Space);
     assert_eq!(*d.picked.borrow(), ["Banana"], "Space picks");
     assert!(!d.open.get_untracked(), "picking closes");
-    assert!(focused(trigger), "focus back on the trigger");
+    assert!(focused(&mut s, trigger), "focus back on the trigger");
 
     plain(&mut s, NamedKey::Space);
     assert!(d.open.get_untracked(), "Space on the trigger opens");
-    assert!(focused(d.foci[0]));
+    assert!(focused(&mut s, d.foci[0]));
     plain(&mut s, NamedKey::Tab);
     assert!(d.open.get_untracked(), "Tab does nothing in a modal menu");
-    assert!(focused(d.foci[0]), "focus stays on the item");
+    assert!(focused(&mut s, d.foci[0]), "focus stays on the item");
     key(
         &mut s,
         NamedKey::Tab,
@@ -277,7 +286,7 @@ fn the_menu_keyboard_table() {
             ..Modifiers::default()
         },
     );
-    assert!(focused(d.foci[0]), "Shift+Tab too");
+    assert!(focused(&mut s, d.foci[0]), "Shift+Tab too");
     plain(&mut s, NamedKey::Enter);
     assert_eq!(d.picked.borrow().len(), 2, "Enter picks the focused item");
 }
@@ -288,12 +297,12 @@ fn an_arrow_from_the_content_itself_reaches_an_end() {
     s.act("open", || d.open.set(true));
     s.settle().expect("settled");
     assert!(
-        d.foci.iter().all(|f| !focused(*f)),
+        d.foci.iter().all(|f| !focused(&mut s, *f)),
         "opened by its caller, the content holds focus, no item"
     );
     plain(&mut s, NamedKey::ArrowUp);
     assert!(
-        focused(d.foci[4]),
+        focused(&mut s, d.foci[4]),
         "ArrowUp from the content reaches the last item, though the menu does not wrap"
     );
 
@@ -301,7 +310,10 @@ fn an_arrow_from_the_content_itself_reaches_an_end() {
     s.act("open", || d.open.set(true));
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(d.foci[0]), "ArrowDown from the content reaches the first");
+    assert!(
+        focused(&mut s, d.foci[0]),
+        "ArrowDown from the content reaches the first"
+    );
 }
 
 #[test]
@@ -312,7 +324,7 @@ fn space_continues_a_typeahead_search() {
     s.settle().expect("settled");
     plain(&mut s, NamedKey::Enter);
     type_char(&mut s, "b");
-    assert!(focused(d.foci[1]));
+    assert!(focused(&mut s, d.foci[1]));
     type_char(&mut s, " ");
     assert!(
         d.open.get_untracked(),
@@ -326,18 +338,18 @@ fn the_highlight_is_focus_and_the_pointer_moves_it() {
     let (mut s, d) = dropdown(MenuOptions::DEFAULT, false, Availability::Enabled);
     click(&mut s, "Open");
     assert!(d.open.get_untracked(), "a click opens it");
-    assert!(d.foci.iter().all(|f| !focused(*f)), "with no item highlighted");
+    assert!(d.foci.iter().all(|f| !focused(&mut s, *f)), "with no item highlighted");
     let (x, y) = at(&s, "Banana");
     hover(&mut s, x, y);
-    assert!(focused(d.foci[1]), "the item under the mouse takes focus");
+    assert!(focused(&mut s, d.foci[1]), "the item under the mouse takes focus");
     let (x, y) = at(&s, "Cherry");
     hover(&mut s, x, y);
     assert!(
-        d.foci.iter().all(|f| !focused(*f)),
+        d.foci.iter().all(|f| !focused(&mut s, *f)),
         "a disabled item takes none: the content holds it"
     );
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(d.foci[0]), "the next arrow starts from an end");
+    assert!(focused(&mut s, d.foci[0]), "the next arrow starts from an end");
     click(&mut s, "Date");
     assert_eq!(*d.picked.borrow(), ["Date"], "a click picks");
     assert!(!d.open.get_untracked());
@@ -369,7 +381,7 @@ fn a_disabled_trigger_opens_nothing() {
     let (mut s, d) = dropdown(MenuOptions::DEFAULT, false, Availability::Disabled);
     click(&mut s, "Open");
     assert!(!d.open.get_untracked());
-    assert!(!focused(trigger_of(&d)), "and takes no focus");
+    assert!(!focused(&mut s, trigger_of(&d)), "and takes no focus");
 }
 
 #[test]
@@ -390,9 +402,9 @@ fn a_menu_that_is_not_modal_closes_on_focus_outside() {
     s.act("focus the trigger", || trigger.focus());
     s.settle().expect("settled");
     plain(&mut s, NamedKey::Enter);
-    assert!(focused(d.foci[0]));
+    assert!(focused(&mut s, d.foci[0]));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(d.page), "Tab leaves a menu that is not modal");
+    assert!(focused(&mut s, d.page), "Tab leaves a menu that is not modal");
     assert!(!d.open.get_untracked(), "and it closes: focus is outside");
 }
 
@@ -406,7 +418,7 @@ fn a_press_on_the_trigger_closes_a_menu_that_is_not_modal() {
         !d.open.get_untracked(),
         "the trigger is inside the layer by ownership: the press is not outside, the click toggles it closed"
     );
-    assert!(focused(trigger_of(&d)), "focus is on the trigger");
+    assert!(focused(&mut s, trigger_of(&d)), "focus is on the trigger");
     click(&mut s, "Open");
     assert!(d.open.get_untracked(), "the next click opens it, once each");
 }
@@ -497,7 +509,10 @@ fn a_submenu_opens_after_the_mouse_rests_100_ms() {
     );
     wait(&mut s, u64::try_from(SUB_OPEN_DELAY.as_millis()).expect("ms") - 50);
     assert!(m.sub_open.get_untracked(), "100 ms after the first move it opens");
-    assert!(m.sub_items.iter().all(|f| !focused(*f)), "focus stays on its trigger");
+    assert!(
+        m.sub_items.iter().all(|f| !focused(&mut s, *f)),
+        "focus stays on its trigger"
+    );
 
     // Leaving before the delay cancels the opening.
     let (mut s, m) = with_submenu();
@@ -508,7 +523,7 @@ fn a_submenu_opens_after_the_mouse_rests_100_ms() {
     hover(&mut s, bx, by);
     wait(&mut s, 200);
     assert!(!m.sub_open.get_untracked(), "leaving first cancels it");
-    assert!(focused(m.root_items[0]));
+    assert!(focused(&mut s, m.root_items[0]));
 }
 
 #[test]
@@ -518,19 +533,19 @@ fn keys_open_and_close_a_submenu() {
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowRight);
     assert!(m.sub_open.get_untracked(), "the inline-end arrow opens it");
-    assert!(focused(m.sub_items[0]), "on its first item");
+    assert!(focused(&mut s, m.sub_items[0]), "on its first item");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(m.sub_items[1]), "its keys are its own");
+    assert!(focused(&mut s, m.sub_items[1]), "its keys are its own");
     plain(&mut s, NamedKey::ArrowDown);
     assert!(
-        focused(m.sub_items[1]),
+        focused(&mut s, m.sub_items[1]),
         "no wrap, and the parent's items are not reached"
     );
     plain(&mut s, NamedKey::ArrowLeft);
     assert!(!m.sub_open.get_untracked(), "the other arrow closes it");
     plain(&mut s, NamedKey::Enter);
     assert!(m.sub_open.get_untracked(), "Enter on the sub trigger opens it");
-    assert!(focused(m.sub_items[0]));
+    assert!(focused(&mut s, m.sub_items[0]));
     plain(&mut s, NamedKey::Escape);
     assert!(!m.open.get_untracked(), "Escape in a submenu closes the whole menu");
     assert!(!m.sub_open.get_untracked());
@@ -547,11 +562,14 @@ fn the_grace_area_keeps_a_submenu_on_the_way_to_it() {
     let (_, by) = at(&s, "Below");
     hover(&mut s, x + 60.0, by);
     assert!(m.sub_open.get_untracked(), "in the grace area the submenu stays");
-    assert!(!focused(m.root_items[1]), "and the item passed takes no highlight");
+    assert!(
+        !focused(&mut s, m.root_items[1]),
+        "and the item passed takes no highlight"
+    );
     wait(&mut s, u64::try_from(GRACE.as_millis()).expect("ms"));
     hover(&mut s, x + 61.0, by);
     assert!(
-        focused(m.root_items[1]),
+        focused(&mut s, m.root_items[1]),
         "after 300 ms the item under the pointer is highlighted"
     );
     assert!(!m.sub_open.get_untracked(), "and the submenu closes");
@@ -564,7 +582,7 @@ fn the_grace_area_keeps_a_submenu_on_the_way_to_it() {
     let (bx, by) = at(&s, "Below");
     hover(&mut s, bx - 40.0, by);
     assert!(
-        focused(m.root_items[1]),
+        focused(&mut s, m.root_items[1]),
         "moving away: the item takes the highlight at once"
     );
     assert!(!m.sub_open.get_untracked());
@@ -621,7 +639,7 @@ fn checkbox_and_radio_items_ask_for_their_values() {
     );
     assert!(open.get_untracked(), "each said Veto");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     let dumped = dump(&tree);
     assert!(
         dumped.contains("MenuItemCheckBox checked=Mixed\n      Label \"Mixed\""),
@@ -638,7 +656,7 @@ fn what_a_screen_reader_is_told_of_a_dropdown_menu() {
     let (mut s, _d) = dropdown(MenuOptions::DEFAULT, false, Availability::Enabled);
     click(&mut s, "Open");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_dropdown_a11y", dump(&tree));
 }
 
@@ -649,7 +667,7 @@ fn what_a_screen_reader_is_told_of_a_submenu() {
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowRight);
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_submenu_a11y", dump(&tree));
 }
 
@@ -657,7 +675,7 @@ fn what_a_screen_reader_is_told_of_a_submenu() {
 fn a_group_is_named_by_its_label_only_when_it_has_one() {
     let foci = [(); 5].map(|()| FocusHandle::new());
     let picked: Log = Rc::default();
-    let s = scenario(move || {
+    let mut s = scenario(move || {
         let picked = Rc::clone(&picked);
         component((), move |_| {
             let dd = DropdownMenu::new(Signal::new(true), MenuOptions::DEFAULT);
@@ -683,7 +701,7 @@ fn a_group_is_named_by_its_label_only_when_it_has_one() {
         .into_element()
     });
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     let nodes: HashMap<NodeId, &Node> = tree.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let groups: Vec<&Node> = tree
         .nodes
@@ -941,7 +959,7 @@ fn a_context_menu_opens_over_an_unavailable_item_on_right_click_and_long_press()
     s.settle().expect("settled");
     s.click(120.0, 120.0);
     s.settle().expect("settled");
-    assert!(focused(focus), "a press focuses it");
+    assert!(focused(&mut s, focus), "a press focuses it");
     assert_eq!(item_clicks.get(), 0, "the unavailable item is never activated");
 }
 
@@ -952,9 +970,9 @@ fn the_context_menu_key_opens_it_on_its_first_item() {
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ContextMenu);
     assert!(c.open.get_untracked());
-    assert!(focused(c.foci[0]), "on its first item");
+    assert!(focused(&mut s, c.foci[0]), "on its first item");
     plain(&mut s, NamedKey::Escape);
-    assert!(focused(c.area), "closing gives focus back to what held it");
+    assert!(focused(&mut s, c.area), "closing gives focus back to what held it");
     key(
         &mut s,
         NamedKey::F10,
@@ -972,7 +990,7 @@ fn what_a_screen_reader_is_told_of_a_context_menu() {
     s.secondary_click(150.0, 150.0);
     s.settle().expect("settled");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_context_a11y", dump(&tree));
 }
 
@@ -1064,14 +1082,14 @@ fn a_menubar_switches_menus_by_pointer_and_keys() {
     assert_eq!(b.value.get_untracked(), "edit");
     plain(&mut s, NamedKey::Escape);
     assert_eq!(b.value.get_untracked(), "");
-    assert!(focused(bar_trigger(&b, 1)), "Escape: focus back on its trigger");
+    assert!(focused(&mut s, bar_trigger(&b, 1)), "Escape: focus back on its trigger");
 
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(bar_trigger(&b, 2)), "the arrows move between triggers");
+    assert!(focused(&mut s, bar_trigger(&b, 2)), "the arrows move between triggers");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(bar_trigger(&b, 2)), "stopping at the end");
+    assert!(focused(&mut s, bar_trigger(&b, 2)), "stopping at the end");
     plain(&mut s, NamedKey::Home);
-    assert!(focused(bar_trigger(&b, 0)));
+    assert!(focused(&mut s, bar_trigger(&b, 0)));
     plain(&mut s, NamedKey::ArrowDown);
     assert_eq!(b.value.get_untracked(), "file", "ArrowDown opens on its first item");
     plain(&mut s, NamedKey::Escape);
@@ -1102,7 +1120,7 @@ fn a_disabled_menubar_trigger_is_passed_and_not_opened_by_hover() {
     );
     plain(&mut s, NamedKey::Escape);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(bar_trigger(&b, 2)), "the arrows pass it");
+    assert!(focused(&mut s, bar_trigger(&b, 2)), "the arrows pass it");
 }
 
 #[test]
@@ -1110,7 +1128,7 @@ fn what_a_screen_reader_is_told_of_a_menubar() {
     let (mut s, _b) = menubar(true);
     click(&mut s, "File");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_menubar_a11y", dump(&tree));
 }
 
@@ -1305,14 +1323,17 @@ fn escape_closes_a_panel_and_focuses_its_trigger() {
     plain(&mut s, NamedKey::Enter);
     assert!(open_one(&n), "Enter toggles");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(n.links[0]), "ArrowDown on the open trigger enters the panel");
+    assert!(
+        focused(&mut s, n.links[0]),
+        "ArrowDown on the open trigger enters the panel"
+    );
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(n.links[1]));
+    assert!(focused(&mut s, n.links[1]));
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(n.links[1]), "no wrap in a panel");
+    assert!(focused(&mut s, n.links[1]), "no wrap in a panel");
     plain(&mut s, NamedKey::Escape);
     assert!(n.value.get_untracked().is_none());
-    assert!(focused(one), "Escape focuses the trigger");
+    assert!(focused(&mut s, one), "Escape focuses the trigger");
 
     // The pointer on the trigger as Escape closes it does not open it again.
     let (mut s, n) = navigation(NavOptions::DEFAULT);
@@ -1341,7 +1362,7 @@ fn arrows_move_between_triggers_and_links_of_the_list() {
     s.act("focus One", || one.focus());
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(two));
+    assert!(focused(&mut s, two));
     plain(&mut s, NamedKey::ArrowDown);
     assert!(
         n.value.get_untracked().is_none(),
@@ -1349,7 +1370,7 @@ fn arrows_move_between_triggers_and_links_of_the_list() {
     );
     plain(&mut s, NamedKey::ArrowLeft);
     plain(&mut s, NamedKey::ArrowUp);
-    assert!(focused(one), "no wrap at the start");
+    assert!(focused(&mut s, one), "no wrap at the start");
     plain(&mut s, NamedKey::End);
     plain(&mut s, NamedKey::Enter);
     assert_eq!(*n.followed.borrow(), ["Docs"], "a link of the list follows");
@@ -1378,7 +1399,7 @@ fn a_press_outside_or_focus_outside_closes_but_not_on_the_menu() {
     plain(&mut s, NamedKey::Enter);
     assert_eq!(*n.followed.borrow(), ["One link 0"]);
     assert!(n.value.get_untracked().is_none(), "following a link closes the menu");
-    assert!(focused(one), "and focus goes back to the trigger");
+    assert!(focused(&mut s, one), "and focus goes back to the trigger");
 }
 
 #[test]
@@ -1389,7 +1410,7 @@ fn what_a_screen_reader_is_told_of_a_navigation_menu() {
     s.settle().expect("settled");
     plain(&mut s, NamedKey::Enter);
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_navigation_a11y", dump(&tree));
 }
 
@@ -1477,46 +1498,46 @@ fn toolbar(orientation: Axis, wrap: Wrap, direction: Option<gui::Direction>) -> 
 fn a_toolbar_is_one_tab_stop_with_arrows_along_it() {
     let (mut s, f, followed) = toolbar(Axis::Horizontal, Wrap::Stop, None);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[0]), "Tab enters at the first enabled item");
+    assert!(focused(&mut s, f[0]), "Tab enters at the first enabled item");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(f[0]), "the other axis does nothing");
+    assert!(focused(&mut s, f[0]), "the other axis does nothing");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[2]), "a disabled item is passed");
+    assert!(focused(&mut s, f[2]), "a disabled item is passed");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[3]));
+    assert!(focused(&mut s, f[3]));
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[3]), "no wrap: reka's loop is off");
+    assert!(focused(&mut s, f[3]), "no wrap: reka's loop is off");
     plain(&mut s, NamedKey::Space);
     assert_eq!(*followed.borrow(), ["Help"], "Space follows a link");
     plain(&mut s, NamedKey::Home);
-    assert!(focused(f[0]));
+    assert!(focused(&mut s, f[0]));
 
     let (mut s, f, _) = toolbar(Axis::Vertical, Wrap::Around, None);
     plain(&mut s, NamedKey::Tab);
     plain(&mut s, NamedKey::ArrowUp);
-    assert!(focused(f[3]), "wrapping when asked, along a vertical toolbar");
+    assert!(focused(&mut s, f[3]), "wrapping when asked, along a vertical toolbar");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[3]), "the horizontal arrows do nothing there");
+    assert!(focused(&mut s, f[3]), "the horizontal arrows do nothing there");
 }
 
 #[test]
 fn a_horizontal_toolbar_swaps_its_arrows_right_to_left() {
     let (mut s, f, _) = toolbar(Axis::Horizontal, Wrap::Stop, Some(gui::Direction::Rtl));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[0]));
+    assert!(focused(&mut s, f[0]));
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(f[2]), "ArrowLeft moves on right to left");
+    assert!(focused(&mut s, f[2]), "ArrowLeft moves on right to left");
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(f[3]));
+    assert!(focused(&mut s, f[3]));
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[2]), "ArrowRight moves back");
+    assert!(focused(&mut s, f[2]), "ArrowRight moves back");
     plain(&mut s, NamedKey::Home);
-    assert!(focused(f[0]), "Home is the first item still");
+    assert!(focused(&mut s, f[0]), "Home is the first item still");
 
     let (mut s, f, _) = toolbar(Axis::Vertical, Wrap::Stop, Some(gui::Direction::Rtl));
     plain(&mut s, NamedKey::Tab);
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(f[2]), "a vertical toolbar's arrows do not swap");
+    assert!(focused(&mut s, f[2]), "a vertical toolbar's arrows do not swap");
 }
 
 /// A toolbar of "Bold", a dropdown trigger "Open" (made an item before or
@@ -1591,19 +1612,22 @@ fn a_menu_trigger_in_a_toolbar_keeps_its_keys() {
         let (mut s, m) = menu_in_toolbar(Axis::Horizontal, trigger_last);
         let trigger = m.trigger.get_untracked().expect("the trigger's focus");
         plain(&mut s, NamedKey::Tab);
-        assert!(focused(m.buttons[0]));
+        assert!(focused(&mut s, m.buttons[0]));
         plain(&mut s, NamedKey::ArrowRight);
-        assert!(focused(trigger), "the toolbar's arrows reach the trigger");
+        assert!(focused(&mut s, trigger), "the toolbar's arrows reach the trigger");
         plain(&mut s, NamedKey::ArrowDown);
         assert!(m.open.get_untracked(), "ArrowDown opens the menu ({trigger_last})");
-        assert!(focused(m.items[0]), "on its first item");
+        assert!(focused(&mut s, m.items[0]), "on its first item");
         plain(&mut s, NamedKey::ArrowRight);
-        assert!(focused(m.items[0]), "the menu's keys are not the toolbar's");
+        assert!(focused(&mut s, m.items[0]), "the menu's keys are not the toolbar's");
         plain(&mut s, NamedKey::Escape);
         assert!(!m.open.get_untracked());
-        assert!(focused(trigger), "focus comes back to the trigger");
+        assert!(focused(&mut s, trigger), "focus comes back to the trigger");
         plain(&mut s, NamedKey::ArrowRight);
-        assert!(focused(m.buttons[1]), "the arrows it leaves move along the toolbar");
+        assert!(
+            focused(&mut s, m.buttons[1]),
+            "the arrows it leaves move along the toolbar"
+        );
         plain(&mut s, NamedKey::ArrowLeft);
         plain(&mut s, NamedKey::Enter);
         assert!(m.open.get_untracked(), "Enter opens it");
@@ -1613,18 +1637,18 @@ fn a_menu_trigger_in_a_toolbar_keeps_its_keys() {
         let trigger = m.trigger.get_untracked().expect("the trigger's focus");
         plain(&mut s, NamedKey::Tab);
         plain(&mut s, NamedKey::ArrowDown);
-        assert!(focused(trigger), "down a vertical toolbar to the trigger");
+        assert!(focused(&mut s, trigger), "down a vertical toolbar to the trigger");
         plain(&mut s, NamedKey::ArrowDown);
         assert!(
             m.open.get_untracked(),
             "ArrowDown opens the menu in a vertical toolbar too ({trigger_last})"
         );
-        assert!(!focused(m.buttons[1]), "instead of moving focus");
+        assert!(!focused(&mut s, m.buttons[1]), "instead of moving focus");
         plain(&mut s, NamedKey::Escape);
-        assert!(focused(trigger));
+        assert!(focused(&mut s, trigger));
         plain(&mut s, NamedKey::ArrowUp);
         assert!(
-            focused(m.buttons[0]),
+            focused(&mut s, m.buttons[0]),
             "ArrowUp, which the trigger leaves, moves up the toolbar"
         );
     }
@@ -1632,9 +1656,9 @@ fn a_menu_trigger_in_a_toolbar_keeps_its_keys() {
 
 #[test]
 fn what_a_screen_reader_is_told_of_a_toolbar() {
-    let (s, _, _) = toolbar(Axis::Horizontal, Wrap::Stop, None);
+    let (mut s, _, _) = toolbar(Axis::Horizontal, Wrap::Stop, None);
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_toolbar_a11y", dump(&tree));
 }
 
@@ -1707,7 +1731,7 @@ fn focus_comes_back_to_the_trigger() {
     click(&mut s, "Open");
     click(&mut s, "Apple");
     assert!(
-        focused(trigger_of(&d)),
+        focused(&mut s, trigger_of(&d)),
         "a pick gives focus to the trigger, not to what held it before (reka's `onCloseAutoFocus`)"
     );
 
@@ -1715,10 +1739,10 @@ fn focus_comes_back_to_the_trigger() {
     let (x, y) = at(&s, "Banana");
     hover(&mut s, x, y);
     plain(&mut s, NamedKey::Escape);
-    assert!(focused(trigger_of(&d)));
+    assert!(focused(&mut s, trigger_of(&d)));
     plain(&mut s, NamedKey::Enter);
     assert!(
-        focused(d.foci[0]),
+        focused(&mut s, d.foci[0]),
         "Enter opens on the first item, the mouse resting on another"
     );
 }
@@ -1739,7 +1763,7 @@ fn a_submenu_stays_open_when_the_highlight_merely_goes_away() {
     wait(&mut s, u64::try_from(GRACE.as_millis()).expect("ms") + 50);
     hover(&mut s, x + 76.0, fy);
     assert!(
-        m.root_items.iter().all(|f| !focused(*f)),
+        m.root_items.iter().all(|f| !focused(&mut s, *f)),
         "no item is highlighted: the content holds focus"
     );
     assert!(
@@ -1750,7 +1774,7 @@ fn a_submenu_stays_open_when_the_highlight_merely_goes_away() {
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(m.sub_items[0]));
+    assert!(focused(&mut s, m.sub_items[0]));
     s.act("focus the first item", || m.root_items[0].focus());
     s.settle().expect("settled");
     assert!(
@@ -1881,16 +1905,14 @@ fn filtered_in(scroll: Option<gui::ScrollHandle>) -> (Scenario, Dropdown, gui::T
     let log = Rc::clone(&picked);
     let s = scenario(move || {
         let log = Rc::clone(&log);
-        let scroll = scroll.clone();
         component((), move |_| {
             let dd = DropdownMenu::new(open, MenuOptions::DEFAULT);
             hand_out(trigger_focus, Some(dd.menu().trigger_focus()));
             hand_out(level, Some(dd.menu()));
-            if let Some(handle) = &scroll {
-                dd.menu().scroll_with(handle.clone());
+            if let Some(handle) = scroll {
+                dd.menu().scroll_with(handle);
             }
             let log = Rc::clone(&log);
-            let scroll = scroll.clone();
             move || {
                 let menu = dd.menu();
                 let search = component((), move |_| {
@@ -1940,28 +1962,25 @@ fn filtered_in(scroll: Option<gui::ScrollHandle>) -> (Scenario, Dropdown, gui::T
 fn a_filter_keeps_focus_while_the_keys_move_the_highlight() {
     let (mut s, d, field, level) = filtered();
     let menu = level.get_untracked().expect("the menu");
-    assert!(focused(field.focus), "asked to, it takes focus once laid out");
+    assert!(focused(&mut s, field.focus), "asked to, it takes focus once laid out");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(field.focus), "focus stays in the field");
+    assert!(focused(&mut s, field.focus), "focus stays in the field");
     assert!(
-        gui::untracked(|| menu.is_highlighted(d.foci[0])),
+        s.read(|| menu.is_highlighted(d.foci[0])),
         "the first item is highlighted"
     );
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(
-        gui::untracked(|| menu.is_highlighted(d.foci[3])),
-        "the disabled item is passed"
-    );
+    assert!(s.read(|| menu.is_highlighted(d.foci[3])), "the disabled item is passed");
     plain(&mut s, NamedKey::Home);
-    assert!(gui::untracked(|| menu.is_highlighted(d.foci[0])));
+    assert!(s.read(|| menu.is_highlighted(d.foci[0])));
     plain(&mut s, NamedKey::End);
-    assert!(gui::untracked(|| menu.is_highlighted(d.foci[4])));
+    assert!(s.read(|| menu.is_highlighted(d.foci[4])));
     // The pointer highlights too, focus kept in the field.
     let (bx, by) = at(&s, "Banana");
     hover(&mut s, bx, by);
-    assert!(focused(field.focus));
-    assert!(gui::untracked(|| menu.is_highlighted(d.foci[1])));
+    assert!(focused(&mut s, field.focus));
+    assert!(s.read(|| menu.is_highlighted(d.foci[1])));
     // Typing types, Space included: no typeahead, no pick.
     type_char(&mut s, "b");
     type_char(&mut s, " ");
@@ -1984,26 +2003,26 @@ fn a_filter_keeps_focus_while_the_keys_move_the_highlight() {
 #[test]
 fn a_highlight_moved_from_the_filter_is_scrolled_into_view_the_nearest_way() {
     let scroll = gui::ScrollHandle::new();
-    let (mut s, d, field, level) = filtered_in(Some(scroll.clone()));
+    let (mut s, d, field, level) = filtered_in(Some(scroll));
     let menu = level.get_untracked().expect("the menu");
     let y = || gui::untracked(|| scroll.offset()).1;
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(gui::untracked(|| menu.is_highlighted(d.foci[1])));
+    assert!(s.read(|| menu.is_highlighted(d.foci[1])));
     assert!(y().abs() < 0.5, "a highlight in view scrolls nothing");
     plain(&mut s, NamedKey::End);
-    assert!(gui::untracked(|| menu.is_highlighted(d.foci[4])));
+    assert!(s.read(|| menu.is_highlighted(d.foci[4])));
     assert!(
         (y() - 72.0).abs() < 0.5,
         "the last row is brought in at the bottom edge: {}",
         y()
     );
     plain(&mut s, NamedKey::ArrowUp);
-    assert!(gui::untracked(|| menu.is_highlighted(d.foci[3])));
+    assert!(s.read(|| menu.is_highlighted(d.foci[3])));
     assert!((y() - 72.0).abs() < 0.5, "Date is in view already: {}", y());
     plain(&mut s, NamedKey::Home);
     assert!(y().abs() < 0.5, "the first row is brought in at the top edge: {}", y());
-    assert!(focused(field.focus), "focus stays in the field throughout");
+    assert!(focused(&mut s, field.focus), "focus stays in the field throughout");
 }
 
 #[test]
@@ -2022,7 +2041,7 @@ fn a_filter_leaves_the_keys_to_a_composing_input_method() {
         before,
         "the arrow is the input method's"
     );
-    assert!(focused(field.focus));
+    assert!(focused(&mut s, field.focus));
 }
 
 #[test]
@@ -2030,7 +2049,7 @@ fn what_a_screen_reader_is_told_of_a_menu_filter() {
     let (mut s, _d, _field, _level) = filtered();
     plain(&mut s, NamedKey::ArrowDown);
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     let nodes: HashMap<NodeId, &Node> = tree.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let search = tree
         .nodes
@@ -2124,11 +2143,11 @@ fn a_right_to_left_menubar_moves_on_with_the_inline_end_key_from_a_submenu() {
     s.act("open File", || value.set("file".to_owned()));
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(foci[0]));
+    assert!(focused(&mut s, foci[0]));
     plain(&mut s, NamedKey::ArrowDown);
     plain(&mut s, NamedKey::ArrowLeft);
     assert!(sub_open.get_untracked(), "ArrowLeft, the inline end, opens the submenu");
-    assert!(focused(foci[2]));
+    assert!(focused(&mut s, foci[2]));
     plain(&mut s, NamedKey::ArrowRight);
     assert!(
         !sub_open.get_untracked(),
@@ -2187,14 +2206,14 @@ fn a_menubar_wraps_when_asked_is_one_tab_stop_and_its_value_is_the_callers() {
     });
     let t = |i: usize| triggers.get_untracked()[i];
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(t(0)), "Tab enters the bar at its first trigger");
+    assert!(focused(&mut s, t(0)), "Tab enters the bar at its first trigger");
     plain(&mut s, NamedKey::ArrowRight);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(t(0)), "the triggers wrap");
+    assert!(focused(&mut s, t(0)), "the triggers wrap");
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(t(1)));
+    assert!(focused(&mut s, t(1)));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(page), "Tab leaves the bar: it is one Tab stop");
+    assert!(focused(&mut s, page), "Tab leaves the bar: it is one Tab stop");
     key(
         &mut s,
         NamedKey::Tab,
@@ -2203,7 +2222,10 @@ fn a_menubar_wraps_when_asked_is_one_tab_stop_and_its_value_is_the_callers() {
             ..Modifiers::default()
         },
     );
-    assert!(focused(t(1)), "Shift+Tab comes back to the trigger focused last");
+    assert!(
+        focused(&mut s, t(1)),
+        "Shift+Tab comes back to the trigger focused last"
+    );
 
     s.act("the caller opens Edit", || value.set("edit".to_owned()));
     s.settle().expect("settled");
@@ -2249,17 +2271,20 @@ fn a_toolbar_remembers_its_item_and_an_all_disabled_one_is_no_stop() {
     };
     plain(&mut s, NamedKey::Tab);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(foci[0]), "Tab enters at the first enabled item");
+    assert!(focused(&mut s, foci[0]), "Tab enters at the first enabled item");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(foci[1]));
+    assert!(focused(&mut s, foci[1]));
     shift_tab(&mut s);
-    assert!(focused(before), "Shift+Tab leaves the toolbar");
+    assert!(focused(&mut s, before), "Shift+Tab leaves the toolbar");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(foci[1]), "Tab enters at the item focused last");
+    assert!(focused(&mut s, foci[1]), "Tab enters at the item focused last");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(after), "Tab leaves at once");
+    assert!(focused(&mut s, after), "Tab leaves at once");
     shift_tab(&mut s);
-    assert!(focused(foci[1]), "Shift+Tab comes back to the item focused last");
+    assert!(
+        focused(&mut s, foci[1]),
+        "Shift+Tab comes back to the item focused last"
+    );
 
     // Every item disabled: the toolbar is no Tab stop.
     let after = FocusHandle::new();
@@ -2281,12 +2306,12 @@ fn a_toolbar_remembers_its_item_and_an_all_disabled_one_is_no_stop() {
         .into_element()
     });
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(after), "Tab passes a toolbar of disabled items");
+    assert!(focused(&mut s, after), "Tab passes a toolbar of disabled items");
     let (ax, ay) = at(&s, "A");
     s.click(ax, ay);
     s.settle().expect("settled");
     assert!(
-        !focused(foci[0]),
+        !focused(&mut s, foci[0]),
         "a disabled item takes no focus, the pointer's either"
     );
 }
@@ -2326,18 +2351,18 @@ fn a_toolbar_toggle_group_is_part_of_the_toolbar() {
         .into_element()
     });
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(foci[0]));
+    assert!(focused(&mut s, foci[0]));
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(foci[1]), "the toolbar's arrows reach the group's items");
+    assert!(focused(&mut s, foci[1]), "the toolbar's arrows reach the group's items");
     plain(&mut s, NamedKey::Space);
     assert_eq!(value.get_untracked(), ["Bold"], "Space presses the toggle");
     plain(&mut s, NamedKey::ArrowRight);
     plain(&mut s, NamedKey::Enter);
     assert_eq!(value.get_untracked(), ["Bold", "Italic"]);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(after), "the whole toolbar is one Tab stop");
+    assert!(focused(&mut s, after), "the whole toolbar is one Tab stop");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     insta::assert_snapshot!("menus_toolbar_toggle_a11y", dump(&tree));
 }
 
@@ -2434,11 +2459,14 @@ fn a_held_space_toggles_a_trigger_once_and_tab_enters_the_panel() {
     s.settle().expect("settled");
     assert!(open_one(&n), "its auto-repeat is ignored");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(n.links[0]), "Tab from the open trigger enters its panel");
+    assert!(
+        focused(&mut s, n.links[0]),
+        "Tab from the open trigger enters its panel"
+    );
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(n.links[1]));
+    assert!(focused(&mut s, n.links[1]));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(two), "past its last link, the next item");
+    assert!(focused(&mut s, two), "past its last link, the next item");
     key(
         &mut s,
         NamedKey::Tab,
@@ -2447,7 +2475,10 @@ fn a_held_space_toggles_a_trigger_once_and_tab_enters_the_panel() {
             ..Modifiers::default()
         },
     );
-    assert!(focused(n.links[1]), "Shift+Tab from the next item, its last link");
+    assert!(
+        focused(&mut s, n.links[1]),
+        "Shift+Tab from the next item, its last link"
+    );
 }
 
 #[test]
@@ -2504,14 +2535,17 @@ fn a_right_to_left_navigation_menu_swaps_its_arrows() {
     s.act("focus One", || one.focus());
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(two), "right to left, ArrowLeft goes to the next trigger");
+    assert!(
+        focused(&mut s, two),
+        "right to left, ArrowLeft goes to the next trigger"
+    );
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(one), "and ArrowRight to the previous");
+    assert!(focused(&mut s, one), "and ArrowRight to the previous");
     plain(&mut s, NamedKey::Enter);
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(links[0]));
+    assert!(focused(&mut s, links[0]));
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(links[1]), "in a panel too");
+    assert!(focused(&mut s, links[1]), "in a panel too");
 }
 
 /// Items "One" and "Two" whose panels a viewport below the list shows,
@@ -2605,22 +2639,25 @@ fn a_viewport_shows_the_open_panel_and_its_tab_stops_follow_the_trigger() {
     );
     plain(&mut s, NamedKey::Tab);
     assert!(
-        focused(links[0]),
+        focused(&mut s, links[0]),
         "Tab from the open trigger enters the panel, drawn in the viewport after the list"
     );
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(links[1]));
+    assert!(focused(&mut s, links[1]));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(t[1]), "past the panel's end, the next item's trigger");
+    assert!(focused(&mut s, t[1]), "past the panel's end, the next item's trigger");
     let back = Modifiers {
         shift: true,
         ..Modifiers::default()
     };
     key(&mut s, NamedKey::Tab, back);
-    assert!(focused(links[1]), "Shift+Tab from the next item, the panel's last link");
+    assert!(
+        focused(&mut s, links[1]),
+        "Shift+Tab from the next item, the panel's last link"
+    );
     key(&mut s, NamedKey::Tab, back);
     key(&mut s, NamedKey::Tab, back);
-    assert!(focused(t[0]), "and before its first, its trigger");
+    assert!(focused(&mut s, t[0]), "and before its first, its trigger");
 
     // Switching moves the viewport's content and its place in Tab order.
     plain(&mut s, NamedKey::ArrowRight);
@@ -2628,7 +2665,7 @@ fn a_viewport_shows_the_open_panel_and_its_tab_stops_follow_the_trigger() {
     s.settle().expect("settled");
     assert!(shows(&s, "Link 2") && !shows(&s, "Link 0"));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(links[2]), "Tab from Two enters Two's panel");
+    assert!(focused(&mut s, links[2]), "Tab from Two enters Two's panel");
 
     // The pointer in the viewport holds it open; leaving closes it.
     let (lx, ly) = at(&s, "Link 3");
@@ -2801,7 +2838,7 @@ fn a_nested_navigation_menu_switches_at_once_and_stays() {
     plain(&mut s, NamedKey::Escape);
     assert!(sub_value.get_untracked().is_none(), "Escape closes the nested panel");
     assert_eq!(value.get_untracked().as_deref(), Some("one"), "and only it");
-    assert!(focused(b_trigger), "focus on its trigger");
+    assert!(focused(&mut s, b_trigger), "focus on its trigger");
 }
 
 #[test]
@@ -2815,7 +2852,7 @@ fn a_link_picked_in_a_nested_panel_closes_the_whole_menu() {
     assert_eq!(n.sub_value.get_untracked().as_deref(), Some("a"));
     plain(&mut s, NamedKey::ArrowRight);
     assert!(
-        focused(n.sub_links[0]),
+        focused(&mut s, n.sub_links[0]),
         "ArrowRight enters a vertical nested menu's panel"
     );
     plain(&mut s, NamedKey::Enter);
@@ -2826,7 +2863,7 @@ fn a_link_picked_in_a_nested_panel_closes_the_whole_menu() {
     );
     assert!(n.sub_value.get_untracked().is_none(), "and the nested one with it");
     let one = n.one.get_untracked().expect("One's trigger");
-    assert!(focused(one), "focus goes back to the root item's trigger");
+    assert!(focused(&mut s, one), "focus goes back to the root item's trigger");
 
     // By the mouse.
     let (mut s, n) = nested();
@@ -2930,11 +2967,8 @@ fn a_filter_registered_again_with_the_same_field_stays_the_levels_filter() {
     s.act("focus the field", || field.focus.focus());
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(field.focus), "focus stays in the level's filter");
-    assert!(
-        gui::untracked(|| menu.is_highlighted(foci[0])),
-        "the first item is highlighted"
-    );
+    assert!(focused(&mut s, field.focus), "focus stays in the level's filter");
+    assert!(s.read(|| menu.is_highlighted(foci[0])), "the first item is highlighted");
 }
 
 /// `part`, set up by the cold frame alone: a cold re-render's setup that

@@ -377,7 +377,7 @@ mod tests {
             .nodes
             .iter()
             .find(|n| n.name == Some(name))
-            .map(|n| n.bounds)
+            .map(|n| n.bounds(gui::inspect::OUTSIDE))
             .expect("the node on screen")
     }
 

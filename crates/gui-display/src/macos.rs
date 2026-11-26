@@ -51,7 +51,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
 use objc2::{MainThreadMarker, available};
 use objc2_app_kit::{
-    NSApplicationDidChangeScreenParametersNotification, NSScreen, NSScreenColorSpaceDidChangeNotification,
+    NSApplication, NSApplicationDidChangeScreenParametersNotification, NSEvent, NSEventMask, NSEventModifierFlags,
+    NSEventPhase, NSEventType, NSScreen, NSScreenColorSpaceDidChangeNotification, NSWindow,
 };
 use objc2_core_foundation::{CFRetained, CFUUID};
 use objc2_core_graphics::{CGDirectDisplayID, CGDisplayCopyDisplayMode, CGDisplayMode};
@@ -59,7 +60,7 @@ use objc2_core_video::{
     CVDisplayLink, CVGetCurrentHostTime, CVGetHostClockFrequency, CVOptionFlags, CVReturn, CVTimeStamp,
     CVTimeStampFlags,
 };
-use objc2_foundation::{NSNotification, NSNotificationCenter, NSNotificationName, NSNumber, ns_string};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSNotificationName, NSNumber, NSProcessInfo, ns_string};
 
 use crate::ticks::{Asked, Feed, Source};
 use crate::{
@@ -742,6 +743,216 @@ impl Drop for Reader {
     }
 }
 
+/// A window's scroll events taken by a local event monitor
+/// ([`crate::ScrollTap`]): the monitor, removed when this is dropped.
+pub(crate) struct Tap {
+    monitor: Retained<AnyObject>,
+}
+
+impl Drop for Tap {
+    fn drop(&mut self) {
+        untap(&self.monitor);
+    }
+}
+
+/// Take the scroll events AppKit dispatches to `window` (by the key
+/// winit's `WindowId` has), each read whole to `on`, the window getting
+/// none ([`crate::tap_scrolls`]). `None` off the main thread.
+pub(crate) fn tap(window: u64, on: Box<dyn Fn(crate::Scroll)>) -> Option<Tap> {
+    let mtm = MainThreadMarker::new()?;
+    // Known by a weak reference, not by its address (Opus r8 nit).
+    let mine = window_named(window, mtm)?;
+    let handler = RcBlock::new(move |e: NonNull<NSEvent>| -> *mut NSEvent {
+        let event = event_of(&e);
+        let taken = handled(
+            event.r#type() == NSEventType::ScrollWheel,
+            || window_of(event, mtm),
+            || address_of(&mine),
+            || read_scroll(event, mtm),
+            &on,
+        );
+        // Taken: AppKit dispatches nothing, so the view's `scrollWheel:`
+        // (winit's one maker of a `MouseWheel`) never runs for it.
+        if taken { std::ptr::null_mut() } else { e.as_ptr() }
+    });
+    monitor(&handler).map(|monitor| Tap { monitor })
+}
+
+/// Whether a tap of `window` takes an event (a `scroll` to the window
+/// `to` names), handing it, read whole, to `on`: its own window's scroll
+/// events alone, each read off the event itself, so nothing of one
+/// window's gesture (a zero-delta end) is ever another's.
+fn take(
+    scroll: bool,
+    to: impl FnOnce() -> Option<u64>,
+    window: impl FnOnce() -> Option<u64>,
+    read: impl FnOnce() -> crate::Scroll,
+    on: &dyn Fn(crate::Scroll),
+) -> bool {
+    if !scroll {
+        return false;
+    }
+    match (to(), window()) {
+        (Some(to), Some(window)) if to == window => {}
+        _ => return false,
+    }
+    on(read());
+    true
+}
+
+/// [`take`], as the monitor's block runs it: a panic in it (reading the
+/// event, the app's handler) never unwinds into AppKit, which would abort
+/// the process. It is reported, and the event goes back to AppKit untaken
+/// (winit's view then handles it as it would with no tap), as the display
+/// link's callback does with its own (`ticked`).
+fn handled(
+    scroll: bool,
+    to: impl FnOnce() -> Option<u64>,
+    window: impl FnOnce() -> Option<u64>,
+    read: impl FnOnce() -> crate::Scroll,
+    on: &dyn Fn(crate::Scroll),
+) -> bool {
+    let run = std::panic::AssertUnwindSafe(|| take(scroll, to, window, read, on));
+    std::panic::catch_unwind(run).unwrap_or_else(|_| {
+        eprintln!("gui-display: a panic handling a tapped scroll event; handed back to AppKit");
+        false
+    })
+}
+
+/// The app's window whose address winit's `WindowId` is (`window`), by a
+/// weak reference: AppKit clears it when the window is freed, so a tap
+/// that outlived its window never takes the events of another window
+/// later made at the same address. `None` when no window has it.
+fn window_named(window: u64, mtm: MainThreadMarker) -> Option<objc2::rc::Weak<NSWindow>> {
+    NSApplication::sharedApplication(mtm)
+        .windows()
+        .iter()
+        .find(|w| u64::try_from(Retained::as_ptr(w).addr()).ok() == Some(window))
+        .map(|w| objc2::rc::Weak::from_retained(&w))
+}
+
+/// The address of the window `weak` holds, while it is alive.
+fn address_of(weak: &objc2::rc::Weak<NSWindow>) -> Option<u64> {
+    let w = weak.load()?;
+    u64::try_from(Retained::as_ptr(&w).addr()).ok()
+}
+
+/// Install `handler` as a local monitor of scroll events.
+#[expect(
+    unsafe_code,
+    reason = "installs a local event monitor for scroll events (ADR-0029, site 13)"
+)]
+fn monitor(handler: &block2::DynBlock<dyn Fn(NonNull<NSEvent>) -> *mut NSEvent>) -> Option<Retained<AnyObject>> {
+    // SAFETY: the handler returns the event it was given (a live NSEvent
+    // AppKit holds for the call) or null, the two returns AppKit takes. It
+    // is called on the main thread only (local monitors run where AppKit
+    // dispatches), which the `MainThreadMarker` it captures assumes, and
+    // AppKit copies the block and keeps it until the monitor is removed.
+    unsafe { NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::ScrollWheel, handler) }
+}
+
+/// The event AppKit hands a monitor, for the call.
+#[expect(
+    unsafe_code,
+    reason = "reads the event a local monitor is handed (ADR-0029, site 14)"
+)]
+fn event_of(e: &NonNull<NSEvent>) -> &NSEvent {
+    // SAFETY: AppKit hands a monitor a non-null pointer to an NSEvent it
+    // keeps alive for the handler's call; the reference is borrowed from
+    // the pointer, so it does not outlive that call, and nothing mutates
+    // an event.
+    unsafe { e.as_ref() }
+}
+
+/// Remove a monitor [`monitor`] returned.
+#[expect(unsafe_code, reason = "removes the local event monitor (ADR-0029, site 15)")]
+fn untap(monitor: &AnyObject) {
+    // SAFETY: `monitor` is the object `addLocalMonitorForEventsMatchingMask:
+    // handler:` returned, the type `removeMonitor:` takes, removed once
+    // (by the one `Tap` holding it).
+    unsafe { NSEvent::removeMonitor(monitor) }
+}
+
+/// A scroll event as AppKit tells it: its phases, its time on the
+/// monotonic clock (the event's timestamp is seconds since boot, as the
+/// process's uptime is), its delta, and where it is in its window's
+/// content (winit's view is flipped: points from the top left).
+fn read_scroll(e: &NSEvent, mtm: MainThreadMarker) -> crate::Scroll {
+    let age = NSProcessInfo::processInfo().systemUptime() - e.timestamp();
+    let now = Instant::now();
+    let at = Duration::try_from_secs_f64(age.max(0.0))
+        .ok()
+        .and_then(|d| now.checked_sub(d))
+        .unwrap_or(now);
+    let (point, inside) = point_of(e, mtm);
+    let flags = e.modifierFlags();
+    crate::Scroll {
+        phase: scroll_phase(e.phase()),
+        momentum: scroll_phase(e.momentumPhase()),
+        at,
+        delta: (e.scrollingDeltaX(), e.scrollingDeltaY()),
+        precise: e.hasPreciseScrollingDeltas(),
+        point,
+        inside,
+        buttons: NSEvent::pressedMouseButtons() != 0,
+        modifiers: crate::ScrollModifiers {
+            shift: flags.contains(NSEventModifierFlags::Shift),
+            control: flags.contains(NSEventModifierFlags::Control),
+            alt: flags.contains(NSEventModifierFlags::Option),
+            command: flags.contains(NSEventModifierFlags::Command),
+        },
+    }
+}
+
+/// Where `e` is in its window's content view, in the view's own
+/// coordinates (winit's view is flipped: points from the top left, its
+/// `mouse_motion`'s reading), and whether that lies in the view, as winit's
+/// `mouse_motion` tells (against the view's frame size, edges included).
+fn point_of(e: &NSEvent, mtm: MainThreadMarker) -> ((f64, f64), bool) {
+    let at = e.locationInWindow();
+    match e.window(mtm).and_then(|w| w.contentView()) {
+        Some(view) => {
+            let p = view.convertPoint_fromView(at, None);
+            let size = view.frame().size;
+            ((p.x, p.y), within((p.x, p.y), (size.width, size.height)))
+        }
+        None => ((at.x, at.y), false),
+    }
+}
+
+/// Whether `p` lies in a view of `size` from its origin, edges included
+/// (winit 0.30's `mouse_motion`: a negative coordinate or one past the
+/// size is outside).
+fn within(p: (f64, f64), size: (f64, f64)) -> bool {
+    !(p.0.is_sign_negative() || p.1.is_sign_negative() || p.0 > size.0 || p.1 > size.1)
+}
+
+/// The window an event goes to, by the key winit's `WindowId` has on
+/// macOS: the address of its `NSWindow` (winit 0.30, `WinitWindow::id`).
+fn window_of(e: &NSEvent, mtm: MainThreadMarker) -> Option<u64> {
+    let w = e.window(mtm)?;
+    u64::try_from(Retained::as_ptr(&w).addr()).ok()
+}
+
+fn scroll_phase(p: NSEventPhase) -> crate::ScrollPhase {
+    use crate::ScrollPhase as P;
+    if p.contains(NSEventPhase::MayBegin) {
+        P::MayBegin
+    } else if p.contains(NSEventPhase::Began) {
+        P::Began
+    } else if p.contains(NSEventPhase::Changed) {
+        P::Changed
+    } else if p.contains(NSEventPhase::Stationary) {
+        P::Stationary
+    } else if p.contains(NSEventPhase::Ended) {
+        P::Ended
+    } else if p.contains(NSEventPhase::Cancelled) {
+        P::Cancelled
+    } else {
+        P::None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -909,5 +1120,98 @@ mod tests {
             wake: std::sync::Arc::new(|| {}),
         };
         assert!(matches!(MacOs::new(notice), Err(Error::NotMainThread)));
+    }
+
+    fn scroll(dy: f64, phase: crate::ScrollPhase, at: Instant) -> crate::Scroll {
+        crate::Scroll {
+            phase,
+            momentum: crate::ScrollPhase::None,
+            at,
+            delta: (0.0, dy),
+            precise: true,
+            point: (10.0, 10.0),
+            inside: true,
+            buttons: false,
+            modifiers: crate::ScrollModifiers::default(),
+        }
+    }
+
+    /// A place is in the view as winit's `mouse_motion` tells it: edges
+    /// in, a negative coordinate or one past the size out (Opus r7 N3).
+    #[test]
+    fn a_place_is_in_the_view_as_winit_tells_it() {
+        let size = (100.0, 50.0);
+        assert!(within((0.0, 0.0), size));
+        assert!(within((100.0, 50.0), size), "its far edges too");
+        assert!(!within((-0.5, 10.0), size));
+        assert!(!within((10.0, 50.5), size));
+        assert!(!within((-0.0, 10.0), size), "a negative zero, as winit's sign test");
+    }
+
+    /// Installing a tap off the main thread installs nothing (Opus r7 N7:
+    /// the part of the install a test can reach without an AppKit run
+    /// loop; a monitor needs `NSApplication` on the main thread).
+    #[test]
+    fn a_tap_off_the_main_thread_installs_nothing() {
+        assert!(tap(1, Box::new(|_| {})).is_none());
+        assert!(crate::tap_scrolls(1, |_| {}).is_none());
+    }
+
+    /// Opus r8 nit: a tap that outlived its window (closed, its `NSWindow`
+    /// freed) never takes the scroll of a new window AppKit put at the
+    /// same address: the tap knows its window by a weak reference, which
+    /// a freed window clears, not by the address.
+    #[test]
+    fn a_tap_whose_window_is_gone_takes_nothing_at_its_old_address() {
+        let s = scroll(0.0, crate::ScrollPhase::Began, Instant::now());
+        let seen = std::cell::RefCell::new(Vec::new());
+        let on = |s: crate::Scroll| seen.borrow_mut().push(s);
+        let gone = || None;
+        assert!(!take(true, || Some(7), gone, || s, &on), "a new window at 7");
+        assert!(seen.borrow().is_empty());
+        assert!(take(true, || Some(7), || Some(7), || s, &on), "its own window still is");
+    }
+
+    /// Opus r8 nit: a panic while a tapped event is read or handed on
+    /// never unwinds into AppKit (an abort): it is reported, and the
+    /// event goes back to AppKit untaken.
+    #[test]
+    fn a_panic_handling_a_tapped_scroll_hands_the_event_back() {
+        let s = scroll(0.0, crate::ScrollPhase::Began, Instant::now());
+        let on = |_: crate::Scroll| panic!("a handler's bug");
+        assert!(!handled(true, || Some(7), || Some(7), || s, &on));
+    }
+
+    /// One window's gesture ends with a zero-delta `Ended` as another
+    /// window's begins with a zero-delta `Began`, each of the two windows
+    /// tapped: each event is taken by its own window's tap alone, with its
+    /// own phase and time, so neither crosses; and each is taken once, the
+    /// monitor then handing AppKit nothing to dispatch (winit's view, the
+    /// one maker of a `MouseWheel`, never sees it).
+    #[test]
+    fn a_zero_delta_end_and_begin_of_two_windows_never_cross_and_go_once() {
+        use std::cell::RefCell;
+        let now = Instant::now();
+        let later = now.checked_add(Duration::from_millis(3)).unwrap_or(now);
+        let (one, two) = (RefCell::new(Vec::new()), RefCell::new(Vec::new()));
+        let on_one = |s: crate::Scroll| one.borrow_mut().push(s);
+        let on_two = |s: crate::Scroll| two.borrow_mut().push(s);
+        let end = scroll(0.0, crate::ScrollPhase::Ended, now);
+        let begin = scroll(0.0, crate::ScrollPhase::Began, later);
+        // As AppKit runs every monitor on each event: both taps, in turn,
+        // the second only when the first passed it on.
+        let dispatch = |to: u64, s: crate::Scroll| {
+            let first = take(true, || Some(to), || Some(1), || s, &on_one);
+            let second = !first && take(true, || Some(to), || Some(2), || s, &on_two);
+            first || second
+        };
+        assert!(dispatch(2, end), "the end is taken (none dispatched)");
+        assert!(dispatch(1, begin), "the begin is taken (none dispatched)");
+        assert_eq!(*one.borrow(), [begin], "window 1: its begin alone, as it came");
+        assert_eq!(*two.borrow(), [end], "window 2: its end alone, as it came");
+        // Not a scroll, or to no window of a tap: passed on, read by none.
+        assert!(!take(false, || Some(1), || Some(1), || begin, &on_one));
+        assert!(!take(true, || None, || Some(1), || begin, &on_one));
+        assert_eq!(one.borrow().len(), 1, "nothing else read");
     }
 }

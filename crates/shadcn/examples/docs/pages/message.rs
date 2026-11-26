@@ -354,7 +354,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .iter()
         .enumerate()
         .filter(|&(i, n)| n.name == Some("button") && frame.ancestors(i).any(|a| Some(a) == pattern))
-        .map(|(_, n)| n.bounds)
+        .map(|(_, n)| n.bounds(gui::inspect::OUTSIDE))
         .reduce(|a, b| if (b.y, -b.x) > (a.y, -a.x) { b } else { a })
         .ok_or_else(|| ScenarioError::TextNotFound("MessagePatternDemo.vue's actions".to_owned()))?;
     s.hover(action.x + action.width / 2.0, action.y + action.height / 2.0);

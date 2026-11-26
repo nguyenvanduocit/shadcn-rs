@@ -184,7 +184,17 @@ impl<T: Clone + PartialEq + 'static> Choice<T> for Vec<T> {
 /// A two-way value a primitive reads and writes: a part's `UseModel`
 /// (convention 2: the primitive keeps no copy of the caller's value), or a
 /// signal of its own.
+///
+/// A [`Bound`] shares it behind `Rc`, so each implementor states how a
+/// fork (a check, ADR-0028) leaves its state ([`Held::fork_policy`]): held
+/// in signals, which the reactive arena forks, or written only by what a
+/// fork never runs (a handler, the caller's own code). [`Bound::set`]
+/// checks it: a write in a fork to a value of the second kind is a bug,
+/// loud in a debug build.
 pub trait Held<T>: 'static {
+    /// How a fork leaves its state (ADR-0028, rule 4): required, so no
+    /// implementor shares state behind `Rc` unsaid.
+    fn fork_policy(&self) -> HeldFork;
     /// The value, subscribing the reader.
     fn get(&self) -> T;
     fn get_untracked(&self) -> T;
@@ -192,7 +202,24 @@ pub trait Held<T>: 'static {
     fn set(&self, value: T);
 }
 
+/// How a fork leaves a [`Held`] value's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeldFork {
+    /// All of it is in signals, which the reactive arena forks: a fork may
+    /// write it, and its rollback puts it back.
+    Signals,
+    /// Written only by what a fork never runs (a handler, the caller's own
+    /// code between frames), for the reason given: a fork must not write
+    /// it, as no rollback would put it back.
+    Outside(&'static str),
+}
+
 impl<P: 'static, T: Clone + PartialEq + 'static> Held<T> for UseModel<P, T> {
+    /// The part's props and its own value: signals.
+    fn fork_policy(&self) -> HeldFork {
+        HeldFork::Signals
+    }
+
     fn get(&self) -> T {
         UseModel::get(self)
     }
@@ -207,6 +234,10 @@ impl<P: 'static, T: Clone + PartialEq + 'static> Held<T> for UseModel<P, T> {
 }
 
 impl<T: Clone + PartialEq + 'static> Held<T> for Signal<T> {
+    fn fork_policy(&self) -> HeldFork {
+        HeldFork::Signals
+    }
+
     fn get(&self) -> T {
         Signal::get(self)
     }
@@ -274,9 +305,20 @@ impl<T: Clone + PartialEq + 'static> Bound<T> {
         self.held().map(|h| h.get_untracked()).unwrap_or_default()
     }
 
-    /// Write it (an equal value is no write).
+    /// Write it (an equal value is no write). In a fork, only a value held
+    /// in signals is written: one written from outside (`HeldFork::Outside`)
+    /// is a bug, loud in a debug build, and left alone in release.
     pub fn set(self, value: T) {
         if let Some(h) = self.held() {
+            if gui::engine::forking()
+                && let HeldFork::Outside(why) = h.fork_policy()
+            {
+                debug_assert!(
+                    false,
+                    "a fork wrote a `Held` value only the outside world writes ({why})"
+                );
+                return;
+            }
             h.set(value);
         }
     }
@@ -397,8 +439,10 @@ pub enum ListFocus {
 
 /// A caller's answer to a choice about to be made (reka's `select` event,
 /// `preventDefault` to refuse it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Pick {
+    /// The answer with no caller asked (no veto set).
+    #[default]
     Allow,
     Refuse,
 }
@@ -1122,7 +1166,7 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Listbox<T, M> {
     fn virtual_list(self) -> Option<(ListState, Source<T>)> {
         self.parts.with_untracked(|p| {
             p.virtual_list
-                .with_untracked(|v| v.map(|v| (v.state.clone(), Rc::clone(&v.source))))
+                .with_untracked(|v| v.map(|v| (v.state, Rc::clone(&v.source))))
         })
     }
 
@@ -1624,5 +1668,43 @@ mod tests {
         assert_eq!(many.values(), ["x", "y"]);
         one.hold(vec!["x", "y"]);
         assert_eq!(one, Some("y"));
+    }
+
+    /// Opus 2 (F1 review 4): a `Held` value's fork policy is checked, not
+    /// said. A fork writing a value only the outside world writes is loud
+    /// in a debug build and writes nothing; one held in signals is written
+    /// and put back.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_fork_writing_a_value_only_the_outside_writes_is_loud() {
+        use super::{Bound, Held, HeldFork};
+        use std::cell::Cell;
+        use std::rc::Rc;
+        struct Outside(Rc<Cell<u32>>);
+        impl Held<u32> for Outside {
+            fn fork_policy(&self) -> HeldFork {
+                HeldFork::Outside("a test's cell")
+            }
+            fn get(&self) -> u32 {
+                self.0.get()
+            }
+            fn get_untracked(&self) -> u32 {
+                self.0.get()
+            }
+            fn set(&self, value: u32) {
+                self.0.set(value);
+            }
+        }
+        let cell = Rc::new(Cell::new(0));
+        let outside = Bound::new(Outside(Rc::clone(&cell)));
+        let wrote = gui::testing::in_check(|| std::panic::catch_unwind(|| outside.set(1)));
+        assert!(wrote.is_err(), "loud");
+        assert_eq!(cell.get(), 0, "nothing written");
+        outside.set(2);
+        assert_eq!(cell.get(), 2, "live, written");
+        let signal = gui::Signal::new(0_u32);
+        let held = Bound::new(signal);
+        gui::testing::in_check(|| held.set(1));
+        assert_eq!(signal.get_untracked(), 0, "a signal, written in the fork and put back");
     }
 }

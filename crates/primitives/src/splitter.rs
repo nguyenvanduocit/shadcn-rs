@@ -118,11 +118,7 @@
 //! reka sets no orientation, no disabled state and no name (research §4
 //! item 13), so its handles are read as an unnamed separator.
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the group's own, written only by its own layout callbacks, actions and drag handlers, never by a setup or render: the handles' boxes (pruned to those laid out), the sizes before a collapse, those told, the drag partners; the memory storage is the caller's, written only by its `save` from the group's commit"
-)]
-use std::cell::RefCell;
+use gui::engine::{WorldCell, WorldRefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -546,13 +542,10 @@ pub trait Storage {
 }
 
 /// A [`Storage`] that lasts as long as the app: layouts survive a group
-/// unmounting and mounting again.
+/// unmounting and mounting again. It is the world's that made it: a check
+/// saves nothing into a live one (ADR-0034, S7).
 #[derive(Clone, Debug, Default)]
-#[expect(
-    clippy::disallowed_types,
-    reason = "the group's own, written only by its own layout callbacks, actions and drag handlers, never by a setup or render: the handles' boxes (pruned to those laid out), the sizes before a collapse, those told, the drag partners; the memory storage is the caller's, written only by its `save` from the group's commit"
-)]
-pub struct MemoryStorage(Rc<RefCell<HashMap<String, SavedLayout>>>);
+pub struct MemoryStorage(Rc<WorldRefCell<HashMap<String, SavedLayout>>>);
 
 impl Storage for MemoryStorage {
     fn load(&self, key: &str) -> Option<SavedLayout> {
@@ -760,46 +753,45 @@ struct Persist {
     save: Delay,
 }
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the group's own, written only by its own layout callbacks, actions and drag handlers, never by a setup or render: the handles' boxes (pruned to those laid out), the sizes before a collapse, those told, the drag partners; the memory storage is the caller's, written only by its `save` from the group's commit"
-)]
+/// Its cells are the world's that made the group: a check writes none of a
+/// live one's (ADR-0034, S7). They are written only by the group's own
+/// layout callbacks, actions and drag handlers, never by a setup or render.
 struct State {
     options: Rc<dyn Fn() -> SplitterOptions>,
     direction: ReadDirection,
     /// Each handle's box as last laid out, by the panel it follows: what
     /// the panels' sizes do not share, and the reach of the pointer. Read
     /// only for handles mounted now.
-    handle_boxes: RefCell<HashMap<usize, Bounds>>,
+    handle_boxes: WorldRefCell<HashMap<usize, Bounds>>,
     /// The handles mounted, for F6 and the pointer.
     handles: Collection<usize>,
     /// Each collapsed panel's size before it collapsed.
-    before_collapse: RefCell<HashMap<usize, f64>>,
+    before_collapse: WorldRefCell<HashMap<usize, f64>>,
     /// What each panel was last told of its size, in its unit.
-    told: RefCell<HashMap<usize, f64>>,
+    told: WorldRefCell<HashMap<usize, f64>>,
     /// The group's length when its layout was last worked out afresh.
-    init_size: std::cell::Cell<Option<f32>>,
+    init_size: WorldCell<Option<f32>>,
     /// The panels changed since the layout was last worked out: the next
     /// layout pass works it out, once every panel of that pass has joined.
-    stale: std::cell::Cell<bool>,
+    stale: WorldCell<bool>,
     /// The group's content box as this pass measured it, until the pass
     /// has measured the handles too.
-    content: std::cell::Cell<Option<f32>>,
+    content: WorldCell<Option<f32>>,
     on_layout: gui::Holder<LayoutCallback>,
     persist: gui::Holder<Persist>,
     /// The last delta of the drag, so tiny moves that change nothing do
     /// not flicker the cursor.
-    last: std::cell::Cell<f64>,
+    last: WorldCell<f64>,
     /// The pointer is over the group, and its box as last laid out.
-    inside: std::cell::Cell<bool>,
-    bounds: std::cell::Cell<Option<Bounds>>,
+    inside: WorldCell<bool>,
+    bounds: WorldCell<Option<Bounds>>,
     /// Its family, its id in it, and the groups of it a drag that started
     /// here drags too.
     family: Rc<Family>,
     id: gui::Registration,
-    partners: RefCell<Vec<Rc<dyn Member>>>,
+    partners: WorldRefCell<Vec<Rc<dyn Member>>>,
     /// A handle's name, from the panel before it (from 1).
-    name: std::cell::Cell<fn(usize) -> String>,
+    name: WorldCell<fn(usize) -> String>,
 }
 
 /// What a screen reader names the handle after panel `n` (from 1) by, in
@@ -885,10 +877,6 @@ impl<P: 'static> Splitter<P> {
     /// `direction`. Called in setup.
     #[must_use]
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the group's own, written only by its own layout callbacks, actions and drag handlers, never by a setup or render: the handles' boxes (pruned to those laid out), the sizes before a collapse, those told, the drag partners; the memory storage is the caller's, written only by its `save` from the group's commit"
-    )]
     pub fn new(
         layout: UseModel<P, Vec<f64>>,
         options: impl Fn() -> SplitterOptions + 'static,
@@ -919,22 +907,22 @@ impl<P: 'static> Splitter<P> {
             state: Signal::new(State {
                 options: Rc::new(options),
                 direction: direction.into(),
-                handle_boxes: RefCell::new(HashMap::new()),
+                handle_boxes: WorldRefCell::new("a splitter's handle boxes", HashMap::new()),
                 handles: Collection::new(),
-                before_collapse: RefCell::new(HashMap::new()),
-                told: RefCell::new(HashMap::new()),
-                init_size: std::cell::Cell::new(None),
-                stale: std::cell::Cell::new(false),
-                content: std::cell::Cell::new(None),
+                before_collapse: WorldRefCell::new("a splitter's sizes before a collapse", HashMap::new()),
+                told: WorldRefCell::new("a splitter's sizes told", HashMap::new()),
+                init_size: WorldCell::new("a splitter's length when laid out afresh", None),
+                stale: WorldCell::new("whether a splitter's layout is stale", false),
+                content: WorldCell::new("a splitter's content box this pass", None),
                 on_layout: gui::Holder::new(),
                 persist: gui::Holder::new(),
-                last: std::cell::Cell::new(0.0),
-                inside: std::cell::Cell::new(false),
-                bounds: std::cell::Cell::new(None),
+                last: WorldCell::new("a splitter's last drag delta", 0.0),
+                inside: WorldCell::new("whether the pointer is over a splitter", false),
+                bounds: WorldCell::new("a splitter's box", None),
                 family: Rc::clone(&family),
                 id,
-                partners: RefCell::new(Vec::new()),
-                name: std::cell::Cell::new(handle_name),
+                partners: WorldRefCell::new("a splitter's drag partners", Vec::new()),
+                name: WorldCell::new("a splitter's handle name", handle_name),
             }),
         };
         family.members.register(Entry {

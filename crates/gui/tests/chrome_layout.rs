@@ -431,7 +431,10 @@ fn ours(nodes: &[FrameNode]) -> Vec<Placed> {
         out.push(Placed {
             depth: depth[i] - 1,
             tag: tag.to_owned(),
-            rect: [n.bounds.x, n.bounds.y, n.bounds.width, n.bounds.height],
+            rect: {
+                let b = n.bounds(gui::inspect::OUTSIDE);
+                [b.x, b.y, b.width, b.height]
+            },
         });
     }
     out

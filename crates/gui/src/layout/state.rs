@@ -19,8 +19,10 @@ pub(crate) type ScrollId = (NodePath, Option<crate::reactive::OwnerId>);
 pub(crate) struct ByScroller<V> {
     map: HashMap<NodePath, (Option<crate::reactive::OwnerId>, V)>,
     /// The paths written since the last layout pass took them (a pass
-    /// reads the state shared, and takes them as it places them).
-    pub(super) changed: std::cell::RefCell<HashSet<NodePath>>,
+    /// reads the state shared, and takes them as it places them). The
+    /// world's that made the state: a check's copy is its own (review r18,
+    /// decision 2).
+    pub(super) changed: crate::engine::WorldRefCell<HashSet<NodePath>>,
     /// Entries visited by writes (tests: a write is O(1)).
     #[cfg(test)]
     pub(crate) visited: u64,
@@ -30,7 +32,10 @@ impl<V> Default for ByScroller<V> {
     fn default() -> Self {
         Self {
             map: HashMap::default(),
-            changed: std::cell::RefCell::default(),
+            changed: crate::engine::WorldRefCell::new(
+                "the scroll paths written (`ByScroller::changed`)",
+                HashSet::default(),
+            ),
             #[cfg(test)]
             visited: 0,
         }

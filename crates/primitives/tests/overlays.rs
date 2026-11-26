@@ -56,8 +56,10 @@ fn scenario(f: impl Fn() -> Element + 'static) -> Scenario {
     s
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// Whether `h` holds focus in `s`'s window, read in a turn of it (outside
+/// any turn, focus is the thread window's: ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
 }
 
 fn plain(s: &mut Scenario, k: NamedKey) {
@@ -238,9 +240,10 @@ fn part(register: impl Fn() + 'static, e: impl IntoElement) -> Element {
     .into_element()
 }
 
-fn a11y(s: &Scenario) -> String {
+fn a11y(s: &mut Scenario) -> String {
     let mut ts = gui::text::TextSystem::new();
-    dump(&gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts))
+    let focus = s.read(gui::focus::focused);
+    dump(&gui::access::tree(s.last(), focus, 1.0, "w", &mut ts))
 }
 
 /// A dismissal's reason, by name.
@@ -322,15 +325,15 @@ fn a_modal_dialog_closes_on_escape_and_a_press_outside_and_gives_focus_back() {
     let mut p = dialog_page(Open::closed(), true, None);
     click(&mut p.s, TRIGGER);
     assert!(p.dialog.is_open(), "the trigger opens it");
-    assert!(focused(p.inner), "focus moves to its first Tab stop");
+    assert!(focused(&mut p.s, p.inner), "focus moves to its first Tab stop");
     // Tab stays inside: the one stop wraps to itself.
     plain(&mut p.s, NamedKey::Tab);
-    assert!(focused(p.inner), "focus is trapped");
-    insta::assert_snapshot!("dialog_a11y", a11y(&p.s));
+    assert!(focused(&mut p.s, p.inner), "focus is trapped");
+    insta::assert_snapshot!("dialog_a11y", a11y(&mut p.s));
 
     plain(&mut p.s, NamedKey::Escape);
     assert!(!p.dialog.is_open(), "Escape closes it");
-    assert!(focused(p.trigger), "focus goes back to the trigger");
+    assert!(focused(&mut p.s, p.trigger), "focus goes back to the trigger");
 
     click(&mut p.s, TRIGGER);
     assert!(p.dialog.is_open());
@@ -441,13 +444,13 @@ fn an_alert_dialog_focuses_cancel_and_closes_only_by_its_buttons_or_escape() {
     let mut p = alert_page(true);
     click(&mut p.s, TRIGGER);
     assert!(p.alert.is_open());
-    assert!(focused(p.cancel), "Cancel takes focus, whatever comes first");
-    insta::assert_snapshot!("alert_dialog_a11y", a11y(&p.s));
+    assert!(focused(&mut p.s, p.cancel), "Cancel takes focus, whatever comes first");
+    insta::assert_snapshot!("alert_dialog_a11y", a11y(&mut p.s));
     click(&mut p.s, OUTSIDE);
     assert!(p.alert.is_open(), "a press outside does not close it");
     plain(&mut p.s, NamedKey::Escape);
     assert!(!p.alert.is_open(), "Escape closes it");
-    assert!(focused(p.trigger), "focus goes back to the trigger");
+    assert!(focused(&mut p.s, p.trigger), "focus goes back to the trigger");
 
     click(&mut p.s, TRIGGER);
     plain(&mut p.s, NamedKey::Enter);
@@ -462,8 +465,8 @@ fn an_alert_dialog_whose_auto_focus_is_prevented_leaves_focus_alone() {
     let mut p = alert_page(false);
     click(&mut p.s, TRIGGER);
     assert!(p.alert.is_open());
-    assert!(!focused(p.cancel), "Cancel is not focused");
-    assert!(focused(p.action), "the trap holds focus at its first stop");
+    assert!(!focused(&mut p.s, p.cancel), "Cancel is not focused");
+    assert!(focused(&mut p.s, p.action), "the trap holds focus at its first stop");
     let _ = p.trigger;
 }
 
@@ -500,21 +503,21 @@ fn a_popover_closes_on_a_press_outside_and_gives_focus_back_to_its_trigger() {
     let trigger = pop.trigger_focus();
     click(&mut s, TRIGGER);
     assert!(pop.is_open());
-    assert!(focused(inner), "focus moves into it");
-    insta::assert_snapshot!("popover_a11y", a11y(&s));
+    assert!(focused(&mut s, inner), "focus moves into it");
+    insta::assert_snapshot!("popover_a11y", a11y(&mut s));
     plain(&mut s, NamedKey::Escape);
     assert!(!pop.is_open(), "Escape closes it");
-    assert!(focused(trigger), "focus goes back to the trigger");
+    assert!(focused(&mut s, trigger), "focus goes back to the trigger");
     // Tab wraps inside it (reka's `loop`), not trapped: focus moved
     // outside by code closes it, and a press outside does too.
     click(&mut s, TRIGGER);
     assert!(pop.is_open());
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(inner) && pop.is_open(), "Tab wraps inside it");
+    assert!(focused(&mut s, inner) && pop.is_open(), "Tab wraps inside it");
     s.act("focus outside", || other.focus());
     s.settle().expect("settled");
     assert!(!pop.is_open(), "focus leaving closes it");
-    assert!(focused(other), "and stays where it went");
+    assert!(focused(&mut s, other), "and stays where it went");
     click(&mut s, TRIGGER);
     assert!(pop.is_open());
     click(&mut s, OUTSIDE);
@@ -563,7 +566,7 @@ fn a_hover_card_opens_after_700ms_and_closes_300ms_after_the_pointer_leaves() {
     assert!(!card.is_open(), "not before 700ms");
     wait(&mut s, 20 * MS);
     assert!(card.is_open(), "open at 700ms");
-    insta::assert_snapshot!("hover_card_a11y", a11y(&s));
+    insta::assert_snapshot!("hover_card_a11y", a11y(&mut s));
 
     // Away from the card: the grace area is left, the close delay runs.
     glide(&mut s, TRIGGER, (400.0, 15.0));
@@ -715,15 +718,15 @@ fn a_tooltip_opens_on_keyboard_focus_and_a_disabled_one_never() {
     t.s.act("focus", || t.triggers[0].focus());
     t.s.settle().expect("settled");
     plain(&mut t.s, NamedKey::Tab);
-    assert!(focused(t.triggers[1]));
+    assert!(focused(&mut t.s, t.triggers[1]));
     assert!(right.is_open(), "keyboard focus opens it");
     plain(&mut t.s, NamedKey::Tab);
     assert!(!right.is_open(), "losing focus closes it");
 }
 
 impl Tips {
-    fn s_a11y(&self) -> String {
-        a11y(&self.s)
+    fn s_a11y(&mut self) -> String {
+        a11y(&mut self.s)
     }
 }
 
@@ -789,14 +792,14 @@ fn a_drawer_asks_before_each_change_and_closes_when_swiped_away() {
     let trigger = drawer.trigger_focus();
     click(&mut s, TRIGGER);
     assert!(drawer.is_open(), "the trigger opens it");
-    assert!(focused(inner), "focus moves into it");
-    insta::assert_snapshot!("drawer_a11y", a11y(&s));
+    assert!(focused(&mut s, inner), "focus moves into it");
+    insta::assert_snapshot!("drawer_a11y", a11y(&mut s));
     plain(&mut s, NamedKey::Escape);
     assert!(drawer.is_open(), "the refused Escape keeps it open");
     refuse_escape.set(false);
     plain(&mut s, NamedKey::Escape);
     assert!(!drawer.is_open(), "Escape closes it");
-    assert!(focused(trigger), "focus goes back to the trigger");
+    assert!(focused(&mut s, trigger), "focus goes back to the trigger");
 
     click(&mut s, TRIGGER);
     // A short drag eases back; a long one closes it.
@@ -867,7 +870,7 @@ fn toasts_count_down_pause_together_restart_on_update_and_leave_on_escape() {
         toaster.show(b, "Failed", says("Failed", Sensitivity::Foreground, Some(5000 * MS)));
     });
     s.settle().expect("settled");
-    insta::assert_snapshot!("toast_a11y", a11y(&s));
+    insta::assert_snapshot!("toast_a11y", a11y(&mut s));
     wait(&mut s, 3000 * MS);
     assert_eq!(count(), 2);
 
@@ -901,7 +904,7 @@ fn toasts_count_down_pause_together_restart_on_update_and_leave_on_escape() {
     plain(&mut s, NamedKey::Tab);
     plain(&mut s, NamedKey::Escape);
     assert_eq!(count(), 0, "Escape dismisses it");
-    assert!(gui::focus::focused().is_some(), "focus is not dropped to nowhere");
+    assert!(s.read(gui::focus::focused).is_some(), "focus is not dropped to nowhere");
 }
 
 // More of each overlay's table ---------------------------------------------
@@ -912,7 +915,7 @@ fn named(s: &Scenario, name: &str) -> gui::Bounds {
         .nodes
         .iter()
         .find(|n| n.name == Some(name))
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .expect("the node is laid out")
 }
 
@@ -968,7 +971,7 @@ fn a_kept_dialog_takes_no_escape_while_closed_and_focuses_again_on_reopening() {
     let mut s = scenario(move || root(Open::closed(), Rc::clone(&make), Rc::clone(&render), &g));
     let dialog = got.get().expect("the dialog");
     click(&mut s, TRIGGER);
-    assert!(focused(inner), "opening focuses its first stop");
+    assert!(focused(&mut s, inner), "opening focuses its first stop");
     plain(&mut s, NamedKey::Escape);
     assert!(!dialog.is_open());
     assert_eq!(escapes.get(), 0, "the open dialog took that Escape");
@@ -980,7 +983,7 @@ fn a_kept_dialog_takes_no_escape_while_closed_and_focuses_again_on_reopening() {
     );
     click(&mut s, TRIGGER);
     assert!(
-        dialog.is_open() && focused(inner),
+        dialog.is_open() && focused(&mut s, inner),
         "reopened, it focuses its first stop again"
     );
 }
@@ -1025,7 +1028,7 @@ fn escape_closes_a_popover_in_a_dialog_before_the_dialog() {
     let popover = pop.get().expect("the popover");
     s.act("open the popover", || popover.set_open(true));
     s.settle().expect("settled");
-    assert!(focused(inner));
+    assert!(focused(&mut s, inner));
     plain(&mut s, NamedKey::Escape);
     assert!(!popover.is_open() && dialog.is_open(), "the top layer closes first");
     plain(&mut s, NamedKey::Escape);
@@ -1062,7 +1065,7 @@ fn a_dialog_that_is_not_modal_closes_when_focus_goes_outside() {
     s.act("focus outside", || elsewhere.focus());
     s.settle().expect("settled");
     assert!(!dialog.is_open(), "focus outside closes it");
-    assert!(focused(elsewhere), "focus stays where it went");
+    assert!(focused(&mut s, elsewhere), "focus stays where it went");
 }
 
 #[test]
@@ -1121,7 +1124,7 @@ fn a_non_modal_dialog_opened_by_code_closes_once_on_the_next_press_of_what_opene
     let at = named_centre(&s, "toggle");
     click(&mut s, at);
     assert!(dialog.is_open(), "the toggle opens it by code");
-    assert!(!focused(toggle), "its content took focus");
+    assert!(!focused(&mut s, toggle), "its content took focus");
     click(&mut s, at);
     assert!(
         !dialog.is_open(),
@@ -1192,14 +1195,14 @@ fn a_modal_popover_closes_on_a_secondary_press_outside_without_giving_focus_back
     let mut p = popover_page(Open::closed(), true, false);
     let trigger = p.pop.trigger_focus();
     click(&mut p.s, TRIGGER);
-    assert!(p.pop.is_open() && focused(p.inner));
+    assert!(p.pop.is_open() && focused(&mut p.s, p.inner));
     p.s.secondary_click(OUTSIDE.0, OUTSIDE.1);
     p.s.settle().expect("settled");
     assert!(
         !p.pop.is_open(),
         "a secondary press outside closes a modal popover (not a dialog)"
     );
-    assert!(!focused(trigger), "and gives no focus back");
+    assert!(!focused(&mut p.s, trigger), "and gives no focus back");
 }
 
 #[test]
@@ -1355,14 +1358,14 @@ fn a_drawer_that_only_traps_focus_lets_the_page_take_the_pointer_and_closes_on_a
         ..DrawerOptions::default()
     });
     click(&mut p.s, DRAWER_TRIGGER);
-    assert!(p.drawer.is_open() && focused(p.inner));
+    assert!(p.drawer.is_open() && focused(&mut p.s, p.inner));
     assert!(
         p.drawer.has_overlay(),
         "reka's source renders the overlay at this level"
     );
     plain(&mut p.s, NamedKey::Tab);
     plain(&mut p.s, NamedKey::Tab);
-    assert!(focused(p.inner), "Tab stays inside: focus is trapped");
+    assert!(focused(&mut p.s, p.inner), "Tab stays inside: focus is trapped");
     click(&mut p.s, PAGE_BUTTON);
     assert!(!p.drawer.is_open(), "a press outside closes it");
     assert_eq!(p.page_clicks.get(), 1, "and the page took the press");
@@ -1740,7 +1743,10 @@ fn a_hover_card_stays_open_while_the_pointer_crosses_to_it_and_keeps_its_stops_o
     p.s.act("focus", || p.card.trigger_focus().focus());
     p.s.settle().expect("settled");
     plain(&mut p.s, NamedKey::Tab);
-    assert!(!focused(p.inside), "the card's stops are out of the Tab order");
+    assert!(
+        !focused(&mut p.s, p.inside),
+        "the card's stops are out of the Tab order"
+    );
     // Off the card, away: closed after the close delay.
     glide(&mut p.s, (TRIGGER.0, card.y + 20.0), (600.0, 500.0));
     wait(&mut p.s, 310 * MS);
@@ -1829,7 +1835,7 @@ fn a_hover_card_waits_700ms_for_keyboard_focus_and_300ms_after_it_leaves() {
         false,
     );
     plain(&mut p.s, NamedKey::Tab);
-    assert!(focused(p.card.trigger_focus()));
+    assert!(focused(&mut p.s, p.card.trigger_focus()));
     wait(&mut p.s, 690 * MS);
     assert!(!p.card.is_open(), "Tab waits as a hover does");
     wait(&mut p.s, 20 * MS);
@@ -1926,7 +1932,7 @@ fn pressing_a_focused_trigger_does_not_swallow_the_next_keyboard_focus() {
         },
     );
     t.s.settle().expect("settled");
-    assert!(focused(t.triggers[0]));
+    assert!(focused(&mut t.s, t.triggers[0]));
     assert!(left.is_open(), "Tab back onto it opens it: the press is long over");
 }
 
@@ -2053,7 +2059,7 @@ fn toasts_past_the_limit_are_inert_and_a_swipe_takes_one_away() {
         t.limited(ToastId(1)) && !t.limited(ToastId(2)),
         "the oldest is past the limit"
     );
-    insta::assert_snapshot!("toast_limit_a11y", a11y(&p.s));
+    insta::assert_snapshot!("toast_limit_a11y", a11y(&mut p.s));
     // The newest is on top: (400..700, 400..440). 30 px is not enough.
     p.s.drag((450.0, 420.0), (480.0, 420.0));
     p.s.settle().expect("settled");
@@ -2351,7 +2357,7 @@ fn a_modal_lacking_a_title_or_a_description_says_so() {
         },
         "a dialog that says it has no description is not asked for one"
     );
-    assert!(!a11y(&s).contains("described-by"), "nor does it point at one");
+    assert!(!a11y(&mut s).contains("described-by"), "nor does it point at one");
     s.act("parts", || {
         says_described.set(true);
         titled.set(true);
@@ -2482,42 +2488,45 @@ fn tab_visits_the_newest_toast_first_and_its_controls_then_the_older_ones() {
     });
     p.s.settle().expect("settled");
     let (old, new) = (p.toasts[&1], p.toasts[&2]);
-    p.before.focus();
+    p.s.act("focus before", || p.before.focus());
     p.s.settle().expect("settled");
     let forward = [new.0, new.1, old.0, old.1, p.after];
     for (step, h) in forward.iter().enumerate() {
         plain(&mut p.s, NamedKey::Tab);
         assert!(
-            focused(*h),
+            focused(&mut p.s, *h),
             "Tab {step}: newest toast, its Close, the older toast, its Close, out"
         );
     }
     // Back from after: the oldest toast's last control first.
     for (step, h) in [old.1, old.0, new.1, new.0, p.before].iter().enumerate() {
         shift_tab(&mut p.s);
-        assert!(focused(*h), "Shift+Tab {step}: the way back");
+        assert!(focused(&mut p.s, *h), "Shift+Tab {step}: the way back");
     }
     // F8 focuses the region; Tab from it reaches the newest toast.
     plain(&mut p.s, NamedKey::F8);
-    assert!(focused(t.region_focus()), "the hotkey focuses the region");
+    assert!(focused(&mut p.s, t.region_focus()), "the hotkey focuses the region");
     plain(&mut p.s, NamedKey::Tab);
-    assert!(focused(new.0), "from the region, the newest toast");
+    assert!(focused(&mut p.s, new.0), "from the region, the newest toast");
     // Close pressed from the keyboard: the toast goes, focus to the region.
     plain(&mut p.s, NamedKey::Tab);
-    assert!(focused(new.1));
+    assert!(focused(&mut p.s, new.1));
     plain(&mut p.s, NamedKey::Enter);
     assert_eq!(
         t.with(|all| all.iter().map(|s| s.id).collect::<Vec<_>>()),
         [ToastId(1)],
         "Enter on Close takes its toast away"
     );
-    assert!(focused(t.region_focus()), "focus goes to the region, not nowhere");
+    assert!(
+        focused(&mut p.s, t.region_focus()),
+        "focus goes to the region, not nowhere"
+    );
     // Escape on a toast: the same.
     plain(&mut p.s, NamedKey::Tab);
-    assert!(focused(old.0));
+    assert!(focused(&mut p.s, old.0));
     plain(&mut p.s, NamedKey::Escape);
     assert_eq!(t.with(<[_]>::len), 0, "Escape takes it away");
-    assert!(focused(t.region_focus()), "focus stays in the region");
+    assert!(focused(&mut p.s, t.region_focus()), "focus stays in the region");
 }
 
 #[test]
@@ -2536,7 +2545,7 @@ fn a_toast_is_announced_by_its_label_and_text_and_again_when_updated() {
         );
     });
     p.s.settle().expect("settled");
-    let tree = a11y(&p.s);
+    let tree = a11y(&mut p.s);
     assert!(
         tree.contains("Status \"Notification. Moved. 3 files. Undo the move.\" live=Assertive"),
         "the label, then the chunks, the action by its alt text, the Close left out:\n{tree}"
@@ -2617,7 +2626,7 @@ fn an_anchored_toast_shows_above_its_anchor_and_pauses_as_the_region_does() {
         "above its anchor (reka's default side): {toast:?} over {a:?}"
     );
     assert!(
-        a11y(&s).contains("Status \"Notification. Copied.\""),
+        a11y(&mut s).contains("Status \"Notification. Copied.\""),
         "read as the region's are"
     );
     hover(&mut s, (toast.x + 10.0, toast.y + 10.0));
@@ -2633,7 +2642,9 @@ fn an_anchored_toast_shows_above_its_anchor_and_pauses_as_the_region_does() {
 fn a_promise_toast_loads_until_its_result_arrives_from_another_thread() {
     let mut p = tab_page();
     let t = p.toaster;
-    let id = t.next_id();
+    // One of the page's (its focus handles are by id 1 to 3); `next_id`
+    // hands out ids of the engine's own space (ADR-0028, rule 3).
+    let id = ToastId(1);
     let tx = t.promise(
         id,
         ("Saving", says("Saving", Sensitivity::Background, Some(1000 * MS))),
@@ -2653,7 +2664,7 @@ fn a_promise_toast_loads_until_its_result_arrives_from_another_thread() {
     p.s.settle().expect("settled");
     assert_eq!(status(), Some((ToastStatus::Success, "Saved")), "in place, a success");
     assert!(
-        a11y(&p.s).contains("\"Notification. Saved.\""),
+        a11y(&mut p.s).contains("\"Notification. Saved.\""),
         "read again as it turns"
     );
     wait(&mut p.s, 1100 * MS);
@@ -2784,7 +2795,7 @@ fn an_alert_dialogs_cancel_registered_again_with_the_same_handle_still_takes_foc
     s.settle().expect("settled");
     click(&mut s, TRIGGER);
     assert!(alert.is_open());
-    assert!(focused(cancel), "Cancel takes focus");
+    assert!(focused(&mut s, cancel), "Cancel takes focus");
 }
 
 /// Two drawers nested in one, both open, of different heights: the one

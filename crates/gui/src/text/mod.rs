@@ -499,8 +499,10 @@ impl Default for TextSystem {
 
 /// A text system's caches, counts and scratch, set aside while a cold
 /// frame lays text out with fresh ones ([`TextSystem::enter_cold`]): it
-/// reads no cache and warms none for the live frames. The faces and their
-/// ids are shared: append-only, so sharing them changes no result.
+/// reads no cache and warms none for the live frames. The faces and
+/// coordinate sets interned before it are shared (their ids name them
+/// alike in both scenes); those it interns first are its own and go with
+/// it, so it shifts no id live text gets ([`fonts::Fonts::forget_since`]).
 #[cfg(debug_assertions)]
 pub(crate) struct LiveCaches {
     shaped: HashMap<u64, Shaped>,
@@ -521,6 +523,7 @@ pub(crate) struct LiveCaches {
     hidden_order: Vec<(u64, u64)>,
     apart_order: Vec<(u64, u64)>,
     ink: fonts::InkCache,
+    interned: fonts::Interned,
 }
 
 #[cfg(debug_assertions)]
@@ -547,6 +550,7 @@ impl TextSystem {
             hidden_order: std::mem::take(&mut self.hidden_order),
             apart_order: std::mem::take(&mut self.apart_order),
             ink: self.fonts.swap_ink(fonts::InkCache::default()),
+            interned: self.fonts.interned(),
         }
     }
 
@@ -571,6 +575,7 @@ impl TextSystem {
             hidden_order,
             apart_order,
             ink,
+            interned,
         } = live;
         self.shaped = shaped;
         self.shapes = shapes;
@@ -590,6 +595,7 @@ impl TextSystem {
         self.hidden_order = hidden_order;
         self.apart_order = apart_order;
         drop(self.fonts.swap_ink(ink));
+        self.fonts.forget_since(interned);
     }
 }
 
@@ -886,6 +892,9 @@ impl TextSystem {
 
     /// Shape `text` (one piece, after its lead) with Parley.
     fn shape(&mut self, text: &str, key: &ShapeKey) -> Layout<u32> {
+        // A check's layout shapes from fresh caches: a cancellation point
+        // per piece shaped bounds how long input waits for it (ADR-0028).
+        crate::engine::cancel_point();
         let lead = key.lead;
         let fonts = &mut self.fonts;
         let mut b = fonts.lcx.ranged_builder(&mut fonts.fcx, text, 1.0, false);

@@ -45,6 +45,28 @@ struct Globals {
     // The map from the target's space to the canvas's: (a, b, c, d), (e, f).
     to_canvas: vec4<f32>,
     to_canvas_t: vec2<f32>,
+    // In a layer, the depth of its output clip: a clip chain is walked
+    // up to its first clip as shallow, which clips the layer's composite
+    // instead (0: the whole chain).
+    stop: u32,
+    // 1 when the target's pixels are not the canvas's (a layer scaled,
+    // turned or moved off them): coverage is measured in its own pixels
+    // and a chain walks every clip, each one's parent next, since what the
+    // effective chain leaves out was decided in the canvas's pixels.
+    grid: u32,
+}
+
+// Clip entry `at` as the target sees it (`entry_seen`).
+fn seen_at(at: u32) -> Seen {
+    let tl = mat2x2<f32>(globals.to_canvas.xy, globals.to_canvas.zw);
+    return entry_seen(props[at + 2u], props[at + 3u], tl, globals.to_canvas_t, globals.grid != 0u);
+}
+
+// The clip after entry `at` in a walk for this target: the next of its
+// effective chain on the canvas's pixels, else its parent.
+fn step_at(at: u32) -> u32 {
+    let link = bitcast<vec4<u32>>(props[at + 4u]);
+    return select(link.x, link.z, globals.grid != 0u);
 }
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -141,31 +163,30 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
         var lo = quad.xy;
         var hi = quad.xy + quad.zw;
         var inside = true;
-        let tl = mat2x2<f32>(globals.to_canvas.xy, globals.to_canvas.zw);
-        let tt = globals.to_canvas_t;
-        let a = tl * lo + tt;
-        let b = tl * vec2<f32>(hi.x, lo.y) + tt;
-        let c = tl * vec2<f32>(lo.x, hi.y) + tt;
-        let d = tl * hi + tt;
+        let a = lo;
+        let b = vec2<f32>(hi.x, lo.y);
+        let c = vec2<f32>(lo.x, hi.y);
+        let d = hi;
         var id = slot.y;
         let n = (globals.bases.w - globals.bases.z) / PCLIP;
         for (var k = 0u; k < n && id != 0u; k = k + 1u) {
             let at = globals.bases.z + id * PCLIP;
+            if (bitcast<u32>(props[at + 4u].y) <= globals.stop) {
+                break;
+            }
             let rect = props[at];
-            let m = props[at + 2u];
-            let t = props[at + 3u];
-            inside = inside && entry_holds(rect, props[at + 1u], m, t, a, b, c, d);
-            // Nothing outside it is drawn: neither is it shaded. From the
-            // target into the clip's space: its map after the target's.
-            let el = mat2x2<f32>(m.xy, m.zw);
-            let lin = el * tl;
-            let off = el * tt + t.xy;
+            // From the target's pixels into the clip's space.
+            let seen = seen_at(at);
+            inside = inside && entry_holds(rect, props[at + 1u], seen.m, seen.t, a, b, c, d);
+            // Nothing outside it is drawn: neither is it shaded.
+            let lin = mat2x2<f32>(seen.m.xy, seen.m.zw);
+            let off = seen.t.xy;
             if (lin[0].y == 0.0 && lin[1].x == 0.0 && lin[0].x > 0.0 && lin[1].y > 0.0) {
                 let scale = vec2<f32>(lin[0].x, lin[1].y);
                 lo = max(lo, floor((rect.xy - off) / scale));
                 hi = min(hi, ceil((rect.xy + rect.zw - off) / scale));
             }
-            id = bitcast<u32>(props[at + 4u].x);
+            id = step_at(at);
         }
         if (!inside) {
             clip = slot.y;
@@ -190,16 +211,21 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance
 // ---- clips ----
 
 // The coverage of clip `clip` and the rest of its chain, multiplied, at
-// point `p` of the target.
+// point `p` of the target: up to the first clip as shallow as the
+// target's output clip (`Globals::stop`), which clips its composite.
 fn clip_cov(clip: u32, p: vec2<f32>) -> f32 {
     var cov = 1.0;
     var id = clip;
-    let q = mat2x2<f32>(globals.to_canvas.xy, globals.to_canvas.zw) * p + globals.to_canvas_t;
     let n = (globals.bases.w - globals.bases.z) / PCLIP;
     for (var k = 0u; k < n && id != 0u; k = k + 1u) {
         let at = globals.bases.z + id * PCLIP;
-        cov = cov * clip_entry_cov(props[at], props[at + 1u], props[at + 2u], props[at + 3u], q);
-        id = bitcast<u32>(props[at + 4u].x);
+        if (bitcast<u32>(props[at + 4u].y) <= globals.stop) {
+            break;
+        }
+        // In the target's pixels, as paths and curve text are cut.
+        let seen = seen_at(at);
+        cov = cov * clip_entry_cov(props[at], props[at + 1u], seen.m, seen.t, p);
+        id = step_at(at);
     }
     return cov;
 }

@@ -4,6 +4,8 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+
+use crate::inspect::OUTSIDE;
 use std::rc::Rc;
 
 use accesskit::{Action, ActionData, ActionRequest, Node, NodeId, Role, TextPosition, TextSelection, TreeId};
@@ -332,7 +334,7 @@ fn a_text_field_exposes_its_characters_words_and_caret_as_runs() {
         node: *run_id,
         character_index,
     };
-    let out = s.pipeline_mut().input(Input::Act(ActionRequest {
+    let out = s.send(Input::Act(ActionRequest {
         action: Action::SetTextSelection,
         target_tree: TreeId::ROOT,
         target_node: input_id,
@@ -403,7 +405,7 @@ fn an_empty_field_has_one_empty_run_for_the_caret() {
 const ROWS: u64 = 1000;
 
 fn list_scenario(state: &ListState, rows: impl Fn(u64) -> Element + 'static, table: bool) -> Scenario {
-    let st = state.clone();
+    let st = *state;
     let rows = Rc::new(rows);
     let mut s = Scenario::measuring(
         move || {
@@ -531,7 +533,7 @@ fn the_focused_and_the_active_rows_stay_when_scrolled_out_of_view() {
         .find(|(_, n)| n.role() == Role::ListItem && n.position_in_set() == Some(4))
         .map(|(id, _)| *id)
         .unwrap();
-    let out = s.pipeline_mut().input(Input::Act(ActionRequest {
+    let out = s.send(Input::Act(ActionRequest {
         action: Action::ScrollIntoView,
         target_tree: TreeId::ROOT,
         target_node: row3,
@@ -732,10 +734,10 @@ fn a_clamped_fields_runs_keep_its_lines_and_agree_with_its_hits() {
         &mut ts,
         &edit.text,
         t,
-        n.content_box,
+        n.content_box(OUTSIDE),
         *multiline,
         false,
-        n.scroll.map_or((0.0, 0.0), |s| s.applied),
+        n.scroll(OUTSIDE).map_or((0.0, 0.0), |s| s.applied),
     );
     let at = ts.hit(
         &edit.text,
@@ -801,10 +803,10 @@ fn a_point_over_a_clamped_fields_ellipsis_is_its_end_in_either_direction() {
             &mut ts,
             &edit.text,
             t,
-            n.content_box,
+            n.content_box(OUTSIDE),
             *multiline,
             false,
-            n.scroll.map_or((0.0, 0.0), |s| s.applied),
+            n.scroll(OUTSIDE).map_or((0.0, 0.0), |s| s.applied),
         );
         // The kept text ends by the ellipsis, which is on its end side.
         let edge = ts.caret(&edit.text, &it.t, it.width, edit.text.len());
@@ -888,10 +890,10 @@ fn a_point_over_a_truncated_fields_ellipsis_is_its_end_in_either_direction() {
             &mut ts,
             &edit.text,
             t,
-            n.content_box,
+            n.content_box(OUTSIDE),
             *multiline,
             false,
-            n.scroll.map_or((0.0, 0.0), |s| s.applied),
+            n.scroll(OUTSIDE).map_or((0.0, 0.0), |s| s.applied),
         );
         // The kept text ends by the ellipsis, which is on its end side.
         let edge = ts.caret(&edit.text, &it.t, it.width, edit.text.len());
@@ -978,7 +980,7 @@ fn a_scrolled_textarea_keeps_its_runs_and_a_point_finds_the_line_shown_there() {
         .find(|n| matches!(n.content, Content::Input { .. }))
         .unwrap()
         .clone();
-    let sc = n.scroll.expect("it scrolls");
+    let sc = n.scroll(OUTSIDE).expect("it scrolls");
     assert!(sc.offset.1 > 0.0, "scrolled: {:?}", sc.offset);
     let offset = sc.applied;
     assert_eq!(s.pipeline().access_stats().runs_built, 0, "a scroll built runs");
@@ -991,7 +993,7 @@ fn a_scrolled_textarea_keeps_its_runs_and_a_point_finds_the_line_shown_there() {
     let bounds = |r: &[(NodeId, Node)]| r.iter().map(|(_, n)| n.bounds()).collect::<Vec<_>>();
     assert_eq!(bounds(&runs), bounds(&before), "its runs stay where they are");
     // Ten pixels into its box, in the window.
-    let (x, y) = (n.content_box.x + 5.0, n.content_box.y + 10.0);
+    let (x, y) = (n.content_box(OUTSIDE).x + 5.0, n.content_box(OUTSIDE).y + 10.0);
     let tree = Tree::new(after, true);
     let state = tree.state();
     let node = state.node_by_tree_local_id(input_id, TreeId::ROOT).unwrap();
@@ -1001,7 +1003,7 @@ fn a_scrolled_textarea_keeps_its_runs_and_a_point_finds_the_line_shown_there() {
         unreachable!()
     };
     let mut ts = TextSystem::new();
-    let it = crate::layout::input_text(&mut ts, &edit.text, t, n.content_box, true, false, offset);
+    let it = crate::layout::input_text(&mut ts, &edit.text, t, n.content_box(OUTSIDE), true, false, offset);
     let hit = ts.hit(&edit.text, &it.t, it.width, x - it.origin.0, y - it.origin.1);
     let line = |at: usize| doc[..at].matches('\n').count();
     assert!(line(hit) > 0, "the scroll took the first line up");

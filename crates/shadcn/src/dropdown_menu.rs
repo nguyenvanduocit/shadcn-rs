@@ -23,7 +23,6 @@
 //! trigger is lit while focused or while its submenu is open (`focus:bg-accent
 //! data-open:bg-accent`, in all three menus).
 
-use std::cell::Cell;
 use std::rc::Rc;
 
 use gui::prelude::*;
@@ -473,9 +472,11 @@ pub(crate) fn menu_content(root: Div, place: MenuPlace, family: MenuFamily) -> P
 /// A pick of a menu item (reka's `select` event), handed to its
 /// `on_select`: the menu closes after it unless the handler keeps it open
 /// ([`Self::keep_open`], reka's `event.preventDefault()`).
+///
+/// Made by the pick, in the world that picks: a check's pick keeps its own.
 #[derive(Clone, Debug, Default)]
 pub struct SelectEvent {
-    keep: Rc<Cell<bool>>,
+    keep: Rc<gui::engine::WorldCell<bool>>,
 }
 
 impl SelectEvent {

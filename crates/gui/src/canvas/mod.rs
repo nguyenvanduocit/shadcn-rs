@@ -1194,12 +1194,14 @@ pub struct WorldState {
     damage_from: u64,
     /// Text not shaped when the last snapshot was made, for the next paint
     /// to shape (pruned as snapshots are made).
-    unshaped: std::cell::RefCell<Vec<u32>>,
+    unshaped: crate::engine::WorldRefCell<Vec<u32>>,
     /// The base of this version, and the snapshot of this version and live
     /// version, made when first read: caches, not state a reader is told of.
-    base: std::cell::RefCell<Option<Arc<Base>>>,
-    damage_list: std::cell::RefCell<Option<DamageList>>,
-    snapshot: std::cell::RefCell<Option<Arc<WorldSnapshot>>>,
+    /// All four are the world's that made the canvas world: a cold frame
+    /// builds its own snapshot and fills none of them (ADR-0034, S7).
+    base: crate::engine::WorldRefCell<Option<Arc<Base>>>,
+    damage_list: crate::engine::WorldRefCell<Option<DamageList>>,
+    snapshot: crate::engine::WorldRefCell<Option<Arc<WorldSnapshot>>>,
 }
 
 /// A canvas' world: a `Copy` handle owned by the scope it was made in.
@@ -1209,9 +1211,10 @@ pub struct World(Signal<WorldState>);
 /// An empty world.
 #[must_use]
 pub fn world() -> World {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    /// The worlds made, numbered.
+    static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("canvas world");
     World(Signal::new(WorldState {
-        id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        id: crate::engine::unique_id(&NEXT),
         version: 0,
         live_version: 0,
         objects: Vec::new(),
@@ -1228,10 +1231,10 @@ pub fn world() -> World {
         lifted: std::collections::BTreeMap::new(),
         damage: std::collections::VecDeque::new(),
         damage_from: 0,
-        unshaped: std::cell::RefCell::new(Vec::new()),
-        base: std::cell::RefCell::new(None),
-        damage_list: std::cell::RefCell::new(None),
-        snapshot: std::cell::RefCell::new(None),
+        unshaped: crate::engine::WorldRefCell::new("a canvas world's unshaped text", Vec::new()),
+        base: crate::engine::WorldRefCell::new("a canvas world's base", None),
+        damage_list: crate::engine::WorldRefCell::new("a canvas world's damage list", None),
+        snapshot: crate::engine::WorldRefCell::new("a canvas world's snapshot", None),
     }))
 }
 

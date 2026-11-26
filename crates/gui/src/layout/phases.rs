@@ -11,7 +11,9 @@ use crate::app::Scenario;
 use crate::color::Color;
 use crate::element::{IntoElement, div, text, text_bound};
 use crate::prelude::*;
-use crate::reactive::{self, Phase, RenderNode, Signal};
+use crate::reactive::Signal;
+#[cfg(debug_assertions)]
+use crate::reactive::{self, Phase, RenderNode};
 use crate::testing::both_passes;
 
 /// A 50 x 50 grid of buttons, each lit on hover, as the stress `grid` scene.
@@ -323,6 +325,7 @@ fn accessibility_sends_and_reads_only_the_node_that_changed() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn a_signal_written_after_a_later_phase_read_it_is_reported() {
     let read_in_layout = Signal::labeled("read in layout", 0_u32);
     let read_in_paint = Signal::labeled("read in paint", 0_u32);
@@ -361,6 +364,7 @@ fn a_signal_written_after_a_later_phase_read_it_is_reported() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
 fn a_late_write_in_a_frame_shows_in_its_report() {
     both_passes(|pass| {
         let seen = Signal::labeled("seen width", 0.0_f32);

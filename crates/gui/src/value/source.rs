@@ -41,10 +41,12 @@
 //! live state.
 
 use std::any::Any;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::Location;
 use std::rc::{Rc, Weak};
+
+use crate::engine::{WorldCell, WorldRefCell};
 
 use crate::interact::{Flag, Interaction};
 use crate::reactive::{Mark, RenderNode, Signal};
@@ -74,7 +76,7 @@ pub(crate) fn cold() -> bool {
 struct Waiter {
     mark: Mark,
     mask: u8,
-    woken: Cell<bool>,
+    woken: WorldCell<bool>,
     key: usize,
     chain: Option<Link>,
 }
@@ -96,12 +98,25 @@ struct Link {
 /// One list may hold many sources, a chain each (the flags of every
 /// [`Interaction`] handle, a chain per handle): a handle costs no list of
 /// its own, and a wake of a chain visits that chain's mounts alone.
-#[derive(Default)]
+///
+/// Of the world that made it (review r18, decision 2): the live mounts'
+/// lists are written live alone; a live mount's registration a check lets
+/// go leaves its list once the check has switched back ([`Wait`]'s drop).
 pub(crate) struct Waiters {
-    list: RefCell<List>,
+    list: WorldRefCell<List>,
     /// Waiters a wake visited, for a test.
     #[cfg(test)]
-    visits: Cell<usize>,
+    visits: WorldCell<usize>,
+}
+
+impl Default for Waiters {
+    fn default() -> Self {
+        Self {
+            list: WorldRefCell::new("a source's waiting mounts (`Waiters`)", List::default()),
+            #[cfg(test)]
+            visits: WorldCell::new("a source's wake visits (`Waiters`, a test's)", 0),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -186,7 +201,7 @@ impl Waiters {
         list.items.push(Waiter {
             mark: Rc::clone(mark),
             mask,
-            woken: Cell::new(false),
+            woken: WorldCell::new("whether a mount was woken (`Waiter::woken`)", false),
             key,
             chain,
         });
@@ -287,15 +302,29 @@ impl Wait {
 }
 
 impl Drop for Wait {
+    /// Its claim goes now (a registry piece's, the running world's). Its
+    /// place in a list goes in the list's world: a live mount's
+    /// registration a check lets go (a live pipeline dropped in a check)
+    /// leaves the live list once the check has switched back, never from
+    /// the check (review r18, decision 2).
     fn drop(&mut self) {
         if let Some((key, id)) = self.solo {
             solo_gone(key, id);
         }
+        let Some(on) = self.on.take() else { return };
+        let key = self.key;
+        let here = on.list.is_here();
+        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), here, move || leave(&on, key));
+    }
+}
+
+/// Take waiter `key` out of `on`'s list.
+fn leave(on: &Waiters, key: usize) {
+    {
         // Borrowed only while it wakes, and a mark drops no registration:
         // should one, the waiter stays, waking a node for nothing.
-        if let Some(on) = &self.on
-            && let Ok(mut l) = on.list.try_borrow_mut()
-            && let Some(at) = l.at.get(self.key).copied().filter(|&a| a != GONE)
+        if let Ok(mut l) = on.list.try_borrow_mut()
+            && let Some(at) = l.at.get(key).copied().filter(|&a| a != GONE)
             && at < l.items.len()
         {
             // Out of its chain first.
@@ -319,10 +348,10 @@ impl Drop for Wait {
             {
                 *m = at;
             }
-            if let Some(a) = l.at.get_mut(self.key) {
+            if let Some(a) = l.at.get_mut(key) {
                 *a = GONE;
             }
-            l.free.push(self.key);
+            l.free.push(key);
         }
     }
 }
@@ -333,7 +362,7 @@ impl Drop for Wait {
 pub(crate) struct Hub {
     node: RenderNode,
     waiters: Rc<Waiters>,
-    armed: Cell<bool>,
+    armed: WorldCell<bool>,
 }
 
 impl Hub {
@@ -350,7 +379,7 @@ impl Hub {
         Self {
             node,
             waiters,
-            armed: Cell::new(false),
+            armed: WorldCell::new("whether a source's hub read (`Hub::armed`)", false),
         }
     }
 
@@ -370,7 +399,7 @@ impl Hub {
 
 impl Drop for Hub {
     fn drop(&mut self) {
-        self.node.dispose();
+        self.node.release(crate::engine::LiveDrop::in_drop());
     }
 }
 
@@ -408,7 +437,7 @@ fn report_read(at: &'static Location<'static>) -> ! {
 crate::engine::engine_local! {
     /// What a source's map reads, in a debug build: nothing, or a report.
     [Shared("a tracker made live; what it reads is undone with the frame that read it")]
-    static PROBE: RenderNode = crate::engine::live(|| RenderNode::new(|| {}));
+    static PROBE: RenderNode = RenderNode::new(|| {});
 }
 
 /// What a bound setter reads where it is mounted: a closure, under a
@@ -807,7 +836,9 @@ pub struct Group<T: 'static>(Rc<GroupCell<T>>);
 struct GroupCell<T> {
     read: Box<dyn Fn() -> T>,
     hub: Hub,
-    value: RefCell<Option<T>>,
+    /// The world's that made the group: a cold build reads the value anew
+    /// and keeps none of it (ADR-0034, S7).
+    value: crate::engine::WorldRefCell<Option<T>>,
 }
 
 impl<T: 'static> Clone for Group<T> {
@@ -829,7 +860,7 @@ impl<T: 'static> Group<T> {
         Self(Rc::new(GroupCell {
             read: Box::new(read),
             hub: Hub::new(),
-            value: RefCell::new(None),
+            value: crate::engine::WorldRefCell::new("a group's value (`Group`)", None),
         }))
     }
 

@@ -997,9 +997,15 @@ impl Chains {
     const FLOOR: usize = 64;
 
     /// Sweep the entries whose link was let go, when they are many: half
-    /// the table, and past [`Self::FLOOR`]. Allocates nothing.
+    /// the table, and past [`Self::FLOOR`]. Allocates nothing. Not while a
+    /// fork is open on this thread (ADR-0028: the table is Shared, so a
+    /// fork leaves it and its count as it found them, but for the links it
+    /// made); the next live sweep takes what was let go meanwhile.
     fn sweep(&mut self) {
         use std::sync::atomic::Ordering;
+        if crate::engine::forking() {
+            return;
+        }
         let dead = self.dead.load(Ordering::Relaxed);
         if dead <= Self::FLOOR || dead.saturating_mul(2) < self.found.len() {
             return;

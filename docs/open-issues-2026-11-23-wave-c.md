@@ -133,6 +133,86 @@ Cổng wave C (fmt, clippy `-D warnings`, test gui-tls/gui/primitives/shadcn, `G
    không có báo lỗi. Sửa: debug assert khi commit scene.
 10. **Chưa có test:** chuỗi clip dưới scale khác 1 với biên lẻ (hit test so với paint); glyph slug trong layer có filter
     dưới clip xoay; đường tăng dần sau khi clip đổi cha qua layer.
+11. **Thumb của overlay scrollbar không đặt output clip.** Effect của thumb để `EffectNode::clip` là 0, nên layer của nó
+    không có clip nào cắt composite. Có từ trước, ngoài phạm vi vòng clip tree. Sửa: paint đặt output clip của thumb là
+    clip mà nhóm của nó nằm trong.
+12. **`effects::subtree_region` cắt vùng theo clip layout chưa biến đổi.** Nội dung layer bị xoay hoặc scale có thể nằm
+    ngoài region, nên bị mất khỏi texture. Có từ trước, ngoài phạm vi. Sửa: cắt region theo bounds của clip trong không
+    gian của layer (hoặc theo `ClipTree::bounds` đã biến đổi).
+13. **Chi phí đã chấp nhận (review vòng 2).** (a) Trong layer có texel riêng (`own_grid`), mỗi fragment đi chuỗi
+    clip theo cha tới output clip, không theo chuỗi hiệu lực, vì chuỗi hiệu lực được quyết định trên pixel canvas. (b)
+    Khi transform của layer đi qua identity (texel riêng sang texel của canvas hoặc ngược lại), layer vẽ lại một lần.
+    (c) Clip đổi hình (`reshaped`) hay clip có key qua canvas đổi chỗ thì key của nó và của mọi clip trong cây con bị
+    bỏ trong mỗi layer đã đọc nó (`ClipKeys::forget`, đi cây con một lần mỗi layer). (d) Transform có matrix hay cha
+    đổi thì bỏ hết key của layer đã compose qua nó, không chỉ key qua nó.
+14. **Những gì vòng 2 làm khác hoặc chưa làm đúng hẳn.** (a) Mục 1: không thử `under` với cha cũ và cha mới; mỗi layer
+    ghi các transform nó đã compose qua (`ClipKeys::through`), reverse index `Plan::through_readers` tìm ra layer, đổi
+    cha thế nào cũng bắt được. Reverse index (`clip_readers`, `through_readers`) giữ cặp cũ tới lần plan cả cây; cặp
+    cũ chỉ tốn một lần tra. Revision và shape vẫn là hash 64 bit. (b) Vòng 4 đã sửa phần hit test: renderer công bố
+    mỗi layer nó vẽ thành một `scene::LayerStage` (map tương đối với target cha, layer ngoài, output clip); một stage
+    lấy mẫu lại khi map khác identity. `Presented` giữ hit table, property tree, scale và stage của cùng một frame,
+    công bố khi frame được trình diễn (như hit-test region list theo từng CompositorFrame của viz). Click, devtools
+    pick và wheel đầu gesture dùng một luật (`clip::hit_in`, `HitView`); không giới hạn độ sâu (8 cấp giữ trên stack,
+    phần còn lại tràn ra `Vec`); trang cao hơn texture công bố stage của lần capture theo band. Mỗi frame trong ring
+    của wheel giữ stage của chính nó cùng table và property tree. Devtools pick và gửi input qua frame đang trình
+    diễn (`devtools::Showing`); lệnh cuộn node vào tầm nhìn chạy lại khi frame cho thấy nó được trình diễn
+    (`Done::Again`); không còn đường route theo frame như layout. Vòng 5: snapshot mang key và owner, dispatch bỏ
+    event khi instance đổi; lệnh devtools có tên từ chối khi màn hình hiện node khác; chỉ còn một luật hit
+    (`chain_keeps` đã xoá; trước lần present đầu, luật đó chạy trên scene UI đã vẽ, không layer); lấy mẫu đi từ dưới
+    lên, mỗi texel đo một lần; frame mới thành frame trên màn hình ở vblank nó được present (`OnScreen`), present hỏng
+    không đẩy frame đang hiện ra khỏi danh sách giữ lại, stamp không còn giữ thì không route; property tree của mỗi
+    frame chỉ chép các entry đã đổi. Còn lại, đều thường: không có phản hồi present theo frame từ wgpu, nên vblank
+    nhắm tới thay cho nó (present GPU xong trễ bị coi là đã hiện sớm tối đa một refresh); mỗi `Presented` giữ bản
+    property tree riêng (tối đa `POOL` + 1 = 8 bản, khoảng 0,88 MB mỗi bản ở 20.000 clip, ghi trong ADR-0015); cuộn của compositor viết lại mọi clip tuyệt đối dưới
+    container, nên bản chép theo đó; node đã biến mất ở frame N+1 thì input theo frame N không trúng gì; fixture lớp
+    layer và fixture hai list của `presented_routing.rs` vẫn tách. Vòng 6: một timeline trình diễn duy nhất
+    (`OnScreen`, compositor sở hữu), chỉ thêm khi present thật sự xảy ra (draw không blit hay present hỏng không thêm
+    gì), frame đã vào không bị đổi (capture của cửa sổ đi với bản sao), `at(t)` là truy vấn thuần; stamp là kiểu
+    (`Shown`, `Seen`), không còn số 0; trước lần present đầu, click và wheel cùng chạy trên scene đã vẽ, cache theo
+    commit; hover của con trỏ đứng yên được kiểm lại khi timeline tiến (`FromRender::Presented`), không phải lúc
+    layout commit; lệnh devtools có tên cần node hiện ra đúng là node đó (hoặc con của nó, hoặc box nhận pointer cho
+    nó), hạn 2 s là timer của đồng hồ UI; tra node của click và hover qua `NodeIndex`; stop của gradient dùng chung
+    (`Arc<[_]>`). Còn lại, đều thường: mỗi present đánh thức UI thread một lần (kể cả frame chỉ compositor cuộn), chi
+    phí năng lượng chưa đo; hover được kiểm khi frame được present, sớm hơn vblank của nó tối đa một refresh; input có
+    stamp cũ hơn mọi frame đang giữ (`Shown::Gone`) không trúng gì, kể cả click; luật "node nhận pointer" có ở ba chỗ
+    (hai chỗ trong `paint.rs`, một trong `devtools::takes_pointer`), nên gom thành một method của `Frame`. Vòng 7:
+    timeline là nguồn duy nhất cho "người dùng thấy gì lúc t". Frame vào timeline ở vblank của nó dù có đổi pixel hay
+    không: commit chỉ đổi hit vẫn hiện từ vblank kế. Chỉ present hỏng mới không vào. Trước lần present đầu, hai thread
+    dựng snapshot bằng một constructor (`Presented::of`) theo commit, nên list thường cuộn được ngay wheel đầu. Hover
+    hội tụ về frame đang hiện: idle so với `OnScreen::now`, timer đặt ở vblank kế (`next_shown`), và input route ở
+    frame cũ thì được kiểm lại ở frame mới. Thông báo chỉ mang id và gộp lại (`tell`/`look`). Giữ lại theo thời gian:
+    `RETAIN` 250 ms, tối đa `KEPT` 64 frame. Số frame sống có chặn, ghi trong ADR-0015 và có test. Input từ frame đã
+    `Gone` không bao giờ là hit. Số của snapshot được gán lúc công bố, nên capture có nội dung khác thì có số mới. Mỗi
+    lần hit hay hover có tính trước theo frame và loại sớm theo vùng (fork RC5). Luật "nhận pointer" gom thành
+    `Frame::takes_pointer` (N1). Lệnh devtools có tên chờ khi bounds đang sống khác frame đang hiện (N4). Còn lại:
+    bound bộ nhớ chưa phải chia sẻ, khoảng 60 MB ở 240 Hz với 20.000 clip; cần chia sẻ chunk của tree (persistent
+    vector). UI kẹt quá 250 ms trong khi compositor vẫn present thì bỏ input vị trí đang giữ. Vòng 8:
+    - Hover là hàm thuần của (vị trí con trỏ, frame đang hiện). Key của lần tính thật cuối cùng chỉ do move/leave
+      hoặc `converge` đặt. Move `Gone` vẫn ghi vị trí. Frame và vblank kế được đọc trong một lần (`OnScreen::sample`).
+    - Render thread chỉ đánh thức UI khi thứ dưới con trỏ đổi: không có con trỏ thì 0 lần; với scroll 1 px/frame
+      trên hàng 10 px thì 12 lần trên 120 frame.
+    - Điểm của event được map qua property tree của frame nó được route (`InputState::placing`).
+    - Hit index là R-tree STR theo từng không gian transform, cộng một R-tree các không gian được refit mỗi frame,
+      với bound `O(log N + k)` có test đếm.
+    - `catch_up` chép nguyên tree khi số id viết lớn hơn số entry.
+    - Test giữ lại frame đếm bằng token, không dùng `Weak`.
+    - Đã đo 240 Hz: lúc timeline đang đầy, 66 frame là 66 bản chép; sau đó 0 lần cấp phát.
+
+    Còn lại:
+    - Refit không gian tốn `O(S)` mỗi frame. Cần `Presented` mang danh sách transform do compositor di chuyển thì mới
+      bỏ được.
+    - So sánh hover trên render thread chỉ xét box và cờ modal, không xét cả chuỗi tổ tiên.
+    - Node mượn box của tổ tiên thì không undo được transform nằm giữa hai node.
+
+    (c) Mục 5: frame vẽ lại layer từng
+    cấp phát ba lần mỗi chunk khi dựng op (chép `segs`, một `Vec` op, chép vào cache); nay op của layer được ghi thẳng.
+    Frame vẽ chunk dưới transform bằng path (`matrix_ops`) vẫn cấp phát theo item.
+15. **Hình học của frame private theo kiểu (đã làm ở vòng 13, không hoãn nữa).** Field hình học của `FrameNode` và
+    `viewport` của `Frame` là `pub(in crate::layout)`. Module khác đọc qua accessor nhận token `layout::Sight` (trait
+    sealed). Mỗi module đọc tự tạo token của nó; token của phía input chỉ tạo được trong `interact::shown` (ADR-0015).
+    Còn lại: token công khai `inspect::OUTSIDE` cho test và công cụ ngoài crate. Rust không chặn được nó bên trong
+    crate, nên lint `tests/shown_reads.rs` cấm `interact.rs` gọi tên mọi token. `look.transform` vẫn là field công
+    khai của `Look` và chỉ có lint giữ.
 
 ## 6. S6b: nhóm component dừng trước vòng sửa cuối
 
@@ -212,6 +292,7 @@ trong render, clip tree, định tuyến wheel của compositor.
 | Shared init chạy tách khỏi scope cả ở đường live | Trước đây scope chạm vào đầu tiên sở hữu nó và có thể dispose nó dưới chân người khác. |
 | Chặn cuối của `keep_at` không gộp vào `scroll_to` | Gộp vào thì `scroll_to(end)` ngay sau khi thêm hàng sẽ dừng ở cuối cũ. |
 | Cold check so dữ liệu O(n) | Chỉ có ở debug (§2.9). |
+| Bỏ input có trước một cú jump, khác mặc định của Chromium | Chromium mặc định cộng phần cuộn compositor còn nợ lên offset main thread vừa đặt. Nó chỉ bỏ phần đó khi main thread yêu cầu (`LayerTreeHost::DropActiveScrollDeltaNextCommit`, `layer_tree_host.cc:2271-2275`). Ta luôn bỏ, và xếp thứ tự bằng dấu thời gian trên một đồng hồ (`scroll::jumped_after`): input có trước cú jump thì bỏ, input có sau thì cộng lên chỗ vừa jump tới. Lý do: cú jump là ý định tuyệt đối của chương trình (`scroll_to`, đưa caret vào tầm nhìn), nên nó phải thắng input mà nó không thấy. Cộng phần cũ lên sẽ đưa nội dung tới một chỗ không ai yêu cầu, giống lỗi của GTK khi deceleration đè lên `set_value` (`gtkscrolledwindow.c:3659-3667`). Với gesture có phase thì đây là luật đúng. Với bánh xe có nấc thì chấp nhận được: nấc làm trước cú jump không có tác dụng, còn nấc kế tiếp cuộn tiếp từ chỗ vừa jump tới. Luật áp dụng như nhau ở cả hai phía của commit (wave C (a) vòng 4). Xét lại nếu một app cần cách của Chromium: thêm một kiểu `Move` cho phép cộng. |
 
 ## 9. Kết quả cổng wave C
 

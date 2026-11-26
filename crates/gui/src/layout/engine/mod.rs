@@ -314,7 +314,7 @@ crate::engine::engine_local! {
 }
 
 /// The batches this thread handed the pool so far (tests).
-#[cfg(test)]
+#[cfg(all(test, debug_assertions))]
 pub(crate) fn handed() -> u64 {
     HANDED.get()
 }
@@ -541,28 +541,13 @@ pub struct Node<S: NodeStyle, L> {
 }
 
 /// Names each final-layout run of an algorithm (compared, never ordered):
-/// each thread takes a block of names at a time, so the threads of a
-/// parallel layout do not contend for one counter.
-static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-/// How many names a thread takes at once.
-const RUN_BLOCK: u64 = 1 << 16;
-
-crate::engine::engine_local! {
-    /// This thread's next name and the end of its block.
-    [Fork] static NEXT_RUN: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
+/// each thread leases blocks of its own, so the threads of a parallel
+/// layout do not contend for one.
+static NEXT_RUN: crate::engine::IdKind = crate::engine::IdKind::new("layout run");
 
 /// A name no other run has had.
 fn next_run() -> u64 {
-    NEXT_RUN.with(|next| {
-        let (mut at, mut end) = next.get();
-        if at >= end {
-            at = RUNS.fetch_add(RUN_BLOCK, std::sync::atomic::Ordering::Relaxed);
-            end = at.saturating_add(RUN_BLOCK);
-        }
-        next.set((at.saturating_add(1), end));
-        at
-    })
+    crate::engine::unique_id(&NEXT_RUN)
 }
 
 impl<S: NodeStyle, L: Measure> Node<S, L> {

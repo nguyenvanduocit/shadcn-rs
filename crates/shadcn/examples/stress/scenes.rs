@@ -512,7 +512,7 @@ fn list_of(count: u64) -> Render {
     Box::new(move || {
         let t = theme();
         let jump = |label: &'static str, to: f64| {
-            let s = state.clone();
+            let s = state;
             button(ButtonVariant::Outline, ButtonSize::Sm)
                 .on_click(move |_| s.scroll_to_fraction(to))
                 .child(label)
@@ -592,7 +592,7 @@ fn big_table() -> Render {
     let view = Signal::labeled("table view", View::identity(BIG_ROWS));
     let sorting = Signal::labeled("sorting", false);
     let list = ListState::new(37.0);
-    let to_top = list.clone();
+    let to_top = list;
     // The heights measured follow their rows to where each view shows them.
     let views = Views::new(&list, View::identity(BIG_ROWS), move |v: View| {
         view.set(v);
@@ -635,7 +635,7 @@ fn big_table() -> Render {
         let sort = Rc::clone(&rebuild);
         let filter = Rc::clone(&rebuild);
         let jump = |label: &'static str, to: f64| {
-            let s = list.clone();
+            let s = list;
             button(ButtonVariant::Outline, ButtonSize::Sm)
                 .on_click(move |_| s.scroll_to_fraction(to))
                 .child(label)
@@ -652,7 +652,7 @@ fn big_table() -> Render {
                 table_head("Status"),
             ],
         );
-        let cols = columns.clone();
+        let cols = columns;
         let body = table_body_virtual(
             &list,
             u64::try_from(shown).unwrap_or(0),

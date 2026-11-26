@@ -30,6 +30,34 @@ pub type Counting = counted::Counting<System>;
 /// The counting allocator a binary installs, which [`now`] and [`thread`] read.
 pub const COUNTING: Counting = Counting::new(System);
 
+/// The crate's own unit tests count the heap too, so a budget is asserted
+/// beside the code it holds for, not through a public hook for another
+/// binary. What they report (frame reports, the devtools' pages, whose
+/// snapshots those tests compare) still reads as not counted: the counts
+/// are only [`allocations`]'.
+#[cfg(test)]
+#[global_allocator]
+static TEST_HEAP: Counting = COUNTING;
+
+/// How many allocations `f` made on this thread, beside what it returns
+/// (the unit tests' count, [`TEST_HEAP`]).
+#[cfg(test)]
+pub(crate) fn allocations<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    start();
+    let before = counted::thread_snapshot().0;
+    let out = f();
+    (out, counted::thread_snapshot().0.saturating_sub(before))
+}
+
+/// How many bytes `f` allocated on this thread, beside what it returns.
+#[cfg(all(test, debug_assertions))]
+pub(crate) fn allocated_bytes<R>(f: impl FnOnce() -> R) -> (R, u64) {
+    start();
+    let before = counted::thread_snapshot().1;
+    let out = f();
+    (out, counted::thread_snapshot().1.saturating_sub(before))
+}
+
 /// Per-thread counting starts with the first reading: the counters'
 /// thread-local cells are written only once asked for.
 fn start() {
@@ -86,6 +114,9 @@ impl ThreadHeap {
 /// Whether [`COUNTING`] is the global allocator: it has counted something
 /// (a running process has allocated).
 fn installed() -> Option<counted::AllocStats> {
+    if cfg!(test) {
+        return None;
+    }
     let s = counted::snapshot();
     (s.allocs > 0).then_some(s)
 }

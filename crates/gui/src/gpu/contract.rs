@@ -228,7 +228,13 @@ pub(crate) struct Globals {
     /// The map from the target's space to the canvas's: (a, b, c, d), (e, f).
     pub to_canvas: [f32; 4],
     pub to_canvas_t: [f32; 2],
-    pub pad: [f32; 2],
+    /// In a layer, its output clip's depth: clip chains are walked up to
+    /// their first clip as shallow (0: whole).
+    pub stop: u32,
+    /// 1 when the target's pixels are not the canvas's (a layer scaled,
+    /// turned or moved off them): clip coverage is measured in its own
+    /// pixels, and chains walk every clip (`ClipTree::step`).
+    pub grid: u32,
 }
 
 /// What the path and curve-text passes read of the globals.

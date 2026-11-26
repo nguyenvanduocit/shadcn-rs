@@ -79,10 +79,8 @@ fn nth_text(s: &Shot, label: &str, n: usize) -> Result<(f32, f32), ScenarioError
         .filter(|node| matches!(&node.content, Content::Text { content, .. } if &**content == label))
         .nth(n)
         .map(|node| {
-            (
-                node.bounds.x + node.bounds.width / 2.0,
-                node.bounds.y + node.bounds.height / 2.0,
-            )
+            let b = node.bounds(gui::inspect::OUTSIDE);
+            (b.x + b.width / 2.0, b.y + b.height / 2.0)
         })
         .ok_or_else(|| ScenarioError::TextNotFound(label.to_owned()))
 }

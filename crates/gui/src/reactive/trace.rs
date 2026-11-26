@@ -15,6 +15,8 @@ pub struct SignalRef {
     pub label: Option<&'static str>,
 }
 
+crate::engine::parts_whole!(SignalRef);
+
 impl fmt::Display for SignalRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.label {
@@ -107,6 +109,8 @@ struct Probe {
     write: fn(NodeId, &str) -> Option<Result<(), String>>,
 }
 
+crate::engine::parts_whole!(Probe);
+
 crate::engine::engine_local! {
     /// The labelled signals the devtools read. A cold frame's labels are
     /// its own, thrown away with it.
@@ -116,18 +120,24 @@ crate::engine::engine_local! {
     [Fresh] static SWEEP_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(64) };
 }
 
+/// Label node `id`: part of making a labelled node, the arena's own
+/// bookkeeping, which a Shared init may reach to make a handle
+/// ([`crate::engine::EngineKey::with_arena`], [`crate::engine::allocating`]:
+/// its sweep reads liveness unchecked).
 pub(crate) fn register_probe<T: fmt::Debug + 'static>(id: NodeId) {
-    PROBES.with(|p| {
-        let mut p = p.borrow_mut();
-        if p.len() >= SWEEP_AT.get() {
-            // Forget the signals disposed since, so the list follows what lives.
-            runtime::with(|rt| p.retain(|probe| rt.live(probe.id).is_some()));
-            SWEEP_AT.set(p.len().saturating_mul(2).max(64));
-        }
-        p.push(Probe {
-            id,
-            snapshot: snapshot_of::<T>,
-            write: write_of::<T>,
+    crate::engine::allocating(|| {
+        PROBES.with_arena(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() >= SWEEP_AT.with_arena(std::cell::Cell::get) {
+                // Forget the signals disposed since, so the list follows what lives.
+                runtime::with(|rt| p.retain(|probe| rt.live(probe.id).is_some()));
+                SWEEP_AT.with_arena(|s| s.set(p.len().saturating_mul(2).max(64)));
+            }
+            p.push(Probe {
+                id,
+                snapshot: snapshot_of::<T>,
+                write: write_of::<T>,
+            });
         });
     });
 }

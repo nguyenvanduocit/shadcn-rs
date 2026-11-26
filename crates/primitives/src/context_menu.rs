@@ -32,7 +32,7 @@
 //!   reaches what is under it (`gui::interact`), as a platform's context
 //!   menu hands it on.
 
-use std::cell::Cell;
+use gui::engine::WorldCell;
 use std::time::Duration;
 
 use gui::{Bounds, DismissReason, Div, KeyEvent, NamedKey, PointerButton, Positioning, Side, SideAlign, Signal};
@@ -54,12 +54,13 @@ pub struct ContextMenu {
     state: Signal<AreaState>,
 }
 
+/// The world's that made the menu: a check writes none of a live one's.
 #[derive(Default)]
 struct AreaState {
-    area: Cell<Option<Bounds>>,
-    by_pointer: Cell<bool>,
+    area: WorldCell<Option<Bounds>>,
+    by_pointer: WorldCell<bool>,
     /// How long a touch or pen is held to open it.
-    delay: Cell<Option<Duration>>,
+    delay: WorldCell<Option<Duration>>,
 }
 
 impl ContextMenu {

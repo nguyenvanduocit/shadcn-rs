@@ -339,7 +339,9 @@ struct Swiping {
     offset: Option<(f32, f32)>,
 }
 
-/// The toasts of one toaster: made once in its setup (`Copy`).
+/// The toasts of one toaster: made once in its setup (`Copy`). Engine
+/// handles alone: a logged collection keeps it behind an
+/// `engine::AppHandle`, which it never changes through.
 pub struct Toaster<T: 'static> {
     shown: Signal<Vec<Shown<T>>>,
     paused: Signal<Paused>,
@@ -348,7 +350,6 @@ pub struct Toaster<T: 'static> {
     region: Interaction,
     region_focus: FocusHandle,
     options: Signal<ToasterOptions>,
-    next: Signal<u64>,
     swiping: Signal<Option<Swiping>>,
     /// A swipe just ended: the click it makes presses nothing.
     swallow: Signal<bool>,
@@ -387,7 +388,6 @@ impl<T: Clone + 'static> Toaster<T> {
             region: Interaction::new(),
             region_focus: FocusHandle::new(),
             options: Signal::new(options),
-            next: Signal::new(1),
             swiping: Signal::labeled("toast swiping", None),
             swallow: Signal::labeled("toast swallow", false),
         };
@@ -462,12 +462,14 @@ impl<T: Clone + 'static> Toaster<T> {
         self.paused.update(|p| p.held = held);
     }
 
-    /// A fresh id.
+    /// A fresh id, never minted from state a rollback restores: one a
+    /// fork handed out names no toast shown live after it (ADR-0028,
+    /// rule 3).
     #[must_use]
     pub fn next_id(self) -> ToastId {
-        let id = self.next.get_untracked();
-        self.next.set(id.wrapping_add(1));
-        ToastId(id)
+        /// The toast ids handed out.
+        static NEXT: gui::engine::IdKind = gui::engine::IdKind::new("toast");
+        ToastId(gui::engine::unique_id(&NEXT))
     }
 
     /// Show `content` as toast `id`, as `options` say; an id already shown

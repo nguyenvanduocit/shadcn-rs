@@ -123,7 +123,7 @@ pub fn specimens(frame: &Frame) -> Vec<(&'static str, Bounds)> {
         .filter_map(|n| {
             n.name
                 .filter(|name| name.ends_with(".vue"))
-                .map(|name| (name, n.bounds))
+                .map(|name| (name, n.bounds(gui::inspect::OUTSIDE)))
         })
         .collect()
 }
@@ -142,7 +142,12 @@ pub fn scenario(page: &Page, dir: &Path) -> Result<Shot, gui::ScenarioError> {
     gui::clock::cancel_all();
     let mut s = Shot::new((page.render)(), dir, WIDTH, PROBE, 2.0)?;
     s.rest(REST)?;
-    let bottom = s.last().nodes.iter().map(|n| n.bounds.bottom()).fold(0.0_f32, f32::max);
+    let bottom = s
+        .last()
+        .nodes
+        .iter()
+        .map(|n| n.bounds(gui::inspect::OUTSIDE).bottom())
+        .fold(0.0_f32, f32::max);
     // The page's own padding below the last demo.
     let height = physical(bottom + 32.0, 1.0);
     if height <= PROBE {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::inspect::OUTSIDE;
 
 crate::engine::engine_local! {
     /// Inline boxes looked up by id on this thread ([`box_range`]).
@@ -3389,10 +3390,10 @@ fn a_focused_clamped_textarea_shows_the_text_its_caret_moves_through() {
             ts,
             &edit.text,
             t,
-            n.content_box,
+            n.content_box(OUTSIDE),
             *multiline,
             *focused,
-            n.scroll.map_or((0.0, 0.0), |s| s.applied),
+            n.scroll(OUTSIDE).map_or((0.0, 0.0), |s| s.applied),
         );
         let caret = ts.caret(&edit.text, &it.t, it.width, edit.caret);
         let before = edit
@@ -3410,7 +3411,7 @@ fn a_focused_clamped_textarea_shows_the_text_its_caret_moves_through() {
             }),
             caret.height,
             before.map(|b| b.into_iter().map(at).collect::<Vec<_>>()),
-            n.content_box,
+            n.content_box(OUTSIDE),
         )
     };
     for step in 0..content.len() - 1 {
@@ -3899,10 +3900,10 @@ fn field_caret(s: &crate::app::Scenario, ts: &mut TextSystem) -> (Bounds, Bounds
         ts,
         &edit.text,
         t,
-        n.content_box,
+        n.content_box(OUTSIDE),
         *multiline,
         *focused,
-        n.scroll.map_or((0.0, 0.0), |s| s.applied),
+        n.scroll(OUTSIDE).map_or((0.0, 0.0), |s| s.applied),
     );
     let c = ts.caret(&edit.text, &it.t, it.width, edit.caret);
     let caret = Bounds {
@@ -3911,7 +3912,7 @@ fn field_caret(s: &crate::app::Scenario, ts: &mut TextSystem) -> (Bounds, Bounds
         width: 0.0,
         height: c.height,
     };
-    (n.content_box, caret, edit.caret, edit.text.to_string())
+    (n.content_box(OUTSIDE), caret, edit.caret, edit.text.to_string())
 }
 
 #[test]
@@ -4085,11 +4086,11 @@ fn field_scrolls(s: &crate::app::Scenario) -> ((f32, f32), (f32, f32), (f32, f32
         .iter()
         .position(|n| matches!(n.content, crate::layout::Content::Input { .. }))
         .unwrap();
-    let field = nodes[i].scroll.expect("a field scrolls");
+    let field = nodes[i].scroll(OUTSIDE).expect("a field scrolls");
     let mut up = nodes[i].parent;
     let mut outer = (0.0, 0.0);
     while let Some(p) = up {
-        if let Some(sc) = nodes[p].scroll {
+        if let Some(sc) = nodes[p].scroll(OUTSIDE) {
             outer = sc.offset;
             break;
         }
@@ -4601,7 +4602,7 @@ fn input_offsets(s: &crate::app::Scenario) -> Vec<(f32, f32)> {
         .nodes
         .iter()
         .filter(|n| matches!(n.content, crate::layout::Content::Input { .. }))
-        .map(|n| n.scroll.map_or((0.0, 0.0), |sc| sc.offset))
+        .map(|n| n.scroll(OUTSIDE).map_or((0.0, 0.0), |sc| sc.offset))
         .collect()
 }
 
@@ -4788,7 +4789,7 @@ fn a_field_moved_from_a_closing_layer_to_the_page_in_one_frame_keeps_its_focus()
     assert_eq!(layer_of(&s), Some(1), "focused in its layer");
     s.act("move", || in_layer.set(false));
     s.settle().unwrap();
-    assert!(field.focus.is_focused(), "focus stays on it");
+    assert!(s.read(|| field.focus.is_focused()), "focus stays on it");
     assert_eq!(layer_of(&s), Some(0), "focused in the page");
     assert_eq!(s.pipeline().field_claims(), 1);
 }
@@ -5238,7 +5239,7 @@ fn a_fields_text_scrolled_into_its_container_shows_as_it_comes_in() {
     .unwrap();
     s.settle().unwrap();
     let mut ts = TextSystem::new();
-    let scene = crate::paint::Painter::default().cold(s.last(), &mut ts, (300, 300), 1.0, Color::WHITE);
+    let scene = crate::paint::Painter::fresh(s.last(), &mut ts, (300, 300), 1.0);
     let mut props = scene.properties;
     // The field's own clip: the one within another.
     let id = (1..props.clips.len())
@@ -5283,9 +5284,9 @@ fn input_node(s: &crate::app::Scenario) -> InputNode {
     else {
         unreachable!()
     };
-    let sc = n.scroll.expect("a field scrolls");
+    let sc = n.scroll(OUTSIDE).expect("a field scrolls");
     (
-        n.content_box,
+        n.content_box(OUTSIDE),
         edit.text.to_string(),
         t.clone(),
         *multiline,
@@ -5600,4 +5601,32 @@ fn a_rounded_scroll_container_in_a_rounded_card_leaves_the_cards_corners_untouch
         assert_eq!(px(x, y), [255, 255, 255, 255], "the card's corner at ({x}, {y})");
     }
     assert_eq!(px(70, 70), [0, 0, 0, 255], "inside: the content");
+}
+
+/// A face and a variation a check uses first are the check's own
+/// (ADR-0034, engine isolation): the ids live text gets after it are
+/// those a text system never checked gives, the check's face included
+/// when live text uses it later.
+#[cfg(debug_assertions)]
+#[test]
+fn a_face_a_check_uses_first_shifts_no_live_face_id() {
+    let sans = style(16.0, 24.0, 400);
+    let mono = ResolvedText {
+        family: FontFamily::GEIST_MONO,
+        ..style(16.0, 24.0, 700)
+    };
+    let live_steps = |ts: &mut TextSystem| {
+        let a = glyphs_of(&drawn(ts, Paragraph::from("live"), &sans, None));
+        let b = glyphs_of(&drawn(ts, Paragraph::from("mono"), &mono, None));
+        (a, b)
+    };
+    let want = live_steps(&mut TextSystem::new());
+    let mut checked = TextSystem::new();
+    let live = checked.enter_cold();
+    let cold = glyphs_of(&drawn(&mut checked, Paragraph::from("mono"), &mono, None));
+    assert!(!cold.is_empty(), "the check drew its text");
+    checked.exit_cold(live);
+    let got = live_steps(&mut checked);
+    assert_eq!(got.0, want.0, "the face live used first after a check");
+    assert_eq!(got.1, want.1, "the check's face, used live later");
 }

@@ -795,7 +795,7 @@ fn red_and_blue(s: &mut Scenario, label: &str) -> (usize, usize) {
         .nodes
         .iter()
         .find(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == label))
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .expect("the paragraph is a node");
     let shot = s.shot(false).unwrap();
     let scale = shot.scale();
@@ -956,7 +956,7 @@ fn a_button_on_a_line_a_clamp_hides_is_not_painted_or_clicked() {
             .find(|n| matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == "the button"))
             .cloned()
             .expect("the button's label is a node");
-        let b = node.bounds;
+        let b = node.bounds(gui::inspect::OUTSIDE);
         s.click(b.x + b.width / 2.0, b.y + b.height / 2.0);
         s.settle().unwrap();
         if clamp {
@@ -1076,9 +1076,10 @@ fn long_paragraph(pass: Pass) {
 
 /// The button of [`a_button_a_clamp_hides_and_shows_again_on_one_tree`]
 /// in the accessibility tree: the node a screen reader can press.
-fn button_in_access_tree(s: &Scenario) -> Option<accesskit::NodeId> {
+fn button_in_access_tree(s: &mut Scenario) -> Option<accesskit::NodeId> {
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "test", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "test", &mut ts);
     let pressable: Vec<_> = tree
         .nodes
         .iter()
@@ -1130,24 +1131,24 @@ fn a_button_a_clamp_hides_and_shows_again_on_one_tree() {
             .expect("the button's label is a node")
     };
     let click = |s: &mut Scenario| {
-        let b = label(s).bounds;
+        let b = label(s).bounds(gui::inspect::OUTSIDE);
         s.click(b.x + b.width / 2.0, b.y + b.height / 2.0);
         s.settle().unwrap();
     };
     // Shown.
     assert!(!label(&s).look.invisible, "on the first line it shows");
-    let id = button_in_access_tree(&s).expect("a screen reader finds the button");
+    let id = button_in_access_tree(&mut s).expect("a screen reader finds the button");
     click(&mut s);
     assert_eq!(clicks.get(), 1, "and takes a click");
     s.act("focus", || focus.focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(focus.id()), "it holds focus");
+    assert_eq!(s.read(gui::focus::focused), Some(focus.id()), "it holds focus");
     // Hidden.
     s.act("narrow", || narrow.set(true));
     s.settle().unwrap();
     assert!(label(&s).look.invisible, "on the clamped line it is hidden");
-    assert_eq!(gui::focus::focused(), None, "and loses focus");
-    assert_eq!(button_in_access_tree(&s), None, "and leaves the accessibility tree");
+    assert_eq!(s.read(gui::focus::focused), None, "and loses focus");
+    assert_eq!(button_in_access_tree(&mut s), None, "and leaves the accessibility tree");
     s.press(NamedKey::Enter, Modifiers::default());
     s.settle().unwrap();
     assert_eq!(clicks.get(), 1, "Enter does not press it");
@@ -1165,7 +1166,11 @@ fn a_button_a_clamp_hides_and_shows_again_on_one_tree() {
     s.act("widen", || narrow.set(false));
     s.settle().unwrap();
     assert!(!label(&s).look.invisible, "back on the first line it shows");
-    assert_eq!(button_in_access_tree(&s), Some(id), "back in the accessibility tree");
+    assert_eq!(
+        button_in_access_tree(&mut s),
+        Some(id),
+        "back in the accessibility tree"
+    );
     click(&mut s);
     assert_eq!(clicks.get(), 2, "and takes a click again");
 }
@@ -1239,23 +1244,25 @@ fn hiding_the_focused_node_of_a_trapped_dialog_keeps_focus_inside() {
     s.settle().unwrap();
     s.act("focus D2", || f[2].focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[2].id()), "D2 holds focus");
+    assert_eq!(s.read(gui::focus::focused), Some(f[2].id()), "D2 holds focus");
     s.act("hide D2", || hide.set(true));
     s.settle().unwrap();
     // The trap's rule for removed content: its region takes focus.
     assert_eq!(
-        gui::focus::focused(),
-        Some(region(&s, 0)),
+        s.read(gui::focus::focused),
+        Some(region(&mut s, 0)),
         "the dialog's region holds focus"
     );
 }
 
-/// The focus id of the region of layer `layer` in the last frame.
+/// The focus id of the region of layer `layer` in the last frame: a
+/// path's id is its window's, so it is asked in a turn of that window.
 #[expect(clippy::expect_used, reason = "a layer not open is a failed test")]
-fn region(s: &Scenario, layer: usize) -> gui::focus::FocusId {
+fn region(s: &mut Scenario, layer: usize) -> gui::focus::FocusId {
     let f = s.last();
     let root = f.layers.get(layer).expect("the layer is open").root;
-    gui::FocusHandle::for_path(&f.nodes.get(root).expect("its root is a node").path).id()
+    let path = f.nodes.get(root).expect("its root is a node").path.clone();
+    s.read(|| gui::FocusHandle::for_path(&path).id())
 }
 
 /// A focused node hidden with its dialog in one pass: the dialog closes
@@ -1284,7 +1291,7 @@ fn hiding_a_dialog_with_its_focused_node_gives_focus_back_to_its_trigger() {
         gone.set(true);
     });
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[0].id()), "back to the trigger");
+    assert_eq!(s.read(gui::focus::focused), Some(f[0].id()), "back to the trigger");
 }
 
 /// Code focusing a hidden node while a shown one holds focus does nothing,
@@ -1322,7 +1329,11 @@ fn focusing_a_hidden_node_keeps_focus_where_it_is() {
     let before = blurs.get();
     s.act("focus the hidden one", || hidden.focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(shown.id()), "the shown one keeps focus");
+    assert_eq!(
+        s.read(gui::focus::focused),
+        Some(shown.id()),
+        "the shown one keeps focus"
+    );
     assert_eq!(blurs.get(), before, "it never blurred");
 }
 
@@ -1396,7 +1407,7 @@ fn a_hidden_deferred_root_leaves_the_key_to_the_root_below() {
     )
     .unwrap();
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), None);
+    assert_eq!(s.read(gui::focus::focused), None);
     s.press(NamedKey::Enter, Modifiers::default());
     s.settle().unwrap();
     assert_eq!(layer_keys.get(), 0, "the hidden root takes no key");
@@ -1431,10 +1442,10 @@ fn a_focused_node_made_inert_loses_focus() {
     let mut s = inert_pair(inert, f);
     s.act("focus B", || f[1].focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[1].id()));
+    assert_eq!(s.read(gui::focus::focused), Some(f[1].id()));
     s.act("make B inert", || inert.set(true));
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), None, "inert, it holds no focus");
+    assert_eq!(s.read(gui::focus::focused), None, "inert, it holds no focus");
 }
 
 /// Code focusing an inert node does not take focus from a shown one.
@@ -1447,7 +1458,7 @@ fn focusing_an_inert_node_keeps_focus_where_it_is() {
     s.settle().unwrap();
     s.act("focus the inert B", || f[1].focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[0].id()), "A keeps focus");
+    assert_eq!(s.read(gui::focus::focused), Some(f[0].id()), "A keeps focus");
 }
 
 /// What runs after layout sees the frame just laid out: a button that
@@ -1477,7 +1488,11 @@ fn a_node_revealed_takes_focus_asked_after_layout() {
         part.run(|| gui::after_layout(move || f[1].focus()));
     });
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[1].id()), "the revealed B holds focus");
+    assert_eq!(
+        s.read(gui::focus::focused),
+        Some(f[1].id()),
+        "the revealed B holds focus"
+    );
 }
 
 /// A focused node removed outside any scope leaves no id behind: laid out
@@ -1504,10 +1519,10 @@ fn a_focused_node_removed_and_laid_out_again_is_not_focused() {
     s.settle().unwrap();
     s.act("remove B", || shown.set(false));
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), None, "removed, nothing holds focus");
+    assert_eq!(s.read(gui::focus::focused), None, "removed, nothing holds focus");
     s.act("lay B out again", || shown.set(true));
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), None, "and B does not take it back");
+    assert_eq!(s.read(gui::focus::focused), None, "and B does not take it back");
 }
 
 /// An inner trapped dialog removed with its opener while the outer one
@@ -1559,12 +1574,12 @@ fn an_inner_dialog_gone_with_its_opener_leaves_focus_in_the_outer() {
     s.settle().unwrap();
     s.act("focus I1", || f[2].focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[2].id()));
+    assert_eq!(s.read(gui::focus::focused), Some(f[2].id()));
     s.act("remove the inner with its opener", || inner.set(false));
     s.settle().unwrap();
     assert_eq!(
-        gui::focus::focused(),
-        Some(region(&s, 0)),
+        s.read(gui::focus::focused),
+        Some(region(&mut s, 0)),
         "the outer's region holds focus"
     );
 }
@@ -1643,7 +1658,7 @@ fn a_dialog_opened_from_a_dormant_node_sleeps_with_it() {
     .unwrap();
     s.settle().unwrap();
     assert_eq!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         Some(inside.id()),
         "awake, the dialog takes focus"
     );
@@ -1651,7 +1666,7 @@ fn a_dialog_opened_from_a_dormant_node_sleeps_with_it() {
     s.settle().unwrap();
     let root = s.last().layers.first().expect("the layer is laid out").root;
     assert!(s.last().nodes[root].look.invisible, "its region is not shown");
-    assert_ne!(gui::focus::focused(), Some(inside.id()), "nor holds focus");
+    assert_ne!(s.read(gui::focus::focused), Some(inside.id()), "nor holds focus");
     s.press(NamedKey::Enter, Modifiers::default());
     s.settle().unwrap();
     assert_eq!(keys.get(), 0, "it takes no key");
@@ -1687,7 +1702,11 @@ fn two_trees_on_one_thread_keep_their_lists_and_hidden_focus_apart() {
     assert_eq!(list.get(), [1], "the other tree's pass keeps this tree's list");
     a.act("focus the shown one", || shown.focus());
     a.act("focus the hidden one", || hidden.focus());
-    assert_eq!(gui::focus::focused(), Some(shown.id()), "this tree still hides it");
+    assert_eq!(
+        a.read(gui::focus::focused),
+        Some(shown.id()),
+        "this tree still hides it"
+    );
 }
 
 /// A list's watcher runs on the frame as it is: a member that pass
@@ -1725,7 +1744,7 @@ fn a_list_watcher_focuses_a_member_revealed_that_pass() {
     });
     s.act("reveal B", || hidden.set(false));
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[1].id()), "the watcher focused B");
+    assert_eq!(s.read(gui::focus::focused), Some(f[1].id()), "the watcher focused B");
 }
 
 /// A pass that hides the focused node, and a hook after it that shows it
@@ -1758,7 +1777,7 @@ fn a_node_hidden_and_shown_again_within_a_frame_keeps_focus() {
         part.run(|| gui::after_layout(move || hidden.set(false)));
     });
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[1].id()), "B keeps focus");
+    assert_eq!(s.read(gui::focus::focused), Some(f[1].id()), "B keeps focus");
 }
 
 /// A node made inert with nothing else changing (no box moves) is known
@@ -1774,7 +1793,7 @@ fn focusing_a_node_just_made_inert_keeps_focus_where_it_is() {
     s.settle().unwrap();
     s.act("focus B", || f[1].focus());
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(f[0].id()), "A keeps focus");
+    assert_eq!(s.read(gui::focus::focused), Some(f[0].id()), "A keeps focus");
 }
 
 /// Focus is each window's own: laying out another window, whose node at
@@ -1800,14 +1819,13 @@ fn laying_out_another_window_keeps_this_window_s_focus() {
     a.settle().unwrap();
     a.click(60.0, 15.0);
     a.settle().unwrap();
-    let held = gui::focus::focused();
+    let held = a.read(gui::focus::focused);
     assert!(held.is_some(), "the node takes focus in the first window");
     let mut b = Scenario::measuring(ui(true), 400, 200, 1.0).unwrap();
     b.settle().unwrap();
-    assert_eq!(gui::focus::focused(), None, "the second window holds none");
+    assert_eq!(b.read(gui::focus::focused), None, "the second window holds none");
     a.settle().unwrap();
-    a.act("read", || {});
-    assert_eq!(gui::focus::focused(), held, "the first window keeps its focus");
+    assert_eq!(a.read(gui::focus::focused), held, "the first window keeps its focus");
 }
 
 /// The cold check lays the frame out again on a tree of its own: the

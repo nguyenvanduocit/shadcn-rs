@@ -90,6 +90,8 @@ pub enum NumberStyle {
     },
 }
 
+impl gui::engine::FreshValue for NumberStyle {}
+
 /// `unitDisplay`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub enum UnitWidth {
@@ -194,10 +196,10 @@ struct Resolved {
 type Key = (String, NumberStyle);
 
 gui::engine_local! {
-    /// Resolved formats, by their options.
+    /// Resolved formats, by their options: a cache, so a fork reads none
+    /// and warms none (it resolves its own).
     #[expect(clippy::disallowed_types, reason = "a per-thread cache of resolved formats, keyed by their options: no component's state")]
-    [Shared("append-only and result-neutral: an entry is a pure function of its key, never changed or removed")]
-    static RESOLVED: RefCell<HashMap<Key, Rc<Resolved>>> = RefCell::new(HashMap::new());
+    [Fresh] static RESOLVED: RefCell<HashMap<Key, Rc<Resolved>>> = RefCell::new(HashMap::new());
 }
 
 /// The unit's names in `locale`, `width` wide: the first of the unit

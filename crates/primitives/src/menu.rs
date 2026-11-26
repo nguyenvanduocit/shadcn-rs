@@ -99,12 +99,7 @@
 //! - The pointer's direction for the grace area is read from moves over
 //!   the content, as reka does (`clientX`, not `movementX`).
 
-use std::cell::Cell;
-#[expect(
-    clippy::disallowed_types,
-    reason = "the level's sideways move and veto: set only by this crate's constructors (`pub(crate)`) in the setup that made the level, read by the level's own handlers"
-)]
-use std::cell::RefCell;
+use gui::engine::{WorldCell, WorldRefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -258,7 +253,7 @@ pub struct Row {
     /// Its box as last laid out, while a filter is there: its own, held
     /// in the level's list of the items laid out (never a table of the
     /// level's that rows would add to).
-    measured: Rc<Cell<Option<gui::Bounds>>>,
+    measured: Rc<WorldCell<Option<gui::Bounds>>>,
 }
 
 #[derive(Clone)]
@@ -288,10 +283,10 @@ struct Hit {
 type Sideways = gui::Callback<bool>;
 type Veto = gui::Callback<DismissReason, bool>;
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the level's sideways move and veto: set only by this crate's constructors (`pub(crate)`) in the setup that made the level, read by the level's own handlers"
-)]
+/// Its cells are the world's that made the level: a check writes none of a
+/// live one's (ADR-0034, S7). The sideways move and veto are set only by
+/// this crate's constructors (`pub(crate)`) in the setup that made the
+/// level, and read by the level's own handlers.
 struct Level {
     open: Rc<dyn OpenModel>,
     parent: Option<Menu>,
@@ -306,25 +301,25 @@ struct Level {
     direction: ReadDirection,
     options: MenuOptions,
     /// ArrowLeft and ArrowRight past the items (a menubar's menus).
-    sideways: RefCell<Option<Sideways>>,
+    sideways: WorldRefCell<Option<Sideways>>,
     /// What a wrapper does not count as outside.
-    veto: RefCell<Option<Veto>>,
+    veto: WorldRefCell<Option<Veto>>,
     /// Where this level's content was placed (a submenu's side, for the
     /// grace area; the look's side and origin).
     placed: Signal<Option<Placement>>,
     /// The pointer over this content: where it last moved, which way along
     /// x, and what it was over.
-    pointer: Cell<(f32, f32)>,
-    heading: Cell<Option<Side>>,
-    hit: Cell<Option<Hit>>,
-    over: Cell<Option<FocusId>>,
+    pointer: WorldCell<(f32, f32)>,
+    heading: WorldCell<Option<Side>>,
+    hit: WorldCell<Option<Hit>>,
+    over: WorldCell<Option<FocusId>>,
     /// The pointer moved over this content since it opened: only then does
     /// its leaving take the highlight away.
-    inside: Cell<bool>,
-    grace: Cell<Option<Grace>>,
-    grace_timer: Cell<Option<TimerId>>,
+    inside: WorldCell<bool>,
+    grace: WorldCell<Option<Grace>>,
+    grace_timer: WorldCell<Option<TimerId>>,
     /// A submenu's opening on the mouse's rest.
-    open_timer: Cell<Option<TimerId>>,
+    open_timer: WorldCell<Option<TimerId>>,
     /// The search field in this content (`DropdownMenuFilter`), if any:
     /// while it holds focus the highlight is [`Level::active`], not focus.
     filter: gui::Holder<FocusHandle>,
@@ -360,7 +355,7 @@ impl std::fmt::Debug for Menu {
     }
 }
 
-fn cancel(timer: &Cell<Option<TimerId>>) {
+fn cancel(timer: &WorldCell<Option<TimerId>>) {
     if let Some(t) = timer.take() {
         clock::cancel(t);
     }
@@ -416,10 +411,6 @@ impl Menu {
     }
 
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the level's sideways move and veto: set only by this crate's constructors (`pub(crate)`) in the setup that made the level, read by the level's own handlers"
-    )]
     fn level(open: Rc<dyn OpenModel>, parent: Option<Menu>, options: MenuOptions) -> Self {
         Self {
             level: Signal::new(Level {
@@ -433,17 +424,17 @@ impl Menu {
                 link: Linked::new(Points::Controls),
                 direction: use_direction(None),
                 options,
-                sideways: RefCell::new(None),
-                veto: RefCell::new(None),
+                sideways: WorldRefCell::new("a menu level's sideways move", None),
+                veto: WorldRefCell::new("a menu level's veto", None),
                 placed: Signal::labeled("menu placed", None),
-                pointer: Cell::new((0.0, 0.0)),
-                heading: Cell::new(None),
-                hit: Cell::new(None),
-                over: Cell::new(None),
-                inside: Cell::new(false),
-                grace: Cell::new(None),
-                grace_timer: Cell::new(None),
-                open_timer: Cell::new(None),
+                pointer: WorldCell::new("a menu level's pointer", (0.0, 0.0)),
+                heading: WorldCell::new("a menu level's pointer heading", None),
+                hit: WorldCell::new("a menu level's hit", None),
+                over: WorldCell::new("the item a menu level's pointer is over", None),
+                inside: WorldCell::new("whether the pointer moved in a menu level", false),
+                grace: WorldCell::new("a menu level's grace area", None),
+                grace_timer: WorldCell::new("a menu level's grace timer", None),
+                open_timer: WorldCell::new("a submenu's open timer", None),
                 filter: gui::Holder::new(),
                 active: Signal::labeled("menu highlight", None),
                 active_ref: NodeRef::new(),
@@ -1306,7 +1297,7 @@ impl Menu {
         };
         let row = Row {
             kind,
-            measured: Rc::new(Cell::new(None)),
+            measured: Rc::new(WorldCell::new("a menu row's box", None)),
         };
         let items = self.with(|l| l.items.clone());
         let item = Item {

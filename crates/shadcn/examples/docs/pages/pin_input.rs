@@ -74,7 +74,7 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .nodes
         .iter()
         .find(|n| n.name == Some("pin-input-slot"))
-        .map(|n| n.bounds);
+        .map(|n| n.bounds(gui::inspect::OUTSIDE));
     let Some(b) = first else {
         return Err(ScenarioError::TextNotFound("pin-input-slot".to_owned()));
     };

@@ -311,6 +311,28 @@ wrote every property table: about 1.5 ms of a steady `grid` frame, with nothing 
 | docs `--bench`, instructions per steady frame | `calendar` 1.08 M, `code-block` 1.41 M | `calendar` 0.04 M, `code-block` 0.07 M; 24 pages faster, none slower |
 | `GUI_COLD_CHECK=1` docs monkey (seeds 1, 3, 7 × 300), `cargo test --workspace` | — | 0 differences |
 
+### The layers a frame was drawn with are published for input (2026-11-24)
+
+- A layer's texels are its own pixels: its composite resamples them (bilinear), so what a pixel shows near a clip
+  edge in a scaled layer is not what the clip covers on the canvas. Input must read what the screen showed.
+- The renderer publishes, per layer it planned, a `scene::LayerStage`: its effect, its outer layer, its map into
+  that layer's target (physical pixels; the identity when the composite copies texels one to one, so a layer that
+  only filters adds no stage to follow) and its output clip. The list changes only when a plan changes, and an
+  oversized frame with no canvas publishes none until its banded capture publishes its own. A frame already
+  presented is never changed: headless, where the read-back is what shows, the capture is presented as a new
+  entry on the presentation timeline; a window's capture draws aside and leaves the frame on screen as it was.
+- The compositor sets it on `Presented` with that frame's hit table and property trees (ADR-0015). `clip::hit_in`
+  walks a hit's clip chain from the innermost resampling layer out, resampling each level's coverage as its
+  composite does; the depth is unbounded (8 levels kept on the stack, the rest spilled in order).
+- Each presented frame keeps its own copy of the property trees for input (ADR-0015). A compose records the ids of
+  the entries it wrote (`compose::PropDelta`), and a recycled frame takes in only those since its buffer's frame;
+  through a compose not recorded, or one that rebuilt the trees, it copies them whole into the buffers it has. cc
+  copies whole trees at commit and carries changed-node lists for the rest (`layer_tree_impl.cc:740-746`,
+  `property_tree.cc:2770-2783`); here the per-frame copy is the hot path, so the list drives the copy itself.
+- Sources: Blink hit-tests against the pixel-snapped geometry paint uses; cc tests rects only and falls back to the
+  main thread where it cannot (crbug 40572334, 40887983); viz keeps hit-test data per `CompositorFrame`. Heckbert
+  (1989) and Smith (1995) frame the composite as reconstruction and resampling, which the hit rule inverts.
+
 ## Revisit when
 
 - A scene's damage regularly covers most of the window (full-screen video, a canvas pan) and the extra blit shows in a

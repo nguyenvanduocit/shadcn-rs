@@ -46,8 +46,10 @@ fn scenario(f: impl Fn() -> Element + 'static) -> Scenario {
     s
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// Whether `h` holds focus in `s`'s window, read in a turn of it (outside
+/// any turn, focus is the thread window's: ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
 }
 
 fn key(s: &mut Scenario, k: NamedKey, modifiers: Modifiers) {
@@ -148,19 +150,25 @@ fn radios(keymap: Keymap, direction: Direction) -> (Scenario, Radios) {
 fn a_roving_group_is_one_tab_stop_entered_at_its_active_item() {
     let (mut s, r) = radios(Keymap::RADIO_GROUP, Direction::Ltr);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(r.before));
+    assert!(focused(&mut s, r.before));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(r.items[1]), "Tab enters at the checked radio, B");
+    assert!(focused(&mut s, r.items[1]), "Tab enters at the checked radio, B");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(r.after), "one press leaves the group");
+    assert!(focused(&mut s, r.after), "one press leaves the group");
     shift(&mut s, NamedKey::Tab);
-    assert!(focused(r.items[1]), "Shift+Tab enters at the same item");
+    assert!(focused(&mut s, r.items[1]), "Shift+Tab enters at the same item");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(r.items[3]), "the disabled C is passed");
+    assert!(focused(&mut s, r.items[3]), "the disabled C is passed");
     shift(&mut s, NamedKey::Tab);
-    assert!(focused(r.before), "Shift+Tab leaves in one press, from any item");
+    assert!(
+        focused(&mut s, r.before),
+        "Shift+Tab leaves in one press, from any item"
+    );
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(r.items[1]), "the active item wins over the last focused");
+    assert!(
+        focused(&mut s, r.items[1]),
+        "the active item wins over the last focused"
+    );
 }
 
 #[test]
@@ -169,14 +177,17 @@ fn moving_the_tab_stop_renders_none_of_the_groups_items() {
     let at_start = r.renders.get();
     plain(&mut s, NamedKey::Tab);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(r.items[1]));
+    assert!(focused(&mut s, r.items[1]));
     plain(&mut s, NamedKey::ArrowRight);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(r.items[0]), "D, then around to A");
+    assert!(focused(&mut s, r.items[0]), "D, then around to A");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(r.after), "the bound stop still lets Tab leave in one press");
+    assert!(
+        focused(&mut s, r.after),
+        "the bound stop still lets Tab leave in one press"
+    );
     shift(&mut s, NamedKey::Tab);
-    assert!(focused(r.items[1]), "and enters at the active item again");
+    assert!(focused(&mut s, r.items[1]), "and enters at the active item again");
     assert_eq!(
         r.renders.get(),
         at_start,
@@ -203,7 +214,7 @@ fn the_keyboard_table_wraps_as_the_keymap_says_and_turns_right_to_left() {
     ];
     for (k, at) in table {
         plain(&mut s, k);
-        assert!(focused(r.items[at]), "{k:?} reaches item {at}");
+        assert!(focused(&mut s, r.items[at]), "{k:?} reaches item {at}");
     }
     key(
         &mut s,
@@ -213,7 +224,7 @@ fn the_keyboard_table_wraps_as_the_keymap_says_and_turns_right_to_left() {
             ..Modifiers::default()
         },
     );
-    assert!(focused(r.items[3]), "Control with an arrow does not move");
+    assert!(focused(&mut s, r.items[3]), "Control with an arrow does not move");
     plain(&mut s, NamedKey::Enter);
     assert_eq!(*r.moved.borrow(), ["enter"], "the item's own handler takes its keys");
 
@@ -221,10 +232,10 @@ fn the_keyboard_table_wraps_as_the_keymap_says_and_turns_right_to_left() {
     s.act("focus A", || r.items[0].focus());
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(r.items[1]), "right to left, ArrowLeft goes forward");
+    assert!(focused(&mut s, r.items[1]), "right to left, ArrowLeft goes forward");
     plain(&mut s, NamedKey::ArrowRight);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(r.items[0]), "without wrap, the first item stays");
+    assert!(focused(&mut s, r.items[0]), "without wrap, the first item stays");
 }
 
 #[test]
@@ -255,11 +266,14 @@ fn an_item_focused_from_code_as_it_mounts_is_the_groups_last() {
         items[2].focus();
     });
     s.settle().expect("settled");
-    assert!(focused(items[2]));
+    assert!(focused(&mut s, items[2]));
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(after));
+    assert!(focused(&mut s, after));
     shift(&mut s, NamedKey::Tab);
-    assert!(focused(items[2]), "Shift+Tab enters at the item that held focus last");
+    assert!(
+        focused(&mut s, items[2]),
+        "Shift+Tab enters at the item that held focus last"
+    );
 }
 
 #[test]
@@ -287,13 +301,18 @@ fn a_key_from_a_descendant_is_not_the_groups() {
         text: None,
         modifiers: Modifiers::default(),
     };
-    assert_eq!(group.key(a, &down), Nav::Ignored, "item A does not hold focus");
+    assert_eq!(
+        s.read(|| group.key(a, &down)),
+        Nav::Ignored,
+        "item A does not hold focus"
+    );
     s.act("focus A", || a.focus());
     s.settle().expect("settled");
-    assert_eq!(group.key(a, &down), Nav::Moved(1));
+    // The key is the window's: handled in a turn of it (ADR-0015).
+    assert_eq!(s.read(|| group.key(a, &down)), Nav::Moved(1));
     s.settle().expect("settled");
     assert_eq!(
-        group.key(b, &down),
+        s.read(|| group.key(b, &down)),
         Nav::Stayed,
         "past the end without wrap: consumed, stays"
     );
@@ -342,12 +361,12 @@ fn typeahead_forgets_its_search_1000_ms_after_the_last_key() {
     s.settle().expect("settled");
     s.type_text("b");
     s.settle().expect("settled");
-    assert!(handles[1].is_focused(), "b reaches Banana");
+    assert!(s.read(|| handles[1].is_focused()), "b reaches Banana");
     s.wait(Duration::from_millis(500));
     s.type_text("l");
     s.settle().expect("settled");
     assert!(
-        handles[2].is_focused(),
+        s.read(|| handles[2].is_focused()),
         "bl, typed within the second, reaches Blueberry"
     );
     assert_eq!(t.search(), "bl");
@@ -360,7 +379,7 @@ fn typeahead_forgets_its_search_1000_ms_after_the_last_key() {
     s.type_text("b");
     s.settle().expect("settled");
     assert!(
-        handles[1].is_focused(),
+        s.read(|| handles[1].is_focused()),
         "a new search: b from Blueberry wraps to Banana"
     );
     // The rule itself, on the whole list.
@@ -625,7 +644,8 @@ fn time_segments_are_spin_buttons_stepped_by_assistive_technology() {
     let model = Signal::new(Time::parse("09:--:--"));
     let (mut s, field, _) = time_form(model, Signal::new((Availability::Enabled, false)));
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("time_a11y", dump(&tree));
     let hours = tree
         .nodes
@@ -655,18 +675,19 @@ fn a_time_field_that_cannot_be_used_is_not_changed_and_its_form_agrees() {
     let (mut s, field, form) = time_form(model, usable);
     s.settle().expect("settled");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("time_disabled_a11y", dump(&tree));
     assert!(form_data(&[&form]).is_empty(), "a disabled field is not sent");
     plain(&mut s, NamedKey::Tab);
-    assert!(!field.focused(), "a disabled segment takes no focus");
+    assert!(!s.read(|| field.focused()), "a disabled segment takes no focus");
 
     s.act("unavailable", || usable.set((Availability::Unavailable, false)));
     s.act("focus the hour", || {
         field.focus_segment(Some(Segment::Hour));
     });
     s.settle().expect("settled");
-    assert!(field.focused(), "an unavailable segment takes focus");
+    assert!(s.read(|| field.focused()), "an unavailable segment takes focus");
     plain(&mut s, NamedKey::ArrowUp);
     s.type_text("5");
     s.settle().expect("settled");
@@ -899,14 +920,15 @@ fn what_a_screen_reader_is_told() {
         .into_element()
     });
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     let dumped = dump(&tree);
     assert!(!dumped.contains("Gone"), "fully hidden text is not read:\n{dumped}");
     insta::assert_snapshot!("blocks_a11y", dumped);
     s.click_text("Accept").expect("the label takes clicks");
     s.settle().expect("settled");
     assert_eq!(toggled.get(), 1, "a click on the label acts on its control");
-    assert!(focused(check), "and focuses it");
+    assert!(focused(&mut s, check), "and focuses it");
 
     // As `<label>` for a disabled `<input>`: nothing happens.
     check.blur();
@@ -915,7 +937,7 @@ fn what_a_screen_reader_is_told() {
     s.click_text("Accept").expect("the label takes clicks");
     s.settle().expect("settled");
     assert_eq!(toggled.get(), 1, "a disabled control is not acted on");
-    assert!(!focused(check), "nor focused");
+    assert!(!focused(&mut s, check), "nor focused");
 
     // An unavailable control is focused (it stays in the tab order) but
     // not acted on.
@@ -924,7 +946,7 @@ fn what_a_screen_reader_is_told() {
     s.click_text("Accept").expect("the label takes clicks");
     s.settle().expect("settled");
     assert_eq!(toggled.get(), 1, "an unavailable control is not acted on");
-    assert!(focused(check), "but is focused");
+    assert!(focused(&mut s, check), "but is focused");
 }
 
 #[test]
@@ -938,16 +960,14 @@ fn a_highlight_moves_by_data_index_to_rows_never_built() {
     let list = ListState::new(30.0);
     let active = Signal::new(Some(0_usize));
     let root = FocusHandle::new();
-    let st = list.clone();
+    let st = list;
     let mut s = scenario(move || {
-        let st = st.clone();
         // The last row is disabled: End lands on the one before it.
         let data = |i: usize| Availability::from_disabled(i == ROWS - 1);
         div()
             .width(300.0)
             .track_focus(root)
             .on_key_down({
-                let st = st.clone();
                 move |ev| {
                     let items = from_fn(ROWS, data, |i| Cow::Owned(format!("row {i}")));
                     let from = active.get_untracked();
@@ -1037,9 +1057,9 @@ fn toolbar() -> (Scenario, [FocusHandle; 3], Rc<RefCell<Vec<&'static str>>>) {
 fn an_unavailable_item_takes_focus_and_is_read_as_disabled_but_is_not_acted_on() {
     let (mut s, items, clicked) = toolbar();
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(items[0]));
+    assert!(focused(&mut s, items[0]));
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(items[1]), "navigation stops on the unavailable Y");
+    assert!(focused(&mut s, items[1]), "navigation stops on the unavailable Y");
     plain(&mut s, NamedKey::Enter);
     plain(&mut s, NamedKey::Space);
     assert!(clicked.borrow().is_empty(), "Enter and Space do not press it");
@@ -1050,7 +1070,8 @@ fn an_unavailable_item_takes_focus_and_is_read_as_disabled_but_is_not_acted_on()
     assert_eq!(*clicked.borrow(), ["X"]);
 
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("unavailable_a11y", dump(&tree));
     let node = |label: &str| {
         tree.nodes

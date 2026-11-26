@@ -5,3 +5,8 @@ node_modules/
 # The verdict's fetched references and the photos it shoots (crates/shadcn/verdict/fetch.sh).
 .shadcn-vue/
 .photos/
+
+# Orchestration guard runtime files
+/.claude/guard/log.tsv
+/.claude/guard/.lock
+/.claude/guard/ledger.tmp

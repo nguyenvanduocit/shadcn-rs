@@ -463,7 +463,8 @@ pub fn with_theme(edit: impl Fn(&mut Theme) + 'static, child: impl IntoElement) 
     )
 }
 
-#[cfg(test)]
+/// The fork tests: forks are built in debug builds only (ADR-0028, F2).
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::{Scheme, use_theme};
     use crate::design::use_design;
@@ -473,7 +474,7 @@ mod tests {
     #[test]
     fn the_defaults_read_first_in_a_cold_frame_are_live_ones() {
         std::thread::spawn(|| {
-            gui::engine::in_cold_frame(|| (use_theme().scheme(), use_design().get()));
+            gui::testing::in_check(|| (use_theme().scheme(), use_design().get()));
             let (t, d) = (use_theme(), use_design());
             t.update(|t| t.scheme = Scheme::Dark);
             assert_eq!(t.scheme(), Scheme::Dark, "the theme works");

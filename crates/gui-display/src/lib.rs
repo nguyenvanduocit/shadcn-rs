@@ -29,9 +29,12 @@ pub mod edid;
 pub mod gamut;
 #[cfg(target_os = "macos")]
 mod macos;
+mod scroll;
 mod ticks;
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "android")))]
 mod x11;
+
+pub use scroll::{Scroll, ScrollModifiers, ScrollPhase, ScrollTap, tap_scrolls};
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};

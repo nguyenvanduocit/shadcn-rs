@@ -148,8 +148,9 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .nodes
         .iter()
         .filter(|n| n.name == Some("dropdown-menu-trigger"))
-        .find(|n| n.bounds.width > 20.0)
-        .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
+        .find(|b| b.width > 20.0)
+        .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound("components menu".into()))?;
     s.click(x, y);
     s.frame("components menu open")?;

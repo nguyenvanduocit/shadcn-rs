@@ -832,6 +832,10 @@ pub(crate) trait Mounted {
     fn eval(&mut self) -> bool;
     /// Write what it last gave; false, writing nothing, before its first run.
     fn write(&self, style: &mut Style) -> bool;
+    /// What it last gave, as a mount of its own that registers with
+    /// nothing: a held write a cold build reuses in its place (ADR-0015,
+    /// rule 12, a hold per setter), never running its closure.
+    fn snapshot(&self) -> Box<dyn Mounted>;
     /// A source's registration, taken out: its node is hidden, and its
     /// parent waits in its place.
     fn take_wait(&mut self) -> Option<source::Wait>;
@@ -932,6 +936,14 @@ where
             }
             None => false,
         }
+    }
+
+    fn snapshot(&self) -> Box<dyn Mounted> {
+        Box::new(Self {
+            def: Rc::clone(&self.def),
+            last: self.last.clone(),
+            wait: None,
+        })
     }
 }
 

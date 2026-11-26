@@ -13,6 +13,9 @@ use super::{Marks, need};
 pub(super) struct Tracked<K: ?Sized, T, E = ()> {
     node: crate::reactive::RenderNode,
     memo: Option<(Rc<K>, E, T)>,
+    /// Its last run panicked in a turn: it gives what it gave before, and
+    /// a cold build reuses that ([`HeldNode`]).
+    held: bool,
 }
 
 impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
@@ -20,26 +23,50 @@ impl<K: ?Sized, T: Clone, E: PartialEq + Clone> Tracked<K, T, E> {
         Self {
             node: tracker(&resolve_mark(marks, u)),
             memo: None,
+            held: false,
         }
     }
 
-    fn get_over(&mut self, f: &Rc<K>, input: &E, run: impl FnOnce() -> T) -> T {
+    /// What it gives: run again when what it read changed or the closure
+    /// or its input is another. A run that panics in a turn (user code,
+    /// ADR-0015, the turn rule) is to the arbiter, and changes nothing:
+    /// it gives what it last gave (`None` before it ever gave: its node
+    /// shows nothing of it), and runs again when what it read before the
+    /// panic changes.
+    fn get_over(&mut self, f: &Rc<K>, input: &E, run: impl FnOnce() -> T) -> Option<T> {
         if let Some((g, e, v)) = &self.memo
             && Rc::ptr_eq(g, f)
             && e == input
             && !self.node.is_marked()
         {
-            return v.clone();
+            return Some(v.clone());
         }
         crate::component::count_binding();
-        let v = self.node.track(run);
-        self.memo = Some((Rc::clone(f), input.clone(), v.clone()));
-        v
+        let node = self.node;
+        match crate::engine::attempt(|| node.track(run)) {
+            Ok(v) => {
+                self.held = false;
+                self.memo = Some((Rc::clone(f), input.clone(), v.clone()));
+                Some(v)
+            }
+            Err(failed) => {
+                crate::component::contain_binding(failed);
+                self.held = true;
+                self.memo.as_ref().map(|(_, _, v)| v.clone())
+            }
+        }
+    }
+
+    /// What it holds over a run that panicked in a turn, for a cold build
+    /// to reuse as it is ([`HeldNode`]): `None` when it holds nothing;
+    /// `Some(None)` when it holds what it gave before it ever gave.
+    fn held(&self) -> Option<Option<T>> {
+        self.held.then(|| self.memo.as_ref().map(|(_, _, v)| v.clone()))
     }
 }
 
 impl<K: ?Sized, T: Clone> Tracked<K, T> {
-    pub(super) fn get(&mut self, f: &Rc<K>, run: impl FnOnce() -> T) -> T {
+    pub(super) fn get(&mut self, f: &Rc<K>, run: impl FnOnce() -> T) -> Option<T> {
         self.get_over(f, &(), run)
     }
 }
@@ -48,7 +75,7 @@ impl<K: ?Sized, T, E> Drop for Tracked<K, T, E> {
     fn drop(&mut self) {
         // Even while unwinding (a binding panicked): a tracker left
         // subscribed would mark a node gone; disposing is safe then.
-        self.node.dispose();
+        self.node.release(crate::engine::LiveDrop::in_drop());
     }
 }
 
@@ -92,7 +119,7 @@ impl Tracker {
 impl Drop for Tracker {
     fn drop(&mut self) {
         if let Some(t) = self.0.take() {
-            t.dispose();
+            t.release(crate::engine::LiveDrop::in_drop());
         }
     }
 }
@@ -130,8 +157,61 @@ pub(super) struct BoundRun {
     /// Made at a closure's first run; none for a source.
     pub(super) node: Option<crate::reactive::RenderNode>,
     /// `None` before its first run, once its write is no longer bound, and
-    /// after its closure panicked (it runs anew at the next resolve).
+    /// after its closure panicked outside a turn (it runs anew at the next
+    /// resolve).
     mounted: Option<Box<dyn Mounted>>,
+    /// Its closure's last run panicked in a turn: the mount gives what it
+    /// gave before, and a cold build reuses the style ([`HeldNode`]).
+    held: bool,
+}
+
+/// One bound write a style binding holds over a run that panicked, by its
+/// place among the node's writes: what it last gave (`None`: it never
+/// gave, so it writes nothing), for a cold build to write in its place.
+pub(super) type HeldWrite = (usize, Option<Box<dyn crate::value::Mounted>>);
+
+/// What one node's bindings hold over runs that panicked in turns
+/// (ADR-0015, rule 12): what a cold build of the frame reuses as the live
+/// node holds it, never running those closures again, so a hold never
+/// switches the check off and everything else is checked. A style holds
+/// per setter: its other bound writes run fresh in the cold build, so a
+/// held width hides no stale height on the same node. Each field is
+/// empty or `None` when that binding holds nothing.
+#[derive(Default)]
+pub(super) struct HeldNode {
+    /// The node's held bound writes.
+    pub(super) style: Vec<HeldWrite>,
+    /// Each span's held bound writes, by its place.
+    pub(super) spans: Vec<(usize, Vec<HeldWrite>)>,
+    /// The bound text (`None` inside: it never gave one).
+    pub(super) text: Option<Option<Arc<str>>>,
+    /// The drawing (`None` inside: it never drew).
+    pub(super) draw: Option<Option<crate::chunk::Drawing>>,
+}
+
+impl HeldNode {
+    /// What a node's bindings hold; `None` when none holds anything.
+    pub(super) fn of(
+        style: Option<&StyleBinding>,
+        spans: &[Option<StyleBinding>],
+        text: Option<&TextBinding>,
+        draw: Option<&DrawBinding>,
+    ) -> Option<Self> {
+        let held = Self {
+            style: style.map(StyleBinding::held).unwrap_or_default(),
+            spans: spans
+                .iter()
+                .enumerate()
+                .filter_map(|(k, b)| {
+                    let h = b.as_ref().map(StyleBinding::held).unwrap_or_default();
+                    (!h.is_empty()).then_some((k, h))
+                })
+                .collect(),
+            text: text.and_then(Tracked::held),
+            draw: draw.and_then(Tracked::held),
+        };
+        (!held.style.is_empty() || !held.spans.is_empty() || held.text.is_some() || held.draw.is_some()).then_some(held)
+    }
 }
 
 impl BoundRun {
@@ -163,21 +243,41 @@ impl BoundRun {
     /// none, another source untracked; whether it gave
     /// something else. Taken out while it runs: a panic leaves no half-run
     /// mount behind.
+    ///
+    /// A closure that panics in a turn (user code, ADR-0015, the turn
+    /// rule) is to the arbiter and changes nothing: the mount keeps what it
+    /// last gave (the node's style as it was), and runs again when what it
+    /// read before the panic changes. Outside a turn the panic goes on,
+    /// the mount left out.
     fn eval(&mut self, mark: &crate::reactive::Mark) -> bool {
         let Some(mut m) = self.mounted.take() else {
             return false;
         };
         m.prepare(mark);
-        let changed = if m.tracked() {
-            let node = *self.node.get_or_insert_with(|| tracker(mark));
-            node.track(|| m.eval())
-        } else {
-            // A source in place of a closure: what the closure read wakes
-            // nothing.
-            if let Some(node) = self.node.take() {
-                node.dispose();
+        let node = &mut self.node;
+        let ran = crate::engine::attempt(|| {
+            if m.tracked() {
+                let node = *node.get_or_insert_with(|| tracker(mark));
+                node.track(|| m.eval())
+            } else {
+                // A source in place of a closure: what the closure read
+                // wakes nothing.
+                if let Some(node) = node.take() {
+                    node.dispose();
+                }
+                crate::reactive::untracked(|| m.eval())
             }
-            crate::reactive::untracked(|| m.eval())
+        });
+        let changed = match ran {
+            Ok(changed) => {
+                self.held = false;
+                changed
+            }
+            Err(failed) => {
+                crate::component::contain_binding(failed);
+                self.held = true;
+                false
+            }
         };
         self.mounted = Some(m);
         changed
@@ -188,6 +288,7 @@ impl BoundRun {
     /// did).
     fn unbind(&mut self) {
         self.mounted = None;
+        self.held = false;
         if let Some(node) = self.node
             && node.has_deps()
         {
@@ -201,7 +302,7 @@ impl Drop for BoundRun {
         // Even while unwinding (its closure panicked): a tracker left
         // subscribed would mark a node gone; disposing is safe then.
         if let Some(node) = self.node {
-            node.dispose();
+            node.release(crate::engine::LiveDrop::in_drop());
         }
     }
 }
@@ -237,6 +338,19 @@ impl StyleBinding {
         }
     }
 
+    /// Each bound write that holds what it gave over a run that panicked,
+    /// by its place ([`HeldNode`]): the rest are not held.
+    fn held(&self) -> Vec<HeldWrite> {
+        self.runs
+            .iter()
+            .enumerate()
+            .filter_map(|(k, r)| {
+                let r = r.as_ref().filter(|r| r.held)?;
+                Some((k, r.mounted.as_ref().map(|m| m.snapshot())))
+            })
+            .collect()
+    }
+
     /// Every tracker it holds.
     pub(super) fn nodes(&self) -> impl Iterator<Item = crate::reactive::RenderNode> + '_ {
         self.runs.iter().flatten().filter_map(|r| r.node).chain(self.replay)
@@ -257,7 +371,11 @@ impl StyleBinding {
     /// or that are new on this node, run again, alone. A closure that
     /// gave what it gave before changes nothing: with the writes and
     /// `base` the same, the style kept stands.
-    pub(super) fn get(&mut self, ops: &Rc<Vec<crate::value::Op>>, base: &Style) -> Style {
+    ///
+    /// `held`: in a cold build, the writes the live node holds
+    /// ([`HeldNode`]), each written as it last gave in its place, its
+    /// closure never run; every other write runs fresh. Live, none.
+    pub(super) fn get(&mut self, ops: &Rc<Vec<crate::value::Op>>, base: &Style, held: &[HeldWrite]) -> Style {
         // Out while it runs: a closure that panics (a binding's, a
         // restyle's) leaves none, and the next resolve binds and replays
         // every write anew rather than trust what it half did.
@@ -267,8 +385,11 @@ impl StyleBinding {
             self.runs.resize_with(ops.len(), || None);
         }
         let mut changed = !same_ops;
+        let held_at = |k: usize| held.iter().find(|(at, _)| *at == k).map(|(_, m)| m.as_deref());
         for (k, run) in self.runs.iter_mut().enumerate() {
             match ops.get(k).and_then(crate::value::Op::bound) {
+                // Held: written from what it last gave, below.
+                Some(_) if held_at(k).is_some() => changed = true,
                 Some(def) => {
                     let run = run.get_or_insert_with(BoundRun::default);
                     // The same writes as last resolved, fully: each run
@@ -297,16 +418,23 @@ impl StyleBinding {
             return out;
         }
         let runs = &self.runs;
+        // A bound write writes only what its mount gave this pass: its
+        // closure ran once above, and is never run again here. One that has
+        // given nothing (its first run panicked in a turn, held) is absent:
+        // the property keeps what the writes before it left (ADR-0015, a
+        // contained getter runs once per pass).
         let replay = || {
             let mut s = base.clone();
             for (k, op) in ops.iter().enumerate() {
-                let wrote = op.bound().is_some()
-                    && runs
-                        .get(k)
-                        .and_then(Option::as_ref)
-                        .and_then(|r| r.mounted.as_deref())
-                        .is_some_and(|m| m.write(&mut s));
-                if !wrote {
+                if op.bound().is_some() {
+                    let mount = match held_at(k) {
+                        Some(held) => held,
+                        None => runs.get(k).and_then(Option::as_ref).and_then(|r| r.mounted.as_deref()),
+                    };
+                    if let Some(m) = mount {
+                        m.write(&mut s);
+                    }
+                } else {
                     op.apply(&mut s);
                 }
             }
@@ -342,7 +470,7 @@ impl Drop for StyleBinding {
     fn drop(&mut self) {
         // Even while unwinding (a restyle panicked), as a run's tracker.
         if let Some(node) = self.replay.take() {
-            node.dispose();
+            node.release(crate::engine::LiveDrop::in_drop());
         }
     }
 }

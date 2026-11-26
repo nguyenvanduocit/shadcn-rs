@@ -1106,6 +1106,7 @@ fn snapshots_find_what_a_scan_finds_through_edits() {
 
 /// Text a cold frame's paint shapes is its own: the live paint after it
 /// still finds the text unshaped, and the labels it had are as they were.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_paint_does_not_shape_text_for_the_live_one() {
     let mut text = crate::text::TextSystem::new();
@@ -1153,6 +1154,7 @@ fn a_cold_paint_does_not_shape_text_for_the_live_one() {
 /// A cold paint shapes every text it draws, not only what the live
 /// snapshots left unshaped: text the live paint shaped before an edit is
 /// in the cold scene, drawn with the glyphs the live one has.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_paint_draws_text_the_live_paint_shaped_before_an_edit() {
     let mut text = crate::text::TextSystem::new();
@@ -1206,6 +1208,7 @@ fn a_cold_paint_draws_text_the_live_paint_shaped_before_an_edit() {
 
 /// A world's snapshot made first in a cold frame is the frame's: the
 /// world's cache of it stays empty, its unshaped text as it was.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_snapshot_leaves_the_worlds_caches_empty() {
     let w = world();

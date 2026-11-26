@@ -326,9 +326,11 @@ mod tests {
     use gui::{Modifiers, NamedKey, Scenario};
 
     /// The label of the trigger holding focus, as a screen reader is told it.
-    fn focused_trigger(s: &Scenario) -> Option<String> {
+    fn focused_trigger(s: &mut Scenario) -> Option<String> {
         let mut ts = gui::text::TextSystem::new();
-        let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+        // Focus is the window's: read in a turn of it (ADR-0015).
+        let focus = s.read(gui::focus::focused);
+        let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
         let nodes: std::collections::HashMap<_, _> = tree.nodes.iter().cloned().collect();
         let focus = nodes.get(&tree.focus)?;
         focus.children().iter().find_map(|c| {
@@ -360,14 +362,18 @@ mod tests {
         .expect("a scenario");
         s.settle().expect("settled");
         key(&mut s, NamedKey::Tab);
-        assert_eq!(focused_trigger(&s).as_deref(), Some("A"));
+        assert_eq!(focused_trigger(&mut s).as_deref(), Some("A"));
         key(&mut s, NamedKey::End);
-        assert_eq!(focused_trigger(&s).as_deref(), Some("B"), "End passes the disabled C");
+        assert_eq!(
+            focused_trigger(&mut s).as_deref(),
+            Some("B"),
+            "End passes the disabled C"
+        );
         key(&mut s, NamedKey::ArrowDown);
-        assert_eq!(focused_trigger(&s).as_deref(), Some("A"), "ArrowDown wraps past C");
+        assert_eq!(focused_trigger(&mut s).as_deref(), Some("A"), "ArrowDown wraps past C");
         key(&mut s, NamedKey::ArrowUp);
-        assert_eq!(focused_trigger(&s).as_deref(), Some("B"));
+        assert_eq!(focused_trigger(&mut s).as_deref(), Some("B"));
         key(&mut s, NamedKey::Tab);
-        assert_ne!(focused_trigger(&s).as_deref(), Some("C"), "Tab does not stop on C");
+        assert_ne!(focused_trigger(&mut s).as_deref(), Some("C"), "Tab does not stop on C");
     }
 }

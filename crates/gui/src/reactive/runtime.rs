@@ -13,6 +13,7 @@
 
 use std::any::Any;
 use std::cell::RefCell;
+use std::marker::PhantomData;
 use std::panic::Location;
 use std::rc::Rc;
 
@@ -20,6 +21,18 @@ use super::trace::{ReactiveTrace, SignalRef};
 
 /// No node or link.
 pub(crate) const NONE: usize = usize::MAX;
+
+/// The bit of a node's index that puts it in a cold frame's own region
+/// (`Runtime::fork_nodes`); [`NONE`] is in no region's range.
+const FORK_NODE: usize = 1 << (usize::BITS - 2);
+
+/// The bit of a link's index that puts it in a cold frame's own region
+/// (`Runtime::fork_links`), as [`FORK_NODE`] does for nodes: the live
+/// links, their free list and their numbering are never changed by a
+/// frame, only written in place under its log. Debug only, as forks are
+/// until F2 (ADR-0028).
+#[cfg(debug_assertions)]
+const FORK_LINK: usize = 1 << (usize::BITS - 2);
 
 /// alien-signals' `ReactiveFlags`, plus `HAS_CHILD`, which marks an owner
 /// (effect, computed, scope) whose deps include a child effect or scope.
@@ -41,17 +54,75 @@ const RECURSION_LIMIT: u32 = 100;
 /// A node's slot and the generation it had when the handle was made: a slot
 /// reused for another node has a new generation, so a stale handle is told
 /// apart from a live one.
+///
+/// It names a node of this thread's arena, so it is neither `Send` nor
+/// `Sync`, nor is any handle holding it (`Signal`, `Computed`, `Effect`,
+/// `Scope`): moved to another thread, its slot and generation would name
+/// that thread's node, a fork's dead handle aliasing a live one there
+/// (Codex 1, F1 review 7), as a `SlabId` would ([`crate::engine::SlabId`]).
+/// The type says it, so no access pays a thread check (compile-fail tests
+/// on [`super::Signal`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct NodeId {
+    // (Slots with `FORK_NODE` set are a cold frame's region.)
     pub(crate) index: usize,
     pub(crate) generation: u32,
+    thread: PhantomData<*const ()>,
+}
+
+/// A node's identity as plain data, for what crosses threads (the render
+/// thread carries the instance that made a node, to route input back to
+/// it): its slot and generation, and the thread whose arena they are in.
+/// It is turned back into a node only on that thread ([`Self::node`]), so
+/// on another it names nothing rather than that thread's node of the same
+/// slot (Codex 1, F1 review 7). The arena is named by its thread's serial
+/// ([`crate::engine::arena`]: an id, never handed out twice in a process),
+/// read from the thread's own slots, with no `thread::current()` handle
+/// cloned per call (Opus nit 6, F1 review 8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct OwnerId {
+    index: usize,
+    generation: u32,
+    arena: u64,
+}
+
+crate::engine::parts_whole!(OwnerId);
+
+impl OwnerId {
+    /// The node it names, on the thread whose arena it is in; else none.
+    pub(crate) fn node(self) -> Option<NodeId> {
+        (self.arena == crate::engine::arena()).then(|| NodeId::new(self.index, self.generation))
+    }
 }
 
 impl NodeId {
+    pub(crate) const fn new(index: usize, generation: u32) -> Self {
+        Self {
+            index,
+            generation,
+            thread: PhantomData,
+        }
+    }
+
+    /// Its identity as plain data that may cross threads.
+    pub(crate) fn owner_id(self) -> OwnerId {
+        OwnerId {
+            index: self.index,
+            generation: self.generation,
+            arena: crate::engine::arena(),
+        }
+    }
+
     /// One number for the devtools: the generation above the slot.
     pub(crate) fn as_u64(self) -> u64 {
         let index = u64::try_from(self.index).unwrap_or(u64::MAX) & 0xFFFF_FFFF;
         u64::from(self.generation).wrapping_shl(32) | index
+    }
+
+    /// Whether a fork made it (its generation is the forks' space, its
+    /// slot in the forks' region, `FORK_NODE`).
+    pub(crate) fn made_in_fork(self) -> bool {
+        self.generation & crate::engine::FORK_GENERATION != 0
     }
 }
 
@@ -142,6 +213,16 @@ impl Node {
             #[cfg(debug_assertions)]
             born_in: 0,
         }
+    }
+
+    /// Whether a cold frame's version of a node, replaced at the switch,
+    /// holds nothing whose drop is user code (ADR-0034, S1): no cleanup,
+    /// and, if the frame owned its value (`owned`: it gave the node one of
+    /// its own, or made it), no value or closure; one it only read holds
+    /// handles shared with the live node put back.
+    #[cfg(debug_assertions)]
+    fn is_shell(&self, owned: bool) -> bool {
+        self.cleanups.is_empty() && (!owned || (self.value.is_none() && self.update.is_none() && self.run.is_none()))
     }
 
     /// This node as a cold frame writes it, the live one kept in the undo
@@ -321,25 +402,37 @@ impl Counts {
         };
         *n = n.saturating_add(1);
     }
-
-    /// `other`'s counts added.
-    #[cfg(debug_assertions)]
-    fn add(&mut self, other: Self) {
-        self.signals = self.signals.saturating_add(other.signals);
-        self.computeds = self.computeds.saturating_add(other.computeds);
-        self.effects = self.effects.saturating_add(other.effects);
-        self.scopes = self.scopes.saturating_add(other.scopes);
-        self.renders = self.renders.saturating_add(other.renders);
-        self.links = self.links.saturating_add(other.links);
-    }
 }
 
 #[derive(Default)]
 pub(crate) struct Runtime {
     nodes: Vec<Node>,
+    /// Each slot's next generations, live and a fork's, by the one slot
+    /// rule of every arena ([`crate::engine::Generations`], ADR-0028 rule
+    /// 3): each only grows, a cold frame's rollback included, which neither
+    /// logs nor truncates them. So no handle is named twice, live or a
+    /// fork's (Codex 3, Opus 1, F1 review 4), and the live ids are as
+    /// without the frame (F1 review 5).
+    generations: crate::engine::Generations,
+    /// The nodes a cold frame makes, in a region of their own (indices
+    /// `FORK_NODE | k`): the live slots, the free ones and their numbering
+    /// are as without the frame, so what live code makes after it (a
+    /// Shared piece's init, run once the fork rolled back) takes the very
+    /// id a run with no check gives. Emptied by each rollback; their next
+    /// generations (the forks' space) never put back.
+    #[cfg(debug_assertions)]
+    fork_nodes: Vec<Node>,
+    #[cfg(debug_assertions)]
+    fork_generations: crate::engine::Generations,
     free_nodes: Vec<usize>,
     links: Vec<Link>,
     free_links: Vec<usize>,
+    /// The links a cold frame makes (indices `FORK_LINK | k`), and those of
+    /// them it freed; emptied by each rollback.
+    #[cfg(debug_assertions)]
+    fork_links: Vec<Link>,
+    #[cfg(debug_assertions)]
+    fork_free_links: Vec<usize>,
     pub(crate) cycle: u32,
     pub(crate) run_depth: u32,
     pub(crate) batch_depth: u32,
@@ -425,6 +518,7 @@ impl Runtime {
         }
         [
             of(&self.nodes),
+            self.generations.held_bytes(),
             of(&self.free_nodes),
             of(&self.links),
             of(&self.free_links),
@@ -437,15 +531,24 @@ impl Runtime {
     }
 }
 
-/// Run `f` on this thread's runtime.
+/// Run `f` on this thread's runtime: every access to it goes through here
+/// or [`try_with`], so R4 has its one gate here (ADR-0028, F1 review 12): a
+/// Shared init reads nothing of the runtime (a node, its liveness or value,
+/// a count, the graph, a trace), as a fork changes all of it. The engine's
+/// own bookkeeping making a handle passes ([`crate::engine::allocating`]),
+/// and gives the init nothing but the handle.
 pub(crate) fn with<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
-    RUNTIME.with(|rt| f(&mut rt.borrow_mut()))
+    #[cfg(debug_assertions)]
+    crate::engine::no_forked_read("the reactive runtime (a node, a count, the graph)");
+    RUNTIME.with_arena(|rt| f(&mut rt.borrow_mut()))
 }
 
 /// Run `f` on this thread's runtime unless the thread is ending.
 pub(crate) fn try_with<R>(f: impl FnOnce(&mut Runtime) -> R) -> Option<R> {
+    #[cfg(debug_assertions)]
+    crate::engine::no_forked_read("the reactive runtime (a node, a count, the graph)");
     RUNTIME
-        .try_with(|rt| rt.try_borrow_mut().ok().map(|mut rt| f(&mut rt)))
+        .try_with_arena(|rt| rt.try_borrow_mut().ok().map(|mut rt| f(&mut rt)))
         .ok()
         .flatten()
 }
@@ -455,7 +558,13 @@ pub(crate) fn try_with<R>(f: impl FnOnce(&mut Runtime) -> R) -> Option<R> {
 pub(crate) fn settle() {
     // Every round runs, though a cleanup of one panics: what a cleanup
     // queued is let go too, and the first panic goes on once all have.
-    let mut first = None;
+    // Inside a turn, each to its arbiter as it is caught.
+    let mut all = crate::engine::Gather::new();
+    // Live, what a fork left to run live runs here, as cleanups do
+    // ([`crate::engine::run_releases`]); none while a fork runs.
+    if let Some(p) = crate::engine::released() {
+        all.add(p);
+    }
     loop {
         let Some(Settle { cleanups, garbage }) = try_with(|rt| std::mem::take(&mut rt.settle)) else {
             break;
@@ -464,23 +573,21 @@ pub(crate) fn settle() {
             break;
         }
         // A cold frame runs no cleanup: what it registered is dropped.
-        if is_cold() {
+        #[cfg(debug_assertions)]
+        if crate::engine::is_cold() {
             drop(cleanups);
             drop(garbage);
             continue;
         }
         // Every one runs, though one panics (taken out, a cleanup a panic
-        // skipped would never run).
+        // skipped would never run). A user's goes through the gate in its
+        // window, in a turn (`on_cleanup`); the engine's own runs as is.
         for cleanup in cleanups {
-            if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| untracked_call(cleanup))) {
-                first.get_or_insert(p);
-            }
+            all.run(|| untracked_call(cleanup));
         }
         drop(garbage);
     }
-    if let Some(p) = first {
-        std::panic::resume_unwind(p);
-    }
+    all.finish();
 }
 
 /// Run `f` with no subscriber, so what it reads tracks nothing.
@@ -496,11 +603,16 @@ pub(crate) struct OwnerGuard {
     prev_owner: Option<Option<NodeId>>,
 }
 
+/// Its steps are the engine's own scoping, which a Shared init may take
+/// (`detached`, `untracked`): what they read goes back into the runtime,
+/// never to the caller ([`crate::engine::allocating`]).
 impl OwnerGuard {
     pub(crate) fn enter(owner: Option<NodeId>, set_owner: bool) -> Self {
-        with(|rt| Self {
-            prev_sub: std::mem::replace(&mut rt.active_sub, NONE),
-            prev_owner: set_owner.then(|| std::mem::replace(&mut rt.active_owner, owner)),
+        crate::engine::allocating(|| {
+            with(|rt| Self {
+                prev_sub: std::mem::replace(&mut rt.active_sub, NONE),
+                prev_owner: set_owner.then(|| std::mem::replace(&mut rt.active_owner, owner)),
+            })
         })
     }
 }
@@ -508,11 +620,13 @@ impl OwnerGuard {
 impl Drop for OwnerGuard {
     fn drop(&mut self) {
         let (sub, owner) = (self.prev_sub, self.prev_owner);
-        try_with(|rt| {
-            rt.active_sub = sub;
-            if let Some(owner) = owner {
-                rt.active_owner = owner;
-            }
+        crate::engine::allocating(|| {
+            try_with(|rt| {
+                rt.active_sub = sub;
+                if let Some(owner) = owner {
+                    rt.active_owner = owner;
+                }
+            });
         });
     }
 }
@@ -537,36 +651,51 @@ pub(crate) fn disposed(what: &str, created_at: &'static Location<'static>) -> ! 
 impl Runtime {
     // ── Arena ────────────────────────────────────────────────────────────
 
-    pub(crate) fn node(&self, i: usize) -> Option<&Node> {
+    /// Slot `i`, in the live region or a cold frame's.
+    fn slot(&self, i: usize) -> Option<&Node> {
+        if i & FORK_NODE != 0 {
+            #[cfg(debug_assertions)]
+            return self.fork_nodes.get(i & !FORK_NODE);
+            #[cfg(not(debug_assertions))]
+            return None;
+        }
         self.nodes.get(i)
+    }
+
+    fn slot_mut(&mut self, i: usize) -> Option<&mut Node> {
+        if i & FORK_NODE != 0 {
+            #[cfg(debug_assertions)]
+            return self.fork_nodes.get_mut(i & !FORK_NODE);
+            #[cfg(not(debug_assertions))]
+            return None;
+        }
+        self.nodes.get_mut(i)
+    }
+
+    pub(crate) fn node(&self, i: usize) -> Option<&Node> {
+        self.slot(i)
     }
 
     pub(crate) fn node_mut(&mut self, i: usize) -> Option<&mut Node> {
         self.log_node(i);
-        self.nodes.get_mut(i)
+        self.slot_mut(i)
     }
 
     /// The live node `id` names, if it was not disposed.
     pub(crate) fn live(&self, id: NodeId) -> Option<&Node> {
-        self.nodes
-            .get(id.index)
-            .filter(|n| n.alive && n.generation == id.generation)
+        self.slot(id.index).filter(|n| n.alive && n.generation == id.generation)
     }
 
     pub(crate) fn live_mut(&mut self, id: NodeId) -> Option<&mut Node> {
         if self.live(id).is_some() {
             self.log_node(id.index);
         }
-        self.nodes
-            .get_mut(id.index)
+        self.slot_mut(id.index)
             .filter(|n| n.alive && n.generation == id.generation)
     }
 
     pub(crate) fn id_of(&self, i: usize) -> Option<NodeId> {
-        self.nodes.get(i).filter(|n| n.alive).map(|n| NodeId {
-            index: i,
-            generation: n.generation,
-        })
+        self.slot(i).filter(|n| n.alive).map(|n| NodeId::new(i, n.generation))
     }
 
     /// How many subscribers node `i` has.
@@ -581,7 +710,7 @@ impl Runtime {
     }
 
     fn flags(&self, i: usize) -> u8 {
-        self.nodes.get(i).map_or(flag::NONE, |n| n.flags)
+        self.slot(i).map_or(flag::NONE, |n| n.flags)
     }
 
     fn set_flags(&mut self, i: usize, flags: u8) {
@@ -607,48 +736,74 @@ impl Runtime {
         id
     }
 
-    /// Undo `id`, made by a Shared init that failed: disposed, or, made
-    /// while a cold frame was suspended, left to the frame's undo (no
-    /// longer kept live).
+    /// Undo `id`, made by a Shared init that failed: disposed.
     fn unmake(&mut self, id: NodeId) {
-        #[cfg(debug_assertions)]
-        if let Some(log) = self.cold.as_deref_mut()
-            && log.kept.contains(&id.index)
-        {
-            log.kept.retain(|&k| k != id.index);
-            return;
-        }
         self.dispose(id);
     }
 
-    fn alloc_slot(&mut self, node: Node) -> NodeId {
-        // A Shared piece made while a cold frame is suspended: live, at
-        // the end of the arena, kept when the frame is undone.
-        #[cfg(debug_assertions)]
-        if let Some(log) = self.cold.as_deref_mut()
-            && log.suspended
-        {
-            self.nodes.push(node);
-            let index = self.nodes.len().saturating_sub(1);
-            log.kept.push(index);
-            return NodeId { index, generation: 0 };
+    /// Whether slot `index` may hold another node (its generations did not
+    /// run out).
+    fn reusable(&self, index: usize) -> bool {
+        self.generations.reusable(index)
+    }
+
+    /// The index the next pushed live node takes, with its generation:
+    /// retired slots past the end are pushed dead first.
+    fn push_index(&mut self, created_at: &'static Location<'static>) -> (usize, u32) {
+        loop {
+            let index = self.nodes.len();
+            if let Some(generation) = self.generations.take(index, false) {
+                return (index, generation);
+            }
+            let mut retired = Node::new(Kind::Signal, flag::NONE, created_at);
+            retired.alive = false;
+            self.nodes.push(retired);
         }
-        if let Some(index) = self.free_nodes.pop() {
-            #[cfg(debug_assertions)]
-            self.undo(Undo::FreeNodePop(index));
-            self.log_node(index);
-            self.born(index);
-            if let Some(slot) = self.nodes.get_mut(index) {
-                // A freed slot holds no lists (`dispose_index` took them).
-                let generation = slot.generation;
-                *slot = Node { generation, ..node };
-                return NodeId { index, generation };
+    }
+
+    /// Whether a cold frame runs: what is done now is the frame's. The
+    /// engine's answer, which a fork never leaves until it ends: it runs
+    /// no live code (ADR-0028). Read as `is_cold`, not the public
+    /// `engine::forking`: a Shared init allocates here, and may not ask
+    /// whether a fork runs ([`crate::engine::shared_init`]).
+    #[cfg(debug_assertions)]
+    fn forking(&self) -> bool {
+        self.cold.is_some() && crate::engine::is_cold()
+    }
+
+    fn alloc_slot(&mut self, node: Node) -> NodeId {
+        // A cold frame's (the one answer, at the moment it is made): in its
+        // own region, under the forks' generations, which a rollback never
+        // puts back (ADR-0028, rule 3), so a handle a frame hands out
+        // names nothing after it, in a live run or another frame.
+        #[cfg(debug_assertions)]
+        if self.forking() {
+            loop {
+                let k = self.fork_nodes.len();
+                if let Some(generation) = self.fork_generations.take(k, true) {
+                    self.fork_nodes.push(Node { generation, ..node });
+                    return NodeId::new(k | FORK_NODE, generation);
+                }
+                let mut retired = Node::new(Kind::Signal, flag::NONE, node.created_at);
+                retired.alive = false;
+                self.fork_nodes.push(retired);
             }
         }
-        self.nodes.push(node);
-        let index = self.nodes.len().saturating_sub(1);
-        self.born(index);
-        NodeId { index, generation: 0 }
+        // Live: exactly as without any frame, its slot and generation the
+        // very ones a run with no check takes.
+        while let Some(index) = self.free_nodes.pop() {
+            let Some(generation) = self.generations.take(index, false) else {
+                continue;
+            };
+            if let Some(slot) = self.nodes.get_mut(index) {
+                // A freed slot holds no lists (`dispose_index` took them).
+                *slot = Node { generation, ..node };
+                return NodeId::new(index, generation);
+            }
+        }
+        let (index, generation) = self.push_index(node.created_at);
+        self.nodes.push(Node { generation, ..node });
+        NodeId::new(index, generation)
     }
 
     /// The room the free slots' `owned` lists hold (none: a list goes with
@@ -687,41 +842,70 @@ impl Runtime {
     }
 
     fn alloc_link(&mut self, link: Link) -> usize {
-        #[cfg(debug_assertions)]
-        assert!(
-            !self.cold.as_deref().is_some_and(|l| l.suspended),
-            "a Shared piece links nodes as it is made: it may make signals only"
-        );
         self.counts.links = self.counts.links.saturating_add(1);
-        if let Some(i) = self.free_links.pop() {
-            #[cfg(debug_assertions)]
-            self.undo(Undo::FreeLinkPop(i));
-            self.log_link(i);
-            if let Some(slot) = self.links.get_mut(i) {
+        // A cold frame's in its own region (as its nodes are): the live
+        // free list and numbering are as without it.
+        #[cfg(debug_assertions)]
+        if self.forking() {
+            if let Some(k) = self.fork_free_links.pop()
+                && let Some(slot) = self.fork_links.get_mut(k)
+            {
                 *slot = link;
-                return i;
+                return k | FORK_LINK;
             }
+            self.fork_links.push(link);
+            return self.fork_links.len().saturating_sub(1) | FORK_LINK;
+        }
+        if let Some(i) = self.free_links.pop()
+            && let Some(slot) = self.links.get_mut(i)
+        {
+            *slot = link;
+            return i;
         }
         self.links.push(link);
         self.links.len().saturating_sub(1)
     }
 
     fn free_link(&mut self, i: usize) {
+        #[cfg(debug_assertions)]
+        if i != NONE && i & FORK_LINK != 0 {
+            let k = i & !FORK_LINK;
+            if let Some(slot) = self.fork_links.get_mut(k) {
+                *slot = FREE_LINK;
+                self.fork_free_links.push(k);
+                self.counts.links = self.counts.links.saturating_sub(1);
+            }
+            return;
+        }
         self.log_link(i);
+        // A live link a running frame frees is not handed to the live free
+        // list (the log puts it back).
+        #[cfg(debug_assertions)]
+        let freed = !self.forking();
+        #[cfg(not(debug_assertions))]
+        let freed = true;
         if let Some(slot) = self.links.get_mut(i) {
             *slot = FREE_LINK;
-            self.free_links.push(i);
-            #[cfg(debug_assertions)]
-            self.undo(Undo::FreeLinkPush);
+            if freed {
+                self.free_links.push(i);
+            }
             self.counts.links = self.counts.links.saturating_sub(1);
         }
     }
 
     fn l(&self, i: usize) -> Link {
+        #[cfg(debug_assertions)]
+        if i != NONE && i & FORK_LINK != 0 {
+            return self.fork_links.get(i & !FORK_LINK).copied().unwrap_or(FREE_LINK);
+        }
         self.links.get(i).copied().unwrap_or(FREE_LINK)
     }
 
     fn l_mut(&mut self, i: usize) -> Option<&mut Link> {
+        #[cfg(debug_assertions)]
+        if i != NONE && i & FORK_LINK != 0 {
+            return self.fork_links.get_mut(i & !FORK_LINK);
+        }
         self.log_link(i);
         self.links.get_mut(i)
     }
@@ -1094,7 +1278,6 @@ impl Runtime {
         let update = n.update.take();
         let run = n.run.take();
         n.check = None;
-        n.generation = n.generation.wrapping_add(1);
         n.label = None;
         n.deps = NONE;
         n.deps_tail = NONE;
@@ -1115,9 +1298,18 @@ impl Runtime {
         if let Some(r) = run {
             self.settle.garbage.push(Garbage::Run(r));
         }
-        self.free_nodes.push(i);
+        // Its handles are dead (`alive` is false); the slot's next node
+        // takes a generation none had before. A slot whose generations ran
+        // out is retired. A frame's own slots are never freed (its region
+        // goes whole), nor a live one a running frame disposes (the log
+        // puts it back): the live free slots are as without the frame.
         #[cfg(debug_assertions)]
-        self.undo(Undo::FreeNodePush);
+        let freed = i & FORK_NODE == 0 && !self.forking();
+        #[cfg(not(debug_assertions))]
+        let freed = true;
+        if freed && self.reusable(i) {
+            self.free_nodes.push(i);
+        }
         match kind {
             Kind::Signal => self.counts.signals = self.counts.signals.saturating_sub(1),
             Kind::Computed => self.counts.computeds = self.counts.computeds.saturating_sub(1),
@@ -1230,7 +1422,7 @@ impl Runtime {
     fn signal_ref(&self, i: usize) -> SignalRef {
         SignalRef {
             id: self.id_of(i).map_or(u64::MAX, NodeId::as_u64),
-            label: self.nodes.get(i).and_then(|n| n.label),
+            label: self.slot(i).and_then(|n| n.label),
         }
     }
 
@@ -1367,6 +1559,9 @@ fn run_effect_body(i: usize) {
         return;
     };
     let _guard = guard;
+    // User code: its run goes through the gate in its window, in a turn
+    // (`Effect::new`'s `Here::run`), so a turn goes on past its panic by
+    // every path that runs it (ADR-0015, the turn rule).
     run();
 }
 
@@ -1412,8 +1607,11 @@ pub(crate) fn check_write(i: usize) {
 /// `createEffect`).
 pub(crate) fn first_run_or_defer(id: NodeId) {
     // An effect made anywhere in a cold frame (a render, a binding, paint)
-    // never runs: the frame is thrown away.
-    if is_cold() {
+    // never runs: the frame is thrown away. The engine's own scheduling,
+    // not a read of a Shared init: the effect's run reads what it reads,
+    // each read checked ([`crate::engine::no_forked_read`]).
+    #[cfg(debug_assertions)]
+    if crate::engine::is_cold() {
         return;
     }
     let deferred = with(|rt| {
@@ -1678,6 +1876,16 @@ pub(crate) fn refresh_computed(i: usize) {
 /// Run the queued effects, unless a flush is running already (it will reach
 /// them): no flush nests in another.
 pub(crate) fn flush() {
+    // The effects run in a turn (ADR-0015, no bare mode): the one under
+    // way, or, a write made with none (a test's top level), one of the
+    // current window's, so their panics have one arbiter.
+    if !crate::engine::dispatching()
+        && !crate::engine::forking()
+        && try_with(|rt| rt.queued.len() > rt.notify_index && !rt.flushing).unwrap_or(false)
+    {
+        crate::engine::in_turn(|_| flush());
+        return;
+    }
     let start = with(|rt| {
         // A cold frame runs no effect: what it queued is dropped.
         #[cfg(debug_assertions)]
@@ -1699,7 +1907,10 @@ pub(crate) fn flush() {
     let guard = FlushGuard;
     // A panicking effect does not stop the others: the flush goes on and the
     // first panic is raised again at its end (Vue's `callWithErrorHandling`).
-    let mut first_panic = None;
+    // Inside a dispatch, each goes to the dispatch's one arbiter as it is
+    // caught: a later effect may dispatch again (input to another window)
+    // and panic there, and the first in time must stay first.
+    let mut all = crate::engine::Gather::new();
     loop {
         let next = with(|rt| {
             let e = rt.queued.get(rt.notify_index).copied()?;
@@ -1707,13 +1918,24 @@ pub(crate) fn flush() {
             Some(e)
         });
         let Some(e) = next else { break };
-        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(e))) {
-            first_panic.get_or_insert(payload);
-        }
+        // An engine commit step publishes all its writes at once: an effect
+        // run inside one would read it half done (`engine::commit`).
+        debug_assert!(
+            !crate::engine::in_commit(),
+            "an effect ran inside an engine commit step: its writes are not one batch"
+        );
+        all.run(|| run(e));
     }
     drop(guard);
-    if let Some(payload) = first_panic {
-        std::panic::resume_unwind(payload);
+    all.finish();
+}
+
+/// Run what is queued when no batch is open: the effects a batch left as a
+/// panic unwound it ([`BatchGuard`]), run by the dispatch that caught the
+/// panic ([`crate::engine::call_out`]) before it goes on.
+pub(crate) fn flush_unbatched() {
+    if try_with(|rt| rt.batch_depth == 0 && rt.queued.len() > rt.notify_index).unwrap_or(false) {
+        flush();
     }
 }
 
@@ -1909,12 +2131,14 @@ pub(crate) fn rendering<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
         rt.in_render = rt.in_render.saturating_add(1);
         Leave(rt.deferred.len())
     });
-    let marked = Marked::enter(
-        #[cfg(debug_assertions)]
-        Some(Pure::Render(name)),
-    );
-    let out = f();
-    drop(marked);
+    // Marked for the render only (it has a `Drop` in debug builds only).
+    let out = {
+        let _marked = Marked::enter(
+            #[cfg(debug_assertions)]
+            Some(Pure::Render(name)),
+        );
+        f()
+    };
     let mark = leave.0;
     drop(leave);
     flush_deferred(mark);
@@ -1946,20 +2170,15 @@ fn flush_deferred(mark: usize) {
     let settles = with(|rt| rt.settles);
     // Every one runs, though one panics: the first panic goes on once all
     // have (a panic leaves nothing queued behind it).
-    let mut first = None;
+    let mut all = crate::engine::Gather::new();
     in_phase(Phase::Effect, settles, || {
         for id in queued {
             if with(|rt| rt.live(id).is_some()) {
-                let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| first_run(id.index)));
-                if let Err(p) = ran {
-                    first.get_or_insert(p);
-                }
+                all.run(|| first_run(id.index));
             }
         }
     });
-    if let Some(p) = first {
-        std::panic::resume_unwind(p);
-    }
+    all.finish();
 }
 
 /// Whether `rt` is a cold frame's.
@@ -1973,10 +2192,14 @@ fn is_cold_rt(_: &Runtime) -> bool {
     false
 }
 
-/// Whether a cold frame runs ([`crate::engine::ColdFrame`]).
+/// Whether a cold frame runs ([`crate::engine::ColdFrame`]). Checked where
+/// it is read (ADR-0028, R4, F1 review 11): a Shared init may not ask, as
+/// its answer differs in a fork and live. The engine's own scheduling and
+/// allocation read `crate::engine::is_cold`, unchecked.
 #[cfg(debug_assertions)]
 #[must_use]
 pub(crate) fn is_cold() -> bool {
+    crate::engine::no_forked_read("whether a fork runs");
     crate::engine::is_cold()
 }
 
@@ -1992,10 +2215,7 @@ pub(crate) const fn is_cold() -> bool {
 
 #[cfg(not(debug_assertions))]
 const _: () = {
-    let id = NodeId {
-        index: 0,
-        generation: 0,
-    };
+    let id = NodeId::new(0, 0);
     assert!(!is_cold() && !cold_refuses(id) && !cold_owns(id));
 };
 
@@ -2004,11 +2224,8 @@ const _: () = {
 enum Undo {
     /// A slot that was there before the frame, as it was then.
     Node(usize, Box<Node>),
+    /// A live link, as it was then.
     Link(usize, Link),
-    FreeNodePop(usize),
-    FreeNodePush,
-    FreeLinkPop(usize),
-    FreeLinkPush,
 }
 
 /// What a cold frame did to the arena, to undo (decision B): each slot
@@ -2021,30 +2238,24 @@ pub(crate) struct ColdLog {
     /// getter or a binding is pure).
     wrote: Vec<String>,
     undo: Vec<Undo>,
-    logged_nodes: std::collections::HashSet<usize>,
-    logged_links: std::collections::HashSet<usize>,
-    /// Slots holding nodes the frame made.
-    born: std::collections::HashSet<usize>,
+    /// Each live node the frame wrote, and where its record is in `undo`.
+    logged_nodes: std::collections::HashMap<usize, usize>,
+    /// Each live link the frame wrote, and where its record is in `undo`.
+    logged_links: std::collections::HashMap<usize, usize>,
     /// Live nodes whose value the frame replaced with its own.
     owned: std::collections::HashSet<usize>,
     /// Live computeds the frame computed again (it trusts no live cache).
     distrusted: std::collections::HashSet<usize>,
-    nodes_len: usize,
-    links_len: usize,
+    /// The live queues and counters while the frame runs.
     aside: Aside,
-    /// The frame is suspended: a Shared piece is made, live.
-    suspended: bool,
-    /// Slots past `nodes_len` holding live nodes made while suspended.
-    kept: Vec<usize>,
 }
 
 #[cfg(debug_assertions)]
 impl ColdLog {
-    /// Slot `i` holds a live node the frame forks: one from before it, or
-    /// one made live while it was suspended, written since by the frame
-    /// (its writes while still suspended are the live state).
-    fn live(&self, i: usize) -> bool {
-        i < self.nodes_len || (!self.suspended && self.kept.contains(&i))
+    /// Slot `i` holds a live node the running frame forks (its own region
+    /// is never logged).
+    fn live(i: usize) -> bool {
+        i & FORK_NODE == 0
     }
 }
 
@@ -2082,15 +2293,17 @@ impl Runtime {
     #[cfg(debug_assertions)]
     #[inline]
     fn log_node(&mut self, i: usize) {
-        if let Some(log) = self.cold.as_deref_mut()
-            && log.live(i)
-            && !log.born.contains(&i)
-            && log.logged_nodes.insert(i)
+        let Some(log) = self.cold.as_deref_mut() else { return };
+        if i & FORK_NODE != 0 {
+            return;
+        }
+        if !log.logged_nodes.contains_key(&i)
             && let Some(n) = self.nodes.get_mut(i)
         {
             let copy = n.cold_copy();
             // The copy, and each node of the owned list it copies.
             crate::engine::fork_work(u64::try_from(copy.owned.len()).unwrap_or(u64::MAX).saturating_add(1));
+            log.logged_nodes.insert(i, log.undo.len());
             log.undo.push(Undo::Node(i, Box::new(std::mem::replace(n, copy))));
         }
     }
@@ -2103,10 +2316,11 @@ impl Runtime {
     #[inline]
     fn log_link(&mut self, i: usize) {
         if let Some(log) = self.cold.as_deref_mut()
-            && i < log.links_len
-            && log.logged_links.insert(i)
+            && i & FORK_LINK == 0
+            && !log.logged_links.contains_key(&i)
             && let Some(&l) = self.links.get(i)
         {
+            log.logged_links.insert(i, log.undo.len());
             log.undo.push(Undo::Link(i, l));
             crate::engine::fork_work(1);
         }
@@ -2116,34 +2330,13 @@ impl Runtime {
     #[inline]
     fn log_link(&mut self, _: usize) {}
 
-    #[cfg(debug_assertions)]
-    #[inline]
-    fn undo(&mut self, step: Undo) {
-        if let Some(log) = self.cold.as_deref_mut() {
-            log.undo.push(step);
-            crate::engine::fork_work(1);
-        }
-    }
-
-    #[cfg(debug_assertions)]
-    #[inline]
-    fn born(&mut self, i: usize) {
-        if let Some(log) = self.cold.as_deref_mut() {
-            log.born.insert(i);
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    #[inline]
-    fn born(&mut self, _: usize) {}
-
     /// In a cold frame, node `i` is a live one whose value the frame shares
     /// and has not made its own.
     #[cfg(debug_assertions)]
     fn inherited(&self, i: usize) -> bool {
         self.cold
             .as_deref()
-            .is_some_and(|log| log.live(i) && !log.born.contains(&i) && !log.owned.contains(&i))
+            .is_some_and(|log| ColdLog::live(i) && !log.owned.contains(&i))
     }
 
     /// In a cold frame, live computed `i` read the first time: marked dirty,
@@ -2153,7 +2346,7 @@ impl Runtime {
         let first = self
             .cold
             .as_deref_mut()
-            .is_some_and(|log| log.live(i) && !log.born.contains(&i) && log.distrusted.insert(i));
+            .is_some_and(|log| ColdLog::live(i) && log.distrusted.insert(i));
         if first && self.node(i).is_some_and(|n| n.alive && n.kind == Kind::Computed) {
             let f = self.flags(i);
             self.set_flags(i, f | flag::DIRTY);
@@ -2162,53 +2355,62 @@ impl Runtime {
 
     /// What the cold frame made, taken out while it still runs: the
     /// cleanups, values and closures of what it wrote or made, and its
-    /// queues; dropped still cold.
+    /// queues; dropped still cold, one box per element (ADR-0034, S9), so a
+    /// drop that panics is a fault and the rest are still dropped, each on
+    /// its own, never in its unwind (S2). A live node it only read keeps its fields: they are handles
+    /// to the live node's own (`Node::cold_copy`), and what reads them while
+    /// the frame disposes finds them.
     #[cfg(debug_assertions)]
     fn drain_cold(&mut self) -> Vec<Box<dyn Any>> {
+        fn each<T: 'static>(made: &mut Vec<Box<dyn Any>>, items: impl IntoIterator<Item = T>) {
+            made.extend(items.into_iter().map(|t| -> Box<dyn Any> { Box::new(t) }));
+        }
         let mut made: Vec<Box<dyn Any>> = Vec::new();
         let Some(log) = self.cold.as_deref() else { return made };
-        let nodes_len = log.nodes_len;
         let own: Vec<(usize, bool)> = log
             .logged_nodes
-            .iter()
-            .map(|&i| (i, log.born.contains(&i) || log.owned.contains(&i)))
-            .chain(
-                (nodes_len..self.nodes.len())
-                    .filter(|i| !log.kept.contains(i))
-                    .map(|i| (i, true)),
-            )
+            .keys()
+            .map(|&i| (i, log.owned.contains(&i)))
+            .chain((0..self.fork_nodes.len()).map(|k| (k | FORK_NODE, true)))
             .collect();
         for (i, whole) in own {
-            let Some(n) = self.nodes.get_mut(i) else { continue };
-            made.push(Box::new(std::mem::take(&mut n.cleanups)));
+            let Some(n) = self.slot_mut(i) else { continue };
+            each(&mut made, std::mem::take(&mut n.cleanups));
             if whole {
-                made.push(Box::new((
-                    n.value.take(),
-                    n.update.take(),
-                    n.run.take(),
-                    n.check.take(),
-                )));
+                each(&mut made, n.value.take());
+                each(&mut made, n.update.take());
+                each(&mut made, n.run.take());
+                each(&mut made, n.check.take());
             }
         }
-        made.push(Box::new(std::mem::take(&mut self.settle)));
+        let Settle { cleanups, garbage } = std::mem::take(&mut self.settle);
+        each(&mut made, cleanups);
+        each(&mut made, garbage);
         made.push(Box::new(std::mem::take(&mut self.late)));
         made.push(Box::new(std::mem::take(&mut self.deferred)));
         made
     }
 
-    /// Put back what the cold frame changed; what it made, to drop once
-    /// every piece of engine state is back.
+    /// Put back what the cold frame changed, by moves (ADR-0034, S1). What
+    /// is replaced is the frame's shells, which the drain emptied of every
+    /// value and closure of its own: a node it only read holds handles to
+    /// the live node's (`Node::cold_copy`), whose drop runs no code while
+    /// the live node, just put back, holds them too. A shell holding more
+    /// is quarantined ([`Node::is_shell`]).
     #[cfg(debug_assertions)]
-    fn rollback(&mut self) -> Vec<Box<dyn Any>> {
+    fn rollback(&mut self) {
+        fn put_by(made: Vec<Box<dyn Any>>) {
+            if !made.is_empty() {
+                crate::engine::quarantined("RUNTIME", Box::new(made));
+            }
+        }
         let mut made: Vec<Box<dyn Any>> = Vec::new();
-        let Some(log) = self.cold.take() else { return made };
+        let Some(log) = self.cold.take() else { return };
         let ColdLog {
             wrote,
             undo,
-            nodes_len,
-            links_len,
             aside,
-            kept,
+            owned,
             ..
         } = *log;
         drop(wrote);
@@ -2216,7 +2418,10 @@ impl Runtime {
             match step {
                 Undo::Node(i, old) => {
                     if let Some(n) = self.nodes.get_mut(i) {
-                        made.push(Box::new(std::mem::replace(n, *old)));
+                        let shell = std::mem::replace(n, *old);
+                        if !shell.is_shell(owned.contains(&i)) {
+                            made.push(Box::new(shell));
+                        }
                     }
                 }
                 Undo::Link(i, old) => {
@@ -2224,44 +2429,17 @@ impl Runtime {
                         *l = old;
                     }
                 }
-                Undo::FreeNodePop(i) => self.free_nodes.push(i),
-                Undo::FreeNodePush => {
-                    self.free_nodes.pop();
-                }
-                Undo::FreeLinkPop(i) => self.free_links.push(i),
-                Undo::FreeLinkPush => {
-                    self.free_links.pop();
-                }
             }
         }
-        // The frame's nodes past the live ones go; a live one made while it
-        // was suspended stays where it is, the frame's below it freed.
-        let last_kept = kept.iter().copied().max();
-        let cut = last_kept.map_or(nodes_len, |k| k.saturating_add(1)).max(nodes_len);
-        made.extend(
-            self.nodes
-                .drain(cut.min(self.nodes.len())..)
-                .map(|n| -> Box<dyn Any> { Box::new(n) }),
-        );
-        let mut kept_counts = Counts::default();
-        for i in nodes_len..cut {
-            if kept.contains(&i) {
-                if let Some(n) = self.nodes.get(i) {
-                    kept_counts.count(n.kind);
-                }
-                continue;
-            }
-            if let Some(n) = self.nodes.get_mut(i) {
-                let generation = n.generation.wrapping_add(1);
-                let created_at = n.created_at;
-                let was = std::mem::replace(n, Node::new(Kind::Signal, flag::NONE, created_at));
-                n.generation = generation;
-                n.alive = false;
-                made.push(Box::new(was));
-                self.free_nodes.push(i);
+        // The frame's own regions go; the live ones were only written
+        // where the log puts them back, their free slots never touched.
+        for shell in self.fork_nodes.drain(..) {
+            if !shell.is_shell(true) {
+                made.push(Box::new(shell));
             }
         }
-        self.links.truncate(links_len);
+        self.fork_links.clear();
+        self.fork_free_links.clear();
         let Aside {
             queued,
             notify_index,
@@ -2289,12 +2467,17 @@ impl Runtime {
             in_render,
             deferred,
         } = aside;
-        made.push(Box::new(std::mem::replace(&mut self.settle, settle)));
-        made.push(Box::new(std::mem::replace(&mut self.queued, queued)));
-        made.push(Box::new(std::mem::replace(&mut self.stack, stack)));
-        made.push(Box::new(std::mem::replace(&mut self.unwatched_stack, unwatched_stack)));
-        made.push(Box::new(std::mem::replace(&mut self.late, late)));
-        made.push(Box::new(std::mem::replace(&mut self.deferred, deferred)));
+        // The frame's queue of cleanups and garbage was drained; the rest
+        // are ids and records, data.
+        let left = std::mem::replace(&mut self.settle, settle);
+        if !left.cleanups.is_empty() || !left.garbage.is_empty() {
+            made.push(Box::new(left));
+        }
+        self.queued = queued;
+        self.stack = stack;
+        self.unwatched_stack = unwatched_stack;
+        self.late = late;
+        self.deferred = deferred;
         self.trace = trace;
         self.notify_index = notify_index;
         self.flushing = flushing;
@@ -2306,7 +2489,6 @@ impl Runtime {
         self.active_owner = active_owner;
         self.unwatching = unwatching;
         self.counts = counts;
-        self.counts.add(kept_counts);
         self.writer = writer;
         self.waking = waking;
         self.frame = frame;
@@ -2315,7 +2497,7 @@ impl Runtime {
         self.rendering = rendering;
         self.renders_run = renders_run;
         self.in_render = in_render;
-        made
+        put_by(made);
     }
 }
 
@@ -2354,16 +2536,11 @@ fn cold_enter() -> Box<dyn Any> {
         rt.cold = Some(Box::new(ColdLog {
             wrote: Vec::new(),
             undo: Vec::new(),
-            logged_nodes: std::collections::HashSet::new(),
-            logged_links: std::collections::HashSet::new(),
-            born: std::collections::HashSet::new(),
+            logged_nodes: std::collections::HashMap::new(),
+            logged_links: std::collections::HashMap::new(),
             owned: std::collections::HashSet::new(),
             distrusted: std::collections::HashSet::new(),
-            nodes_len: rt.nodes.len(),
-            links_len: rt.links.len(),
             aside,
-            suspended: false,
-            kept: Vec::new(),
         }));
     });
     Box::new(())
@@ -2373,12 +2550,12 @@ fn cold_enter() -> Box<dyn Any> {
 /// the values and closures of the nodes it made or made its own, the
 /// cleanups it queued, its queues.
 #[cfg(debug_assertions)]
-fn cold_drain(_: &dyn Any) -> Box<dyn Any> {
-    Box::new(try_with(Runtime::drain_cold).unwrap_or_default())
+fn cold_drain(_: &dyn Any) -> Vec<Box<dyn Any>> {
+    try_with(Runtime::drain_cold).unwrap_or_default()
 }
 
-/// The arena's slots, and how many hold a live node.
-#[cfg(test)]
+/// The arena's slots, and how many hold a live node (the fork tests).
+#[cfg(all(debug_assertions, test))]
 pub(crate) fn arena() -> (usize, usize) {
     with(|rt| (rt.nodes.len(), rt.nodes.iter().filter(|n| n.alive).count()))
 }
@@ -2411,8 +2588,9 @@ pub(crate) fn making_shared<R>(f: impl FnOnce() -> R) -> R {
             if undone.is_empty() {
                 return;
             }
-            // Last made first, as a scope disposes what it owns.
-            try_with(|rt| undone.into_iter().rev().for_each(|id| rt.unmake(id)));
+            // Last made first, as a scope disposes what it owns: the
+            // arena's own bookkeeping ([`crate::engine::allocating`]).
+            crate::engine::allocating(|| try_with(|rt| undone.into_iter().rev().for_each(|id| rt.unmake(id))));
             // While unwinding, what disposing runs waits for the next settle.
             if !std::thread::panicking() {
                 settle();
@@ -2429,38 +2607,14 @@ pub(crate) fn making_shared<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
-/// Run `f` live while a cold frame is suspended: what it allocates is the
-/// live arena's (kept when the frame is undone), made with no owner and
-/// tracked by nothing.
+/// The arena put back as it was, by moves (ADR-0034, S1).
 #[cfg(debug_assertions)]
-pub(crate) fn outside_cold<R>(f: impl FnOnce() -> R) -> R {
-    /// The frame resumes however `f` ends.
-    struct Resume(Option<(usize, Option<NodeId>)>);
-    impl Drop for Resume {
-        fn drop(&mut self) {
-            let Some((sub, owner)) = self.0 else { return };
-            try_with(|rt| {
-                rt.active_sub = sub;
-                rt.active_owner = owner;
-                if let Some(log) = rt.cold.as_deref_mut() {
-                    log.suspended = false;
-                }
-            });
+fn cold_exit(_: Box<dyn Any>) {
+    RUNTIME.switch_with(|rt| {
+        if let Ok(mut rt) = rt.try_borrow_mut() {
+            rt.rollback();
         }
-    }
-    let was = with(|rt| {
-        let log = rt.cold.as_deref_mut()?;
-        log.suspended = true;
-        Some((std::mem::replace(&mut rt.active_sub, NONE), rt.active_owner.take()))
     });
-    let _resume = Resume(was);
-    f()
-}
-
-/// The arena put back as it was; what the cold frame made, to drop.
-#[cfg(debug_assertions)]
-fn cold_exit(_: Box<dyn Any>) -> Box<dyn Any> {
-    Box::new(try_with(Runtime::rollback).unwrap_or_default())
 }
 
 /// How many steps the running cold frame's undo log holds (its cost).

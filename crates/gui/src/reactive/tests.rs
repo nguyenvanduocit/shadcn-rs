@@ -1558,6 +1558,7 @@ fn a_deferred_effects_reads_are_no_renders() {
 
 /// A cold re-render that panics leaves nothing cold behind it: the
 /// effects a later live render makes still run.
+#[cfg(debug_assertions)]
 #[test]
 fn a_panicking_cold_render_leaves_later_effects_running() {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1588,4 +1589,29 @@ fn a_panicking_cleanup_leaves_none_after_it_unrun() {
     let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scope.dispose()));
     assert!(out.is_err(), "the panic goes on");
     assert_eq!(ran.get(), 1, "the cleanup after it ran");
+}
+
+/// Review r14 D: an engine commit step is one batch, its effects run once
+/// it is whole; one that flushes part way (an effect run inside it) is
+/// caught in a debug build.
+#[test]
+fn an_effect_run_inside_an_engine_commit_step_is_caught() {
+    let (a, b) = (Signal::new(0_u32), Signal::new(0_u32));
+    let seen = log();
+    let s = Rc::clone(&seen);
+    let _e = Effect::new(move || push(&s, &format!("{} {}", a.get(), b.get())));
+    take(&seen);
+    crate::engine::commit_here(|_| {
+        a.set(1);
+        b.set(1);
+    });
+    assert_eq!(take(&seen), ["1 1"], "one run, the step whole");
+    let flushed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::engine::commit_here(|_| {
+            a.set(2);
+            // What a step must never do: flush part way.
+            runtime::flush();
+        });
+    }));
+    assert_eq!(flushed.is_err(), cfg!(debug_assertions), "caught in a debug build");
 }

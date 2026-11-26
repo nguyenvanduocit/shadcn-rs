@@ -1,5 +1,6 @@
 use super::binding::Tracked;
 use super::*;
+use crate::compositor::motion::units2;
 use crate::element::{IntoElement, Side, SideAlign, Text, deferred, div, key_of, span, text};
 use crate::focus::FocusHandle;
 use crate::placement::EDGE_MARGIN;
@@ -409,7 +410,7 @@ fn trackers_dropped_while_unwinding_leave_the_graph() {
         let (style, bindings) = d.style_and_bindings();
         let ops = Rc::clone(bindings.and_then(|b| b.ops()).expect("bound"));
         let mut sb = binding::StyleBinding::new(&marks, 0);
-        let _ = sb.get(&ops, style);
+        let _ = sb.get(&ops, style, &[]);
         std::panic::panic_any("a binding panicked");
     }));
     assert!(unwound.is_err());
@@ -793,9 +794,9 @@ fn a_binding_that_panicked_then_went_reads_nothing() {
         };
         let ((s1, o1), (s2, o2)) = (ops(&mut before), ops(&mut after));
         let mut sb = binding::StyleBinding::new(&marks, 0);
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&o1, &s1)));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&o1, &s1, &[])));
         assert!(unwound.is_err(), "the width's closure panicked");
-        sb.get(&o2, &s2);
+        sb.get(&o2, &s2, &[]);
         marks.borrow_mut().clear();
         w.set(20.0);
         assert!(marks.borrow().is_empty(), "what the closure read marks nothing");
@@ -836,14 +837,14 @@ fn a_binding_or_restyle_that_panicked_runs_again_at_the_next_resolve() {
             s
         };
         let mut sb = binding::StyleBinding::new(&marks, 0);
-        assert!(sb.get(&ops, style) == resolved());
+        assert!(sb.get(&ops, style, &[]) == resolved());
         w.set(20.0);
         boom.set(true);
-        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&ops, style)));
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sb.get(&ops, style, &[])));
         assert!(unwound.is_err(), "it panicked");
         boom.set(false);
         assert!(
-            sb.get(&ops, style) == resolved(),
+            sb.get(&ops, style, &[]) == resolved(),
             "the width as it is now (restyle: {restyle})"
         );
     }
@@ -925,20 +926,20 @@ fn a_scroll_offset_is_set_in_constant_work_however_many_paths_are_kept() {
     let mut state = UiState::default();
     let path = |i: usize| NodePath::new([PathSeg::Index(0), PathSeg::Index(i)].into());
     for i in 0..1_000 {
-        state.set_scroll((path(i), None), (0.0, 1.0));
+        state.set_scroll((path(i), None), units2((0.0, 1.0)));
     }
     let (a, b) = (crate::reactive::Scope::new(), crate::reactive::Scope::new());
     let (a, b) = (a.run(crate::reactive::owner), b.run(crate::reactive::owner));
     let before = state.scroll.visited;
-    state.set_scroll((path(500), a), (0.0, 20.0));
-    state.set_scroll((path(500), b), (0.0, 30.0));
+    state.set_scroll((path(500), a), units2((0.0, 20.0)));
+    state.set_scroll((path(500), b), units2((0.0, 30.0)));
     assert_eq!(state.scroll.visited - before, 2, "one entry a write");
     assert_eq!(
         state.scroll.get(&(path(500), a)),
         None,
         "the owner replaced at the path left nothing"
     );
-    assert_eq!(state.scroll.get(&(path(500), b)), Some(&(0.0, 30.0)));
+    assert_eq!(state.scroll.get(&(path(500), b)), Some(&units2((0.0, 30.0))));
     assert_eq!(state.scroll.get(&(path(500), None)), None);
     assert_eq!(state.scroll.paths().count(), 1_000, "one entry a path");
 }
@@ -963,16 +964,16 @@ fn a_pass_places_only_the_scrolls_written_since_the_last() {
     let list = find(tree.frame(), "list").path.clone();
     for i in 0..999 {
         let other = NodePath::new([PathSeg::Index(7), PathSeg::Index(i)].into());
-        state.set_scroll((other, None), (0.0, 1.0));
+        state.set_scroll((other, None), units2((0.0, 1.0)));
     }
-    state.set_scroll((list.clone(), None), (0.0, 10.0));
+    state.set_scroll((list.clone(), None), units2((0.0, 10.0)));
     tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     assert_eq!(state.scroll.logged(), 0, "the pass took the log");
     let before = tree.scroll_marked;
     for i in 0..10_000_u16 {
-        state.set_scroll((list.clone(), None), (0.0, f32::from(i % 300)));
+        state.set_scroll((list.clone(), None), units2((0.0, f32::from(i % 300))));
     }
-    state.set_scroll((list, None), (0.0, 50.0));
+    state.set_scroll((list, None), units2((0.0, 50.0)));
     assert_eq!(state.scroll.logged(), 1, "one path written, one entry");
     tree.layout(&el, 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     assert_eq!(tree.scroll_marked - before, 1, "one placement for it");
@@ -1000,7 +1001,7 @@ fn ten_thousand_scrolled_frames_leave_the_scroll_log_bounded() {
     for k in 0..10_000_u32 {
         let step = crate::compositor::WheelStep {
             point: (50.0, 50.0),
-            at: f32::from(u16::try_from(k % 1000).unwrap_or(0)),
+            time: u64::from(k % 1000) * 1_000_000_000,
             ..crate::compositor::WheelStep::default()
         };
         let dy = if k % 2 == 0 { 30.0 } else { -30.0 };
@@ -1034,7 +1035,7 @@ fn scrolled_children_move_up_and_are_clipped() {
     };
     let before = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     let path = find(&before, "list").path.clone();
-    state.scroll.insert((path, None), (0.0, 1000.0));
+    state.scroll.insert((path, None), units2((0.0, 1000.0)));
     let after = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     let list = find(&after, "list");
     assert_eq!(list.scroll.map(|s| s.offset.1), Some(300.0), "clamped to 400 - 100");
@@ -1063,7 +1064,7 @@ fn a_scroll_offset_moves_content_by_whole_device_pixels() {
     };
     let before = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     let path = find(&before, "list").path.clone();
-    state.scroll.insert((path, None), (0.0, 10.3));
+    state.scroll.insert((path, None), units2((0.0, 10.3)));
     let after = layout(&tree(), 400.0, 300.0, &state, &mut Motion::default(), &mut ts);
     assert_eq!(
         find(&after, "first").bounds.y,
@@ -1362,6 +1363,7 @@ fn parallel_serial_and_reversed_layouts_are_bit_identical() {
 
 /// A cold layout of a tree the pool would take runs on its own thread:
 /// no job reaches a pool thread's text system, a live cache.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_layout_hands_the_pool_no_jobs() {
     let state = UiState::default();

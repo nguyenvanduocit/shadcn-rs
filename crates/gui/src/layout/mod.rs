@@ -26,7 +26,6 @@ mod place;
 mod state;
 mod write;
 
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -75,8 +74,8 @@ pub struct UiState {
     pub hovered: HashSet<NodePath>,
     pub active: HashSet<NodePath>,
     /// The offsets of the scroll containers without a handle, by identity
-    /// ([`ScrollId`]).
-    pub(crate) scroll: ByScroller<(f32, f32)>,
+    /// ([`ScrollId`]), exactly ([`crate::compositor::motion`]).
+    pub(crate) scroll: ByScroller<crate::compositor::motion::Exact>,
     /// How many times the UI set each of those offsets itself (its wheel),
     /// not taking in the compositor's scroll (ADR-0015).
     pub(crate) scroll_generation: ByScroller<u64>,
@@ -101,8 +100,8 @@ impl UiState {
 
     /// Scroll container `id` (without a handle) at `offset`: what another
     /// instance left at its path goes, so a path holds one entry.
-    pub(crate) fn set_scroll(&mut self, id: ScrollId, offset: (f32, f32)) {
-        self.scroll.insert(id, offset);
+    pub(crate) fn set_scroll(&mut self, id: ScrollId, pos: crate::compositor::motion::Exact) {
+        self.scroll.insert(id, pos);
     }
 }
 
@@ -145,8 +144,9 @@ mod need {
     pub(super) const VISIT: u8 = 4;
 }
 
-/// Node and phase marks that signal writes left for the next pass.
-type Marks = Rc<RefCell<Vec<(u32, u8)>>>;
+/// Node and phase marks that signal writes left for the next pass: the
+/// tree's world's (review r18, decision 2), so no check marks a live tree.
+type Marks = Rc<crate::engine::WorldRefCell<Vec<(u32, u8)>>>;
 
 /// What the tree keeps beside each layout node: who it is and what paint
 /// and input read of it.
@@ -260,7 +260,7 @@ struct Extra {
 impl Drop for Extra {
     fn drop(&mut self) {
         if let Some(h) = self.hidden.take() {
-            h.dispose();
+            h.release(crate::engine::LiveDrop::in_drop());
         }
     }
 }
@@ -592,15 +592,18 @@ pub struct LayoutTree {
     joining: Vec<u32>,
     /// The measure hooks ([`crate::Div::on_measured`]) of the nodes placed
     /// since the lists were last filled, with their boxes: run after them.
-    measured_due: RefCell<Vec<(Handler<Bounds>, Bounds)>>,
+    measured_due: crate::engine::WorldRefCell<Vec<(Handler<Bounds>, Bounds)>>,
     /// What placing text fields says of their scroll state, for the input
     /// state to take ([`LayoutTree::swap_fields`]).
-    fields: RefCell<Vec<FieldSettled>>,
+    fields: crate::engine::WorldRefCell<Vec<FieldSettled>>,
     /// Its lists ([`crate::Members`]), filled each pass.
     lists: Rc<crate::members::Lists>,
-    /// A tree laid out once beside the window's own (a cold check): it
-    /// writes nothing of the window's (its lists, focus, scroll handles,
-    /// measure hooks, placement reports), so laying it out changes nothing.
+    /// A tree laid out beside the window's own: it writes nothing of the
+    /// window's (its lists, focus, scroll handles, measure hooks,
+    /// placement reports), so laying it out changes nothing. A cold
+    /// check's, and every tree a check makes, by whatever constructor: the
+    /// world decides, not the path (review r18, Codex 2: a tree a check
+    /// made with `LayoutTree::new` took a live list over).
     detached: bool,
     /// How many layers have opened: the next one's place in opening order.
     opened: u64,
@@ -609,6 +612,10 @@ pub struct LayoutTree {
     /// Which layer opened first is retained state, as a scroll offset is,
     /// so a cold build paints the layers in the order the window does.
     carried: HashMap<NodePath, u64>,
+    /// What the window's bindings hold over runs that panicked, by node
+    /// (a cold check, [`layout_carrying`]): reused as they are, never run
+    /// again, so a hold never switches the check off (ADR-0015, rule 6).
+    held: HashMap<NodePath, binding::HeldNode>,
     /// The window size the last pass laid out at.
     size: (f32, f32),
     /// The motion generation the last pass sampled at.
@@ -625,7 +632,7 @@ impl Drop for LayoutTree {
     fn drop(&mut self) {
         // Bindings' trackers, then the probe.
         self.extras.clear();
-        self.probe.dispose();
+        self.probe.release(crate::engine::LiveDrop::in_drop());
     }
 }
 
@@ -637,6 +644,25 @@ fn set_style(node: &mut Node, style: BoxStyle) {
 }
 
 impl LayoutTree {
+    /// What its nodes' bindings hold over runs that panicked in turns, by
+    /// path, for a cold build to reuse ([`binding::HeldNode`]). A walk of
+    /// the nodes, on a cold check's path only.
+    fn held_values(&self) -> HashMap<NodePath, binding::HeldNode> {
+        self.extras
+            .iter()
+            .flatten()
+            .filter_map(|ex| {
+                binding::HeldNode::of(
+                    ex.style_binding.as_deref(),
+                    &ex.span_bindings,
+                    ex.text_binding.as_deref(),
+                    ex.draw_binding.as_deref(),
+                )
+                .map(|h| (ex.path.clone(), h))
+            })
+            .collect()
+    }
+
     #[must_use]
     pub fn new() -> Self {
         Self::with_schedule(Schedule::from_env())
@@ -659,7 +685,10 @@ impl LayoutTree {
             focused: None,
             root_path: NodePath::new([PathSeg::Index(0)].into()),
             frame: Frame::default(),
-            marks: Rc::default(),
+            marks: Rc::new(crate::engine::WorldRefCell::new(
+                "a layout tree's marks (`LayoutTree::marks`)",
+                Vec::new(),
+            )),
             probe: crate::reactive::detached(|| crate::reactive::RenderNode::new(|| {})),
             by_path: foldhash::HashMap::default(),
             by_focus: foldhash::HashMap::default(),
@@ -672,12 +701,13 @@ impl LayoutTree {
             structure: true,
             layer_paths: Vec::new(),
             joining: Vec::new(),
-            measured_due: RefCell::new(Vec::new()),
-            fields: RefCell::default(),
+            measured_due: crate::engine::WorldRefCell::new("a layout tree's measure hooks due", Vec::new()),
+            fields: crate::engine::WorldRefCell::new("a layout tree's text fields placed", Vec::new()),
             lists: Rc::default(),
-            detached: false,
+            detached: crate::engine::forking(),
             opened: 0,
             carried: HashMap::new(),
+            held: HashMap::new(),
             size: (-1.0, -1.0),
             motion_seen: 0,
         }
@@ -702,7 +732,7 @@ impl LayoutTree {
     }
 
     /// The frame as last laid out, for a test to make stale.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn frame_mut(&mut self) -> &mut Frame {
         &mut self.frame
     }
@@ -1057,6 +1087,7 @@ pub(crate) fn layout_carrying(
     if let Some(w) = window {
         tree.carried = w.layers.iter().map(|l| (l.path.clone(), l.opened)).collect();
         tree.opened = w.opened;
+        tree.held = w.held_values();
     }
     tree.layout(root, width, height, state, motion, text);
     tree.take_frame()

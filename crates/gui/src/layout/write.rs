@@ -40,12 +40,9 @@ impl LayoutTree {
         motion: &mut Motion,
         text: &mut TextSystem,
     ) -> &Frame {
-        let pass = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.pass(root, width, height, state, motion, text);
-        }));
-        if let Err(panic) = pass {
+        if let Err(failed) = crate::engine::attempt(|| self.pass(root, width, height, state, motion, text)) {
             self.forget(motion);
-            std::panic::resume_unwind(panic);
+            failed.go_on();
         }
         &self.frame
     }
@@ -116,6 +113,7 @@ impl LayoutTree {
         }
         let mut frame = std::mem::take(&mut self.frame);
         frame.viewport = viewport;
+        frame.scale = state.scale;
         // A pass that rebuilds starts from the frame as it was, for what the
         // frame report says changed.
         let mut rebuilt_from: Option<usize> = None;
@@ -310,9 +308,24 @@ impl LayoutTree {
                     frame.layers.push(at);
                 }
                 Write::Changed => {
+                    let mut retabbed = None;
                     if let Some(l) = frame.layers.get_mut(layer.saturating_sub(1)) {
                         l.anchor = anchor;
-                        l.tab_after = t.deferred.tab_after;
+                        if l.tab_after != t.deferred.tab_after {
+                            l.tab_after = t.deferred.tab_after;
+                            retabbed = Some(l.root);
+                        }
+                    }
+                    // The node its Tab stops follow changed in place (a
+                    // viewport's panel following another trigger): its
+                    // root is logged, so a reader of the log (the layer
+                    // stack) reads that layer's again, and no other.
+                    if let Some(root) = retabbed {
+                        frame.changes.log.push(super::Changed {
+                            index: u32::try_from(root).unwrap_or(u32::MAX),
+                            before: frame.nodes.get(root).map_or_else(Bounds::default, |n| n.bounds),
+                            repainted: false,
+                        });
                     }
                 }
             }
@@ -448,8 +461,11 @@ impl LayoutTree {
         self.joining = joining;
         self.joining.clear();
         let due = std::mem::take(&mut *self.measured_due.borrow_mut());
+        // Callers' closures, through the one gate (ADR-0028, rule 5).
         for (f, bounds) in &due {
-            crate::reactive::untracked(|| f(bounds));
+            crate::engine::call_out(crate::engine::Site::Measured, || {
+                crate::reactive::untracked(|| f(bounds));
+            });
         }
         let mut due = due;
         due.clear();

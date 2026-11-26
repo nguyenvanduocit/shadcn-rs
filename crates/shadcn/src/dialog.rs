@@ -576,7 +576,8 @@ mod tests {
         s.settle().expect("settled");
         s.act("focus inside", || inner.focus());
         s.settle().expect("settled");
-        assert!(inner.is_focused(), "the content holds focus while open");
+        // Focus is the window's: read in a turn of it (ADR-0015).
+        assert!(s.read(|| inner.is_focused()), "the content holds focus while open");
         s.act("close", || open.set(false));
         s.settle().expect("settled");
     }
@@ -589,7 +590,7 @@ mod tests {
         s.act("focus before", || before.focus());
         s.settle().expect("settled");
         open_and_close(&mut s, open, inner);
-        assert!(before.is_focused(), "focus is back where it was");
+        assert!(s.read(|| before.is_focused()), "focus is back where it was");
     }
 
     #[test]
@@ -599,7 +600,7 @@ mod tests {
         let (before, inner) = (FocusHandle::new(), FocusHandle::new());
         let mut s = page(open, before, inner, trigger);
         open_and_close(&mut s, open, inner);
-        assert_eq!(focus::focused(), None, "focus is not left on the closed content");
+        assert_eq!(s.read(focus::focused), None, "focus is not left on the closed content");
     }
 
     #[test]
@@ -615,11 +616,8 @@ mod tests {
         s.act("focus inside", || inner.focus());
         s.act("close", || open.set(false));
         s.settle().expect("settled");
-        let back = focus::focused();
-        assert!(
-            back.is_some() && !before.is_focused() && !inner.is_focused(),
-            "focus is on the trigger"
-        );
+        let (back, was_before, was_inner) = s.read(|| (focus::focused(), before.is_focused(), inner.is_focused()));
+        assert!(back.is_some() && !was_before && !was_inner, "focus is on the trigger");
         // The trigger holds it: Enter presses it and opens the dialog again.
         s.press(NamedKey::Enter, Modifiers::default());
         s.settle().expect("settled");
@@ -634,7 +632,7 @@ mod tests {
         s.act("focus before", || before.focus());
         s.settle().expect("settled");
         open_and_close(&mut s, open, inner);
-        assert!(before.is_focused(), "what held focus wins over the trigger");
+        assert!(s.read(|| before.is_focused()), "what held focus wins over the trigger");
     }
 
     #[test]
@@ -649,6 +647,6 @@ mod tests {
         s.settle().expect("settled");
         s.act("close", || open.set(false));
         s.settle().expect("settled");
-        assert_eq!(focus::focused(), None, "nothing keeps focus");
+        assert_eq!(s.read(focus::focused), None, "nothing keeps focus");
     }
 }

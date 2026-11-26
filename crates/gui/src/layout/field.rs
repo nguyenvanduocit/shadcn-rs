@@ -10,7 +10,8 @@ use super::{LayoutTree, Pending};
 /// ([`caret_reveal`]), or a newer reveal taken ([`LayoutTree::swap_fields`]).
 pub(crate) struct FieldSettled {
     pub field: TextField,
-    pub offset: (f32, f32),
+    /// Exactly ([`crate::compositor::motion`]).
+    pub pos: crate::compositor::motion::Exact,
     /// The reveal generation it took.
     pub applied: u64,
 }

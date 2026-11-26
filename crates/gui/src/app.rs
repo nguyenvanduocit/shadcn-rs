@@ -5,6 +5,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -14,7 +15,7 @@ use crate::access;
 use crate::clock;
 use crate::color::Color;
 use crate::component::Root;
-use crate::compositor::{Compose, Headless, MainFrame, Presented};
+use crate::compositor::{Compose, Headless, MainFrame, Presented, Shown};
 use crate::convert::u32_to_f32;
 use crate::devtools::{self, Attached};
 use crate::edit::Preedit;
@@ -54,6 +55,35 @@ pub struct DebugTools {
     /// `--attach`) inspects and drives the running app. Setting
     /// `GUI_DEVTOOLS=1` (or a socket path) in the environment does the same.
     pub attach: bool,
+}
+
+/// What hover is a function of: where the pointer is (logical, `None`
+/// outside the window) and the frame it is worked out in.
+type HoverKey = (Option<(f32, f32)>, crate::compositor::Seen);
+
+/// One dispatch in the frame it was routed in ([`Pipeline::input_on`]):
+/// dropped, as the dispatch returns or as a panic unwinds through it, it
+/// ends the routing ([`InputState::routed`]). Unwinding, the move or leave
+/// did not finish working hover out, so the frame on screen is put back
+/// as for any other input.
+struct Routing<'a> {
+    pipeline: &'a mut Pipeline,
+    hovers: bool,
+}
+
+impl Drop for Routing<'_> {
+    /// A move or a leave that unwinds may have changed hover part way (its
+    /// hover handlers ran, a pointer handler panicked): hover and the key
+    /// it was last worked out by ([`Pipeline::checked`]) change together,
+    /// so the key is dropped with the frame put back, and the next check
+    /// works hover out afresh in the frame on screen.
+    fn drop(&mut self) {
+        let unwinding = std::thread::panicking();
+        self.pipeline.input_state.routed(self.hovers && !unwinding);
+        if self.hovers && unwinding {
+            self.pipeline.checked = None;
+        }
+    }
 }
 
 /// Turns a component into frames and routes input back into it.
@@ -105,12 +135,32 @@ pub struct Pipeline {
     cold_check: bool,
     /// The scene the cold frame painted, what the live paint must equal.
     cold_scene: Option<crate::scene::Scene>,
+    /// How many checks in a row were skipped ([`SKIP_FLOOR`]).
+    skips: u32,
     /// The layout tree kept across frames (ADR-0014).
     tree: LayoutTree,
     /// The tree a screen reader holds (ADR-0021).
     access: access::Accessibility,
     /// The devtools' own, to measure updates without touching the window's.
     probe: access::Accessibility,
+    /// What input that came before any frame was presented is hit-tested
+    /// against, made once per commit ([`Self::on_screen`]).
+    first: Option<(u64, Arc<Presented>)>,
+    /// The key of the last time hover was actually worked out: where the
+    /// pointer was and the frame it was worked out in (by a move routed,
+    /// or the check of a resting pointer, [`Self::converge`]). Hover is a
+    /// function of the two; when either differs, it is worked out again.
+    checked: Option<HoverKey>,
+    /// The number of the last pull of the compositor's scroll taken in
+    /// ([`Self::take_pulled`]): what the next commit's bases hold (I4).
+    taken: u64,
+    /// The deltas of the pulls handed on and not yet taken in, in the
+    /// order handed on: the next turn takes them in first, as part of it
+    /// ([`Self::turn`]); its buffer kept.
+    took: Vec<crate::compositor::ScrollDelta>,
+    /// Whether what the last turn took in moved anything
+    /// ([`Self::pulls_moved`]).
+    pull_moved: bool,
 }
 
 /// What layout and paint read outside any node's own phases (a layer's
@@ -121,14 +171,16 @@ struct Trackers {
     layout: RenderNode,
     paint: RenderNode,
     /// One of them changed: the next frame is laid out and recorded whole.
-    whole: std::rc::Rc<std::cell::Cell<bool>>,
+    /// The world's that made the pipeline: a check marks none of a live
+    /// one's (ADR-0034, S7).
+    whole: std::rc::Rc<crate::engine::WorldCell<bool>>,
 }
 
 impl Trackers {
     fn new() -> Self {
         let scope = reactive::Scope::detached();
-        let whole = std::rc::Rc::new(std::cell::Cell::new(false));
-        let mark = |w: &std::rc::Rc<std::cell::Cell<bool>>| {
+        let whole = std::rc::Rc::new(crate::engine::WorldCell::new("a pipeline's whole-frame mark", false));
+        let mark = |w: &std::rc::Rc<crate::engine::WorldCell<bool>>| {
             let w = std::rc::Rc::clone(w);
             move || {
                 w.set(true);
@@ -145,11 +197,49 @@ impl Trackers {
     }
 }
 
+/// Their scope is the pipeline's world's: a live pipeline a check lets go
+/// of has its trackers' scope disposed live, once the check has switched
+/// back, never in the check's world, where the dispose would be the check's
+/// and the live scope never end (review r18, V2).
 impl Drop for Trackers {
     fn drop(&mut self) {
-        if !std::thread::panicking() {
-            self.scope.dispose();
-        }
+        let scope = self.scope;
+        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), self.whole.is_here(), move || {
+            if !std::thread::panicking() {
+                scope.dispose();
+            }
+        });
+    }
+}
+
+/// An accessibility update that changes nothing: what one that panicked
+/// inside another window's turn answers (the next is the whole tree).
+fn no_update() -> accesskit::TreeUpdate {
+    accesskit::TreeUpdate {
+        nodes: Vec::new(),
+        tree: None,
+        tree_id: accesskit::TreeId::ROOT,
+        focus: accesskit::NodeId(0),
+    }
+}
+
+/// The pipeline is its window's live owner (ADR-0034, S4 and S5): as it
+/// ends, its window closes, whoever still holds its `Rc`, in the window's
+/// own world. A live pipeline a check drops closes live once the check has
+/// switched back, through the release queue; never by the explicit close,
+/// which acts on the running world, so inside a check on the check's copy
+/// of the window, leaving the live one open with its mail (review r18,
+/// Codex 1). A drop never panics: a panic of the close is said and dropped.
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        let window = Rc::clone(&self.focus);
+        let root = self.root.closer();
+        let made_in_fork = window.made_in_fork();
+        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), made_in_fork, move || {
+            if let Err(said) = close_window(&window, root) {
+                eprintln!("gui: closing a window, user code panicked: {said}");
+            }
+        });
     }
 }
 
@@ -157,12 +247,29 @@ impl Pipeline {
     /// A pipeline for `component`, the app's root render. With `trace`, the
     /// reactive runtime records what each frame wrote and read.
     pub fn new(component: impl Fn() -> Element + 'static, trace: bool) -> Self {
+        Self::made(trace, |_| component)
+    }
+
+    /// A pipeline whose root render `make` gives, made in the window's
+    /// first turn (ADR-0015): the window exists first, so what `make` (an
+    /// app's setup) reads and schedules is the window's. A `make` that
+    /// panicked inside another window's turn (whose arbiter has the panic)
+    /// leaves the window empty.
+    pub(crate) fn made<C: Fn() -> Element + 'static>(
+        trace: bool,
+        make: impl FnOnce(&crate::engine::Turn) -> C,
+    ) -> Self {
         if trace {
             reactive::start_trace();
         }
+        let focus = crate::focus::FocusRoot::new();
+        let component: Box<dyn Fn() -> Element> = match crate::engine::turn(&focus, make) {
+            Some(c) => Box::new(c),
+            None => Box::new(|| Element::Empty),
+        };
         Self {
-            focus: crate::focus::FocusRoot::new(),
-            root: Root::new(component),
+            focus,
+            root: Root::of_pipeline(component),
             trackers: Trackers::new(),
             text: TextSystem::new(),
             painter: Painter::default(),
@@ -188,10 +295,195 @@ impl Pipeline {
             // A debug build's check: a release build has none to run.
             cold_check: cold_check_asked(),
             cold_scene: None,
+            skips: 0,
             tree: LayoutTree::new(),
             access: access::Accessibility::default(),
             probe: access::Accessibility::default(),
+            first: None,
+            checked: None,
+            taken: 0,
+            took: Vec::new(),
+            pull_moved: false,
         }
+    }
+
+    /// Run `work` as one turn of this window (ADR-0015, the turn rule,
+    /// `engine::turn`): the window current, one dispatch whose arbiter
+    /// keeps the first panic of the user code it reaches, and what the
+    /// compositor scrolled that was handed on before it taken in first, as
+    /// part of it ([`Self::take_pulled`]). Every entry from outside goes
+    /// through here: input, a frame, mail, timers, the devtools, an
+    /// accessibility update, a caller's act. What `work` answered; `None`
+    /// when it panicked inside another window's turn, whose arbiter has the
+    /// panic (the outermost turn unwinds with the first panic instead).
+    pub(crate) fn turn<R>(&mut self, work: impl FnOnce(&mut Self) -> R) -> Option<R> {
+        self.turn_with(|p, _| work(p))
+    }
+
+    /// [`Self::turn`], its work handed the turn's leave
+    /// ([`crate::engine::Turn`]): for the engine steps that take one (a
+    /// write of the window's own signals the platform told).
+    ///
+    /// A closed window runs no turn (ADR-0015, the window state machine):
+    /// `work` is dropped unrun, where the caller runs, and `None` answers.
+    /// Using a closed pipeline is a caller's bug, so a debug build panics
+    /// then, once `work` is gone.
+    pub(crate) fn turn_with<R>(&mut self, work: impl FnOnce(&mut Self, &crate::engine::Turn) -> R) -> Option<R> {
+        let window = Rc::clone(&self.focus);
+        if window.is_closed() {
+            drop(work);
+            debug_assert!(false, "gui: a turn of a closed window: its pipeline was closed");
+            return None;
+        }
+        crate::engine::turn(&window, |t| {
+            self.pull_moved = false;
+            self.take_in_pulls();
+            work(self, t)
+        })
+    }
+
+    /// Close its window (ADR-0015, the window state machine): Open →
+    /// Closing → Closed, in ONE turn of it, so every piece of user code its
+    /// close runs (and every drop of what it scheduled) runs in it, its
+    /// panics ordered by that turn's arbiter:
+    ///
+    /// 1. the root unmounts: every instance's cleanups and unmount hooks;
+    /// 2. the close settles: round after round, the effects it owns are
+    ///    disposed (their cleanups run) and its timers, hooks after layout,
+    ///    mailboxes and obligations cancelled and dropped, until a round
+    ///    finds none (what a cleanup makes in it is the next round's); past
+    ///    `focus::CLOSE_ROUNDS` it is a fault of the close, raised there;
+    /// 3. Closed: its record goes, no place on the window stack names it
+    ///    any more, and its signals end.
+    ///
+    /// Then the release queue is drained while the engine is reachable.
+    /// Closing again, or from inside its own close, does nothing.
+    ///
+    /// # Errors
+    ///
+    /// What the first panic of its close turn said, whether it closes at
+    /// the top or inside another window's turn. Nested, that panic also
+    /// goes to the outer turn's arbiter, once, in its place in time: the
+    /// outer turn goes on with it unless one of its own came first.
+    pub fn close(&mut self) -> Result<(), String> {
+        let root = &self.root;
+        close_window(&self.focus, || root.close())
+    }
+
+    /// Its window, whose turns its work runs in ([`Self::turn`]).
+    pub(crate) fn window(&self) -> Rc<crate::focus::FocusRoot> {
+        Rc::clone(&self.focus)
+    }
+}
+
+/// The close turn of `window` ([`Pipeline::close`]), in the running world:
+/// `close_root` unmounts its root first. Shared by the explicit close and
+/// the live close a drop queues ([`Pipeline`]'s `Drop`).
+fn close_window(window: &Rc<crate::focus::FocusRoot>, close_root: impl FnOnce()) -> Result<(), String> {
+    {
+        if !window.begin_close() {
+            return Ok(());
+        }
+        let ran = crate::engine::turn_own(window, |_| {
+            let settled = crate::engine::contained(|| {
+                close_root();
+                window.settle_close()
+            });
+            // Closed whatever happened above, inside this turn.
+            window.finish_close(matches!(settled, Some(Ok(()))));
+            // A close that never settles is a fault of the close: handed
+            // to this turn's arbiter, which answers it as the close's own.
+            if let Some(Err(rounds)) = settled {
+                crate::engine::raise(Box::new(format!(
+                    "gui: a window's close did not settle in {rounds} rounds: its work kept making work in it"
+                )));
+            }
+        });
+        // Its turn refused (closed since it began closing: nothing to do)
+        // or ended: closed either way.
+        if !window.is_closed() {
+            window.finish_close(false);
+        }
+        crate::engine::shutdown();
+        match ran {
+            Ok(()) | Err(None) => Ok(()),
+            Err(Some(p)) => {
+                let said = crate::engine::said_of(&p);
+                if crate::engine::dispatching() {
+                    crate::engine::raise(p);
+                } else {
+                    crate::engine::drop_quietly(p);
+                }
+                Err(said)
+            }
+        }
+    }
+}
+
+impl Pipeline {
+    /// Hand on what the compositor scrolled that the render thread handed
+    /// on with an input or a main frame (ADR-0033), for the turn that
+    /// handles that input or builds that frame to take in first
+    /// ([`Self::turn`]): the pull and the work it rides with are one turn,
+    /// so the user code taking it in reaches (a layer asked whether a
+    /// scroll dismisses it) is that turn's, and a panic there drops none of
+    /// it. What was scrolled of a mount the container at its key is no
+    /// longer (removed, or another mounted there since) is not taken in, as
+    /// cc applies a pulled delta only to the element it was pulled for.
+    /// Whether anything is to be taken in; a frame follows then.
+    pub(crate) fn take_pulled(&mut self, pulled: &crate::compositor::Pulled) -> bool {
+        self.taken = self.taken.max(pulled.take);
+        if pulled.is_empty() {
+            return false;
+        }
+        let painter = &self.painter;
+        let before = self.took.len();
+        self.took.extend(
+            pulled
+                .deltas
+                .iter()
+                .filter(|d| painter.scroll_instance(d.key, d.owner) == Some(d.instance))
+                .copied(),
+        );
+        self.took.len() > before
+    }
+
+    /// Take in the pulls handed on ([`Self::take_pulled`]), inside a turn:
+    /// each container's offset moves by them, added to where the UI holds
+    /// it, once and in the order handed on.
+    fn take_in_pulls(&mut self) {
+        if self.took.is_empty() {
+            return;
+        }
+        let moved = self.input_state.take_scroll(self.tree.frame(), &self.took);
+        self.took.clear();
+        self.dirty |= moved;
+        self.pull_moved |= moved;
+    }
+
+    /// Whether the pulls the last turn took in moved anything.
+    pub(crate) fn pulls_moved(&mut self) -> bool {
+        std::mem::take(&mut self.pull_moved)
+    }
+
+    /// Go on with the wheel gesture the compositor latched to a container
+    /// (ADR-0033): the UI's latch takes it on, so the rest of the gesture,
+    /// which the UI scrolls while input goes straight to it, stays there.
+    pub(crate) fn take_gesture(&mut self, gesture: crate::compositor::HandedGesture) {
+        self.input_state.take_gesture(self.tree.frame(), gesture);
+    }
+
+    /// Hand the wheel gesture under way back to the compositor as input
+    /// comes through it again (ADR-0033): one side latches it at a time.
+    pub(crate) fn hand_gesture(&mut self) -> Option<crate::compositor::HandedGesture> {
+        self.input_state.hand_gesture(self.tree.frame())
+    }
+
+    /// The wheel gesture the UI latched, by identity (the single-owner
+    /// rule's check, [`Self::hand_gesture`]).
+    #[cfg(test)]
+    pub(crate) fn holds_gesture(&self) -> Option<u64> {
+        self.input_state.holds_gesture()
     }
 
     /// What moves: set reduced motion or hold loops on it.
@@ -206,24 +498,52 @@ impl Pipeline {
     }
 
     /// The last frame, for a test to make stale.
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn frame_mut(&mut self) -> &mut Frame {
         self.tree.frame_mut()
     }
 
     /// Run `f` (typically signal writes) and name it as the cause of the next frame.
+    /// One turn ([`Self::turn`]).
     pub fn act(&mut self, cause: impl Into<String>, f: impl FnOnce()) {
-        self.focus.enter();
         self.causes.push(cause.into());
-        f();
+        self.turn(|_| f());
+    }
+
+    /// What `f` reads in this window: its focus, size, visibility and the
+    /// rest of its ambient state ([`crate::focus::focused`] and the like),
+    /// untracked, in one turn of it. Code outside any turn reads the
+    /// thread's own window, never the last one a turn ran in (ADR-0015,
+    /// the thread-window rule), so a test asks its window by name. `None`
+    /// once the window closed (a debug build panics then, as
+    /// [`Self::act`] does).
+    pub fn read<R>(&mut self, f: impl FnOnce() -> R) -> Option<R> {
+        self.turn(|_| crate::untracked(f))
     }
 
     /// The window gains (`true`) or loses the keyboard focus: what reads
     /// it ([`crate::interact::window_active`]) and the carets, which show
     /// and blink only in the active window, follow at the next frame.
     pub(crate) fn set_window_active(&mut self, active: bool) {
+        self.turn_with(|p, t| p.window_active_in(t, active));
+    }
+
+    /// [`Self::set_window_active`], in the turn `t`.
+    fn window_active_in(&mut self, t: &crate::engine::Turn, active: bool) {
         self.painter.set_window_active(active);
-        crate::interact::set_window_active(active);
+        crate::interact::set_window_active(t, active);
+    }
+
+    /// The platform told this window is `size` logical pixels: one turn of
+    /// it (ADR-0015), live and replayed alike.
+    pub(crate) fn told_size(&mut self, size: (f32, f32)) {
+        self.turn_with(|_, t| crate::environment::put_window_size(t, size));
+    }
+
+    /// The platform told this window can (or cannot) be seen: one turn of
+    /// it, as [`Self::told_size`].
+    pub(crate) fn told_visible(&mut self, visible: bool) {
+        self.turn_with(|_, t| crate::environment::put_window_visible(t, visible));
     }
 
     pub fn toggle_overlay(&mut self) {
@@ -238,8 +558,18 @@ impl Pipeline {
     /// What a screen reader must be told of the last frame, laid out at
     /// `scale`: what changed since the last update, or the whole tree after
     /// [`Self::access_reset`] (ADR-0021).
+    /// One turn ([`Self::turn`]): the bound text it reads is user code.
     pub fn access_update(&mut self, scale: f32, title: &str) -> accesskit::TreeUpdate {
-        self.focus.enter();
+        self.turn(|p| p.access_update_in(scale, title)).unwrap_or_else(|| {
+            // It panicked inside another window's turn: what was sent is
+            // not known, so the next update is the whole tree.
+            self.access.reset();
+            no_update()
+        })
+    }
+
+    /// [`Self::access_update`], inside its turn.
+    fn access_update_in(&mut self, scale: f32, title: &str) -> accesskit::TreeUpdate {
         let frame = self.tree.frame();
         let update = reactive::in_phase(reactive::Phase::Access, false, || {
             self.access
@@ -262,6 +592,11 @@ impl Pipeline {
     /// The screen reader connected again or went away: the next update is the whole tree.
     pub fn access_reset(&mut self) {
         self.access.reset();
+    }
+
+    /// The number of the last commit made ([`Presented::commit`] once shown).
+    pub(crate) fn committed(&self) -> u64 {
+        self.commits
     }
 
     /// The input state between frames, for tests to look into.
@@ -299,31 +634,35 @@ impl Pipeline {
 
     /// Bring the devtools' probe tree (never the window's) up to the last
     /// frame, from nothing when `full`; what it cost.
+    /// One turn ([`Self::turn`]), as [`Self::access_update`] is; a probe that
+    /// panicked inside another window's turn measures nothing.
     pub(crate) fn access_probe(&mut self, full: bool) -> (accesskit::TreeUpdate, access::AccessStats) {
-        self.focus.enter();
-        if full {
+        let probed = self.turn(|p| {
+            if full {
+                p.probe.reset();
+            }
+            p.probe
+                .update(p.tree.frame(), crate::focus::focused(), 1.0, "window", &mut p.text)
+        });
+        let update = probed.unwrap_or_else(|| {
             self.probe.reset();
-        }
-        let update = self.probe.update(
-            self.tree.frame(),
-            crate::focus::focused(),
-            1.0,
-            "window",
-            &mut self.text,
-        );
+            no_update()
+        });
         (update, self.probe.stats())
     }
 
     /// The whole tree a screen reader would be given for the last frame.
+    /// One turn ([`Self::turn`]).
     pub fn access_tree(&mut self, scale: f32, title: &str) -> accesskit::TreeUpdate {
-        self.focus.enter();
-        access::tree(self.tree.frame(), crate::focus::focused(), scale, title, &mut self.text)
+        let tree = |p: &mut Self| access::tree(p.tree.frame(), crate::focus::focused(), scale, title, &mut p.text);
+        self.turn(tree).unwrap_or_else(no_update)
     }
 
-    /// Where an input method may type in the last frame, if anywhere.
+    /// Where an input method may type in the last frame, if anywhere. One
+    /// turn ([`Self::turn`]): the field it asks is laid out by user code.
     pub fn ime_target(&mut self) -> Option<ImeTarget> {
-        self.focus.enter();
-        self.input_state.ime_target(self.tree.frame(), &mut self.text)
+        self.turn(|p| p.input_state.ime_target(p.tree.frame(), &mut p.text))
+            .flatten()
     }
 
     /// Route `input`, which arrived while `presented` was on screen, to
@@ -332,23 +671,143 @@ impl Pipeline {
     /// known to show `presented` from now on, until a frame or an input
     /// says otherwise, so the frames after compare against what the input
     /// saw.
-    pub fn input_shown(&mut self, input: Input, presented: &Arc<Presented>) -> Outcome {
-        self.input_state.show(Some(Arc::clone(presented)));
-        self.route(input)
+    ///
+    /// What the compositor scrolled that rides with `input` is taken in
+    /// before it, in its turn ([`Self::take_pulled`], ADR-0033), so its
+    /// handlers see every wheel the render thread took before it, and none
+    /// after.
+    ///
+    /// Input from a frame no longer kept ([`Shown::Gone`]) cannot know
+    /// what it was over: it is never taken for a hit on nothing (a press
+    /// there would dismiss what opened since). A press, a wheel or a touch
+    /// that starts is dropped; a move only has hover worked out again in
+    /// the frame on screen; what is not over anything (a key, a release
+    /// that ends a press captured where it began) goes on.
+    ///
+    /// One turn ([`Self::turn`]): a handler or an effect that panics stops
+    /// nothing else of it, and its panic goes on once the input is fully
+    /// routed, the key hover was worked out by kept too (the routing it
+    /// wraps, [`Self::input_on`], is part of it).
+    pub fn input_shown(&mut self, input: Input, presented: &Shown) -> Outcome {
+        self.turn(|p| p.dispatch_shown(input, presented)).unwrap_or_default()
     }
 
-    /// Route `input` to the last frame's nodes as laid out (the devtools,
-    /// which read positions off the frame), laid out again first when a
-    /// signal was written or the wheel scrolled since.
-    pub fn input(&mut self, input: Input) -> Outcome {
-        self.input_state.show(None);
-        self.route(input)
+    /// [`Self::input_shown`], inside its turn.
+    fn dispatch_shown(&mut self, input: Input, presented: &Shown) -> Outcome {
+        if let Shown::Gone(_) = presented {
+            let positional = match &input {
+                Input::MouseDown { .. } | Input::ButtonDown { .. } | Input::Wheel { .. } | Input::WheelAt { .. } => {
+                    true
+                }
+                Input::Touch(t) => t.phase == crate::events::TouchPhase::Started,
+                // Where the pointer went is kept: hover is worked out there,
+                // in the frame on screen, at the next check.
+                Input::PointerMoved { x, y } => {
+                    self.input_state.pointer_at(*x, *y);
+                    true
+                }
+                _ => false,
+            };
+            if positional {
+                return Outcome::default();
+            }
+        }
+        // A move or a leave works hover out, where it puts the pointer, in
+        // the frame it came under; nothing else does (a key, a modifier).
+        let hovers = matches!(input, Input::PointerMoved { .. } | Input::PointerLeft);
+        let shown = self.on_screen(presented);
+        let out = self.input_on(input, shown);
+        if hovers {
+            self.checked = Some(self.hover_key(presented));
+        }
+        out
+    }
+
+    /// Route `input` through `on`, what is on screen as
+    /// [`Self::on_screen`] gave it, for this dispatch alone
+    /// ([`InputState::route_in`]): hover and the cursor go on reading the
+    /// frame they were last worked out in, unless `input` is a move or a
+    /// leave, which works hover out in `on`. The frame on screen is put
+    /// back however the dispatch ends, a handler's panic unwinding through
+    /// it included ([`Routing`]): what an app catches leaves hover and the
+    /// cursor where they were.
+    ///
+    /// The routing primitive every path of input takes (the platform's, a
+    /// scenario's, the devtools'), so it is a turn ([`Self::turn`],
+    /// ADR-0015): no path reaches a handler outside one.
+    pub(crate) fn input_on(&mut self, input: Input, on: Arc<Presented>) -> Outcome {
+        self.turn(|p| {
+            let hovers = matches!(input, Input::PointerMoved { .. } | Input::PointerLeft);
+            p.input_state.route_in(on);
+            let routing = Routing { pipeline: p, hovers };
+            routing.pipeline.route(input)
+        })
+        .unwrap_or_default()
+    }
+
+    /// The key hover is worked out by while `shown` is on screen.
+    fn hover_key(&self, shown: &Shown) -> HoverKey {
+        (self.input_state.pointer(), shown.seen())
+    }
+
+    /// What input is hit-tested against while `presented` is on screen:
+    /// the frame presented; before any was, the scene this pipeline last
+    /// committed, no layer drawn ([`Presented::of`], as the render thread
+    /// routes a wheel then, keyed by the same commit: one rule for every
+    /// kind of input), made once per commit; a frame no longer kept,
+    /// nothing (never a hit: [`Self::input_shown`] drops what would be).
+    pub(crate) fn on_screen(&mut self, presented: &Shown) -> Arc<Presented> {
+        match presented {
+            Shown::Frame(p) => Arc::clone(p),
+            Shown::BeforeFirst => {
+                if let Some((commit, first)) = &self.first
+                    && *commit == self.commits
+                {
+                    return Arc::clone(first);
+                }
+                let first = Arc::new(Presented::of(self.painter.scene(), self.commits));
+                self.first = Some((self.commits, Arc::clone(&first)));
+                first
+            }
+            Shown::Gone(frame) => Arc::new(Presented {
+                frame: *frame,
+                ..Presented::default()
+            }),
+        }
+    }
+
+    /// Hover follows the pointer and the frame on screen `shown` (the
+    /// presentation timeline as of now, [`Compose::shown_and_next`]): it is
+    /// a function of the two, worked out again only when either differs
+    /// from the last time it was (a pointer moved where no frame kept could
+    /// route it, an input routed in an older frame, the frame before this
+    /// one), as the boxes under the pointer show in `shown`, with no input.
+    /// Called whenever the UI is idle and at the vblank from which a frame
+    /// entered changes what is under the pointer, so it converges on what
+    /// the screen shows rather than on what layout committed or a message
+    /// said. Whether a frame must follow. One turn, as an input is
+    /// ([`Self::turn`]).
+    pub fn converge(&mut self, shown: &Shown) -> bool {
+        self.turn(|p| p.rehover_shown(shown)).unwrap_or_default()
+    }
+
+    /// [`Self::converge`], inside its turn.
+    fn rehover_shown(&mut self, shown: &Shown) -> bool {
+        let key = self.hover_key(shown);
+        if matches!(shown, Shown::Gone(_)) || self.checked == Some(key) {
+            return false;
+        }
+        self.checked = Some(key);
+        let on = self.on_screen(shown);
+        self.input_state.show(Some(on));
+        let redraw = self.input_state.rehover(self.tree.frame(), &mut self.text).redraw;
+        self.dirty |= redraw;
+        redraw
     }
 
     /// Route `input` to the last frame's nodes where the screen is known
     /// to show them.
     fn route(&mut self, input: Input) -> Outcome {
-        self.focus.enter();
         self.refresh();
         let (f, t) = (self.tree.frame(), &mut self.text);
         let mut out = match input {
@@ -395,22 +854,57 @@ impl Pipeline {
     /// list the last click closed is gone, a scrolled list has moved), as a
     /// browser's DOM has changed before its next event arrives. Nothing is
     /// painted: the frame due next paints it.
+    ///
+    /// The frame is stale until it is laid out: a layout that unwinds
+    /// leaves it stale, for the next input to lay out before it is routed,
+    /// and one whose root a panic left poisoned (down, empty, for the rest
+    /// of the turn it failed in, [`Root::resolve`]) leaves it stale too, so
+    /// the next turn mounts the tree again before its input is routed.
     fn refresh(&mut self) {
         self.stale |= crate::component::take_due();
-        if !std::mem::take(&mut self.stale) {
+        if !self.stale {
             return;
         }
         self.dirty = true;
         self.input_state.sync_focus(&self.tree);
         reactive::begin_frame();
         self.lay_out();
+        self.stale = self.root.is_poisoned();
     }
 
     /// Build the component and lay it out at the window's size, again while
     /// scroll handles' hooks or what moves change it; the frame and the time
     /// spent building and laying out.
+    ///
+    /// User code a layout reaches outside the gate (a binding, a bound
+    /// text, a drawing's `make`) that panics in a turn holds what it last
+    /// gave (ADR-0015, the turn rule), and the pass goes on. What still
+    /// unwinds here (outside a turn, any panic; in one, the engine's own)
+    /// is as a resolve that unwinds ([`Root::resolve`]): its panic goes to
+    /// the arbiter, the root is torn down, and the frame is laid out again
+    /// over what the root gives for the rest of that turn, nothing, so the
+    /// tree the pass left half done is replaced by an empty one, whole, and
+    /// the turn's input is routed into it; the tree mounts again at the
+    /// next turn's refresh (the root poisoned keeps the frame stale). Should
+    /// that pass panic too, the frame stays as the arbiter found it, stale.
     fn lay_out(&mut self) -> Timings {
-        self.focus.enter();
+        match crate::engine::attempt(|| self.lay_out_once()) {
+            Ok(timings) => timings,
+            Err(failed) => {
+                self.root.failed(failed);
+                match crate::engine::attempt(|| self.lay_out_once()) {
+                    Ok(timings) => timings,
+                    Err(failed) => {
+                        self.root.failed(failed);
+                        Timings::default()
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`Self::lay_out`], once.
+    fn lay_out_once(&mut self) -> Timings {
         let mut timings = Timings::default();
         let mut again = self.pass(&mut timings, 0);
         // What a scroll handle's hook changes after layout (an offset, a spacer
@@ -511,6 +1005,9 @@ impl Pipeline {
             let tree = &self.tree;
             self.motion.finish(self.last_root.as_ref(), &|p| tree.holds(p))
         };
+        // Scroll containers mounted and unmounted, as laid out: what the
+        // compositor scrolled is taken in by the mount it moved alone.
+        self.painter.mount_scrollers(self.tree.frame());
         self.last_root = Some(root);
         timings.build = timings.build.saturating_add(t1.duration_since(t0));
         timings.layout = timings.layout.saturating_add(t1.elapsed());
@@ -526,7 +1023,25 @@ impl Pipeline {
     /// its buffers kept: with the commit the renderer gave back and the
     /// displays it let go of, a frame that changes what one before changed
     /// (a hover) allocates nothing on this thread, report included.
+    ///
+    /// One turn ([`Self::turn`]), as an input is: the user code a frame
+    /// reaches (a render, a hook after layout, a measured box, a long press
+    /// come due, a layer asked as focus leaves it, an effect) that panics
+    /// stops nothing else of the frame, which is laid out, painted and
+    /// committed whole before the first panic goes on.
     pub fn draw_with(
+        &mut self,
+        target: &mut dyn Compose,
+        begin: MainFrame,
+        size: (u32, u32),
+        scale: f32,
+        report: &mut FrameReport,
+    ) {
+        self.turn(|p| p.draw_frame(target, begin, size, scale, report));
+    }
+
+    /// [`Self::draw_with`], inside its turn.
+    fn draw_frame(
         &mut self,
         target: &mut dyn Compose,
         begin: MainFrame,
@@ -541,12 +1056,17 @@ impl Pipeline {
             }
             self.size = logical;
         }
-        self.focus.enter();
         let heap_before = heap::now();
         let thread_before = heap::thread();
         clock::begin_frame(begin.present_at);
         reactive::begin_frame();
-        if self.input_state.apply_scroll(self.tree.frame(), &begin.scroll) {
+        // What the compositor scrolled, pulled as it granted the frame
+        // (ADR-0033), after what was handed on before it (taken in as the
+        // turn began), and how far each container moving may go.
+        self.take_pulled(&begin.taken);
+        self.take_in_pulls();
+        let took = self.pulls_moved();
+        if self.input_state.reach(self.tree.frame(), &begin.scroll) || took {
             self.causes.push("compositor scroll".to_owned());
         }
         // A drag held past a text field's edge scrolls it on.
@@ -561,15 +1081,18 @@ impl Pipeline {
         // state taken in, the bindings run, the tree laid out.
         let built = heap::thread();
 
-        if self.cold_check {
-            self.check_cold(size, scale);
-        }
         let t2 = Instant::now();
         // Commit what changed since the last commit, with the glyph tables
         // it needs (all of them to a renderer that has none yet), into the
         // commit the renderer last gave back.
         let full = self.commits == 0 || std::mem::take(&mut self.resend);
         let mut commit = target.spare().unwrap_or_default();
+        // The reach's and the pull's buffers go back with the commit, for
+        // the next grant.
+        commit.reach = begin.scroll;
+        commit.reach.clear();
+        commit.pulled = begin.taken.deltas;
+        commit.pulled.clear();
         let (painter, text, frame, paint) = (
             &mut self.painter,
             &mut self.text,
@@ -583,6 +1106,18 @@ impl Pipeline {
             });
         });
         let shaped = self.text.take_shaped();
+        // The cold frame is built once the live one is painted: every face
+        // and variation the live paint uses is interned first, under the
+        // ids a never-checked frame gives them, and the cold scene names
+        // them alike; those only the check uses are its own and go with it
+        // ([`TextSystem::exit_cold`]). Its time is not the paint's.
+        let checked = if self.cold_check {
+            let at = Instant::now();
+            self.check_cold(size, scale);
+            at.elapsed()
+        } else {
+            std::time::Duration::ZERO
+        };
         // The live paint against what the cold frame painted from its own
         // layout: a stale box or misplaced text in the live frame shows.
         if let Some(cold) = self.cold_scene.take() {
@@ -614,6 +1149,8 @@ impl Pipeline {
         self.commits = self.commits.saturating_add(1);
         commit.sequence = self.commits;
         commit.answers = begin.sequence;
+        // Its bases hold every pull taken in so far (I4).
+        commit.taken = self.taken;
         commit.at = begin.present_at;
         commit.full = full;
         commit.glyphs = self.text.glyph_update(full);
@@ -622,12 +1159,11 @@ impl Pipeline {
         let t3 = Instant::now();
         let vsync = target.waited();
         self.text.end_frame();
-        // The boxes under a resting pointer may have changed: compared as
-        // the screen shows them now, as every input was.
-        if self.visits.placed > 0 {
-            self.input_state.show(Some(target.presented()));
-            self.dirty = self.input_state.rehover(self.tree.frame(), &mut self.text).redraw;
-        }
+        // A compositor that draws inline presented the commit already: the
+        // boxes under a resting pointer are compared as it shows them. The
+        // render thread's shows later, at the vblank the UI's idle timer
+        // waits for ([`Self::converge`]).
+        self.converge(&target.presented());
         let drawn = target.drawn();
         self.held = target.held();
         report.number = self.frames;
@@ -636,7 +1172,7 @@ impl Pipeline {
         report.bindings = crate::component::take_bindings();
         report.shaped = shaped;
         report.timings = Timings {
-            paint: t3.duration_since(t2).saturating_sub(vsync),
+            paint: t3.duration_since(t2).saturating_sub(vsync).saturating_sub(checked),
             vsync,
             ..timings
         };
@@ -713,52 +1249,139 @@ impl Pipeline {
     }
 
     /// Panic unless `frame` equals the frame every instance rendered again
-    /// gives (ADR-0013: incremental equals cold). Motion runs on a copy.
-    /// The cold frame lays its text out from fresh caches and paints its
-    /// own scene, kept as what the live paint must equal.
+    /// gives (ADR-0013: incremental equals cold): the debug build's check,
+    /// failing on what [`Self::check_frame`] reports. A cold build that
+    /// panicked raises its panic (as a string, ADR-0034 S3).
     #[cfg(debug_assertions)]
+    #[expect(
+        clippy::panic,
+        reason = "a frame that differs from a cold one fails the debug build's check"
+    )]
     fn check_cold(&mut self, size: (u32, u32), scale: f32) {
+        use crate::engine::{CheckReport, Mismatch};
+        let report = self.check_frame(size, scale);
+        // A checker that only skips checks nothing: past the floor of
+        // skips in a row, it fails as a mismatch does (ADR-0015, rule 6;
+        // a hold is never a reason to skip).
+        self.skips = match &report {
+            CheckReport::Skipped(_) => self.skips.saturating_add(1),
+            _ => 0,
+        };
+        if let CheckReport::Skipped(why) = &report
+            && self.skips > SKIP_FLOOR
+        {
+            panic!("the cold check skipped {} frames in a row, the last: {why}", self.skips);
+        }
+        match report {
+            CheckReport::Ok | CheckReport::Skipped(_) | CheckReport::Cancelled => {}
+            CheckReport::Mismatch(Mismatch::Panicked(said)) => std::panic::resume_unwind(Box::new(said)),
+            CheckReport::Mismatch(Mismatch::Wrote(wrote)) => {
+                panic!("a cold frame wrote live state, which a render, a getter or a binding must not: {wrote}")
+            }
+            CheckReport::Mismatch(Mismatch::Layout(d)) => panic!(
+                "incremental frame {} differs from a cold one:\n{d}",
+                self.frames.saturating_add(1)
+            ),
+            CheckReport::Faulted(fault) => panic!("{fault}"),
+        }
+    }
+
+    /// Check this frame (ADR-0034, S10): build it cold, in a check, and
+    /// compare. Motion runs on a copy. The cold frame lays its text out
+    /// from fresh caches and paints its own scene, kept as what the live
+    /// paint must equal. The answer is closed ([`crate::engine::CheckReport`]).
+    #[cfg(debug_assertions)]
+    fn check_frame(&mut self, size: (u32, u32), scale: f32) -> crate::engine::CheckReport {
+        use crate::engine::{CheckReport, Mismatch};
         // One transaction from tree to paint: what the cold frame does is
-        // its own, thrown away once it is compared.
-        let frame = self.root.cold();
-        let live_text = self.text.enter_cold();
-        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut motion = self.motion.clone();
-            let root = motion.splice(frame.resolve());
-            motion.begin();
-            let cold = crate::layout::layout_carrying(
-                &root,
-                self.size.0,
-                self.size.1,
-                self.input_state.state(),
-                &mut motion,
-                &mut self.text,
-                Some(&self.tree),
-            );
-            let background = crate::paint::window_background(&cold, size, scale, Color::WHITE);
-            let scene = self.painter.cold(&cold, &mut self.text, size, scale, background);
-            let live = self.tree.frame();
-            (
-                inspect::diff(&live.nodes, &cold.nodes),
-                live.nodes.len() == cold.nodes.len(),
-                frame.wrote(),
-                scene,
-            )
-        }));
-        self.text.exit_cold(live_text);
-        drop(frame);
-        let (d, same, wrote, scene) = built.unwrap_or_else(|p| std::panic::resume_unwind(p));
-        assert!(
-            wrote.is_empty(),
-            "a cold frame wrote live state, which a render, a getter or a binding must not: {}",
-            wrote.join(", ")
+        // its own, thrown away once it is compared. A fork that reached a
+        // site that cannot answer inside one is dropped (ADR-0028): this
+        // sample is skipped.
+        // The fork is scoped by the closure; the verdict is read once it has
+        // dropped what it made (a drop may doom it), and a result not kept
+        // is dropped inside it. A build that panicked keeps its panic,
+        // raised before any of a drop: a dropped sample raises it, never
+        // skipped with it.
+        let (motion, size_now, input, text, tree, painter) = (
+            &self.motion,
+            self.size,
+            &self.input_state,
+            &mut self.text,
+            &self.tree,
+            &mut self.painter,
         );
-        assert!(
-            d.is_empty() && same,
-            "incremental frame {} differs from a cold one:\n{d}",
-            self.frames.saturating_add(1)
-        );
+        let root = &self.root;
+        let built = crate::engine::attempt(|| {
+            root.check(|frame| {
+                let live_text = text.enter_cold();
+                let built = crate::engine::attempt(|| {
+                    // Cancellation points between the phases, as inside
+                    // them (each instance rendered, each piece of text
+                    // shaped): a cancelled check unwinds at the next one
+                    // and reports `Cancelled` (ADR-0028, ADR-0034 S10).
+                    let mut motion = motion.clone();
+                    let root = motion.splice(frame.resolve());
+                    crate::engine::cancel_point();
+                    motion.begin();
+                    let cold = crate::layout::layout_carrying(
+                        &root,
+                        size_now.0,
+                        size_now.1,
+                        input.state(),
+                        &mut motion,
+                        text,
+                        Some(tree),
+                    );
+                    crate::engine::cancel_point();
+                    let background = crate::paint::window_background(&cold, size, scale, Color::WHITE);
+                    let scene = painter.cold(&cold, text, size, scale, background);
+                    crate::engine::cancel_point();
+                    let live = tree.frame();
+                    (
+                        inspect::diff(&live.nodes, &cold.nodes),
+                        live.nodes.len() == cold.nodes.len(),
+                        frame.wrote(),
+                        scene,
+                    )
+                });
+                text.exit_cold(live_text);
+                built.unwrap_or_else(|failed| failed.go_on())
+            })
+        });
+        // What the check let go of the live world is released now, live,
+        // after the switch and before the next input, however the check
+        // ended (ADR-0034, S5, S10): nothing waits on a later drain point.
+        // The check's own panic or fault wins over a release's failure.
+        let released = crate::engine::released();
+        let built = match built {
+            Ok(Ok(built)) => built,
+            Ok(Err(report)) => {
+                if let Some(r) = released {
+                    let said = r.downcast_ref::<String>().map_or("", String::as_str);
+                    eprintln!("gui: a release failed after a check that did not stand: {said}");
+                }
+                return report;
+            }
+            Err(failed) => {
+                if let Some(r) = released {
+                    let said = r.downcast_ref::<String>().map_or("", String::as_str);
+                    eprintln!("gui: a release failed after a check that panicked: {said}");
+                }
+                failed.go_on();
+            }
+        };
+        if let Some(p) = released {
+            crate::engine::go_on(p);
+        }
+        let (d, same, wrote, scene) = built;
+        if !wrote.is_empty() {
+            return CheckReport::Mismatch(Mismatch::Wrote(wrote.join(", ")));
+        }
+        if !(d.is_empty() && same) {
+            return CheckReport::Mismatch(Mismatch::Layout(d.to_string()));
+        }
         self.cold_scene = Some(scene);
+        CheckReport::Ok
     }
 
     #[cfg(not(debug_assertions))]
@@ -847,7 +1470,7 @@ impl Pipeline {
         let hovered = self
             .input_state
             .pointer()
-            .and_then(|(x, y)| interact::hit(self.tree.frame(), x, y))
+            .and_then(|(x, y)| interact::hit_presented(self.tree.frame(), self.input_state.presented(), x, y))
             .and_then(|i| self.tree.frame().nodes.get(i));
         let overlay = Overlay {
             nodes: &self.tree.frame().nodes,
@@ -889,10 +1512,28 @@ impl Pipeline {
         target.capture(over)
     }
 
-    /// Run due timers and say whether a frame is due.
+    /// Deliver the value the mailbox at `at` was sent, where the one queue
+    /// hands it on among the input (mail comes no other way to a window:
+    /// ADR-0033); whether a frame is due.
+    fn mail(&mut self, at: mailbox::Address) -> bool {
+        self.mail_waiting(at, Duration::ZERO)
+    }
+
+    /// [`Self::mail`], waiting up to `wait` for the value (a replay's
+    /// sender may not have sent it yet).
+    /// One turn ([`Self::turn`]): the handlers are user code (each runs in
+    /// the window its mailbox was made in).
+    fn mail_waiting(&mut self, at: mailbox::Address, wait: Duration) -> bool {
+        let got = self.turn(|_| mailbox::deliver_one(at, wait)).unwrap_or_default();
+        let changed = crate::component::take_due();
+        self.stale |= changed;
+        got || changed
+    }
+
+    /// Run due timers and say whether a frame is due. One turn
+    /// ([`Self::turn`]): each timer runs in the window that set it.
     fn idle(&mut self) -> Wake {
-        let timers = clock::run_due_timers();
-        let mail = mailbox::deliver();
+        let timers = self.turn(|_| clock::run_due_timers()).unwrap_or_default();
         let changed = crate::component::take_due();
         self.stale |= changed;
         // A motion the compositor runs alone ends: the UI lays out its end.
@@ -900,10 +1541,10 @@ impl Pipeline {
             .motion
             .wake_at()
             .filter(|_| !clock::scripted())
-            .map(|at| (at <= clock::current_seconds(), clock::instant(at)));
+            .map(|at| (at <= clock::current_nanos(), clock::instant_of(at)));
         let ended = settled.is_some_and(|(due, _)| due);
         Wake {
-            redraw: timers || mail || changed || ended || std::mem::take(&mut self.dirty),
+            redraw: timers || changed || ended || std::mem::take(&mut self.dirty),
             animating: self.animating,
             next_timer: clock::next_deadline()
                 .into_iter()
@@ -921,6 +1562,13 @@ impl FrameReport {
         !self.causes.is_empty() || !self.diff.is_empty()
     }
 }
+
+/// How many checks in a row a pipeline may skip before its check fails
+/// (the coverage floor, ADR-0015 rule 6): a skip is for a frame that
+/// reached a site no check can answer, never for a hold, so a run of them
+/// this long is a checker that checks nothing.
+#[cfg(debug_assertions)]
+const SKIP_FLOOR: u32 = 32;
 
 /// Whether every frame is checked against one built cold (ADR-0013): a
 /// debug build run with `GUI_COLD_CHECK` set to `1` or `true` (`0`, empty
@@ -959,17 +1607,28 @@ fn take_built(frame: &Frame) -> bool {
     moved
 }
 
+#[cfg(test)]
+crate::engine::engine_local! {
+    /// The handles [`after_layout`] looked up among those it ran (a cost
+    /// test, Opus r11).
+    [Fork] pub(crate) static HANDLE_COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Run each tracked handle's hooks once: a handle tracked by more than
+/// one container runs at its first. The ones run are a set (Opus r11: a
+/// scan of those before each was 2.3 s a frame at 20,000 handles).
 fn after_layout(frame: &Frame) -> bool {
-    let mut ran: Vec<&ScrollHandle> = Vec::new();
+    let mut ran: foldhash::HashSet<ScrollHandle> = foldhash::HashSet::default();
     let mut changed = false;
     for (handle, built) in frame.handles.iter().filter_map(|&i| {
         let b = frame.behaviour.get(i)?;
         Some((b.scroll.as_ref()?, b.scroll_built.as_ref()))
     }) {
-        if ran.iter().any(|h| h.same(handle)) {
+        #[cfg(test)]
+        HANDLE_COMPARES.with(|c| c.set(c.get().saturating_add(1)));
+        if !ran.insert(*handle) {
             continue;
         }
-        ran.push(handle);
         changed |= handle.after_layout(built);
     }
     changed
@@ -1159,7 +1818,25 @@ impl WindowHandler for Live {
         }
     }
 
-    fn input(&mut self, input: Input, presented: &Arc<Presented>) -> bool {
+    fn take_scroll(&mut self, pulled: crate::compositor::Pulled) -> bool {
+        self.pipeline.take_pulled(&pulled)
+    }
+
+    // Each entry from the platform's loop is a turn of the window
+    // (ADR-0015): none reaches the engine's state outside one.
+    fn take_gesture(&mut self, gesture: crate::compositor::HandedGesture) {
+        self.pipeline.turn(|p| p.take_gesture(gesture));
+    }
+
+    fn hand_gesture(&mut self) -> Option<crate::compositor::HandedGesture> {
+        self.pipeline.turn(Pipeline::hand_gesture).flatten()
+    }
+
+    fn mail(&mut self, at: mailbox::Address) -> bool {
+        self.pipeline.mail(at)
+    }
+
+    fn input(&mut self, input: Input, presented: &Shown) -> bool {
         if let Input::Key(ev) = &input
             && ev.is(NamedKey::F12)
         {
@@ -1199,16 +1876,29 @@ impl WindowHandler for Live {
     }
 
     fn focused(&mut self) -> bool {
-        self.pipeline.reload_text_settings()
+        self.pipeline.turn(Pipeline::reload_text_settings).unwrap_or(true)
+    }
+
+    fn resized(&mut self, size: (f32, f32)) {
+        self.pipeline.told_size(size);
+    }
+
+    fn visible(&mut self, visible: bool) {
+        self.pipeline.told_visible(visible);
     }
 
     fn renderer_lost(&mut self) {
-        self.pipeline.recommit();
+        self.pipeline.turn(Pipeline::recommit);
     }
 
     fn chrome(&mut self, chrome: Chrome) -> bool {
-        self.pipeline.set_window_active(chrome.active);
-        self.chrome.set(chrome);
+        // One turn of the window: its activity and its decorations, which
+        // the root render reads.
+        let signal = self.chrome;
+        self.pipeline.turn_with(|p, t| {
+            p.window_active_in(t, chrome.active);
+            signal.set(chrome);
+        });
         true
     }
 
@@ -1216,10 +1906,26 @@ impl WindowHandler for Live {
         std::mem::take(&mut *self.actions.borrow_mut())
     }
 
-    fn idle(&mut self, _target: &mut dyn Compose) -> Wake {
+    fn idle(&mut self, target: &mut dyn Compose) -> Wake {
         let mut wake = self.pipeline.idle();
+        // Hover converges on the frame on screen now, and is worked out
+        // again at the vblank from which the next frame entered changes
+        // what is under the pointer: a timer, not a message, so it holds
+        // however late the UI hears of it. Both from one look at the
+        // timeline: a frame entering between two would be missed.
+        let (now, next) = target.shown_and_next();
+        if self.pipeline.converge(&now) || crate::component::take_due() {
+            wake.redraw = true;
+        }
+        if let Some(next) = next {
+            let next = clock::instant_of(next);
+            wake.next_timer = wake.next_timer.into_iter().chain(Some(next)).min();
+        }
         if let Some(attached) = &mut self.attached
-            && attached.run(&mut self.pipeline)
+            && attached.run(&mut crate::devtools::Showing::new(
+                &mut self.pipeline,
+                &target.presented(),
+            ))
         {
             // What a command wrote shows in the frame it waits for.
             self.pipeline.stale |= crate::component::take_due();
@@ -1281,8 +1987,6 @@ fn live<C>(setup: impl FnOnce() -> C, options: RunOptions) -> Box<dyn WindowHand
 where
     C: Fn() -> Element + 'static,
 {
-    // Before the app's setup, so what it builds reads it from the start.
-    crate::environment::set_reduced_motion(options.reduced_motion);
     let debug = options.debug;
     let attached = (debug.attach || std::env::var_os("GUI_DEVTOOLS").is_some())
         .then(attach)
@@ -1290,9 +1994,17 @@ where
     // The window's own decorations, around the app when it draws them.
     let chrome = reactive::Signal::new(Chrome::default());
     let actions = Actions::default();
-    let root = decoration::decorate(chrome, std::rc::Rc::clone(&actions), setup());
+    let decorations = std::rc::Rc::clone(&actions);
+    // The window first, then the app's setup, in the window's first turn
+    // (ADR-0015): what the setup reads (the window's size) and schedules
+    // (an effect, a timer) is the window's, and a panic of it is the
+    // turn's. Reduced motion before it, so what it builds reads it.
+    let reduced = options.reduced_motion;
     // The devtools' reports name the signals each frame wrote and read.
-    let mut pipeline = Pipeline::new(root, debug.log || attached.is_some());
+    let mut pipeline = Pipeline::made(debug.log || attached.is_some(), |t| {
+        crate::environment::put_reduced_motion(t, reduced);
+        decoration::decorate(chrome, decorations, setup())
+    });
     if debug.overlay {
         pipeline.toggle_overlay();
     }
@@ -1400,6 +2112,18 @@ pub struct Scenario {
     /// The compositor and the GPU, on this thread (ADR-0015): each commit is
     /// applied and drawn as it is made, at its own time, so runs repeat.
     headless: Headless,
+    /// Replaying a log: mail is delivered where it took it, not by frames.
+    logged_mail: bool,
+}
+
+/// Input the render thread handed on and the UI has not handled yet
+/// ([`Scenario::queue`]): with what the compositor scrolled that rides
+/// with it, and what was on screen as it came.
+#[derive(Debug)]
+pub struct Queued {
+    pub(crate) input: Input,
+    pulled: crate::compositor::Pulled,
+    shown: Shown,
 }
 
 impl Scenario {
@@ -1444,6 +2168,7 @@ impl Scenario {
         clock::script_fresh(Duration::ZERO);
         let gpu = GpuRenderer::headless().map_err(|e| ScenarioError::Gpu(e.to_string()))?;
         let read = dir.is_some();
+        let headless = Headless::new(gpu, Glyphs::for_os(), read);
         Ok(Self {
             pipeline,
             dir,
@@ -1454,8 +2179,23 @@ impl Scenario {
             trace: String::new(),
             reports: Vec::new(),
             report: FrameReport::default(),
-            headless: Headless::new(gpu, Glyphs::for_os(), read),
+            headless,
+            logged_mail: false,
         })
+    }
+
+    /// Mail is delivered only where a replayed log took it
+    /// ([`Self::mail_logged`]), from now on: a frame delivers none.
+    #[cfg(test)]
+    pub(crate) fn mail_as_logged(&mut self) {
+        self.logged_mail = true;
+    }
+
+    /// Deliver the value the mailbox at `at` was sent, where the log took
+    /// it, waiting up to `wait` for its sender to send it; whether it came.
+    #[cfg(test)]
+    pub(crate) fn mail_logged(&mut self, at: mailbox::Address, wait: Duration) -> bool {
+        self.pipeline.mail_waiting(at, wait)
     }
 
     /// Check every frame from now on against one built cold, panicking where
@@ -1467,6 +2207,36 @@ impl Scenario {
         self.pipeline.cold_check = on;
         self.headless.gpu.check_cold(on);
         self.headless.compositor.check_cold(on);
+    }
+
+    /// One check of the frame shown, now, between frames, as a sampled
+    /// check takes one (ADR-0034, V5): it panics as the check does. What it
+    /// painted is not kept for the next frame to equal.
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn check_now(&mut self) {
+        let (size, scale) = (self.size, self.scale);
+        self.pipeline.check_cold(size, scale);
+        self.pipeline.cold_scene = None;
+    }
+
+    /// [`Self::check_now`], its closed report given back (ADR-0034, S10).
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn check_report(&mut self) -> crate::engine::CheckReport {
+        let (size, scale) = (self.size, self.scale);
+        let report = self.pipeline.check_frame(size, scale);
+        self.pipeline.cold_scene = None;
+        report
+    }
+
+    /// [`Self::check_report`] of a check `cancel` cancels, set from any
+    /// thread (as input arriving does, ADR-0028).
+    #[cfg(all(test, debug_assertions))]
+    pub(crate) fn check_report_cancelled_by(
+        &mut self,
+        cancel: &crate::engine::CancelFlag,
+    ) -> crate::engine::CheckReport {
+        crate::engine::cancel_next_check_by(cancel);
+        self.check_report()
     }
 
     /// From now on, transitions and animations take their time on the
@@ -1485,20 +2255,24 @@ impl Scenario {
     /// Set the clock to `seconds` since the scenario began, running the
     /// timers that fall due on the way (an autoplay's advances, a tooltip's
     /// delay) at their own times.
-    pub fn at(&mut self, seconds: f32) {
-        // Its timers are this window's code.
-        self.pipeline.focus.enter();
+    pub fn at(&mut self, at: impl clock::Moment) {
+        let at = at.nanos();
         // While a canvas rasters, the render thread draws on its own at the
         // display's rate: its frames, each with its raster budget, until
         // the time comes or a timer wants the UI.
         while self.headless.raster_pending() {
-            let next = clock::current_seconds() + RASTER_FRAME;
-            if next >= seconds {
+            let next = clock::shifted(clock::current_nanos(), RASTER_FRAME);
+            if next >= at {
                 break;
             }
-            let ran = clock::advance_to(Duration::try_from_secs_f32(next).unwrap_or_default());
+            // One turn: its timers each run in the window that set them.
+            let ran = self
+                .pipeline
+                .turn(|_| clock::advance_to(Duration::from_nanos(next)))
+                .unwrap_or_default();
             if ran {
-                self.pipeline.act(format!("clock {next}s"), || {});
+                let seconds = clock::seconds_of(next);
+                self.pipeline.act(format!("clock {seconds}s"), || {});
                 if self.render().is_err() {
                     break;
                 }
@@ -1506,14 +2280,15 @@ impl Scenario {
                 self.compositor_frame(next);
             }
         }
-        let to = Duration::try_from_secs_f32(seconds).unwrap_or_default();
+        let to = Duration::from_nanos(at);
+        let seconds = clock::seconds_of(at);
         self.pipeline.act(format!("clock {seconds}s"), || {
             clock::advance_to(to);
         });
     }
 
-    /// A frame the render thread draws without the UI, at `at` seconds, logged.
-    fn compositor_frame(&mut self, at: f32) {
+    /// A frame the render thread draws without the UI, at `at`, logged.
+    fn compositor_frame(&mut self, at: u64) {
         let t0 = std::time::Instant::now();
         self.headless.draw(at);
         let took = t0.elapsed();
@@ -1529,15 +2304,15 @@ impl Scenario {
             if !self.headless.raster_pending() {
                 break;
             }
-            let next = clock::current_seconds() + RASTER_FRAME;
-            clock::advance_to(Duration::try_from_secs_f32(next).unwrap_or_default());
+            let next = clock::shifted(clock::current_nanos(), RASTER_FRAME);
+            self.pipeline.turn(|_| clock::advance_to(Duration::from_nanos(next)));
             self.compositor_frame(next);
         }
     }
 
     /// Let `time` pass, as [`Self::at`] does.
     pub fn wait(&mut self, time: Duration) {
-        self.at(clock::frame_time() + time.as_secs_f32());
+        self.at(clock::frame_nanos().saturating_add(clock::Moment::nanos(time)));
     }
 
     /// Bring the page to rest, as a still of it in a browser is taken: the
@@ -1545,11 +2320,11 @@ impl Scenario {
     /// transition, finite animation and exit plays to its end, while loops
     /// hold their first frame. Nothing is written.
     pub fn rest(&mut self, limit: Duration) -> Result<(), ScenarioError> {
-        let end = clock::frame_time() + limit.as_secs_f32();
+        let end = clock::frame_nanos().saturating_add(clock::Moment::nanos(limit));
         self.pipeline.motion.hold_loops(true);
         self.settle()?;
-        if let Some(due) = clock::last_due_by(Duration::try_from_secs_f32(end).unwrap_or_default()) {
-            self.at(due.as_secs_f32());
+        if let Some(due) = clock::last_due_by(Duration::from_nanos(end)) {
+            self.at(due);
             self.settle()?;
         }
         // Canvas tiles finish as the render thread would draw them.
@@ -1559,7 +2334,7 @@ impl Scenario {
             match self.pipeline.motion.settles_at() {
                 Some(t) if t <= end => {
                     // Just past the end, so the last frame is the rest pose.
-                    self.at(t + 1e-3);
+                    self.at(t.saturating_add(1_000_000));
                     self.settle()?;
                 }
                 _ => break,
@@ -1569,13 +2344,54 @@ impl Scenario {
     }
 
     fn render(&mut self) -> Result<FrameReport, ScenarioError> {
-        // What other threads sent before this frame is in it, as in a window.
-        mailbox::deliver();
-        let begin = self.headless.begin(clock::current_seconds());
+        self.render_granted(|_| {})
+    }
+
+    /// A frame whose main frame is granted, then `between` runs (wheels
+    /// the render thread takes while the UI builds), then the UI answers.
+    fn render_granted(&mut self, between: impl FnOnce(&mut Self)) -> Result<FrameReport, ScenarioError> {
+        self.render_for(clock::current_nanos(), between)
+    }
+
+    /// A frame granted for `present_at` (nanoseconds on the frame clock),
+    /// `between` run before the UI answers it.
+    fn render_for(&mut self, present_at: u64, between: impl FnOnce(&mut Self)) -> Result<FrameReport, ScenarioError> {
+        // What other threads sent before this frame is in it, delivered in
+        // one turn, as the platform's is; a replay delivers it where the
+        // log took it instead.
+        if !self.logged_mail {
+            self.pipeline.turn(|_| mailbox::deliver());
+        }
+        let begin = self.headless.begin(present_at);
+        between(self);
         self.pipeline
             .draw_with(&mut self.headless, begin, self.size, self.scale, &mut self.report);
         self.reports.push(self.report.clone());
         Ok(self.report.clone())
+    }
+
+    /// A frame granted, `between` run before the UI answers it (ADR-0032:
+    /// input on both sides of a grant's cut).
+    #[cfg(test)]
+    pub(crate) fn frame_granted(&mut self, between: impl FnOnce(&mut Self)) -> Result<FrameReport, ScenarioError> {
+        self.render_granted(between)
+    }
+
+    /// A main frame granted for `present_at` (nanoseconds on the frame
+    /// clock), as a recorded log's grant says (ADR-0033).
+    #[cfg(test)]
+    pub(crate) fn frame_for(&mut self, present_at: u64) -> Result<FrameReport, ScenarioError> {
+        self.render_for(present_at, |_| {})
+    }
+
+    /// A frame whose commit the render thread drops (a delta after a panic,
+    /// ADR-0032 I4), the UI told to send the whole scene next.
+    #[cfg(test)]
+    pub(crate) fn frame_aborted(&mut self) -> Result<FrameReport, ScenarioError> {
+        self.headless.abort_next = true;
+        let report = self.render();
+        self.pipeline.recommit();
+        report
     }
 
     /// Render a frame and write its files under `name`.
@@ -1640,6 +2456,49 @@ impl Scenario {
         Ok(())
     }
 
+    /// Take what the platform told of its window as the live UI takes it
+    /// (`window::ui_loop`, ADR-0033): a replayed log's size and scale (the
+    /// next frame lays out at them), focus, visibility and decorations.
+    #[cfg(test)]
+    pub(crate) fn told(&mut self, told: &crate::compositor::input_log::Told) -> Result<(), ScenarioError> {
+        // What the platform says of this window is its own: one turn of it.
+        let window = Rc::clone(&self.pipeline.focus);
+        crate::engine::turn(&window, |t| self.take_told(t, told)).unwrap_or(Ok(()))
+    }
+
+    /// [`Self::told`], inside its turn `t`.
+    #[cfg(test)]
+    fn take_told(
+        &mut self,
+        t: &crate::engine::Turn,
+        told: &crate::compositor::input_log::Told,
+    ) -> Result<(), ScenarioError> {
+        use crate::compositor::input_log::Told;
+        match told {
+            Told::Resized { size, scale } => {
+                let (pw, ph) = *size;
+                // A window of no size (minimized, Codex r12 5c) is one as
+                // live takes it: its size kept, no pixels to read back.
+                if pw > 0 && ph > 0 {
+                    self.blank = Pixels::new(pw, ph).ok_or(ScenarioError::Size(pw, ph))?;
+                }
+                self.size = (pw, ph);
+                self.scale = *scale;
+                if *scale > 0.0 {
+                    let logical = |p: u32| u32_to_f32(p) / *scale;
+                    crate::environment::put_window_size(t, (logical(pw), logical(ph)));
+                }
+            }
+            Told::Focused => {
+                self.pipeline.reload_text_settings();
+            }
+            Told::Visible(v) => crate::environment::put_window_visible(t, *v),
+            Told::Chrome(c) => self.pipeline.window_active_in(t, c.active),
+            Told::Access(_) | Told::Quit => {}
+        }
+        Ok(())
+    }
+
     /// The report of every frame drawn since the last call, in order; the
     /// scenario keeps none after it.
     pub fn take_reports(&mut self) -> Vec<FrameReport> {
@@ -1669,10 +2528,44 @@ impl Scenario {
         self.pipeline.act(cause, f);
     }
 
+    /// What `f` reads in this window ([`Pipeline::read`]).
+    ///
+    /// # Panics
+    /// When the window was closed.
+    #[expect(clippy::expect_used, reason = "a scenario's window is open while the scenario lives")]
+    pub fn read<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.pipeline
+            .read(f)
+            .expect("gui: a scenario read after its window closed")
+    }
+
     /// The last frame.
     #[must_use]
     pub fn last(&self) -> &Frame {
         self.pipeline.frame()
+    }
+
+    /// The cursor the window shows now ([`Pipeline::cursor`]).
+    #[must_use]
+    pub fn cursor(&self) -> Cursor {
+        self.pipeline.cursor()
+    }
+
+    /// Where an input method may type now ([`Pipeline::ime_target`]).
+    pub fn ime_target(&mut self) -> Option<ImeTarget> {
+        self.pipeline.ime_target()
+    }
+
+    /// The layers open, bottom first, by the path of each one's node in
+    /// the last frame.
+    #[must_use]
+    pub fn open_layers(&self) -> Vec<String> {
+        let frame = self.pipeline.frame();
+        self.pipeline
+            .input_state
+            .layer_nodes()
+            .filter_map(|i| frame.nodes.get(i).map(|n| format!("{:?}", n.path)))
+            .collect()
     }
 
     /// Scroll on the render thread alone, as the platform's wheel at
@@ -1681,7 +2574,12 @@ impl Scenario {
     #[cfg(test)]
     pub(crate) fn compositor_wheel(&mut self, point: (f32, f32), delta: (f32, f32), at: f32) -> bool {
         let scrolled = self.headless.wheel(point, delta, at);
-        self.headless.draw(at + 1.0);
+        // The second passes for the UI too: what it draws next shows after.
+        let later = clock::nanos_of(at + 1.0).max(clock::current_nanos());
+        self.pipeline
+            .turn(|_| clock::advance_to(std::time::Duration::from_nanos(later)));
+        self.headless.draw(later);
+        self.pipeline.converge(&self.headless.shown());
         scrolled
     }
 
@@ -1695,14 +2593,64 @@ impl Scenario {
     /// since the UI's last commit included.
     #[must_use]
     pub fn presented(&self) -> std::sync::Arc<Presented> {
-        self.headless.presented()
+        match self.headless.shown() {
+            Shown::Frame(p) => p,
+            Shown::BeforeFirst | Shown::Gone(_) => self.headless.compositor.presented(),
+        }
+    }
+
+    /// What the screen shows: the frame presented last, or nothing yet.
+    #[must_use]
+    pub fn shown(&self) -> Shown {
+        self.headless.shown()
     }
 
     /// Route `input` as the window does: hit-tested through what is on
-    /// screen (a touch, a key, any input a helper below does not send).
+    /// screen (a touch, a key, any input a helper below does not send),
+    /// after every wheel sent before it ([`Self::queue`] and
+    /// [`Self::handle`] at once).
     pub fn send(&mut self, input: Input) -> Outcome {
-        let shown = self.headless.presented();
-        self.pipeline.input_shown(input, &shown)
+        let queued = self.queue(input);
+        self.handle(queued)
+    }
+
+    /// Send `input` as the platform thread does, through the render thread,
+    /// which hands it on now with what the compositor scrolled since the
+    /// last hand-off (ADR-0033), for the UI to handle later
+    /// ([`Self::handle`]): wheels turned meanwhile scroll after it,
+    /// whenever the UI gets to it, as a stalled UI's queued input does.
+    pub fn queue(&mut self, input: Input) -> Queued {
+        Queued {
+            input,
+            pulled: self.headless.pull(),
+            shown: self.headless.shown(),
+        }
+    }
+
+    /// Handle input handed on before ([`Self::queue`]): what the compositor
+    /// scrolled that rides with it is taken in first.
+    pub fn handle(&mut self, queued: Queued) -> Outcome {
+        self.pipeline.take_pulled(&queued.pulled);
+        let mut out = self.pipeline.input_shown(queued.input, &queued.shown);
+        out.redraw |= self.pipeline.pulls_moved();
+        out
+    }
+
+    /// [`Self::send`], routed in `shown` (the frame a recorded log says it
+    /// was routed in) rather than in what shows now.
+    #[cfg(test)]
+    pub(crate) fn send_shown(&mut self, input: Input, shown: Shown) -> Outcome {
+        let pulled = self.headless.pull();
+        self.handle(Queued { input, pulled, shown })
+    }
+
+    /// Take in, as the UI does with a drag move it holds, what the
+    /// compositor scrolled since the last hand-off: whether it moved.
+    #[cfg(test)]
+    pub(crate) fn take_pull(&mut self) -> bool {
+        let pulled = self.headless.pull();
+        self.pipeline.take_pulled(&pulled);
+        self.pipeline.turn(Pipeline::pulls_moved).unwrap_or_default()
     }
 
     /// Physical pixels per logical pixel.
@@ -1759,34 +2707,31 @@ impl Scenario {
     /// Whether anything scrolled.
     pub fn wheel(&mut self, dy: f32) -> bool {
         let at = self.pipeline.input_state.pointer().unwrap_or_default();
-        let now = clock::current_seconds();
+        let now = clock::current_nanos();
         // As the render thread takes it, in the frame shown: over a wheel
         // handler it hands it to the UI.
-        let seen = self.headless.presented().frame;
+        let seen = self.headless.shown().seen();
         let w = crate::compositor::WheelInput {
             point: at,
             delta: (0.0, dy),
-            at: now,
+            time: now,
             precise: false,
-            began: false,
-            ended: false,
+            phase: crate::compositor::WheelPhase::None,
             seen,
         };
-        match self.headless.compositor.wheel_input(w) {
-            crate::compositor::Wheeled::Ui(target) => {
-                self.send(Input::WheelAt {
-                    step: w.step(),
-                    dx: 0.0,
-                    dy,
-                    target,
-                })
-                .redraw
+        match self.headless.compositor.dispatch_wheel(w) {
+            crate::compositor::Dispatched::Ui(input) => {
+                // Handed on as input is (ADR-0033).
+                self.send(input).redraw
             }
-            crate::compositor::Wheeled::Scrolled => {
+            crate::compositor::Dispatched::Scrolled => {
                 self.headless.draw(now);
+                // Presented: hover converges on it, as the window's UI
+                // does when idle.
+                self.pipeline.converge(&self.headless.shown());
                 true
             }
-            crate::compositor::Wheeled::Nothing => false,
+            crate::compositor::Dispatched::Nothing => false,
         }
     }
 
@@ -1795,7 +2740,7 @@ impl Scenario {
     pub fn locate(&self, text: &str) -> Result<(f32, f32), ScenarioError> {
         let frame = self.pipeline.frame();
         inspect::find_text(&frame.nodes, text)
-            .map(|r| r.bounds)
+            .map(|r| r.bounds(inspect::OUTSIDE))
             .or_else(|| frame.span_bounds(text))
             .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
             .ok_or_else(|| ScenarioError::TextNotFound(text.to_owned()))
@@ -1891,7 +2836,7 @@ pub fn snapshot(view: impl IntoElement, path: &Path, width: u32, height: u32, sc
     let (pw, ph) = (size(width), size(height));
     let gpu = GpuRenderer::headless().map_err(|e| ScenarioError::Gpu(e.to_string()))?;
     let mut headless = Headless::new(gpu, Glyphs::for_os(), true);
-    let begin = headless.begin(0.0);
+    let begin = headless.begin(0);
     pipeline.draw_with(&mut headless, begin, (pw, ph), scale, &mut FrameReport::default());
     let pixels = headless
         .pixels()
@@ -1907,6 +2852,217 @@ mod tests {
     use crate::prelude::*;
     use crate::scene::Item;
     use crate::styled::Styled;
+
+    /// A compositor whose frames show later, as the render thread's: the
+    /// commit is drawn and presented, but the screen shows `shows` until
+    /// the test says the frame is up.
+    struct Later<'a> {
+        inner: &'a mut Headless,
+        shows: Shown,
+    }
+
+    impl Compose for Later<'_> {
+        fn commit(&mut self, commit: Box<crate::compositor::Commit>, overlay: Option<Scene>) {
+            self.inner.commit(commit, overlay);
+        }
+        fn spare(&mut self) -> Option<Box<crate::compositor::Commit>> {
+            Compose::spare(self.inner)
+        }
+        fn overlay(&mut self, overlay: Option<Scene>) {
+            Compose::overlay(self.inner, overlay);
+        }
+        fn held(&self) -> Held {
+            Compose::held(self.inner)
+        }
+        fn drawn(&self) -> crate::scene::Drawn {
+            Compose::drawn(self.inner)
+        }
+        fn capture(&mut self, overlay: Option<Scene>) -> Option<Pixels> {
+            Compose::capture(self.inner, overlay)
+        }
+        fn presented(&self) -> Shown {
+            self.shows.clone()
+        }
+        fn begin(&mut self, at: u64) -> MainFrame {
+            self.inner.begin(at)
+        }
+    }
+
+    /// B laid out under a resting pointer where A was: nothing changes
+    /// while the frame before still shows (the commit is not on screen),
+    /// and once B's frame presents, B is hovered and A left, with no
+    /// input: hover follows what the screen shows, checked when it
+    /// changes, not when layout committed.
+    #[test]
+    fn a_box_moved_under_a_resting_pointer_is_hovered_once_its_frame_presents() {
+        let swapped = crate::reactive::Signal::new(false);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mut s = Scenario::measuring(two_boxes(swapped, &log), 400, 100, 1.0).expect("a scenario");
+        s.frame("first").expect("a frame");
+        s.send(Input::PointerMoved { x: 50.0, y: 20.0 });
+        assert_eq!(std::mem::take(&mut *log.borrow_mut()), ["A true"]);
+        s.act("swap", || swapped.set(true));
+        // Committed and drawn; the screen still shows the frame before.
+        let shows = s.headless.shown();
+        let mut later = Later {
+            inner: &mut s.headless,
+            shows,
+        };
+        let begin = later.begin(clock::current_nanos());
+        s.pipeline.draw_with(&mut later, begin, s.size, s.scale, &mut s.report);
+        assert!(
+            log.borrow().is_empty(),
+            "B's frame is not on screen yet: {:?}",
+            log.borrow()
+        );
+        // It presents, and nothing else comes: idle converges on it.
+        let now = s.headless.shown();
+        s.pipeline.converge(&now);
+        let mut seen = std::mem::take(&mut *log.borrow_mut());
+        seen.sort();
+        assert_eq!(seen, ["A false", "B true"], "hover follows the frame on screen");
+    }
+
+    /// Boxes A and B side by side, 100 by 40, A on the left until
+    /// `swapped`; each writes its hover into `log`.
+    fn two_boxes(
+        swapped: crate::reactive::Signal<bool>,
+        log: &std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+    ) -> impl Fn() -> Element + 'static {
+        let into = std::rc::Rc::clone(log);
+        move || {
+            let boxed = |who: &'static str, left: f32| {
+                let log = std::rc::Rc::clone(&into);
+                div()
+                    .key(u64::from(who.as_bytes()[0]))
+                    .position(Position::Absolute)
+                    .left(left)
+                    .top(0.0)
+                    .width(100.0)
+                    .height(40.0)
+                    .on_hover(move |on| log.borrow_mut().push(format!("{who} {on}")))
+            };
+            let (a, b) = if swapped.get() { (200.0, 0.0) } else { (0.0, 200.0) };
+            div()
+                .size(pct(100.0))
+                .child(boxed("A", a))
+                .child(boxed("B", b))
+                .into_element()
+        }
+    }
+
+    /// B's frame is on screen and hover followed it; then a move made
+    /// while A's frame showed comes late, and is routed in A (A hovered
+    /// again). With no more input, hover converges back on B, the frame
+    /// on screen: an input routed in an older frame has hover worked out
+    /// again in the newest.
+    #[test]
+    fn a_move_from_an_older_frame_leaves_hover_on_the_frame_on_screen() {
+        let swapped = crate::reactive::Signal::new(false);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mut s = Scenario::measuring(two_boxes(swapped, &log), 400, 100, 1.0).expect("a scenario");
+        s.frame("first").expect("a frame");
+        s.send(Input::PointerMoved { x: 50.0, y: 20.0 });
+        let a = s.headless.shown();
+        s.act("swap", || swapped.set(true));
+        s.frame("swapped").expect("a frame");
+        log.borrow_mut().clear();
+        s.pipeline.input_shown(Input::PointerMoved { x: 50.0, y: 20.0 }, &a);
+        let mut seen = std::mem::take(&mut *log.borrow_mut());
+        seen.sort();
+        assert_eq!(seen, ["A true", "B false"], "routed in the frame it came under");
+        let now = s.headless.shown();
+        assert!(s.pipeline.converge(&now), "worked out again in the frame on screen");
+        let mut seen = std::mem::take(&mut *log.borrow_mut());
+        seen.sort();
+        assert_eq!(seen, ["A false", "B true"], "hover follows the frame on screen");
+    }
+
+    /// Codex r7 2: B shows, and a move made while A showed is routed late
+    /// in A (A hovered); then a modifier key stamped with B is routed. It
+    /// works out no hover, so hover is not taken as worked out in B: idle
+    /// still converges on B.
+    #[test]
+    fn a_modifier_stamped_with_the_frame_on_screen_leaves_hover_to_converge() {
+        let swapped = crate::reactive::Signal::new(false);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mut s = Scenario::measuring(two_boxes(swapped, &log), 400, 100, 1.0).expect("a scenario");
+        s.frame("first").expect("a frame");
+        s.send(Input::PointerMoved { x: 50.0, y: 20.0 });
+        let a = s.headless.shown();
+        s.act("swap", || swapped.set(true));
+        s.frame("swapped").expect("a frame");
+        s.pipeline.input_shown(Input::PointerMoved { x: 50.0, y: 20.0 }, &a);
+        log.borrow_mut().clear();
+        let b = s.headless.shown();
+        let shift = crate::events::Modifiers {
+            shift: true,
+            ..crate::events::Modifiers::default()
+        };
+        s.pipeline.input_shown(Input::Modifiers(shift), &b);
+        assert!(log.borrow().is_empty(), "a modifier moves no hover");
+        s.pipeline.converge(&b);
+        let mut seen = std::mem::take(&mut *log.borrow_mut());
+        seen.sort();
+        assert_eq!(seen, ["A false", "B true"], "hover converges on B all the same");
+    }
+
+    /// Codex r7 3, Opus r7 nit 1: the pointer moves from over A to over B
+    /// under a frame no longer kept: the move is routed nowhere, but where
+    /// it went is kept, and hover is worked out there in the frame on
+    /// screen, not where the pointer was before.
+    #[test]
+    fn a_move_from_a_frame_gone_is_hovered_where_it_went() {
+        let swapped = crate::reactive::Signal::new(false);
+        let log = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let mut s = Scenario::measuring(two_boxes(swapped, &log), 400, 100, 1.0).expect("a scenario");
+        s.frame("first").expect("a frame");
+        s.send(Input::PointerMoved { x: 50.0, y: 20.0 });
+        assert_eq!(std::mem::take(&mut *log.borrow_mut()), ["A true"]);
+        let out = s
+            .pipeline
+            .input_shown(Input::PointerMoved { x: 250.0, y: 20.0 }, &Shown::Gone(1));
+        assert!(log.borrow().is_empty() && !out.redraw, "routed nowhere");
+        let now = s.headless.shown();
+        s.pipeline.converge(&now);
+        let mut seen = std::mem::take(&mut *log.borrow_mut());
+        seen.sort();
+        assert_eq!(seen, ["A false", "B true"], "hovered where the pointer went");
+    }
+
+    /// A press made under a frame no longer kept is dropped, not taken for
+    /// a press on nothing: a popup that opened since stays open.
+    /// (Retention: [`crate::compositor::RETAIN`].)
+    #[test]
+    fn a_press_from_a_frame_no_longer_kept_does_not_dismiss_what_opened_since() {
+        let asked = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+        let a = std::rc::Rc::clone(&asked);
+        let tree = move || {
+            let a = std::rc::Rc::clone(&a);
+            // The popup opens from a small trigger in the corner.
+            let trigger = div().width(20.0).height(20.0).child(crate::element::deferred(
+                crate::element::Positioning::At { x: 200.0, y: 10.0 },
+                div()
+                    .layer(crate::layer::Layer::new().on_dismiss(move |_| {
+                        a.set(a.get() + 1);
+                        crate::Dismiss::Close
+                    }))
+                    .width(100.0)
+                    .height(50.0),
+            ));
+            div().size(pct(100.0)).child(trigger).into_element()
+        };
+        let mut s = Scenario::measuring(tree, 400, 100, 1.0).expect("a scenario");
+        s.frame("open").expect("a frame");
+        let press = Input::MouseDown { x: 100.0, y: 80.0 };
+        let out = s.pipeline.input_shown(press.clone(), &Shown::Gone(1));
+        assert_eq!(asked.get(), 0, "a press from a frame gone dismisses nothing");
+        assert!(!out.redraw, "it is dropped");
+        // The same press made under the frame on screen does dismiss it.
+        let shown = s.headless.shown();
+        s.pipeline.input_shown(press, &shown);
+        assert_eq!(asked.get(), 1, "a press outside it in the frame shown asks it to close");
+    }
 
     /// What a cold check forks is what it writes, over every Fork piece of
     /// engine state together (copies and undo entries, one counter): the
@@ -1943,6 +3099,7 @@ mod tests {
         assert_eq!(next_id(true), next_id(false), "the same id with the check as without");
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_cold_check_forks_what_it_writes_beside_any_other_window() {
         let work = |other: usize| {
@@ -1979,6 +3136,11 @@ mod tests {
             .expect("a scenario");
             small.frame("first").expect("a frame");
             small.check_cold(true);
+            // One checked frame first: what the thread registers as it
+            // first checks (a piece first used by the check) is not the
+            // work measured.
+            small.act("warm", || n.set(2));
+            small.frame("warm").expect("a frame");
             small.act("tick", || n.set(1));
             let before = crate::engine::fork_work_done();
             small.frame("checked").expect("a frame");
@@ -1991,11 +3153,87 @@ mod tests {
         assert_eq!(few, many, "the same work however large the other window");
     }
 
+    /// Opus nit (F1 review 9): a cold build that panics in a fork that is
+    /// also dropped (it reached a site that cannot answer in one) raises
+    /// its panic; the dropped sample does not skip it with the panic.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_dropped_cold_check_keeps_its_build_panic() {
+        let mut s = Scenario::measuring(
+            || {
+                if crate::engine::forking() {
+                    crate::engine::drop_fork("a test site");
+                    std::panic::panic_any("the cold build fails");
+                }
+                div().size(10.0).into_element()
+            },
+            100,
+            50,
+            1.0,
+        )
+        .expect("a scenario");
+        s.check_cold(true);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.frame("first").map(|_| ())));
+        let said = caught.expect_err("the build's panic is raised");
+        // As a string: a check's payloads are (ADR-0034, S3).
+        assert_eq!(
+            said.downcast_ref::<String>().map(String::as_str),
+            Some("the cold build fails")
+        );
+    }
+
+    /// ADR-0015 rule 12: a checker that only ever skips checks nothing, so
+    /// past `SKIP_FLOOR` skips in a row it fails as a mismatch does; one
+    /// skip among checked frames passes.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_cold_check_that_only_skips_fails() {
+        let always = Rc::new(std::cell::Cell::new(true));
+        let a = Rc::clone(&always);
+        let n = crate::reactive::Signal::new(0_u32);
+        let mut s = Scenario::measuring(
+            move || {
+                if crate::engine::forking() && a.get() {
+                    crate::engine::drop_fork("a test site");
+                }
+                div()
+                    .size(10.0 + f32::from(u16::try_from(n.get()).unwrap_or(0)))
+                    .into_element()
+            },
+            100,
+            50,
+            1.0,
+        )
+        .expect("a scenario");
+        s.check_cold(true);
+        // Skipped now and then: checked between, never failed.
+        for i in 0..(2 * SKIP_FLOOR) {
+            always.set(i % 2 == 0);
+            s.act("n", || n.set(i));
+            s.frame("sometimes").expect("a frame");
+        }
+        always.set(true);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for i in 0..=SKIP_FLOOR + 1 {
+                s.act("n", || n.set(1000 + i));
+                drop(s.frame("always"));
+            }
+        }));
+        let said = caught.expect_err("a checker that only skips fails");
+        let said = said
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| said.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default();
+        assert!(said.contains("skipped"), "{said}");
+    }
+
     /// A stale content box the layout check cannot see (the border box is
     /// the same) moves the text the live paint draws; the paint check finds
     /// it, as it compares with what the cold frame painted from its own
     /// layout, not the live layout painted again.
     #[test]
+    #[cfg(debug_assertions)]
     fn a_stale_content_box_fails_the_paint_check() {
         let mut s = Scenario::measuring(
             || div().size(pct(100.0)).padding(8.0).child(text("moved")).into_element(),
@@ -2012,8 +3250,7 @@ mod tests {
             .iter_mut()
             .find(|n| matches!(n.content, crate::layout::Content::Text { .. }))
             .expect("the text node");
-        node.content_box.x += 5.0;
-        node.space_content.x += 5.0;
+        node.move_content(5.0);
         // Paint records the whole frame again, the stale box with it.
         frame.changes.rebuilt(0);
         let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| s.frame("stale").map(|_| ())));
@@ -2143,7 +3380,7 @@ mod tests {
         if let Some(path) = std::env::var_os("GUI_HUD_PNG") {
             let scene = s.pipeline.painter.scene();
             let hud = record_hud(scene.size, scene.scale, &mut s.pipeline.text, &lines, &history.times());
-            let pixmap = s.headless.capture(Some(hud)).expect("read back");
+            let pixmap = s.headless.capture(Some(&hud)).expect("read back");
             pixmap.save_png(path).expect("written");
         }
     }
@@ -2185,7 +3422,7 @@ mod tests {
                 .nodes
                 .iter()
                 .find(|n| n.name == Some(name))
-                .map(|n| n.bounds)
+                .map(|n| n.bounds(crate::inspect::OUTSIDE))
                 .expect("a node")
         };
         let (grown, painted) = (was("grown"), was("painted"));

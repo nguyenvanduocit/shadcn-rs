@@ -107,7 +107,7 @@ fn a_focused_node_moved_to_another_box_lights_that_box_in_the_first_frame() {
     assert_eq!(look(&s, "a"), Some(Color::BLACK), "focus is within A");
     s.act("move the node to B", || in_b.set(true));
     s.frame("moved").unwrap();
-    assert_eq!(gui::focus::focused(), Some(focus.id()), "it keeps focus");
+    assert_eq!(s.read(gui::focus::focused), Some(focus.id()), "it keeps focus");
     assert_eq!(look(&s, "b"), Some(Color::BLACK), "B holds focus from the first frame");
     assert_eq!(look(&s, "a"), Some(Color::WHITE), "and A no more");
 }
@@ -123,7 +123,7 @@ fn a_scroll_handle_reports_the_row_a_focus_handle_moved_to() {
     // but for which handle they hold.
     let other = FocusHandle::new();
     let on_b = Signal::new(false);
-    let sh = scroll.clone();
+    let sh = scroll;
     // Each row holds a component reading `on_b`, which holds the handle or
     // not: moving it renders those again, not the rows nor the container.
     let row = move |key: u64, on: bool| {
@@ -172,7 +172,7 @@ fn a_scroll_handle_reports_the_row_a_focus_handle_moved_to() {
     assert_eq!(holding(&scroll), Some(vec![Some(1)]));
     s.act("move the handle to row 2", || on_b.set(true));
     s.frame("moved").unwrap();
-    assert_eq!(gui::focus::focused(), Some(focus.id()));
+    assert_eq!(s.read(gui::focus::focused), Some(focus.id()));
     assert_eq!(holding(&scroll), Some(vec![Some(2)]), "the handle reports row 2");
 }
 
@@ -184,7 +184,7 @@ fn a_pinned_focused_row_stays_when_a_sibling_comes_before_its_list() {
     let state = ListState::new(30.0);
     let focus = FocusHandle::new();
     let before = Signal::new(false);
-    let st = state.clone();
+    let st = state;
     let mut s = Scenario::measuring(
         move || -> Element {
             let list = virtual_list(
@@ -219,6 +219,6 @@ fn a_pinned_focused_row_stays_when_a_sibling_comes_before_its_list() {
     assert_eq!(state.focused_row(), Some(3), "kept built, pinned");
     s.act("a sibling before the list", || before.set(true));
     s.settle().unwrap();
-    assert_eq!(gui::focus::focused(), Some(focus.id()), "row 3 keeps focus");
+    assert_eq!(s.read(gui::focus::focused), Some(focus.id()), "row 3 keeps focus");
     assert_eq!(state.focused_row(), Some(3), "and stays built");
 }

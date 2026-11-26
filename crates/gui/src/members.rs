@@ -8,19 +8,29 @@
 //! one not laid out is; a dormant one ([`crate::Div::dormant`]) is kept,
 //! for its owner to walk while it sleeps ([`crate::layout::Frame::navigable`]).
 
-use std::cell::{Cell, RefCell};
+use crate::engine::{WorldCell, WorldRefCell};
 use std::fmt;
 use std::rc::{Rc, Weak};
 
 /// One layout tree's lists: its pass count, which the lists it fills read
 /// against, and those of them watched ([`Members::on_laid_out`]). Owned by
-/// the tree, so two trees on one thread keep their lists apart.
-#[derive(Default)]
+/// the tree, so two trees on one thread keep their lists apart; of the
+/// world that made the tree, which alone lays it out (review r18,
+/// decision 2: a check's tree is the check's, and fills no live list).
 pub(crate) struct Lists {
     /// The layout pass running now, or the last one.
-    pass: Cell<u64>,
+    pass: WorldCell<u64>,
     /// The watched lists this tree fills, told once a pass.
-    watched: RefCell<Vec<Weak<dyn Watched>>>,
+    watched: WorldRefCell<Vec<Weak<dyn Watched>>>,
+}
+
+impl Default for Lists {
+    fn default() -> Self {
+        Self {
+            pass: WorldCell::new("a layout tree's pass (`Lists::pass`)", 0),
+            watched: WorldRefCell::new("a layout tree's watched lists (`Lists::watched`)", Vec::new()),
+        }
+    }
 }
 
 impl Lists {
@@ -36,49 +46,45 @@ impl Lists {
     /// still watched. Allocates nothing.
     pub(crate) fn end_pass(&self) {
         let mut watched = self.watched.take();
-        let mut first = None;
+        // Inside a turn, each panic to its arbiter as it is caught.
+        let mut all = crate::engine::Gather::new();
         watched.retain(|w| {
             w.upgrade().is_some_and(|l| {
-                if let Some(p) = l.notify() {
-                    first.get_or_insert(p);
-                }
+                l.notify(&mut all);
                 true
             })
         });
         // Those that began to be watched while telling these join them.
         watched.append(&mut self.watched.borrow_mut());
         self.watched.replace(watched);
-        if let Some(p) = first {
-            std::panic::resume_unwind(p);
-        }
+        all.finish();
     }
 }
 
-/// A panic caught, to go on later.
-type Panic = Box<dyn std::any::Any + Send>;
-
 /// A list told what it holds at each pass's end.
 trait Watched {
-    /// Run every callback, to completion: the first panic, caught.
-    fn notify(&self) -> Option<Panic>;
+    /// Run every callback, to completion, each under `all`.
+    fn notify(&self, all: &mut crate::engine::Gather);
 }
 
 type Watch<T> = Rc<dyn Fn(&[T])>;
 
+/// A list's state, of the world that made it: a live list is filled by the
+/// live layout and watched by live mounts alone (review r18, decision 2).
 struct Inner<T> {
-    items: RefCell<Vec<T>>,
+    items: WorldRefCell<Vec<T>>,
     /// The pass `items` were filled in, of the tree that fills it.
-    pass: Cell<u64>,
+    pass: WorldCell<u64>,
     /// That tree's lists: none until a member joins.
-    lists: RefCell<Weak<Lists>>,
+    lists: WorldRefCell<Weak<Lists>>,
     /// What each part watching it runs at a pass's end, in the order they
     /// registered, by the number its registration was given: an entry each,
     /// taken out as its part unmounts ([`Members::on_laid_out`]).
-    watch: RefCell<Vec<(u64, Watch<T>)>>,
+    watch: WorldRefCell<Vec<(u64, Watch<T>)>>,
     /// The registrations issued so far.
-    issued: Cell<u64>,
+    issued: WorldCell<u64>,
     /// It is among its tree's watched lists.
-    watched: Cell<bool>,
+    watched: WorldCell<bool>,
 }
 
 impl<T> Inner<T> {
@@ -93,14 +99,13 @@ impl<T> Inner<T> {
 }
 
 impl<T> Watched for Inner<T> {
-    fn notify(&self) -> Option<Panic> {
+    fn notify(&self, all: &mut crate::engine::Gather) {
         // Step through the registrations by number, no borrow held while
         // one runs: a callback may register another (it runs from the next
         // pass) or end a part (whose callback, taken out, runs no more,
         // this pass included). No copy: nothing allocated.
         let last = self.issued.get();
         let mut after = 0;
-        let mut first = None;
         loop {
             let next = {
                 let watch = self.watch.borrow();
@@ -112,18 +117,17 @@ impl<T> Watched for Inner<T> {
             };
             let Some((id, f)) = next else { break };
             after = id;
-            let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                if self.current() {
-                    f(&self.items.borrow());
-                } else {
-                    f(&[]);
-                }
-            }));
-            if let Err(p) = run {
-                first.get_or_insert(p);
-            }
+            // A caller's closure, through the one gate (ADR-0028, rule 5).
+            all.run(|| {
+                crate::engine::call_out(crate::engine::Site::LaidOut, || {
+                    if self.current() {
+                        f(&self.items.borrow());
+                    } else {
+                        f(&[]);
+                    }
+                })
+            });
         }
-        first
     }
 }
 
@@ -158,12 +162,12 @@ impl<T> Members<T> {
     #[must_use]
     pub fn new() -> Self {
         Self(Rc::new(Inner {
-            items: RefCell::new(Vec::new()),
-            pass: Cell::new(0),
-            lists: RefCell::new(Weak::new()),
-            watch: RefCell::new(Vec::new()),
-            issued: Cell::new(0),
-            watched: Cell::new(false),
+            items: WorldRefCell::new("a list's members (`Members`)", Vec::new()),
+            pass: WorldCell::new("a list's pass (`Members`)", 0),
+            lists: WorldRefCell::new("a list's layout tree (`Members`)", Weak::new()),
+            watch: WorldRefCell::new("a list's watchers (`Members::on_laid_out`)", Vec::new()),
+            issued: WorldCell::new("a list's watcher count (`Members::on_laid_out`)", 0),
+            watched: WorldCell::new("whether a list is watched (`Members`)", false),
         }))
     }
 
@@ -275,6 +279,7 @@ pub(crate) fn join<T: Clone + 'static>(list: &Members<T>, value: T) -> Join {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::{Cell, RefCell};
 
     #[test]
     fn a_pass_replaces_the_last_and_an_empty_pass_empties_it() {

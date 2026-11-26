@@ -161,6 +161,8 @@ struct Scratch {
     rows: Vec<Track>,
 }
 
+crate::engine::parts_whole!(Scratch);
+
 /// What a grid keeps from its last run, so the next (its final layout
 /// after its size probes, as a column asks them) does not ask its children
 /// their contributions again: its items' contributions to their rows (its

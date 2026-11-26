@@ -486,9 +486,11 @@ impl Animation {
         }
     }
 
-    /// When it ends, `duration` seconds an iteration after `start`; never when infinite.
-    fn end(&self, start: f32, duration: f32) -> Option<f32> {
-        self.iterations.map(|n| start + self.delay + duration * n)
+    /// When it ends (nanoseconds on the frame clock), `duration` seconds an
+    /// iteration after `start`; never when infinite.
+    fn end(&self, start: u64, duration: f32) -> Option<u64> {
+        self.iterations
+            .map(|n| clock::shifted(start, self.delay + duration * n))
     }
 
     /// Whether it moves something only a UI frame paints: a height (which
@@ -640,7 +642,8 @@ struct Timing {
 struct Run<T> {
     from: T,
     to: T,
-    start: f32,
+    /// When it starts, nanoseconds on the frame clock.
+    start: u64,
     duration: f32,
     easing: Easing,
     /// What a reversal back to it is measured against.
@@ -649,18 +652,19 @@ struct Run<T> {
 }
 
 impl<T: Mix> Run<T> {
-    fn output(&self, now: f32) -> f32 {
+    fn output(&self, now: u64) -> f32 {
         if self.duration <= 0.0 {
             return 1.0;
         }
-        self.easing.at(((now - self.start) / self.duration).clamp(0.0, 1.0))
+        self.easing
+            .at((clock::span(self.start, now) / self.duration).clamp(0.0, 1.0))
     }
 
-    fn end(&self) -> f32 {
-        self.start + self.duration
+    fn end(&self) -> u64 {
+        clock::shifted(self.start, self.duration)
     }
 
-    fn value(&self, now: f32) -> T {
+    fn value(&self, now: u64) -> T {
         self.from.mix(&self.to, self.output(now))
     }
 }
@@ -675,22 +679,25 @@ struct Track<T> {
 
 impl<T: Clone> Track<T> {
     /// Its run, while one runs at `now`.
-    fn live(&self, now: f32) -> Option<Run<T>> {
-        self.run.as_deref().filter(|r| now < r.start + r.duration).cloned()
+    fn live(&self, now: u64) -> Option<Run<T>> {
+        self.run
+            .as_deref()
+            .filter(|r| now < clock::shifted(r.start, r.duration))
+            .cloned()
     }
 }
 
 /// What the frame being built still has moving.
 #[derive(Default)]
 struct Busy {
-    /// When the last finite run ends.
-    until: Option<f32>,
+    /// When the last finite run ends, nanoseconds on the frame clock.
+    until: Option<u64>,
     /// A loop plays.
     looping: bool,
 }
 
 impl Busy {
-    fn ends_at(&mut self, end: f32) {
+    fn ends_at(&mut self, end: u64) {
         self.until = Some(self.until.map_or(end, |u| u.max(end)));
     }
 }
@@ -698,7 +705,7 @@ impl Busy {
 /// The value of a transitioned property this frame: `after` when it has not
 /// changed or does not transition (`timing` is `None`), else eased from what
 /// shows now.
-fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Timing>, now: f32, busy: &mut Busy) -> T {
+fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Timing>, now: u64, busy: &mut Busy) -> T {
     let Some(track) = track else {
         // A node's first values show as they are, as CSS starts no
         // transition on an element's first style.
@@ -729,7 +736,7 @@ fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Tim
                     Run {
                         from: current,
                         to: after.clone(),
-                        start: now + t.delay,
+                        start: clock::shifted(now, t.delay),
                         duration: t.duration * factor,
                         easing: t.easing,
                         reversing_from: r.to.clone(),
@@ -739,7 +746,7 @@ fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Tim
                 _ => Run {
                     from: current.clone(),
                     to: after.clone(),
-                    start: now + t.delay,
+                    start: clock::shifted(now, t.delay),
                     duration: t.duration,
                     easing: t.easing,
                     reversing_from: current,
@@ -762,23 +769,30 @@ fn transition<T: Mix>(track: &mut Option<Track<T>>, after: T, timing: Option<Tim
 #[derive(Clone)]
 struct Playing {
     animation: Rc<Animation>,
-    start: f32,
+    /// When it started, nanoseconds on the frame clock; `None`: long ago
+    /// (one ended as it started, or ended early).
+    start: Option<u64>,
     /// It is the exit of a node that left, which holds its last pose once it
     /// ends (`forwards`), as the node is gone by then.
     leaving: bool,
 }
 
+/// Seconds from `start` (`None`: long ago, an infinite span) to `now`.
+fn elapsed(start: Option<u64>, now: u64) -> f32 {
+    start.map_or(f32::INFINITY, |s| clock::span(s, now))
+}
+
 impl Playing {
     /// Whether it has ended by `now` and no longer sets anything: a finite
     /// animation past its last iteration (an exit holds its last pose).
-    fn ended(&self, m: &MotionStyle, now: f32) -> bool {
+    fn ended(&self, m: &MotionStyle, now: u64) -> bool {
         let (duration, _) = self.animation.timing(m);
         duration <= 0.0
             || (!self.leaving
                 && self
                     .animation
                     .iterations
-                    .is_some_and(|n| now - self.start - self.animation.delay >= duration * n))
+                    .is_some_and(|n| elapsed(self.start, now) - self.animation.delay >= duration * n))
     }
 }
 
@@ -825,9 +839,13 @@ struct NodeState {
 impl NodeState {
     /// Whether a transition of something only a UI frame paints (a colour,
     /// a shadow, a size) runs at `now`.
-    fn runs_paint(&self, now: f32) -> bool {
-        fn on<T>(t: Option<&Track<T>>, now: f32) -> bool {
-            t.is_some_and(|t| t.run.as_ref().is_some_and(|r| now < r.start + r.duration))
+    fn runs_paint(&self, now: u64) -> bool {
+        fn on<T>(t: Option<&Track<T>>, now: u64) -> bool {
+            t.is_some_and(|t| {
+                t.run
+                    .as_ref()
+                    .is_some_and(|r| now < clock::shifted(r.start, r.duration))
+            })
         }
         on(self.background.as_ref(), now)
             || on(self.border.as_ref(), now)
@@ -842,7 +860,7 @@ impl NodeState {
     }
 
     /// Whether a transition of its opacity or transform runs at `now`.
-    fn runs_composited(&self, now: f32) -> bool {
+    fn runs_composited(&self, now: u64) -> bool {
         [&self.opacity, &self.scale, &self.rotate]
             .iter()
             .any(|t| t.as_ref().is_some_and(|t| t.live(now).is_some()))
@@ -874,7 +892,7 @@ impl NodeState {
         end(&mut self.padding);
         end(&mut self.inset);
         if let Some(p) = self.playing.as_mut().filter(|p| p.animation.iterations.is_some()) {
-            p.start = f32::NEG_INFINITY;
+            p.start = None;
         }
     }
 }
@@ -889,8 +907,10 @@ struct Leaving {
     slot: Element,
     /// Where the slot sat among its siblings, for a keyed one.
     index: usize,
-    since: f32,
-    until: f32,
+    /// When it started leaving and when its exit ends, nanoseconds on the
+    /// frame clock.
+    since: u64,
+    until: u64,
 }
 
 /// What runs, across frames, by node path; the pipeline owns one.
@@ -898,14 +918,16 @@ struct Leaving {
 pub struct Motion {
     nodes: HashMap<NodePath, NodeState>,
     leaving: Vec<Leaving>,
-    /// When the last finite motion of the last pass ends.
-    settles_at: Option<f32>,
+    /// When the last finite motion of the last pass ends, nanoseconds on
+    /// the frame clock.
+    settles_at: Option<u64>,
     reduced: bool,
     instant: bool,
     hold_loops: bool,
     /// When the earliest motion the compositor runs alone ends: the UI
-    /// lays out once then, to show its end and drop it (ADR-0015).
-    wake_at: Option<f32>,
+    /// lays out once then, to show its end and drop it (ADR-0015);
+    /// nanoseconds on the frame clock.
+    wake_at: Option<u64>,
     /// Nodes whose after-mount animation started this pass.
     mounting: Vec<NodePath>,
     /// Nodes with an exit that left the tree this pass.
@@ -1014,16 +1036,17 @@ impl Motion {
     }
 
     /// When the last transition, finite animation or exit that ran in the
-    /// last layout ends, if one runs.
+    /// last layout ends, if one runs: nanoseconds on the frame clock.
     #[must_use]
-    pub fn settles_at(&self) -> Option<f32> {
+    pub fn settles_at(&self) -> Option<u64> {
         self.settles_at
     }
 
     /// When a motion the compositor runs alone ends and the UI must lay
-    /// out again, if one runs (ADR-0015: nothing else asks for UI frames).
+    /// out again, if one runs (ADR-0015: nothing else asks for UI frames):
+    /// nanoseconds on the frame clock.
     #[must_use]
-    pub fn wake_at(&self) -> Option<f32> {
+    pub fn wake_at(&self) -> Option<u64> {
         self.wake_at
     }
 
@@ -1033,12 +1056,12 @@ impl Motion {
         self.wake_at = None;
     }
 
-    fn wake_by(&mut self, at: f32) {
+    fn wake_by(&mut self, at: u64) {
         self.wake_at = Some(self.wake_at.map_or(at, |w| w.min(at)));
     }
 
     /// When the subtree holding `path` started leaving.
-    fn leaving_since(&self, path: &NodePath) -> Option<f32> {
+    fn leaving_since(&self, path: &NodePath) -> Option<u64> {
         self.leaving
             .iter()
             .find(|l| path.0.starts_with(&l.path.0))
@@ -1058,7 +1081,7 @@ impl Motion {
         let rest = (style.transform.translate, style.transform.toward_anchor);
         let m = style.motion.take().unwrap_or_default();
         let leaving = self.leaving_since(path);
-        let now = clock::frame_time();
+        let now = clock::frame_nanos();
         let (reduced, hold) = (self.reduced, self.hold_loops);
         let finite_still = reduced || self.instant;
         let state = self.nodes.entry(path.clone()).or_default();
@@ -1075,7 +1098,7 @@ impl Motion {
         let playing = match (leaving, &m.animation) {
             (Some(since), _) => m.exit.clone().map(|animation| Playing {
                 animation,
-                start: since,
+                start: Some(since),
                 leaving: true,
             }),
             (None, Some(a)) => {
@@ -1090,7 +1113,7 @@ impl Motion {
                     let ended = finite_still && a.iterations.is_some();
                     state.playing = Some(Playing {
                         animation: a.clone(),
-                        start: if ended { f32::NEG_INFINITY } else { now },
+                        start: if ended { None } else { Some(now) },
                         leaving: false,
                     });
                 }
@@ -1215,7 +1238,7 @@ impl Motion {
             let parent = path.0.split_last().map(|(_, p)| p);
             if !parent.is_some_and(|p| previous.is_some_and(|r| holds(r, p))) {
                 if let Some(p) = &mut s.playing {
-                    p.start = f32::NEG_INFINITY;
+                    p.start = None;
                 }
                 again = true;
             }
@@ -1226,7 +1249,7 @@ impl Motion {
             .filter(|path| self.leaving_since(path).is_none())
             .collect();
         if !gone.is_empty() && !self.reduced && !self.instant {
-            let now = clock::frame_time();
+            let now = clock::frame_nanos();
             for path in &gone {
                 // The topmost node that left with it is the one to keep.
                 let mut len = path.0.len();
@@ -1247,7 +1270,7 @@ impl Motion {
                     .filter(|p| p.0.starts_with(&root.0))
                     .filter_map(|p| self.nodes.get(p)?.exit.as_ref())
                     .filter_map(|(a, duration)| a.end(now, *duration))
-                    .fold(now, f32::max);
+                    .fold(now, u64::max);
                 if let Some((mut slot, index)) = previous.and_then(|p| slot_at(p, &root)) {
                     for p in gone.iter().filter(|p| p.0.starts_with(&root.0)) {
                         if let Some(r) = self.nodes.get(p).and_then(|s| s.report.clone()) {
@@ -1290,7 +1313,7 @@ impl Motion {
     /// subtree whose exit has ended, whose parent is gone, or whose slot is
     /// taken again (it came back) is let go.
     pub(crate) fn splice(&mut self, mut root: Element) -> Element {
-        let now = clock::frame_time();
+        let now = clock::frame_nanos();
         let mut ended = Vec::new();
         for l in std::mem::take(&mut self.leaving) {
             // Its slot holds a node again: it came back before its exit
@@ -1330,7 +1353,7 @@ impl Motion {
 }
 
 /// Ease each property `style`'s transition lists; when `still`, none.
-fn transitions(state: &mut NodeState, style: &mut Style, m: &MotionStyle, still: bool, now: f32, busy: &mut Busy) {
+fn transitions(state: &mut NodeState, style: &mut Style, m: &MotionStyle, still: bool, now: u64, busy: &mut Busy) {
     let timing = Timing {
         duration: m.duration.unwrap_or(0.15),
         easing: m.easing.unwrap_or(Easing::STANDARD),
@@ -1389,7 +1412,7 @@ fn animate(
     m: &MotionStyle,
     p: &Playing,
     hold: bool,
-    now: f32,
+    now: u64,
     busy: &mut Busy,
 ) -> bool {
     let a = &p.animation;
@@ -1437,14 +1460,14 @@ fn animate(
 /// its end). What still runs is noted in `busy`.
 fn progress(
     a: &Animation,
-    start: f32,
+    start: Option<u64>,
     leaving: bool,
     duration: f32,
     hold: bool,
-    now: f32,
+    now: u64,
     busy: Option<&mut Busy>,
 ) -> Option<f32> {
-    let elapsed = now - start - a.delay;
+    let elapsed = elapsed(start, now) - a.delay;
     if elapsed < 0.0 || duration <= 0.0 {
         return None;
     }
@@ -1458,8 +1481,8 @@ fn progress(
             if last == 0.0 { 1.0 } else { last }
         }
         Some(n) => {
-            if let Some(b) = busy {
-                b.ends_at(start + a.delay + duration * n);
+            if let (Some(b), Some(start)) = (busy, start) {
+                b.ends_at(clock::shifted(start, a.delay + duration * n));
             }
             (elapsed / duration).fract()
         }
@@ -1562,7 +1585,8 @@ pub struct Curves {
 #[derive(Clone, Debug, PartialEq)]
 struct CurvePlay {
     animation: Arc<Animation>,
-    start: f32,
+    /// As [`Playing::start`].
+    start: Option<u64>,
     leaving: bool,
     duration: f32,
     easing: Easing,
@@ -1592,11 +1616,11 @@ impl Curves {
             })
     }
 
-    /// The values at `now` (seconds on the frame clock), starting from the
+    /// The values at `now` (nanoseconds on the frame clock), starting from the
     /// node's `transform` (its origin and what does not move).
     #[must_use]
-    pub fn at(&self, now: f32, transform: crate::style::Transform) -> Moment {
-        fn run<T: Mix>(r: Option<&Run<T>>, target: T, now: f32) -> T {
+    pub fn at(&self, now: u64, transform: crate::style::Transform) -> Moment {
+        fn run<T: Mix>(r: Option<&Run<T>>, target: T, now: u64) -> T {
             match r {
                 Some(r) if now < r.end() => r.value(now),
                 _ => target,
@@ -1826,7 +1850,7 @@ mod tests {
         assert!(s.compositor().animating(1.0), "it blinks");
         let end = s.pipeline_mut().motion().settles_at();
         assert!(
-            end.is_some_and(|t| (t - crate::paint::CARET_BLINK_TIMEOUT).abs() < 0.01),
+            end.is_some_and(|t| (crate::clock::seconds_of(t) - crate::paint::CARET_BLINK_TIMEOUT).abs() < 0.01),
             "it ends as a text input's caret stops: {end:?}"
         );
         s.rest(std::time::Duration::from_secs(20)).unwrap();
@@ -1852,13 +1876,68 @@ mod tests {
             easing: Easing::Linear,
             delay: 0.0,
         });
-        transition(&mut track, 0.0_f32, timing, 0.0, &mut busy);
-        transition(&mut track, 1.0, timing, 0.0, &mut busy);
-        assert_eq!(transition(&mut track, 1.0, timing, 0.25, &mut busy), 0.25);
+        let ms = |n: u64| n * 1_000_000;
+        transition(&mut track, 0.0_f32, timing, 0, &mut busy);
+        transition(&mut track, 1.0, timing, 0, &mut busy);
+        assert_eq!(transition(&mut track, 1.0, timing, ms(250), &mut busy), 0.25);
         // Back to 0 from a quarter of the way: a quarter of the time.
         let mut busy = Busy::default();
-        assert_eq!(transition(&mut track, 0.0, timing, 0.25, &mut busy), 0.25);
-        assert_eq!(busy.until, Some(0.5));
-        assert_eq!(transition(&mut track, 0.0, timing, 0.5, &mut busy), 0.0);
+        assert_eq!(transition(&mut track, 0.0, timing, ms(250), &mut busy), 0.25);
+        assert_eq!(busy.until, Some(ms(500)));
+        assert_eq!(transition(&mut track, 0.0, timing, ms(500), &mut busy), 0.0);
+    }
+
+    /// A fade (a transition of opacity) and a pulse (an animation the
+    /// compositor plays) sampled from 1 s of uptime and from 262,144 s
+    /// (three days, where an f32 of seconds steps by 1/64 s) give the same
+    /// values at every frame, to 1e-4: instants are exact nanoseconds and
+    /// only spans between them are seconds ([`crate::clock::span`]).
+    #[test]
+    fn a_motion_is_the_same_at_any_uptime() {
+        let ms = |n: u64| n * 1_000_000;
+        let timing = Some(Timing {
+            duration: 0.3,
+            easing: Easing::Linear,
+            delay: 0.0,
+        });
+        let samples = |base: u64| {
+            let (mut track, mut busy) = (None, Busy::default());
+            transition(&mut track, 1.0_f32, timing, base, &mut busy);
+            transition(&mut track, 0.0, timing, base + 777, &mut busy);
+            let pulse = Arc::new(Animation::pulse());
+            let curves = Curves {
+                own: Own::of(&Style::default()),
+                opacity: None,
+                translate_x: None,
+                translate_y: None,
+                scale: None,
+                rotate: None,
+                playing: Some(CurvePlay {
+                    animation: Arc::clone(&pulse),
+                    start: Some(base + 777),
+                    leaving: false,
+                    duration: 1.0,
+                    easing: Easing::Linear,
+                    hold: false,
+                }),
+            };
+            (1..40_u64)
+                .map(|k| {
+                    let at = base + 777 + ms(7 * k) + 1_234;
+                    let fade = transition(&mut track, 0.0, timing, at, &mut busy);
+                    let pulsed = curves.at(at, crate::style::Transform::default()).opacity;
+                    (fade, pulsed)
+                })
+                .collect::<Vec<_>>()
+        };
+        let near = samples(1_000_000_000);
+        let far = samples(262_144 * 1_000_000_000);
+        assert!(near.iter().any(|&(f, _)| f > 0.1 && f < 0.9), "it fades: {near:?}");
+        for (k, (a, b)) in near.iter().zip(&far).enumerate() {
+            assert!(
+                (a.0 - b.0).abs() <= 1e-4 && (a.1 - b.1).abs() <= 1e-4,
+                "frame {k}: {a:?} at 1 s, {b:?} at 262,144 s"
+            );
+        }
     }
 }

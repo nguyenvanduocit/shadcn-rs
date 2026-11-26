@@ -3,11 +3,7 @@
 //! `github-dark` colours, from irosashi, a Rust port of Shiki's TextMate
 //! engine whose tokens are byte-identical to it (ADR-0002).
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "a cache of highlighted lines the code block keeps for itself"
-)]
-use std::cell::RefCell;
+use gui::engine::WorldRefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -96,24 +92,18 @@ type Lines = Rc<Vec<Vec<HighlightedToken>>>;
 #[derive(Clone)]
 struct Highlighting(Rc<State>);
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "a cache of highlighted lines the code block keeps for itself"
-)]
 struct State {
     highlighter: Option<Highlighter>,
-    kept: RefCell<HashMap<(String, &'static str), Lines>>,
+    /// The world's that made it: a check reads what the live app kept and
+    /// keeps nothing of its own in it (ADR-0034, S7).
+    kept: WorldRefCell<HashMap<(String, &'static str), Lines>>,
 }
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "a cache of highlighted lines the code block keeps for itself"
-)]
 fn highlighting() -> Highlighting {
     use_context::<Highlighting>().unwrap_or_else(|| {
         let h = Highlighting(Rc::new(State {
             highlighter: build_highlighter(),
-            kept: RefCell::new(HashMap::new()),
+            kept: WorldRefCell::new("the code block's highlighted lines", HashMap::new()),
         }));
         provide(h.clone());
         h
@@ -169,6 +159,9 @@ pub fn highlight_code(code: &str, language: &str) -> Option<Vec<Vec<HighlightedT
     } else {
         tokenize(highlighter, code, grammar)?
     });
+    if !h.0.kept.is_here() {
+        return Some(lines.as_ref().clone());
+    }
     let mut kept = h.0.kept.borrow_mut();
     if kept.len() >= KEPT {
         kept.clear();

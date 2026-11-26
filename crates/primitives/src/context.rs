@@ -33,16 +33,17 @@ pub struct MissingRoot {
     pub at: &'static Location<'static>,
 }
 
+impl gui::engine::FreshValue for MissingRoot {}
+
 gui::engine_local! {
-    /// What was reported already: (part, root, place).
+    /// What was reported already: (part, root, place). Reported live only
+    /// (a fork is no live render), so a fork sees an empty set of its own.
     #[expect(clippy::disallowed_types, reason = "diagnostics reported once per call site, per thread: no part's state")]
-    [Shared("diagnostics, reported once per (part, root, place): no frame's result reads them")]
-    static REPORTED: RefCell<HashSet<(&'static str, &'static str, &'static Location<'static>)>> = RefCell::new(HashSet::new());
+    [Fresh] static REPORTED: RefCell<HashSet<(&'static str, &'static str, &'static Location<'static>)>> = RefCell::new(HashSet::new());
 
     /// What was reported since the last [`take_missing_roots`], in order.
     #[expect(clippy::disallowed_types, reason = "diagnostics reported once per call site, per thread: no part's state")]
-    [Shared("diagnostics, reported once per (part, root, place): no frame's result reads them")]
-    static MISSING: RefCell<Vec<MissingRoot>> = RefCell::new(Vec::new());
+    [Fresh] static MISSING: RefCell<Vec<MissingRoot>> = RefCell::new(Vec::new());
 }
 
 /// What was reported on this thread since the last call (a test drains
@@ -66,7 +67,9 @@ pub fn use_root_at<T: Clone + 'static>(
     at: &'static Location<'static>,
 ) -> Option<T> {
     let found = gui::use_context::<T>();
-    if found.is_none() && REPORTED.with(|r| r.borrow_mut().insert((part, root, at))) {
+    // A report reaches the outside world: made by the live render, never a
+    // fork's (which renders what live code rendered and reported).
+    if found.is_none() && !gui::engine::forking() && REPORTED.with(|r| r.borrow_mut().insert((part, root, at))) {
         MISSING.with(|m| {
             m.borrow_mut().push(MissingRoot { part, root, at });
         });

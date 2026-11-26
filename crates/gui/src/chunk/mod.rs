@@ -86,9 +86,10 @@ impl GridSnapshot {
     /// `values`, `width` a row, as a grid of its own.
     #[must_use]
     pub fn new(width: u32, height: u32, values: Vec<f32>) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        /// The grids made, numbered.
+        static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("grid chunk");
         Self(Arc::new(GridData {
-            id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            id: crate::engine::unique_id(&NEXT),
             version: 0,
             width,
             height,
@@ -126,8 +127,7 @@ impl PartialEq for GridSnapshot {
 
 crate::engine::engine_local! {
     /// While the cold check compares two scenes ([`comparing_content`]).
-    [Shared("a flag set only around the cold check's compare, which no frame reads")]
-    static BY_CONTENT: std::cell::Cell<bool> = std::cell::Cell::new(false);
+    [Fork] static BY_CONTENT: std::cell::Cell<bool> = std::cell::Cell::new(false);
 }
 
 /// Whether data sources compare by what they hold, not which allocation
@@ -159,11 +159,9 @@ pub struct Bytes(Arc<(u64, Vec<u8>)>);
 impl Bytes {
     #[must_use]
     pub fn new(data: Vec<u8>) -> Self {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        Self(Arc::new((
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            data,
-        )))
+        /// The byte blocks made, numbered.
+        static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("bytes chunk");
+        Self(Arc::new((crate::engine::unique_id(&NEXT), data)))
     }
 
     #[must_use]

@@ -543,18 +543,30 @@ impl LayoutTree {
         match el {
             Element::Text(n) if n.kind.spans.iter().any(|sp| !sp.bindings.is_empty()) => {
                 ex.span_bindings.resize_with(n.kind.spans.len(), || None);
-                let styles = n.kind.spans.iter().zip(ex.span_bindings.iter_mut()).map(|(sp, b)| {
-                    // A span that no longer binds drops its trackers:
-                    // what its old closures read resolves nothing.
-                    let Some(ops) = sp.bindings.ops() else {
-                        *b = None;
-                        return None;
-                    };
-                    Some(
-                        b.get_or_insert_with(|| StyleBinding::new(&self.marks, u))
-                            .get(ops, &sp.style),
-                    )
-                });
+                // A cold build reuses each span's held writes, the rest run.
+                let held = self.held.get(&ex.path).map(|h| h.spans.as_slice()).unwrap_or_default();
+                let styles = n
+                    .kind
+                    .spans
+                    .iter()
+                    .zip(ex.span_bindings.iter_mut())
+                    .enumerate()
+                    .map(|(k, (sp, b))| {
+                        // A span that no longer binds drops its trackers:
+                        // what its old closures read resolves nothing.
+                        let Some(ops) = sp.bindings.ops() else {
+                            *b = None;
+                            return None;
+                        };
+                        let held = held
+                            .iter()
+                            .find(|(at, _)| *at == k)
+                            .map_or(&[][..], |(_, h)| h.as_slice());
+                        Some(
+                            b.get_or_insert_with(|| StyleBinding::new(&self.marks, u))
+                                .get(ops, &sp.style, held),
+                        )
+                    });
                 bound_spans.extend(styles);
             }
             _ => ex.span_bindings.clear(),
@@ -603,8 +615,15 @@ impl LayoutTree {
             && ex.behaviour.cursor == style.cursor
             && match el {
                 Element::Text(n) if !bound_spans.is_empty() => acting(&n.kind.spans, &bound_spans)
-                    .map(|(k, cursor)| (k, n.kind.spans.get(k).map(|sp| &sp.range), cursor))
-                    .eq(ex.behaviour.spans.iter().map(|t| (t.index, Some(&t.range), t.cursor))),
+                    .map(|(k, cursor)| {
+                        let sp = n.kind.spans.get(k);
+                        (k, sp.map(|sp| &sp.range), cursor, sp.and_then(|sp| sp.key))
+                    })
+                    .eq(ex
+                        .behaviour
+                        .spans
+                        .iter()
+                        .map(|t| (t.index, Some(&t.range), t.cursor, t.key))),
                 _ => true,
             };
         let spans: Vec<SpanTarget> = match el {
@@ -614,6 +633,7 @@ impl LayoutTree {
                     let sp = n.kind.spans.get(k)?;
                     Some(SpanTarget {
                         index: k,
+                        key: sp.key,
                         range: sp.range.clone(),
                         click: sp.click.clone(),
                         cursor,
@@ -628,11 +648,17 @@ impl LayoutTree {
             Element::Text(n) => {
                 // Its content no longer bound, the binding goes: what it
                 // read resolves nothing, and the text it gave is let go.
+                // A binding whose first run panicked gives nothing yet:
+                // its text is empty ([`Tracked`]).
+                let held = self.held.get(&ex.path).and_then(|h| h.text.clone());
                 let bound = match n.kind.bound.as_ref() {
+                    // A cold build reuses the text the live node holds.
+                    Some(_) if let Some(t) = held => Some(t.unwrap_or_else(|| Arc::from(""))),
                     Some(f) => Some(
                         ex.text_binding
                             .get_or_insert_with(|| Box::new(Tracked::new(&self.marks, u)))
-                            .get(f, || Arc::from(f())),
+                            .get(f, || Arc::from(f()))
+                            .unwrap_or_else(|| Arc::from("")),
                     ),
                     None => {
                         ex.text_binding = None;
@@ -728,11 +754,16 @@ impl LayoutTree {
             Element::Figures(n) => (Pending::Figures(n.kind.clone()), None),
             Element::Drawn(n) => {
                 let f = &n.kind.make;
-                let d = ex
-                    .draw_binding
-                    .get_or_insert_with(|| Box::new(Tracked::new(&self.marks, u)))
-                    .get(f, || f());
-                (Pending::Drawn(d), None)
+                // A cold build reuses the drawing the live node holds.
+                let d = match self.held.get(&ex.path).and_then(|h| h.draw.clone()) {
+                    Some(held) => held,
+                    None => ex
+                        .draw_binding
+                        .get_or_insert_with(|| Box::new(Tracked::new(&self.marks, u)))
+                        .get(f, || f()),
+                };
+                // A `make` whose first run panicked has drawn nothing yet.
+                (d.map_or(Pending::None, Pending::Drawn), None)
             }
             Element::Image(n) => {
                 let (w, h) = n.kind.size();
@@ -800,7 +831,7 @@ impl LayoutTree {
                 cursor: style.cursor,
                 field,
                 spans,
-                scroll: common.scroll.clone(),
+                scroll: common.scroll,
                 scroll_built: common.scroll_built.clone(),
                 semantics: common.semantics.clone(),
                 interaction: ex.interaction.flags(),
@@ -1060,9 +1091,14 @@ impl LayoutTree {
         match common.bindings.ops() {
             Some(ops) => {
                 let base = &common.style;
+                // A cold build writes each bound write the live node holds
+                // over a panic as it last gave, never running it again;
+                // every other write runs, so it is checked (ADR-0015, rule
+                // 12: a hold per setter).
+                let held = self.held.get(&ex.path).map_or(&[][..], |h| h.style.as_slice());
                 ex.style_binding
                     .get_or_insert_with(|| Box::new(StyleBinding::new(&self.marks, u)))
-                    .get(ops, base)
+                    .get(ops, base, held)
             }
             // Nothing bound any more: its trackers go, so what its old
             // closures read resolves nothing (as a span's do).

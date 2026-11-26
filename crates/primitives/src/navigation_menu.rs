@@ -69,12 +69,7 @@
 //!
 //! The indicator's place is [`NavigationMenu::active_trigger`].
 
-use std::cell::Cell;
-#[expect(
-    clippy::disallowed_types,
-    reason = "boxes written by the menu's own layout callback on its triggers and links, bounded by those laid out"
-)]
-use std::cell::RefCell;
+use gui::engine::{WorldCell, WorldRefCell};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -192,10 +187,9 @@ pub enum Motion {
     ToEnd,
 }
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "boxes written by the menu's own layout callback on its triggers and links, bounded by those laid out"
-)]
+/// Its cells are the world's that made the menu: a check writes none of a
+/// live one's (ADR-0034, S7). The boxes are written by the menu's own
+/// layout callback on its triggers and links, bounded by those laid out.
 struct Nav {
     value: Rc<dyn NavValue>,
     options: NavOptions,
@@ -207,15 +201,15 @@ struct Nav {
     top: Collection<()>,
     /// Where the triggers and links of the menu were laid out: a press on
     /// one is not outside a panel.
-    boxes: RefCell<Vec<(FocusId, Bounds)>>,
+    boxes: WorldRefCell<Vec<(FocusId, Bounds)>>,
     /// The open item's trigger box (tracked: the indicator's).
     active: Signal<Option<Bounds>>,
-    timer: Cell<Option<TimerId>>,
+    timer: WorldCell<Option<TimerId>>,
     /// A panel the pointer closed opens the next sooner, for a while.
-    skipped: Cell<bool>,
-    skip_timer: Cell<Option<TimerId>>,
+    skipped: WorldCell<bool>,
+    skip_timer: WorldCell<Option<TimerId>>,
     /// A pending close the pointer's switch to another trigger drops.
-    skip_next_close: Cell<bool>,
+    skip_next_close: WorldCell<bool>,
     /// The menu this one is nested in (reka's `NavigationMenuSub`): its
     /// triggers switch at once on hover, the pointer leaving closes
     /// nothing, and a press outside its panel does not close it.
@@ -250,7 +244,7 @@ impl std::fmt::Debug for NavigationMenu {
     }
 }
 
-fn cancel(timer: &Cell<Option<TimerId>>) {
+fn cancel(timer: &WorldCell<Option<TimerId>>) {
     if let Some(t) = timer.take() {
         clock::cancel(t);
     }
@@ -283,10 +277,6 @@ impl NavigationMenu {
     }
 
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "boxes written by the menu's own layout callback on its triggers and links, bounded by those laid out"
-    )]
     fn make(value: impl NavValue + 'static, options: NavOptions, parent: Option<NavigationMenu>) -> Self {
         let me = Self {
             nav: Signal::new(Nav {
@@ -296,12 +286,12 @@ impl NavigationMenu {
                 previous: Signal::labeled("navigation menu previous", None),
                 order: Members::new(),
                 top: Collection::new(),
-                boxes: RefCell::new(Vec::new()),
+                boxes: WorldRefCell::new("a navigation menu's trigger boxes", Vec::new()),
                 active: Signal::labeled("navigation menu active trigger", None),
-                timer: Cell::new(None),
-                skipped: Cell::new(false),
-                skip_timer: Cell::new(None),
-                skip_next_close: Cell::new(false),
+                timer: WorldCell::new("a navigation menu's timer", None),
+                skipped: WorldCell::new("whether a navigation menu skips its delay", false),
+                skip_timer: WorldCell::new("a navigation menu's skip timer", None),
+                skip_next_close: WorldCell::new("whether a navigation menu drops its next close", false),
                 parent,
                 items: gui::Registry::new(),
                 subs: gui::Registry::new(),
@@ -699,23 +689,24 @@ impl NavigationMenu {
     }
 }
 
+/// The world's that made the item: a check writes none of a live one's.
 #[derive(Default)]
 struct Flags {
     /// Escape closed it: the pointer does not open it again until it
     /// leaves the trigger and comes back.
-    escape_closed: Cell<bool>,
+    escape_closed: WorldCell<bool>,
     /// A click closed it: the same.
-    click_closed: Cell<bool>,
+    click_closed: WorldCell<bool>,
     /// A move asked to open it just now: a click is ignored.
-    moved_open: Cell<bool>,
-    moved_timer: Cell<Option<TimerId>>,
+    moved_open: WorldCell<bool>,
+    moved_timer: WorldCell<Option<TimerId>>,
     /// Where the pointer last moved on the trigger: an event at the same
     /// place, which `gui` sends again after a frame, is no move (a browser
     /// sends no `pointermove` then).
-    at: Cell<Option<(f32, f32)>>,
+    at: WorldCell<Option<(f32, f32)>>,
     /// A touch or pen is down on the trigger: its click is a tap, not the
     /// mouse's.
-    touched: Cell<bool>,
+    touched: WorldCell<bool>,
 }
 
 /// One item of a navigation menu, a trigger and its panel (reka's

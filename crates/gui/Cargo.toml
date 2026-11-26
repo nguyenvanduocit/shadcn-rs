@@ -107,3 +107,8 @@ accesskit_consumer = "0.39"
 # Text snapshots of the layout and accessibility dumps (M9 I4), reviewed
 # with `cargo insta review` and rewritten with INSTA_UPDATE=always.
 insta = "1"
+# The kept-closure lint (ADR-0015, tests/kept_closures.rs): gui, primitives
+# and shadcn sources parsed, so a closure kept outside `Stored` is found by
+# its type, not by the text on its line.
+syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = "1"

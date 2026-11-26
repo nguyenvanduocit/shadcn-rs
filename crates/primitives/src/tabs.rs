@@ -120,7 +120,8 @@ struct State {
     /// The tab asked for by its focus arriving or by a press, and the frame
     /// it was in: a press focuses as it selects, and the one act asks once,
     /// whichever of the two runs first.
-    asked: std::cell::Cell<Option<(gui::focus::FocusId, f32)>>,
+    /// The world's that made the tabs: a check writes none of live tabs'.
+    asked: gui::engine::WorldCell<Option<(gui::focus::FocusId, f32)>>,
 }
 
 /// A tabs' state: made once in its root's setup, `Copy`.
@@ -187,7 +188,7 @@ impl<P: 'static, T: Clone + Eq + Hash + 'static> Tabs<P, T> {
             links: gui::Keyed::new(),
             state: Signal::new(State {
                 options: Rc::clone(&options),
-                asked: std::cell::Cell::new(None),
+                asked: gui::engine::WorldCell::new("the tab asked for (`Tabs`)", None),
             }),
         };
         // The keymap follows the caller's orientation and wrap.

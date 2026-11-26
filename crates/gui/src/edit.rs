@@ -57,8 +57,9 @@ impl Eq for TextEdit {}
 
 /// A new content revision, never one given before.
 fn revision() -> u64 {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    /// The revisions given, numbered.
+    static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("text revision");
+    crate::engine::unique_id(&NEXT)
 }
 
 /// A copy of a field's text: every copy the edit path makes goes through
@@ -80,6 +81,70 @@ pub struct Shown {
     pub anchor: usize,
     /// What its text was made from.
     source: Source,
+}
+
+impl Shown {
+    /// How an offset in this text falls in the value it shows
+    /// ([`Offsets`]), `preedit` the range a composition takes in it.
+    #[must_use]
+    pub(crate) fn offsets(&self, preedit: Option<(usize, usize)>) -> Offsets {
+        if self.source.masked {
+            return Offsets::Masked;
+        }
+        match (self.source.composing, preedit) {
+            (Some((_, start, end)), Some((a, b))) => Offsets::Composed {
+                start,
+                shown: b.saturating_sub(a),
+                replaced: end.saturating_sub(start),
+            },
+            _ => Offsets::Plain,
+        }
+    }
+}
+
+/// How an offset in what a field showed falls in its value: the one map
+/// from shown text to value, a pure function of what was shown, so an
+/// event routed in a frame lands where that frame showed it, whatever the
+/// field shows now (revealed, masked, its composition ended since).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Offsets {
+    /// The value as it is.
+    #[default]
+    Plain,
+    /// Each character of the value shown as one bullet: the `n`th bullet
+    /// is the value's `n`th character.
+    Masked,
+    /// A composition `shown` bytes long at `start`, standing in for the
+    /// `replaced` bytes of the value's selection there: inside it is where
+    /// it starts, past it is past the selection.
+    Composed {
+        start: usize,
+        shown: usize,
+        replaced: usize,
+    },
+}
+
+impl Offsets {
+    /// Where `at` in the shown text falls in `value`.
+    #[must_use]
+    pub fn value_offset(self, value: &str, at: usize) -> usize {
+        match self {
+            Self::Plain => at,
+            Self::Masked => {
+                let nth = at.checked_div(BULLET.len_utf8()).unwrap_or(0);
+                value.char_indices().nth(nth).map_or(value.len(), |(i, _)| i)
+            }
+            Self::Composed { start, shown, replaced } => {
+                if at <= start {
+                    at
+                } else if at < start.saturating_add(shown) {
+                    start
+                } else {
+                    at.saturating_sub(shown).saturating_add(replaced)
+                }
+            }
+        }
+    }
 }
 
 /// What a shown text is made from: the value's revision, the composition
@@ -307,8 +372,7 @@ impl TextEdit {
     /// Where an offset `at` in [`Self::masked`] falls in this text.
     #[must_use]
     pub fn unmasked(&self, at: usize) -> usize {
-        let nth = at.checked_div(BULLET.len_utf8()).unwrap_or(0);
-        self.text.char_indices().nth(nth).map_or(self.text.len(), |(i, _)| i)
+        Offsets::Masked.value_offset(&self.text, at)
     }
 
     /// Show `preedit` in place of the selection; an empty one ends the
@@ -389,14 +453,12 @@ impl TextEdit {
     pub fn uncomposed(&self, at: usize) -> usize {
         let Some(p) = &self.preedit else { return at };
         let (a, b) = self.selection();
-        let end = a.saturating_add(p.text.len());
-        if at <= a {
-            at
-        } else if at < end {
-            a
-        } else {
-            at.saturating_sub(p.text.len()).saturating_add(b.saturating_sub(a))
+        Offsets::Composed {
+            start: a,
+            shown: p.text.len(),
+            replaced: b.saturating_sub(a),
         }
+        .value_offset(&self.text, at)
     }
 
     /// Put the caret at `at` (clamped to a char boundary), as a click does.
@@ -501,49 +563,101 @@ impl TextField {
         self.view.update(|v| v.reveal = v.reveal.wrapping_add(1));
     }
 
-    /// Its content's scroll offset.
+    /// Its content's scroll offset, in pixels.
+    #[cfg(test)]
     pub(crate) fn offset(&self) -> (f32, f32) {
-        self.view.with_untracked(|v| v.offset)
+        crate::compositor::motion::px2(self.pos())
     }
 
-    /// Scroll its content to `offset`.
+    /// Its content's scroll position, exactly ([`crate::compositor::motion`]).
+    pub(crate) fn pos(&self) -> crate::compositor::motion::Exact {
+        self.view.with_untracked(|v| v.pos)
+    }
+
+    /// How many times the UI side jumped its content
+    /// ([`FieldView::generation`]).
+    pub(crate) fn scroll_generation(&self) -> u64 {
+        self.view.with_untracked(|v| v.generation)
+    }
+
+    /// Scroll its content to `offset` as a program's jump does, unless it
+    /// is there.
+    #[cfg(test)]
     pub(crate) fn scroll_to(&self, offset: (f32, f32)) {
-        if self.offset() != offset {
-            self.view.update(|v| v.offset = offset);
+        self.put(crate::compositor::motion::units2(offset), crate::scroll::Move::Jump);
+    }
+
+    /// Put its content at `pos`, as a jump (a new generation) or a
+    /// rebase ([`crate::scroll::Move`], the one rule for both kinds),
+    /// unless it is there: an assignment, the last made wins (ADR-0032).
+    fn put(&self, pos: crate::compositor::motion::Exact, kind: crate::scroll::Move) {
+        if self.pos() == pos {
+            return;
+        }
+        let jump = kind == crate::scroll::Move::Jump;
+        self.view.update(|v| {
+            v.pos = pos;
+            if jump {
+                v.generation = v.generation.wrapping_add(1);
+            }
+        });
+    }
+
+    /// The compositor's scroll taken in put its content at `pos`
+    /// ([`crate::interact::InputState::take_scroll`]): no new generation.
+    pub(crate) fn synced(&self, pos: crate::compositor::motion::Exact) {
+        if self.pos() != pos {
+            self.view.update(|v| v.pos = pos);
         }
     }
 
-    /// Laid out at `offset`, having taken reveals up to generation
-    /// `applied` (a newer ask stays to be taken).
-    pub(crate) fn settled(&self, offset: (f32, f32), applied: u64) {
-        if self.view.with_untracked(|v| v.offset != offset || v.applied != applied) {
-            self.view.update(|v| {
-                v.offset = offset;
-                v.applied = applied;
-            });
+    /// Laid out at `pos`, having taken reveals up to generation
+    /// `applied` (a newer ask stays to be taken). A reveal it took that
+    /// moved its content is the UI's own write, a jump (what the
+    /// compositor flings there stops, ADR-0032 I4); a position only
+    /// clamped (its text shrank under it) is not.
+    pub(crate) fn settled(&self, pos: crate::compositor::motion::Exact, applied: u64) {
+        let revealed = self.view.with_untracked(|v| v.applied != applied);
+        if revealed {
+            self.put(pos, crate::scroll::Move::Jump);
+            self.view.update(|v| v.applied = applied);
+        } else {
+            self.put(pos, crate::scroll::Move::Rebase);
         }
     }
 }
 
-/// How a text field's content is scrolled: its offset, and the caret
+/// How a text field's content is scrolled: its position, and the caret
 /// reveals asked (a generation) and taken.
 #[derive(Debug, PartialEq)]
 pub(crate) struct FieldView {
-    pub offset: (f32, f32),
+    /// Exactly ([`crate::compositor::motion`]): its pixels are drawn.
+    pub pos: crate::compositor::motion::Exact,
     /// Bumped by each ask to bring the caret into view.
     pub reveal: u64,
     /// The last generation its field took.
     pub applied: u64,
+    /// Bumped each time the UI side jumps its content (its own scroll to a
+    /// place, a reveal that moved it), never by the compositor's scroll
+    /// taken in: the field's [`crate::layout::Scroll::generation`], which
+    /// stops what the compositor flings there (ADR-0032 I4), as a scroll
+    /// container's handle has its own ([`crate::ScrollHandle`]).
+    pub generation: u64,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(clippy::derivable_impls, reason = "a test build counts the views made here")
+)]
 impl Default for FieldView {
     fn default() -> Self {
         #[cfg(test)]
         VIEWS.with(|n| n.set(n.get().saturating_add(1)));
         Self {
-            offset: (0.0, 0.0),
+            pos: (0, 0),
             reveal: 0,
             applied: 0,
+            generation: 0,
         }
     }
 }

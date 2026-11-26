@@ -9,14 +9,15 @@
 /// declarations (extern blocks, impls, functions) it may hold. Each of them
 /// is lifted by one `#[expect(unsafe_code, …)]` on its own function or
 /// extern block, so the count of those is the sum.
-const SITES: [(&str, &str, usize, usize); 6] = [
+const SITES: [(&str, &str, usize, usize); 7] = [
     ("lib.rs", include_str!("../src/lib.rs"), 0, 0),
     ("ticks.rs", include_str!("../src/ticks.rs"), 0, 0),
     ("gamut.rs", include_str!("../src/gamut.rs"), 0, 0),
     ("edid.rs", include_str!("../src/edid.rs"), 0, 0),
-    // Ten blocks (ADR-0029's table, 1 to 9 and 12) and the declaration of
-    // one ColorSync function.
-    ("macos.rs", include_str!("../src/macos.rs"), 10, 1),
+    ("scroll.rs", include_str!("../src/scroll.rs"), 0, 0),
+    // Thirteen blocks (ADR-0029's table, 1 to 9, 12, and the scroll tap's
+    // 13 to 15) and the declaration of one ColorSync function.
+    ("macos.rs", include_str!("../src/macos.rs"), 13, 1),
     // Xlib's XCB connection, and adopting it (ADR-0029's table, 10 and 11).
     ("x11.rs", include_str!("../src/x11.rs"), 2, 0),
 ];
@@ -215,6 +216,24 @@ const MACOS_CALLS: &[(&str, (u32, u32))] = &[
     ("is_running", (10, 4)),
     ("CVGetCurrentHostTime", (10, 4)),
     ("CVGetHostClockFrequency", (10, 4)),
+    // NSEvent, NSWindow, NSView, NSProcessInfo: the scroll tap
+    ("addLocalMonitorForEventsMatchingMask_handler", (10, 6)),
+    ("removeMonitor", (10, 6)),
+    // The tapped window, held weakly (NSApplication).
+    ("sharedApplication", (10, 0)),
+    ("windows", (10, 0)),
+    ("window", (10, 0)),
+    ("locationInWindow", (10, 0)),
+    ("contentView", (10, 0)),
+    ("convertPoint_fromView", (10, 0)),
+    ("momentumPhase", (10, 7)),
+    ("scrollingDeltaX", (10, 7)),
+    ("scrollingDeltaY", (10, 7)),
+    ("hasPreciseScrollingDeltas", (10, 7)),
+    ("modifierFlags", (10, 0)),
+    ("pressedMouseButtons", (10, 6)),
+    ("processInfo", (10, 0)),
+    ("systemUptime", (10, 6)),
 ];
 
 /// What `macos.rs` must not call at all, and why.

@@ -106,7 +106,8 @@ fn handle(s: &Shot, nth: usize) -> Result<(f32, f32), ScenarioError> {
         .iter()
         .filter(|n| n.name == Some("resizable-handle"))
         .nth(nth)
-        .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
+        .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound(format!("resizable-handle #{nth}")))
 }
 

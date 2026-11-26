@@ -137,14 +137,8 @@ impl CaptureGroup {
     /// A group of its own.
     #[must_use]
     pub fn new() -> Self {
-        crate::engine::engine_local! {
-            [Fork] static NEXT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-        }
-        Self(NEXT.with(|n| {
-            let id = n.get();
-            n.set(id.wrapping_add(1));
-            id
-        }))
+        static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("capture group");
+        Self(crate::engine::unique_id(&NEXT))
     }
 }
 

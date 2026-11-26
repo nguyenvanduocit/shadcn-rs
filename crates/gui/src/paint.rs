@@ -26,7 +26,7 @@ use std::time::Duration;
 use crate::clock;
 use crate::color::Color;
 use crate::compositor::Commit;
-use crate::compositor::{Compositing, Hit, MovingNode, NodeKey, ScrollNode, ThumbNode};
+use crate::compositor::{Compositing, Hit, MovingNode, NodeKey, ScrollNode, ShownText, ThumbNode};
 use crate::effects;
 use crate::geometry::{Bounds, NodePath};
 use crate::inspect::{PaintStats, Repaint};
@@ -36,6 +36,13 @@ use crate::scene::{
 };
 use crate::style::{Corners, Edges, ResolvedText};
 use crate::text::{Paragraph, Target, TextSystem, physical, physical_pos};
+
+/// Paint's reader of laid-out geometry ([`crate::layout::Sight`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Sight(());
+
+/// Paint's [`Sight`].
+const SIGHT: Sight = Sight(());
 
 /// The caret shows for this long, then hides for as long.
 const BLINK: f32 = 0.53;
@@ -53,22 +60,24 @@ pub(crate) const CARET_BLINK_TIMEOUT: f32 = 10.0;
 /// shows in none other (Blink's `FrameSelection::FocusedOrActiveStateChanged`).
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct CaretClock {
-    since: f32,
+    /// When they began, nanoseconds on the frame clock: the blink's phase
+    /// is the span from it ([`clock::span`]), exact at any uptime.
+    since: u64,
     active: bool,
 }
 
 impl CaretClock {
     /// Whether a focused caret shows at `t`: from `since`, shown for
     /// [`BLINK`], hidden for as long, and so on, until it stays shown.
-    fn shows(self, t: f32) -> bool {
-        let e = t - self.since;
+    fn shows(self, t: impl clock::Moment) -> bool {
+        let e = clock::span(self.since, t.nanos());
         self.active && (e < 0.0 || e >= CARET_BLINK_TIMEOUT || (e / BLINK).floor().rem_euclid(2.0) < 1.0)
     }
 
     /// How long after `t` a focused caret next shows or hides; none while
     /// it stays as it is (blinked out, or in an inactive window).
-    fn next_change(self, t: f32) -> Option<f32> {
-        let e = (t - self.since).max(0.0);
+    fn next_change(self, t: impl clock::Moment) -> Option<f32> {
+        let e = clock::span(self.since, t.nanos()).max(0.0);
         if !self.active || e >= CARET_BLINK_TIMEOUT {
             return None;
         }
@@ -121,6 +130,9 @@ pub struct Painter {
     /// under the same key, or whose component another replaced at its key,
     /// is a new one.
     scroll_instances: foldhash::HashMap<(NodeKey, Option<crate::reactive::OwnerId>), u64>,
+    /// The last map of them emptied, kept for the next layout's
+    /// ([`Self::mount_scrollers`]).
+    scroll_spare: foldhash::HashMap<(NodeKey, Option<crate::reactive::OwnerId>), u64>,
     /// The instance the next new scroll container is.
     next_scroll: u64,
     /// The scene as last recorded (and committed).
@@ -140,6 +152,18 @@ pub struct Painter {
     overlay_of: Vec<Option<usize>>,
     region: Vec<bool>,
     hit_rect: Vec<Option<HitBox>>,
+    /// Per frame node, the cursor it shows as the last tables had it
+    /// ([`crate::compositor::Hit::cursor`]): its own, or its nearest
+    /// ancestor's with one.
+    cursor_of: Vec<Option<crate::style::Cursor>>,
+    /// Per frame node, the text its box shows input
+    /// ([`crate::compositor::ShownText`]), and the last tables' while new
+    /// ones are made: one kept while it shows the same.
+    shown_text: Vec<Option<Arc<ShownText>>>,
+    shown_text_was: Vec<Option<Arc<ShownText>>>,
+    /// Scratch: the tables' texts as made, by the place of their box in
+    /// the hit table ([`Compositing::texts`]).
+    texts: Vec<(u32, Arc<ShownText>)>,
     /// Focused inputs, whose caret blinks.
     blinkers: Vec<usize>,
     /// Scratch: the nodes a record visits.
@@ -248,6 +272,12 @@ impl Pooled {
 fn item_bytes(n: usize) -> usize {
     n.saturating_mul(std::mem::size_of::<Item>())
 }
+
+/// How many nodes a whole record paints between a check's cancellation
+/// points: few enough that a slice stays far under the input budget
+/// (ADR-0028's +2 ms), many enough that live paint pays one test per run
+/// of them.
+const CANCEL_EVERY: usize = 64;
 
 /// Whether a display with room for `room` items is large ([`LARGE_BYTES`]).
 fn large(room: usize) -> bool {
@@ -466,11 +496,11 @@ struct Moved {
 impl Moved {
     fn of(node: &FrameNode) -> Self {
         Self {
-            offset: node.offset,
+            offset: node.offset(SIGHT),
             opacity: node.look.opacity,
             scale: node.look.transform.scale,
             rotate: node.look.transform.rotate,
-            clip: node.clip,
+            clip: node.clip(SIGHT),
         }
     }
 }
@@ -576,10 +606,9 @@ fn same_look(a: &Look, b: &Look) -> bool {
 /// The node as its chunk records it: in its paint space, unclipped (its
 /// clip is the chunk's state), its properties aside.
 fn in_space(node: &FrameNode) -> FrameNode {
-    FrameNode {
-        content: node.content.clone(),
-        ..bare_in_space(node)
-    }
+    let mut n = bare_in_space(node);
+    n.content = node.content.clone();
+    n
 }
 
 /// [`in_space`] written over `into`, the buffers of its content kept: a
@@ -608,10 +637,8 @@ fn in_space_into(node: &FrameNode, into: &mut FrameNode) {
         }
         (to, from) => to.clone_from(from),
     }
-    *into = FrameNode {
-        content,
-        ..bare_in_space(node)
-    };
+    *into = bare_in_space(node);
+    into.content = content;
 }
 
 /// [`in_space`] without its content.
@@ -625,32 +652,13 @@ fn bare_in_space(node: &FrameNode) -> FrameNode {
     };
     look.effects.filters.clear();
     look.effects.mask = None;
-    FrameNode {
-        path: node.path.clone(),
-        name: node.name,
-        bounds: node.space,
-        content_box: node.space_content,
-        space: node.space,
-        space_content: node.space_content,
-        offset: (0.0, 0.0),
-        translating: false,
-        moving: None,
-        clip: None,
-        clip_radius: Corners::default(),
-        clip_curve: crate::shape::ROUND,
-        clipper: None,
-        layer: node.layer,
-        parent: None,
-        look,
-        content: Content::None,
-        scroll: None,
-    }
+    node.in_space(look)
 }
 
 /// Whether the caret of a text input shows now, its blink as `caret` says.
 fn caret_on(node: &FrameNode, caret: CaretClock) -> bool {
     match &node.content {
-        Content::Input { focused, mode, .. } => *focused && !mode.read_only && caret.shows(clock::frame_time()),
+        Content::Input { focused, mode, .. } => *focused && !mode.read_only && caret.shows(clock::frame_nanos()),
         _ => false,
     }
 }
@@ -668,7 +676,7 @@ pub fn window_background(frame: &Frame, size: (u32, u32), scale: f32, fallback: 
         crate::convert::u32_to_f32(size.0) / scale.max(1e-3),
         crate::convert::u32_to_f32(size.1) / scale.max(1e-3),
     );
-    let b = root.bounds;
+    let b = root.bounds(SIGHT);
     let covers = b.x <= 0.0 && b.y <= 0.0 && b.x + b.width >= w - 0.5 && b.y + b.height >= h - 0.5;
     match root.look.background {
         Some(c) if covers && c.a >= 1.0 && root.look.opacity >= 1.0 && !root.look.invisible => c,
@@ -791,7 +799,125 @@ fn is_blinker(node: &FrameNode) -> bool {
 
 /// The box the compositor hit-tests a node by.
 fn hit_box(node: &FrameNode) -> HitBox {
-    (node.space, node.look.shape, node.look.hit_slop)
+    (node.space(SIGHT), node.look.shape, node.look.hit_slop)
+}
+
+/// `b` (laid out in the window) from the corner of `node`'s border box.
+fn from_corner(node: &FrameNode, b: Bounds) -> Bounds {
+    Bounds {
+        x: b.x - node.bounds(SIGHT).x,
+        y: b.y - node.bounds(SIGHT).y,
+        ..b
+    }
+}
+
+/// The spans of node `i` that take the pointer, each box its text took
+/// with the span's index, from its corner.
+fn span_boxes<'a>(
+    frame: &'a Frame,
+    i: usize,
+    node: &'a FrameNode,
+) -> impl Iterator<Item = crate::compositor::ShownSpan> + 'a {
+    frame
+        .behaviour(i)
+        .into_iter()
+        .flat_map(|b| b.spans.iter())
+        .flat_map(move |s| {
+            let (span, cursor) = (s.id(), s.cursor);
+            s.boxes.iter().map(move |b| crate::compositor::ShownSpan {
+                span,
+                cursor,
+                rect: from_corner(node, *b),
+            })
+        })
+}
+
+/// [`ShownText::Field`]'s `scrolls`: the id of the content transform
+/// paint writes for a scrolling field, `content` (its box's offset plus
+/// the scroll applied; [`ShownText::scrolled`] takes the box's transform
+/// off it). It is a transform id, not a scroll amount. `None` for a
+/// field that does not scroll.
+fn scrolls(node: &FrameNode, content: u32) -> Option<u32> {
+    node.scroll(SIGHT).map(|_| content)
+}
+
+/// The text node `i`'s box shows input as laid out now
+/// ([`ShownText`]): a field's, or a paragraph's spans that take the
+/// pointer; `None` for neither. `content`: the content transform paint
+/// placed it with.
+fn shown_text(frame: &Frame, i: usize, node: &FrameNode, content: u32) -> Option<ShownText> {
+    match &node.content {
+        Content::Input {
+            edit,
+            text,
+            focused,
+            multiline,
+            preedit,
+            ..
+        } => Some(ShownText::Field {
+            content: Arc::clone(&edit.text),
+            text: text.clone(),
+            area: from_corner(node, node.content_box(SIGHT)),
+            multiline: *multiline,
+            focused: *focused,
+            scrolls: scrolls(node, content),
+            offsets: edit.offsets(*preedit),
+            caret: edit.caret,
+            selection: edit.selection(),
+            preedit: *preedit,
+        }),
+        _ if frame.behaviour(i).is_some_and(|b| !b.spans.is_empty()) => {
+            Some(ShownText::Spans(span_boxes(frame, i, node).collect()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether node `i` shows input the text `was` holds (`None`: none), by
+/// comparison alone: a frame that changes no text makes nothing.
+fn shows_text(frame: &Frame, i: usize, node: &FrameNode, content_at: u32, was: Option<&ShownText>) -> bool {
+    match (&node.content, was) {
+        (
+            Content::Input {
+                edit,
+                text,
+                focused,
+                multiline,
+                preedit: shown_preedit,
+                ..
+            },
+            Some(ShownText::Field {
+                content,
+                text: t,
+                area,
+                multiline: m,
+                focused: f,
+                scrolls: s,
+                offsets,
+                caret,
+                selection,
+                preedit,
+            }),
+        ) => {
+            (Arc::ptr_eq(&edit.text, content) || *edit.text == **content)
+                && edit.offsets(*shown_preedit) == *offsets
+                && text == t
+                && from_corner(node, node.content_box(SIGHT)) == *area
+                && multiline == m
+                && focused == f
+                && scrolls(node, content_at) == *s
+                && edit.caret == *caret
+                && edit.selection() == *selection
+                && shown_preedit == preedit
+        }
+        (Content::Input { .. }, _) => false,
+        (_, Some(ShownText::Spans(boxes))) => {
+            frame.behaviour(i).is_some_and(|b| !b.spans.is_empty())
+                && span_boxes(frame, i, node).eq(boxes.iter().copied())
+        }
+        (_, Some(ShownText::Field { .. })) => false,
+        (_, None) => frame.behaviour(i).is_none_or(|b| b.spans.is_empty()),
+    }
 }
 
 /// What the compositor hit-tests a node by, as the UI does
@@ -806,7 +932,8 @@ fn has_overlay(node: &FrameNode) -> bool {
 
 /// A scroll container that shows a thumb.
 fn has_thumb(node: &FrameNode) -> bool {
-    node.scroll.is_some_and(|s| s.max.1 > 0.0 && !s.thumb.is_transparent())
+    node.scroll(SIGHT)
+        .is_some_and(|s| s.max.1 > 0.0 && !s.thumb.is_transparent())
 }
 
 /// The ids of the transforms, clips and effects in-place writes (`undo`)
@@ -966,6 +1093,38 @@ impl Painter {
         &self.scene
     }
 
+    /// The mount the scroll container at `key`, of the component instance
+    /// `owner`, is in the tables as last recorded ([`ScrollNode::instance`]):
+    /// what the compositor's scroll for it must name to be taken in
+    /// (ADR-0033); none when no such container is there.
+    pub(crate) fn scroll_instance(&self, key: NodeKey, owner: Option<crate::reactive::OwnerId>) -> Option<u64> {
+        self.scroll_instances.get(&(key, owner)).copied()
+    }
+
+    /// Take in the scroll containers `frame` laid out, painted or not: one
+    /// gone from it is unmounted, and one at its identity later is a new
+    /// mount ([`ScrollNode::instance`]), though no paint saw the gap (a UI
+    /// behind its input lays out each input's change). What the compositor
+    /// moved the old one by then names a mount that is gone (ADR-0033).
+    pub(crate) fn mount_scrollers(&mut self, frame: &crate::layout::Frame) {
+        let mut was = std::mem::take(&mut self.scroll_instances);
+        let mut now = std::mem::take(&mut self.scroll_spare);
+        for (i, node) in frame.nodes.iter().enumerate() {
+            if node.scroll(SIGHT).is_none() {
+                continue;
+            }
+            let identity = (NodeKey::of(&node.path), crate::interact::owner_of(frame, i));
+            let instance = was.get(&identity).copied().unwrap_or_else(|| {
+                self.next_scroll = self.next_scroll.wrapping_add(1);
+                self.next_scroll
+            });
+            now.insert(identity, instance);
+        }
+        was.clear();
+        self.scroll_spare = was;
+        self.scroll_instances = now;
+    }
+
     /// Record the whole frame (reusing each chunk whose input is the same).
     fn record_all(
         &mut self,
@@ -1009,6 +1168,12 @@ impl Painter {
         let generation = text.generation();
         let mut layer = frame.nodes.first().map_or(0, |n| n.layer);
         for (i, node) in frame.nodes.iter().enumerate() {
+            // A check's paint can be given up every so many nodes, so no
+            // slice of it is a whole paint (ADR-0028, ADR-0034 S10). What
+            // it recorded is its own painter's, dropped with it.
+            if i % CANCEL_EVERY == 0 {
+                crate::engine::cancel_point();
+            }
             self.overlays(frame, &mut over, Some(i), &mut scene, scale, generation, text);
             if node.layer != layer {
                 // A layer's thumbs paint over all of it.
@@ -1379,7 +1544,10 @@ impl Painter {
             {
                 return Err(Whole);
             }
-            compositing |= node.scroll.is_some() || node.moving.is_some() || self.hit_changed(frame, i, node);
+            compositing |= node.scroll(SIGHT).is_some()
+                || node.moving.is_some()
+                || self.hit_changed(frame, i, node)
+                || self.text_changed(frame, i, node);
             if has_thumb(node) {
                 thumbs.push(i);
             }
@@ -1416,8 +1584,30 @@ impl Painter {
 
     /// Whether node `i`'s box the compositor hit-tests changed.
     fn hit_changed(&self, frame: &Frame, i: usize, node: &FrameNode) -> bool {
-        let takes = frame.behaviour(i).is_some_and(|b| !b.pass_through) && !node.look.invisible;
-        takes.then(|| hit_box(node)) != self.hit_rect.get(i).copied().flatten()
+        frame.takes_pointer(i).then(|| hit_box(node)) != self.hit_rect.get(i).copied().flatten()
+            || self.cursor_at(frame, i, node) != self.cursor_of.get(i).copied().flatten()
+    }
+
+    /// The cursor node `i` shows: its own, or its parent's as the last
+    /// tables had it. A node whose own cursor changed is visited, so its
+    /// tables are made again, and every node under it resolved afresh.
+    fn cursor_at(&self, frame: &Frame, i: usize, node: &FrameNode) -> Option<crate::style::Cursor> {
+        frame
+            .behaviour(i)
+            .and_then(|b| b.cursor)
+            .or_else(|| node.parent.and_then(|q| self.cursor_of.get(q).copied().flatten()))
+    }
+
+    /// Whether the text node `i`'s box shows input changed
+    /// ([`ShownText`]).
+    fn text_changed(&self, frame: &Frame, i: usize, node: &FrameNode) -> bool {
+        let was = self.shown_text.get(i).and_then(Option::as_deref);
+        if frame.takes_pointer(i) {
+            let content = self.placed.get(i).map_or(0, |p| p.content);
+            !shows_text(frame, i, node, content, was)
+        } else {
+            was.is_some()
+        }
     }
 
     /// Whether `node`'s caret shows otherwise than its overlay chunk, the
@@ -1448,26 +1638,35 @@ impl Painter {
         // its path, which a wheel the UI is handed names.
         let mut instance_of: Vec<Option<crate::reactive::OwnerId>> = Vec::with_capacity(frame.nodes.len());
         self.hit_rect.clear();
+        self.cursor_of.clear();
+        std::mem::swap(&mut self.shown_text, &mut self.shown_text_was);
+        self.shown_text.clear();
+        self.texts.clear();
         // Below the top modal layer the wheel scrolls nothing (ADR-0024):
         // a window-sized hit in no scroll container, under that layer.
         let floor = crate::layer::Stack::of(frame).floor;
         for (i, node) in frame.nodes.iter().enumerate() {
             if i == floor && floor > 0 {
                 hits.push(Hit {
-                    rect: frame.viewport,
+                    rect: frame.viewport(SIGHT),
                     shape: crate::shape::Shape::default(),
                     slop: crate::style::Edges::all(0.0),
                     transform: 0,
                     clip: 0,
+                    effect: 0,
                     scroller: None,
                     wheel: false,
                     target: crate::compositor::HitTarget {
                         key: NodeKey(0),
                         owner: None,
                     },
+                    cursor: None,
                     below_modal: false,
                 });
             }
+            // Its parent's is resolved already (parents come first).
+            let cursor = self.cursor_at(frame, i, node);
+            self.cursor_of.push(cursor);
             let p = self.placed.get(i).copied().unwrap_or_default();
             let around = node.parent.and_then(|q| scroller_of.get(q).copied().flatten());
             let handles = frame.behaviour(i).is_some_and(|b| b.handlers.wheel.is_some());
@@ -1478,10 +1677,11 @@ impl Painter {
             instance_of.push(instance);
             // A parent that scrolls ends the run: what is above it is its own.
             let inherited = node.parent.is_some_and(|q| {
-                frame.nodes.get(q).is_some_and(|n| n.scroll.is_none()) && wheel_below.get(q).copied().unwrap_or(false)
+                frame.nodes.get(q).is_some_and(|n| n.scroll(SIGHT).is_none())
+                    && wheel_below.get(q).copied().unwrap_or(false)
             });
-            wheel_below.push(node.scroll.is_none() && (handles || inherited));
-            let within = match node.scroll {
+            wheel_below.push(node.scroll(SIGHT).is_none() && (handles || inherited));
+            let within = match node.scroll(SIGHT) {
                 Some(sc) => {
                     let index = u32::try_from(scrollers.len()).ok();
                     let key = NodeKey::of(&node.path);
@@ -1501,6 +1701,8 @@ impl Painter {
                         offset: sc.offset,
                         applied: sc.applied,
                         max: sc.max,
+                        pos: sc.pos,
+                        end: sc.end,
                         rtl: node.look.text.direction == crate::style::Direction::Rtl,
                         generation: sc.generation,
                         thumb: self.thumb_nodes.get(&key).copied(),
@@ -1514,8 +1716,21 @@ impl Painter {
                 None => around,
             };
             scroller_of.push(within);
-            let takes = frame.behaviour(i).is_some_and(|b| !b.pass_through) && !node.look.invisible;
+            let takes = frame.takes_pointer(i);
             self.hit_rect.push(takes.then(|| hit_box(node)));
+            // The text its box shows input: the one the last tables had,
+            // while it shows the same.
+            let was = self.shown_text_was.get_mut(i).and_then(Option::take);
+            let text = takes
+                .then(|| match was {
+                    Some(t) if shows_text(frame, i, node, p.content, Some(&t)) => Some(t),
+                    _ => shown_text(frame, i, node, p.content).map(Arc::new),
+                })
+                .flatten();
+            if let (Some(t), Ok(at)) = (&text, u32::try_from(hits.len())) {
+                self.texts.push((at, Arc::clone(t)));
+            }
+            self.shown_text.push(text);
             if takes {
                 let (rect, shape, slop) = hit_box(node);
                 hits.push(Hit {
@@ -1524,12 +1739,14 @@ impl Painter {
                     slop,
                     transform: p.transform,
                     clip: p.clip,
+                    effect: p.effect,
                     scroller: within,
                     wheel: wheel_below.last().copied().unwrap_or(false),
                     target: crate::compositor::HitTarget {
                         key: NodeKey::of(&node.path),
                         owner: instance.or_else(|| frame.behaviour(i).and_then(|b| b.handlers.owner)),
                     },
+                    cursor,
                     below_modal: i < floor,
                 });
             }
@@ -1539,7 +1756,7 @@ impl Painter {
                     transform: Some(p.transform),
                     effect: Some(p.effect),
                     moving: m.clone(),
-                    space: node.space,
+                    space: node.space(SIGHT),
                     invisible: node.look.invisible,
                     turns: m.curves.turns(),
                 });
@@ -1548,17 +1765,35 @@ impl Painter {
         (scrollers, hits, moving)
     }
 
-    /// Keep the compositor's tables, each the same `Arc` while equal.
+    /// Keep the compositor's tables, each the same `Arc` while equal, and
+    /// their index ([`crate::compositor::TableIndex`]) made again only
+    /// when what it indexes changed: a scroller's place or a hit's reach,
+    /// not an offset (at the cost of the comparison already made).
     fn keep_compositing(&mut self, scrollers: Vec<ScrollNode>, hits: Vec<Hit>, moving: Vec<MovingNode>) {
         let c = &mut self.compositing;
+        let mut reindex = false;
         if *c.scrollers != *scrollers {
+            reindex |= !c
+                .scrollers
+                .iter()
+                .map(|s| s.instance)
+                .eq(scrollers.iter().map(|s| s.instance));
             c.scrollers = std::sync::Arc::from(scrollers);
         }
         if *c.hits != *hits {
+            let reach = |h: &Hit| (h.target, h.below_modal);
+            reindex |= !c.hits.iter().map(reach).eq(hits.iter().map(reach));
             c.hits = std::sync::Arc::from(hits);
+        }
+        if reindex {
+            c.index = std::sync::Arc::new(crate::compositor::TableIndex::of(&c.scrollers, &c.hits));
         }
         if *c.moving != *moving {
             c.moving = std::sync::Arc::from(moving);
+        }
+        let same = |a: &(u32, Arc<ShownText>), b: &(u32, Arc<ShownText>)| a.0 == b.0 && Arc::ptr_eq(&a.1, &b.1);
+        if c.texts.len() != self.texts.len() || !c.texts.iter().zip(&self.texts).all(|(a, b)| same(a, b)) {
+            c.texts = std::sync::Arc::from(self.texts.as_slice());
         }
     }
 
@@ -1615,8 +1850,8 @@ impl Painter {
         let turns = node.moving.as_ref().is_some_and(|m| m.curves.turns());
         let matrix = (turns || !t.is_identity()).then_some(GroupTransform {
             origin: (
-                (node.bounds.x + t.origin.0) * scale,
-                (node.bounds.y + t.origin.1) * scale,
+                (node.bounds(SIGHT).x + t.origin.0) * scale,
+                (node.bounds(SIGHT).y + t.origin.1) * scale,
             ),
             scale: t.scale,
             rotate: t.rotate,
@@ -1627,7 +1862,7 @@ impl Painter {
                 id,
                 TransformNode {
                     parent: up.content,
-                    offset: node.offset,
+                    offset: node.offset(SIGHT),
                     matrix,
                 },
             );
@@ -1640,8 +1875,10 @@ impl Painter {
         // clips, ADR-0016: the shaders multiply each one's coverage, so a
         // rounded clip inside another keeps both one's corners; the clip
         // layout intersected, `node.clip`, only culls).
-        let clip = match (node.clipper, node.clip) {
-            (Some(c), Some(_)) => {
+        // A node is clipped when it has a clipper, as hit testing has it
+        // (`clip::hit_in`, which reads this clip).
+        let clip = match node.clipper {
+            Some(c) => {
                 let owner = frame.nodes.get(c);
                 let id = owner.map_or(0, |o| self.clips.id(key(&o.path, Role::Clip), now));
                 let up = self.placed.get(c);
@@ -1665,7 +1902,7 @@ impl Painter {
                 );
                 id
             }
-            _ => 0,
+            None => 0,
         };
         let effect = if effects::grouped(node) || node.moving.is_some() {
             let id = self.effects.id(key(&node.path, Role::Effect), now);
@@ -1690,6 +1927,7 @@ impl Painter {
                     transform,
                     transformed: matrix.is_some(),
                     region,
+                    clip,
                 },
             );
             id
@@ -1699,14 +1937,14 @@ impl Painter {
             }
             up.effect
         };
-        let content = match node.scroll {
+        let content = match node.scroll(SIGHT) {
             Some(s) => {
                 let id = self.transforms.id(key(&node.path, Role::Content), now);
                 w.transform(
                     id,
                     TransformNode {
                         parent: transform,
-                        offset: (node.offset.0 + s.applied.0, node.offset.1 + s.applied.1),
+                        offset: (node.offset(SIGHT).0 + s.applied.0, node.offset(SIGHT).1 + s.applied.1),
                         matrix: None,
                     },
                 );
@@ -1721,7 +1959,7 @@ impl Painter {
         // as what is between them scrolls or moves, what comes into the
         // container shows.
         let field = if matches!(node.content, Content::Input { .. }) {
-            let b = node.bounds;
+            let b = node.bounds(SIGHT);
             let radius = node.look.shape.used(b.width, b.height);
             let (padding, radius) = border_inner(b, radius, node.look.border).unwrap_or((b, radius));
             let id = self.clips.id(key(&node.path, Role::Clip), now);
@@ -1768,13 +2006,13 @@ impl Painter {
         let caret = caret_on(node, self.caret.clock);
         // What it may record: what its clip shows, and a margin.
         // A text input's content (its overlay chunk) lies under its scroll.
-        let scrolled = match (overlay, &node.content, node.scroll) {
+        let scrolled = match (overlay, &node.content, node.scroll(SIGHT)) {
             (true, Content::Input { .. }, Some(s)) => s.applied,
             _ => (0.0, 0.0),
         };
         let visible = node
-            .clip
-            .map(|c| c.translated(-node.offset.0 - scrolled.0, -node.offset.1 - scrolled.1));
+            .clip(SIGHT)
+            .map(|c| c.translated(-node.offset(SIGHT).0 - scrolled.0, -node.offset(SIGHT).1 - scrolled.1));
         let moved = Moved::of(node);
         if let Some(r) = self.chunks.get_mut(&id)
             && let Input::Node {
@@ -1789,8 +2027,8 @@ impl Painter {
             // A text input's box chunk draws none of its content (its
             // overlay chunk does): a keystroke or a blink keeps it.
             let boxed = !overlay && matches!(node.content, Content::Input { .. });
-            let same = was.space == node.space
-                && was.space_content == node.space_content
+            let same = was.space(SIGHT) == node.space(SIGHT)
+                && was.space_content(SIGHT) == node.space_content(SIGHT)
                 && *s == snap
                 && (boxed || *c == caret)
                 && *k == scale
@@ -1807,14 +2045,15 @@ impl Painter {
                 if r.properties != moved {
                     self.stats.moved = self.stats.moved.saturating_add(1);
                     self.painted.push(Repaint {
-                        bounds: node.bounds,
+                        bounds: node.bounds(SIGHT),
                         recorded: false,
                     });
                     r.properties = moved;
                 }
                 return Arc::clone(&r.display);
             }
-            if was.space.width == node.space.width && was.space.height == node.space.height {
+            if was.space(SIGHT).width == node.space(SIGHT).width && was.space(SIGHT).height == node.space(SIGHT).height
+            {
                 self.stats.repainted = self.stats.repainted.saturating_add(1);
             } else {
                 self.stats.relaid = self.stats.relaid.saturating_add(1);
@@ -1822,7 +2061,7 @@ impl Painter {
         }
         self.stats.recorded = self.stats.recorded.saturating_add(1);
         self.painted.push(Repaint {
-            bounds: node.bounds,
+            bounds: node.bounds(SIGHT),
             recorded: true,
         });
         let cull = visible.map(|v| v.outset(CULL_MARGIN));
@@ -2004,8 +2243,8 @@ impl Painter {
             let (Some(node), Some(p)) = (frame.nodes.get(i), self.placed.get(i).copied()) else {
                 continue;
             };
-            let Some(scroll) = node.scroll else { continue };
-            let b = node.space.snapped(scale);
+            let Some(scroll) = node.scroll(SIGHT) else { continue };
+            let b = node.space(SIGHT).snapped(scale);
             let content_h = b.height + scroll.max.1;
             let thumb_h = (b.height * b.height / content_h).max(20.0);
             let travel = (b.height - thumb_h - 4.0).max(0.0);
@@ -2016,7 +2255,7 @@ impl Painter {
                 TransformNode {
                     // Under the container's own transform: what moves it moves its thumb.
                     parent: p.transform,
-                    offset: (node.offset.0, node.offset.1 + along),
+                    offset: (node.offset(SIGHT).0, node.offset(SIGHT).1 + along),
                     matrix: None,
                 },
             );
@@ -2036,9 +2275,9 @@ impl Painter {
                     // The track: wherever along it the thumb is.
                     region: effects::physical_rect(
                         Bounds {
-                            x: node.bounds.right() - 8.0,
+                            x: node.bounds(SIGHT).right() - 8.0,
                             width: 8.0,
-                            ..node.bounds
+                            ..node.bounds(SIGHT)
                         },
                         scale,
                         size,
@@ -2051,14 +2290,14 @@ impl Painter {
                 ThumbNode {
                     transform,
                     effect,
-                    top: node.offset,
+                    top: node.offset(SIGHT),
                     travel,
                 },
             );
             let id = ChunkId(key(&node.path, Role::Thumb));
             let same = self.chunks.get(&id).is_some_and(|r| {
                 matches!(r.input, Input::Thumb { space, max, thumb, scale: k }
-                    if space == node.space && max == scroll.max && thumb == scroll.thumb && k == scale)
+                    if space == node.space(SIGHT) && max == scroll.max && thumb == scroll.thumb && k == scale)
             });
             let display = if let Some(r) = self.chunks.get_mut(&id).filter(|_| same) {
                 r.seen = now;
@@ -2067,9 +2306,9 @@ impl Painter {
                 self.stats.recorded = self.stats.recorded.saturating_add(1);
                 self.painted.push(Repaint {
                     bounds: Bounds {
-                        x: node.bounds.right() - 8.0,
+                        x: node.bounds(SIGHT).right() - 8.0,
                         width: 8.0,
-                        ..node.bounds
+                        ..node.bounds(SIGHT)
                     },
                     recorded: true,
                 });
@@ -2091,7 +2330,7 @@ impl Painter {
                     id,
                     Retained {
                         input: Input::Thumb {
-                            space: node.space,
+                            space: node.space(SIGHT),
                             max: scroll.max,
                             thumb: scroll.thumb,
                             scale,
@@ -2149,6 +2388,20 @@ impl Painter {
         std::mem::take(&mut p.scene)
     }
 
+    /// The scene `frame` records into from nothing, by a painter with no
+    /// history: what input to a frame no renderer presented is hit-tested
+    /// against ([`crate::interact::hit`]), its boxes and property trees as
+    /// paint makes them for any frame.
+    pub(crate) fn fresh(frame: &Frame, text: &mut TextSystem, size: (u32, u32), scale: f32) -> Scene {
+        let mut p = Self::default();
+        p.record(frame, text, size, scale, Color::WHITE, true, &mut Commit::default());
+        p.cancel_blink();
+        for r in p.chunks.values() {
+            text.unpin(&r.pieces);
+        }
+        std::mem::take(&mut p.scene)
+    }
+
     /// Whether the window has the keyboard focus: a caret shows and blinks
     /// only while it has, read at the next record.
     pub fn set_window_active(&mut self, active: bool) {
@@ -2177,7 +2430,7 @@ impl Painter {
             return;
         }
         self.caret.clock = CaretClock {
-            since: clock::frame_time(),
+            since: clock::frame_nanos(),
             active,
         };
         self.caret.activation = self.activations;
@@ -2201,7 +2454,7 @@ impl Painter {
         if self.blinkers.is_empty() {
             return;
         }
-        if let Some(next) = self.caret.clock.next_change(clock::frame_time()) {
+        if let Some(next) = self.caret.clock.next_change(clock::frame_nanos()) {
             self.blink = Some(clock::after(Duration::from_secs_f32(next.max(0.01)), || {}));
         }
     }
@@ -2214,7 +2467,7 @@ fn record_node(node: &FrameNode, target: &mut Target<'_>, text: &mut TextSystem,
         return;
     }
     if let Some(c) = cull
-        && c.intersect(&node.bounds.outset(16.0)).is_empty()
+        && c.intersect(&node.bounds(SIGHT).outset(16.0)).is_empty()
     {
         return;
     }
@@ -2236,7 +2489,7 @@ fn record_box(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSystem) 
         decoration,
         ..
     } = &node.look;
-    let b = target.snapped(node.bounds);
+    let b = target.snapped(node.bounds(SIGHT));
     // The radii the box gets (CSS's overlapping-curves rule, against the
     // box as painted, as Blink constrains them on the snapped border box).
     let radius = shape.used(b.width, b.height);
@@ -2422,7 +2675,7 @@ pub(crate) fn record_overlay(target: &mut Target<'_>, node: &FrameNode) {
     else {
         return;
     };
-    let b = target.snapped(node.bounds);
+    let b = target.snapped(node.bounds(SIGHT));
     let radius = node.look.shape.used(b.width, b.height);
     let k = node.look.shape.curve();
     // Along the padding box's edge and its inner corners, as an absolute
@@ -2450,7 +2703,7 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
     match &node.content {
         Content::None => {}
         Content::Figures(shapes) => {
-            let b = target.snapped(node.bounds);
+            let b = target.snapped(node.bounds(SIGHT));
             for shape in shapes {
                 target.items.push(Item::Path {
                     origin: (b.x, b.y),
@@ -2462,12 +2715,12 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
         Content::Drawn(d) => {
             let key = foldhash::fast::FixedState::with_seed(0x51c7_d2a9).hash_one(&node.path);
             d.shape(text);
-            d.draw(node.content_box, target.scale, key, target.items);
+            d.draw(node.content_box(SIGHT), target.scale, key, target.items);
         }
         Content::Image { source, radius } => {
             target.items.push(Item::Image {
                 source: source.clone(),
-                bounds: target.snapped(node.bounds),
+                bounds: target.snapped(node.bounds(SIGHT)),
                 radius: *radius,
                 curve: node.look.shape.curve(),
             });
@@ -2478,7 +2731,7 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
             runs,
             boxes,
         } => {
-            let area = &node.content_box;
+            let area = &node.content_box(SIGHT);
             let p = Paragraph { content, runs, boxes };
             if let Some(img) = effects::text_background(node) {
                 effects::record_text_through(target, node, img, text, p, t, text_width(t, area));
@@ -2492,14 +2745,14 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
             stroke_width,
         } => {
             let scale = target.scale;
-            let side = node.bounds.width.min(node.bounds.height);
+            let side = node.bounds(SIGHT).width.min(node.bounds(SIGHT).height);
             target.items.push(Item::Icon {
                 icon: *icon,
                 size: physical(side, scale),
                 color: *color,
                 stroke_width: *stroke_width,
-                x: physical_pos(node.bounds.x + (node.bounds.width - side) / 2.0, scale),
-                y: physical_pos(node.bounds.y + (node.bounds.height - side) / 2.0, scale),
+                x: physical_pos(node.bounds(SIGHT).x + (node.bounds(SIGHT).width - side) / 2.0, scale),
+                y: physical_pos(node.bounds(SIGHT).y + (node.bounds(SIGHT).height - side) / 2.0, scale),
             });
         }
         Content::Input {
@@ -2513,7 +2766,7 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
             multiline,
             ..
         } => {
-            let area = &node.content_box;
+            let area = &node.content_box(SIGHT);
             // Under the field's scroll offset (its content transform) and
             // clipped to it ([`Placed::field`]): laid out unscrolled.
             let it = input_text(text, &edit.text, t, *area, *multiline, *focused, (0.0, 0.0));
@@ -2584,56 +2837,39 @@ fn record_content(target: &mut Target<'_>, node: &FrameNode, text: &mut TextSyst
 /// less (or more) beyond the window than one recorded now, and records
 /// again before that part can show.
 pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<String> {
-    fn transforms(p: &Properties, mut id: u32) -> Vec<((f32, f32), Option<GroupTransform>)> {
-        let mut out = Vec::new();
-        while id != 0 && out.len() < 4096 {
-            let t = p.transform(id);
-            out.push((t.offset, t.matrix));
-            id = t.parent;
-        }
-        out
-    }
-    type Clipped = Option<(Clip, Vec<((f32, f32), Option<GroupTransform>)>)>;
-    fn clip(p: &Properties, id: u32) -> Clipped {
-        p.clip(id).map(|c| (c.clip, transforms(p, c.transform)))
-    }
-    fn effects(p: &Properties, id: u32) -> String {
-        p.effect_chain(id, 0)
-            .map(|(_, e)| {
-                format!(
-                    "{} {:?} {:?} {} {:?} {:?}",
-                    e.opacity,
-                    e.filters,
-                    e.mask,
-                    e.transformed,
-                    e.region,
-                    transforms(p, e.transform),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" / ")
-    }
-    /// A chunk's items the window shows, under its states read as values.
-    fn shown<'s>(s: &'s Scene, c: &'s Chunk) -> Option<(Vec<&'s Item>, String)> {
+    type Shown<'s> = (Vec<&'s Item>, Vec<crate::scene::Depends>);
+    /// A chunk's items the window shows, under all its state depends on,
+    /// read as values ([`Properties::depends`]: every clip, transform and
+    /// effect its state reaches, not only its own, its groups numbered in
+    /// `groups`).
+    fn shown<'s>(s: &'s Scene, c: &'s Chunk, groups: &mut crate::scene::Groups) -> Option<Shown<'s>> {
         let p = &s.properties;
-        let chain = transforms(p, c.state.transform);
-        let turned = chain.iter().any(|(_, m)| m.is_some());
+        let turned = p.matrices(c.state.transform, 0).next().is_some();
         let o = p.transform(c.state.transform).offset;
         let (mut x_min, mut y_min) = (0.0_f32, 0.0_f32);
         let (mut w, mut h) = (
             crate::convert::u32_to_f32(s.size.0),
             crate::convert::u32_to_f32(s.size.1),
         );
-        // Within its clip too, in window pixels.
-        if let Some(k) = p.clip(c.state.clip)
-            && !transforms(p, k.transform).iter().any(|(_, m)| m.is_some())
-        {
+        // Within each clip of its chain too, each moved into window pixels
+        // by its own transform before they are intersected (a scrolled
+        // child clip lies elsewhere in its own space than in its parent's).
+        // A clip under a scale or turn is not culled by.
+        for (_, k) in p.clip_chain(c.state.clip) {
+            if p.matrices(k.transform, 0).next().is_some() {
+                continue;
+            }
             let t = p.transform(k.transform).offset;
             let b = k.clip.bounds.translated(t.0, t.1);
             x_min = x_min.max(b.x * s.scale);
             y_min = y_min.max(b.y * s.scale);
             w = w.min(b.right() * s.scale);
             h = h.min(b.bottom() * s.scale);
+        }
+        // Clips that do not meet leave nothing to paint, whatever an item
+        // reaches (one spanning both would pass each bound on its own).
+        if x_min >= w || y_min >= h {
+            return None;
         }
         let items: Vec<&Item> = c
             .display
@@ -2648,10 +2884,7 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
                     })
             })
             .collect();
-        (!items.is_empty()).then(|| {
-            let state = format!("{chain:?} {:?} {}", clip(p, c.state.clip), effects(p, c.state.effect));
-            (items, state)
-        })
+        (!items.is_empty()).then(|| (items, p.depends(c.state, groups)))
     }
     let name = |id: ChunkId| {
         frame
@@ -2667,13 +2900,17 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
     if a.background != b.background || a.size != b.size || a.scale != b.scale {
         return Some("the target".to_owned());
     }
-    fn list(s: &Scene) -> Vec<(ChunkId, (Vec<&Item>, String))> {
-        s.chunks.iter().filter_map(|c| shown(s, c).map(|x| (c.id, x))).collect()
+    fn list(s: &Scene) -> Vec<(ChunkId, Shown<'_>)> {
+        // One numbering of its effect groups a scene, in paint order.
+        let mut groups = crate::scene::Groups::default();
+        s.chunks
+            .iter()
+            .filter_map(|c| shown(s, c, &mut groups).map(|x| (c.id, x)))
+            .collect()
     }
     let (x, y) = (list(a), list(b));
     if x.len() != y.len() {
-        let ids =
-            |l: &[(ChunkId, (Vec<&Item>, String))]| l.iter().map(|c| c.0).collect::<std::collections::BTreeSet<_>>();
+        let ids = |l: &[(ChunkId, Shown<'_>)]| l.iter().map(|c| c.0).collect::<std::collections::BTreeSet<_>>();
         let (i, j) = (ids(&x), ids(&y));
         return Some(format!(
             "{} chunks shown against {}: only here {:?}, only there {:?}",
@@ -2708,7 +2945,7 @@ pub(crate) fn scene_differs(frame: &Frame, a: &Scene, b: &Scene) -> Option<Strin
             ));
         }
         if state_a != state_b {
-            return Some(format!("chunk {}'s state: {state_a} against {state_b}", name(*ia)));
+            return Some(format!("chunk {}'s state: {state_a:?} against {state_b:?}", name(*ia)));
         }
     }
     None
@@ -2722,7 +2959,7 @@ mod tests {
     #[test]
     fn a_caret_blinks_from_its_last_change_until_it_has_been_idle_a_while() {
         let c = CaretClock {
-            since: 100.0,
+            since: clock::nanos_of(100.0),
             active: true,
         };
         assert!(c.shows(100.0) && c.shows(100.5), "shown at once, for a blink");
@@ -2739,6 +2976,35 @@ mod tests {
         let inactive = CaretClock { active: false, ..c };
         assert!(!inactive.shows(100.0));
         assert_eq!(inactive.next_change(100.0), None);
+    }
+
+    /// A caret blinks the same at 262,144 s of uptime (three days, where an
+    /// f32 of seconds steps by 1/64 s) as at 1 s: shown and hidden at the
+    /// same frames, its next change due at the same time to 1e-4 s.
+    #[test]
+    fn a_caret_blinks_the_same_at_any_uptime() {
+        let ms = |n: u64| n * 1_000_000;
+        let blinks = |base: u64| {
+            let c = CaretClock {
+                since: base + 4_321,
+                active: true,
+            };
+            (0..200_u64)
+                .map(|k| {
+                    let t = base + ms(7 * k) + 999;
+                    (c.shows(t), c.next_change(t))
+                })
+                .collect::<Vec<_>>()
+        };
+        let near = blinks(1_000_000_000);
+        let far = blinks(262_144 * 1_000_000_000);
+        for (k, (a, b)) in near.iter().zip(&far).enumerate() {
+            let close = match (a.1, b.1) {
+                (Some(x), Some(y)) => (x - y).abs() <= 1e-4,
+                (x, y) => x == y,
+            };
+            assert!(a.0 == b.0 && close, "frame {k}: {a:?} at 1 s, {b:?} at 262,144 s");
+        }
     }
 
     #[test]
@@ -2990,5 +3256,221 @@ mod tests {
         }
         assert!(painter.recording.capacity() < large_room());
         assert!(painter.held().1 < before);
+    }
+
+    /// Two scenes whose chunk has the same items, the same leaf clip and
+    /// the same transform, but whose leaf clip lies within a rounded parent
+    /// with other corners (an incremental scene that kept the wrong
+    /// parent), or a parent elsewhere, paint differently: the cold check
+    /// compares the whole clip chain a chunk lies in, each clip's own
+    /// transform chain with it.
+    #[test]
+    fn the_cold_check_sees_a_clip_ancestor_that_differs() {
+        let rounded = |r: f32| Clip {
+            bounds: Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            },
+            radius: Corners::all(r),
+            curve: crate::shape::ROUND,
+        };
+        let leaf = Clip {
+            bounds: Bounds {
+                x: 10.0,
+                y: 10.0,
+                width: 80.0,
+                height: 80.0,
+            },
+            ..Clip::default()
+        };
+        let mut a = Scene::new((100, 100), 1.0, Some(Color::WHITE));
+        let moved = a.add_transform((0.0, 0.0), None);
+        let outer = a.add_clip(rounded(12.0), moved);
+        let inner = a.add_clip(leaf, 0);
+        if let Some(c) = usize::try_from(inner).ok().and_then(|i| a.properties.clips.get_mut(i)) {
+            c.parent = outer;
+        }
+        a.push_under(
+            State {
+                transform: 0,
+                clip: inner,
+                effect: 0,
+            },
+            vec![Item::Rect {
+                bounds: Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                },
+                color: Color::BLACK,
+            }],
+        );
+        let frame = Frame::default();
+        assert_eq!(scene_differs(&frame, &a, &a.clone()), None, "the same scene");
+        let outer_at = usize::try_from(outer).unwrap_or(0);
+        let mut corners = a.clone();
+        corners.properties.clips[outer_at].clip.radius = Corners::all(4.0);
+        assert!(
+            scene_differs(&frame, &a, &corners).is_some(),
+            "a parent clip's corners differ"
+        );
+        let mut placed = a.clone();
+        placed.properties.transforms[usize::try_from(moved).unwrap_or(0)].offset = (0.0, 6.0);
+        assert!(
+            scene_differs(&frame, &a, &placed).is_some(),
+            "a parent clip's transform differs"
+        );
+    }
+
+    fn square(at: f32, size: f32) -> Bounds {
+        Bounds {
+            x: 0.0,
+            y: at,
+            width: size,
+            height: size,
+        }
+    }
+
+    fn black(bounds: Bounds) -> Vec<Item> {
+        vec![Item::Rect {
+            bounds,
+            color: Color::BLACK,
+        }]
+    }
+
+    /// Two chunks under one 50% group composite as one layer (where they
+    /// overlap, 50%); under two equal 50% groups, each its own (75%). The
+    /// cold check sees which chunks share a group, and an effect's output
+    /// clip (where its layer is cut once composited).
+    #[test]
+    fn the_cold_check_sees_an_effects_group_and_its_output_clip() {
+        let half = EffectNode {
+            opacity: 0.5,
+            ..EffectNode::default()
+        };
+        let under = |effect: u32| State {
+            transform: 0,
+            clip: 0,
+            effect,
+        };
+        let mut one = Scene::new((100, 100), 1.0, Some(Color::WHITE));
+        let g = one.add_effect(half.clone());
+        one.push_under(under(g), black(square(0.0, 60.0)));
+        one.push_under(under(g), black(square(30.0, 60.0)));
+        let mut two = one.clone();
+        let g2 = two.add_effect(half.clone());
+        if let Some(c) = two.chunks.last_mut() {
+            c.state.effect = g2;
+        }
+        let frame = Frame::default();
+        assert_eq!(scene_differs(&frame, &one, &one.clone()), None, "the same scene");
+        assert!(scene_differs(&frame, &one, &two).is_some(), "one group is not two");
+        let mut cut = Scene::new((100, 100), 1.0, Some(Color::WHITE));
+        let c = cut.add_clip(
+            Clip {
+                bounds: square(0.0, 50.0),
+                ..Clip::default()
+            },
+            0,
+        );
+        let g = cut.add_effect(EffectNode { clip: c, ..half });
+        cut.push_under(under(g), black(square(0.0, 60.0)));
+        let mut wider = cut.clone();
+        wider.properties.clips[usize::try_from(c).unwrap_or(0)].clip.bounds = square(0.0, 80.0);
+        assert!(
+            scene_differs(&frame, &cut, &wider).is_some(),
+            "an output clip that differs"
+        );
+    }
+
+    /// A chunk inside two clips that do not meet ([0, 10] within [20, 30])
+    /// paints nothing, though its item spans both: a scene without it is
+    /// the same scene.
+    #[test]
+    fn the_cold_check_shows_nothing_inside_clips_that_do_not_meet() {
+        let mut a = Scene::new((100, 100), 1.0, Some(Color::WHITE));
+        let outer = a.add_clip(
+            Clip {
+                bounds: square(20.0, 10.0),
+                ..Clip::default()
+            },
+            0,
+        );
+        let inner = a.add_clip(
+            Clip {
+                bounds: square(0.0, 10.0),
+                ..Clip::default()
+            },
+            0,
+        );
+        if let Some(n) = usize::try_from(inner).ok().and_then(|i| a.properties.clips.get_mut(i)) {
+            n.parent = outer;
+        }
+        let without = a.clone();
+        a.push_under(
+            State {
+                transform: 0,
+                clip: inner,
+                effect: 0,
+            },
+            black(Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 30.0,
+            }),
+        );
+        assert_eq!(
+            scene_differs(&Frame::default(), &a, &without),
+            None,
+            "nothing of it shows"
+        );
+    }
+
+    /// A clip scrolled with its content (its bounds in content space, far
+    /// below its parent's) still shows in the window: the cold check moves
+    /// each clip of the chain into window pixels before it culls by them,
+    /// so what paints there is compared.
+    #[test]
+    fn the_cold_check_culls_by_each_clip_where_it_shows() {
+        let mut a = Scene::new((100, 100), 1.0, Some(Color::WHITE));
+        let viewport = a.add_clip(
+            Clip {
+                bounds: square(0.0, 100.0),
+                ..Clip::default()
+            },
+            0,
+        );
+        let scrolled = a.add_transform((0.0, -200.0), None);
+        let inner = a.add_clip(
+            Clip {
+                bounds: square(200.0, 80.0),
+                ..Clip::default()
+            },
+            scrolled,
+        );
+        if let Some(n) = usize::try_from(inner).ok().and_then(|i| a.properties.clips.get_mut(i)) {
+            n.parent = viewport;
+        }
+        a.push_under(
+            State {
+                transform: scrolled,
+                clip: inner,
+                effect: 0,
+            },
+            black(square(200.0, 80.0)),
+        );
+        let frame = Frame::default();
+        assert_eq!(scene_differs(&frame, &a, &a.clone()), None, "the same scene");
+        // Scrolled a pixel further, the same rows show elsewhere.
+        let mut b = a.clone();
+        b.properties.transforms[usize::try_from(scrolled).unwrap_or(0)].offset = (0.0, -201.0);
+        assert!(
+            scene_differs(&frame, &a, &b).is_some(),
+            "a scrolled clip's content is compared"
+        );
     }
 }

@@ -774,12 +774,13 @@ fn a_calendar_in_a_window_one_tab_stop_and_what_a_screen_reader_is_told() {
     });
     let c = made.get().expect("the calendar");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("calendar_a11y", dump(&tree));
     // Tab enters on the anchor, the picked day.
     s.press(NamedKey::Tab, Modifiers::default());
     s.settle().expect("settled");
-    assert!(c.grid.focus_handle().is_focused());
+    assert!(s.read(|| c.grid.focus_handle().is_focused()));
     assert_eq!(anchor(c.grid), day(2024, 2, 9));
     // Keys move focus with the anchor: down a week, back onto the
     // unavailable 15th (an arrow stops there).
@@ -788,7 +789,7 @@ fn a_calendar_in_a_window_one_tab_stop_and_what_a_screen_reader_is_told() {
         s.settle().expect("settled");
     }
     assert_eq!(anchor(c.grid), day(2024, 2, 15));
-    assert!(c.grid.focus_handle().is_focused());
+    assert!(s.read(|| c.grid.focus_handle().is_focused()));
     s.press(NamedKey::Enter, Modifiers::default());
     s.settle().expect("settled");
     assert_eq!(
@@ -804,7 +805,7 @@ fn a_calendar_in_a_window_one_tab_stop_and_what_a_screen_reader_is_told() {
     // picked day.
     s.press(NamedKey::Tab, Modifiers::default());
     s.settle().expect("settled");
-    assert!(!c.grid.focus_handle().is_focused());
+    assert!(!s.read(|| c.grid.focus_handle().is_focused()));
     s.press(
         NamedKey::Tab,
         Modifiers {
@@ -813,7 +814,7 @@ fn a_calendar_in_a_window_one_tab_stop_and_what_a_screen_reader_is_told() {
         },
     );
     s.settle().expect("settled");
-    assert!(c.grid.focus_handle().is_focused());
+    assert!(s.read(|| c.grid.focus_handle().is_focused()));
     assert_eq!(anchor(c.grid), day(2024, 2, 16));
 }
 
@@ -838,19 +839,23 @@ fn a_calendars_is_date_disabled_that_reads_a_signal_renders_the_day_again() {
         })
         .into_element()
     });
-    let disabled = |s: &Scenario, name: &str| {
+    let disabled = |s: &mut Scenario, name: &str| {
         let mut ts = gui::text::TextSystem::new();
-        let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+        let focus = s.read(gui::focus::focused);
+        let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
         tree.nodes
             .iter()
             .find(|(_, n)| n.label() == Some(name))
             .is_some_and(|(_, n)| n.is_disabled())
     };
     let (d14, d20) = ("Wednesday, February 14, 2024", "Tuesday, February 20, 2024");
-    assert!(disabled(&s, d14) && !disabled(&s, d20), "the 14th closed");
+    assert!(disabled(&mut s, d14) && !disabled(&mut s, d20), "the 14th closed");
     closed.set(20);
     s.settle().expect("settled");
-    assert!(!disabled(&s, d14) && disabled(&s, d20), "the 20th closed instead");
+    assert!(
+        !disabled(&mut s, d14) && disabled(&mut s, d20),
+        "the 20th closed instead"
+    );
 }
 
 #[test]
@@ -886,7 +891,8 @@ fn a_date_field_in_a_window_and_what_a_screen_reader_is_told() {
         (Some(3), Some(31), Some(3333), Some(3), Some(3))
     );
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("date_field_a11y", dump(&tree));
 }
 
@@ -936,7 +942,8 @@ fn a_picker_joins_the_field_and_the_calendar_over_one_value() {
     });
     let p = made.get().expect("the picker");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("date_picker_a11y", dump(&tree));
     let date = p.date();
     assert_eq!(date.get_untracked(), Some(day(2024, 1, 5)));
@@ -960,16 +967,18 @@ fn a_picker_joins_the_field_and_the_calendar_over_one_value() {
     );
     // The trigger ends the field's arrow chain.
     let last = p.field.edge(true).expect("a last segment");
-    last.focus();
-    p.field.key(Segment::DayPeriod, &plain(NamedKey::ArrowRight));
-    assert!(p.trigger_handle().is_focused());
+    s.act("the last segment's ArrowRight", || {
+        last.focus();
+        p.field.key(Segment::DayPeriod, &plain(NamedKey::ArrowRight));
+    });
+    assert!(s.read(|| p.trigger_handle().is_focused()));
     // Escape closes the popup and gives focus back to the trigger.
     s.act("open", || p.set_open(true));
     s.settle().expect("settled");
     s.press(NamedKey::Escape, Modifiers::default());
     s.settle().expect("settled");
     assert!(!open.get_untracked(), "Escape dismisses");
-    assert!(p.trigger_handle().is_focused());
+    assert!(s.read(|| p.trigger_handle().is_focused()));
 }
 
 type Range = RangeCalendar<Bind<DateRange>>;
@@ -978,7 +987,7 @@ type Range = RangeCalendar<Bind<DateRange>>;
 fn a_range_calendar_and_what_a_screen_reader_is_told() {
     let made = Rc::new(Cell::new(None::<Range>));
     let probe = Rc::clone(&made);
-    let s = scenario(move || {
+    let mut s = scenario(move || {
         let probe = Rc::clone(&probe);
         component(
             Bind::default().with_default(DateRange::between(day(2024, 2, 5), day(2024, 2, 7))),
@@ -1011,7 +1020,8 @@ fn a_range_calendar_and_what_a_screen_reader_is_told() {
     let picked = |d: u8| gui::untracked(|| r.day(day(2024, 2, d)));
     assert!(picked(5).start && picked(7).end && picked(6).selected && !picked(8).selected);
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("range_calendar_a11y", dump(&tree));
 }
 
@@ -1138,7 +1148,7 @@ fn time_look<P: Clone + PartialEq + 'static>(f: TimeField<P>) -> gui::Div {
 
 #[test]
 fn a_time_field_and_a_read_only_invalid_date_field_as_a_screen_reader_hears_them() {
-    let s = scenario(move || {
+    let mut s = scenario(move || {
         div()
             .child(component(
                 Bind::default().with_default(Time::parse("07:05")),
@@ -1178,7 +1188,8 @@ fn a_time_field_and_a_read_only_invalid_date_field_as_a_screen_reader_hears_them
             .into_element()
     });
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("time_and_invalid_field_a11y", dump(&tree));
 }
 
@@ -1290,7 +1301,7 @@ fn a_range_picker_runs_its_arrows_through_both_fields_to_the_trigger() {
         for _ in 0..6 {
             s.press(on, Modifiers::default());
             s.settle().expect("settled");
-            seen.push(p.trigger_handle().is_focused());
+            seen.push(s.read(|| p.trigger_handle().is_focused()));
         }
         assert_eq!(
             seen,
@@ -1299,7 +1310,7 @@ fn a_range_picker_runs_its_arrows_through_both_fields_to_the_trigger() {
         );
         s.press(back, Modifiers::default());
         s.settle().expect("settled");
-        assert_eq!(gui::untracked(|| p.end.edge(true)).map(|h| h.is_focused()), Some(true));
+        assert_eq!(s.read(|| p.end.edge(true).map(|h| h.is_focused())), Some(true));
         // A new locale reorders the segments; the chain follows.
         s.act("vi", || {
             options.set(DateFieldOptions {
@@ -1314,7 +1325,10 @@ fn a_range_picker_runs_its_arrows_through_both_fields_to_the_trigger() {
         s.press(on, Modifiers::default());
         s.settle().expect("settled");
         let first = gui::untracked(|| p.end.edge(false)).expect("a segment");
-        assert!(first.is_focused(), "{direction:?}: onto the end's first, the day in vi");
+        assert!(
+            s.read(|| first.is_focused()),
+            "{direction:?}: onto the end's first, the day in vi"
+        );
         assert_eq!(gui::untracked(|| p.end.segments())[0], Segment::Day);
     }
 }
@@ -1371,7 +1385,8 @@ fn a_range_picker_closes_once_whole_and_reports_its_value_and_validity() {
     }
     s.settle().expect("settled");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let tree = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     insta::assert_snapshot!("date_range_picker_a11y", dump(&tree));
 }
 
@@ -1396,5 +1411,5 @@ fn escape_while_a_range_is_half_made_puts_it_back_and_closes_the_popup() {
         "the last whole range is back"
     );
     assert!(!open.get_untracked(), "and the popup closed");
-    assert!(p.trigger_handle().is_focused(), "focus back on the trigger");
+    assert!(s.read(|| p.trigger_handle().is_focused()), "focus back on the trigger");
 }

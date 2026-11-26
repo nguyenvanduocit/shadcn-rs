@@ -14,7 +14,6 @@
 //! multiplies by [`Scene::scale`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::color::Color;
 use crate::figure::{Path, PathStyle};
@@ -75,8 +74,9 @@ impl Scene {
 
     /// A chunk of `items` under `state`, recorded now, with a fresh id.
     pub fn push_under(&mut self, state: State, items: Vec<Item>) {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        let id = ChunkId(NEXT.fetch_add(1, Ordering::Relaxed) | (1 << 63));
+        /// The chunks pushed, numbered.
+        static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("pushed chunk");
+        let id = ChunkId(crate::engine::unique_id(&NEXT) | (1 << 63));
         self.chunks.push(Chunk {
             id,
             state,
@@ -161,14 +161,14 @@ pub struct Display {
 }
 
 /// The generations recordings are numbered by.
-static GENERATIONS: AtomicU64 = AtomicU64::new(1);
+static GENERATIONS: crate::engine::IdKind = crate::engine::IdKind::new("recording generation");
 
 impl Display {
     /// `items`, recorded now.
     #[must_use]
     pub fn new(items: Vec<Item>) -> Self {
         Self {
-            generation: GENERATIONS.fetch_add(1, Ordering::Relaxed),
+            generation: crate::engine::unique_id(&GENERATIONS),
             items,
         }
     }
@@ -176,7 +176,7 @@ impl Display {
     /// Empty, under a generation of its own, for a recording made now.
     pub fn renew(&mut self) {
         self.items.clear();
-        self.generation = GENERATIONS.fetch_add(1, Ordering::Relaxed);
+        self.generation = crate::engine::unique_id(&GENERATIONS);
     }
 }
 
@@ -221,19 +221,96 @@ impl Properties {
     /// rectangle and its parent, and the shaders walk the chain.
     #[must_use]
     pub fn clip(&self, id: u32) -> Option<ClipNode> {
-        let get = |id: u32| {
-            (id != 0)
-                .then(|| usize::try_from(id).ok().and_then(|i| self.clips.get(i)))
-                .flatten()
-        };
-        let mut c = *get(id)?;
-        let mut up = c.parent;
-        for _ in 0..64 {
-            let Some(p) = get(up) else { break };
+        let mut chain = self.clip_chain(id);
+        let (_, first) = chain.next()?;
+        let mut c = *first;
+        for (_, p) in chain {
             c.clip.bounds = c.clip.bounds.intersect(&p.clip.bounds);
-            up = p.parent;
         }
         Some(c)
+    }
+
+    /// The clip `id` and each it lies within ([`ClipNode::parent`]),
+    /// innermost first: the chain an item under it is clipped by.
+    pub fn clip_chain(&self, id: u32) -> impl Iterator<Item = (u32, &ClipNode)> + '_ {
+        let mut at = id;
+        let mut steps = 0_usize;
+        std::iter::from_fn(move || {
+            if at == 0 || steps >= 4096 {
+                return None;
+            }
+            steps = steps.saturating_add(1);
+            let c = usize::try_from(at).ok().and_then(|i| self.clips.get(i))?;
+            let here = at;
+            at = c.parent;
+            Some((here, c))
+        })
+    }
+
+    /// The transform `id` and its ancestors, innermost first: what takes
+    /// its space to the window.
+    pub fn transform_chain(&self, id: u32) -> impl Iterator<Item = (u32, &TransformNode)> + '_ {
+        let mut at = id;
+        let mut steps = 0_usize;
+        std::iter::from_fn(move || {
+            if at == 0 || steps >= 4096 {
+                return None;
+            }
+            steps = steps.saturating_add(1);
+            let here = at;
+            let t = self.transform(at);
+            at = t.parent;
+            Some((here, t))
+        })
+    }
+
+    /// Everything a chunk painted under `state` depends on, as values: the
+    /// one definition of a chunk's property tree state, every node its
+    /// state reaches through a link, in a fixed order: its transform
+    /// chain; each clip of its clip chain with that clip's transform
+    /// chain; each effect of its effect chain with its group (`groups`'
+    /// number for it), its transform chain and its output clip's chain
+    /// ([`EffectNode::clip`]). Ids are left out (each painter numbers its
+    /// nodes) but an effect's group is kept: chunks under one 50% group
+    /// composite as one layer, unlike the same chunks under two equal
+    /// groups, so the cold check ([`crate::paint`]'s `scene_differs`)
+    /// numbers each scene's groups as its chunks first reach them (one
+    /// [`Groups`] a scene), and two scenes' chunks paint alike exactly
+    /// when these are equal, chunk by chunk in paint order.
+    #[must_use]
+    pub fn depends(&self, state: State, groups: &mut Groups) -> Vec<Depends> {
+        let mut out = Vec::new();
+        let space = |out: &mut Vec<Depends>, id: u32| {
+            out.extend(self.transform_chain(id).map(|(_, t)| Depends::Transform {
+                offset: t.offset,
+                matrix: t.matrix,
+            }));
+            out.push(Depends::Up);
+        };
+        let clips = |out: &mut Vec<Depends>, id: u32| {
+            for (_, c) in self.clip_chain(id) {
+                out.push(Depends::Clip(c.clip));
+                space(out, c.transform);
+            }
+            out.push(Depends::Up);
+        };
+        space(&mut out, state.transform);
+        clips(&mut out, state.clip);
+        for (id, e) in self.effect_chain(state.effect, 0) {
+            out.push(Depends::Effect(
+                EffectNode {
+                    parent: 0,
+                    transform: 0,
+                    clip: 0,
+                    ..e.clone()
+                },
+                groups.number(id),
+            ));
+            space(&mut out, e.transform);
+            clips(&mut out, e.clip);
+        }
+        out.push(Depends::Up);
+        out
     }
 
     #[must_use]
@@ -276,6 +353,38 @@ impl Properties {
             at = e.parent;
             Some((here, e))
         })
+    }
+}
+
+/// One step of what a chunk depends on ([`Properties::depends`]): a node
+/// of a chain as what it does, or the end of a chain.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Depends {
+    Transform {
+        offset: (f32, f32),
+        matrix: Option<GroupTransform>,
+    },
+    /// A clip's own rounded rectangle, then its transform chain.
+    Clip(Clip),
+    /// An effect's own values (its links cleared) and its group's number
+    /// in its scene ([`Groups`]), then its transform chain and its output
+    /// clip's chain.
+    Effect(EffectNode, u32),
+    /// The chain above ends.
+    Up,
+}
+
+/// A scene's effect groups numbered as its chunks, in paint order, first
+/// reach them ([`Properties::depends`]): what tells two chunks in one
+/// group from two in equal groups, whatever ids a painter gave them.
+#[derive(Debug, Default)]
+pub struct Groups(std::collections::HashMap<u32, u32>);
+
+impl Groups {
+    /// Effect `id`'s number: the next one the first time it is asked for.
+    pub fn number(&mut self, id: u32) -> u32 {
+        let next = u32::try_from(self.0.len()).unwrap_or(u32::MAX);
+        *self.0.entry(id).or_insert(next)
     }
 }
 
@@ -323,6 +432,18 @@ pub struct EffectNode {
     pub transformed: bool,
     /// The physical window pixels its subtree may paint, as untransformed.
     pub region: Option<PixelRect>,
+    /// The clip its output lies in (Chrome's output clip): the clip of
+    /// the node it groups, 0 for none. A layer drawn for it holds its
+    /// subtree's clips below this one; this one and those above it clip
+    /// the layer where it is composited, after its filters and resampling.
+    ///
+    /// The contract: every chunk under the effect is clipped by this clip
+    /// or by one that lies in it (its clip's ancestry reaches this one), as
+    /// paint makes it (a node's clip is its layout parent's, or one inside
+    /// it). A layer's walks end at the first clip as shallow as this one,
+    /// so a chunk clipped on another branch would lose the clips it has
+    /// there; planning checks it in debug builds and under `GUI_COLD_CHECK`.
+    pub clip: u32,
 }
 
 impl Default for EffectNode {
@@ -335,7 +456,44 @@ impl Default for EffectNode {
             transform: 0,
             transformed: false,
             region: None,
+            clip: 0,
         }
+    }
+}
+
+/// One layer a frame was drawn with, as a stage of how its pixels were
+/// made (the renderer's plan, by its per-case rule: filters, a mask, an
+/// opacity over what overlaps, what it cannot draw through a scale or
+/// turn): its texels are the whole physical pixels of the space of its
+/// effect's transform, and its composite samples them into the target of
+/// the layer it lies in (`outer`; 0, the canvas) through `map`, bilinearly
+/// (`KIND_LAYER` in `gpu/shaders.wgsl`), under its output clip `clip`.
+/// Hit testing reads a frame's stages to follow a pixel back through each
+/// one that resamples ([`crate::clip::hit_in`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LayerStage {
+    /// Its effect, which names it.
+    pub effect: u32,
+    /// The layer it is composited into, 0 for the canvas.
+    pub outer: u32,
+    /// Its effect's transform: its texels' space.
+    pub transform: u32,
+    /// Its map from its space into `outer`'s, in physical pixels as the
+    /// scene's matrices are ([`GroupTransform::matrix`]), scales and turns
+    /// alone (offsets are whole device pixels, ADR-0020).
+    pub map: [f32; 6],
+    /// Its output clip ([`EffectNode::clip`]).
+    pub clip: u32,
+}
+
+impl LayerStage {
+    /// Whether its composite resamples its texels: its map into the target
+    /// it is composited into is not the identity, so they are not that
+    /// target's pixels. A layer that does not changes no pixel's centre:
+    /// what clips its texels clips its target's pixels alike.
+    #[must_use]
+    pub fn resamples(&self) -> bool {
+        self.map != [1.0, 0.0, 0.0, 1.0, 0.0, 0.0]
     }
 }
 
@@ -597,14 +755,17 @@ pub struct PixelRect {
 
 /// A linear gradient placed in logical pixels: colours `stops` along the
 /// line from `start` to `end` (offsets `0.0..=1.0` along it), mixed in OKLab
-/// between stops as CSS mixes `bg-linear-*`, padded past both ends.
+/// between stops as CSS mixes `bg-linear-*`, padded past both ends. The
+/// stops are shared: a copy (the property trees each frame presented
+/// holds, a paint moved by the compositor) moves the line, never copies
+/// the stops.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Gradient {
     Solid(Color),
     Linear {
         start: (f32, f32),
         end: (f32, f32),
-        stops: Vec<(f32, Color)>,
+        stops: std::sync::Arc<[(f32, Color)]>,
     },
 }
 
@@ -649,7 +810,7 @@ pub struct Drawn {
     /// those of the clips within it (the shaders walk each chain).
     pub clips_written: usize,
     /// The longest effective clip chain among the clips decided this frame
-    /// (the clips the shaders walk for it, [`crate::clip::needed`]).
+    /// (the clips the shaders walk for it, [`crate::clip::holds`]).
     pub clip_chain: usize,
     /// The GPU time of the last frame whose timestamps came back (a frame
     /// or two behind; `None` without timestamp queries), its first pass's

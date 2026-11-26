@@ -22,6 +22,7 @@ use accesskit::{Action, ActionData, ActionRequest, NodeId, TreeId};
 
 use crate::access;
 use crate::app::{Pipeline, Scenario, ScenarioError};
+use crate::compositor::Presented;
 use crate::events::{Key, KeyEvent, Modifiers, NamedKey};
 use crate::focus;
 use crate::heap;
@@ -32,6 +33,14 @@ use crate::process;
 use crate::reactive;
 use crate::testing::Rng;
 use crate::window::Input;
+
+/// The devtools' reader of laid-out geometry ([`crate::layout::Sight`]):
+/// what they report and where they bring a node into view.
+#[derive(Clone, Copy)]
+pub(crate) struct Sight(());
+
+/// The devtools' [`Sight`].
+const SIGHT: Sight = Sight(());
 
 /// How many frame reports the log keeps.
 pub const LOG_FRAMES: usize = 120;
@@ -262,6 +271,13 @@ impl FrameLog {
 /// What the commands read and drive: a pipeline, live or headless.
 pub(crate) trait Target {
     fn frame(&self) -> &Frame;
+    /// The frame the screen shows: where a point is picked as a click
+    /// lands ([`interact::hit_presented`]), and what input sent is routed
+    /// through ([`Self::send`]), as the platform's is.
+    fn presented(&self) -> Option<&Presented>;
+    /// The last commit made: a frame presented with a later one shows
+    /// what input sent since did.
+    fn committed(&self) -> u64;
     fn send(&mut self, input: Input) -> Outcome;
     fn footprint(&self) -> Footprint;
     /// What each part of the pipeline holds (the memory report by owner).
@@ -272,35 +288,74 @@ pub(crate) trait Target {
     /// Bring a probe tree of its own (never the window's) up to the last
     /// frame, from nothing when `full`: what an update costs.
     fn access_probe(&mut self, full: bool) -> access::AccessStats;
+    /// The window its commands are turns of ([`execute`]).
+    fn window(&self) -> std::rc::Rc<crate::focus::FocusRoot>;
 }
 
-impl Target for Pipeline {
+/// A pipeline and the frame its screen shows: the devtools pick and send
+/// input through that frame, as the platform's input is routed.
+pub(crate) struct Showing<'a> {
+    pub(crate) pipeline: &'a mut Pipeline,
+    pub(crate) shown: std::sync::Arc<Presented>,
+}
+
+/// A headless scenario's pipeline and the frame it last presented.
+fn showing(scenario: &mut Scenario) -> Showing<'_> {
+    let presented = scenario.shown();
+    Showing::new(scenario.pipeline_mut(), &presented)
+}
+
+impl<'a> Showing<'a> {
+    /// `pipeline` while `presented` is on screen: before any frame was
+    /// presented, the scene it last painted ([`Pipeline::on_screen`]).
+    pub(crate) fn new(pipeline: &'a mut Pipeline, presented: &crate::compositor::Shown) -> Self {
+        let shown = pipeline.on_screen(presented);
+        Self { pipeline, shown }
+    }
+}
+
+impl Target for Showing<'_> {
     fn frame(&self) -> &Frame {
-        Pipeline::frame(self)
+        self.pipeline.frame()
+    }
+
+    fn window(&self) -> std::rc::Rc<crate::focus::FocusRoot> {
+        self.pipeline.window()
+    }
+
+    fn presented(&self) -> Option<&Presented> {
+        Some(&self.shown)
+    }
+
+    fn committed(&self) -> u64 {
+        self.pipeline.committed()
     }
 
     fn send(&mut self, input: Input) -> Outcome {
-        self.input(input)
+        // Made now by the agent's step, on the UI thread: what the
+        // compositor scrolled reaches it with the next input or frame the
+        // render thread hands on (ADR-0033).
+        self.pipeline.input_on(input, std::sync::Arc::clone(&self.shown))
     }
 
     fn footprint(&self) -> Footprint {
-        Pipeline::footprint(self)
+        self.pipeline.footprint()
     }
 
     fn owners(&self) -> Vec<inspect::Owner> {
-        Pipeline::owners(self)
+        self.pipeline.owners()
     }
 
     fn last_diff(&self) -> &LayoutDiff {
-        Pipeline::last_diff(self)
+        self.pipeline.last_diff()
     }
 
     fn access_tree(&mut self) -> accesskit::TreeUpdate {
-        Pipeline::access_tree(self, 1.0, "window")
+        self.pipeline.access_tree(1.0, "window")
     }
 
     fn access_probe(&mut self, full: bool) -> access::AccessStats {
-        Pipeline::access_probe(self, full).1
+        self.pipeline.access_probe(full).1
     }
 }
 
@@ -317,7 +372,15 @@ pub(crate) enum Done {
     Screenshot { path: PathBuf, overlay: bool },
     /// A command only a [`Session`] runs (time, size, bench).
     Headless(Vec<String>),
+    /// It scrolled its node into view (what it says): run it again once
+    /// the frame that shows it there is presented. Input lands by the
+    /// frame on screen, the devtools' as the platform's.
+    Again(String),
 }
+
+/// How many times a command may scroll its node toward view before it
+/// gives up (a node that moves away as it is scrolled to).
+const AGAIN: usize = 4;
 
 /// Split a command line into words: spaces separate them, quotes ("…" or '…')
 /// keep spaces in one, a backslash escapes the next character.
@@ -349,37 +412,67 @@ pub fn split(line: &str) -> Result<Vec<String>, String> {
     Ok(words)
 }
 
-/// Run one command (already split) against `target`.
+/// Run one command (already split) against `target`: one turn of its
+/// window (`engine::turn`, ADR-0015), however many inputs it sends (a
+/// click's move, press and release), so user code that panics in one
+/// leaves the others to be sent, and the first panic goes on once the
+/// command is done.
 pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String]) -> Result<Done, String> {
+    let window = target.window();
+    crate::engine::turn(&window, |_| execute_one(target, log, words))
+        .unwrap_or_else(|| Err("the command panicked".to_owned()))
+}
+
+/// [`execute`], inside its turn.
+fn execute_one(target: &mut dyn Target, log: &FrameLog, words: &[String]) -> Result<Done, String> {
     let Some((verb, args)) = words.split_first() else {
         return Ok(Done::Text(String::new()));
     };
     let arg = |n: usize, what: &str| args.get(n).map(String::as_str).ok_or(format!("{verb}: needs {what}"));
     let text = |s: String| Ok(Done::Text(s));
+    // The point a selector names on screen, or, while the screen shows the
+    // node elsewhere than it is laid out, run the command again later.
+    macro_rules! aim {
+        ($sel:expr) => {
+            match point_of(&*target, $sel)? {
+                Aim::At(x, y, about) => (x, y, about),
+                Aim::Wait(why) => return Ok(Done::Again(why)),
+            }
+        };
+    }
     match verb.as_str() {
         "help" | "?" => text(HELP.to_owned()),
         "tree" => {
             let (flags, rest) = flags(args);
             let depth = flag_num(&flags, "depth")?;
-            let root = rest.first().map(|s| node_of(target.frame(), s)).transpose()?;
+            let root = rest
+                .first()
+                .map(|s| node_of(target.frame(), target.presented(), s))
+                .transpose()?;
             text(tree(target.frame(), root, depth))
         }
         "components" => {
-            let root = args.first().map(|s| node_of(target.frame(), s)).transpose()?;
+            let root = args
+                .first()
+                .map(|s| node_of(target.frame(), target.presented(), s))
+                .transpose()?;
             text(components(target.frame(), root))
         }
         "node" => {
-            let i = node_of(target.frame(), arg(0, "a node (SEL)")?)?;
+            let i = node_of(target.frame(), target.presented(), arg(0, "a node (SEL)")?)?;
             text(node_detail(target.frame(), i))
         }
         "find" => text(find(target.frame(), &args.join(" "))),
         "at" => {
             let x = num(arg(0, "X Y")?)?;
             let y = num(arg(1, "X Y")?)?;
-            text(at(target.frame(), x, y))
+            text(at(target.frame(), target.presented(), x, y))
         }
         "a11y" | "access" => {
-            let root = args.first().map(|s| node_of(target.frame(), s)).transpose()?;
+            let root = args
+                .first()
+                .map(|s| node_of(target.frame(), target.presented(), s))
+                .transpose()?;
             let update = target.access_tree();
             text(a11y(target.frame(), &update, root))
         }
@@ -430,8 +523,10 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
         "click" | "rclick" => {
             let sel = arg(0, "a node (SEL)")?;
             let scrolled = reveal(target, sel)?;
-            let (x, y, about) = point_of(target.frame(), sel)?;
-            let about = format!("{scrolled}{about}");
+            if !scrolled.is_empty() {
+                return Ok(Done::Again(scrolled));
+            }
+            let (x, y, about) = aim!(sel);
             target.send(Input::PointerMoved { x, y });
             let out = if verb == "click" {
                 target.send(Input::MouseDown { x, y });
@@ -448,8 +543,10 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
         "hover" => {
             let sel = arg(0, "a node (SEL)")?;
             let scrolled = reveal(target, sel)?;
-            let (x, y, about) = point_of(target.frame(), sel)?;
-            let about = format!("{scrolled}{about}");
+            if !scrolled.is_empty() {
+                return Ok(Done::Again(scrolled));
+            }
+            let (x, y, about) = aim!(sel);
             let out = target.send(Input::PointerMoved { x, y });
             Ok(Done::Acted(format!("{about}\n{}", handled(&out))))
         }
@@ -457,7 +554,7 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
             // A press or a release alone, for a drag over many frames:
             // `down SEL`, then `hover SEL` for each move, then `up SEL`.
             let sel = arg(0, "a node (SEL)")?;
-            let (x, y, about) = point_of(target.frame(), sel)?;
+            let (x, y, about) = aim!(sel);
             target.send(Input::PointerMoved { x, y });
             let out = if verb == "down" {
                 target.send(Input::MouseDown { x, y })
@@ -473,17 +570,22 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
         "reveal" => {
             let sel = arg(0, "a node (SEL)")?;
             let scrolled = reveal(target, sel)?;
-            let i = node_of(target.frame(), sel)?;
-            Ok(Done::Acted(format!(
-                "{scrolled}{} is in view",
-                label(target.frame(), i)
-            )))
+            if !scrolled.is_empty() {
+                return Ok(Done::Again(scrolled));
+            }
+            // In view once the screen shows it there.
+            aim!(sel);
+            let i = node_of(target.frame(), target.presented(), sel)?;
+            Ok(Done::Acted(format!("{} is in view", label(target.frame(), i))))
         }
         "drag" => {
             let from_sel = arg(0, "two nodes (SEL SEL)")?;
-            reveal(target, from_sel)?;
-            let (x0, y0, from) = point_of(target.frame(), from_sel)?;
-            let (x1, y1, to) = point_of(target.frame(), arg(1, "two nodes (SEL SEL)")?)?;
+            let scrolled = reveal(target, from_sel)?;
+            if !scrolled.is_empty() {
+                return Ok(Done::Again(scrolled));
+            }
+            let (x0, y0, from) = aim!(from_sel);
+            let (x1, y1, to) = aim!(arg(1, "two nodes (SEL SEL)")?);
             target.send(Input::PointerMoved { x: x0, y: y0 });
             target.send(Input::MouseDown { x: x0, y: y0 });
             target.send(Input::PointerMoved { x: x1, y: y1 });
@@ -494,7 +596,7 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
             let dy = num(arg(0, "DY")?)?;
             let mut about = String::new();
             if let Some(sel) = args.get(1) {
-                let (x, y, over) = point_of(target.frame(), sel)?;
+                let (x, y, over) = aim!(sel);
                 target.send(Input::PointerMoved { x, y });
                 about = format!("{over}\n");
             }
@@ -529,7 +631,7 @@ pub(crate) fn execute(target: &mut dyn Target, log: &FrameLog, words: &[String])
             Ok(Done::Acted(lines.join("\n")))
         }
         "activate" | "focus" | "setvalue" => {
-            let i = actor(target.frame(), arg(0, "a node (SEL)")?, verb)?;
+            let i = actor(target.frame(), target.presented(), arg(0, "a node (SEL)")?, verb)?;
             let (action, data) = match verb.as_str() {
                 "activate" => (Action::Click, None),
                 "focus" => (Action::Focus, None),
@@ -743,17 +845,19 @@ fn pick_text(frame: &Frame, sel: &str) -> Result<Pick, String> {
 }
 
 /// The node a selector names (a point names the node under it).
-fn node_of(frame: &Frame, sel: &str) -> Result<usize, String> {
+fn node_of(frame: &Frame, seen: Option<&Presented>, sel: &str) -> Result<usize, String> {
     match pick(frame, sel)? {
         Pick::Node(i) => Ok(i),
-        Pick::Point(x, y) => interact::hit(frame, x, y).ok_or_else(|| format!("no node under ({x},{y})")),
+        Pick::Point(x, y) => {
+            interact::hit_presented(frame, seen, x, y).ok_or_else(|| format!("no node under ({x},{y})"))
+        }
     }
 }
 
 /// The node a screen reader's action on `sel` reaches: of the nodes `sel`
 /// may mean, the first that takes the action itself or through the nearest
 /// ancestor that does (a label's text names an input; a button's text sits in it).
-fn actor(frame: &Frame, sel: &str, verb: &str) -> Result<usize, String> {
+fn actor(frame: &Frame, seen: Option<&Presented>, sel: &str, verb: &str) -> Result<usize, String> {
     let takes = |i: usize| {
         frame.behaviour(i).is_some_and(|b| {
             !b.disabled
@@ -765,12 +869,12 @@ fn actor(frame: &Frame, sel: &str, verb: &str) -> Result<usize, String> {
         })
     };
     let candidates = match sel.chars().next() {
-        Some('@' | '#') => vec![node_of(frame, sel)?],
+        Some('@' | '#') => vec![node_of(frame, seen, sel)?],
         _ if sel
             .split_once(',')
             .is_some_and(|(x, y)| x.trim().parse::<f32>().is_ok() && y.trim().parse::<f32>().is_ok()) =>
         {
-            vec![node_of(frame, sel)?]
+            vec![node_of(frame, seen, sel)?]
         }
         _ => text_matches(frame, sel),
     };
@@ -794,9 +898,9 @@ fn reveal(target: &mut dyn Target, sel: &str) -> Result<String, String> {
             break;
         };
         let Some(n) = frame.nodes.get(i) else { break };
-        let b = n.bounds;
+        let b = n.bounds(SIGHT);
         let visible = |c: &crate::geometry::Bounds| {
-            let v = frame.viewport;
+            let v = frame.viewport(SIGHT);
             let (x0, y0) = (c.x.max(v.x), c.y.max(v.y));
             let (x1, y1) = (c.right().min(v.right()), c.bottom().min(v.bottom()));
             (x0, y0, x1, y1)
@@ -804,15 +908,15 @@ fn reveal(target: &mut dyn Target, sel: &str) -> Result<String, String> {
         // The nearest scroll container that does not show all of the node.
         let hidden_in = frame.ancestors(i).skip(1).find(|&a| {
             frame.nodes.get(a).is_some_and(|c| {
-                let (x0, y0, x1, y1) = visible(&c.bounds);
-                c.scroll.is_some() && (b.y < y0 || b.bottom() > y1 || b.x < x0 || b.right() > x1)
+                let (x0, y0, x1, y1) = visible(&c.bounds(SIGHT));
+                c.scroll(SIGHT).is_some() && (b.y < y0 || b.bottom() > y1 || b.x < x0 || b.right() > x1)
             })
         });
         let Some(c) = hidden_in.and_then(|a| frame.nodes.get(a).map(|c| (a, c))) else {
             break;
         };
         let (a, container) = c;
-        let (x0, y0, x1, y1) = visible(&container.bounds);
+        let (x0, y0, x1, y1) = visible(&container.bounds(SIGHT));
         let delta = |lo: f32, hi: f32, start: f32, end: f32| {
             if end - start > hi - lo || start < lo {
                 start - lo - MARGIN
@@ -838,20 +942,23 @@ fn reveal(target: &mut dyn Target, sel: &str) -> Result<String, String> {
     Ok(lines)
 }
 
-/// Where to put the pointer for a selector, and a line saying what is there.
-fn point_of(frame: &Frame, sel: &str) -> Result<(f32, f32, String), String> {
+/// Where to put the pointer for a selector, and a line saying what is
+/// there; or that the screen does not show the node where it is laid out
+/// yet ([`Aim::Wait`]).
+fn point_of(target: &dyn Target, sel: &str) -> Result<Aim, String> {
+    let (frame, seen) = (target.frame(), target.presented());
     let (x, y, named) = match pick(frame, sel)? {
         Pick::Point(x, y) => (x, y, None),
         Pick::Node(i) => {
             let n = frame.nodes.get(i).ok_or("the node is gone")?;
             // The part of the box its clip shows: a node scrolled out of view
             // cannot be pointed at.
-            let b = n.bounds;
+            let b = n.bounds(SIGHT);
             let (mut x0, mut y0, mut x1, mut y1) = (b.x, b.y, b.right(), b.bottom());
-            if let Some(c) = n.clip {
+            if let Some(c) = n.clip(SIGHT) {
                 (x0, y0, x1, y1) = (x0.max(c.x), y0.max(c.y), x1.min(c.right()), y1.min(c.bottom()));
             }
-            let v = frame.viewport;
+            let v = frame.viewport(SIGHT);
             (x0, y0, x1, y1) = (x0.max(v.x), y0.max(v.y), x1.min(v.right()), y1.min(v.bottom()));
             if x1 <= x0 || y1 <= y0 {
                 return Err(format!(
@@ -862,18 +969,79 @@ fn point_of(frame: &Frame, sel: &str) -> Result<(f32, f32, String), String> {
             ((x0 + x1) / 2.0, (y0 + y1) / 2.0, Some(i))
         }
     };
-    let hit = interact::hit(frame, x, y);
+    let hit = interact::hit_presented(frame, seen, x, y);
     let mut about = format!("at ({x:.0},{y:.0})");
-    match (hit, named) {
-        (Some(h), Some(i)) if !frame.ancestors(h).any(|a| a == i) && !frame.ancestors(i).any(|a| a == h) => {
-            about.push_str(&format!(" {}, covered by {}", label(frame, i), label(frame, h)));
-        }
+    // A node named is acted on only where the screen shows it: the target
+    // the frame on screen hits at the point must be it, a node inside it,
+    // or the node that takes the pointer for it (a text takes none: its
+    // button does). Anything else (nothing, a node around that one,
+    // another) would take the input in its place: a press on nothing
+    // dismisses an open layer as a press outside it, one on a box around
+    // it is not the named node's. The input goes where the screen shows
+    // it, as a device's would (UI Events: the target is what is hit at
+    // the point).
+    let takes_for = named.and_then(|i| frame.ancestors(i).find(|&a| frame.takes_pointer(a)));
+    let elsewhere = match (hit, named) {
+        (Some(h), Some(i)) if !frame.ancestors(h).any(|a| a == i) && Some(h) != takes_for => Some(format!(
+            "{} is not what the screen shows at ({x:.0},{y:.0}): it shows {}",
+            label(frame, i),
+            label(frame, h)
+        )),
+        (None, Some(i)) => Some(format!(
+            "{} is not what the screen shows at ({x:.0},{y:.0}): it shows nothing that takes the pointer",
+            label(frame, i)
+        )),
         (Some(h), _) => {
             about.push_str(&format!(" reaches {}", label(frame, h)));
+            None
         }
-        (None, _) => about.push_str(" reaches nothing that takes the pointer"),
+        (None, None) => {
+            about.push_str(" reaches nothing that takes the pointer");
+            None
+        }
+    };
+    let Some(why) = elsewhere else {
+        return Ok(Aim::At(x, y, about));
+    };
+    // The point is where the frame laid out last puts the node; the
+    // screen may still show an older frame, with the node elsewhere. That
+    // is no failure: the command runs again once a later frame is
+    // presented ([`Done::Again`]), and only a frame that shows the node
+    // where it is laid out and still puts something else there fails it.
+    match takes_for.filter(|&a| moved_since(frame, seen, a)) {
+        Some(i) => Ok(Aim::Wait(format!(
+            "{} is laid out where the frame on screen does not show it yet: waited for the next\n",
+            label(frame, i)
+        ))),
+        None => Err(why),
     }
-    Ok((x, y, about))
+}
+
+/// Where a command that names a node puts the pointer.
+#[derive(Debug, PartialEq)]
+enum Aim {
+    /// The point, and a line saying what the screen shows there.
+    At(f32, f32, String),
+    /// The node is laid out elsewhere than the frame on screen shows it:
+    /// run again once a frame of the last commit is presented.
+    Wait(String),
+}
+
+/// Whether node `i` of `frame`, one that takes the pointer, is laid out
+/// otherwise than `seen`, the frame on screen, shows it: that frame's hit
+/// table has no box of the node's key at the node's place in its paint
+/// space. (A box the compositor moves keeps that place: scroll and
+/// motion move its space, not it.) A frame presented since that shows
+/// the node where it is laid out has that box.
+fn moved_since(frame: &Frame, seen: Option<&Presented>, i: usize) -> bool {
+    let (Some(seen), Some(n)) = (seen, frame.nodes.get(i)) else {
+        return false;
+    };
+    let key = crate::compositor::NodeKey::of(&n.path);
+    !seen
+        .hits
+        .iter()
+        .any(|h| h.target.key == key && h.rect == n.space(SIGHT))
 }
 
 /// The words a node shows or is named by: its text, an input's value and
@@ -972,7 +1140,7 @@ fn behaviour(frame: &Frame, i: usize) -> String {
         w.push("a11y-hidden".to_owned());
     }
     if let Some(n) = frame.nodes.get(i) {
-        if let Some(sc) = n.scroll {
+        if let Some(sc) = n.scroll(SIGHT) {
             w.push(format!(
                 "scroll={:.0},{:.0}/{:.0},{:.0}",
                 sc.offset.0, sc.offset.1, sc.max.0, sc.max.1
@@ -1045,7 +1213,7 @@ fn tree(frame: &Frame, root: Option<usize>, max_depth: Option<usize>) -> String 
             "  ".repeat(depth),
             n.path,
             inspect::describe(n),
-            n.bounds,
+            n.bounds(SIGHT),
             behaviour(frame, i)
         ));
     }
@@ -1070,7 +1238,7 @@ fn components(frame: &Frame, root: Option<usize>) -> String {
             "{}#{name}  @{}  {}  {}\n",
             "  ".repeat(depth),
             n.path,
-            n.bounds,
+            n.bounds(SIGHT),
             behaviour(frame, i)
         ));
     }
@@ -1084,8 +1252,12 @@ fn node_detail(frame: &Frame, i: usize) -> String {
     };
     let mut out = String::new();
     out.push_str(&format!("@{}  {}\n", n.path, inspect::describe(n)));
-    out.push_str(&format!("  box        {}  content {}\n", n.bounds, n.content_box));
-    if let Some(c) = n.clip {
+    out.push_str(&format!(
+        "  box        {}  content {}\n",
+        n.bounds(SIGHT),
+        n.content_box(SIGHT)
+    ));
+    if let Some(c) = n.clip(SIGHT) {
         out.push_str(&format!("  clip       {c}\n"));
     }
     let l = &n.look;
@@ -1232,7 +1404,7 @@ fn find(frame: &Frame, needle: &str) -> String {
             "@{}  {}  {}  {}{via}\n",
             n.path,
             inspect::describe(n),
-            n.bounds,
+            n.bounds(SIGHT),
             behaviour(frame, i)
         ));
     }
@@ -1240,8 +1412,8 @@ fn find(frame: &Frame, needle: &str) -> String {
     out
 }
 
-fn at(frame: &Frame, x: f32, y: f32) -> String {
-    let Some(h) = interact::hit(frame, x, y) else {
+fn at(frame: &Frame, seen: Option<&Presented>, x: f32, y: f32) -> String {
+    let Some(h) = interact::hit_presented(frame, seen, x, y) else {
         return format!("nothing at ({x},{y}) takes the pointer");
     };
     let mut out = String::new();
@@ -1828,13 +2000,31 @@ impl Session {
         last.ok_or_else(|| "no frame was drawn".to_owned())
     }
 
+    /// Run `words`, and again once the frame is presented each time it
+    /// scrolls its node into view (up to [`AGAIN`] times): what it scrolled,
+    /// and what it did at last.
+    fn presented_then(&mut self, words: &[String]) -> Result<(String, Done), String> {
+        let mut scrolled = String::new();
+        for _ in 0..AGAIN {
+            match execute(&mut showing(&mut self.scenario), &self.log, words)? {
+                Done::Again(what) => {
+                    scrolled.push_str(&what);
+                    self.draw()?;
+                }
+                done => return Ok((scrolled, done)),
+            }
+        }
+        Ok((scrolled, Done::Again(String::new())))
+    }
+
     /// Run one command line; the answer, or why it failed.
     pub fn run(&mut self, line: &str) -> Result<String, String> {
         let words = split(line)?;
-        let done = execute(self.scenario.pipeline_mut(), &self.log, &words)?;
+        let (scrolled, done) = self.presented_then(&words)?;
         match done {
+            Done::Again(_) => Err(format!("{scrolled}the node does not stay in view")),
             Done::Text(t) => Ok(t),
-            Done::Acted(what) => Ok(format!("{what}\n{}", self.draw()?)),
+            Done::Acted(what) => Ok(format!("{scrolled}{what}\n{}", self.draw()?)),
             Done::Frame => self.draw().map(|r| r.to_string()),
             Done::Screenshot { path, overlay } => {
                 let report = self.draw()?;
@@ -1910,7 +2100,7 @@ impl Session {
             let action = self.random_action(&mut rng);
             let words = split(&action)?;
             // A handler that panics leaves its state half written; the run stops there.
-            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step(&words)));
+            let ran = crate::engine::attempt(|| self.step(&words));
             let report = match ran {
                 Ok(Ok(report)) => report,
                 Ok(Err(e)) => {
@@ -1922,12 +2112,8 @@ impl Session {
                     log.push(format!("{step:>4} {action}  ({e})"));
                     continue;
                 }
-                Err(panic) => {
-                    let why = panic
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| panic.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                        .unwrap_or_else(|| "a panic".to_owned());
+                Err(failed) => {
+                    let why = failed.message();
                     return Err(stopped(seed, step, &action, &format!("PANIC {why}"), &log));
                 }
             };
@@ -2002,15 +2188,15 @@ impl Session {
             self.scenario.wait(Duration::from_secs_f32(ms_ / 1000.0));
             return self.draw();
         }
-        execute(self.scenario.pipeline_mut(), &self.log, words)?;
+        self.presented_then(words)?;
         self.draw()
     }
 
     /// A random action on what the last frame shows.
     fn random_action(&self, rng: &mut Rng) -> String {
-        let frame = Target::frame(self.scenario.pipeline());
+        let frame = self.scenario.pipeline().frame();
         let targets = frame.pointer_targets();
-        let v = frame.viewport;
+        let v = frame.viewport(SIGHT);
         let point = |rng: &mut Rng| -> String {
             match rng.pick(&targets) {
                 Some(b) => {
@@ -2233,21 +2419,87 @@ pub(crate) struct Attached {
     pub(crate) inbox: std::rc::Rc<std::cell::RefCell<VecDeque<Request>>>,
     /// Answers waiting for the next frame (its report, or its pixels).
     waiting: Vec<Waiting>,
+    /// Commands that scrolled their node into view, run again once a frame
+    /// after the commit they saw is presented ([`Done::Again`]). Shared
+    /// with the timer that answers each past [`AGAIN_WAIT`].
+    again: std::rc::Rc<std::cell::RefCell<Vec<Rerun>>>,
 }
 
+/// A command that scrolled its node into view, waiting for a frame that
+/// shows it there to be presented.
+struct Rerun {
+    req: Request,
+    /// What it scrolled so far.
+    scrolled: String,
+    /// The commit it saw: a frame presented with a later one shows it.
+    after: u64,
+    /// How many times it scrolled.
+    tries: usize,
+    /// When it began to wait, on the UI clock: past [`AGAIN_WAIT`] it is
+    /// answered with an error (a window hidden or stopped presents nothing).
+    since: Duration,
+    /// The timer that answers it then ([`Attached::deadline`]).
+    wake: Option<crate::clock::TimerId>,
+}
+
+/// How long a command waits for the frame that shows its node in view.
+const AGAIN_WAIT: Duration = Duration::from_secs(2);
+
 impl Attached {
-    /// Run the requests that arrived; whether a frame is due for one.
+    /// Run the requests that arrived, and those whose node a frame since
+    /// presented shows in view; whether a frame is due for one.
     pub(crate) fn run(&mut self, target: &mut dyn Target) -> bool {
-        let mut due = false;
-        loop {
-            let next = self.inbox.borrow_mut().pop_front();
-            let Some(req) = next else { break };
+        let now = crate::clock::current_time();
+        let shown = target.presented().map_or(0, |p| p.commit);
+        let (ready, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut *self.again.borrow_mut())
+            .into_iter()
+            .partition(|r| shown > r.after);
+        self.again.borrow_mut().extend(waiting);
+        // A frame is due until the one each waits for is presented.
+        let mut due = !self.again.borrow().is_empty();
+        let arrived = std::iter::from_fn(|| self.inbox.borrow_mut().pop_front()).map(|req| Rerun {
+            req,
+            scrolled: String::new(),
+            after: 0,
+            tries: 0,
+            since: now,
+            wake: None,
+        });
+        let all: Vec<_> = ready.into_iter().chain(arrived).collect();
+        for Rerun {
+            req,
+            scrolled,
+            tries,
+            since,
+            wake,
+            ..
+        } in all
+        {
+            if let Some(w) = wake {
+                crate::clock::cancel(w);
+            }
             let done = split(&req.line).and_then(|w| execute(target, &self.log, &w));
             match done {
+                Ok(Done::Again(what)) if tries < AGAIN => {
+                    due = true;
+                    let wake = Some(self.deadline(since));
+                    self.again.borrow_mut().push(Rerun {
+                        req,
+                        scrolled: format!("{scrolled}{what}"),
+                        after: target.committed(),
+                        tries: tries.saturating_add(1),
+                        since,
+                        wake,
+                    });
+                }
+                Ok(Done::Again(_)) => drop(
+                    req.answer
+                        .send(format!("error: {scrolled}the node does not stay in view")),
+                ),
                 Ok(Done::Text(t)) => drop(req.answer.send(t)),
                 Ok(Done::Acted(what)) => {
                     due = true;
-                    self.waiting.push((req, what, None));
+                    self.waiting.push((req, format!("{scrolled}{what}"), None));
                 }
                 Ok(Done::Frame) => {
                     due = true;
@@ -2265,6 +2517,32 @@ impl Attached {
             }
         }
         due
+    }
+
+    /// A timer on the UI clock that answers, [`AGAIN_WAIT`] after `since`,
+    /// each command still waiting then that no frame showing its node was
+    /// presented. A timer, so the UI loop wakes for it with nothing else
+    /// going on (it sleeps until the next timer, [`crate::window::Wake`]):
+    /// a hidden or stopped window presents nothing and sends no input,
+    /// and without one the command would wait unanswered.
+    fn deadline(&self, since: Duration) -> crate::clock::TimerId {
+        let left = AGAIN_WAIT.saturating_sub(crate::clock::current_time().saturating_sub(since));
+        let again = std::rc::Rc::downgrade(&self.again);
+        crate::clock::after(left, move || {
+            let Some(again) = again.upgrade() else { return };
+            let now = crate::clock::current_time();
+            again.borrow_mut().retain(|r| {
+                if now.saturating_sub(r.since) < AGAIN_WAIT {
+                    return true;
+                }
+                drop(r.req.answer.send(format!(
+                    "error: {}no frame showing it was presented within {} s (the window is hidden or stopped)",
+                    r.scrolled,
+                    AGAIN_WAIT.as_secs()
+                )));
+                false
+            });
+        })
     }
 
     /// A frame was drawn: log it and answer what waited for it. `capture`
@@ -2566,6 +2844,69 @@ frame 2 at Ts took Tms (build Tms layout Tms paint Tms, most in layout): click (
         (Session::new(scenario).expect("a session"), hits)
     }
 
+    /// Two buttons side by side on screen; a commit not yet presented
+    /// swaps them. A named click on the one now laid out where the screen
+    /// still shows the other presses nothing while that frame is on
+    /// screen: a live window's waits for a frame of the commit (Opus N4),
+    /// a session draws one, and then the named button is pressed, the one
+    /// the screen shows there now.
+    #[test]
+    fn a_named_click_where_the_screen_still_shows_another_node_waits_for_the_frame_of_the_commit() {
+        let (mut s, pressed) = swapped_buttons();
+        let shown = s.scenario().shown();
+        let mut attached = Attached::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        attached.inbox.borrow_mut().push_back(Request {
+            line: "click #one".to_owned(),
+            answer: tx,
+        });
+        attached.run(&mut Showing::new(s.scenario().pipeline_mut(), &shown));
+        assert_eq!(attached.again.borrow().len(), 1, "it waits for a frame of the swap");
+        assert!(rx.try_recv().is_err(), "not answered yet");
+        assert!(pressed.get_untracked().is_empty(), "nothing pressed meanwhile");
+
+        let (mut s, pressed) = swapped_buttons();
+        let out = s.run("click #one").expect("clicked once the swap is shown");
+        assert_eq!(pressed.get_untracked(), ["one"], "{out}");
+    }
+
+    /// Two buttons side by side on screen, and a commit that swaps them
+    /// laid out by input since but not presented; what each click pressed.
+    fn swapped_buttons() -> (Session, Signal<Vec<&'static str>>) {
+        let (swapped, pressed) = (Signal::new(false), Signal::labeled("pressed", Vec::<&str>::new()));
+        let scenario = Scenario::measuring(
+            move || {
+                let button = |who: &'static str, k: u64| {
+                    div()
+                        .key(k)
+                        .named(who)
+                        .width(100.0)
+                        .height(40.0)
+                        .on_click(move |_| pressed.update(|v| v.push(who)))
+                        .child(text(who))
+                };
+                let (a, b) = (button("one", 1), button("two", 2));
+                let (first, second) = if swapped.get() { (b, a) } else { (a, b) };
+                div()
+                    .size(pct(100.0))
+                    .display(Display::Flex)
+                    .child(first)
+                    .child(second)
+                    .into_element()
+            },
+            320,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        let mut s = Session::new(scenario).expect("a session");
+        s.scenario().act("swap", || swapped.set(true));
+        // Input since lays the swap out; no frame of it is presented.
+        s.scenario()
+            .send(crate::window::Input::PointerMoved { x: 319.0, y: 99.0 });
+        (s, pressed)
+    }
+
     #[test]
     fn a_click_scrolls_its_node_into_view_first() {
         let (mut s, hits) = long_list();
@@ -2576,6 +2917,43 @@ frame 2 at Ts took Tms (build Tms layout Tms paint Tms, most in layout): click (
         s.run("click \"#0\"").expect("click");
         assert_eq!(hits.get(), [40, 0]);
         assert!(s.run("reveal \"#49\"").expect("reveal").contains("is in view"));
+    }
+
+    /// A live window's click that scrolled its row into view waits for a
+    /// frame showing it there; the window presents none (hidden, stopped):
+    /// past the wait, the client is answered with an error, not left
+    /// without an answer, and the row is not clicked. The answer comes
+    /// from a timer on the UI clock, which the UI loop wakes for with
+    /// nothing else going on: no input, no frame, no other run.
+    #[test]
+    fn a_rerun_a_stopped_window_never_presents_for_is_answered_with_an_error() {
+        let (mut s, hits) = long_list();
+        let mut attached = Attached::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        attached.inbox.borrow_mut().push_back(Request {
+            line: "click \"#40\"".to_owned(),
+            answer: tx,
+        });
+        // The frame on screen stays the one before the scroll.
+        let shown = s.scenario().shown();
+        let t0 = crate::clock::current_time();
+        let due = attached.run(&mut Showing::new(s.scenario().pipeline_mut(), &shown));
+        assert!(due, "a frame is due for it");
+        assert!(rx.try_recv().is_err(), "it waits for its frame");
+        // The UI loop sleeps until the next timer: one is due at the end
+        // of the wait.
+        assert_eq!(
+            crate::clock::last_due_by(t0 + AGAIN_WAIT),
+            Some(t0 + AGAIN_WAIT),
+            "a wake at the deadline"
+        );
+        crate::clock::advance_to(t0 + AGAIN_WAIT - Duration::from_millis(1));
+        assert!(rx.try_recv().is_err(), "still waiting before the deadline");
+        crate::clock::advance_to(t0 + AGAIN_WAIT);
+        let answer = rx.try_recv().expect("answered");
+        assert!(answer.starts_with("error:"), "{answer}");
+        assert!(answer.contains("no frame showing it was presented"), "{answer}");
+        assert!(hits.get_untracked().is_empty(), "the row was not clicked");
     }
 
     #[test]
@@ -2628,13 +3006,149 @@ frame 2 at Ts took Tms (build Tms layout Tms paint Tms, most in layout): click (
         assert_eq!(split(r#"type """#).ok(), Some(vec!["type".to_owned(), String::new()]));
     }
 
+    /// A commit not yet presented puts a clickable box inside another and
+    /// one alone on bare ground. The screen shows the box around the first
+    /// and nothing under the second: input there now would press those in
+    /// its place (a press on nothing closes an open layer as a press
+    /// outside it). A named click on either waits for a frame that shows
+    /// it (Opus N4) and presses it, never what was shown before. On a
+    /// screen that shows the frame laid out, a click on a box another
+    /// covers, or on a box the pointer passes through on bare ground, is
+    /// refused, naming what is shown there.
+    #[test]
+    fn a_named_click_where_the_screen_shows_nothing_or_what_is_around_it_waits_or_is_refused() {
+        let (added, pressed) = (Signal::new(false), Signal::labeled("pressed", Vec::<&str>::new()));
+        let scenario = Scenario::measuring(
+            move || {
+                let clickable = |who: &'static str| {
+                    div()
+                        .named(who)
+                        .width(80.0)
+                        .height(40.0)
+                        .on_click(move |_| pressed.update(|v| v.push(who)))
+                };
+                let outer = div()
+                    .width(200.0)
+                    .height(80.0)
+                    .on_click(move |_| pressed.update(|v| v.push("outer")));
+                let (outer, lone) = if added.get() {
+                    (outer.child(clickable("inner")), Some(clickable("lone")))
+                } else {
+                    (outer, None)
+                };
+                let covered = div()
+                    .position(crate::style::Position::Relative)
+                    .width(80.0)
+                    .height(40.0)
+                    .child(clickable("hidden"))
+                    .child(
+                        clickable("cover")
+                            .position(crate::style::Position::Absolute)
+                            .left(0.0)
+                            .top(0.0),
+                    );
+                // Bare ground: the root takes no pointer.
+                div()
+                    .size(pct(100.0))
+                    .pass_through()
+                    .display(Display::Flex)
+                    .child(outer)
+                    .children(lone)
+                    .child(covered)
+                    .child(div().named("ghost").pass_through().width(20.0).height(20.0))
+                    .into_element()
+            },
+            400,
+            100,
+            1.0,
+        )
+        .expect("a scenario");
+        let mut s = Session::new(scenario).expect("a session");
+        s.scenario().act("add", || added.set(true));
+        // Input since lays the boxes out; no frame of them is presented.
+        s.scenario()
+            .send(crate::window::Input::PointerMoved { x: 399.0, y: 99.0 });
+        s.run("click #inner").expect("waited, then clicked");
+        s.run("click #lone").expect("waited, then clicked");
+        assert_eq!(
+            pressed.get_untracked(),
+            ["inner", "lone"],
+            "never what was shown before"
+        );
+        let covered = s.run("click #hidden").expect_err("refused");
+        assert!(covered.contains("is not what the screen shows"), "{covered}");
+        assert!(covered.contains("cover"), "names what is shown: {covered}");
+        let nothing = s.run("click #ghost").expect_err("refused");
+        assert!(nothing.contains("it shows nothing"), "{nothing}");
+        assert_eq!(pressed.get_untracked(), ["inner", "lone"], "nothing else pressed");
+    }
+
+    /// A text names the box that takes its click: a click on it goes to
+    /// that box, which the screen shows there.
+    #[test]
+    fn a_named_click_on_a_text_reaches_the_box_that_takes_its_pointer() {
+        let (mut s, hits) = long_list();
+        s.run("click \"#1\"").expect("clicked");
+        assert_eq!(hits.get_untracked(), [1]);
+    }
+
+    /// A drag or a reveal that scrolled its node into view runs again once
+    /// a frame showing it there is presented, as a click does: neither acts
+    /// on the frame laid out before the screen shows the scroll.
+    #[test]
+    fn a_drag_and_a_reveal_that_scrolled_wait_for_the_frame_showing_it() {
+        for line in ["drag \"#40\" \"#41\"", "reveal \"#45\""] {
+            let (mut s, _) = long_list();
+            let mut attached = Attached::default();
+            let (tx, rx) = std::sync::mpsc::channel();
+            attached.inbox.borrow_mut().push_back(Request {
+                line: line.to_owned(),
+                answer: tx,
+            });
+            let shown = s.scenario().shown();
+            attached.run(&mut Showing::new(s.scenario().pipeline_mut(), &shown));
+            assert_eq!(attached.again.borrow().len(), 1, "{line} waits for its frame");
+            assert!(attached.waiting.is_empty(), "{line} did not act");
+            assert!(rx.try_recv().is_err(), "{line} is not answered yet");
+        }
+    }
+
+    /// A rerun whose frame was presented runs, and the timer that would
+    /// have answered it with an error is gone with it.
+    #[test]
+    fn a_rerun_whose_frame_came_leaves_no_wake_behind() {
+        let (mut s, hits) = long_list();
+        let mut attached = Attached::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        attached.inbox.borrow_mut().push_back(Request {
+            line: "click \"#40\"".to_owned(),
+            answer: tx,
+        });
+        let shown = s.scenario().shown();
+        let t0 = crate::clock::current_time();
+        attached.run(&mut Showing::new(s.scenario().pipeline_mut(), &shown));
+        assert_eq!(crate::clock::last_due_by(t0 + AGAIN_WAIT), Some(t0 + AGAIN_WAIT));
+        s.scenario().settle().expect("the scroll presented");
+        let shown = s.scenario().shown();
+        attached.run(&mut Showing::new(s.scenario().pipeline_mut(), &shown));
+        assert_eq!(hits.get_untracked(), [40], "the row was clicked");
+        assert_eq!(
+            crate::clock::last_due_by(t0 + AGAIN_WAIT),
+            None,
+            "its wake went with it"
+        );
+        crate::clock::advance_to(t0 + AGAIN_WAIT);
+        assert!(rx.try_recv().is_err(), "no error answers a command that ran");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_client_on_the_socket_is_answered_by_the_ui_thread() {
         let mut s = counter();
         let mut attached = Attached::default();
         let inbox = std::rc::Rc::clone(&attached.inbox);
-        let to_ui = crate::mailbox::mailbox(move |req: Request| inbox.borrow_mut().push_back(req));
+        let to_ui =
+            crate::engine::owned(|| crate::mailbox::mailbox(move |req: Request| inbox.borrow_mut().push_back(req)));
         let path = std::env::temp_dir().join(format!("gui-devtools-test-{}.sock", std::process::id()));
         listen(&path, to_ui).expect("listening");
         let client = {
@@ -2645,7 +3159,7 @@ frame 2 at Ts took Tms (build Tms layout Tms paint Tms, most in layout): click (
         let started = Instant::now();
         while !client.is_finished() && started.elapsed() < ANSWER_WITHIN {
             crate::mailbox::deliver();
-            attached.run(s.scenario().pipeline_mut());
+            attached.run(&mut showing(s.scenario()));
             std::thread::sleep(Duration::from_millis(5));
         }
         let answer = client.join().expect("the client ran").expect("answered");

@@ -817,7 +817,8 @@ fn named(s: &Shot, name: &str) -> Result<(f32, f32), ScenarioError> {
         .nodes
         .iter()
         .find(|n| n.name == Some(name))
-        .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
+        .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound(name.to_owned()))
 }
 

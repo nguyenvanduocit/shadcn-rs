@@ -140,7 +140,9 @@ pub enum WindowAction {
 }
 
 /// Where the decorations put what they ask, for the UI thread to hand on.
-pub type Actions = Rc<RefCell<Vec<WindowAction>>>;
+/// The live window's: a check that clicks a live decoration asks nothing of
+/// the platform, its write refused (ADR-0034, S7).
+pub type Actions = Rc<crate::engine::WorldRefCell<Vec<WindowAction>>>;
 
 /// The edge of a window `size` logical pixels that resizes it from
 /// `(x, y)`, if any: only while the window draws its own decorations,
@@ -186,17 +188,23 @@ pub fn edge_at(chrome: &Chrome, size: (f32, f32), x: f32, y: f32) -> Option<Edge
 /// that moves past the drag threshold moves the window, once.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Caption {
-    /// The last press that may start a double click: when (seconds) and where.
-    last: Option<(f32, f32, f32)>,
+    /// The last press that may start a double click: when (nanoseconds on
+    /// the frame clock) and where.
+    last: Option<(u64, f32, f32)>,
     /// Where the button went down, while it is held and has not moved the window.
     held: Option<(f32, f32)>,
 }
 
 impl Caption {
-    /// The primary button went down on the bar at `(x, y)`, `at` seconds.
-    pub fn press(&mut self, at: f32, x: f32, y: f32) -> Option<WindowAction> {
+    /// The primary button went down on the bar at `(x, y)`, at `at` on the
+    /// frame clock; two presses are ordered by the span between them
+    /// ([`clock::span`]), exact at any uptime.
+    pub fn press(&mut self, at: impl clock::Moment, x: f32, y: f32) -> Option<WindowAction> {
+        let at = at.nanos();
         let double = self.last.is_some_and(|(t, px, py)| {
-            at - t <= DOUBLE_CLICK && (x - px).abs() <= DOUBLE_CLICK_DISTANCE && (y - py).abs() <= DOUBLE_CLICK_DISTANCE
+            clock::span(t, at) <= DOUBLE_CLICK
+                && (x - px).abs() <= DOUBLE_CLICK_DISTANCE
+                && (y - py).abs() <= DOUBLE_CLICK_DISTANCE
         });
         if double {
             *self = Self::default();
@@ -366,7 +374,7 @@ fn bar(c: &Chrome, p: &Palette, caption: &Rc<RefCell<Caption>>, actions: &Action
         .align_items(Align::Center)
         .justify_content(Justify::End)
         .on_mouse_down(move |e| {
-            if let Some(a) = down.borrow_mut().press(clock::current_seconds(), e.x, e.y) {
+            if let Some(a) = down.borrow_mut().press(clock::current_nanos(), e.x, e.y) {
                 push(&a_down, a);
             }
         })
@@ -501,6 +509,28 @@ mod tests {
         // Moves after the release move nothing.
         c.released();
         assert_eq!(c.moved(200.0, 16.0), None);
+    }
+
+    /// Two presses 395 ms apart are a double click, 405 ms apart two
+    /// clicks, at 262,144 s of uptime (three days, where an f32 of seconds
+    /// steps by 1/64 s) as at 1 s.
+    #[test]
+    fn a_double_click_is_timed_the_same_at_any_uptime() {
+        let ms = |n: u64| n * 1_000_000;
+        for base in [1_000_000_000_u64, 262_144 * 1_000_000_000] {
+            for (gap, double) in [(395, true), (405, false)] {
+                let mut c = Caption::default();
+                c.press(base + 7_777, 100.0, 17.0);
+                c.released();
+                let second = c.press(base + 7_777 + ms(gap), 100.0, 17.0);
+                assert_eq!(
+                    second == Some(WindowAction::ToggleMaximize),
+                    double,
+                    "{gap} ms apart at {} s",
+                    base / 1_000_000_000
+                );
+            }
+        }
     }
 
     /// The bar laid out over an app, driven as a window drives it.

@@ -6,80 +6,718 @@
 //! state, like a signal) and attaches it to an element with `track_focus`.
 //! Which handle holds focus is a signal, so reading it re-renders on change.
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
 use crate::edit::TextEdit;
+use crate::engine::{Commit, Owned};
 use crate::geometry::NodePath;
 use crate::layer::{Entry, Layer, Stack, layer_start, within};
 use crate::layout::Frame;
-use crate::reactive::Signal;
 
-crate::engine::engine_local! {
-    [Fork] static NEXT: Cell<u64> = const { Cell::new(1) };
-    /// The windows made, for each one's own path-derived ids.
-    [Fork] static WINDOWS: Cell<u64> = const { Cell::new(0) };
-    /// The window whose code runs now: what [`focused`], [`set_focus`] and
-    /// a handle's `focus()` read and write. A window makes itself current
-    /// as it takes input, lays out or runs a caller's code; one made last
-    /// is current until then. With no window, one of the thread's own.
-    [Fork] static CURRENT: RefCell<Option<Rc<FocusRoot>>> = const { RefCell::new(None) };
+/// The focus handles made, numbered.
+static NEXT: crate::engine::IdKind = crate::engine::IdKind::new("focus handle");
+/// The windows made, for each one's own path-derived ids.
+static WINDOWS: crate::engine::IdKind = crate::engine::IdKind::new("focus window");
+
+/// The windows whose code runs now, one inside another (ADR-0015, the
+/// window stack), written only here: pushed by the guard a turn or work
+/// scheduled in a window enters it with ([`enter_window`],
+/// [`enter_thread`], which take the engine's leave, `engine::Entering`),
+/// popped as that guard drops, and a closing window struck out of every
+/// place in it ([`cx::forget`]). Nothing else in this module or outside it
+/// reaches it.
+mod cx {
+    use super::FocusRoot;
+    use std::cell::{Cell, RefCell};
+    use std::rc::{Rc, Weak};
+
+    /// How deep turns of windows may nest, one inside another's code: a
+    /// handler sending input to another window, work scheduled in one run
+    /// from another's turn. Deeper is runaway recursion, an engine fault.
+    const DEPTH: usize = 64;
+
+    /// One place in the stack.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Entry {
+        /// The thread's own window ([`NOWHERE`]): code from outside any
+        /// turn that names no window (ADR-0015, the thread-window rule).
+        Thread,
+        /// A window, by its salt ([`WINDOW_OF`] finds it).
+        Window(u64),
+        /// A window that closed while its entry was below the top: never
+        /// current again; what is above or below it is.
+        Gone,
+    }
+
+    /// The stack: plain data in a `Copy` cell, so a check's pushes, pops
+    /// and strikes are undone by the switch, and a turn allocates nothing.
+    #[derive(Clone, Copy)]
+    struct Stack {
+        len: usize,
+        at: [Entry; DEPTH],
+    }
+
+    impl Stack {
+        /// The window current: the top entry not struck out; `None` for
+        /// the thread's own (an empty stack, or `Thread` on top).
+        fn top(&self) -> Option<u64> {
+            self.at.get(..self.len)?.iter().rev().find_map(|e| match e {
+                Entry::Thread => Some(None),
+                Entry::Window(salt) => Some(Some(*salt)),
+                Entry::Gone => None,
+            })?
+        }
+    }
+
+    crate::engine::engine_local! {
+        /// The windows whose code runs now ([`Stack`]): its top (struck
+        /// entries skipped) is what [`super::focused`],
+        /// [`super::set_focus`], a handle's `focus()` and the window's
+        /// ambient signals ([`super::WindowSignals`]) read and write. A
+        /// turn pushes its window ([`enter_window`]), and its guard pops it
+        /// as it ends, on return or unwind; with nothing on it, no turn
+        /// runs, and the window current is the thread's own ([`NOWHERE`]),
+        /// never the window of the last turn.
+        [Fork] static STACK: Cell<Stack> = const { Cell::new(Stack { len: 0, at: [Entry::Gone; DEPTH] }) };
+        /// Each window made on this thread, by its salt, held weakly: how
+        /// the stack's entries (plain salts) find their window. Written by
+        /// a window as it is made and as its last handle drops, never by
+        /// its close.
+        [Shared("a live index from a window's salt to its handle, held weakly; a stack entry names the salt, which forks")]
+        static WINDOW_OF: RefCell<std::collections::HashMap<u64, Weak<FocusRoot>>> = RefCell::default();
+        /// The thread's own window: what code with no window current runs
+        /// in (the reactive core used with no window, a test's top level
+        /// before any window's turn). Made once, never closed nor replaced,
+        /// so what is scheduled in it and what reads it stay its own
+        /// (Opus r16 I2: a stand-in replaced and disposed left readers on
+        /// dead signals). Shared: a fork's code with no window reads it.
+        /// Made the first time its state is read ([`current_window`]),
+        /// never just to schedule or run work in it: work made with no
+        /// window current runs with none current ([`entered_window`]), so
+        /// the reactive core used alone makes no window's signals.
+        [Shared("the thread's own window, made once; its signals are the reactive arena's, which forks")]
+        static NOWHERE: Rc<FocusRoot> = FocusRoot::new_detached();
+    }
+
+    /// The current window's focus (a clone is a count, not an allocation).
+    pub(super) fn current() -> Rc<FocusRoot> {
+        current_window()
+    }
+
+    /// The window current now: always one, the thread's own when no
+    /// window's code runs ([`NOWHERE`]).
+    pub(crate) fn current_window() -> Rc<FocusRoot> {
+        entered_window().unwrap_or_else(thread_window)
+    }
+
+    /// The window a turn made current, if any: `None` is the thread's own
+    /// ([`NOWHERE`]), which never closes, so work made then needs no
+    /// window to be kept in nor entered to run (and makes none). Never a
+    /// closed window: a close strikes it out of the stack ([`forget`]).
+    pub(crate) fn entered_window() -> Option<Rc<FocusRoot>> {
+        let salt = STACK.try_with(|s| s.get().top()).ok().flatten()?;
+        WINDOW_OF
+            .try_with(|w| w.try_borrow().ok().and_then(|w| w.get(&salt).and_then(Weak::upgrade)))
+            .ok()
+            .flatten()
+    }
+
+    /// The thread's own window ([`NOWHERE`]).
+    pub(crate) fn thread_window() -> Rc<FocusRoot> {
+        NOWHERE.with(Rc::clone)
+    }
+
+    /// The salt of the window current now: 0, the thread's own, when no
+    /// window's code runs.
+    pub(super) fn current_salt() -> u64 {
+        STACK.try_with(|s| s.get().top()).ok().flatten().unwrap_or(0)
+    }
+
+    /// Whether `root` is the window current now.
+    pub(crate) fn is_current(root: &Rc<FocusRoot>) -> bool {
+        STACK.try_with(|s| s.get().top()).ok().flatten() == Some(root.salt)
+    }
+
+    /// `root`, made: the stack's entries can name it.
+    pub(super) fn made(root: &Rc<FocusRoot>) {
+        let made = WINDOW_OF.try_with(|w| {
+            w.try_borrow_mut()
+                .map(|mut w| {
+                    // Those whose last handle went are let go as more are
+                    // made: the index holds about the live ones.
+                    if w.len() == w.capacity() {
+                        w.retain(|_, r| r.strong_count() > 0);
+                    }
+                    w.insert(root.salt, Rc::downgrade(root))
+                })
+                .ok()
+        });
+        drop(made);
+    }
+
+    /// The window salted `salt` is gone (its last handle dropped).
+    pub(super) fn unmade(salt: u64) {
+        let gone = WINDOW_OF.try_with(|w| w.try_borrow_mut().ok().and_then(|mut w| w.remove(&salt)));
+        drop(gone);
+    }
+
+    /// Push `entry`: the guard that pops it.
+    fn push(entry: Entry) -> Entered {
+        let index = STACK.with(|s| {
+            let mut stack = s.get();
+            let index = stack.len;
+            #[expect(
+                clippy::panic,
+                reason = "turns nested past the bound are runaway recursion, an engine fault"
+            )]
+            let Some(slot) = stack.at.get_mut(index) else {
+                panic!("gui: turns of windows nested deeper than {DEPTH}, one inside another");
+            };
+            *slot = entry;
+            stack.len = index.saturating_add(1);
+            s.set(stack);
+            index
+        });
+        Entered { index }
+    }
+
+    /// Make `root` the current window while its code runs, until the
+    /// guard drops ([`Entered`]): pushed on the stack, popped then, on
+    /// return or unwind, whatever it entered from. Only the engine's turn
+    /// and the work a window scheduled enter one (`_leave`). A closed
+    /// window is never entered: what would run in it does not
+    /// (`engine::turn`), so this is its stack's guard, never its door.
+    pub(crate) fn enter_window(root: &Rc<FocusRoot>, _leave: &crate::engine::Entering) -> Entered {
+        debug_assert!(!root.is_closed(), "gui: a closed window entered");
+        push(Entry::Window(root.salt))
+    }
+
+    /// Make the thread's own window current while code from outside any
+    /// turn runs, until the guard drops: a turn that names no window
+    /// (ADR-0015, the thread-window rule). Makes no window's signals.
+    pub(crate) fn enter_thread(_leave: &crate::engine::Entering) -> Entered {
+        push(Entry::Thread)
+    }
+
+    /// A window's code running ([`enter_window`], [`enter_thread`]): its
+    /// place on the stack. Dropped, on return or unwind, the stack is cut
+    /// back to below it: it restores no window it saved, so none it named
+    /// can come back once closed.
+    #[must_use = "the window is current while this lives"]
+    pub struct Entered {
+        index: usize,
+    }
+
+    impl Drop for Entered {
+        fn drop(&mut self) {
+            let index = self.index;
+            STACK
+                .try_with(|s| {
+                    let mut stack = s.get();
+                    stack.len = stack.len.min(index);
+                    s.set(stack);
+                })
+                .ok();
+        }
+    }
+
+    /// `root` closes: struck out of every place on the stack, so no guard
+    /// popping down to it makes it current again (Opus r17 I1).
+    pub(super) fn forget(root: &FocusRoot) {
+        let salt = root.salt;
+        STACK
+            .try_with(|s| {
+                let mut stack = s.get();
+                let len = stack.len;
+                for e in stack.at.iter_mut().take(len) {
+                    if *e == Entry::Window(salt) {
+                        *e = Entry::Gone;
+                    }
+                }
+                s.set(stack);
+            })
+            .ok();
+    }
 }
 
-/// One window's focus: which of its nodes holds it, whether its ring shows,
-/// the focus to hand on once laid out, and its focusable nodes as its last
-/// layout left them. Each window has its own, so laying one out or moving
-/// focus in it leaves another's as it was.
+pub use cx::Entered;
+use cx::current;
+pub(crate) use cx::{enter_thread, enter_window, entered_window, is_current};
+
+crate::engine::engine_local! {
+    /// Each window's focus to hand on and focusable nodes, by its salt.
+    /// Logged, not behind the window's `Rc`: the registry puts a pointer
+    /// back, not what it points to, so state a fork writes lives where the
+    /// rollback undoes it (ADR-0028, rule 4).
+    [Fork(log)] static WINDOW_FOCUS: RefCell<crate::engine::ForkMap<u64, WindowFocus>> = RefCell::default();
+    /// Windows gone while [`WINDOW_FOCUS`] was borrowed: their entries,
+    /// taken out at its next use ([`sweep_gone`]), so none is left behind.
+    /// Bounded: one entry per window dropped during a single borrow (a key
+    /// per window, so a window counts once), all of them emptied by the
+    /// next use, which every focus read or write is.
+    [Fork(log)] static GONE: RefCell<crate::engine::ForkMap<u64, ()>> = RefCell::default();
+}
+
+/// One window's focus: which of its nodes holds it and whether its ring
+/// shows (signals, which the reactive arena forks), and its salt, which
+/// names its focus to hand on and its focusable nodes ([`WINDOW_FOCUS`]).
+/// Each window has its own, so laying one out or moving focus in it leaves
+/// another's as it was.
 pub struct FocusRoot {
     /// Mixed into its path-derived ids ([`FocusHandle::for_path`]), so the
     /// same place in two windows is two nodes.
     salt: u64,
-    focused: Signal<Option<FocusId>>,
+    focused: Owned<Option<FocusId>>,
     /// Whether the input modality was [`Modality::Keyboard`] when focus last
     /// moved, which is when `focus-visible` shows: written only by
     /// [`set_focus`], from [`MODALITY`], so the two never disagree.
-    visible: Signal<bool>,
-    /// Focus to hand on once laid out ([`hand_on`]).
-    hand_on: Cell<Option<HandOn>>,
-    focusables: Focusables,
+    visible: Owned<bool>,
+    /// What the platform says of this window: each window's own, so a
+    /// second window's input or resize leaves this one's as it was.
+    window: WindowSignals,
+}
+
+/// Where a window is in its life (ADR-0015, the window state machine):
+///
+/// ```text
+/// Open ──Pipeline::close──▶ Closing ──its close turn settled──▶ Closed
+///  (runs turns)           (one turn: the fixed point)          (no record)
+/// ```
+///
+/// Closed is the record's absence ([`WINDOW_WORK`]): nothing names a
+/// closed window's state, and a check's close removes the record in the
+/// check's world alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Life {
+    /// It runs turns, and owns what is made in it.
+    #[default]
+    Open,
+    /// Its close turn runs: what is made in it still goes to it, and the
+    /// close takes it too ([`FocusRoot::settle_close`]).
+    Closing,
+}
+
+/// How many rounds a close takes before work that keeps making work in a
+/// closing window is a fault of the close, not a hang.
+pub(crate) const CLOSE_ROUNDS: usize = 64;
+
+/// What a window owns of the work made in it, by its salt ([`WINDOW_WORK`]):
+/// present while it is open or closing, gone once it closed (its work was
+/// ended by its close, and what names it never runs: `engine::Here`). Not
+/// behind the window's `Rc`: logged, so what a fork writes there its
+/// rollback undoes (ADR-0028, rule 4).
+#[derive(Clone, Default)]
+struct WindowWork {
+    /// Where it is in its life ([`Life`]).
+    life: Life,
+    /// The effects made in it that no scope owns (made at a turn's top,
+    /// a setup's own): disposed as it closes, in its own turn
+    /// ([`FocusRoot::dispose_effects`]). Those disposed before are let go
+    /// as more are made.
+    effects: Vec<crate::reactive::Effect>,
+    /// The engine's live obligations made in it ([`WindowOwned`]): each
+    /// ended, once, as it closes, whatever still holds them (ADR-0034,
+    /// S4). Held weakly: one already gone is let go as more are made.
+    owned: Vec<std::rc::Weak<dyn WindowOwned>>,
+}
+
+// A logged value (ADR-0034 S7, audited): `&WindowWork` changes nothing.
+crate::engine::fork_value_audited!(WindowWork);
+impl crate::engine::parts_seal::Sealed for WindowWork {}
+impl crate::engine::Parts for WindowWork {
+    /// Each effect handle and each weak obligation on its own box (S9).
+    /// Every field named (the drain lint).
+    fn parts(self, out: &mut Vec<Box<dyn std::any::Any>>) {
+        let Self { life, effects, owned } = self;
+        for e in effects {
+            crate::engine::whole(e, out);
+        }
+        for o in owned {
+            crate::engine::whole(o, out);
+        }
+        crate::engine::whole(life, out);
+    }
+}
+impl crate::engine::sealed::Sealed for WindowWork {}
+impl crate::engine::ForkClone for WindowWork {
+    /// A copy of two short lists, on a fork's first write to the entry
+    /// (a fork makes no effect it keeps, and owns no obligation).
+    fn fork_clone(&self) -> Self {
+        self.clone()
+    }
+}
+
+crate::engine::engine_local! {
+    /// Each open window's work ([`WindowWork`]), by its salt.
+    [Fork(log)] static WINDOW_WORK: RefCell<crate::engine::ForkMap<u64, WindowWork>> = RefCell::default();
+}
+
+/// The windows' work and focus as the live registry holds them, by
+/// window in the order they were made (salts rise), with no id: what V2
+/// compares between two engines (review r18, decision 6).
+#[cfg(test)]
+pub(crate) fn registry_summary() -> String {
+    let mut work: Vec<(u64, String)> = WINDOW_WORK.with_borrow(|w| {
+        w.iter()
+            .map(|(salt, w)| {
+                let owned = w.owned.iter().filter(|o| o.strong_count() > 0).count();
+                (*salt, format!("{:?} effects {} owned {owned}", w.life, w.effects.len()))
+            })
+            .collect()
+    });
+    work.sort_unstable_by_key(|(salt, _)| *salt);
+    let mut focus: Vec<(u64, bool)> =
+        WINDOW_FOCUS.with_borrow(|f| f.iter().map(|(salt, f)| (*salt, f.hand_on.is_some())).collect());
+    focus.sort_unstable_by_key(|(salt, _)| *salt);
+    format!(
+        "work {:?} hand_on {:?}",
+        work.into_iter().map(|(_, w)| w).collect::<Vec<_>>(),
+        focus.into_iter().map(|(_, h)| h).collect::<Vec<_>>()
+    )
+}
+
+/// Write window `salt`'s work, if it is open and the table not borrowed.
+fn window_work<R>(salt: u64, f: impl FnOnce(&mut WindowWork) -> R) -> Option<R> {
+    WINDOW_WORK
+        .try_with(|w| {
+            let mut w = w.try_borrow_mut().ok()?;
+            w.contains_key(&salt).then(|| f(w.entry_mut(salt)))
+        })
+        .ok()
+        .flatten()
+}
+
+/// A live obligation of the engine's that its window ends as it closes
+/// (a list's views and their worker): its end is idempotent, as its own
+/// owner (a scope, its last live handle) may have ended it first.
+pub(crate) trait WindowOwned {
+    /// End it (again: nothing).
+    fn end_with_window(&self);
+}
+
+/// The current window owns `owned` ([`WindowOwned`]): ended as it closes.
+/// Whether a window took it: not with no window's code running (the
+/// thread's own never closes). In a check, the check's copy of the
+/// window's work takes it, gone with the check (review r17, decision 1).
+/// Only [`crate::engine::own`] calls it.
+pub(crate) fn owned_by_window(owned: std::rc::Weak<dyn WindowOwned>) -> bool {
+    let Some(window) = entered_window() else {
+        return false;
+    };
+    window_work(window.salt, |w| {
+        if w.owned.len() == w.owned.capacity() {
+            w.owned.retain(|o| o.strong_count() > 0);
+        }
+        w.owned.push(owned);
+    })
+    .is_some()
+}
+
+/// The ambient state of one window that its code reads (tracked) without
+/// naming it: where the pointer is over it
+/// ([`crate::interact::pointer_position`]), whether it has the keyboard
+/// focus ([`crate::interact::window_active`]), its size
+/// ([`crate::environment::window_size`]) and whether it can be seen
+/// ([`crate::environment::window_visible`]). The current window's
+/// ([`window_signals`]). How the user acts ([`Modality`]) and reduced
+/// motion are the user's, one for the app.
+#[derive(Clone, Copy)]
+pub(crate) struct WindowSignals {
+    pub(crate) pointer: Owned<Option<(f32, f32)>>,
+    pub(crate) active: Owned<bool>,
+    pub(crate) size: Owned<Option<(f32, f32)>>,
+    pub(crate) visible: Owned<bool>,
+}
+
+impl WindowSignals {
+    fn new() -> Self {
+        Self {
+            pointer: Owned::labeled("pointer", None),
+            active: Owned::labeled("window active", true),
+            size: Owned::labeled("window size", None),
+            visible: Owned::labeled("window visible", true),
+        }
+    }
+
+    fn dispose(self) {
+        self.pointer.dispose_quietly();
+        self.active.dispose_quietly();
+        self.size.dispose_quietly();
+        self.visible.dispose_quietly();
+    }
+}
+
+/// The current window's ambient signals ([`WindowSignals`]).
+pub(crate) fn window_signals() -> WindowSignals {
+    current().window
+}
+
+/// A window's focus to hand on once laid out ([`hand_on`]) and its
+/// focusable nodes as its last layout left them ([`publish`]).
+#[derive(Clone, Default)]
+struct WindowFocus {
+    /// Written often (each `hand_on`), and small: a check's copy of it is
+    /// a bit copy.
+    hand_on: Option<HandOn>,
+    /// Published whole by each layout ([`publish`]), and large: shared, so
+    /// a check's copy of the entry shares the live set (ADR-0034, S7). A
+    /// check's layout publishes a set of its own beside it, never copying
+    /// the live one; live, the one owner refills its buffers in place.
+    focusables: Rc<Focusables>,
+}
+
+// A logged value (ADR-0034 S7, audited): `&WindowFocus` changes nothing.
+crate::engine::fork_value_audited!(WindowFocus);
+impl crate::engine::parts_seal::Sealed for WindowFocus {}
+impl crate::engine::Parts for WindowFocus {
+    /// The published set, let go of at once if live shares it (S9).
+    /// Every field named (the drain lint).
+    fn parts(self, out: &mut Vec<Box<dyn std::any::Any>>) {
+        let Self { hand_on, focusables } = self;
+        crate::engine::whole(hand_on, out);
+        crate::engine::Parts::parts(focusables, out);
+    }
+}
+impl crate::engine::sealed::Sealed for WindowFocus {}
+impl crate::engine::ForkClone for WindowFocus {
+    /// O(1): the hand-on is copied, the focusable set shared.
+    fn fork_clone(&self) -> Self {
+        Self {
+            hand_on: self.hand_on,
+            focusables: Rc::clone(&self.focusables),
+        }
+    }
 }
 
 impl FocusRoot {
-    /// A window's, current from now on (until another window runs).
+    /// A window's. Making one switches no window: the caller's stays
+    /// current, and this one is current only in its own turns
+    /// (`engine::turn`).
     #[must_use]
     pub fn new() -> Rc<Self> {
-        let salt = WINDOWS.with(|w| {
-            let n = w.get().wrapping_add(1);
-            w.set(n);
-            n
-        });
-        let me = Rc::new(Self {
+        // Hashed into the handles of its paths ([`FocusHandle::for_path`]),
+        // which a caller holds: unique as they are.
+        let salt = crate::engine::unique_id(&WINDOWS);
+        WINDOW_WORK.with_borrow_mut(|w| w.insert(salt, WindowWork::default()));
+        let root = Rc::new(Self {
             salt,
-            focused: crate::reactive::detached(|| Signal::labeled("focus", None)),
-            visible: crate::reactive::detached(|| Signal::labeled("focus-visible", false)),
-            hand_on: Cell::new(None),
-            focusables: Focusables::default(),
+            focused: Owned::labeled("focus", None),
+            visible: Owned::labeled("focus-visible", false),
+            window: WindowSignals::new(),
         });
-        me.enter();
-        me
+        cx::made(&root);
+        root
+    }
+}
+
+impl FocusRoot {
+    /// Open → Closing ([`Life`]): whether it was open. Its live owner
+    /// begins its close (`Pipeline::close`), then runs one turn of it in
+    /// which the close settles ([`Self::settle_close`]) and ends
+    /// ([`Self::finish_close`]). Closing again, or from inside its own
+    /// close, does nothing.
+    pub(crate) fn begin_close(&self) -> bool {
+        window_work(self.salt, |w| {
+            let open = w.life == Life::Open;
+            w.life = Life::Closing;
+            open
+        })
+        .unwrap_or(false)
     }
 
-    /// Make it the current window's: its code runs now.
-    pub fn enter(self: &Rc<Self>) {
-        CURRENT.with_borrow_mut(|c| {
-            if !c.as_ref().is_some_and(|c| Rc::ptr_eq(c, self)) {
-                *c = Some(Rc::clone(self));
+    /// The close's fixed point, inside its close turn (ADR-0015, the close
+    /// order): round after round, every piece of work it owns is taken out
+    /// and ended there, in it: its effects disposed (their cleanups run),
+    /// its timers, hooks after layout and mailboxes cancelled and dropped,
+    /// its obligations ended. What that work makes in it in turn is the
+    /// next round's, until a round finds none. `Err` with the rounds run
+    /// when work keeps making work past [`CLOSE_ROUNDS`]: a fault of the
+    /// close, never a hang.
+    pub(crate) fn settle_close(self: &Rc<Self>) -> Result<(), usize> {
+        for _ in 0..CLOSE_ROUNDS {
+            if !self.close_round() {
+                return Ok(());
             }
+        }
+        Err(CLOSE_ROUNDS)
+    }
+
+    /// One round of [`Self::settle_close`]: whether it found any work.
+    fn close_round(self: &Rc<Self>) -> bool {
+        let (effects, owned) = window_work(self.salt, |w| {
+            (std::mem::take(&mut w.effects), std::mem::take(&mut w.owned))
+        })
+        .unwrap_or_default();
+        let mut found = !effects.is_empty() || !owned.is_empty();
+        // Each piece ends though one panics: inside the close turn, each
+        // panic goes to its arbiter as it is caught.
+        let mut all = crate::engine::Gather::new();
+        for e in effects {
+            all.run(|| e.dispose());
+        }
+        found |= all.run(|| crate::clock::cancel_window(self)).unwrap_or(0) > 0;
+        found |= all.run(|| crate::component::cancel_hooks(self)).unwrap_or(0) > 0;
+        found |= all.run(|| crate::mailbox::close_window(self)).unwrap_or(0) > 0;
+        for o in owned {
+            if let Some(o) = o.upgrade() {
+                all.run(|| o.end_with_window());
+            }
+        }
+        all.finish();
+        found
+    }
+
+    /// Closing → Closed, the last step of its close turn: its record goes
+    /// (a debug build panics should a settled close leave work in it), no
+    /// place on the window stack names it any more, and its signals end in
+    /// the running world. `settled`: whether [`Self::settle_close`] found
+    /// none left; one that did not was a fault, already raised, and what it
+    /// left belongs to no open window, so never runs.
+    pub(crate) fn finish_close(&self, settled: bool) {
+        let left = WINDOW_WORK
+            .try_with(|w| w.try_borrow_mut().ok().and_then(|mut w| w.remove(&self.salt)))
+            .ok()
+            .flatten();
+        if let Some(left) = &left {
+            debug_assert!(
+                !settled
+                    || (left.effects.iter().all(|e| !e.is_alive()) && left.owned.iter().all(|o| o.strong_count() == 0)),
+                "gui: a window's record removed while it still holds work"
+            );
+        }
+        drop(left);
+        cx::forget(self);
+        self.end();
+    }
+
+    /// Whether a check made it: its pipeline's drop closes it in the check
+    /// then; a live one's closes live, once the check has switched back.
+    pub(crate) fn made_in_fork(&self) -> bool {
+        self.focused.made_in_fork()
+    }
+
+    /// Whether it closed ([`Self::finish_close`]): its record is gone.
+    pub(crate) fn is_closed(&self) -> bool {
+        // The thread's own (salt 0) never closes, and keeps no work table:
+        // what it owns lives as long as the thread.
+        self.salt != 0
+            && WINDOW_WORK
+                .try_with(|w| w.try_borrow().is_ok_and(|w| !w.contains_key(&self.salt)))
+                .unwrap_or(true)
+    }
+
+    /// It owns `effect`, made in it with no scope to own it: disposed as
+    /// it closes ([`Self::settle_close`]; made while it closes, by the
+    /// close's next round). A fork's effect goes with it. A closed window
+    /// owns nothing: an effect made for one is disposed at once. No code
+    /// runs in a closed window (it is struck off the stack), so this is a
+    /// guard, not a path: such an effect's cleanups would run where the
+    /// caller runs.
+    pub(crate) fn own_effect(&self, effect: crate::reactive::Effect) {
+        if crate::engine::forking() {
+            return;
+        }
+        let owned = window_work(self.salt, |w| {
+            // Those disposed since are let go before the list grows: it
+            // holds at most twice the live ones.
+            if w.effects.len() == w.effects.capacity() {
+                w.effects.retain(crate::reactive::Effect::is_alive);
+            }
+            w.effects.push(effect);
         });
+        if owned.is_none() && self.salt != 0 {
+            effect.dispose();
+        }
+    }
+
+    /// Its signals and entries ended in the running world: an explicit
+    /// close a check makes ends the check's copies (review r17, decision 3).
+    fn end(&self) {
+        let (focused, visible, window, salt) = (self.focused, self.visible, self.window, self.salt);
+        end_window(focused, visible, window, salt);
+    }
+}
+
+/// A window's signals and entries ended, in the running world.
+fn end_window(focused: Owned<Option<FocusId>>, visible: Owned<bool>, window: WindowSignals, salt: u64) {
+    focused.dispose_quietly();
+    visible.dispose_quietly();
+    window.dispose();
+    // Its entry goes now, or, the map borrowed (a window dropped while its
+    // focus is read), at the map's next use: never left behind. Its work
+    // table goes too (a window dropped unclosed): closed, its work never
+    // runs.
+    let work = WINDOW_WORK
+        .try_with(|w| w.try_borrow_mut().ok().and_then(|mut w| w.remove(&salt)))
+        .ok()
+        .flatten();
+    drop(work);
+    let removed = WINDOW_FOCUS
+        .try_with(|w| match w.try_borrow_mut() {
+            Ok(mut w) => {
+                drop(w.remove(&salt));
+                true
+            }
+            Err(_) => false,
+        })
+        .unwrap_or(true);
+    if !removed {
+        GONE.try_with(|g| g.borrow_mut().insert(salt, ())).ok();
     }
 }
 
 impl Drop for FocusRoot {
+    /// Its last `Rc`. A live window a check drops goes once the check has
+    /// switched back: released in the check, the rollback would put its
+    /// entry and its signals back with no window left to release them
+    /// (ADR-0028).
+    /// Its index entry ([`cx::unmade`]) goes in the same job, in its own
+    /// world: a check writes nothing live (review r18, decision 4).
     fn drop(&mut self) {
-        self.focused.dispose_quietly();
-        self.visible.dispose_quietly();
+        let (focused, visible, window, salt) = (self.focused, self.visible, self.window, self.salt);
+        crate::engine::dropped(crate::engine::LiveDrop::in_drop(), focused.made_in_fork(), move || {
+            cx::unmade(salt);
+            end_window(focused, visible, window, salt);
+        });
     }
+}
+
+/// Take out the entries of windows gone while the map was borrowed.
+fn sweep_gone() {
+    let gone: Vec<u64> = GONE.with(|g| {
+        let mut g = g.borrow_mut();
+        if g.is_empty() {
+            return Vec::new();
+        }
+        let keys: Vec<u64> = g.iter().map(|(k, ())| *k).collect();
+        for k in &keys {
+            g.remove(k);
+        }
+        keys
+    });
+    if gone.is_empty() {
+        return;
+    }
+    let removed: Vec<WindowFocus> =
+        WINDOW_FOCUS.with_borrow_mut(|w| gone.iter().filter_map(|salt| w.remove(salt)).collect());
+    drop(removed);
+}
+
+/// What the current window's focus to hand on and focusable nodes are
+/// ([`WindowFocus`]), read.
+fn window_focus<R>(f: impl FnOnce(Option<&WindowFocus>) -> R) -> R {
+    sweep_gone();
+    let salt = current().salt;
+    WINDOW_FOCUS.with(|w| f(w.borrow().get(&salt)))
+}
+
+/// The current window's [`WindowFocus`], written (logged in a fork).
+fn window_focus_mut<R>(f: impl FnOnce(&mut WindowFocus) -> R) -> R {
+    sweep_gone();
+    let salt = current().salt;
+    WINDOW_FOCUS.with_borrow_mut(|w| f(w.entry_mut(salt)))
 }
 
 impl fmt::Debug for FocusRoot {
@@ -90,20 +728,14 @@ impl fmt::Debug for FocusRoot {
     }
 }
 
-/// The current window's focus (a clone is a count, not an allocation).
-fn current() -> Rc<FocusRoot> {
-    CURRENT.with_borrow_mut(|c| Rc::clone(c.get_or_insert_with(FocusRoot::new_detached)))
-}
-
 impl FocusRoot {
     /// The thread's own, for code that runs outside any window.
     fn new_detached() -> Rc<Self> {
         Rc::new(Self {
             salt: 0,
-            focused: crate::reactive::detached(|| Signal::labeled("focus", None)),
-            visible: crate::reactive::detached(|| Signal::labeled("focus-visible", false)),
-            hand_on: Cell::new(None),
-            focusables: Focusables::default(),
+            focused: Owned::labeled("focus", None),
+            visible: Owned::labeled("focus-visible", false),
+            window: WindowSignals::new(),
         })
     }
 }
@@ -121,16 +753,21 @@ struct HandOn {
 /// lost (reka's carousel `rescueFocus`). Applied as that frame settles,
 /// only if `from` still holds focus and no node holds it any more.
 pub fn hand_on(from: FocusId, into: crate::access::NodeRef, or: Option<FocusHandle>) {
-    current().hand_on.set(Some(HandOn {
+    let h = HandOn {
         from,
         into,
         or: or.map(FocusHandle::id),
-    }));
+    };
+    window_focus_mut(|w| w.hand_on = Some(h));
 }
 
 /// Hand focus on as [`hand_on`] asked; whether it moved.
 fn take_hand_on(frame: &Frame, stack: &Stack) -> bool {
-    let Some(h) = current().hand_on.take() else {
+    // Written only when one is asked for: a frame with none logs nothing.
+    if !window_focus(|w| w.is_some_and(|w| w.hand_on.is_some())) {
+        return false;
+    }
+    let Some(h) = window_focus_mut(|w| w.hand_on.take()) else {
         return false;
     };
     if focused_now() != Some(h.from) || node_of(frame, h.from).is_some() {
@@ -176,12 +813,9 @@ impl Default for FocusHandle {
 impl FocusHandle {
     #[must_use]
     pub fn new() -> Self {
-        let id = NEXT.with(|n| {
-            let id = n.get();
-            n.set(id.wrapping_add(1));
-            id
-        });
-        Self { id: FocusId(id) }
+        Self {
+            id: FocusId(crate::engine::unique_id(&NEXT)),
+        }
     }
 
     /// The handle of a node focusable by its place in the tree of the
@@ -224,6 +858,28 @@ impl FocusHandle {
     }
 }
 
+/// A window, by identity: the key of state an app keeps per window (one
+/// tooltip open in each), never a handle to it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    /// As a number, to key a map (unique on this thread; the thread's own
+    /// window's is 0).
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// The window whose code runs now (ADR-0015, the window stack): the
+/// thread's own when none's does. Not reactive: which window runs code is
+/// not state its code reads to change.
+#[must_use]
+pub fn window_id() -> WindowId {
+    WindowId(cx::current_salt())
+}
+
 /// The focused element, if any (reactive).
 #[must_use]
 pub fn focused() -> Option<FocusId> {
@@ -246,21 +902,24 @@ pub fn set_focus(id: Option<FocusId>, by_keyboard: bool) {
     // `focus()` on an element that is not rendered does nothing in a
     // browser: what holds focus keeps it.
     if let Some(id) = id
-        && current().focusables.hidden.borrow().contains(&id)
+        && window_focus(|w| w.is_some_and(|w| w.focusables.hidden.contains(&id)))
     {
         return;
     }
-    if by_keyboard {
-        set_modality(Modality::Keyboard);
-    }
-    let visible = id.is_some() && MODALITY.with(|m| m.get_untracked()) == Modality::Keyboard;
-    let root = current();
-    if root.focused.get_untracked() != id {
-        root.focused.set(id);
-    }
-    if root.visible.get_untracked() != visible {
-        root.visible.set(visible);
-    }
+    // One commit: what reads focus, its ring and the modality sees them
+    // change together, never the pair half written (ADR-0015). Part of the
+    // turn under way (a handler's), or one of its own.
+    crate::engine::in_turn(|t| {
+        crate::engine::commit(t, |c| {
+            if by_keyboard {
+                set_modality(Modality::Keyboard, c);
+            }
+            let visible = id.is_some() && MODALITY.with(|m| m.get_untracked()) == Modality::Keyboard;
+            let root = current();
+            root.focused.put(id, c);
+            root.visible.put(visible, c);
+        });
+    });
 }
 
 /// How the user acts now: one fact of the engine (reka's
@@ -279,12 +938,12 @@ pub enum Modality {
 /// out but does not show ([`Frame::shown`]), whose focus asked for is
 /// refused, and where each shown one lies (its path), for what asks where
 /// focus is before the next layout.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Focusables {
-    hidden: RefCell<Vec<FocusId>>,
-    paths: RefCell<Vec<(FocusId, NodePath)>>,
+    hidden: Vec<FocusId>,
+    paths: Vec<(FocusId, NodePath)>,
     /// The frame they were taken from: its epoch and change count.
-    of: Cell<Option<(u64, usize)>>,
+    of: Option<(u64, usize)>,
 }
 
 /// Take the current window's focusable nodes from `frame`, into the
@@ -293,56 +952,64 @@ struct Focusables {
 /// against the frame as it is now. A frame already taken (focus alone
 /// moved since) is not read again.
 pub(crate) fn publish(frame: &Frame) {
-    let root = current();
-    let f = &root.focusables;
     let key = (frame.epoch(), frame.changes.end());
-    if f.of.get() == Some(key) {
+    if window_focus(|w| w.is_some_and(|w| w.focusables.of == Some(key))) {
         return;
     }
-    f.of.set(Some(key));
-    let mut hidden = f.hidden.borrow_mut();
-    let mut paths = f.paths.borrow_mut();
-    hidden.clear();
-    paths.clear();
-    for i in 0..frame.nodes.len() {
-        let (Some(id), Some(n)) = (focus_at(frame, i), frame.nodes.get(i)) else {
-            continue;
-        };
-        if frame.shown(i) {
-            // Paths are shared: a clone is a count, not an allocation.
-            paths.push((id, n.path.clone()));
-        } else {
-            hidden.push(id);
+    window_focus_mut(|w| {
+        // The set's one owner (live, always) refills its buffers; a set
+        // shared with live (a check's copy of the entry) is replaced by
+        // one of the check's own, never copied (S7).
+        if Rc::get_mut(&mut w.focusables).is_none() {
+            w.focusables = Rc::new(Focusables::default());
         }
-    }
+        let Some(f) = Rc::get_mut(&mut w.focusables) else {
+            return;
+        };
+        f.of = Some(key);
+        f.hidden.clear();
+        f.paths.clear();
+        for i in 0..frame.nodes.len() {
+            let (Some(id), Some(n)) = (focus_at(frame, i), frame.nodes.get(i)) else {
+                continue;
+            };
+            if frame.shown(i) {
+                // Paths are shared: a clone is a count, not an allocation.
+                f.paths.push((id, n.path.clone()));
+            } else {
+                f.hidden.push(id);
+            }
+        }
+    });
 }
 
 /// Where the node focused by `id` lies in the current window's last frame,
 /// shown: for what keeps it built (a virtual list's row) before the next
 /// layout, as focus moves.
 pub(crate) fn path_of(id: FocusId) -> Option<NodePath> {
-    let root = current();
-    let paths = root.focusables.paths.borrow();
-    paths.iter().find(|(i, _)| *i == id).map(|(_, p)| p.clone())
+    window_focus(|w| {
+        w?.focusables
+            .paths
+            .iter()
+            .find(|(i, _)| *i == id)
+            .map(|(_, p)| p.clone())
+    })
 }
 
 crate::engine::engine_local! {
-    [Shared("a handle made live; the value is the reactive arena's, which forks")] static MODALITY: Signal<Modality> = crate::reactive::detached(|| Signal::labeled("modality", Modality::Pointer));
+    [Shared("a handle made live; the value is the reactive arena's, which forks")] static MODALITY: Owned<Modality> = Owned::labeled("modality", Modality::Pointer);
 }
 
 /// How the user acts now (reactive).
 #[must_use]
 pub fn modality() -> Modality {
-    MODALITY.with(Signal::get)
+    MODALITY.with(|m| m.get())
 }
 
-/// Record how the user acts, written only when it changes.
-pub(crate) fn set_modality(m: Modality) {
-    MODALITY.with(|s| {
-        if s.get_untracked() != m {
-            s.set(m);
-        }
-    });
+/// Record how the user acts, inside the step `c` of the input that shows
+/// it; written only when it changes.
+pub(crate) fn set_modality(m: Modality, c: &Commit) {
+    MODALITY.with(|s| s.put(m, c));
 }
 
 /// Where a focus scope puts focus as its layer opens.
@@ -593,14 +1260,19 @@ fn focused_now() -> Option<FocusId> {
 /// at the keyboard, and all of a text field's text selected (reka's
 /// `focus(…, { select: true })`).
 pub(crate) fn engine_focus(frame: &Frame, to: Option<FocusId>) {
-    set_focus(to, false);
-    if let Some(field) = to
-        .and_then(|id| node_of(frame, id))
-        .and_then(|i| frame.behaviour(i))
-        .and_then(|b| b.field)
-    {
-        field.edit.update(TextEdit::select_all);
-    }
+    // One commit: focus and the selection of the field it lands in.
+    crate::engine::in_turn(|t| {
+        crate::engine::commit(t, |_| {
+            set_focus(to, false);
+            if let Some(field) = to
+                .and_then(|id| node_of(frame, id))
+                .and_then(|i| frame.behaviour(i))
+                .and_then(|b| b.field)
+            {
+                field.edit.update(TextEdit::select_all);
+            }
+        });
+    });
 }
 
 /// Focus left on a node `frame` (a frame's last pass) does not hold or
@@ -900,4 +1572,144 @@ fn near_owner(frame: &Frame, stack: &Stack, owner: &NodePath) -> Option<FocusId>
     (o..=subtree_end(frame, o))
         .find_map(|i| focus_at(frame, i))
         .or_else(|| frame.ancestors(o).find_map(|i| focus_at(frame, i)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Opus (F1 review 4): a window dropped while its focus map is borrowed
+    /// leaves no entry behind: its removal waits for the map's next use.
+    #[test]
+    fn a_window_dropped_while_its_focus_is_read_leaves_no_entry() {
+        let root = FocusRoot::new();
+        crate::engine::turn(&root, |_| window_focus_mut(|_| {}));
+        let salt = root.salt;
+        let other = FocusRoot::new();
+        WINDOW_FOCUS.with(|w| {
+            let _read = w.borrow();
+            drop(root);
+        });
+        assert!(WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)), "busy: deferred");
+        crate::engine::turn(&other, |_| window_focus(|_| ()));
+        assert!(
+            !WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)),
+            "taken out at the next use"
+        );
+    }
+
+    /// Codex 6 (F1 review 6): the last owner of a live window dropped in a
+    /// fork. Released in the fork, the rollback would put its entry and its
+    /// signals back with no window left; it is released once the fork has
+    /// rolled back, and leaves nothing.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_live_window_a_fork_drops_leaves_no_entry_and_no_signal() {
+        let root = FocusRoot::new();
+        crate::engine::turn(&root, |_| window_focus_mut(|_| {}));
+        let (salt, focused, visible) = (root.salt, root.focused, root.visible);
+        let other = FocusRoot::new();
+        // Another window's turn: the first is no longer current, so the
+        // fork drops its last owner.
+        crate::engine::turn(&other, |_| ());
+        {
+            let _cold = crate::engine::ColdFrame::begin();
+            drop(root);
+        }
+        // The release is live work, run by the live loop after the fork.
+        crate::engine::run_releases();
+        assert!(!WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)), "no entry left");
+        assert!(!focused.is_alive() && !visible.is_alive(), "no signal left");
+        drop(other);
+    }
+
+    /// ADR-0034, S4: a check that clones a window's root and faults (the
+    /// clone forgotten, as a runaway's set-aside does) leaves the
+    /// window's end to its live owner: closed, it leaves no entry and no
+    /// signal, though an `Rc` to it lives on.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[expect(clippy::mem_forget, reason = "a runaway's set-aside clone, as the check makes it")]
+    fn a_window_a_checks_forgotten_clone_holds_ends_with_its_owner() {
+        let root = FocusRoot::new();
+        crate::engine::turn(&root, |_| window_focus_mut(|_| {}));
+        let (salt, focused, visible) = (root.salt, root.focused, root.visible);
+        {
+            let _cold = crate::engine::ColdFrame::begin();
+            std::mem::forget(Rc::clone(&root));
+        }
+        assert!(root.begin_close());
+        let settled = crate::engine::turn(&root, |_| root.settle_close());
+        root.finish_close(settled == Some(Ok(())));
+        drop(root);
+        assert!(!WINDOW_FOCUS.with(|w| w.borrow().contains_key(&salt)), "no entry left");
+        assert!(!focused.is_alive() && !visible.is_alive(), "no signal left");
+        assert_eq!(crate::engine::releases_pending(), 0, "nothing left pending");
+    }
+
+    /// Codex 4 (F1 review 3): focus to hand on asked live, then asked
+    /// again in a fork: after the rollback the live request is the one
+    /// kept, as the window's state a fork writes is logged, not behind the
+    /// pointer the registry puts back.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_hand_on_a_fork_asks_leaves_the_live_one() {
+        let root = FocusRoot::new();
+        let (live, forked) = (FocusHandle::new(), FocusHandle::new());
+        let asked = crate::engine::turn(&root, |_| {
+            hand_on(live.id(), crate::access::NodeRef::new(), None);
+            {
+                let _cold = crate::engine::ColdFrame::begin();
+                hand_on(forked.id(), crate::access::NodeRef::new(), None);
+            }
+            window_focus(|w| w.and_then(|w| w.hand_on).map(|h| h.from))
+        })
+        .flatten();
+        assert_eq!(asked, Some(live.id()), "the live request, kept");
+    }
+
+    /// ADR-0034, S7 (the `WindowFocus` split): a check's `hand_on` copies
+    /// the small hand-on, sharing the window's published focusable set,
+    /// however large: it never copies the live set. The live set is as it
+    /// was after the check, and refilled in place live again.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_checks_hand_on_shares_the_published_focusables() {
+        let root = FocusRoot::new();
+        let into = crate::access::NodeRef::new();
+        let (live, shared, same) = crate::engine::turn(&root, |_| {
+            window_focus_mut(|w| {
+                let f = Rc::make_mut(&mut w.focusables);
+                f.hidden = (0..100_000).map(FocusId).collect();
+            });
+            let live = window_focus(|w| w.map(|w| Rc::as_ptr(&w.focusables)));
+            let (shared, same) = crate::engine::in_cold_frame(|| {
+                hand_on(FocusId(1), into, None);
+                window_focus(|w| {
+                    let w = w.map(|w| (Rc::as_ptr(&w.focusables), w.hand_on.map(|h| h.from)));
+                    (w.map(|w| w.0) == live, w.and_then(|w| w.1) == Some(FocusId(1)))
+                })
+            });
+            (live, shared, same)
+        })
+        .unwrap_or_default();
+        assert!(
+            shared && same,
+            "the check's entry shares the set and has its own hand-on"
+        );
+        let _ = crate::engine::turn(&root, |_| {
+            let after = window_focus(|w| {
+                w.map(|w| {
+                    (
+                        Rc::as_ptr(&w.focusables),
+                        w.focusables.hidden.len(),
+                        w.hand_on.is_none(),
+                    )
+                })
+            });
+            assert_eq!(after, live.map(|p| (p, 100_000, true)), "live is whole");
+            let unique = WINDOW_FOCUS.with(|m| m.borrow().get(&root.salt).map(|w| Rc::strong_count(&w.focusables)));
+            assert_eq!(unique, Some(1), "live owns its set alone again: refilled in place");
+        });
+    }
 }

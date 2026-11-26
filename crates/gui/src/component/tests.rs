@@ -8,6 +8,27 @@ use super::*;
 use crate::element::{div, text};
 use crate::styled::Styled;
 
+/// A root owned by a scope of the test's own ([`Root::new`] needs an
+/// owner): the scope lives as long as the test's thread, so the root ends
+/// with its last handle, as these tests expect.
+fn owned_root(render: impl Fn() -> Element + 'static) -> Root {
+    Scope::detached().run(|| Root::new(render))
+}
+
+/// A root with no owner panics as it is made (debug), naming the fix.
+#[cfg(debug_assertions)]
+#[test]
+fn a_root_with_no_owner_is_refused() {
+    let made = std::panic::catch_unwind(|| drop(Root::new(|| Element::Empty)));
+    let said = made.expect_err("no owner: refused");
+    let said = said
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| said.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(said.contains("no scope running"), "{said}");
+}
+
 fn counter() -> Rc<Cell<u32>> {
     Rc::new(Cell::new(0))
 }
@@ -39,7 +60,7 @@ fn setup_runs_once_and_render_only_when_what_it_read_changes() {
     let (s, r) = (Rc::clone(&setups), Rc::clone(&renders));
     let n = Signal::new(0_i32);
     let other = Signal::new(0_i32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (s, r) = (Rc::clone(&s), Rc::clone(&r));
         component((), move |_| {
             bump(&s);
@@ -61,18 +82,16 @@ fn setup_runs_once_and_render_only_when_what_it_read_changes() {
     assert_eq!((setups.get(), renders.get()), (1, 2));
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_re_render_leaves_what_is_due_to_render_due() {
     let n = Signal::new(0_i32);
     let root =
-        Root::new(move || component((), move |_| move || text(n.get().to_string()).into_element()).into_element());
+        owned_root(move || component((), move |_| move || text(n.get().to_string()).into_element()).into_element());
     assert_eq!(texts(&root.resolve()), ["0"]);
     // Written after the frame's resolve: due in the next frame.
     n.set(1);
-    let cold = {
-        let frame = root.cold();
-        texts(&frame.resolve())
-    };
+    let cold = root.cold(|frame| texts(&frame.resolve())).expect("kept");
     assert_eq!(cold, ["1"], "the cold render reads the state as it is");
     assert_eq!(texts(&root.resolve()), ["1"], "and the next frame still renders it");
 }
@@ -83,7 +102,7 @@ fn a_child_renders_alone_and_its_parent_keeps_its_output() {
     let child_renders = counter();
     let (p, c) = (Rc::clone(&parent_renders), Rc::clone(&child_renders));
     let n = Signal::new(0_i32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         bump(&p);
         let c = Rc::clone(&c);
         div()
@@ -108,7 +127,7 @@ fn equal_props_skip_the_child_and_changed_ones_render_it() {
     let c = Rc::clone(&child_renders);
     let label = Signal::new("a".to_owned());
     let unrelated = Signal::new(0_i32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         unrelated.get();
         let c = Rc::clone(&c);
         component(label.get(), move |cx: Ctx<String>| {
@@ -136,7 +155,7 @@ fn a_callback_is_always_the_latest_and_never_renders_the_child() {
     let got = Rc::new(Cell::new(0_i32));
     let call: Rc<RefCell<Option<Callback<i32, i32>>>> = Rc::new(RefCell::new(None));
     let call_out = Rc::clone(&call);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let b = base.get();
         let (c, call) = (Rc::clone(&c), Rc::clone(&call));
         div()
@@ -174,7 +193,7 @@ fn a_callback_the_child_kept_in_setup_calls_the_closure_passed_last() {
     let c = Rc::clone(&child_renders);
     let kept: Rc<RefCell<Option<Callback<(), i32>>>> = Rc::new(RefCell::new(None));
     let k = Rc::clone(&kept);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let id = id.get();
         let (k, c) = (Rc::clone(&k), Rc::clone(&c));
         div()
@@ -221,7 +240,7 @@ fn a_shared_callback_replaced_for_one_child_stays_for_the_other() {
     let kept: KeptPair = Rc::default();
     let k = Rc::clone(&kept);
     let save: Callback<(), &'static str> = Callback::new(|()| "save");
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let second = if swapped.get() {
             Callback::new(|()| "other")
         } else {
@@ -254,7 +273,7 @@ fn a_decorating_callback_calls_the_one_it_wraps_and_is_freed_with_the_tree() {
     let kept: Rc<RefCell<Option<Callback<i32, i32>>>> = Rc::default();
     let k = Rc::clone(&kept);
     let prev: Rc<RefCell<Option<Callback<i32, i32>>>> = Rc::default();
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         n.get();
         let (t, before) = (Rc::clone(&token), prev.borrow().clone());
         let cb = Callback::new(move |x: i32| {
@@ -290,7 +309,7 @@ fn handles_to_an_optional_and_a_plain_callback_call_their_own_fields() {
     let with_a = Signal::new(false);
     let kept: Rc<RefCell<Option<(Named, Named)>>> = Rc::default();
     let k = Rc::clone(&kept);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let props: Props = if with_a.get() {
             (Some(Callback::new(|()| "a")), Callback::new(|()| "b2"))
         } else {
@@ -313,13 +332,14 @@ fn handles_to_an_optional_and_a_plain_callback_call_their_own_fields() {
 
 /// The cold check renders the parent again, which passes a closure of
 /// its own: a handle the child holds still calls the live one.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_check_leaves_what_a_held_handle_calls() {
     let renders = counter();
     let r = Rc::clone(&renders);
     let kept: Rc<RefCell<Option<Callback<(), u32>>>> = Rc::default();
     let k = Rc::clone(&kept);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         bump(&r);
         let made = r.get();
         let k = Rc::clone(&k);
@@ -332,10 +352,10 @@ fn a_cold_check_leaves_what_a_held_handle_calls() {
     root.resolve();
     let handle = kept.borrow().clone().expect("kept");
     assert_eq!(handle.call(()), 1);
-    let frame = root.cold();
-    frame.resolve();
-    assert_eq!(renders.get(), 2, "the cold check rendered the parent");
-    drop(frame);
+    root.cold(|frame| {
+        frame.resolve();
+        assert_eq!(renders.get(), 2, "the cold check rendered the parent");
+    });
     assert_eq!(handle.call(()), 1, "the live closure, not the cold one");
     assert_eq!(handle.call(()), 1);
 }
@@ -347,7 +367,7 @@ fn a_child_that_leaves_unmounts_and_its_scope_is_disposed() {
     let u = Rc::clone(&unmounted);
     let inner: Rc<Cell<Option<Signal<i32>>>> = Rc::new(Cell::new(None));
     let inner_out = Rc::clone(&inner);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         if !show.get() {
             return Element::Empty;
         }
@@ -373,7 +393,7 @@ fn keyed_children_keep_their_state_when_reordered() {
     let order = Signal::new(vec![1_u64, 2, 3]);
     let setups = counter();
     let s = Rc::clone(&setups);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let s = Rc::clone(&s);
         div()
             .children(order.get().into_iter().map(move |k| {
@@ -399,7 +419,7 @@ fn another_component_type_at_one_place_is_a_new_instance() {
     let flip = Signal::new(false);
     let setups = counter();
     let s = Rc::clone(&setups);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let s = Rc::clone(&s);
         if flip.get() {
             component((), move |_| {
@@ -434,7 +454,7 @@ fn shows_theme() -> Element {
 
 #[test]
 fn context_follows_the_tree() {
-    let root = Root::new(|| {
+    let root = owned_root(|| {
         div()
             .child(component((), |_| {
                 provide(Dark(true));
@@ -455,7 +475,7 @@ fn mounted_runs_once_after_the_first_render_and_updated_after_each_other() {
     let mounted = counter();
     let updated = counter();
     let (m, u) = (Rc::clone(&mounted), Rc::clone(&updated));
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (m, u) = (Rc::clone(&m), Rc::clone(&u));
         component((), move |_| {
             on_mounted(move || bump(&m));
@@ -513,7 +533,7 @@ fn incremental_resolve_equals_a_cold_one() {
                 .into_element()
         }
     };
-    let warm = Root::new(make.clone());
+    let warm = owned_root(make.clone());
     warm.resolve();
     let steps: [&dyn Fn(); 4] = [
         &|| flags.first().iter().for_each(|s| s.set(true)),
@@ -524,7 +544,7 @@ fn incremental_resolve_equals_a_cold_one() {
     for step in steps {
         step();
         let incremental = texts(&warm.resolve());
-        let cold = Root::new(make.clone());
+        let cold = owned_root(make.clone());
         assert_eq!(incremental, texts(&cold.resolve()));
     }
 }
@@ -532,7 +552,7 @@ fn incremental_resolve_equals_a_cold_one() {
 #[test]
 fn a_write_from_a_handler_renders_only_the_reader() {
     let total = Signal::new(0_u32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         div()
             .child(component((), move |_| {
                 move || text(format!("{}", total.get())).into_element()
@@ -551,7 +571,7 @@ fn a_write_from_a_handler_renders_only_the_reader() {
 fn an_idle_render_waits_for_a_frame_with_time_and_input_never_does() {
     let query = Signal::new(0_i32);
     let typed = Signal::new(0_i32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         div()
             .child(component((), move |_| {
                 move || text(format!("typed {}", typed.get())).into_element()
@@ -579,7 +599,7 @@ fn an_idle_render_waits_for_a_frame_with_time_and_input_never_does() {
 #[test]
 fn a_parent_renders_before_its_child_and_a_child_it_rendered_is_not_rendered_twice() {
     let n = Signal::new(0_i32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let v = n.get();
         div()
             .child(text(format!("parent {v}")))
@@ -600,13 +620,14 @@ fn a_parent_renders_before_its_child_and_a_child_it_rendered_is_not_rendered_twi
 /// A child panicking in the cold check's render, the panic caught: the
 /// live props are back (a held handle calls the live closure) and no
 /// render is cold any more.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_render_that_panics_leaves_the_live_props_and_ends_the_cold_check() {
     let renders = counter();
     let r = Rc::clone(&renders);
     let kept: Rc<RefCell<Option<Callback<(), u32>>>> = Rc::default();
     let k = Rc::clone(&kept);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         bump(&r);
         let made = r.get();
         let k = Rc::clone(&k);
@@ -628,60 +649,60 @@ fn a_cold_render_that_panics_leaves_the_live_props_and_ends_the_cold_check() {
     });
     root.resolve();
     let handle = kept.borrow().clone().expect("kept");
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold().resolve()));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold(|f| f.resolve())));
     assert!(caught.is_err(), "the cold render panicked");
     assert!(!is_cold_render(), "the cold check is over");
     assert_eq!(handle.call(()), 1, "the live closure");
 }
 
 /// A child's props signal, kept by a test.
-type HeldCallback = Rc<RefCell<Option<Signal<Callback<(), u32>>>>>;
+/// A value and a callback made with it, each render anew.
+#[cfg(debug_assertions)]
+type MadeProps = (u32, Callback<()>);
+#[cfg(debug_assertions)]
+type HeldCallback = Rc<RefCell<Option<Signal<MadeProps>>>>;
 
 /// The cold check reads the props a fresh placeholder passes and writes
 /// none: run while the child's props are borrowed, it neither aborts nor
 /// leaves the live props, or anything due to render, changed.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_check_run_while_a_childs_props_are_borrowed_writes_none_of_them() {
     let held: HeldCallback = Rc::default();
     let (renders, cold_saw) = (counter(), Rc::new(Cell::new(0_u32)));
     let (h, r, saw) = (Rc::clone(&held), Rc::clone(&renders), Rc::clone(&cold_saw));
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (h, r, saw) = (Rc::clone(&h), Rc::clone(&r), Rc::clone(&saw));
         let made = if is_cold_render() { 2 } else { 1 };
         // A fresh placeholder each render: its props are passed each time.
+        // A fresh callback each render, never equal to the last; the value
+        // is read beside it, as a fork calls no caller's callback.
         div()
-            .child(component(
-                Callback::new(move |()| made),
-                move |cx: Ctx<Callback<(), u32>>| {
-                    *h.borrow_mut() = Some(cx.props());
-                    let props = cx.props();
-                    move || {
-                        let called = props.with(|f| f.call(()));
-                        if is_cold_render() {
-                            saw.set(called);
-                        } else {
-                            bump(&r);
-                        }
-                        div().into_element()
+            .child(component((made, Callback::new(|()| {})), move |cx: Ctx<MadeProps>| {
+                *h.borrow_mut() = Some(cx.props());
+                let props = cx.props();
+                move || {
+                    let called = props.with(|p| p.0);
+                    if is_cold_render() {
+                        saw.set(called);
+                    } else {
+                        bump(&r);
                     }
-                },
-            ))
+                    div().into_element()
+                }
+            }))
             .into_element()
     });
     root.resolve();
     let props = held.borrow().expect("the child's props");
     assert_eq!(renders.get(), 1);
-    props.with_untracked(|_| root.cold().resolve());
+    props.with_untracked(|_| root.cold(|f| f.resolve()));
     assert_eq!(
         cold_saw.get(),
         2,
         "the cold render read the props its parent passed cold"
     );
-    assert_eq!(
-        props.with_untracked(|f| f.call(())),
-        1,
-        "the live props are the live render's"
-    );
+    assert_eq!(props.with_untracked(|p| p.0), 1, "the live props are the live render's");
     assert!(!take_due(), "nothing is due to render");
     root.resolve();
     assert_eq!(renders.get(), 1, "nothing rendered again live");
@@ -689,9 +710,10 @@ fn a_cold_check_run_while_a_childs_props_are_borrowed_writes_none_of_them() {
 
 /// A cold render that makes a signal and panics leaks no scope: what the
 /// check made is disposed when it ends, however its renders ended.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_render_that_panics_after_making_a_signal_leaks_no_scope() {
-    let root = Root::new(|| {
+    let root = owned_root(|| {
         div()
             .child(component((), |_| {
                 || {
@@ -706,7 +728,7 @@ fn a_cold_render_that_panics_after_making_a_signal_leaks_no_scope() {
     });
     root.resolve();
     let check = || {
-        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold().resolve()));
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold(|f| f.resolve())));
         assert!(caught.is_err(), "the cold render panicked");
         crate::reactive::graph()
     };
@@ -724,6 +746,7 @@ fn a_cold_render_that_panics_after_making_a_signal_leaks_no_scope() {
 /// A cold check whose render panics leaves the live tree as it found it,
 /// as one that returns does: an update queued before it is still rendered
 /// live by the next frame, and effects run as before.
+#[cfg(debug_assertions)]
 #[test]
 fn an_update_queued_before_a_cold_check_that_panics_is_rendered_by_the_next_frame() {
     let n = Signal::new(0_u32);
@@ -731,7 +754,7 @@ fn an_update_queued_before_a_cold_check_that_panics_is_rendered_by_the_next_fram
     let l = Rc::clone(&live);
     let mounted = Rc::new(Cell::new(false));
     let m = Rc::clone(&mounted);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (l, m) = (Rc::clone(&l), Rc::clone(&m));
         div()
             .children((n.get() == 2).then(|| {
@@ -762,7 +785,7 @@ fn an_update_queued_before_a_cold_check_that_panics_is_rendered_by_the_next_fram
     root.resolve();
     assert_eq!(live.get(), 0);
     n.set(1);
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold().resolve()));
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| root.cold(|f| f.resolve())));
     assert!(caught.is_err(), "the cold render panicked");
     root.resolve();
     assert_eq!(live.get(), 1, "the update queued before the check is rendered live");
@@ -1022,7 +1045,7 @@ fn a_keyed_component_marks_a_root_in_a_layer_and_the_root_of_a_memoized_child() 
 #[test]
 fn a_cached_root_given_again_is_marked_once_and_is_the_same_node() {
     use crate::element::IntoElement;
-    let owner = crate::reactive::Scope::new().id();
+    let owner = crate::reactive::Scope::new().id().owner_id();
     let cached = div().width(10.0).into_element();
     let mut cache = None;
     let first = mark_root(&mut cache, cached.clone(), Some(7), owner);
@@ -1038,11 +1061,12 @@ fn a_cached_root_given_again_is_marked_once_and_is_the_same_node() {
 /// of the frame's, and the next live read computes the live value. Once
 /// live and clean, a cold frame computing it from other props leaves the
 /// live cache as it was.
+#[cfg(debug_assertions)]
 #[test]
 fn a_computed_read_first_cold_leaves_its_live_cache_and_links_as_they_were() {
     let n = Signal::new(0_i32);
     let tick = Signal::new(0_u32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         // Cold, the parent passes other props than it does live.
         let props = if is_cold_render() { 7 } else { n.get() };
         component(props, move |cx: Ctx<i32>| {
@@ -1062,10 +1086,7 @@ fn a_computed_read_first_cold_leaves_its_live_cache_and_links_as_they_were() {
     });
     assert_eq!(texts(&root.resolve()), ["none"]);
     let links = crate::reactive::graph().subscriptions;
-    let cold = {
-        let frame = root.cold();
-        texts(&frame.resolve())
-    };
+    let cold = root.cold(|frame| texts(&frame.resolve())).expect("kept");
     assert_eq!(cold, ["70"], "the cold render computed it from the cold props");
     assert_eq!(
         crate::reactive::graph().subscriptions,
@@ -1074,10 +1095,7 @@ fn a_computed_read_first_cold_leaves_its_live_cache_and_links_as_they_were() {
     );
     n.set(2);
     assert_eq!(texts(&root.resolve()), ["20"], "the live value, not the cold one");
-    let cold = {
-        let frame = root.cold();
-        texts(&frame.resolve())
-    };
+    let cold = root.cold(|frame| texts(&frame.resolve())).expect("kept");
     assert_eq!(cold, ["70"], "computed again cold, from the cold props");
     // Rendered again live, the computed clean: its live cache is read.
     tick.set(1);
@@ -1087,10 +1105,11 @@ fn a_computed_read_first_cold_leaves_its_live_cache_and_links_as_they_were() {
 /// A computed that reads its props untracked stays clean though they
 /// changed: the cold frame trusts no live cache and computes it again, so
 /// the check sees what the props now give.
+#[cfg(debug_assertions)]
 #[test]
 fn a_clean_computed_over_stale_props_is_computed_again_cold() {
     let n = Signal::new(1_i32);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         component(n.get(), move |cx: Ctx<i32>| {
             let props = cx.props();
             let doubled = crate::reactive::Computed::new(move || props.get_untracked() * 2);
@@ -1101,10 +1120,7 @@ fn a_clean_computed_over_stale_props_is_computed_again_cold() {
     assert_eq!(texts(&root.resolve()), ["2"]);
     n.set(5);
     assert_eq!(texts(&root.resolve()), ["2"], "live, the stale cache stays clean");
-    let cold = {
-        let frame = root.cold();
-        texts(&frame.resolve())
-    };
+    let cold = root.cold(|frame| texts(&frame.resolve())).expect("kept");
     assert_eq!(cold, ["10"], "cold, computed again: the check catches the stale value");
 }
 
@@ -1112,6 +1128,7 @@ fn a_clean_computed_over_stale_props_is_computed_again_cold() {
 /// through it, so the binding reads the props the cold render passed, and
 /// the check sees the width they give.
 #[test]
+#[cfg(debug_assertions)]
 fn a_width_binding_reads_the_props_the_cold_frame_passed() {
     use crate::element::IntoElement;
     let mut s = crate::app::Scenario::measuring(
@@ -1193,6 +1210,70 @@ fn hooks_a_cold_only_setup_registers_never_run() {
     );
 }
 
+/// F1 review 4 (rule 5): a check runs no `after_layout` hook, its own nor
+/// a live one queued before it (`POST` is Fresh: the fork sees none): a
+/// hook is a caller's closure, whose writes no rollback puts back. The live
+/// hook runs live after it, once; the fork's never.
+#[cfg(debug_assertions)]
+#[test]
+fn a_check_runs_no_after_layout_hook() {
+    let ran = Rc::new(Cell::new(0_u32));
+    let owner = Scope::new();
+    let r = Rc::clone(&ran);
+    owner.run(|| after_layout(move || r.set(r.get() + 1)));
+    {
+        let _cold = crate::engine::ColdFrame::begin();
+        let r = Rc::clone(&ran);
+        owner.run(|| after_layout(move || r.set(r.get() + 10)));
+        assert!(!run_post(), "no hook runs in a fork");
+    }
+    assert_eq!(ran.get(), 0, "the cell is unchanged after the rollback");
+    assert!(run_post(), "the live hook runs live");
+    assert_eq!(ran.get(), 1);
+    owner.dispose();
+}
+
+/// Codex 2 (F1 review 5): a model's `on_change` is the caller's closure, so
+/// a write in a check never calls it (one gate, ADR-0028 rule 5); a live
+/// write does.
+#[cfg(debug_assertions)]
+#[test]
+fn a_write_in_a_check_calls_no_on_change() {
+    let heard = counter();
+    let h = Rc::clone(&heard);
+    let model = Model::local(0_i32).on_change(move |_| bump(&h));
+    {
+        let _cold = crate::engine::ColdFrame::begin();
+        model.set(1);
+    }
+    assert_eq!(heard.get(), 0, "no on_change ran in the fork");
+    assert_eq!(model.get_untracked(), 0, "the write is rolled back");
+    model.set(2);
+    assert_eq!(heard.get(), 1, "a live write is heard");
+}
+
+/// Codex 2 (F1 review 5): the same for a component's bind: a write through
+/// `use_model` in a check calls no `on_change`.
+#[cfg(debug_assertions)]
+#[test]
+fn a_bound_write_in_a_check_calls_no_on_change() {
+    let heard = counter();
+    let h = Rc::clone(&heard);
+    let owner = Scope::new();
+    let used = owner.run(|| {
+        let props = Signal::new(Bind::value(0_i32).on_change(move |_| bump(&h)));
+        use_model(props, |p| p)
+    });
+    {
+        let _cold = crate::engine::ColdFrame::begin();
+        used.set(1);
+    }
+    assert_eq!(heard.get(), 0, "no on_change ran in the fork");
+    used.set(1);
+    assert_eq!(heard.get(), 1, "a live write is heard");
+    owner.dispose();
+}
+
 /// How many instances the tree holds.
 fn instances() -> usize {
     with_tree(|t| t.slab.iter().flatten().count())
@@ -1204,11 +1285,12 @@ fn panics(f: impl FnOnce()) -> bool {
 }
 
 /// Sibling A mounts (registered with a registry), then sibling B's setup
-/// panics: the root is poisoned, A goes down with it (its entry too), and
-/// the next frame mounts both again, fresh. A leaving then takes its entry
-/// and its instance with it.
+/// panics in the frame's turn: B alone is torn down, its slot empty, and
+/// A stays as it is, its entry with it (ADR-0015, the turn rule: a
+/// failing component does not take the window down). The root rendering
+/// again mounts B anew. A leaving then takes its entry and its instance.
 #[test]
-fn a_sibling_whose_setup_panics_takes_the_one_mounted_before_it_down_with_the_root() {
+fn a_sibling_whose_setup_panics_is_torn_down_alone() {
     use crate::element::IntoElement;
     let owner = Scope::new();
     let registry: crate::Registry<&'static str> = owner.run(crate::Registry::new);
@@ -1239,11 +1321,12 @@ fn a_sibling_whose_setup_panics_takes_the_one_mounted_before_it_down_with_the_ro
     )
     .expect("a scenario");
     assert!(panics(|| drop(sc.frame("b panics"))), "b's setup panicked");
-    assert_eq!(registry.len_untracked(), 0, "a went down with the root");
-    assert_eq!(instances(), 0, "the whole tree is down");
+    assert_eq!(registry.to_vec_untracked(), ["a"], "a stays, its entry with it");
+    assert_eq!(instances(), 2, "the root and a: b alone is down");
     sc.act("again", || tick.set(1));
     sc.settle().expect("settled");
-    assert_eq!(a_setups.get(), 2, "a mounted again, fresh");
+    assert_eq!(a_setups.get(), 1, "a kept");
+    assert_eq!(instances(), 3, "b mounted anew as the root rendered again");
     assert_eq!(registry.to_vec_untracked(), ["a"]);
     sc.act("remove a", || show_a.set(false));
     sc.settle().expect("settled");
@@ -1288,6 +1371,11 @@ fn an_observer_that_panics_at_a_registration_leaves_the_surviving_registry_empty
         "the observer panicked"
     );
     assert!(!armed.get(), "it saw the entry");
+    // The frame is one dispatch (ADR-0015): the observer's panic is kept
+    // for its end and tears nothing down, so the instance and its entry
+    // stay; they go down with the root.
+    assert_eq!(registry.len_untracked(), 1, "the instance stays mounted");
+    drop(sc);
     assert_eq!(registry.len_untracked(), 0, "the entry went down with the root");
     owner.dispose();
 }
@@ -1301,7 +1389,7 @@ fn a_mounted_hook_of_an_instance_a_poison_tore_down_never_runs() {
     let a_setups = counter();
     let armed = Rc::new(Cell::new(true));
     let (r, s, a) = (Rc::clone(&ran), Rc::clone(&a_setups), Rc::clone(&armed));
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (r, s, a) = (Rc::clone(&r), Rc::clone(&s), Rc::clone(&a));
         let first = component((), move |_| {
             bump(&s);
@@ -1332,7 +1420,7 @@ fn a_key_held_by_a_setup_that_panics_is_let_go_with_the_poison() {
     let key = Rc::new(Cell::new(1_u32));
     let armed = Rc::new(Cell::new(true));
     let (k, a) = (Rc::clone(&key), Rc::clone(&armed));
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (k, a) = (Rc::clone(&k), Rc::clone(&a));
         component((), move |_| {
             keyed.hold(&k.get(), || u64::from(k.get()));
@@ -1404,7 +1492,7 @@ fn a_slot_whose_generations_ran_out_is_never_reused() {
     let show = Signal::new(true);
     let ids: Rc<std::cell::RefCell<Vec<Id>>> = Rc::default();
     let i = Rc::clone(&ids);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let i = Rc::clone(&i);
         div()
             .children(show.get().then(|| {
@@ -1418,17 +1506,15 @@ fn a_slot_whose_generations_ran_out_is_never_reused() {
     assert_eq!(texts(&root.resolve()), ["kid"]);
     show.set(false);
     assert_eq!(texts(&root.resolve()), Vec::<String>::new());
-    // The kid's slot, free, at its last generation: the next kid takes it.
+    // The kid's slot, free, at its last live generation: the next kid
+    // takes it.
     let slot = ids.borrow().first().expect("the kid mounted").slot;
-    with_tree(|t| {
-        if let Some(g) = t.generations.get_mut(slot) {
-            *g = u32::MAX;
-        }
-    });
+    let final_live = crate::engine::FORK_GENERATION - 2;
+    with_tree(|t| t.generations.set(slot, final_live, 0));
     show.set(true);
     assert_eq!(texts(&root.resolve()), ["kid"]);
     let last = *ids.borrow().last().expect("the kid mounted again");
-    assert_eq!((last.slot, last.generation), (slot, u32::MAX), "it took the slot");
+    assert_eq!((last.slot, last.generation), (slot, final_live), "it took the slot");
     show.set(false);
     assert_eq!(texts(&root.resolve()), Vec::<String>::new());
     show.set(true);
@@ -1459,7 +1545,7 @@ fn a_setup_that_panics_after_a_panicking_cleanup_poisons_its_root_once() {
     let cleaned = counter();
     let armed = Rc::new(Cell::new(true));
     let (c, a) = (Rc::clone(&cleaned), Rc::clone(&armed));
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let (c, a) = (Rc::clone(&c), Rc::clone(&a));
         div()
             .child(component((), move |_| {
@@ -1489,7 +1575,7 @@ fn a_setup_that_panics_after_a_panicking_cleanup_poisons_its_root_once() {
 #[test]
 fn a_child_whose_cleanup_panics_leaves_another_roots_instances_alone() {
     let show = Signal::new(true);
-    let first = Root::new(move || {
+    let first = owned_root(move || {
         div()
             .children(show.get().then(|| {
                 component((), |_| {
@@ -1504,7 +1590,7 @@ fn a_child_whose_cleanup_panics_leaves_another_roots_instances_alone() {
     assert!(panics(|| drop(first.resolve())), "the cleanup panicked");
     let cleaned = counter();
     let c = Rc::clone(&cleaned);
-    let second = Root::new(move || {
+    let second = owned_root(move || {
         let c = Rc::clone(&c);
         component((), move |_| {
             let c = Rc::clone(&c);
@@ -1528,7 +1614,7 @@ fn a_poisoned_root_mounts_its_new_child_again_not_the_stale_output() {
     let show = Signal::new(false);
     let armed = Rc::new(Cell::new(true));
     let a = Rc::clone(&armed);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         let a = Rc::clone(&a);
         let kid = show.get().then(|| {
             component((), move |_| {
@@ -1581,6 +1667,7 @@ fn siblings_removed_together_are_all_torn_down_though_a_cleanup_panics() {
 /// A placeholder the cold check meets before the live frame does (its
 /// parent held it, then passed it again) still passes its props live: what
 /// the cold frame noted of it is gone with the cold frame.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_check_then_a_live_update_to_the_same_placeholder_passes_its_props() {
     let child = |n: u32| {
@@ -1593,24 +1680,25 @@ fn a_cold_check_then_a_live_update_to_the_same_placeholder_passes_its_props() {
     let held = Rc::new(std::cell::RefCell::new(child(1)));
     let tick = Signal::new(0_u32);
     let h = Rc::clone(&held);
-    let root = Root::new(move || {
+    let root = owned_root(move || {
         tick.get();
         div().child(h.borrow().clone()).into_element()
     });
     assert_eq!(texts(&root.resolve()), ["1"]);
     *held.borrow_mut() = child(2);
     tick.set(1);
-    root.cold().resolve();
+    root.cold(|f| f.resolve());
     assert_eq!(texts(&root.resolve()), ["2"], "the new props passed live");
 }
 
 /// What a cold frame costs is what it writes, not what the thread holds:
 /// beside another window of a hundred or ten thousand signals and
 /// instances, checking a small one logs the same steps.
+#[cfg(debug_assertions)]
 #[test]
 fn a_cold_frame_costs_its_writes_not_the_size_of_another_window() {
     let steps = |other: usize| {
-        let big = Root::new(move || {
+        let big = owned_root(move || {
             let cells: Vec<Element> = (0..other)
                 .map(|i| {
                     component(i, |cx: Ctx<usize>| {
@@ -1626,16 +1714,18 @@ fn a_cold_frame_costs_its_writes_not_the_size_of_another_window() {
         });
         big.resolve();
         let n = Signal::new(1_u32);
-        let small = Root::new(move || {
+        let small = owned_root(move || {
             div()
                 .child(component((), move |_| move || text(n.get().to_string()).into_element()))
                 .into_element()
         });
         small.resolve();
-        let cold = small.cold();
-        cold.resolve();
-        let cost = (crate::reactive::cold_steps(), cold_tree_steps());
-        drop(cold);
+        let cost = small
+            .cold(|cold| {
+                cold.resolve();
+                (crate::reactive::cold_steps(), cold_tree_steps())
+            })
+            .expect("kept");
         drop((small, big));
         cost
     };

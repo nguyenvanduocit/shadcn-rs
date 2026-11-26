@@ -84,11 +84,7 @@
 //!   hidden at once as kept-mounted content is ([`crate::presence`]; ADR-0025,
 //!   "Group 5: third review fixes", item 3).
 
-#[expect(
-    clippy::disallowed_types,
-    reason = "the select's own scroll handle, and the boxes its own layout callback writes, bounded by the options laid out"
-)]
-use std::cell::RefCell;
+use gui::engine::{WorldCell, WorldRefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -138,29 +134,28 @@ struct Press {
     moved: bool,
 }
 
-/// What a select keeps beside its value and open state.
-#[expect(
-    clippy::disallowed_types,
-    reason = "the select's own scroll handle, and the boxes its own layout callback writes, bounded by the options laid out"
-)]
+/// What a select keeps beside its value and open state. Its cells are the
+/// world's that made the select: a check writes none of a live one's
+/// (ADR-0034, S7).
 struct Parts<T: 'static> {
     items: Collection<T>,
     /// The boxes of the options as last laid out: written by the select's
     /// own layout callback on each option's node (never by a render or a
     /// setup), and let go of with the options that left.
-    boxes: RefCell<HashMap<FocusId, Bounds>>,
-    list_box: std::cell::Cell<Option<Bounds>>,
-    scroll: RefCell<ScrollHandle>,
-    stepping: std::cell::Cell<Option<TimerId>>,
+    boxes: WorldRefCell<HashMap<FocusId, Bounds>>,
+    list_box: WorldCell<Option<Bounds>>,
+    /// The list's scroll: made in the select's setup, so it goes with the
+    /// select's scope; started afresh as the list opens and as it is
+    /// placed again ([`ScrollHandle::reset`]).
+    scroll: ScrollHandle,
+    stepping: WorldCell<Option<TimerId>>,
     /// Scroll buttons shown: up, down.
-    buttons: std::cell::Cell<(bool, bool)>,
-    /// The list lines its anchor option up on the trigger (item-aligned).
-    aligned: std::cell::Cell<bool>,
+    buttons: WorldCell<(bool, bool)>,
     /// Placed again since it opened (once, as the up button came).
-    replaced: std::cell::Cell<bool>,
+    replaced: WorldCell<bool>,
     /// The next opening is from the keyboard ([`Select::open`]'s word),
     /// so the anchor option shows its focus.
-    by_keyboard: std::cell::Cell<bool>,
+    by_keyboard: WorldCell<bool>,
 }
 
 /// A select: made once in its root's setup, `Copy`.
@@ -215,10 +210,6 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
     /// scope).
     #[must_use]
     #[track_caller]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "the select's own scroll handle, and the boxes its own layout callback writes, bounded by the options laid out"
-    )]
     pub fn new(value: Bound<M>, open: Bound<bool>, direction: impl Into<ReadDirection>) -> Self {
         // One value replaces: choosing the chosen option keeps it
         // (`SelectRoot.vue` assigns `modelValue = value`); several toggle.
@@ -244,14 +235,13 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
             buttons: Signal::new((false, false)),
             parts: Signal::new(Rc::new(Parts {
                 items: Collection::new(),
-                boxes: RefCell::new(HashMap::new()),
-                list_box: std::cell::Cell::new(None),
-                scroll: RefCell::new(ScrollHandle::new()),
-                stepping: std::cell::Cell::new(None),
-                buttons: std::cell::Cell::new((false, false)),
-                aligned: std::cell::Cell::new(false),
-                replaced: std::cell::Cell::new(false),
-                by_keyboard: std::cell::Cell::new(false),
+                boxes: WorldRefCell::new("a select's option boxes", HashMap::new()),
+                list_box: WorldCell::new("a select's list box", None),
+                scroll: ScrollHandle::new(),
+                stepping: WorldCell::new("a select's scroll step timer", None),
+                buttons: WorldCell::new("a select's scroll buttons", (false, false)),
+                replaced: WorldCell::new("whether a select was placed again", false),
+                by_keyboard: WorldCell::new("whether a select opens from the keyboard", false),
             })),
             placed: Signal::new(0),
             trigger: FocusHandle::new(),
@@ -305,7 +295,7 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
     fn opened(self) {
         self.list.typeahead().reset();
         let parts = self.parts();
-        parts.scroll.replace(ScrollHandle::new());
+        parts.scroll.reset();
         self.buttons.set((false, false));
         parts.buttons.set((false, false));
         parts.replaced.set(false);
@@ -360,6 +350,15 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
 
     fn parts(self) -> Rc<Parts<T>> {
         self.parts.with_untracked(Rc::clone)
+    }
+
+    /// What the select keeps beside its value, watched (tests: it goes
+    /// with the select's scope).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn parts_held(self) -> std::rc::Weak<dyn std::any::Any> {
+        let parts: Rc<dyn std::any::Any> = self.parts();
+        Rc::downgrade(&parts)
     }
 
     /// The value (tracked).
@@ -747,29 +746,31 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
         }
     }
 
-    /// Whether the list lines its anchor option up on the trigger
-    /// (item-aligned) rather than floating below it; the look says.
-    pub fn set_aligned(self, aligned: bool) {
-        self.parts().aligned.set(aligned);
-    }
-
     /// `d` as the scrolling viewport the options sit in (`SelectViewport`):
     /// it scrolls by the select's handle, and tells which scroll buttons
-    /// show. Its scrollbar is the look's to hide. An item-aligned list is
-    /// placed again once, as its up button first shows and pushes the
-    /// options down, and focus goes to the anchor option again
-    /// (`SelectItemAlignedPosition.vue:211-217`).
+    /// show. Its scrollbar is the look's to hide. `aligned`: the list lines
+    /// its anchor option up on the trigger (item-aligned) rather than
+    /// floating below it, as the look's render says; such a list is placed
+    /// again once, as its up button first shows and pushes the options
+    /// down, and focus goes to the anchor option again
+    /// (`SelectItemAlignedPosition.vue:211-217`). The render hands it to the
+    /// viewport's layout hook, which is the handle's (forked with it): a
+    /// render writes nothing live.
     #[must_use]
-    pub fn viewport(self, d: Div) -> Div {
+    pub fn viewport(self, d: Div, aligned: bool) -> Div {
         self.placed.get();
         let parts = self.parts();
-        let handle = parts.scroll.borrow().clone();
+        let handle = parts.scroll;
         let shows = |l: &ScrollLayout| (l.offset.1 > 0.5, l.offset.1 < l.max.1 - 0.5);
-        let shown = Rc::clone(&parts);
+        // Weak: the hook is held by the handle's state, which the parts name.
+        let shown = Rc::downgrade(&parts);
         let buttons = self.buttons;
         let placed = self.placed;
         let select = self;
         handle.on_layout(move |l| {
+            let Some(shown) = shown.upgrade() else {
+                return false;
+            };
             let now = shows(l);
             if now == shown.buttons.get() {
                 return false;
@@ -777,11 +778,11 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
             let came = now.0 && !shown.buttons.get().0;
             shown.buttons.set(now);
             gui::untracked(|| buttons.set(now));
-            if came && shown.aligned.get() && !shown.replaced.get() {
+            if came && aligned && !shown.replaced.get() {
                 shown.replaced.set(true);
-                // A new scroll: the engine scrolls it as it opens, the
-                // anchor over the trigger with the button above it.
-                shown.scroll.replace(ScrollHandle::new());
+                // The scroll afresh: the engine scrolls it as it opens,
+                // the anchor over the trigger with the button above it.
+                shown.scroll.reset();
                 gui::untracked(|| placed.update(|n| *n = n.wrapping_add(1)));
                 select.later(move || select.focus_anchor(gui::focus::focus_visible()));
             }
@@ -827,7 +828,7 @@ impl<T: Clone + PartialEq + 'static, M: Choice<T>> Select<T, M> {
             return;
         }
         let dy = if up { -self.step_height() } else { self.step_height() };
-        let handle = self.parts().scroll.borrow().clone();
+        let handle = self.parts().scroll;
         let (x, y) = handle.offset();
         handle.scroll_to((x, (y + dy).max(0.0)));
         // The select owns the step, not whatever runs this (a hover

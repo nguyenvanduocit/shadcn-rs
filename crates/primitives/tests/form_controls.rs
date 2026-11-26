@@ -46,8 +46,17 @@ fn scenario(f: impl Fn() -> Element + 'static) -> Scenario {
     s
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// The accessibility tree of `s`'s last frame, with its window's focus
+/// (read in a turn of it: ADR-0015).
+fn access_tree(s: &mut Scenario, ts: &mut gui::text::TextSystem) -> accesskit::TreeUpdate {
+    let focus = s.read(gui::focus::focused);
+    gui::access::tree(s.last(), focus, 1.0, "w", ts)
+}
+
+/// Whether `h` holds focus in `s`'s window, read in a turn of it (outside
+/// any turn, focus is the thread window's: ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
 }
 
 fn focus(s: &mut Scenario, h: FocusHandle) {
@@ -94,7 +103,7 @@ fn bounds(s: &Scenario, name: &str) -> gui::Bounds {
         .nodes
         .iter()
         .find(|n| n.name == Some(name))
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .expect("the named node")
 }
 
@@ -171,7 +180,7 @@ fn checkbox_switch_and_toggle_take_space_enter_as_the_platform_does() {
     // Unavailable: focus stays, nothing is acted on.
     usable.set(Availability::Unavailable);
     s.settle().expect("settled");
-    assert!(focused(tg), "an unavailable control keeps focus");
+    assert!(focused(&mut s, tg), "an unavailable control keeps focus");
     plain(&mut s, NamedKey::Space);
     click(&mut s, "Check");
     click(&mut s, "Switch");
@@ -246,9 +255,9 @@ fn a_checkbox_group_holds_one_list_its_limit_and_its_parent() {
     assert_eq!(values.get_untracked(), ["a", "b"], "a held-back box does not check");
     focus(&mut s, boxes[1]);
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(boxes[2]), "a held-back box keeps arrow navigation");
+    assert!(focused(&mut s, boxes[2]), "a held-back box keeps arrow navigation");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(boxes[2]), "no wrap");
+    assert!(focused(&mut s, boxes[2]), "no wrap");
 }
 
 /// A radio group of `&str` bound by a `Bind`.
@@ -289,13 +298,13 @@ fn a_radio_group_checks_with_the_arrows_and_only_focuses_with_home_and_end() {
     let (mut s, _, items) = radios(Bind::model(value), Direction::Ltr);
     focus(&mut s, items[1]);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(items[3]), "the disabled radio is skipped");
+    assert!(focused(&mut s, items[3]), "the disabled radio is skipped");
     assert_eq!(value.get_untracked(), Some("D"), "an arrow checks");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(items[0]), "both axes, and it wraps");
+    assert!(focused(&mut s, items[0]), "both axes, and it wraps");
     assert_eq!(value.get_untracked(), Some("A"));
     plain(&mut s, NamedKey::End);
-    assert!(focused(items[3]), "End focuses the last");
+    assert!(focused(&mut s, items[3]), "End focuses the last");
     assert_eq!(
         value.get_untracked(),
         Some("A"),
@@ -337,7 +346,7 @@ fn a_radio_group_steps_over_a_radio_not_shown() {
     });
     focus(&mut s, items[0]);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(items[2]), "the radio not shown is stepped over");
+    assert!(focused(&mut s, items[2]), "the radio not shown is stepped over");
     assert_eq!(value.get_untracked(), Some("D"), "and never checked");
 }
 
@@ -348,7 +357,7 @@ fn a_radio_group_reads_arrows_right_to_left_and_a_caller_vetoes_by_keeping_its_v
     let (mut s, group, items) = radios(bind, Direction::Rtl);
     focus(&mut s, items[0]);
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(items[1]), "right to left, ArrowLeft goes on");
+    assert!(focused(&mut s, items[1]), "right to left, ArrowLeft goes on");
     assert_eq!(heard.borrow().as_slice(), [Some("B")], "the caller hears the check");
     assert_eq!(group.value(), Some("A"), "and, keeping its value, vetoes it");
 }
@@ -403,20 +412,20 @@ fn a_toggle_group_of_one_may_be_emptied_and_one_of_many_toggles_each() {
 
     focus(&mut s, f2[2]);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f2[0]), "roving: the arrows move focus, wrapping");
+    assert!(focused(&mut s, f2[0]), "roving: the arrows move focus, wrapping");
     assert_eq!(many.get_untracked(), ["under"], "and press nothing");
     plain(&mut s, NamedKey::Space);
     assert_eq!(many.get_untracked(), ["under", "bold"], "Space presses");
     plain(&mut s, NamedKey::Tab);
-    assert!(!f2.iter().any(|f| focused(*f)), "the group is one Tab stop");
+    assert!(!f2.iter().any(|f| focused(&mut s, *f)), "the group is one Tab stop");
 
     rove.set(false);
     s.settle().expect("settled");
     focus(&mut s, f2[0]);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f2[0]), "not roving: the arrows do nothing");
+    assert!(focused(&mut s, f2[0]), "not roving: the arrows do nothing");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f2[1]), "and each item is a Tab stop");
+    assert!(focused(&mut s, f2[1]), "and each item is a Tab stop");
 }
 
 /// A focusable box before a radio group of A (disabled), B and C bound to
@@ -465,27 +474,33 @@ fn tab_enters_a_radio_group_at_the_checked_item_and_a_toggle_group_at_the_presse
     let (mut s, f) = entries(value, pressed);
     focus(&mut s, f[0]);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[3]), "Tab enters a radio group at the checked item");
+    assert!(focused(&mut s, f[3]), "Tab enters a radio group at the checked item");
     assert_eq!(value.get_untracked(), Some("C"), "and checks nothing");
     plain(&mut s, NamedKey::Tab);
     assert!(
-        focused(f[5]),
+        focused(&mut s, f[5]),
         "one Tab leaves it, into a toggle group at its pressed item"
     );
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[7]), "and one Tab leaves that");
+    assert!(focused(&mut s, f[7]), "and one Tab leaves that");
     shift(&mut s, NamedKey::Tab);
-    assert!(focused(f[5]), "Shift+Tab enters a toggle group at its pressed item");
+    assert!(
+        focused(&mut s, f[5]),
+        "Shift+Tab enters a toggle group at its pressed item"
+    );
     shift(&mut s, NamedKey::Tab);
-    assert!(focused(f[3]), "and a radio group at its checked item");
+    assert!(focused(&mut s, f[3]), "and a radio group at its checked item");
 
     // Nothing checked or pressed: the first usable item.
     let (mut s, f) = entries(Signal::new(None), Signal::new(Vec::new()));
     focus(&mut s, f[0]);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[2]), "nothing checked: the first usable radio (A is disabled)");
+    assert!(
+        focused(&mut s, f[2]),
+        "nothing checked: the first usable radio (A is disabled)"
+    );
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[4]), "nothing pressed: the first toggle");
+    assert!(focused(&mut s, f[4]), "nothing pressed: the first toggle");
 }
 
 /// The values a slider committed, in order.
@@ -591,7 +606,7 @@ fn a_range_keeps_its_thumbs_apart_by_steps_and_home_moves_the_first() {
     );
     plain(&mut s, NamedKey::Home);
     assert_eq!(value.get_untracked(), [0.0, 30.0], "Home moves the first thumb");
-    assert!(focused(sl.focus_of(0)), "and focus goes to it");
+    assert!(focused(&mut s, sl.focus_of(0)), "and focus goes to it");
 }
 
 #[test]
@@ -952,7 +967,7 @@ fn a_button_held_by_a_finger_to_the_max_lets_go_and_both_buttons_click_after() {
 /// showing, `label`.
 fn at_press(s: &mut Scenario, role: accesskit::Role, label: &str) {
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(s, &mut ts);
     let nodes: HashMap<NodeId, &Node> = tree.nodes.iter().map(|(id, n)| (*id, n)).collect();
     let target = tree
         .nodes
@@ -1133,17 +1148,20 @@ fn a_pin_moves_on_as_it_is_typed_and_back_on_backspace() {
     focus(&mut s, slots[0]);
     typed(&mut s, "1a2");
     assert_eq!(code(&value.get_untracked()), "12", "a number pin refuses a letter");
-    assert!(focused(slots[2]), "focus goes on with each character");
+    assert!(focused(&mut s, slots[2]), "focus goes on with each character");
     plain(&mut s, NamedKey::Backspace);
-    assert!(focused(slots[1]), "Backspace on an empty slot goes back");
+    assert!(focused(&mut s, slots[1]), "Backspace on an empty slot goes back");
     assert_eq!(code(&value.get_untracked()), "1", "and clears that one");
     plain(&mut s, NamedKey::ArrowRight);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(slots[3]), "not a one-time code: the arrows reach any slot");
+    assert!(
+        focused(&mut s, slots[3]),
+        "not a one-time code: the arrows reach any slot"
+    );
     typed(&mut s, "9");
     assert_eq!(code(&value.get_untracked()), "1__9", "a slot is bound to its place");
     plain(&mut s, NamedKey::Home);
-    assert!(focused(slots[0]));
+    assert!(focused(&mut s, slots[0]));
     focus(&mut s, slots[1]);
     typed(&mut s, "7");
     typed(&mut s, "8");
@@ -1160,13 +1178,16 @@ fn a_one_time_pin_holds_focus_to_its_first_empty_slot() {
     };
     let (mut s, slots, _) = pin(value, config);
     focus(&mut s, slots[3]);
-    assert!(focused(slots[1]), "focus from outside goes to the first empty slot");
+    assert!(
+        focused(&mut s, slots[1]),
+        "focus from outside goes to the first empty slot"
+    );
     plain(&mut s, NamedKey::End);
-    assert!(focused(slots[1]), "End stops there");
+    assert!(focused(&mut s, slots[1]), "End stops there");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(slots[1]), "and the arrows");
+    assert!(focused(&mut s, slots[1]), "and the arrows");
     plain(&mut s, NamedKey::ArrowLeft);
-    assert!(focused(slots[0]), "back is free");
+    assert!(focused(&mut s, slots[0]), "back is free");
 }
 
 #[test]
@@ -1247,7 +1268,7 @@ fn an_input_method_types_into_a_pin_and_an_otp() {
     assert_eq!(code(&value.get_untracked()), "", "its keys are the input method's");
     ime(&mut s, gui::ImeEvent::Commit("かな".to_owned()));
     assert_eq!(code(&value.get_untracked()), "かな", "a commit spreads over the slots");
-    assert!(focused(slots[2]));
+    assert!(focused(&mut s, slots[2]));
 
     let otp_value = Signal::new(String::new());
     let made = Rc::new(Cell::new(None));
@@ -1328,12 +1349,12 @@ fn a_linear_stepper_reaches_the_next_step_only_and_moves_on_the_press() {
 
     focus(&mut s, t[1]);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(t[2]), "the arrows move focus to a reachable trigger");
+    assert!(focused(&mut s, t[2]), "the arrows move focus to a reachable trigger");
     assert_eq!(value.get_untracked(), 2, "and choose nothing");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(t[2]), "no wrap");
+    assert!(focused(&mut s, t[2]), "no wrap");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(t[2]), "the other axis does nothing");
+    assert!(focused(&mut s, t[2]), "the other axis does nothing");
     plain(&mut s, NamedKey::Enter);
     assert_eq!(value.get_untracked(), 3, "Enter chooses at once");
     shift(&mut s, NamedKey::Space);
@@ -1363,13 +1384,13 @@ fn a_control_press_on_a_trigger_neither_moves_nor_takes_focus() {
         1,
         "a Control press moves nothing, nor does its click"
     );
-    assert!(focused(t[0]), "and focus stays where it was");
+    assert!(focused(&mut s, t[0]), "and focus stays where it was");
     s.send(gui::window::Input::Modifiers(Modifiers::default()));
     s.send(gui::window::Input::MouseDown { x, y });
     s.send(gui::window::Input::MouseUp { x, y });
     s.settle().expect("settled");
     assert_eq!(value.get_untracked(), 3);
-    assert!(focused(t[2]));
+    assert!(focused(&mut s, t[2]));
 }
 
 #[test]
@@ -1600,7 +1621,7 @@ fn told<R: Fn() -> Div + 'static>(setup: impl Fn() -> R + 'static) -> String {
     s.act("relayout", || {});
     s.settle().expect("settled");
     let mut ts = gui::text::TextSystem::new();
-    let tree = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let tree = access_tree(&mut s, &mut ts);
     dump(&tree)
 }
 
@@ -1894,7 +1915,7 @@ fn steps_that_come_and_go_leave_nothing_behind() {
     // Each step held by the parts of the last two renders (what may be on
     // screen): bounded however many come.
     assert!(most <= 4, "kept {most} steps, 3 shown");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("Button labelled_by=[\"Title 1000\", \"About 1000\"]"),
         "each trigger is still named by its own title and description:\n{tree}"
@@ -1954,7 +1975,7 @@ fn a_step_trigger_that_leaves_for_a_layout_is_named_by_its_labels_again() {
     s.settle().expect("settled");
     s.act("the trigger comes back", || shown.set(true));
     s.settle().expect("settled");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("Button labelled_by=[\"Title 1\", \"About 1\"]"),
         "the trigger is named by its title and description again:\n{tree}"
@@ -2007,11 +2028,11 @@ fn slider_thumbs_that_come_and_go_leave_nothing_behind() {
     // The one thumb left is focused through the same handle as ever, and
     // apart from the others'.
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(sl.focus_of(0)), "Tab reaches the thumb");
+    assert!(focused(&mut s, sl.focus_of(0)), "Tab reaches the thumb");
     assert_ne!(sl.focus_of(0), sl.focus_of(1));
 }
 
-fn a11y(s: &Scenario) -> String {
+fn a11y(s: &mut Scenario) -> String {
     let mut ts = gui::text::TextSystem::new();
-    dump(&gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts))
+    dump(&access_tree(s, &mut ts))
 }

@@ -409,8 +409,12 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .last()
         .nodes
         .iter()
-        .find(|n| n.name == Some("checkbox") && (n.bounds.y + n.bounds.height / 2.0 - y).abs() < 10.0)
-        .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
+        .find(|n| {
+            let b = n.bounds(gui::inspect::OUTSIDE);
+            n.name == Some("checkbox") && (b.y + b.height / 2.0 - y).abs() < 10.0
+        })
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
+        .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound("ken99's checkbox".to_owned()))?;
     s.click(cx, cy);
     s.frame("one row selected, header indeterminate")?;
@@ -432,7 +436,8 @@ pub fn script(s: &mut Shot) -> Result<(), ScenarioError> {
         .nodes
         .iter()
         .find(|n| n.name == Some("dropdown-menu-checkbox-item"))
-        .map(|n| (n.bounds.x + n.bounds.width / 2.0, n.bounds.y + n.bounds.height / 2.0))
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
+        .map(|b| (b.x + b.width / 2.0, b.y + b.height / 2.0))
         .ok_or_else(|| ScenarioError::TextNotFound("Status item".to_owned()))?;
     s.click(mx, my);
     s.frame("status hidden")?;

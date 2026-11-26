@@ -9,8 +9,6 @@
 //! (`model`); each [`menubar_menu`] holds a trigger and its content, and is
 //! open while the bar's value is its own.
 
-use std::cell::Cell;
-
 use gui::prelude::*;
 use gui::{Bind, Div, Icon, Model, Text, component, div, icon, provide, use_context, use_model};
 
@@ -129,10 +127,8 @@ impl Part<MenubarMenuProps> {
     }
 }
 
-gui::engine_local! {
-    /// Values for menus not given one (reka's `useId`).
-    [Fork] static NEXT_MENU: Cell<u64> = Cell::new(0);
-}
+/// Values for menus not given one (reka's `useId`).
+static NEXT_MENU: gui::engine::IdKind = gui::engine::IdKind::new("menubar menu");
 
 /// One menu of the bar (`MenubarMenu`): the anchor its content opens
 /// against. Give it a [`menubar_trigger`] and a [`menubar_content`].
@@ -145,8 +141,7 @@ pub fn menubar_menu() -> Part<MenubarMenuProps> {
             component(p, |cx| {
                 let props = cx.props();
                 let me = props.with_untracked(|p| p.props.value.clone()).unwrap_or_else(|| {
-                    let n = NEXT_MENU.get();
-                    NEXT_MENU.set(n.wrapping_add(1));
+                    let n = gui::engine::unique_id(&NEXT_MENU);
                     format!("menubar-menu-{n}")
                 });
                 if let Some(bar) = use_context::<Menubar>() {

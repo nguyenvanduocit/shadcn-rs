@@ -15,7 +15,6 @@
 //! Alt+T focuses the stack (vue-sonner's hotkey). The store and its countdowns are `primitives::toast`'s
 //! (`Toaster`): unmounted, the toaster cancels them. This module draws them.
 
-use std::cell::Cell;
 #[expect(
     clippy::disallowed_types,
     reason = "the toasters mounted, added and taken out only as each mounts and unmounts (`gui::while_mounted`)"
@@ -200,12 +199,16 @@ gui::engine_local! {
     /// The toasters mounted, by the order they mounted in: [`toast()`] goes
     /// to the last.
     #[expect(clippy::disallowed_types, reason = "the toasters mounted, added and taken out only as each mounts and unmounts (`gui::while_mounted`)")]
-    [Fork(log)] static TOASTERS: RefCell<gui::engine::ForkMap<u64, Store>> = RefCell::default();
-    /// The next toaster's place in that order.
-    [Fork] static MOUNTED: Cell<u64> = Cell::new(0);
-    /// The id the next toast gets.
-    [Fork] static NEXT: Cell<u64> = Cell::new(1);
+    /// Each by handle (ADR-0034 S7): a store is engine handles alone, so
+    /// nothing changes through the handle; a check's insert or forget is
+    /// its own.
+    [Fork(log)] static TOASTERS: RefCell<gui::engine::ForkMap<u64, gui::engine::AppHandle<Store>>> = RefCell::default();
 }
+
+/// The toasters' places in that order, increasing on a thread.
+static MOUNTED: gui::engine::IdKind = gui::engine::IdKind::new("sonner toaster");
+/// The toasts' ids.
+static NEXT: gui::engine::IdKind = gui::engine::IdKind::new("sonner toast");
 
 /// The toasts a [`toaster`] holds, newest first. Made in its setup.
 #[derive(Clone, Copy, PartialEq)]
@@ -215,7 +218,7 @@ struct Store {
 
 impl Store {
     fn last() -> Option<Self> {
-        TOASTERS.with(|t| t.borrow().iter().max_by_key(|(n, _)| **n).map(|(_, s)| *s))
+        TOASTERS.with(|t| t.borrow().iter().max_by_key(|(n, _)| **n).map(|(_, s)| **s))
     }
 
     /// Show `toast` as `id`, in front of the others, or in place of the
@@ -323,9 +326,7 @@ pub mod toast {
 
 /// The next toast's id.
 fn fresh_id() -> ToastId {
-    let id = ToastId(NEXT.get());
-    NEXT.set(NEXT.get().wrapping_add(1));
-    id
+    ToastId(gui::engine::unique_id(&NEXT))
 }
 
 /// The toaster (`<Toaster />`): the toasts over the window's bottom-right
@@ -350,10 +351,13 @@ pub fn toaster() -> Element {
         // In the toasters while mounted: a setup never pushes into the
         // shared list (one that never mounts, a cold re-render's, leaves it).
         gui::while_mounted(move || {
-            let n = MOUNTED.replace(MOUNTED.get().wrapping_add(1));
-            TOASTERS.with(|t| t.borrow_mut().insert(n, store));
+            let n = gui::engine::unique_id(&MOUNTED);
+            TOASTERS.with(|t| {
+                t.borrow_mut()
+                    .replace(n, gui::engine::AppHandle::new(std::rc::Rc::new(store)))
+            });
             move || {
-                TOASTERS.try_with(|t| t.borrow_mut().remove(&n)).ok();
+                TOASTERS.try_with(|t| t.borrow_mut().forget(&n)).ok();
             }
         });
         move || stack(store)

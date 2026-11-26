@@ -79,7 +79,7 @@ fn modules() -> Vec<Module> {
                     label,
                     "Globals",
                     Globals,
-                    [size, origin, bases, to_canvas, to_canvas_t]
+                    [size, origin, bases, to_canvas, to_canvas_t, stop, grid]
                 );
             },
         });

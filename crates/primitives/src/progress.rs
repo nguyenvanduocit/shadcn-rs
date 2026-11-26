@@ -34,9 +34,10 @@ use gui::{Div, Role, ValueRange};
 
 gui::engine_local! {
     /// The places an invalid value or max was already reported from.
+    /// Reported live only (a fork is no live render), so a fork sees an
+    /// empty set of its own.
     #[expect(clippy::disallowed_types, reason = "diagnostics reported once per call site, per thread: no part's state")]
-    [Shared("diagnostics, reported once per call site: no frame's result reads them")]
-    static REPORTED: RefCell<HashSet<(&'static Location<'static>, bool)>> = RefCell::new(HashSet::new());
+    [Fresh] static REPORTED: RefCell<HashSet<(&'static Location<'static>, bool)>> = RefCell::new(HashSet::new());
 }
 
 /// The max a bar has unless told otherwise.
@@ -165,7 +166,8 @@ fn f64_to_i64(v: f64) -> i64 {
 }
 
 fn report(at: &'static Location<'static>, value: bool, message: &str) {
-    if REPORTED.with(|r| r.borrow_mut().insert((at, value))) {
+    // A report reaches the outside world: made by the live render only.
+    if !gui::engine::forking() && REPORTED.with(|r| r.borrow_mut().insert((at, value))) {
         eprintln!("primitives: {message} (at {at})");
     }
 }

@@ -16,6 +16,20 @@
 //! `LayerTreeFrameSink`, then a full commit). A panic that comes back three
 //! times in ten seconds is the scene's, not the GPU's: the app closes,
 //! saying why.
+//!
+//! **Input (ADR-0033).** Every input reaches the UI through this thread,
+//! as every input reaches Blink's main thread through the compositor
+//! thread (`widget_input_handler_manager.cc`): it applies the wheels and
+//! hands the rest on in the order it took them, each with what the
+//! compositor scrolled since the last hand-off ([`super::Outbox::pull`]).
+//! So the UI handles every input after what the wheels sent before it
+//! moved, and before what later ones move, with no cut, count or wait. It
+//! never blocks with input waiting: it waits for a vblank, a commit or a
+//! deadline on its channel, and asks the surface for a texture only once
+//! the frame presented last shows, when one is free ([`Self::wait_vsync`]).
+//! While it is made afresh after a panic, until its compositor can scroll
+//! again, input goes straight to the UI ([`Forwarding`]); a device made
+//! again leaves the compositor whole, and input goes through it all along.
 
 use std::collections::VecDeque;
 use std::panic::AssertUnwindSafe;
@@ -23,12 +37,13 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use super::{Commit, Compositor, MainFrame, Presented};
+use super::{Commit, Compositor, MainFrame, Pulled, Seen, input_log};
 use crate::clock::{self, Vsync};
 use crate::gpu::GpuRenderer;
 use crate::image::Pixels;
 use crate::scene::{Drawn, Held, Renderer, Scene};
 use crate::text::Glyphs;
+use crate::window::Input;
 
 /// What the render thread is told.
 pub(crate) enum ToRender {
@@ -39,23 +54,57 @@ pub(crate) enum ToRender {
     /// The UI has a frame to run: grant it a [`MainFrame`].
     NeedsFrame,
     /// The wheel at `point` (logical window pixels) moved `delta` at `at`:
-    /// a trackpad's (`precise`) is resampled, a notched wheel's applied.
-    /// `shown` is the frame on screen as it came: it is routed in that.
+    /// a trackpad's (`precise`) is resampled, a notched wheel's applied;
+    /// `phase` its place in the platform's gesture. `at` is when the OS
+    /// says it happened where it says so, else when it came. `shown` is
+    /// the frame on screen as it came: it is routed in that. `event`: the
+    /// platform's event it was made of, which an input log being recorded
+    /// writes ([`input_log::Route`]).
     Wheel {
         point: (f32, f32),
         delta: (f32, f32),
         at: Instant,
+        /// When the platform sent it: its hop is timed from here.
+        sent: Instant,
         precise: bool,
-        began: bool,
-        ended: bool,
-        shown: Arc<Presented>,
+        phase: super::WheelPhase,
+        shown: Seen,
+        event: Option<Box<input_log::Event>>,
+    },
+    /// Input for the UI (every input but the wheel goes through here, an
+    /// assistive technology's action too, ADR-0033), stamped `at` with the
+    /// frame `shown` as it came, and the platform's event it was made of:
+    /// handed on at once, in the order it came, with what the compositor
+    /// scrolled since the last hand-off. `sent`: when the platform sent it,
+    /// which its hop is timed from (`at` is when the event happened, which
+    /// an OS's stamp or a script's puts before the send).
+    Input {
+        input: Input,
+        at: Instant,
+        sent: Instant,
+        shown: Seen,
+        event: Option<Box<input_log::Event>>,
+    },
+    /// What the platform told the UI of its window (resized, focused,
+    /// shown, its decorations, a screen reader, closing), in one order with
+    /// the input ([`input_log::Told`], ADR-0033): what of it is the render
+    /// thread's own (a size, being seen) taken in, then handed on as input
+    /// is, logged as it is taken.
+    Told {
+        told: input_log::Told,
+        at: Instant,
+        shown: Seen,
+        event: Option<Box<input_log::Event>>,
     },
     /// The window is this many physical pixels now: its surface is
     /// configured to it at once, and shows the last frame at its own size
-    /// until the UI commits one laid out at the new size.
+    /// until the UI commits one laid out at the new size. Sent alone while
+    /// input goes straight to the UI ([`Forwarding`]); else with
+    /// [`Self::Told`].
     Resize((u32, u32)),
     /// The window is shown or hidden (occluded, minimized): hidden, nothing
-    /// is drawn; shown again, the next frame is presented.
+    /// is drawn; shown again, the next frame is presented. Sent alone as
+    /// [`Self::Resize`] is.
     Visible(bool),
     /// The OS asks for what the window shows again (it was exposed): the
     /// next frame presents it.
@@ -75,15 +124,57 @@ pub(crate) enum ToRender {
     FrameCallback(Instant),
     /// Read the last frame back, `overlay` over it.
     Capture(Option<Scene>, Sender<Option<Pixels>>),
+    /// The UI's wheel gesture, handed back as input came through the render
+    /// thread again ([`FromRender::Restored`]): the compositor's latch from
+    /// now on. The input that came meanwhile waited for it.
+    Latch(Option<super::HandedGesture>),
+    /// Another thread sent a value to the mailbox at this address: handed
+    /// on to the UI as input is, logged here, so the UI takes it in order
+    /// with the input and a replay where the log has it (ADR-0033).
+    Mail(crate::mailbox::Address),
     /// Fault injection (tests, the stress check): lose the GPU device as a
     /// driver reset would, or panic as a bug in the render thread would.
     LoseDevice,
+    /// Lose the device, and have no device answer for this long, as a GPU
+    /// still resetting (fault injection).
+    HoldLost(Duration),
     Panic,
+    /// Fault injection: panic when it next reaches `Stage` (diverting,
+    /// with a device being made on its helper thread, as it returns the
+    /// UI's latch), as a bug there would.
+    #[cfg(test)]
+    PanicAt(PanicStage),
+    /// Fling trackpad gestures after they end (`true`), or leave it to the
+    /// platform's momentum ([`super::Compositor::set_flings`]): what a log
+    /// recorded offscreen says its platform does.
+    Flings(bool),
     /// Nothing but a wake: the device was lost while the thread slept
     /// ([`crate::gpu::GpuRenderer::wake_on_lost`]), and it is to be made
     /// again and drawn.
     Wake,
     Quit,
+}
+
+/// A panic injected (fault injection: a bug in the render thread).
+fn injected_panic() -> ! {
+    #[expect(
+        clippy::panic,
+        reason = "fault injection: a bug in the render thread, recovered from"
+    )]
+    {
+        panic!("render thread: panic injected");
+    }
+}
+
+/// Where an injected panic goes off ([`ToRender::PanicAt`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanicStage {
+    /// As it diverts input (after a panic): under the switch's lock.
+    Divert,
+    /// While a device is being made on its helper thread.
+    Remake,
+    /// As it returns the UI's latch, between that and the restore.
+    Returned,
 }
 
 /// What the render thread tells the UI thread.
@@ -99,17 +190,69 @@ pub(crate) enum FromRender {
     Failed(String),
     /// A commit applied, emptied: the UI's next frame writes into it.
     Spare(Box<Commit>),
-    /// A wheel event over a wheel handler, its place in its gesture
-    /// (`step`), `delta` as the UI's `Input::WheelAt` takes it, and the
-    /// frame shown as it came: the UI routes it from there, and may
-    /// consume it.
+    /// A wheel event over a wheel handler, as the UI's input
+    /// ([`super::Compositor::dispatch_wheel`]: its place in its gesture,
+    /// its delta, the node it was over), and the frame shown as it came:
+    /// the UI routes it from there, and may consume it.
     Wheel {
-        step: super::WheelStep,
-        delta: (f32, f32),
-        shown: Arc<Presented>,
-        /// The node it was over in that frame.
-        target: Option<super::HitTarget>,
+        input: Input,
+        shown: Seen,
+        /// What the compositor scrolled since the last hand-off: the UI
+        /// takes it in first (ADR-0033).
+        pulled: Pulled,
     },
+    /// Input the platform sent ([`ToRender::Input`]), handed on in the
+    /// order it came, with what the compositor scrolled since the last
+    /// hand-off: the UI takes that in, then handles it (ADR-0033).
+    Input {
+        input: Input,
+        at: Instant,
+        /// When the platform sent it ([`ToRender::Input`]): the hop's start.
+        sent: Instant,
+        shown: Seen,
+        pulled: Pulled,
+    },
+    /// What the platform told of its window ([`ToRender::Told`]), handed on
+    /// as input is.
+    Told {
+        told: input_log::Told,
+        pulled: Pulled,
+    },
+    /// A value for the mailbox at `at` ([`ToRender::Mail`]), handed on as
+    /// input is.
+    Mail {
+        at: crate::mailbox::Address,
+        pulled: Pulled,
+    },
+    /// Input stops going through the render thread ([`Forwarding`]): what
+    /// the compositor scrolled and had not handed on (its gesture's
+    /// resampling settled first), so the UI has it before any input sent
+    /// after; and the wheel gesture under way where the compositor latched
+    /// it to a container, which the UI's latch takes on, so the rest of
+    /// that gesture scrolls the same container (ADR-0033).
+    Diverted {
+        pulled: Pulled,
+        gesture: Option<super::HandedGesture>,
+        /// The UI's own latch is on its way to the render thread (it was
+        /// handed back as input came through, [`Self::Restored`]): it
+        /// comes back ([`Self::Returned`]), and the UI holds its input
+        /// until then.
+        returning: bool,
+    },
+    /// The UI's latch, which reached the render thread after the route
+    /// was diverted again, back to the UI ([`Self::Diverted`]'s
+    /// `returning`): one side holds a gesture at a time, and none routes
+    /// with it in flight.
+    Returned(Option<super::HandedGesture>),
+    /// Input comes through the render thread again, from after the input
+    /// sent straight before this: the UI hands its wheel gesture back
+    /// ([`ToRender::Latch`]) and latches none it hands, so one side holds
+    /// a gesture's latch at a time (ADR-0033).
+    Restored,
+    /// The timeline has frames the UI has not looked at: it reads them
+    /// there ([`super::OnScreen::look`]). Sent once until it looks, so a
+    /// stalled UI holds one message and no frame.
+    Presented,
 }
 
 /// What the renderer did with a commit, for the UI's reports.
@@ -179,6 +322,67 @@ impl FrameCallbacks for winit::window::Window {
     }
 }
 
+/// Where the platform sends input (ADR-0033): to the render thread, which
+/// hands it on, while it serves; straight to the UI while it cannot (made
+/// afresh after a panic, or its device made again). The switch is made
+/// under the lock every send is, with what the render thread holds handed
+/// on first ([`RenderThread::divert`]), so no input overtakes another:
+/// the UI handles them in the platform's order either way. The input log
+/// is written under the same lock ([`input_log::Route`]), by whichever
+/// path takes the input, so it is in that order too (Opus r10 P1).
+#[derive(Debug)]
+pub(crate) struct Forwarding(Mutex<input_log::Route>);
+
+impl Forwarding {
+    /// Input goes through the render thread.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(input_log::Route::new())))
+    }
+    /// Run `send` with the route as it is now (whether input goes through
+    /// the render thread, and the log), under the lock: no switch falls
+    /// between the choice and the send.
+    pub(crate) fn send<R>(&self, send: impl FnOnce(&mut input_log::Route) -> R) -> R {
+        send(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// Input goes straight to the UI from now on; `hand_on` runs first,
+    /// under the lock, so what the render thread held reaches the UI before
+    /// anything sent straight.
+    fn divert(&self, at: Instant, hand_on: impl FnOnce(&mut input_log::Route)) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .divert(at, hand_on);
+    }
+
+    /// Input goes through the render thread again; `tell` runs under the
+    /// lock, after everything sent straight. Whether a wheel went to the
+    /// UI while diverted ([`input_log::Route::took_wheel`]).
+    fn restore(&self, tell: impl FnOnce()) -> bool {
+        let mut route = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if !route.through {
+            tell();
+        }
+        route.restore()
+    }
+}
+
+/// What of what the platform told is the render thread's own: the size its
+/// surface is configured to, and whether the window can be seen.
+pub(crate) fn own_part(told: &input_log::Told) -> Option<ToRender> {
+    match told {
+        input_log::Told::Resized { size, .. } => Some(ToRender::Resize(*size)),
+        input_log::Told::Visible(v) => Some(ToRender::Visible(*v)),
+        _ => None,
+    }
+}
+
+/// How long before the vblank the frame presented last shows at an
+/// acquire is made where the display says nothing of its own phase: it
+/// blocks that long, a sample of the phase ([`Vsync::acquired`]), and input
+/// waits no longer than that and the fit's error (ADR-0033).
+const ACQUIRE_PROBE: Duration = Duration::from_micros(1_500);
+
 /// How many frames in a row may present nothing on Wayland before one
 /// presents anyway: a frame callback is asked for only with a present
 /// (winit commits no surface without one), and a hidden window is known
@@ -197,8 +401,6 @@ pub(crate) struct RenderThread {
     gpu: GpuRenderer,
     rx: Receiver<ToRender>,
     to_ui: Box<dyn Fn(FromRender) + Send>,
-    /// What the platform thread stamps input with.
-    presented: Arc<Mutex<Arc<Presented>>>,
     /// The output the window is on, in its mode: its vsync and every
     /// vblank a frame was drawn or granted for, made afresh as one.
     timing: Timing,
@@ -220,6 +422,32 @@ pub(crate) struct RenderThread {
     /// nothing is tried until it is shown or exposed, or this time comes
     /// (a slow probe, which is no frame).
     occluded_until: Option<Instant>,
+    /// A lost device no device answered for yet: asked again at this time,
+    /// what comes meanwhile taken in (input scrolled, handed on).
+    device_retry: Option<Instant>,
+    /// Input came through it again and the UI's gesture is not back yet
+    /// ([`Self::restore`]): the input that comes meanwhile waits in
+    /// `waiting`, in its order.
+    awaiting_latch: bool,
+    waiting: VecDeque<ToRender>,
+    /// Diverted again while the UI's latch was on its way here: it is
+    /// returned to the UI as it comes ([`FromRender::Returned`]), and a
+    /// restore due meanwhile waits for that (`restore_due`).
+    latch_out: bool,
+    restore_due: bool,
+    /// Fault injection: no device answers until then ([`ToRender::HoldLost`]).
+    no_device_until: Option<Instant>,
+    /// Fault injection: panic when it next reaches this ([`ToRender::PanicAt`]).
+    panic_at: Option<PanicStage>,
+    /// A device being made on a thread of its own ([`Self::ensure_device`]),
+    /// the wait before the next attempt after one failed, and whether the
+    /// loss was told (once).
+    remaking: Option<Receiver<Result<crate::gpu::Remade, crate::gpu::GpuError>>>,
+    backoff: Duration,
+    told_lost: bool,
+    /// A device was made again and taken, and no frame drew on it yet
+    /// ([`Frame::renewed`]): taken in [`Self::step`], before the frame.
+    renewed: bool,
     /// The size the window was last told to be, not yet configured: only
     /// the last of a drag's resizes configures the surface.
     resize_to: Option<(u32, u32)>,
@@ -252,6 +480,12 @@ pub(crate) struct RenderThread {
     awaiting_full: bool,
     /// When it recovered from a panic, the last few times.
     recoveries: VecDeque<Instant>,
+    /// Where the platform sends input: switched while it cannot serve
+    /// ([`Forwarding`]); none in tests that send it all.
+    forwarding: Option<Arc<Forwarding>>,
+    /// What came before input was diverted and is not input, taken in
+    /// before anything on the channel once it serves again.
+    deferred: VecDeque<ToRender>,
 }
 
 /// What the render thread times its frames by on the output the window is
@@ -366,21 +600,23 @@ const PRESENT_MARGIN: Duration = Duration::from_millis(1);
 /// Slack over the worst recent cost.
 const DRAW_SLACK: Duration = Duration::from_millis(1);
 /// More panics than this within [`RECOVERY_WINDOW`] and it gives up.
-const MAX_RECOVERIES: usize = 3;
+pub(crate) const MAX_RECOVERIES: usize = 3;
 const RECOVERY_WINDOW: Duration = Duration::from_secs(10);
 /// How long to wait before asking again for a device that did not answer
-/// (a GPU still resetting), and how many times to ask.
+/// (a GPU still resetting), at first.
 const REBUILD_RETRY: Duration = Duration::from_millis(100);
-const REBUILD_TRIES: u32 = 50;
+/// The longest wait between two attempts at a lost device, backed off.
+const REBUILD_MAX: Duration = Duration::from_secs(5);
+/// How often a device being made is looked for, the thread meanwhile
+/// asleep on its channel.
+const REMAKE_POLL: Duration = Duration::from_millis(4);
 
 impl RenderThread {
-    #[expect(clippy::too_many_arguments, reason = "everything the thread owns, handed over once")]
     pub(crate) fn new(
         compositor: Compositor,
         gpu: GpuRenderer,
         rx: Receiver<ToRender>,
         to_ui: Box<dyn Fn(FromRender) + Send>,
-        presented: Arc<Mutex<Arc<Presented>>>,
         interval: Duration,
         pace: Pace,
         log: Option<Arc<Mutex<Vec<FrameStat>>>>,
@@ -390,7 +626,6 @@ impl RenderThread {
             gpu,
             rx,
             to_ui,
-            presented,
             timing: Timing::of(Vsync::new(interval), None),
             pace,
             wants: false,
@@ -400,6 +635,17 @@ impl RenderThread {
             retry: false,
             visible: true,
             occluded_until: None,
+            device_retry: None,
+            awaiting_latch: false,
+            latch_out: false,
+            restore_due: false,
+            waiting: VecDeque::new(),
+            no_device_until: None,
+            panic_at: None,
+            remaking: None,
+            backoff: REBUILD_RETRY,
+            told_lost: false,
+            renewed: false,
             resize_to: None,
             called_back: true,
             callback_at: None,
@@ -415,84 +661,417 @@ impl RenderThread {
             costs: VecDeque::new(),
             awaiting_full: false,
             recoveries: VecDeque::new(),
+            forwarding: None,
+            deferred: VecDeque::new(),
+        }
+    }
+
+    /// Input reaches it through `forwarding`, which it switches while it
+    /// cannot serve.
+    pub(crate) fn forwarding(mut self, forwarding: Arc<Forwarding>) -> Self {
+        self.forwarding = Some(forwarding);
+        self
+    }
+
+    /// The next message: one deferred first, then what the channel has,
+    /// waiting until `until` (none: for as long as it takes).
+    fn next(&mut self, until: Option<Instant>) -> Result<ToRender, RecvTimeoutError> {
+        if let Some(m) = self.deferred.pop_front() {
+            return Ok(m);
+        }
+        match until {
+            Some(t) => self.rx.recv_timeout(t.saturating_duration_since(Instant::now())),
+            None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        }
+    }
+
+    /// The next message there is now, deferred first.
+    fn next_now(&mut self) -> Option<ToRender> {
+        self.deferred.pop_front().or_else(|| self.rx.try_recv().ok())
+    }
+
+    /// Take in what comes until `until`: `false` when told to quit.
+    fn wait_until(&mut self, until: Instant) -> bool {
+        loop {
+            match self.next(Some(until)) {
+                Ok(msg) => {
+                    if !self.handle(msg) {
+                        return false;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => return true,
+                Err(RecvTimeoutError::Disconnected) => return false,
+            }
+        }
+    }
+
+    /// Input goes straight to the UI from now on ([`Forwarding`]): what the
+    /// compositor scrolled and had not handed on goes first, then the input
+    /// waiting on the channel, in its order; what else waits is kept for
+    /// when it serves again. All under the switch's lock, so nothing sent
+    /// straight overtakes it.
+    pub(crate) fn divert(&mut self) {
+        let Some(f) = self.forwarding.clone() else { return };
+        // What it held is settled to now, the time the log's `diverted`
+        // has, so a replay settles it to the same.
+        let now = clock::current_nanos();
+        f.divert(clock::instant_of(now), |route| {
+            // Fault injection: a panic as it begins to divert, under the
+            // switch's lock, nothing handed on yet.
+            if self.panic_at == Some(PanicStage::Divert) {
+                self.panic_at = None;
+                injected_panic();
+            }
+            // What it accepted is handed on whole (Codex r11 1): the
+            // displacement its gesture's resampling held goes into the
+            // outbox, then all of it to the UI, with the gesture's latch.
+            // After a panic the compositor may be half way through a
+            // change: what it holds is taken only if that takes.
+            let (pulled, gesture) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.compositor.settle_gesture(now);
+                (self.compositor.pull(), self.compositor.hand_gesture())
+            }))
+            .unwrap_or_default();
+            // The UI's latch on its way here (input came through again,
+            // and its gesture is not back yet): it goes back to the UI as
+            // it comes, and the UI holds its input until then, so no
+            // wheel it takes meanwhile is routed with no latch.
+            let returning = self.awaiting_latch;
+            self.latch_out |= returning;
+            if !pulled.is_empty() || gesture.is_some() || returning {
+                (self.to_ui)(FromRender::Diverted {
+                    pulled,
+                    gesture,
+                    returning,
+                });
+            }
+            // Each taken here is logged here, as it is handed on: what
+            // waited and went back on the queue as the latch came
+            // (the oldest), then what still waits for it, then the
+            // channel: every input not yet handed on, in its order (the
+            // fault matrix: input left on the queue went to the
+            // compositor made afresh, a wheel into no scene).
+            self.awaiting_latch = false;
+            let (queued, kept): (VecDeque<ToRender>, VecDeque<ToRender>) =
+                std::mem::take(&mut self.deferred).into_iter().partition(|m| {
+                    matches!(
+                        m,
+                        ToRender::Input { .. } | ToRender::Wheel { .. } | ToRender::Told { .. } | ToRender::Mail(_)
+                    )
+                });
+            self.deferred = kept;
+            let waiting = std::mem::take(&mut self.waiting);
+            for msg in queued
+                .into_iter()
+                .chain(waiting)
+                .chain(std::iter::from_fn(|| self.rx.try_recv().ok()))
+            {
+                match msg {
+                    ToRender::Input {
+                        input,
+                        at,
+                        sent,
+                        shown,
+                        event,
+                    } => {
+                        if let Some(e) = &event {
+                            route.record(at, e, shown);
+                        }
+                        (self.to_ui)(FromRender::Input {
+                            input,
+                            at,
+                            sent,
+                            shown,
+                            pulled: Pulled::default(),
+                        });
+                    }
+                    // The UI scrolls it, in order with the rest.
+                    ToRender::Wheel {
+                        point,
+                        delta,
+                        at,
+                        sent,
+                        precise,
+                        phase,
+                        shown,
+                        event,
+                    } => {
+                        if let Some(e) = &event {
+                            route.record(at, e, shown);
+                        }
+                        route.took_wheel(precise, phase);
+                        (self.to_ui)(FromRender::Input {
+                            input: Input::diverted_wheel(point, delta, at, precise, phase),
+                            at,
+                            sent,
+                            shown,
+                            pulled: Pulled::default(),
+                        });
+                    }
+                    // The UI's part handed on in order; the thread's own
+                    // kept for when it serves again.
+                    ToRender::Told { told, at, shown, event } => {
+                        if let Some(e) = &event {
+                            route.record(at, e, shown);
+                        }
+                        if let Some(own) = own_part(&told) {
+                            self.deferred.push_back(own);
+                        }
+                        (self.to_ui)(FromRender::Told {
+                            told,
+                            pulled: Pulled::default(),
+                        });
+                    }
+                    ToRender::Mail(at) => {
+                        route.observe(input_log::Observation::Mail(at.site, at.nth));
+                        (self.to_ui)(FromRender::Mail {
+                            at,
+                            pulled: Pulled::default(),
+                        });
+                    }
+                    // The UI's latch, on its way here as it diverts: back
+                    // to the UI at once, before the input after it, with
+                    // no device and no recovery waited for (Opus r13 I2).
+                    ToRender::Latch(gesture) if self.latch_out => {
+                        self.latch_out = false;
+                        (self.to_ui)(FromRender::Returned(
+                            gesture.filter(|g| !g.1).map(|g| super::HandedGesture(g.0, false, g.2)),
+                        ));
+                    }
+                    other => self.deferred.push_back(other),
+                }
+            }
+        });
+    }
+
+    /// Input goes through it again: the UI is told so under the switch's
+    /// lock, after everything sent it straight, and hands its gesture back
+    /// ([`ToRender::Latch`]); the input that comes until then waits for
+    /// it, so no wheel is routed past the gesture's latch (Codex r12 1).
+    fn restore(&mut self) {
+        // The UI's latch is still on its way back to it: input comes
+        // through again once it is there, one latch in flight at a time.
+        if self.latch_out {
+            self.restore_due = true;
+            return;
+        }
+        let Some(f) = self.forwarding.clone() else { return };
+        // A wheel the UI took meanwhile stops a fling handed on, as a new
+        // gesture stops it in the compositor (ADR-0033, "Accepted motion").
+        if f.restore(|| (self.to_ui)(FromRender::Restored)) {
+            self.compositor.stop_fling();
+        }
+        self.awaiting_latch = true;
+    }
+
+    /// While no frame is drawn (no device, the window hidden), no tick
+    /// moves a gesture on: what its resampling holds and its fling are
+    /// applied whole before input or a frame is handed on, so the UI has
+    /// all the compositor accepted (Opus r12 P2). Logged, for a replay to
+    /// do the same there.
+    fn settle_undrawn(&mut self) {
+        let undrawn = self.gpu.lost() || !self.visible || self.occluded_until.is_some();
+        if undrawn && self.compositor.gesture_moving() {
+            // Logged with the time it settled to, which a replay settles to.
+            let now = clock::current_nanos();
+            self.compositor.settle_gesture(now);
+            if let Some(f) = &self.forwarding {
+                f.send(|route| route.observe_at(clock::instant_of(now), input_log::Observation::Settled));
+            }
+        }
+    }
+
+    /// Write `event`, taken at `at` and routed in `shown`, to the input
+    /// log being recorded.
+    fn record(&self, at: Instant, event: Option<Box<input_log::Event>>, shown: Seen) {
+        if let (Some(f), Some(e)) = (&self.forwarding, event) {
+            f.send(|route| route.record(at, &e, shown));
+        }
+    }
+
+    /// Write what it did now to the input log being recorded.
+    fn observe(&self, what: input_log::Observation) {
+        if let Some(f) = &self.forwarding {
+            f.send(|route| route.observe(what));
         }
     }
 
     /// Run until told to quit or the UI thread goes away, starting afresh
     /// after a panic (ADR-0015's invariant 7).
+    ///
+    /// The whole body is under the one catch (Codex r13, Opus r13): a
+    /// panic while it diverts or recovers (made afresh, the compositor and
+    /// its glyphs) is a panic like any, counted, and past the last
+    /// recovery the thread stops with the UI the one owner of input,
+    /// diverted for good ([`FromRender::Failed`]). Input goes straight to
+    /// the UI until its compositor can scroll again: made afresh, it holds
+    /// no scroll container until the UI's full commit, and a wheel it took
+    /// meanwhile would scroll nothing (Codex r10 1, Opus r10 I1). That
+    /// commit restores it.
     pub(crate) fn run(mut self) {
+        let mut recovering = false;
         loop {
-            match std::panic::catch_unwind(AssertUnwindSafe(|| self.serve())) {
-                Ok(()) => return,
-                Err(_) => {
-                    if let Err(why) = self.recover() {
-                        (self.to_ui)(FromRender::Failed(why));
-                        return;
-                    }
+            let ran = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                if recovering {
+                    self.divert();
+                    self.recover();
                 }
+                self.serve();
+            }));
+            if ran.is_ok() {
+                return;
             }
+            recovering = true;
+            let now = Instant::now();
+            self.recoveries
+                .retain(|t| now.saturating_duration_since(*t) < RECOVERY_WINDOW);
+            if self.recoveries.len() >= MAX_RECOVERIES {
+                self.fail(format!(
+                    "it panicked {} times in {} s",
+                    MAX_RECOVERIES.saturating_add(1),
+                    RECOVERY_WINDOW.as_secs()
+                ));
+                return;
+            }
+            self.recoveries.push_back(now);
         }
     }
 
-    /// Start afresh after a panic: a new device on the same surface, an
-    /// empty compositor, and a full commit asked of the UI. Nothing is drawn
-    /// until it comes, so the window keeps its last frame meanwhile.
-    fn recover(&mut self) -> Result<(), String> {
-        let now = Instant::now();
-        self.recoveries
-            .retain(|t| now.saturating_duration_since(*t) < RECOVERY_WINDOW);
-        if self.recoveries.len() >= MAX_RECOVERIES {
-            return Err(format!(
-                "the render thread panicked {} times in {} s; giving up",
-                MAX_RECOVERIES.saturating_add(1),
-                RECOVERY_WINDOW.as_secs()
-            ));
+    /// Give up past the last recovery: input goes straight to the UI for
+    /// good, what the thread holds of it handed on first, and the UI is
+    /// told. Under its own catch: a panic here still leaves the route
+    /// diverted, which the switch's lock guarantees by itself.
+    fn fail(&mut self, why: String) {
+        let diverted = std::panic::catch_unwind(AssertUnwindSafe(|| self.divert()));
+        if diverted.is_err()
+            && let Some(f) = &self.forwarding
+        {
+            f.divert(Instant::now(), |_| {});
         }
-        self.recoveries.push_back(now);
-        self.compositor = Compositor::new(Glyphs::for_os());
-        let mut tries = 0_u32;
-        loop {
-            let made = std::panic::catch_unwind(AssertUnwindSafe(|| self.gpu.rebuild()));
-            match made {
-                Ok(Ok(())) => break,
-                Ok(Err(e)) if tries < REBUILD_TRIES => {
-                    tries = tries.saturating_add(1);
-                    eprintln!("render thread: no device yet ({e}); trying again");
-                    std::thread::sleep(REBUILD_RETRY);
-                }
-                Ok(Err(e)) => return Err(format!("the render thread lost its device and got no other: {e}")),
-                Err(_) => return Err("the render thread panicked making its device again".to_owned()),
-            }
-        }
+        (self.to_ui)(FromRender::Failed(why));
+    }
+
+    /// Start afresh after a panic: an empty compositor going on with what
+    /// the one before accepted, a new device, and a full commit asked of
+    /// the UI. Nothing blocks (Opus r13 I2): the device is marked lost and
+    /// made on a thread of its own as any lost one is
+    /// ([`Self::ensure_device`]), the thread serving its channel meanwhile
+    /// (the UI's latch, input); nothing is drawn until the device and the
+    /// commit come, so the window keeps its last frame meanwhile.
+    fn recover(&mut self) {
+        // The window still shows what was presented: the timeline goes on,
+        // and so does what the compositor accepted of input (ADR-0033,
+        // [`Accepted`]).
+        let old = std::mem::replace(&mut self.compositor, Compositor::new(Glyphs::for_os()));
+        let (timeline, accepted) = old.into_accepted();
+        self.compositor = Compositor::after(Glyphs::for_os(), timeline, accepted);
+        // What the panic left of the renderer is not trusted: made again.
+        self.gpu.lose();
+        self.remaking = None;
+        self.device_retry = None;
         self.owed = None;
         self.granted = None;
         self.applied = None;
         self.dirty = false;
         self.retry = false;
         self.awaiting_full = true;
+        // The full commit restores input; a restore due before is that one.
+        self.restore_due = false;
         // A main frame for the full commit.
         self.wants = true;
         (self.to_ui)(FromRender::Lost);
-        Ok(())
     }
 
-    /// A lost device made again, the committed scene to be drawn whole;
-    /// `false` when no device answered yet (tried again next frame).
+    /// Whether it has a device: a lost one is made again, the committed
+    /// scene to be drawn whole. Never blocks: the device is made on a
+    /// thread of its own ([`crate::gpu::Remake`], Codex r12 2: making one
+    /// takes hundreds of milliseconds, and this thread hands every input
+    /// on), and taken here once made; `false` until then. An attempt that
+    /// fails is tried again after a back-off doubling from
+    /// [`REBUILD_RETRY`] to [`REBUILD_MAX`], told once, and none is made
+    /// while the window cannot be seen (Opus r12 P1).
+    ///
+    /// Input keeps going through it all along (Opus r11 I3): its
+    /// compositor keeps its tables, its gesture and its latch, and scrolls
+    /// without a device; only drawing waits for one. Diverting would hand
+    /// the UI wheels to route afresh, off the gesture's latch.
     fn ensure_device(&mut self) -> bool {
         if !self.gpu.lost() {
             return true;
         }
-        match self.gpu.rebuild() {
-            Ok(()) => {
-                self.dirty = true;
-                true
-            }
-            Err(e) => {
-                eprintln!("render thread: the device was lost and none answers yet ({e})");
-                std::thread::sleep(REBUILD_RETRY);
-                false
+        let now = Instant::now();
+        if let Some(rx) = &self.remaking {
+            let made = match rx.try_recv() {
+                Ok(made) => made,
+                // Fault injection: a panic while the device is being made.
+                Err(std::sync::mpsc::TryRecvError::Empty) if self.panic_at == Some(PanicStage::Remake) => {
+                    self.panic_at = None;
+                    injected_panic();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(crate::gpu::GpuError("making the device panicked".to_owned()))
+                }
+            };
+            self.remaking = None;
+            match made.and_then(|m| self.gpu.take_made(m)) {
+                Ok(old) => {
+                    // The lost renderer is let go of off this thread:
+                    // freeing its device takes milliseconds. No thread,
+                    // and it goes here.
+                    std::thread::Builder::new()
+                        .name("gui device".to_owned())
+                        .spawn(move || drop(old))
+                        .ok();
+                    self.renewed = true;
+                    self.dirty = true;
+                    // The lost device's last present never calls back:
+                    // the new one has none made, so none is waited for
+                    // (the fault matrix: a device lost after a present
+                    // drew nothing again).
+                    self.called_back = true;
+                    self.device_retry = None;
+                    self.backoff = REBUILD_RETRY;
+                    if std::mem::take(&mut self.told_lost) {
+                        eprintln!("render thread: a device answers again");
+                    }
+                    return true;
+                }
+                Err(e) => {
+                    if !std::mem::replace(&mut self.told_lost, true) {
+                        eprintln!("render thread: the device was lost and none answers yet ({e}); trying again");
+                    }
+                    self.device_retry = now.checked_add(self.backoff);
+                    self.backoff = self.backoff.saturating_mul(2).min(REBUILD_MAX);
+                    return false;
+                }
             }
         }
+        // Another attempt when due, while the window can be seen.
+        if self.device_retry.is_some_and(|t| t > now) || !self.visible {
+            return false;
+        }
+        self.device_retry = None;
+        let remake = self.gpu.remake();
+        let refused = self.no_device_until.is_some_and(|t| t > now);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("gui device".to_owned())
+            .spawn(move || {
+                let made = if refused {
+                    Err(crate::gpu::GpuError("no device answers (held lost)".to_owned()))
+                } else {
+                    remake.make()
+                };
+                tx.send(made).ok();
+            });
+        // No thread: an attempt that failed.
+        if spawned.is_ok() {
+            self.remaking = Some(rx);
+        } else {
+            self.device_retry = now.checked_add(self.backoff);
+        }
+        false
     }
 
     /// The thread's loop, until told to quit or the UI thread goes away.
@@ -505,26 +1084,33 @@ impl RenderThread {
     /// quit.
     fn step(&mut self) -> bool {
         // Sleep on the channel unless something is to be drawn; an
-        // occluded window until its slow probe.
-        let occluded = self.occluded_until.filter(|t| *t > Instant::now());
+        // occluded window until its slow probe, a lost device that no
+        // device answered for until it is asked again.
+        let now = Instant::now();
+        let occluded = self.occluded_until.filter(|t| *t > now);
         if occluded.is_none() {
             self.occluded_until = None;
         }
-        let asleep = !self.busy() || !self.visible || !self.called_back || occluded.is_some();
+        // A lost device: one being made is looked for, another tried
+        // when due; neither blocks (Codex r12 2). Paused while hidden.
+        let lost = !self.ensure_device();
+        let retry = if !lost {
+            None
+        } else if self.remaking.is_some() {
+            now.checked_add(REMAKE_POLL)
+        } else {
+            self.device_retry
+        };
+        let paused = occluded.into_iter().chain(retry).min();
+        let asleep = !self.busy() || !self.visible || !self.called_back || paused.is_some();
         if asleep {
             if let Some(ticks) = &self.timing.ticks {
                 ticks.run(false);
             }
-            let msg = match occluded {
-                Some(t) => match self.rx.recv_timeout(t.saturating_duration_since(Instant::now())) {
-                    Ok(msg) => Some(msg),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return false,
-                },
-                None => match self.rx.recv() {
-                    Ok(msg) => Some(msg),
-                    Err(_) => return false,
-                },
+            let msg = match self.next(paused) {
+                Ok(msg) => Some(msg),
+                Err(RecvTimeoutError::Timeout) => None,
+                Err(RecvTimeoutError::Disconnected) => return false,
             };
             if let Some(msg) = msg
                 && !self.handle(msg)
@@ -532,7 +1118,7 @@ impl RenderThread {
                 return false;
             }
         }
-        while let Ok(msg) = self.rx.try_recv() {
+        while let Some(msg) = self.next_now() {
             if !self.handle(msg) {
                 return false;
             }
@@ -543,7 +1129,7 @@ impl RenderThread {
             self.take_tick();
             self.grant_now();
         }
-        let hidden = self.occluded_until.is_some();
+        let hidden = self.occluded_until.is_some() || self.gpu.lost();
         !(self.busy() && self.visible && self.called_back && !hidden) || self.frame()
     }
 
@@ -590,7 +1176,7 @@ impl RenderThread {
     /// `dirty`, and the device is still to be made again and drawn whole
     /// before the thread sleeps.
     fn busy(&self) -> bool {
-        let now = clock::seconds(Instant::now());
+        let now = Instant::now();
         self.dirty
             || self.retry
             || self.gpu.lost()
@@ -601,7 +1187,46 @@ impl RenderThread {
 
     /// Take in one message; `false` to quit.
     pub(super) fn handle(&mut self, msg: ToRender) -> bool {
+        // Input waits for the UI's gesture as the route comes back to it,
+        // in its order (Codex r12 1).
+        if self.awaiting_latch
+            && matches!(
+                msg,
+                ToRender::Input { .. } | ToRender::Wheel { .. } | ToRender::Told { .. } | ToRender::Mail(_)
+            )
+        {
+            self.waiting.push_back(msg);
+            return true;
+        }
         match msg {
+            // Diverted again before it came: the UI's still, returned to
+            // it, which holds its input until then; and only then may
+            // input come through again.
+            ToRender::Latch(gesture) if !self.awaiting_latch => {
+                self.latch_out = false;
+                (self.to_ui)(FromRender::Returned(
+                    gesture.filter(|g| !g.1).map(|g| super::HandedGesture(g.0, false, g.2)),
+                ));
+                // Fault injection: a panic between the latch returned and
+                // input restored.
+                if self.panic_at == Some(PanicStage::Returned) {
+                    self.panic_at = None;
+                    injected_panic();
+                }
+                if std::mem::take(&mut self.restore_due) {
+                    self.restore();
+                }
+            }
+            ToRender::Latch(gesture) => {
+                if let Some(g) = gesture {
+                    self.compositor.take_gesture(g);
+                }
+                self.awaiting_latch = false;
+                // What waited goes first, in its order.
+                while let Some(m) = self.waiting.pop_back() {
+                    self.deferred.push_front(m);
+                }
+            }
             ToRender::Commit(mut commit, overlay) => {
                 if self.owed.is_some_and(|(seq, _)| seq <= commit.answers) {
                     self.owed = None;
@@ -615,56 +1240,111 @@ impl RenderThread {
                     }
                 }
                 if self.awaiting_full && !commit.full {
-                    // A delta against what a panic dropped.
+                    // A delta against what a panic dropped: aborted. What
+                    // the UI took for it stays kept, and the full commit
+                    // carries it (ADR-0032, I4).
                     commit.clear();
+                    self.observe(input_log::Observation::Aborted);
                     (self.to_ui)(FromRender::Spare(commit));
                     return true;
                 }
-                self.awaiting_full = false;
+                let recovered = std::mem::replace(&mut self.awaiting_full, false);
                 self.applied = Some(commit.sequence);
+                if let Some(f) = &self.forwarding {
+                    f.send(|route| {
+                        route.committed = true;
+                        route.observe(input_log::Observation::Committed);
+                    });
+                }
                 self.compositor.apply(&mut commit);
                 (self.to_ui)(FromRender::Spare(commit));
                 self.compositor.set_overlay(overlay);
                 self.dirty = true;
+                if recovered {
+                    // Its tables are whole again: it can scroll what the
+                    // UI shows, so input comes through it again.
+                    self.restore();
+                }
             }
             ToRender::Overlay(o) => {
                 self.compositor.set_overlay(o);
                 self.dirty = true;
             }
             ToRender::NeedsFrame => self.wants = true,
+            // Handed on at once, after what every wheel taken before it
+            // moved, before what any later one moves (ADR-0033).
+            ToRender::Input {
+                input,
+                at,
+                sent,
+                shown,
+                event,
+            } => {
+                self.settle_undrawn();
+                self.record(at, event, shown);
+                let pulled = self.compositor.pull();
+                (self.to_ui)(FromRender::Input {
+                    input,
+                    at,
+                    sent,
+                    shown,
+                    pulled,
+                });
+            }
             ToRender::Wheel {
                 point,
                 delta,
                 at,
+                sent: _,
                 precise,
-                began,
-                ended,
+                phase,
                 shown,
+                event,
             } => {
+                self.record(at, event, shown);
                 let w = super::WheelInput {
                     point,
                     delta,
-                    at: clock::seconds(at),
+                    time: clock::nanos(at),
                     precise,
-                    began,
-                    ended,
-                    seen: shown.frame,
+                    phase,
+                    seen: shown,
                 };
-                let wheeled = self.compositor.wheel_input(w);
-                if let super::Wheeled::Ui(target) = wheeled {
-                    (self.to_ui)(FromRender::Wheel {
-                        step: w.step(),
-                        delta,
-                        shown,
-                        target,
-                    });
-                    return true;
+                match self.compositor.dispatch_wheel(w) {
+                    super::Dispatched::Ui(input) => {
+                        // Handed on as input is.
+                        let pulled = self.compositor.pull();
+                        (self.to_ui)(FromRender::Wheel { input, shown, pulled });
+                        return true;
+                    }
+                    super::Dispatched::Scrolled => {
+                        self.dirty = true;
+                        // The UI takes the scroll in with its next frame.
+                        self.wants = true;
+                    }
+                    super::Dispatched::Nothing => {}
                 }
-                if wheeled == super::Wheeled::Scrolled {
-                    self.dirty = true;
-                    // The UI takes the scroll in with its next frame.
-                    self.wants = true;
+            }
+            // Its own part taken in, then handed on as input is, after
+            // what the wheels taken before it moved.
+            ToRender::Told { told, at, shown, event } => {
+                self.settle_undrawn();
+                self.record(at, event, shown);
+                if let Some(own) = own_part(&told)
+                    && !self.handle(own)
+                {
+                    return false;
                 }
+                let pulled = self.compositor.pull();
+                (self.to_ui)(FromRender::Told { told, pulled });
+            }
+            // Handed on as input is, after what the wheels taken before
+            // it moved, and logged where it is taken.
+            ToRender::Mail(at) => {
+                self.settle_undrawn();
+                self.observe(input_log::Observation::Mail(at.site, at.nth));
+                let pulled = self.compositor.pull();
+                (self.to_ui)(FromRender::Mail { at, pulled });
             }
             // Configured by the next frame, with only the last of those
             // that came meanwhile.
@@ -704,17 +1384,16 @@ impl RenderThread {
             }
             // Made again by the next frame, which `busy` asks for.
             ToRender::LoseDevice => self.gpu.lose(),
+            ToRender::HoldLost(d) => {
+                self.no_device_until = Instant::now().checked_add(d);
+                self.gpu.lose();
+            }
             // Woken: `busy` reads the loss off the device.
             ToRender::Wake => {}
-            ToRender::Panic => {
-                #[expect(
-                    clippy::panic,
-                    reason = "fault injection: a bug in the render thread, recovered from"
-                )]
-                {
-                    panic!("render thread: panic injected");
-                }
-            }
+            ToRender::Panic => injected_panic(),
+            #[cfg(test)]
+            ToRender::PanicAt(stage) => self.panic_at = Some(stage),
+            ToRender::Flings(flings) => self.compositor.set_flings(flings),
             ToRender::Quit => return false,
         }
         true
@@ -725,25 +1404,64 @@ impl RenderThread {
     /// a sample of the vsync. Only a texture acquired, or a tick, is: a
     /// frame begun with a texture held, or whose acquire failed (a minimized
     /// window), waited for nothing, and its deadline paces it
-    /// ([`Self::frame`]).
-    fn wait_vsync(&mut self) -> (Instant, Option<Duration>) {
+    /// ([`Self::frame`]). `None` when told to quit meanwhile.
+    ///
+    /// It never blocks with input waiting (ADR-0033): until the vblank the
+    /// frame presented last shows at, when the surface frees a texture, it
+    /// waits on its channel and hands input on; only then does it ask for
+    /// the texture, which a display whose phase it knows (its vsync source,
+    /// or a Wayland frame callback) gives at once, and one it fits from the
+    /// acquires gives within [`ACQUIRE_PROBE`] and the fit's error. A
+    /// ticker's tick is waited for on the channel alike.
+    fn wait_vsync(&mut self) -> Option<(Instant, Option<Duration>)> {
         match &self.pace {
             Pace::Surface { .. } => {
                 if self.gpu.holds_frame() {
-                    return (Instant::now(), None);
+                    return Some((Instant::now(), None));
+                }
+                // Taking in what comes until the acquire is due, input
+                // handed on at once; asked again after each message, which
+                // may change when (the window on another output).
+                while let Some(due) = self.acquire_due(Instant::now()) {
+                    match self.next(Some(due)) {
+                        Ok(msg) => {
+                            if !self.handle(msg) {
+                                return None;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return None,
+                    }
                 }
                 let waited = self.gpu.acquire();
-                (Instant::now(), waited)
+                Some((Instant::now(), waited))
             }
             Pace::Ticker(interval) => {
                 let interval = *interval;
                 let now = Instant::now();
                 let next = self.next_tick(interval, now);
-                std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                if !self.wait_until(next) {
+                    return None;
+                }
                 self.ticked = Some(next);
-                (next, Some(next.saturating_duration_since(now)))
+                Some((next, Some(next.saturating_duration_since(now))))
             }
         }
+    }
+
+    /// When a texture is to be asked for, at `now`: at the vblank the frame
+    /// presented last shows at (the surface frees one then), or
+    /// [`ACQUIRE_PROBE`] before it where the display tells nothing of its
+    /// phase; none when that is past or nothing was presented for a vblank
+    /// ahead.
+    fn acquire_due(&self, now: Instant) -> Option<Instant> {
+        let shows = self.timing.reserved?;
+        let due = if self.timing.vsync.told_lately(now) {
+            shows
+        } else {
+            shows.checked_sub(ACQUIRE_PROBE)?
+        };
+        (due > now).then_some(due)
     }
 
     /// The ticker's next tick after `now`, on its grid.
@@ -826,7 +1544,7 @@ impl RenderThread {
             if now >= deadline {
                 return Some(false);
             }
-            match self.rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            match self.next(Some(deadline)) {
                 Ok(msg) => {
                     if !self.handle(msg) {
                         return None;
@@ -845,31 +1563,43 @@ impl RenderThread {
         if !self.timing.holds(epoch) {
             return;
         }
+        self.settle_undrawn();
         self.sequence = self.sequence.saturating_add(1);
         let token = MainFrame {
             sequence: self.sequence,
-            present_at: clock::seconds(present),
+            present_at: clock::nanos(present),
             deadline,
             interval: self.timing.vsync.interval(),
+            // What it scrolled, handed on with the frame (ADR-0033).
+            taken: self.compositor.pull_for_frame(),
             scroll: self.compositor.begin_main_frame(
-                self.sequence,
-                clock::seconds(Instant::now()),
+                Instant::now(),
                 super::horizon(self.ui_worst(), self.timing.vsync.interval()),
             ),
         };
+        // When it is presented is consumed by the UI (its drag resampled
+        // for it): logged with it (Codex r10 3), and sent under the same
+        // lock, so input the platform sends straight meanwhile (diverted)
+        // is in the log on the same side of the grant as in the UI's queue
+        // (Codex r11 plausible).
         self.wants = false;
         self.owed = Some((self.sequence, deadline));
         self.granted = Some(Instant::now());
-        (self.to_ui)(FromRender::Begin(token));
+        match &self.forwarding {
+            Some(f) => f.send(|route| {
+                route.grant(present);
+                (self.to_ui)(FromRender::Begin(token));
+            }),
+            None => (self.to_ui)(FromRender::Begin(token)),
+        }
     }
 
     /// Draw one frame; `false` when the UI thread is gone.
     fn frame(&mut self) -> bool {
-        let was_lost = self.gpu.lost();
         if !self.ensure_device() {
             return true;
         }
-        let renewed = was_lost && !self.gpu.lost();
+        let renewed = std::mem::take(&mut self.renewed);
         if let Some(size) = self.resize_to.take() {
             self.gpu.resize(size);
         }
@@ -879,7 +1609,14 @@ impl RenderThread {
         if let Some(ticks) = &self.timing.ticks {
             ticks.run(true);
         }
-        let (vblank, waited) = self.wait_vsync();
+        let Some((vblank, waited)) = self.wait_vsync() else {
+            return false;
+        };
+        // Lost while it waited (a message taken in): drawn whole on a
+        // device made again, as `busy` keeps the thread awake.
+        if self.gpu.lost() {
+            return true;
+        }
         let woke = Instant::now();
         self.take_tick();
         if let Some(waited) = waited {
@@ -938,7 +1675,7 @@ impl RenderThread {
         }
         let mut deadline = self.deadline(present, vblank);
         // What arrived while waiting (a commit, the wheel).
-        while let Ok(msg) = self.rx.try_recv() {
+        while let Some(msg) = self.next_now() {
             if !self.handle(msg) {
                 return false;
             }
@@ -963,7 +1700,7 @@ impl RenderThread {
             if now >= deadline {
                 break;
             }
-            match self.rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            match self.next(Some(deadline)) {
                 Ok(msg) => {
                     if !self.handle(msg) {
                         return false;
@@ -988,8 +1725,8 @@ impl RenderThread {
         // Drawn without the commit the UI owes: a compositor-only frame.
         let without_ui = self.owed.is_some();
         let drawing = Instant::now();
-        let at = clock::seconds(present);
-        self.compositor.draw(&mut self.gpu, at);
+        // Exact on the frame clock: the physics takes spans of instants.
+        self.compositor.draw(&mut self.gpu, present);
         // A fling or a resampled gesture moved on: the UI takes it in, and
         // builds what it scrolls toward, with its next frame.
         self.wants |= self.compositor.scrolled();
@@ -1042,12 +1779,27 @@ impl RenderThread {
         if self.costs.len() > COSTS {
             self.costs.pop_front();
         }
-        // What input is stamped with is what the window shows: a frame
-        // meant to present that could not leaves the last one there.
+        // What input is stamped with is what the window shows, from the
+        // vblank this frame was drawn for: a present made, or nothing to
+        // present (its pixels are those on screen: a commit that changed
+        // only what takes the pointer shows all the same). A present that
+        // could not be made (no texture) is owed: the frame on screen stays
+        // what input is stamped with. The UI hears of it once until it
+        // looks (its hover follows the timeline, not this message).
         let owed = surface && self.gpu.owes_present();
         let presented = self.compositor.presented();
-        if !owed {
-            *self.presented.lock().unwrap_or_else(PoisonError::into_inner) = Arc::clone(&presented);
+        // Every draw is logged where it fell among the events, with the
+        // display time the compositor ticked scroll and motion to (Codex
+        // r11 2), so a replay draws each there, at that time: the frame
+        // input is routed in from its present shows what this one did.
+        if let Some(f) = &self.forwarding {
+            f.send(|route| route.drawn(presented.frame, present));
+        }
+        // The UI is woken only for a frame that changes what is under the
+        // pointer: with none in the window, or one at rest over what an
+        // animation leaves as it was, never.
+        if !owed && self.compositor.did_present() && self.compositor.timeline().tell() {
+            (self.to_ui)(FromRender::Presented);
         }
         if let Some(log) = &self.log {
             log.lock().unwrap_or_else(PoisonError::into_inner).push(FrameStat {
@@ -1080,6 +1832,7 @@ impl RenderThread {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compositor::Shown;
     use crate::gpu::Fault;
 
     /// A render thread on a headless device, ticking every millisecond,
@@ -1092,7 +1845,6 @@ mod tests {
             gpu,
             rx,
             Box::new(|_| {}),
-            Arc::new(Mutex::new(Arc::new(Presented::default()))),
             Duration::from_millis(1),
             Pace::Ticker(Duration::from_millis(1)),
             None,
@@ -1114,12 +1866,357 @@ mod tests {
             gpu,
             rx,
             Box::new(|_| {}),
-            Arc::new(Mutex::new(Arc::new(Presented::default()))),
             interval,
             Pace::Surface { callbacks: None },
             Some(Arc::clone(&log)),
         );
         (thread, log, tx)
+    }
+
+    /// ADR-0033's fallback: the platform sent a press and a wheel through
+    /// the render thread, which panicked before it took them in. It hands
+    /// them on as it diverts, so the release the platform sends next,
+    /// straight to the UI, comes after them; a resize waits for it to
+    /// serve again; once it does, input goes through it again.
+    #[test]
+    fn input_diverted_from_a_render_thread_that_panicked_keeps_its_order() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let ui: Arc<Mutex<Vec<String>>> = Arc::default();
+        let to_ui = Arc::clone(&ui);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let forwarding = Forwarding::new();
+        let mut thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(move |m| {
+                let name = match m {
+                    FromRender::Input {
+                        input: Input::WheelAt { step, dx, dy, .. },
+                        ..
+                    } => format!("WheelAt {:?} {dx} {dy} {} {:?}", step.point, step.precise, step.phase),
+                    FromRender::Input { input, .. } => format!("{input:?}"),
+                    other => format!("other {}", matches!(other, FromRender::Diverted { .. })),
+                };
+                to_ui.lock().unwrap_or_else(PoisonError::into_inner).push(name);
+            }),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        )
+        .forwarding(Arc::clone(&forwarding));
+        let at = Instant::now();
+        let send = |input: Input| {
+            forwarding.send(|route| {
+                let through = route.through;
+                if through {
+                    tx.send(ToRender::Input {
+                        input,
+                        at,
+                        sent: at,
+                        shown: Seen::BeforeFirst,
+                        event: None,
+                    })
+                    .ok();
+                } else {
+                    ui.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(format!("{input:?} straight"));
+                }
+                through
+            })
+        };
+        assert!(send(Input::MouseDown { x: 1.0, y: 2.0 }));
+        tx.send(ToRender::Wheel {
+            point: (1.0, 2.0),
+            delta: (0.0, 3.0),
+            at,
+            sent: at,
+            precise: true,
+            phase: super::super::WheelPhase::Changed,
+            shown: Seen::BeforeFirst,
+            event: None,
+        })
+        .ok();
+        tx.send(ToRender::Resize((8, 8))).ok();
+        thread.divert();
+        assert!(!send(Input::MouseUp { x: 1.0, y: 2.0 }));
+        assert_eq!(
+            *ui.lock().unwrap_or_else(PoisonError::into_inner),
+            [
+                "MouseDown { x: 1.0, y: 2.0 }",
+                "WheelAt (1.0, 2.0) 0 3 true Changed",
+                "MouseUp { x: 1.0, y: 2.0 } straight"
+            ],
+            "in the platform's order"
+        );
+        assert!(
+            matches!(thread.next_now(), Some(ToRender::Resize((8, 8)))),
+            "kept for later"
+        );
+        thread.restore();
+        assert!(send(Input::MouseDown { x: 1.0, y: 2.0 }), "through it again");
+        // The fault matrix's finding (release, a panic before a gesture's
+        // end and another before the next wheel): the input that waited
+        // for the UI's latch goes back on the queue when the latch comes;
+        // diverted again before it is handled, it goes to the UI in its
+        // order, not to the compositor made afresh, which has no scene to
+        // scroll a wheel in (one was lost so).
+        tx.send(ToRender::Wheel {
+            point: (1.0, 2.0),
+            delta: (0.0, 4.0),
+            at,
+            sent: at,
+            precise: false,
+            phase: super::super::WheelPhase::None,
+            shown: Seen::BeforeFirst,
+            event: None,
+        })
+        .ok();
+        for _ in 0..2 {
+            let m = thread.next_now().expect("waiting on the channel");
+            assert!(thread.handle(m));
+        }
+        tx.send(ToRender::Latch(None)).ok();
+        let latch = thread.next_now().expect("the UI's latch");
+        assert!(thread.handle(latch));
+        ui.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        assert!(send(Input::MouseUp { x: 1.0, y: 2.0 }));
+        thread.divert();
+        assert_eq!(
+            *ui.lock().unwrap_or_else(PoisonError::into_inner),
+            [
+                "MouseDown { x: 1.0, y: 2.0 }",
+                "WheelAt (1.0, 2.0) 0 4 false None",
+                "MouseUp { x: 1.0, y: 2.0 }"
+            ],
+            "what waited for the latch, then the channel, in order"
+        );
+        assert!(thread.next_now().is_none(), "no input left for the compositor");
+    }
+
+    /// One latch in flight at a time (the fault matrix's class): diverted
+    /// again while the UI's latch is on its way back to it, the render
+    /// thread tells the UI the latch is coming back, returns it as it
+    /// comes, and comes through again (a restore due meanwhile) only then.
+    #[test]
+    fn a_latch_in_flight_when_diverted_again_goes_back_before_input_comes_through() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let ui: Arc<Mutex<Vec<String>>> = Arc::default();
+        let to_ui = Arc::clone(&ui);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let forwarding = Forwarding::new();
+        let mut thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(move |m| {
+                let name = match m {
+                    FromRender::Diverted { returning, .. } => format!("diverted returning {returning}"),
+                    FromRender::Returned(_) => "returned".to_owned(),
+                    FromRender::Restored => "restored".to_owned(),
+                    _ => "other".to_owned(),
+                };
+                to_ui.lock().unwrap_or_else(PoisonError::into_inner).push(name);
+            }),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        )
+        .forwarding(Arc::clone(&forwarding));
+        let through = || forwarding.send(|route| route.through);
+        thread.divert();
+        thread.restore();
+        assert!(through());
+        // A panic before the UI's latch came back.
+        thread.divert();
+        assert!(!through());
+        // Recovered meanwhile: its restore waits for the latch.
+        thread.restore();
+        assert!(!through(), "no restore with the UI's latch in flight");
+        tx.send(ToRender::Latch(None)).ok();
+        let latch = thread.next_now().expect("the UI's latch");
+        assert!(thread.handle(latch));
+        assert!(through(), "restored once it is back");
+        assert_eq!(
+            *ui.lock().unwrap_or_else(PoisonError::into_inner),
+            ["restored", "diverted returning true", "returned", "restored"]
+        );
+    }
+
+    /// Opus r13 I2, made deterministic by a gate that holds the device: a
+    /// panic while the UI's latch is on its way back, and no device answers
+    /// for a while. Recovering blocks nothing: the latch goes back to the
+    /// UI as the panic diverts, not after a device is made (it waited ~230
+    /// ms for the synchronous rebuild, the UI holding its input meanwhile).
+    #[test]
+    fn a_latch_in_flight_goes_back_at_once_while_no_device_answers() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let ui: Arc<Mutex<Vec<(String, Instant)>>> = Arc::default();
+        let to_ui = Arc::clone(&ui);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let forwarding = Forwarding::new();
+        let mut thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(move |m| {
+                let name = match m {
+                    FromRender::Returned(_) => "returned",
+                    FromRender::Failed(_) => "failed",
+                    _ => "other",
+                };
+                to_ui
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((name.to_owned(), Instant::now()));
+            }),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        )
+        .forwarding(Arc::clone(&forwarding));
+        thread.divert();
+        thread.restore();
+        // No device answers for two seconds, and the UI's latch is on its
+        // way when the render thread panics.
+        assert!(thread.handle(ToRender::HoldLost(Duration::from_secs(2))));
+        tx.send(ToRender::Latch(None)).ok();
+        let panicked = Instant::now();
+        thread.divert();
+        thread.recover();
+        let returned = || {
+            ui.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .iter()
+                .find(|(n, _)| n == "returned")
+                .map(|(_, t)| *t)
+        };
+        let until = panicked + Duration::from_secs(3);
+        while returned().is_none() && Instant::now() < until {
+            thread.step();
+        }
+        let took = returned().map(|t| t.saturating_duration_since(panicked));
+        assert!(
+            took.is_some_and(|t| t < Duration::from_millis(16)),
+            "the latch went back after {took:?}"
+        );
+    }
+
+    /// Codex r10 1: a render thread made afresh after a panic holds no
+    /// scroll container until the UI's full commit, so a wheel it took
+    /// would scroll nothing. Input stays with the UI until that commit is
+    /// applied (a delta dropped meanwhile changes nothing), then comes
+    /// through it again.
+    #[test]
+    fn input_goes_to_the_ui_until_a_recovered_compositor_can_scroll() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let forwarding = Forwarding::new();
+        let mut thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(|_| {}),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        )
+        .forwarding(Arc::clone(&forwarding));
+        let through = || forwarding.send(|route| route.through);
+        thread.divert();
+        thread.recover();
+        assert!(!through(), "nothing to scroll yet");
+        let commit = |sequence: u64, full: bool| {
+            let mut c = Commit::default();
+            c.between(&Scene::default(), &Scene::new((64, 64), 1.0, None));
+            c.sequence = sequence;
+            c.full = full;
+            ToRender::Commit(Box::new(c), None)
+        };
+        assert!(thread.handle(commit(1, false)));
+        assert!(!through(), "a delta is dropped: still nothing to scroll");
+        assert!(thread.handle(commit(2, true)));
+        assert!(through(), "its tables whole, input comes through it again");
+    }
+
+    /// Opus r11 I3: a device lost and made again leaves the compositor its
+    /// tables, its latch and its gesture: it can scroll throughout, so
+    /// input keeps going through it. A wheel waiting as the device is made
+    /// again is the compositor's to take, never handed to the UI to route
+    /// afresh (which would pass a latched list's gesture at its end on to
+    /// the list around it).
+    #[test]
+    fn a_device_made_again_keeps_input_going_through_the_compositor() {
+        let Ok(gpu) = GpuRenderer::headless() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let ui: Arc<Mutex<Vec<String>>> = Arc::default();
+        let to_ui = Arc::clone(&ui);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let forwarding = Forwarding::new();
+        let mut thread = RenderThread::new(
+            Compositor::new(Glyphs::for_os()),
+            gpu,
+            rx,
+            Box::new(move |m| {
+                let name = match m {
+                    FromRender::Input { input, .. } => format!("{input:?}"),
+                    _ => "other".to_owned(),
+                };
+                to_ui.lock().unwrap_or_else(PoisonError::into_inner).push(name);
+            }),
+            Duration::from_millis(1),
+            Pace::Ticker(Duration::from_millis(1)),
+            None,
+        )
+        .forwarding(Arc::clone(&forwarding));
+        // A present made, its callback not yet come, as the device is lost.
+        thread.called_back = false;
+        assert!(thread.handle(ToRender::LoseDevice));
+        tx.send(ToRender::Wheel {
+            point: (1.0, 2.0),
+            delta: (0.0, 3.0),
+            at: Instant::now(),
+            sent: Instant::now(),
+            precise: false,
+            phase: super::super::WheelPhase::None,
+            shown: Seen::BeforeFirst,
+            event: None,
+        })
+        .ok();
+        // Made on a thread of its own, taken once made.
+        let until = Instant::now() + Duration::from_secs(10);
+        while !thread.ensure_device() {
+            assert!(Instant::now() < until, "made again");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(forwarding.send(|route| route.through), "input goes through it");
+        assert!(
+            ui.lock().unwrap_or_else(PoisonError::into_inner).is_empty(),
+            "nothing handed to the UI to scroll"
+        );
+        assert!(
+            matches!(thread.next_now(), Some(ToRender::Wheel { .. })),
+            "the wheel is the compositor's"
+        );
+        // The fault matrix: the lost device's present never calls back;
+        // the new device draws without waiting for it (failed: no frame
+        // drawn again after a plain loss).
+        assert!(thread.called_back, "no callback waited for on the new device");
     }
 
     #[test]
@@ -1208,7 +2305,6 @@ mod tests {
                     to_ui.send(frame.deadline).ok();
                 }
             }),
-            Arc::new(Mutex::new(Arc::new(Presented::default()))),
             hz60,
             Pace::Surface { callbacks: None },
             None,
@@ -1490,6 +2586,111 @@ mod tests {
     }
 
     #[test]
+    fn five_failed_presents_leave_the_frame_shown_stamped_and_kept() {
+        // Frame A reaches the window; five commits after it are drawn and
+        // none presents (no texture could be taken). Input stays stamped
+        // with A, and A, all of it, stays kept for input stamped with it.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, tx) = on_surface(gpu, Duration::from_millis(4));
+        let shown = thread.compositor.timeline();
+        let commit = |sequence: u64, background: crate::color::Color| {
+            let mut c = Commit::default();
+            c.between(&Scene::default(), &Scene::new((64, 64), 1.0, Some(background)));
+            c.sequence = sequence;
+            c.full = true;
+            ToRender::Commit(Box::new(c), None)
+        };
+        tx.send(commit(1, crate::color::Color::WHITE)).ok();
+        assert!(thread.step());
+        let a = shown.latest().expect("A presented");
+        assert_eq!(a.commit, 1, "A is shown");
+        for n in 2..=6_u64 {
+            thread
+                .gpu
+                .virtual_display()
+                .faults
+                .extend([Fault::Timeout, Fault::Timeout]);
+            tx.send(commit(n, crate::color::Color::BLACK)).ok();
+            assert!(thread.step());
+        }
+        assert_eq!(thread.gpu.presents(), 1, "none of the five presented");
+        assert!(thread.compositor.presented().frame > a.frame, "frames were drawn since");
+        let Shown::Frame(stamped) = shown.at(u64::MAX) else {
+            panic!("A shows")
+        };
+        assert!(
+            Arc::ptr_eq(&stamped, &a),
+            "input stays stamped with A, its own snapshot"
+        );
+    }
+
+    #[test]
+    fn a_commit_that_changes_only_what_takes_the_pointer_shows_from_the_next_vblank() {
+        // Frame A reaches the window; then a commit adds only a box that
+        // takes the pointer (no pixel changes), so nothing blits or
+        // presents. The screen shows it all the same from the vblank it
+        // was drawn for: it enters the timeline, and a click after that
+        // lands on the box, with no other damage to carry it. A stays
+        // kept for input stamped with it.
+        let Ok(gpu) = GpuRenderer::with_virtual_window((64, 64)) else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let (mut thread, _, tx) = on_surface(gpu, Duration::from_millis(4));
+        let shown = thread.compositor.timeline();
+        let scene = Scene::new((64, 64), 1.0, Some(crate::color::Color::WHITE));
+        let mut c = Commit::default();
+        c.between(&Scene::default(), &scene);
+        c.sequence = 1;
+        c.full = true;
+        tx.send(ToRender::Commit(Box::new(c), None)).ok();
+        assert!(thread.step());
+        let a = shown.latest().expect("A presented");
+        let mut hit = scene.clone();
+        let target = super::super::HitTarget {
+            key: super::super::NodeKey(1),
+            owner: None,
+        };
+        hit.compositing.hits = Arc::from([super::super::Hit {
+            rect: crate::geometry::Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 32.0,
+                height: 32.0,
+            },
+            shape: crate::shape::Shape::default(),
+            slop: crate::style::Edges::default(),
+            transform: 0,
+            clip: 0,
+            effect: 0,
+            scroller: None,
+            wheel: false,
+            target,
+            cursor: None,
+            below_modal: false,
+        }]);
+        let mut c = Commit::default();
+        c.between(&scene, &hit);
+        c.sequence = 2;
+        tx.send(ToRender::Commit(Box::new(c), None)).ok();
+        assert!(thread.step());
+        assert_eq!(thread.gpu.presents(), 1, "no pixel changed: nothing presented");
+        let Shown::Frame(now) = shown.at(u64::MAX) else {
+            panic!("a frame shows")
+        };
+        assert_eq!(now.commit, 2, "the commit shows from the vblank it was drawn for");
+        assert_eq!(now.hits.len(), 1, "a click there finds the box");
+        let routed = thread.compositor.tables(super::super::Seen::Frame(a.frame));
+        assert!(
+            routed.is_some_and(|r| Arc::ptr_eq(&r, &a)),
+            "input stamped with A is still routed in A"
+        );
+    }
+
+    #[test]
     fn a_present_that_failed_leaves_input_stamped_with_what_the_window_shows() {
         // A commit drawn and not presented (its texture could not be
         // taken) is not what the window shows: input stays stamped with the
@@ -1499,7 +2700,7 @@ mod tests {
             return;
         };
         let (mut thread, _, tx) = on_surface(gpu, Duration::from_millis(4));
-        let shown = Arc::clone(&thread.presented);
+        let shown = thread.compositor.timeline();
         let commit = |sequence: u64, background: crate::color::Color| {
             let mut c = Commit::default();
             c.between(&Scene::default(), &Scene::new((64, 64), 1.0, Some(background)));
@@ -1507,7 +2708,11 @@ mod tests {
             c.full = true;
             ToRender::Commit(Box::new(c), None)
         };
-        let stamped = || shown.lock().unwrap_or_else(PoisonError::into_inner).commit;
+        // What input is stamped with once each present's vblank has come.
+        let stamped = || match shown.at(u64::MAX) {
+            Shown::Frame(p) => p.commit,
+            _ => 0,
+        };
         tx.send(commit(1, crate::color::Color::WHITE)).ok();
         assert!(thread.step());
         assert_eq!(stamped(), 1);
@@ -1604,7 +2809,7 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .first()
-            .map(|f| clock::seconds(f.present_at));
+            .map(|f| clock::nanos(f.present_at));
         assert!(at.is_some() && at == drawn, "granted for {at:?}, drawn for {drawn:?}");
     }
 
@@ -1781,18 +2986,19 @@ mod tests {
             wake.send(ToRender::Wake).ok();
         });
         let device = gpu.device();
-        let presented = Arc::new(Mutex::new(Arc::new(Presented::default())));
+        let compositor = Compositor::new(Glyphs::for_os());
+        let presented = compositor.timeline();
         let thread = RenderThread::new(
-            Compositor::new(Glyphs::for_os()),
+            compositor,
             gpu,
             rx,
             Box::new(|_| {}),
-            Arc::clone(&presented),
             Duration::from_millis(1),
             Pace::Ticker(Duration::from_millis(1)),
             None,
         );
-        let frames = || presented.lock().unwrap_or_else(PoisonError::into_inner).frame;
+        // Each frame presented.
+        let frames = || presented.latest().map_or(0, |p| p.frame);
         let running = std::thread::spawn(move || thread.run());
         // Idle: nothing to draw, it sleeps on its channel.
         std::thread::sleep(Duration::from_millis(100));
@@ -1829,9 +3035,14 @@ mod tests {
         assert!(thread.frame(), "the frame runs");
         assert!(thread.gpu.lost(), "the device the frame drew on is lost");
         assert!(thread.busy(), "a lost device keeps it from sleeping");
-        // The next frame makes it again, and then it may sleep.
+        // The next turns make it again (on a thread of its own: each turn
+        // looks for it), and then it may sleep.
+        let until = Instant::now() + Duration::from_secs(10);
+        while thread.gpu.lost() {
+            assert!(Instant::now() < until, "made again");
+            assert!(thread.step());
+        }
         assert!(thread.frame());
-        assert!(!thread.gpu.lost(), "made again");
         assert!(!thread.busy(), "made again and drawn: it may sleep");
     }
 }

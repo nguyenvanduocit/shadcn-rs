@@ -86,9 +86,42 @@ const MAX_LCD_PPEM: f32 = 48.0;
 const MAX_ATLAS_PPEM: f32 = 128.0;
 use self::contract::GLOBALS;
 
+/// How to make a renderer again on a new device, off the thread that
+/// draws ([`GpuRenderer::remake`]).
+pub(crate) struct Remake {
+    instance: wgpu::Instance,
+    format: wgpu::TextureFormat,
+    options: GpuOptions,
+    wake: LostWaker,
+}
+
+/// A renderer made on a new device, and the adapter it was made on, for
+/// the renderer it replaces to take ([`GpuRenderer::take_made`]).
+pub(crate) struct Remade {
+    gpu: GpuRenderer,
+    adapter: wgpu::Adapter,
+}
+
+impl Remake {
+    /// Make it: an adapter, its device, every pipeline and the adapter's
+    /// self-test ([`GpuRenderer::test_adapter`]), so that its first frame
+    /// on the render thread costs what any frame costs. Blocks.
+    ///
+    /// # Errors
+    ///
+    /// When no adapter or device answers yet (the GPU is still resetting).
+    pub(crate) fn make(self) -> Result<Remade, GpuError> {
+        let adapter = pollster::block_on(self.instance.request_adapter(&adapter_options(None)))
+            .map_err(|e| GpuError(format!("adapter: {e}")))?;
+        let mut gpu = GpuRenderer::with_adapter(&self.instance, &adapter, self.format, self.options, self.wake)?;
+        gpu.test_adapter();
+        Ok(Remade { gpu, adapter })
+    }
+}
+
 /// Why the GPU renderer could not start.
 #[derive(Debug)]
-pub struct GpuError(String);
+pub struct GpuError(pub(crate) String);
 
 impl std::fmt::Display for GpuError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -641,6 +674,11 @@ pub struct GpuRenderer {
     /// drew in a layer (a layer of any other is given back).
     layers: foldhash::HashMap<u32, CachedLayer>,
     layered: foldhash::HashSet<u32>,
+    /// The layers the last plan drew, as stages, by effect: what hit
+    /// testing reads ([`Self::shown_stages`]), made again only when they
+    /// change; `stage_work` is where they are made.
+    shown_stages: std::sync::Arc<[crate::scene::LayerStage]>,
+    stage_work: Vec<crate::scene::LayerStage>,
     /// Whether an effect's primitives overlap, by what they were.
     overlaps: foldhash::HashMap<u32, (u64, bool)>,
     /// This frame's tables for paths and curve text, and its reads.
@@ -877,21 +915,77 @@ impl GpuRenderer {
         };
         let adapter = pollster::block_on(self.instance.request_adapter(&adapter_options(compatible)))
             .map_err(|e| GpuError(format!("adapter: {e}")))?;
-        let mut fresh = Self::with_adapter(
+        let fresh = Self::with_adapter(
             &self.instance,
             &adapter,
             self.format,
             self.options,
             Arc::clone(&self.wake),
         )?;
+        self.take_device(fresh);
+        Ok(())
+    }
+
+    /// What making it on a new device takes, to make it off the thread
+    /// that draws ([`Remake::make`]): that blocks for an adapter and builds
+    /// every pipeline, hundreds of milliseconds, and the render thread
+    /// hands input on meanwhile (ADR-0033, Codex r12 2).
+    #[must_use]
+    pub(crate) fn remake(&self) -> Remake {
+        Remake {
+            instance: self.instance.clone(),
+            format: self.format,
+            options: self.options,
+            wake: Arc::clone(&self.wake),
+        }
+    }
+
+    /// Go on on `fresh`, made by [`Remake::make`]: its window's surface
+    /// configured for the new device, its frame count kept. What it kept
+    /// is gone, as for [`Self::rebuild`].
+    ///
+    /// # Errors
+    ///
+    /// When the new device cannot present to its window's surface; it is
+    /// left as it was, to try again.
+    ///
+    /// The renderer it replaces is handed back, for the caller to let go of
+    /// off the thread that draws: freeing a device's every pipeline,
+    /// texture and buffer takes milliseconds, and the render thread hands
+    /// input on (ADR-0033).
+    pub(crate) fn take_made(&mut self, made: Remade) -> Result<Self, GpuError> {
+        if let Some(Surface::Os { surface, .. }) = self.window.as_ref().map(|w| &w.surface)
+            && !made.adapter.is_surface_supported(surface)
+        {
+            return Err(GpuError("the new device cannot present to the window".to_owned()));
+        }
+        Ok(self.take_device(made.gpu))
+    }
+
+    /// Run the adapter's self-tests now rather than in its first frame:
+    /// whether banded curve text draws as the full scan does (ADR-0017)
+    /// reads a frame back, milliseconds of waiting on the GPU. They test
+    /// the adapter, not the text, so the OS's text settings serve, and the
+    /// UI's are taken in at the first frame.
+    pub(crate) fn test_adapter(&mut self) {
+        if self.banded_ok.is_some() {
+            return;
+        }
+        let mut text = Glyphs::for_os();
+        self.sync_text(&text);
+        self.banded_ok = Some(self.slug_self_test(&mut text));
+        self.text_generation = None;
+    }
+
+    /// Go on on `fresh`; the renderer it replaces.
+    fn take_device(&mut self, mut fresh: Self) -> Self {
         if let Some(mut w) = self.window.take() {
             // A texture of the lost device is never presented.
             w.configure(&fresh.device);
             fresh.window = Some(w);
         }
         fresh.frame = self.frame;
-        *self = fresh;
-        Ok(())
+        std::mem::replace(self, fresh)
     }
 
     #[expect(clippy::too_many_lines, reason = "every pipeline and layout, made once")]
@@ -1198,6 +1292,8 @@ impl GpuRenderer {
             shown: foldhash::HashMap::default(),
             layers: foldhash::HashMap::default(),
             layered: foldhash::HashSet::default(),
+            shown_stages: std::sync::Arc::from(Vec::new()),
+            stage_work: Vec::new(),
             overlaps: foldhash::HashMap::default(),
             fr: FrameData::default(),
             reads: read::Reads::new(&device),
@@ -1674,6 +1770,16 @@ impl GpuRenderer {
         let asked = std::time::Instant::now();
         drop(self.device.poll(wgpu::PollType::wait_indefinitely()));
         self.drawn.gpu_wait = asked.elapsed();
+    }
+
+    /// The layers the last frame was drawn with (or, for a page taller
+    /// than a texture, read back with), by effect id
+    /// ([`crate::scene::LayerStage`]): published with what it showed, so
+    /// hit testing follows how each pixel was made rather than guessing.
+    /// The same list (one `Arc`) while the plan's layers stay as they are.
+    #[must_use]
+    pub fn shown_stages(&self) -> std::sync::Arc<[crate::scene::LayerStage]> {
+        std::sync::Arc::clone(&self.shown_stages)
     }
 
     /// The canvas as drawn, read back (tests: what damage left there).

@@ -26,7 +26,6 @@
 //! can step back when the system's clock is set back.
 
 use std::cell::{Cell, RefCell};
-use std::rc::Rc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The wall time a script starts the clock at: 2026-06-15T12:00:00Z.
@@ -45,10 +44,45 @@ struct Timer {
     /// When it runs, on the clock.
     due: Duration,
     id: u64,
-    run: Rc<dyn Fn()>,
+    /// Its work, kept in the window current when it was set: it runs in
+    /// that window, whichever window's turn runs it, and never once that
+    /// window closed (ADR-0015, [`crate::engine::Stored`]).
+    run: crate::engine::Stored<Box<dyn Fn()>>,
     /// What owned it when it was made: its call runs as that owner, so a
     /// timer it sets again (an autoplay) is owned, and cancelled, too.
     owner: Option<crate::reactive::OwnerId>,
+}
+
+/// Run `timer`'s work, in the window and as the owner it was set in,
+/// through the gate, under `all`: one that panics leaves the others to run.
+fn run_timer(timer: &Timer, all: &mut crate::engine::Gather) {
+    all.run(|| {
+        timer.run.call(|f| crate::reactive::run_owned(timer.owner, f));
+    });
+}
+
+/// `window` closes: the timers set in it are cancelled (ADR-0015, the
+/// close order), dropped once out of the queue, each under a catch, in
+/// its close turn. How many were.
+pub(crate) fn cancel_window(window: &crate::focus::FocusRoot) -> usize {
+    let gone: Vec<Timer> = TIMERS
+        .try_with(|t| {
+            t.try_borrow_mut()
+                .map(|mut t| {
+                    let (gone, kept) = std::mem::take(&mut t.timers)
+                        .into_iter()
+                        .partition(|x| x.run.is_of(window));
+                    t.timers = kept;
+                    gone
+                })
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    let n = gone.len();
+    for timer in gone {
+        crate::engine::contained(move || drop(timer));
+    }
+    n
 }
 
 /// When the process's clock started: every thread's times are from it.
@@ -63,6 +97,128 @@ pub fn seconds(at: Instant) -> f32 {
     at.saturating_duration_since(start()).as_secs_f32()
 }
 
+/// `at` as nanoseconds on the frame clock (real time, from any thread):
+/// exact at any uptime.
+#[must_use]
+pub fn nanos(at: Instant) -> u64 {
+    u64::try_from(at.saturating_duration_since(start()).as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The time on the clock now, nanoseconds: real time, or where a script
+/// set it ([`current_time`]).
+#[must_use]
+pub fn current_nanos() -> u64 {
+    u64::try_from(current().as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// A moment on the frame clock as a caller has it. The compositor's
+/// physics (resampling, flings, scrollbar fades) keeps every instant as
+/// exact nanoseconds and takes only spans between two of them as seconds
+/// ([`span`]), as Chromium's `TimeTicks` and `TimeDelta` (int64
+/// microseconds) and Flutter's `Duration` do: an f32 of seconds since the
+/// clock started steps by 1/64 s at three days of uptime, which no
+/// physics survives. Seconds as `f32` remain accepted for scripted times
+/// near the clock's start (tests), where they are exact enough.
+pub trait Moment: Copy {
+    /// Nanoseconds on the frame clock.
+    fn nanos(self) -> u64;
+}
+
+impl Moment for u64 {
+    fn nanos(self) -> u64 {
+        self
+    }
+}
+
+impl Moment for Duration {
+    fn nanos(self) -> u64 {
+        u64::try_from(self.as_nanos()).unwrap_or(u64::MAX)
+    }
+}
+
+impl Moment for Instant {
+    fn nanos(self) -> u64 {
+        nanos(self)
+    }
+}
+
+/// Seconds as a script gives them (a test's `s.at(1.0)`, a frame at 0.016):
+/// an input-only conversion, to nanoseconds as they come in. Nothing
+/// stores an f32 instant (frame time, motion, the compositor's physics,
+/// the caret's blink, a double click all keep u64 nanoseconds and take
+/// spans of them), and nothing outside tests and scenarios passes one: an
+/// f32 of seconds since the clock started is exact only near its start.
+impl Moment for f32 {
+    fn nanos(self) -> u64 {
+        nanos_of(self)
+    }
+}
+
+/// The shortest span a rate is measured over, seconds (Chromium's
+/// `kResampleMinDelta`): events closer than input is sampled measure no
+/// rate (two events of one instant, a scenario's, measure none). Both
+/// times are of one source (ADR-0032: no time is compared across
+/// sources).
+pub const MIN_RATE_SPAN: f32 = 0.002;
+
+/// `amount` a second, over the span from `from` to `to`: `None` under
+/// [`MIN_RATE_SPAN`] (or backwards). Every rate made of times (a speed,
+/// a fling's, a prediction's) is made here.
+#[must_use]
+pub fn rate(amount: (f32, f32), from: u64, to: u64) -> Option<(f32, f32)> {
+    let over = span(from, to);
+    (over >= MIN_RATE_SPAN).then(|| (amount.0 / over, amount.1 / over))
+}
+
+/// The span from `from` to `to` (nanoseconds on the frame clock),
+/// seconds; negative when `to` is earlier. Taken from two exact instants,
+/// in f64, then narrowed: small, so exact enough as an f32 at any uptime.
+#[must_use]
+pub fn span(from: u64, to: u64) -> f32 {
+    let s = if to >= from {
+        Duration::from_nanos(to.saturating_sub(from)).as_secs_f64()
+    } else {
+        -Duration::from_nanos(from.saturating_sub(to)).as_secs_f64()
+    };
+    crate::convert::f64_to_f32(s)
+}
+
+/// `seconds` (a small span, from [`span`]'s side) as nanoseconds; 0 for
+/// a negative one.
+#[must_use]
+pub fn span_nanos(seconds: f32) -> u64 {
+    nanos_of(seconds)
+}
+
+/// The instant `seconds` (a span, negative before) from `at`.
+#[must_use]
+pub fn shifted(at: u64, seconds: f32) -> u64 {
+    if seconds >= 0.0 {
+        at.saturating_add(nanos_of(seconds))
+    } else {
+        at.saturating_sub(nanos_of(-seconds))
+    }
+}
+
+/// `nanos` on the frame clock as seconds (what motion is sampled in).
+#[must_use]
+pub fn seconds_of(nanos: u64) -> f32 {
+    Duration::from_nanos(nanos).as_secs_f32()
+}
+
+/// `seconds` on the frame clock as nanoseconds (a time given in seconds).
+#[must_use]
+pub fn nanos_of(seconds: f32) -> u64 {
+    let d = Duration::try_from_secs_f32(seconds.max(0.0)).unwrap_or_default();
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+/// The moment `nanos` on the frame clock is (real time).
+#[must_use]
+pub fn instant_of(nanos: u64) -> Instant {
+    start().checked_add(Duration::from_nanos(nanos)).unwrap_or_else(start)
+}
+
 /// The moment `seconds` on the frame clock is (real time).
 #[must_use]
 pub fn instant(seconds: f32) -> Instant {
@@ -72,7 +228,8 @@ pub fn instant(seconds: f32) -> Instant {
 
 crate::engine::engine_local! {
     /// The time frames read, fixed per frame so one frame is consistent.
-    [Fork] static FRAME_TIME: Cell<Option<f32>> = const { Cell::new(None) };
+    /// Nanoseconds on the frame clock ([`Moment`]).
+    [Fork] static FRAME_TIME: Cell<Option<u64>> = const { Cell::new(None) };
     /// Where a script has set the clock, once one drives it.
     [Fork] static SCRIPTED: Cell<Option<Duration>> = const { Cell::new(None) };
     /// The wall time at the clock's zero, once taken.
@@ -83,7 +240,19 @@ crate::engine::engine_local! {
     /// A cold frame's timers are its own; the live ones it can only see
     /// ([`Queue`]).
     [Fork(cold_enter, cold_drain, cold_exit)] static TIMERS: RefCell<Queue> = RefCell::new(Queue::default());
-    [Fork] static NEXT_TIMER: Cell<u64> = const { Cell::new(1) };
+}
+
+/// The timers set, numbered.
+static NEXT_TIMER: crate::engine::IdKind = crate::engine::IdKind::new("timer");
+
+/// The timers as the live registry holds them, with no id: what V2
+/// compares between two engines (review r18, decision 6).
+#[cfg(test)]
+pub(crate) fn registry_summary() -> String {
+    TIMERS.with(|q| {
+        let q = q.borrow();
+        format!("timers {} set aside {}", q.timers.len(), q.live.is_some())
+    })
 }
 
 /// The timers pending. In a cold frame, `timers` are the frame's (none at
@@ -129,17 +298,27 @@ fn cold_enter() -> Box<dyn std::any::Any> {
 }
 
 #[cfg(debug_assertions)]
-fn cold_drain(_: &dyn std::any::Any) -> Box<dyn std::any::Any> {
-    Box::new(TIMERS.with(|t| std::mem::take(&mut t.borrow_mut().timers)))
+fn cold_drain(_: &dyn std::any::Any) -> Vec<Box<dyn std::any::Any>> {
+    // One box per timer (ADR-0034, S9): each its own drop.
+    let timers = TIMERS.with(|t| std::mem::take(&mut t.borrow_mut().timers));
+    let mut out = Vec::with_capacity(timers.len());
+    for t in timers {
+        crate::engine::whole(t, &mut out);
+    }
+    out
 }
 
+/// The live timers moved back (ADR-0034, S1); the check's were drained.
 #[cfg(debug_assertions)]
-fn cold_exit(_: Box<dyn std::any::Any>) -> Box<dyn std::any::Any> {
-    TIMERS.with(|t| {
+fn cold_exit(_: Box<dyn std::any::Any>) {
+    TIMERS.switch_with(|t| {
         let mut q = t.borrow_mut();
         let live = q.live.take().map(|(live, _)| live).unwrap_or_default();
-        Box::new(std::mem::replace(&mut q.timers, live))
-    })
+        let left = std::mem::replace(&mut q.timers, live);
+        if !left.is_empty() {
+            crate::engine::quarantined("TIMERS", Box::new(left));
+        }
+    });
 }
 
 /// The time on the clock: since the app started, or where a script set it.
@@ -176,13 +355,20 @@ pub fn request_frame() {
 /// The frame's time without asking for another frame (painting reads it).
 #[must_use]
 pub fn frame_time() -> f32 {
-    FRAME_TIME.with(Cell::get).unwrap_or_else(|| current().as_secs_f32())
+    seconds_of(frame_nanos())
+}
+
+/// The frame's time, exact nanoseconds on the frame clock: what motion
+/// and the compositor sample at, by spans of it ([`span`]).
+#[must_use]
+pub fn frame_nanos() -> u64 {
+    FRAME_TIME.with(Cell::get).unwrap_or_else(current_nanos)
 }
 
 /// Fix the clock for the frame about to be built, to be presented at `at`
-/// seconds on the clock (a scripted clock's frames are at its time).
-pub fn begin_frame(at: f32) {
-    FRAME_TIME.with(|f| f.set(Some(at)));
+/// on the clock (a scripted clock's frames are at its time).
+pub fn begin_frame(at: impl Moment) {
+    FRAME_TIME.with(|f| f.set(Some(at.nanos())));
     if !scripted() {
         // The system's clock jumped (a sleep, a time sync): reckon from it.
         let now = current();
@@ -244,7 +430,8 @@ pub fn take_frame_request() -> bool {
 
 /// Let a script drive the clock from here on, starting at `at`: time then
 /// moves only by [`advance_to`]. Timers already pending keep the delay they
-/// have left.
+/// have left. No order of input and writes is read off this clock
+/// (ADR-0032), so setting it back reorders nothing.
 pub fn script(at: Duration) {
     // The wall time carries over as the clock is moved to `at`; the first
     // script starts it at the fixed day.
@@ -253,8 +440,8 @@ pub fn script(at: Duration) {
 }
 
 /// [`script`], on the fixed day ([`script_epoch`]) whatever the wall time
-/// was: a Scenario's clock, which never inherits the day an earlier one
-/// on the thread left.
+/// was: a Scenario's, a scheduler's or a snapshot's clock, which inherits
+/// no day an earlier one on the thread left.
 pub fn script_fresh(at: Duration) {
     start_script(at, script_epoch());
 }
@@ -275,24 +462,36 @@ fn start_script(at: Duration, wall: SystemTime) {
 /// then at its own time, earliest first (one a timer schedules on the way
 /// included); returns whether any ran. A clock set back runs nothing.
 pub fn advance_to(to: Duration) -> bool {
+    // As [`run_due_timers`]: a timer that panics leaves the others due on
+    // the way to run, and the clock reaches `to`.
+    let mut all = crate::engine::Gather::new();
     let mut ran = false;
     while let Some(timer) = take_due(to) {
         set_scripted(timer.due.max(current()));
-        crate::reactive::run_owned(timer.owner, || (timer.run)());
+        run_timer(&timer, &mut all);
         ran = true;
     }
     set_scripted(to);
+    all.finish();
     ran
 }
 
 fn set_scripted(at: Duration) {
     SCRIPTED.with(|s| s.set(Some(at)));
     // What a timer's work reads as "now" (an animation it starts) is its own time.
-    FRAME_TIME.with(|f| f.set(Some(at.as_secs_f32())));
+    FRAME_TIME.with(|f| f.set(Some(at.nanos())));
 }
 
-/// Remove and return the earliest timer due by `by`.
+/// Remove and return the earliest timer due by `by`; in a fork, none. A
+/// timer's callback is the outside world's (it writes what it captured,
+/// which no rollback puts back), so a fork runs none, made before it or by
+/// it, as a fork's `Sender::send` delivers nothing (ADR-0028, rule 5).
+/// The live run serves the live timers as without the fork; the fork's own
+/// go with it.
 fn take_due(by: Duration) -> Option<Timer> {
+    if crate::engine::forking() {
+        return None;
+    }
     TIMERS.with(|t| {
         let timers = &mut t.borrow_mut().timers;
         let first = timers
@@ -313,21 +512,19 @@ pub struct TimerId(u64);
 /// runs, it is owned there: cancelled when that owner is disposed (or the
 /// effect runs again), as ADR-0013 has timers owned.
 pub fn after(delay: Duration, f: impl Fn() + 'static) -> TimerId {
-    let id = NEXT_TIMER.with(|n| {
-        let id = n.get();
-        n.set(id.wrapping_add(1));
-        id
-    });
+    // Never minted from state a rollback restores: a fork's timer id kept
+    // past it names no live timer (ADR-0028, rule 3).
+    let id = crate::engine::unique_id(&NEXT_TIMER);
     TIMERS.with(|t| {
         t.borrow_mut().timers.push(Timer {
             due: current().saturating_add(delay),
             id,
-            run: Rc::new(f),
+            run: crate::engine::Stored::new(crate::engine::Site::Timer, Box::new(f)),
             owner: crate::reactive::owner(),
         });
     });
     if crate::reactive::has_owner() {
-        crate::reactive::on_cleanup(move || cancel(TimerId(id)));
+        crate::reactive::on_release(move || cancel(TimerId(id)));
     }
     TimerId(id)
 }
@@ -344,19 +541,32 @@ pub fn is_pending(timer: TimerId) -> bool {
     TIMERS.with(|t| t.borrow().is_pending(timer.0))
 }
 
+/// How many scheduled calls are pending (tests).
+#[cfg(test)]
+pub(crate) fn pending_timers() -> usize {
+    TIMERS.with(|t| t.borrow().timers.len())
+}
+
 /// Drop a scheduled call that has not run yet.
 pub fn cancel(timer: TimerId) {
     TIMERS.with(|t| t.borrow_mut().cancel(timer.0));
 }
 
 /// Run every timer that is due, earliest first; returns whether any ran.
+/// Each timer's work is a caller's closure, reached through the one gate
+/// ([`crate::engine::call_out`]) in the window it was set in, so one that
+/// panics leaves the others due to run: inside a turn (ADR-0015, the turn
+/// rule; the window's idle is one), its panic goes to the turn's arbiter;
+/// outside one, the first goes on once all have run.
 pub fn run_due_timers() -> bool {
     let now = current();
+    let mut all = crate::engine::Gather::new();
     let mut ran = false;
     while let Some(timer) = take_due(now) {
-        crate::reactive::run_owned(timer.owner, || (timer.run)());
+        run_timer(&timer, &mut all);
         ran = true;
     }
+    all.finish();
     ran
 }
 
@@ -523,6 +733,15 @@ impl Vsync {
         self.told = Some((tick.output, tick.sequence, tick.seen));
     }
 
+    /// Whether the display itself said its phase within [`TICK_FRESH`] of
+    /// `at` (its vsync source ticked, or a Wayland frame callback came): no
+    /// acquire need block to sample it (ADR-0033).
+    #[must_use]
+    pub fn told_lately(&self, at: Instant) -> bool {
+        let fresh = |seen: Instant| at.saturating_duration_since(seen) < TICK_FRESH;
+        self.told.is_some_and(|(_, _, seen)| fresh(seen)) || self.called.is_some_and(fresh)
+    }
+
     /// An acquire returned at `at` after waiting `waited`.
     pub fn acquired(&mut self, at: Instant, waited: Duration) {
         if waited < VSYNC_BLOCKED {
@@ -676,6 +895,22 @@ impl Vsync {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::rc::Rc;
+
+    /// Times a nanosecond apart, or closer than input is sampled, measure
+    /// no rate; 10 ms apart, theirs.
+    #[test]
+    fn a_rate_is_measured_over_a_span_of_time_never_over_an_instant() {
+        let at = 1_000_000_000;
+        assert_eq!(rate((10.0, 0.0), at, at + 1), None, "one nanosecond");
+        assert_eq!(rate((10.0, 0.0), at, at + 1_999_999), None, "under 2 ms");
+        assert_eq!(rate((10.0, 0.0), at + 1, at), None, "backwards");
+        let r = rate((10.0, -5.0), at, at + 10_000_000);
+        assert!(
+            r.is_some_and(|(x, y)| (x - 1_000.0).abs() < 0.1 && (y + 500.0).abs() < 0.1),
+            "{r:?}"
+        );
+    }
 
     #[test]
     fn a_scripted_clock_runs_timers_at_their_own_times_in_order() {
@@ -698,6 +933,49 @@ mod tests {
         assert!(advance_to(Duration::from_millis(3200)));
         assert_eq!(*seen.borrow(), [1.0, 2.0, -2.5, 3.0]);
         assert!((frame_time() - 3.2).abs() < 1e-6);
+    }
+
+    /// Codex 3 (F1 review 3): a timer id a fork handed out and kept past
+    /// its rollback names no live timer: cancelling it leaves the timer
+    /// set live after it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_timer_id_a_fork_kept_cancels_no_live_timer() {
+        script(Duration::ZERO);
+        let kept = {
+            let _cold = crate::engine::ColdFrame::begin();
+            after(Duration::from_secs(1), || {})
+        };
+        let live = after(Duration::from_secs(1), || {});
+        assert_ne!(kept, live);
+        cancel(kept);
+        assert!(is_pending(live), "the live timer stands");
+        cancel_all();
+    }
+
+    /// Codex 6 (F1 review 4): a check that sets a zero-delay timer and runs
+    /// the due ones, or moves the clock past a live one, runs no callback:
+    /// what a callback writes is the outside world's, which no rollback
+    /// puts back. The live timer runs live after it, once.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_check_runs_no_timer_callback() {
+        script(Duration::ZERO);
+        let ran = Rc::new(Cell::new(0_u32));
+        let r = Rc::clone(&ran);
+        let _live = after(Duration::from_millis(5), move || r.set(r.get() + 1));
+        {
+            let _cold = crate::engine::ColdFrame::begin();
+            let r = Rc::clone(&ran);
+            let _ = after(Duration::ZERO, move || r.set(r.get() + 10));
+            assert!(!run_due_timers(), "no callback runs in a fork");
+            assert!(!advance_to(Duration::from_secs(1)), "nor as the fork's clock moves");
+            assert_eq!(ran.get(), 0);
+        }
+        assert_eq!(ran.get(), 0, "the cell is unchanged after the rollback");
+        assert!(advance_to(Duration::from_millis(5)), "the live timer runs live");
+        assert_eq!(ran.get(), 1, "once, and the fork's never");
+        cancel_all();
     }
 
     #[test]
@@ -852,6 +1130,7 @@ mod tests {
     /// The wall time is sampled as a frame begins: it does not move while
     /// the frame is built, a cold build of the frame reads the same, and
     /// the next frame samples again.
+    #[cfg(debug_assertions)]
     #[test]
     fn the_wall_time_is_one_sample_per_frame_shared_by_the_cold_build() {
         begin_frame(0.0);

@@ -80,8 +80,10 @@ fn press(s: &mut Scenario, label: &str) {
     s.settle().expect("settled");
 }
 
-fn focused(h: FocusHandle) -> bool {
-    gui::focus::focused() == Some(h.id())
+/// Whether `h` holds focus in `s`'s window, read in a turn of it (outside
+/// any turn, focus is the thread window's: ADR-0015).
+fn focused(s: &mut Scenario, h: FocusHandle) -> bool {
+    s.read(gui::focus::focused) == Some(h.id())
 }
 
 fn focus(s: &mut Scenario, h: FocusHandle) {
@@ -91,16 +93,21 @@ fn focus(s: &mut Scenario, h: FocusHandle) {
 
 /// The bounds of the node named `name` in the last frame.
 fn bounds(s: &Scenario, name: &str) -> Option<Bounds> {
-    s.last().nodes.iter().find(|n| n.name == Some(name)).map(|n| n.bounds)
+    s.last()
+        .nodes
+        .iter()
+        .find(|n| n.name == Some(name))
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
 }
 
 fn has(s: &Scenario, name: &str) -> bool {
     bounds(s, name).is_some()
 }
 
-fn a11y(s: &Scenario) -> String {
+fn a11y(s: &mut Scenario) -> String {
     let mut ts = gui::text::TextSystem::new();
-    dump(&gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts))
+    let focus = s.read(gui::focus::focused);
+    dump(&gui::access::tree(s.last(), focus, 1.0, "w", &mut ts))
 }
 
 fn name(n: &Node) -> Option<String> {
@@ -228,7 +235,7 @@ fn collapsible_opens_by_its_trigger_unless_disabled() {
     s.act("keep", || keep.set(true));
     s.settle().expect("settled");
     assert!(has(&s, "content"), "kept mounted");
-    assert!(!a11y(&s).contains("Body"), "kept content is not read while closed");
+    assert!(!a11y(&mut s).contains("Body"), "kept content is not read while closed");
 }
 
 #[test]
@@ -259,9 +266,9 @@ fn collapsible_a11y() {
     let held: Held<Collapsible<Bind<bool>>> = Rc::default();
     let h = Rc::clone(&held);
     let mut s = scenario(move || collapsible(Bind::default_value(true), disabled, keep, &h));
-    insta::assert_snapshot!("collapsible_a11y_open", a11y(&s));
+    insta::assert_snapshot!("collapsible_a11y_open", a11y(&mut s));
     click(&mut s, "Toggle");
-    insta::assert_snapshot!("collapsible_a11y_closed", a11y(&s));
+    insta::assert_snapshot!("collapsible_a11y_closed", a11y(&mut s));
 }
 
 // ------------------------------------------------------------------ Accordion
@@ -343,24 +350,24 @@ fn accordion_keys_walk_its_own_usable_triggers() {
     });
     let a = held.get().expect("made").accordion;
     click(&mut s, "A");
-    let at = || {
-        let f = gui::focus::focused();
+    let at = |s: &mut Scenario| {
+        let f = s.read(gui::focus::focused);
         a.triggers()
             .with(|list| list.iter().position(|t| Some(t.focus.id()) == f))
     };
-    assert_eq!(at(), Some(0));
+    assert_eq!(at(&mut s), Some(0));
     plain(&mut s, NamedKey::ArrowDown);
-    assert_eq!(at(), Some(2), "ArrowDown skips the disabled B");
+    assert_eq!(at(&mut s), Some(2), "ArrowDown skips the disabled B");
     plain(&mut s, NamedKey::ArrowDown);
-    assert_eq!(at(), Some(0), "and wraps");
+    assert_eq!(at(&mut s), Some(0), "and wraps");
     plain(&mut s, NamedKey::ArrowUp);
-    assert_eq!(at(), Some(2), "ArrowUp wraps back");
+    assert_eq!(at(&mut s), Some(2), "ArrowUp wraps back");
     plain(&mut s, NamedKey::Home);
-    assert_eq!(at(), Some(0), "Home: the first usable");
+    assert_eq!(at(&mut s), Some(0), "Home: the first usable");
     plain(&mut s, NamedKey::End);
-    assert_eq!(at(), Some(2), "End: the last usable, not the disabled one");
+    assert_eq!(at(&mut s), Some(2), "End: the last usable, not the disabled one");
     plain(&mut s, NamedKey::ArrowRight);
-    assert_eq!(at(), Some(2), "vertical: across arrows do nothing");
+    assert_eq!(at(&mut s), Some(2), "vertical: across arrows do nothing");
     plain(&mut s, NamedKey::Enter);
     assert!(a.is_open(&"c"), "Enter on a trigger opens its section");
 }
@@ -370,8 +377,8 @@ fn accordion_a11y() {
     let options = Signal::new(AccordionOptions::default());
     let held: Held<Sections> = Rc::default();
     let h = Rc::clone(&held);
-    let s = scenario(move || accordion(Bind::default_value(Some("a")), options, &h));
-    insta::assert_snapshot!("accordion_a11y", a11y(&s));
+    let mut s = scenario(move || accordion(Bind::default_value(Some("a")), options, &h));
+    insta::assert_snapshot!("accordion_a11y", a11y(&mut s));
 }
 
 // ----------------------------------------------------------------------- Tabs
@@ -415,18 +422,21 @@ fn tabs_automatic_selects_as_focus_moves_and_skips_disabled() {
     let mut s = scenario(move || tabs(Bind::default_value("a"), options, &h));
     let (t, f) = held.get().expect("made");
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[0]), "Tab reaches the selected tab");
+    assert!(focused(&mut s, f[0]), "Tab reaches the selected tab");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[2]), "ArrowRight skips the disabled tab");
+    assert!(focused(&mut s, f[2]), "ArrowRight skips the disabled tab");
     assert_eq!(t.value(), "c", "automatic: focus selects");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[0]) && t.value() == "a", "and wraps");
+    assert!(focused(&mut s, f[0]) && t.value() == "a", "and wraps");
     plain(&mut s, NamedKey::End);
-    assert!(focused(f[2]) && t.value() == "c");
+    assert!(focused(&mut s, f[2]) && t.value() == "c");
     plain(&mut s, NamedKey::Home);
-    assert!(focused(f[0]) && t.value() == "a");
+    assert!(focused(&mut s, f[0]) && t.value() == "a");
     plain(&mut s, NamedKey::Tab);
-    assert!(!focused(f[0]) && !focused(f[2]), "Tab leaves the list for the panel");
+    assert!(
+        !focused(&mut s, f[0]) && !focused(&mut s, f[2]),
+        "Tab leaves the list for the panel"
+    );
     press(&mut s, "Two");
     assert_eq!(t.value(), "a", "a disabled tab is not selected by a press");
     click(&mut s, "Three");
@@ -445,7 +455,7 @@ fn tabs_manual_selects_on_enter_and_space_only() {
     let (t, f) = held.get().expect("made");
     focus(&mut s, f[0]);
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[2]));
+    assert!(focused(&mut s, f[2]));
     assert_eq!(t.value(), "a", "manual: focus alone selects nothing");
     plain(&mut s, NamedKey::Enter);
     assert_eq!(t.value(), "c", "Enter selects");
@@ -462,9 +472,9 @@ fn tabs_manual_selects_on_enter_and_space_only() {
     });
     s.settle().expect("settled");
     plain(&mut s, NamedKey::ArrowDown);
-    assert!(focused(f[2]), "vertical: ArrowDown");
+    assert!(focused(&mut s, f[2]), "vertical: ArrowDown");
     plain(&mut s, NamedKey::ArrowRight);
-    assert!(focused(f[2]), "vertical: across arrows do nothing");
+    assert!(focused(&mut s, f[2]), "vertical: across arrows do nothing");
 }
 
 #[test]
@@ -548,8 +558,8 @@ fn tabs_a11y() {
     let options = Signal::new(TabsOptions::default());
     let held: TabsHeld = Rc::default();
     let h = Rc::clone(&held);
-    let s = scenario(move || tabs(Bind::default_value("a"), options, &h));
-    insta::assert_snapshot!("tabs_a11y", a11y(&s));
+    let mut s = scenario(move || tabs(Bind::default_value("a"), options, &h));
+    insta::assert_snapshot!("tabs_a11y", a11y(&mut s));
 }
 
 // ----------------------------------------------------------------- Pagination
@@ -658,20 +668,20 @@ fn pagination_clamps_a_page_written_out_of_range_when_asked() {
     };
     // Not asked: a page written past the count stays as written, and no
     // button is the current one.
-    let (s, _, p) = clamped(false, &heard);
+    let (mut s, _, p) = clamped(false, &heard);
     assert_eq!(p.page(), 15);
     assert!((1..=10).all(|n| !p.is_current(n)));
     assert!(heard.borrow().is_empty(), "nothing to tell");
-    assert!(!a11y(&s).contains("current="), "no page is current");
+    assert!(!a11y(&mut s).contains("current="), "no page is current");
     // Asked: corrected from the first value on, before the first frame,
     // and told once.
     let (mut s, options, p) = clamped(true, &heard);
     assert_eq!(p.page(), 10, "page 15 of 10 is page 10 from the start");
     assert_eq!(*heard.borrow(), [10], "told once");
     assert!(
-        a11y(&s).contains("\"Page 10\" current=Page"),
+        a11y(&mut s).contains("\"Page 10\" current=Page"),
         "the first frame shows page 10:\n{}",
-        a11y(&s)
+        a11y(&mut s)
     );
     s.act("fewer items", || {
         options.set(PaginationOptions {
@@ -694,8 +704,8 @@ fn pagination_a11y() {
     let options = Signal::new(ten_pages());
     let held: Held<Pagination<Bind<usize>>> = Rc::default();
     let h = Rc::clone(&held);
-    let s = scenario(move || pagination(Bind::default_value(1), options, &h));
-    insta::assert_snapshot!("pagination_a11y", a11y(&s));
+    let mut s = scenario(move || pagination(Bind::default_value(1), options, &h));
+    insta::assert_snapshot!("pagination_a11y", a11y(&mut s));
 }
 
 // --------------------------------------------------------------------- Avatar
@@ -1095,7 +1105,7 @@ fn scroll_area_virtualizer_builds_the_rows_in_view_and_keeps_the_focused_ones() 
         })
         .into_element()
     });
-    let (area, list) = held.borrow().clone().expect("made");
+    let (area, list) = held.borrow().expect("made");
     s.settle().expect("settled");
     let built = |s: &Scenario, i: u64| s.locate(&format!("row {i}")).is_ok();
     // 140 px shows five rows; twelve rows' worth (28 px each) beyond it.
@@ -1179,9 +1189,10 @@ fn scroll_area_virtualizer_a11y() {
         .into_element()
     });
     s.settle().expect("settled");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     let mut ts = gui::text::TextSystem::new();
-    let update = gui::access::tree(s.last(), gui::focus::focused(), 1.0, "w", &mut ts);
+    let focus = s.read(gui::focus::focused);
+    let update = gui::access::tree(s.last(), focus, 1.0, "w", &mut ts);
     let list = update
         .nodes
         .iter()
@@ -1291,11 +1302,11 @@ fn splitter_keys_move_collapse_and_cycle() {
     plain(&mut s, NamedKey::Home);
     assert_eq!(sp.layout()[0], 5.0, "Home: collapsed");
     plain(&mut s, NamedKey::F6);
-    assert!(focused(f[1]), "F6: the next handle");
+    assert!(focused(&mut s, f[1]), "F6: the next handle");
     plain(&mut s, NamedKey::F6);
-    assert!(focused(f[0]), "and wraps");
+    assert!(focused(&mut s, f[0]), "and wraps");
     shift(&mut s, NamedKey::F6);
-    assert!(focused(f[1]), "Shift+F6: the previous");
+    assert!(focused(&mut s, f[1]), "Shift+F6: the previous");
     let before = sp.layout()[2];
     plain(&mut s, NamedKey::ArrowLeft);
     assert_eq!(sp.layout()[2], before + 10.0, "the last panel grows");
@@ -1344,7 +1355,7 @@ fn splitter_disabled_handle_keeps_focus_moves_nothing_and_f6_passes_it() {
     let start = sp.layout();
     focus(&mut s, f[0]);
     plain(&mut s, NamedKey::Tab);
-    assert!(focused(f[1]), "a disabled handle stays in the Tab order");
+    assert!(focused(&mut s, f[1]), "a disabled handle stays in the Tab order");
     for k in [
         NamedKey::ArrowRight,
         NamedKey::ArrowLeft,
@@ -1363,19 +1374,22 @@ fn splitter_disabled_handle_keeps_focus_moves_nothing_and_f6_passes_it() {
         .iter()
         .filter(|n| n.name == Some("handle"))
         .nth(1)
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .expect("the second handle");
     let (x, y) = (b.x + 1.0, b.y + 50.0);
     s.drag((x, y), (x + 60.0, y));
     s.settle().expect("settled");
     assert_eq!(sp.layout(), start, "nor a drag");
     plain(&mut s, NamedKey::F6);
-    assert!(focused(f[0]), "F6 leaves it");
+    assert!(focused(&mut s, f[0]), "F6 leaves it");
     plain(&mut s, NamedKey::F6);
-    assert!(focused(f[0]), "and passes it: the only usable handle wraps to itself");
+    assert!(
+        focused(&mut s, f[0]),
+        "and passes it: the only usable handle wraps to itself"
+    );
     shift(&mut s, NamedKey::F6);
-    assert!(focused(f[0]), "Shift+F6 passes it too");
-    let tree = a11y(&s);
+    assert!(focused(&mut s, f[0]), "Shift+F6 passes it too");
+    let tree = a11y(&mut s);
     assert!(
         tree.lines()
             .any(|l| l.contains("Splitter \"Resize panel 2\"") && l.contains("disabled")),
@@ -1670,8 +1684,9 @@ fn splitter_a11y() {
     let held: SplitHeld = Rc::default();
     let h = Rc::clone(&held);
     // The second handle disabled: read as disabled, still named and valued.
-    let s = scenario(move || splitter_with(Bind::default_value(vec![40.0, 30.0, 30.0]), Direction::Ltr, &h, Some(1)));
-    insta::assert_snapshot!("splitter_a11y", a11y(&s));
+    let mut s =
+        scenario(move || splitter_with(Bind::default_value(vec![40.0, 30.0, 30.0]), Direction::Ltr, &h, Some(1)));
+    insta::assert_snapshot!("splitter_a11y", a11y(&mut s));
 }
 
 // ------------------------------------------------------------------- Carousel
@@ -1845,7 +1860,7 @@ fn carousel_steps_by_buttons_and_keys_within_its_snaps() {
     assert_eq!(c.position(), 1.0);
     // The root is a Tab stop and takes the keys while it holds focus.
     plain(&mut s, NamedKey::Tab);
-    assert!(gui::focus::focused().is_some(), "the root is a Tab stop");
+    assert!(s.read(gui::focus::focused).is_some(), "the root is a Tab stop");
     plain(&mut s, NamedKey::ArrowRight);
     assert_eq!(c.index(), 2, "ArrowRight: the next snap");
     key(
@@ -2143,13 +2158,13 @@ fn carousel_hands_focus_on_to_the_slide_coming_in() {
     let first = handles.borrow()[0];
     let second = handles.borrow()[1];
     focus(&mut s, first);
-    assert!(focused(first));
+    assert!(focused(&mut s, first));
     s.act("go", || c.go(1));
     s.settle().expect("settled");
     s.at(1.0);
     s.settle().expect("settled");
     assert!(
-        focused(second),
+        focused(&mut s, second),
         "focus in the slide going out moves to the one coming in"
     );
 }
@@ -2419,7 +2434,8 @@ fn carousel_rotation_pauses_hidden_and_stops_for_keyboard_focus_and_reduced_moti
     let c = held.get().expect("made");
     s.act("hide", || gui::environment::set_window_visible(false));
     s.settle().expect("settled");
-    assert!(c.paused(), "a hidden window pauses it");
+    // Visibility is the window's: read in a turn of it (ADR-0015).
+    assert!(s.read(|| c.paused()), "a hidden window pauses it");
     s.at(3.0);
     s.settle().expect("settled");
     assert_eq!(c.index(), 0);
@@ -2429,7 +2445,7 @@ fn carousel_rotation_pauses_hidden_and_stops_for_keyboard_focus_and_reduced_moti
     assert_eq!(c.index(), 1, "seen again, it counts its delay afresh");
     s.act("window", || gui::environment::set_window_size((800.0, 600.0)));
     s.settle().expect("settled");
-    assert!(!c.paused(), "in the window");
+    assert!(!s.read(|| c.paused()), "in the window");
     // Keyboard focus coming in stops it.
     plain(&mut s, NamedKey::Tab);
     assert!(!c.playing(), "keyboard focus in the carousel stops it");
@@ -2451,7 +2467,7 @@ fn carousel_slides_out_of_view_are_hidden_and_named_by_place() {
     };
     let mut s = scenario(move || carousel(Bind::default_value(0), &setup, &h));
     s.play_motion();
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(tree.contains("\"1 of 4\""), "a slide is named by its place:\n{tree}");
     assert!(!tree.contains("\"2 of 4\""), "slides out of view are hidden:\n{tree}");
     let view = bounds(&s, "content").expect("laid out");
@@ -2462,9 +2478,10 @@ fn carousel_slides_out_of_view_are_hidden_and_named_by_place() {
     s.settle().expect("settled");
     let on_screen = |s: &Scenario, label: &str| {
         s.last().nodes.iter().any(|n| {
+            let b = n.bounds(gui::inspect::OUTSIDE);
             !n.look.invisible
-                && n.bounds.x + n.bounds.width > view.x + 1.0
-                && n.bounds.x < view.x + view.width - 1.0
+                && b.x + b.width > view.x + 1.0
+                && b.x < view.x + view.width - 1.0
                 && matches!(&n.content, gui::layout::Content::Text { content, .. } if &**content == label)
         })
     };
@@ -2473,14 +2490,14 @@ fn carousel_slides_out_of_view_are_hidden_and_named_by_place() {
         "the slide going out is still on screen and paints"
     );
     assert!(on_screen(&s, "Open 2"), "and the one coming in");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("\"2 of 4\"") && tree.contains("\"1 of 4\""),
         "on its way, both on screen are read:\n{tree}"
     );
     s.wait(Duration::from_millis(1000));
     s.settle().expect("settled");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(tree.contains("\"2 of 4\"") && !tree.contains("\"1 of 4\""), "{tree}");
 }
 
@@ -2519,14 +2536,14 @@ fn carousel_indicators_are_tabs_moving_by_arrows() {
     // Arrived: the slides it passed on its way sleep again.
     s.wait(Duration::from_millis(1000));
     s.settle().expect("settled");
-    insta::assert_snapshot!("carousel_indicators_a11y", a11y(&s));
+    insta::assert_snapshot!("carousel_indicators_a11y", a11y(&mut s));
 }
 
 #[test]
 fn carousel_a11y() {
     let held: CarouselHeld = Rc::default();
-    let s = plain_carousel(&held);
-    insta::assert_snapshot!("carousel_a11y", a11y(&s));
+    let mut s = plain_carousel(&held);
+    insta::assert_snapshot!("carousel_a11y", a11y(&mut s));
 }
 
 #[test]
@@ -2539,14 +2556,14 @@ fn carousel_lone_indicators_go_to_their_slide_and_control_the_content() {
     };
     let mut s = scenario(move || carousel(Bind::default_value(0), &setup, &h));
     let c = held.get().expect("made");
-    insta::assert_snapshot!("carousel_lone_indicators_a11y", a11y(&s));
+    insta::assert_snapshot!("carousel_lone_indicators_a11y", a11y(&mut s));
     click(&mut s, "Dot 3");
     s.wait(Duration::from_millis(1000));
     s.settle().expect("settled");
     assert_eq!(c.index(), 2, "a lone indicator goes to its slide");
     press(&mut s, "Dot 3");
     assert_eq!(c.index(), 2, "the current one is unavailable");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.lines()
             .any(|l| l.contains("\"Go to slide 3\"") && l.contains("disabled") && l.contains("controls=")),
@@ -2693,9 +2710,9 @@ fn tabs_keys_with_modifiers_pages_and_leaving_backwards() {
     let (t, f) = held.get().expect("made");
     focus(&mut s, f[0]);
     plain(&mut s, NamedKey::PageDown);
-    assert!(focused(f[2]) && t.value() == "c", "PageDown: the last usable");
+    assert!(focused(&mut s, f[2]) && t.value() == "c", "PageDown: the last usable");
     plain(&mut s, NamedKey::PageUp);
-    assert!(focused(f[0]) && t.value() == "a", "PageUp: the first");
+    assert!(focused(&mut s, f[0]) && t.value() == "a", "PageUp: the first");
     for m in [
         Modifiers {
             control: true,
@@ -2715,11 +2732,11 @@ fn tabs_keys_with_modifiers_pages_and_leaving_backwards() {
         },
     ] {
         key(&mut s, NamedKey::ArrowRight, m);
-        assert!(focused(f[0]) && t.value() == "a", "{m:?}: not handled");
+        assert!(focused(&mut s, f[0]) && t.value() == "a", "{m:?}: not handled");
     }
     shift(&mut s, NamedKey::Tab);
     assert!(
-        !focused(f[0]) && !focused(f[2]) && gui::focus::focused().is_some(),
+        !focused(&mut s, f[0]) && !focused(&mut s, f[2]) && s.read(gui::focus::focused).is_some(),
         "Shift+Tab leaves the list at once"
     );
 }
@@ -2742,10 +2759,10 @@ fn tabs_control_press_neither_selects_nor_focuses() {
     s.send(Input::MouseUp { x, y });
     s.settle().expect("settled");
     assert_eq!(t.value(), "a", "a Control press is a secondary click: no selection");
-    assert!(!focused(f[2]), "and no focus");
+    assert!(!focused(&mut s, f[2]), "and no focus");
     s.send(Input::Modifiers(Modifiers::default()));
     click(&mut s, "Three");
-    assert!(focused(f[2]) && t.value() == "c");
+    assert!(focused(&mut s, f[2]) && t.value() == "c");
 }
 
 #[test]
@@ -2773,7 +2790,7 @@ fn tabs_controlled_by_a_value_only_asks() {
 
 #[test]
 fn avatar_a11y() {
-    let s = scenario(move || {
+    let mut s = scenario(move || {
         component((), move |_| {
             let avatar = Avatar::new();
             let _image = avatar.image(|| ImageLoad::Failed, |_| {});
@@ -2787,7 +2804,7 @@ fn avatar_a11y() {
         })
         .into_element()
     });
-    insta::assert_snapshot!("avatar_a11y", a11y(&s));
+    insta::assert_snapshot!("avatar_a11y", a11y(&mut s));
 }
 
 #[test]
@@ -2814,13 +2831,13 @@ fn avatar_without_an_image_is_idle_and_shows_its_fallback() {
 
 #[test]
 fn aspect_ratio_a11y() {
-    let s = scenario(move || {
+    let mut s = scenario(move || {
         div()
             .width(320.0)
             .child(frame(4.0 / 3.0, div().named("ratio").child(label("photo", "Photo"))))
             .into_element()
     });
-    insta::assert_snapshot!("aspect_ratio_a11y", a11y(&s));
+    insta::assert_snapshot!("aspect_ratio_a11y", a11y(&mut s));
 }
 
 // ------------------------------------------------- ScrollArea, more of it
@@ -3097,8 +3114,8 @@ fn scroll_area_a11y() {
     let options = area_options(Policy::Always, Bars::Both);
     let held: AreaHeld = Rc::default();
     let h = Rc::clone(&held);
-    let s = scenario(move || area(options, Direction::Ltr, (1000.0, 1000.0), &h));
-    insta::assert_snapshot!("scroll_area_a11y", a11y(&s));
+    let mut s = scenario(move || area(options, Direction::Ltr, (1000.0, 1000.0), &h));
+    insta::assert_snapshot!("scroll_area_a11y", a11y(&mut s));
 }
 
 // --------------------------------------------------- Splitter, more of it
@@ -3533,7 +3550,7 @@ fn a_splitter_handle_whose_panel_never_mounts_leaves_no_entry() {
     let sp = held.get().expect("the splitter");
     for i in 1..=1000 {
         s.act("the handle moves past a panel never mounted", || at.set(i));
-        let tree = a11y(&s);
+        let tree = a11y(&mut s);
         assert!(
             !tree.contains("controls="),
             "round {i}: the handle controls nothing:\n{tree}"
@@ -3583,7 +3600,7 @@ fn a_tab_panel_whose_tab_never_mounts_leaves_nothing_behind() {
     // Each value held by the parts of the last two renders (what may be on
     // screen): the two tabs' and the panels', bounded however many come.
     assert!(most <= 5, "kept {most} values, 2 tabs and 2 panels shown");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("Tab \"One\" selected controls=TabPanel") && tree.contains("TabPanel labelled-by=One"),
         "the tab still controls its own panel:\n{tree}"
@@ -3635,7 +3652,7 @@ fn a_tab_that_leaves_for_a_layout_finds_its_panel_again() {
     s.settle().expect("settled");
     s.act("the tab comes back", || shown.set(true));
     s.settle().expect("settled");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("Tab \"One\" selected controls=TabPanel") && tree.contains("TabPanel labelled-by=One"),
         "the tab controls its panel again, which it names:\n{tree}"
@@ -3776,7 +3793,7 @@ fn carousel_slides_that_come_and_go_leave_nothing_behind() {
         most = most.max(c.kept_slides());
     }
     assert_eq!(most, 4, "the most slides shown at once");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("Tab \"Slide 1\" selected controls=TabPanel") && tree.contains("TabPanel labelled-by=Slide 1"),
         "the first dot still controls its slide, and names it:\n{tree}"
@@ -3946,7 +3963,7 @@ fn a_virtual_viewport_follows_the_list_a_sibling_makes_and_replaces() {
     assert!(s.locate("row 0").is_ok(), "the rows show on the list");
     s.act("another part replaces it", || maker.set(2));
     s.settle().expect("settled");
-    let second = made.borrow().clone().expect("the second list");
+    let second = made.borrow().expect("the second list");
     s.act("the new list goes down", || second.scroll_to_row(500));
     s.settle().expect("settled");
     assert!(
@@ -3992,7 +4009,7 @@ fn tabs_whose_values_hash_alike_name_nodes_of_their_own() {
         .into_element()
     });
     s.settle().expect("settled");
-    let tree = a11y(&s);
+    let tree = a11y(&mut s);
     assert!(
         tree.contains("Tab \"One\" selected controls=TabPanel") && tree.contains("TabPanel labelled-by=One\n"),
         "the panel is its own tab's:\n{tree}"

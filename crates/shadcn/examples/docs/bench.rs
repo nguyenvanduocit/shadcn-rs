@@ -444,7 +444,7 @@ fn page(p: &'static Page, options: &Options) -> Result<Bench, ScenarioError> {
     let mut rounds = vec![steady_round(&mut s, options.frames, &mut counter, &mut per_frame)?];
     let rest = s.footprint();
 
-    let viewport = s.last().viewport;
+    let viewport = s.last().viewport(gui::inspect::OUTSIDE);
     let all = s.last().pointer_targets();
     let targets: Vec<Bounds> = all
         .iter()

@@ -47,13 +47,16 @@ impl<T: PartialEq + 'static> Computed<T> {
     pub fn new(f: impl Fn() -> T + 'static) -> Self {
         let created_at = Location::caller();
         let cell: Rc<Cell<T>> = Rc::new(RefCell::new(None));
-        let id = runtime::with(|rt| {
-            let id = rt.alloc(Kind::Computed, flag::NONE, created_at);
-            if let Some(n) = rt.live_mut(id) {
-                n.value = Some(cell);
-            }
-            rt.adopt(id);
-            id
+        // Making a handle: the arena's own bookkeeping ([`crate::engine::allocating`]).
+        let id = crate::engine::allocating(|| {
+            runtime::with(|rt| {
+                let id = rt.alloc(Kind::Computed, flag::NONE, created_at);
+                if let Some(n) = rt.live_mut(id) {
+                    n.value = Some(cell);
+                }
+                rt.adopt(id);
+                id
+            })
         });
         // The value is the node's, found as it computes: a cold frame's copy
         // of the node keeps its own ([`runtime::cold_owns`]).
@@ -80,10 +83,12 @@ impl<T: PartialEq + 'static> Computed<T> {
             drop(old);
             true
         });
-        runtime::with(|rt| {
-            if let Some(n) = rt.live_mut(id) {
-                n.update = Some(update);
-            }
+        crate::engine::allocating(|| {
+            runtime::with(|rt| {
+                if let Some(n) = rt.live_mut(id) {
+                    n.update = Some(update);
+                }
+            });
         });
         Self {
             id,
@@ -94,7 +99,8 @@ impl<T: PartialEq + 'static> Computed<T> {
 }
 
 impl<T: 'static> Computed<T> {
-    /// Up to date, and subscribed by the running reader.
+    /// Up to date, and subscribed by the running reader. A Shared init
+    /// reads none: [`runtime::with`] refuses it (ADR-0028, R4).
     fn fresh(&self) -> Rc<Cell<T>> {
         let i = self.id.index;
         if runtime::with(|rt| rt.live(self.id).is_none()) {

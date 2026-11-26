@@ -109,7 +109,7 @@
 //! (`:61-69`), which only that mode reads, are not built (ADR-0025, group 8
 //! second review fixes, item 1).
 
-use std::cell::Cell;
+use gui::engine::WorldCell;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -358,12 +358,12 @@ struct State {
     /// The viewport's focus: Space scrolls only while it has it.
     focus: gui::FocusHandle,
     /// The sizes the last overflow check was asked for.
-    sized: Cell<((f32, f32), (f32, f32))>,
+    sized: WorldCell<((f32, f32), (f32, f32))>,
     /// The virtualizer's rows, while the part that made them is mounted
     /// ([`ScrollArea::virtualizer`]): they scroll, not `handle`.
     list: gui::Holder<ListState>,
     /// The row holding focus in the virtualizer, as last laid out.
-    focused_row: Cell<Option<u64>>,
+    focused_row: WorldCell<Option<u64>>,
 }
 
 /// A scroll area's state: made once in its root's setup, `Copy`. Its
@@ -408,9 +408,9 @@ impl ScrollArea {
                 options: Rc::new(options),
                 direction: direction.into(),
                 focus: gui::FocusHandle::new(),
-                sized: Cell::new(((-1.0, -1.0), (-1.0, -1.0))),
+                sized: WorldCell::new("a scroll area's sizes checked", ((-1.0, -1.0), (-1.0, -1.0))),
                 list: gui::Holder::new(),
-                focused_row: Cell::new(None),
+                focused_row: WorldCell::new("a scroll area's focused row", None),
             }),
         };
         let handle = me.handle();
@@ -429,7 +429,7 @@ impl ScrollArea {
     /// through its list instead ([`ScrollArea::virtualizer`]).
     #[must_use]
     pub fn handle(self) -> ScrollHandle {
-        self.state.with_untracked(|s| s.handle.clone())
+        self.state.with_untracked(|s| s.handle)
     }
 
     /// The virtualizer's rows, when the viewport is one (untracked: for
@@ -487,7 +487,7 @@ impl ScrollArea {
         // The list is read from the state, not held by its own hook.
         let me = self;
         list.on_layout(move |l| me.metrics.is_alive() && me.list().is_some_and(|list| me.list_laid_out(&list, l)));
-        self.state.with_untracked(|s| s.list).hold(list.clone());
+        self.state.with_untracked(|s| s.list).hold(list);
         list
     }
 
@@ -752,9 +752,9 @@ impl ScrollArea {
     #[must_use]
     pub fn viewport(self, d: Div) -> Div {
         let axis = |on: bool| if on { Overflow::Scroll } else { Overflow::Hidden };
-        let (handle, focus) = self.state.with_untracked(|s| (s.handle.clone(), s.focus));
+        let (handle, focus) = self.state.with_untracked(|s| (s.handle, s.focus));
         let bars = self.options().bars;
-        let keys = handle.clone();
+        let keys = handle;
         d.overflow_y(axis(bars.vertical()))
             .overflow_x(axis(bars.horizontal()))
             .scrollbar_hidden(true)

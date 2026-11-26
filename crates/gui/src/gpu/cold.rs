@@ -41,7 +41,7 @@ impl GpuRenderer {
     }
 
     /// Data chunks checked against cold ones so far (tests).
-    #[cfg(test)]
+    #[cfg(all(test, debug_assertions))]
     pub(crate) fn chunks_checked_cold(&self) -> usize {
         self.data.checked
     }

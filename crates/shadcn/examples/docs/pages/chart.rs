@@ -294,10 +294,8 @@ fn nth_named(s: &Shot, name: &str, n: usize, dy: f32) -> Result<(f32, f32), Scen
         .filter(|node| node.name == Some(name))
         .nth(n)
         .map(|node| {
-            (
-                node.bounds.x + node.bounds.width / 2.0,
-                node.bounds.y + node.bounds.height / 2.0 + dy,
-            )
+            let b = node.bounds(gui::inspect::OUTSIDE);
+            (b.x + b.width / 2.0, b.y + b.height / 2.0 + dy)
         })
         .ok_or_else(|| ScenarioError::TextNotFound(name.to_owned()))
 }

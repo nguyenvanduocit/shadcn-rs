@@ -61,12 +61,18 @@ use crate::layout::{Behaviour, Changed, Content, Frame, FrameNode, ReadAt, Since
 use crate::style::ResolvedText;
 use crate::text::{TextRun, TextSystem};
 
+/// Accessibility's reader of laid-out geometry ([`crate::layout::Sight`]).
+#[derive(Clone, Copy)]
+pub(crate) struct Sight(());
+
+/// Accessibility's [`Sight`].
+const SIGHT: Sight = Sight(());
+
 /// The window, the root every layer hangs from.
 const WINDOW: NodeId = NodeId(0);
 
-crate::engine::engine_local! {
-    [Fork] static NEXT_REF: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
-}
+/// The node refs made, numbered.
+static NEXT_REF: crate::engine::IdKind = crate::engine::IdKind::new("node ref");
 
 /// A node's name for other nodes' relations to it: made once (a
 /// component's setup), given to the node with `.node_ref`, and to others'
@@ -84,11 +90,7 @@ impl Default for NodeRef {
 impl NodeRef {
     #[must_use]
     pub fn new() -> Self {
-        Self(NEXT_REF.with(|n| {
-            let id = n.get();
-            n.set(id.wrapping_add(1));
-            id
-        }))
+        Self(crate::engine::unique_id(&NEXT_REF))
     }
 }
 
@@ -509,14 +511,14 @@ impl Accessibility {
         let window = WindowKept {
             title: title.to_owned(),
             scale,
-            viewport: frame.viewport,
+            viewport: frame.viewport(SIGHT),
             children,
         };
         if self.window.as_ref() != Some(&window) {
             let mut node = Node::new(Role::Window);
             node.set_label(title);
             node.set_transform(Affine::scale(f64::from(scale)));
-            node.set_bounds(rect(frame.viewport));
+            node.set_bounds(rect(frame.viewport(SIGHT)));
             node.set_children(window.children.clone());
             nodes.push((WINDOW, node));
             self.window = Some(window);
@@ -745,14 +747,14 @@ impl Accessibility {
         let scrolls = parent.is_some_and(|s| s.scrolls);
         let unavailable = b.semantics.unavailable || parent.is_some_and(|s| s.unavailable);
         let outer = parent.map_or((0.0, 0.0), |s| s.space);
-        let space = n.scroll.map_or(outer, |sc| {
+        let space = n.scroll(SIGHT).map_or(outer, |sc| {
             let rtl = n.look.text.direction == crate::style::Direction::Rtl;
             let x = if rtl {
-                n.bounds.x + sc.offset.0
+                n.bounds(SIGHT).x + sc.offset.0
             } else {
-                n.bounds.x - sc.offset.0
+                n.bounds(SIGHT).x - sc.offset.0
             };
-            (x, n.bounds.y - sc.offset.1)
+            (x, n.bounds(SIGHT).y - sc.offset.1)
         });
         let hidden = n.parent.is_none() && i < self.floor;
         let Some(mut inputs) = inputs_of(frame, i, b, set, scrolls, unavailable, outer, space, hidden) else {
@@ -807,7 +809,7 @@ impl Accessibility {
             slot: Some(Slot {
                 id,
                 set: s.row_count.map(|rows| (role, rows)).or(set),
-                scrolls: scrolls || n.scroll.is_some(),
+                scrolls: scrolls || n.scroll(SIGHT).is_some(),
                 unavailable,
                 space,
             }),
@@ -908,7 +910,7 @@ fn inputs_of<'f>(
     };
     let mut inputs = Inputs {
         role,
-        bounds: local(n.bounds, space),
+        bounds: local(n.bounds(SIGHT), space),
         transform: (space != outer).then_some((space.0 - outer.0, space.1 - outer.1)),
         label,
         value: None,
@@ -957,9 +959,11 @@ fn inputs_of<'f>(
             // Its runs are in its content's space as laid out unscrolled:
             // the node's transform carries its scroll, so a scroll alone
             // moves the node and none of its runs.
-            let unscrolled = n.scroll.map_or(space, |_| (n.bounds.x, n.bounds.y));
+            let unscrolled = n
+                .scroll(SIGHT)
+                .map_or(space, |_| (n.bounds(SIGHT).x, n.bounds(SIGHT).y));
             inputs.field = Some(Field {
-                area: local(n.content_box, unscrolled),
+                area: local(n.content_box(SIGHT), unscrolled),
                 text: text.clone(),
                 multiline: *multiline,
                 focused: *focused,
@@ -1223,7 +1227,7 @@ pub(crate) fn selection_in(
         return None;
     };
     let field = Field {
-        area: n.content_box,
+        area: n.content_box(SIGHT),
         text: t.clone(),
         multiline: *multiline,
         focused: *focused,

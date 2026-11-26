@@ -76,9 +76,11 @@ pub enum DismissReason {
 }
 
 /// A layer owner's answer to a dismiss request.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Dismiss {
-    /// It closes (the owner wrote its open state).
+    /// It closes (the owner wrote its open state). The answer with no
+    /// veto asked (a layer with none closes).
+    #[default]
     Close,
     /// It stays: the request is refused. The input that caused it goes on
     /// as it would have (a vetoed press outside still presses what it is on).
@@ -274,12 +276,18 @@ impl Layer {
         if !self.policy.takes(reason) {
             return None;
         }
-        self.on_dismiss.as_ref().map(|f| f(reason))
+        // The owner's closure, through the one gate: a fork asks no one
+        // (ADR-0028, rule 5), and a request no one answers is not taken.
+        self.on_dismiss
+            .as_ref()
+            .and_then(|f| crate::engine::call_out(crate::engine::Site::Dismiss, || f(reason)))
     }
 }
 
+/// The layer handles made, numbered.
+static NEXT_HANDLE: crate::engine::IdKind = crate::engine::IdKind::new("layer handle");
+
 crate::engine::engine_local! {
-    [Fork] static NEXT_HANDLE: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
     /// Who answers each handle's requests, as the last settled frame has it.
     [Fresh] static ANSWERS: RefCell<Vec<(LayerHandle, DismissHandler)>> = const { RefCell::new(Vec::new()) };
 }
@@ -298,11 +306,7 @@ impl Default for LayerHandle {
 impl LayerHandle {
     #[must_use]
     pub fn new() -> Self {
-        Self(NEXT_HANDLE.with(|n| {
-            let id = n.get();
-            n.set(id.wrapping_add(1));
-            id
-        }))
+        Self(crate::engine::unique_id(&NEXT_HANDLE))
     }
 
     /// Whether a layer with this handle is open in the last frame.
@@ -340,6 +344,10 @@ pub(crate) struct Stack {
     /// Per frame layer number, the node its Tab stops follow: its owner,
     /// or the keyed node inside it it asks for.
     pub(crate) tab_owners: Vec<Option<usize>>,
+    /// Per frame layer number, the key its Tab stops were asked to follow
+    /// when `tab_owners` was read for it: a layer whose root a pass wrote
+    /// in place is read again only when it asks for another.
+    tab_keys: Vec<Option<crate::element::ElementKey>>,
     /// The first node that takes input: every node before it is below the
     /// top modal layer. 0 without one.
     pub(crate) floor: usize,
@@ -347,58 +355,137 @@ pub(crate) struct Stack {
     pub(crate) modal: Option<usize>,
     /// Which frame this was read from: its epoch and change count
     /// ([`Changes::end`](crate::layout::Changes::end)).
-    read: Option<(u64, usize)>,
+    read: crate::layout::ReadAt,
 }
 
 impl Stack {
     /// The layers of `frame`, kept from the last call while it is the same
-    /// frame (its epoch and change log); read again into the same buffers,
-    /// so a frame without layers costs no allocation.
+    /// frame. Every table it keeps is brought up to date by the one read
+    /// of the frame's change log: written in place since, it costs what
+    /// was written. A node written is its own entry again; a layer's root
+    /// written is that layer's Tab owner read again when the layer asks
+    /// for another (a pass changes `tab_after` in place, a viewport's
+    /// panel following another trigger, and logs the root). Owners stay:
+    /// a write in place changes no path, so no node owns another layer.
+    /// Rebuilt, the whole frame is read, into the same buffers, so a frame
+    /// without layers costs no allocation.
     pub(crate) fn refresh(&mut self, frame: &Frame) {
-        let key = (frame.epoch(), frame.changes.end());
-        if self.read == Some(key) {
-            return;
+        match frame.changes.since(&mut self.read) {
+            crate::layout::Since::Logged(log) => {
+                if log.is_empty() {
+                    return;
+                }
+                for c in log {
+                    let Ok(i) = usize::try_from(c.index) else { continue };
+                    crate::interact::visited();
+                    // Layers lie in the frame in order: their roots ascend.
+                    if let Ok(k) = frame.layers.binary_search_by_key(&i, |l| l.root) {
+                        self.read_tab_owner(frame, k);
+                    }
+                    let now = self.entry_of(frame, i);
+                    match (self.entries.binary_search_by_key(&i, |e| e.node), now) {
+                        (Ok(at), Some(e)) => {
+                            if let Some(slot) = self.entries.get_mut(at) {
+                                *slot = e;
+                            }
+                        }
+                        (Ok(at), None) => {
+                            self.entries.remove(at);
+                        }
+                        (Err(at), Some(e)) => self.entries.insert(at, e),
+                        (Err(_), None) => {}
+                    }
+                }
+                self.top(frame);
+            }
+            crate::layout::Since::Rebuilt | crate::layout::Since::FellBehind => self.read_all(frame),
         }
-        self.read = Some(key);
+    }
+
+    /// Node `i`'s entry, if it is a layer shown.
+    fn entry_of(&self, frame: &Frame, i: usize) -> Option<Entry> {
+        let spec = frame.behaviour(i)?.handlers.layer.as_ref()?;
+        let n = frame.nodes.get(i)?;
+        frame.shown(i).then(|| Entry {
+            node: i,
+            layer: n.layer,
+            owner: self.owners.get(n.layer).copied().flatten(),
+            spec: Rc::clone(spec),
+        })
+    }
+
+    /// The top modal layer of the entries, and the floor below it.
+    fn top(&mut self, frame: &Frame) {
+        self.modal = self.entries.iter().rposition(|e| e.spec.modal);
+        self.floor = self
+            .modal
+            .and_then(|m| self.entries.get(m))
+            .map_or(0, |e| layer_start(frame, e.layer));
+    }
+
+    /// Read every layer of `frame`.
+    fn read_all(&mut self, frame: &Frame) {
+        self.read_layers(frame);
+        self.entries.clear();
+        for i in 0..frame.behaviour.len() {
+            crate::interact::visited();
+            if let Some(e) = self.entry_of(frame, i) {
+                self.entries.push(e);
+            }
+        }
+        self.top(frame);
+    }
+
+    /// Read `frame`'s layers: each one's owner, and the node its Tab stops
+    /// follow.
+    fn read_layers(&mut self, frame: &Frame) {
         self.owners.clear();
         self.owners.push(None);
         self.tab_owners.clear();
         self.tab_owners.push(None);
+        self.tab_keys.clear();
+        self.tab_keys.push(None);
         for l in &frame.layers {
             let owner = frame
                 .nodes
                 .get(l.root)
                 .and_then(|root| owner_of(frame, l.root, &root.path));
             self.owners.push(owner);
-            let part = owner.zip(l.tab_after).and_then(|(o, k)| {
-                let path = &frame.nodes.get(o)?.path.0;
-                (o..l.root).find(|&i| {
-                    frame.nodes.get(i).is_some_and(|n| {
-                        n.path.0.starts_with(path) && n.path.0.last().and_then(|s| s.element_key()) == Some(k)
-                    })
+            self.tab_owners.push(owner);
+            self.tab_keys.push(None);
+        }
+        for k in 0..frame.layers.len() {
+            self.read_tab_owner(frame, k);
+        }
+    }
+
+    /// Read the node frame layer `k` (from 0) has its Tab stops follow:
+    /// its owner, or the keyed node inside it the layer asks for. Nothing
+    /// to read when it asks for what it asked for when last read.
+    fn read_tab_owner(&mut self, frame: &Frame, k: usize) {
+        let Some(l) = frame.layers.get(k) else { return };
+        let n = k.saturating_add(1);
+        let (Some(asked), Some(owner)) = (self.tab_keys.get_mut(n), self.owners.get(n).copied()) else {
+            return;
+        };
+        // Read with none asked, a layer's Tab owner is its owner already
+        // ([`Self::read_layers`]).
+        if *asked == l.tab_after {
+            return;
+        }
+        *asked = l.tab_after;
+        let part = owner.zip(l.tab_after).and_then(|(o, key)| {
+            let path = &frame.nodes.get(o)?.path.0;
+            (o..l.root).find(|&i| {
+                crate::interact::visited();
+                frame.nodes.get(i).is_some_and(|n| {
+                    n.path.0.starts_with(path) && n.path.0.last().and_then(|s| s.element_key()) == Some(key)
                 })
-            });
-            self.tab_owners.push(part.or(owner));
+            })
+        });
+        if let Some(slot) = self.tab_owners.get_mut(n) {
+            *slot = part.or(owner);
         }
-        self.entries.clear();
-        for (i, b) in frame.behaviour.iter().enumerate() {
-            let Some(spec) = &b.handlers.layer else { continue };
-            let Some(n) = frame.nodes.get(i) else { continue };
-            if !frame.shown(i) {
-                continue;
-            }
-            self.entries.push(Entry {
-                node: i,
-                layer: n.layer,
-                owner: self.owners.get(n.layer).copied().flatten(),
-                spec: Rc::clone(spec),
-            });
-        }
-        self.modal = self.entries.iter().rposition(|e| e.spec.modal);
-        self.floor = self
-            .modal
-            .and_then(|m| self.entries.get(m))
-            .map_or(0, |e| layer_start(frame, e.layer));
     }
 
     /// The layers of `frame`.
@@ -508,6 +595,7 @@ fn owner_of(frame: &Frame, root: usize, path: &NodePath) -> Option<usize> {
     let segs = &path.0;
     let mut best: Option<(usize, usize)> = None;
     for (i, n) in frame.nodes.iter().enumerate().take(root) {
+        crate::interact::visited();
         let p = &n.path.0;
         if p.len() < segs.len() && segs.starts_with(p) && best.is_none_or(|(_, len)| p.len() > len) {
             best = Some((i, p.len()));

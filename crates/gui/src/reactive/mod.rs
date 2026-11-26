@@ -14,7 +14,7 @@ mod computed;
 mod effect;
 mod runtime;
 /// A node that owns what is made while it runs (a scope, effect or computed).
-pub(crate) use runtime::NodeId as OwnerId;
+pub(crate) use runtime::OwnerId;
 mod scope;
 mod signal;
 mod trace;
@@ -55,17 +55,17 @@ pub(crate) fn in_phase<R>(phase: Phase, settles: bool, f: impl FnOnce() -> R) ->
     runtime::in_phase(phase, settles, f)
 }
 pub use computed::Computed;
+pub(crate) use effect::on_release;
 pub use effect::{Effect, on_cleanup, watch};
-#[cfg(test)]
+#[cfg(all(debug_assertions, test))]
 pub(crate) use runtime::arena;
 #[cfg(all(debug_assertions, test))]
 pub(crate) use runtime::cold_steps;
 #[cfg(debug_assertions)]
 pub(crate) use runtime::cold_wrote;
+pub(crate) use runtime::flush_unbatched;
 pub(crate) use runtime::is_cold;
 pub(crate) use runtime::making_shared;
-#[cfg(debug_assertions)]
-pub(crate) use runtime::outside_cold;
 pub use scope::Scope;
 pub use signal::Signal;
 pub use trace::{
@@ -106,20 +106,27 @@ pub fn detached<R>(f: impl FnOnce() -> R) -> R {
 
 /// Whether something owns what is made now (a scope, an effect, a computed).
 /// What owns what is made now, if it is alive.
-pub(crate) fn owner() -> Option<runtime::NodeId> {
-    runtime::with(|rt| rt.active_owner.filter(|&o| rt.live(o).is_some()))
+pub(crate) fn owner() -> Option<OwnerId> {
+    runtime::with(|rt| rt.active_owner.filter(|&o| rt.live(o).is_some())).map(runtime::NodeId::owner_id)
 }
 
-/// Run `f` with `owner` (if still alive) owning what it makes, tracking nothing.
-pub(crate) fn run_owned<R>(owner: Option<runtime::NodeId>, f: impl FnOnce() -> R) -> R {
-    let owner = owner.filter(|&o| runtime::with(|rt| rt.live(o).is_some()));
+/// Run `f` with `owner` (if still alive, and of this thread) owning what
+/// it makes, tracking nothing.
+pub(crate) fn run_owned<R>(owner: Option<OwnerId>, f: impl FnOnce() -> R) -> R {
+    let owner = owner
+        .and_then(OwnerId::node)
+        .filter(|&o| runtime::with(|rt| rt.live(o).is_some()));
     let _guard = runtime::OwnerGuard::enter(owner, true);
     f()
 }
 
-/// Whether `owner` (as [`owner`] gave it) was not disposed.
-pub(crate) fn is_live(owner: runtime::NodeId) -> bool {
-    runtime::try_with(|rt| rt.live(owner).is_some()).unwrap_or(false)
+/// Whether `owner` (as [`owner`] gave it) was not disposed; never, named
+/// on another thread.
+pub(crate) fn is_live(owner: OwnerId) -> bool {
+    owner
+        .node()
+        .and_then(|o| runtime::try_with(|rt| rt.live(o).is_some()))
+        .unwrap_or(false)
 }
 
 pub(crate) fn has_owner() -> bool {
@@ -153,13 +160,15 @@ impl RenderNode {
     pub(crate) fn marking(mark: &Mark) -> Self {
         let at = std::panic::Location::caller();
         let run = std::rc::Rc::clone(mark);
-        let id = runtime::with(|rt| {
-            let id = rt.alloc(runtime::Kind::Render, runtime::flag::WATCHING, at);
-            if let Some(n) = rt.live_mut(id) {
-                n.run = Some(run);
-            }
-            rt.adopt(id);
-            id
+        let id = crate::engine::allocating(|| {
+            runtime::with(|rt| {
+                let id = rt.alloc(runtime::Kind::Render, runtime::flag::WATCHING, at);
+                if let Some(n) = rt.live_mut(id) {
+                    n.run = Some(run);
+                }
+                rt.adopt(id);
+                id
+            })
         });
         Self(id)
     }
@@ -197,6 +206,13 @@ impl RenderNode {
         if runtime::try_with(|rt| rt.dispose(self.0)).is_some() && !std::thread::panicking() {
             runtime::settle();
         }
+    }
+
+    /// [`Self::dispose`], from the `Drop` of its owner: a live node whose
+    /// owner a fork drops is disposed once the fork has rolled back
+    /// ([`crate::engine::dropped`]), never in it.
+    pub(crate) fn release(self, live: crate::engine::LiveDrop) {
+        crate::engine::dropped(live, self.0.made_in_fork(), move || self.dispose());
     }
 
     /// Run `f`, its reads becoming this render's dependencies.

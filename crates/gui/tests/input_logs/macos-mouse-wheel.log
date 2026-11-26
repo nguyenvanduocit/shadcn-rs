@@ -1,21 +1,21 @@
-gui-input-log 1
+gui-input-log 2
 platform macos
 window 480 320 2
-source synthesized, not recorded: a notched mouse wheel on macOS. AppKit reports it without precise deltas (hasPreciseScrollingDeltas false), scrollingDeltaY in lines, accelerated when the wheel spins fast, phase and momentumPhase None, which winit 0.30 maps to LineDelta and moved. Notches 120 ms apart, then a spin 25 ms apart with the acceleration rising and falling.
-0.000 move 120 100
-100.000 wheel lines 0 -1 moved
-220.000 wheel lines 0 -1 moved
-340.000 wheel lines 0 -1 moved
-460.000 wheel lines 0 -1 moved
-700.000 wheel lines 0 1 moved
-725.000 wheel lines 0 1 moved
-750.000 wheel lines 0 2 moved
-775.000 wheel lines 0 3 moved
-800.000 wheel lines 0 4 moved
-825.000 wheel lines 0 4 moved
-850.000 wheel lines 0 3 moved
-875.000 wheel lines 0 2 moved
-900.000 wheel lines 0 1 moved
-1100.000 move 120 100
-1101.000 down
-1151.000 up
+source synthesized, not recorded: a notched mouse wheel on macOS. AppKit reports it without precise deltas (hasPreciseScrollingDeltas false), scrollingDeltaY in lines, accelerated when the wheel spins fast, phase and momentumPhase None: LineDelta, no phase. Notches 120 ms apart, then a spin 25 ms apart with the acceleration rising and falling.
+0.000000 move 120 100
+100.000000 wheel lines 0 -1 none
+220.000000 wheel lines 0 -1 none
+340.000000 wheel lines 0 -1 none
+460.000000 wheel lines 0 -1 none
+700.000000 wheel lines 0 1 none
+725.000000 wheel lines 0 1 none
+750.000000 wheel lines 0 2 none
+775.000000 wheel lines 0 3 none
+800.000000 wheel lines 0 4 none
+825.000000 wheel lines 0 4 none
+850.000000 wheel lines 0 3 none
+875.000000 wheel lines 0 2 none
+900.000000 wheel lines 0 1 none
+1100.000000 move 120 100
+1101.000000 down
+1151.000000 up

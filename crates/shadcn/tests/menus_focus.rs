@@ -62,8 +62,9 @@ fn a_menubar_menu_closed_by_focus_outside_leaves_focus_where_it_went() {
     s.act("focus elsewhere", || elsewhere.focus());
     s.settle().expect("settled");
     assert!(!shows(&s, "New"), "focus outside a menubar's menu closes it");
+    // Focus is the window's: read in a turn of it (ADR-0015).
     assert_eq!(
-        gui::focus::focused(),
+        s.read(gui::focus::focused),
         Some(elsewhere.id()),
         "focus taken elsewhere is not taken back"
     );
@@ -87,41 +88,56 @@ fn a_modal_menu_gives_focus_back_after_a_primary_press_outside_and_not_after_a_s
             .child(div().width(200.0).height(30.0).child(text("Page")))
             .into_element()
     });
-    let held = || gui::focus::focused();
+    // Focus is the window's: read in a turn of it (ADR-0015).
+    let held = |s: &mut Scenario| s.read(gui::focus::focused);
 
     click(&mut s, "Open");
     assert!(shows(&s, "Profile"));
-    let inside = held();
+    let inside = held(&mut s);
     s.press(NamedKey::Escape, Modifiers::default());
     s.settle().expect("settled");
     assert!(!shows(&s, "Profile"));
-    let trigger = held();
+    let trigger = held(&mut s);
     assert!(trigger.is_some() && trigger != inside, "Escape focuses the trigger");
-    assert!(gui::focus::focus_visible(), "with its ring: the keyboard closed it");
+    assert!(
+        s.read(gui::focus::focus_visible),
+        "with its ring: the keyboard closed it"
+    );
 
     click(&mut s, "Open");
     assert!(shows(&s, "Profile"));
-    assert_ne!(held(), trigger, "focus went into the menu");
+    assert_ne!(held(&mut s), trigger, "focus went into the menu");
     let (x, y) = at(&s, "Page");
     s.secondary_click(x, y);
     s.settle().expect("settled");
     assert!(!shows(&s, "Profile"), "a secondary press outside closes it");
-    assert_eq!(held(), None, "and gives no focus back (reka's hasInteractedOutside)");
+    assert_eq!(
+        held(&mut s),
+        None,
+        "and gives no focus back (reka's hasInteractedOutside)"
+    );
 
     click(&mut s, "Open");
     assert!(shows(&s, "Profile"));
     s.press_button(x, y, PointerButton::Middle);
     s.settle().expect("settled");
     assert!(!shows(&s, "Profile"), "so does the middle button");
-    assert_eq!(held(), None);
+    assert_eq!(held(&mut s), None);
 
     click(&mut s, "Open");
     assert!(shows(&s, "Profile"));
     s.click(x, y);
     s.settle().expect("settled");
     assert!(!shows(&s, "Profile"));
-    assert_eq!(held(), trigger, "a primary press outside a modal menu gives focus back");
-    assert!(!gui::focus::focus_visible(), "without a ring: a pointer closed it");
+    assert_eq!(
+        held(&mut s),
+        trigger,
+        "a primary press outside a modal menu gives focus back"
+    );
+    assert!(
+        !s.read(gui::focus::focus_visible),
+        "without a ring: a pointer closed it"
+    );
 }
 
 #[test]

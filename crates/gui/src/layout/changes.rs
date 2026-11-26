@@ -1,5 +1,3 @@
-use std::cell::Cell;
-
 use crate::geometry::Bounds;
 
 /// One frame node a pass wrote in place.
@@ -66,14 +64,10 @@ impl Changes {
     /// every change; what was written into the others is in the nodes kept
     /// as they were ([`Frame::before`](super::Frame::before), undone there by the rebuild).
     pub(crate) fn rebuilt(&mut self, start: usize) {
-        crate::engine::engine_local! {
-            [Fork] static EPOCHS: Cell<u64> = const { Cell::new(0) };
-        }
-        self.epoch = EPOCHS.with(|e| {
-            let next = e.get().wrapping_add(1).max(1);
-            e.set(next);
-            next
-        });
+        static EPOCHS: crate::engine::IdKind = crate::engine::IdKind::new("frame epoch");
+        // Never minted from state a rollback restores: a frame a fork laid
+        // out never shares an epoch with a live one (ADR-0028, rule 3).
+        self.epoch = crate::engine::unique_id(&EPOCHS);
         let end = self.end();
         self.keep_unread(end, |c| usize::try_from(c.index).is_ok_and(|i| i < start));
         self.log.clear();

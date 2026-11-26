@@ -14,6 +14,8 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+
+use crate::engine::WorldCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -29,14 +31,8 @@ impl Registration {
     #[must_use]
     #[expect(clippy::new_without_default, reason = "each one is new: no default one")]
     pub fn new() -> Self {
-        crate::engine::engine_local! {
-            [Fork] static ISSUED: Cell<u64> = const { Cell::new(0) };
-        }
-        Self(ISSUED.with(|n| {
-            let next = n.get().checked_add(1).unwrap_or_else(|| exhausted("registrations"));
-            n.set(next);
-            next
-        }))
+        static ISSUED: crate::engine::IdKind = crate::engine::IdKind::new("registration");
+        Self(crate::engine::unique_id(&ISSUED))
     }
 }
 
@@ -233,7 +229,7 @@ struct Slot<T> {
     /// Taken out while a read was under way: every read skips it, and it
     /// stays linked (a walk standing on it steps on to the next) until the
     /// last read ends, which unlinks it.
-    gone: Cell<bool>,
+    gone: WorldCell<bool>,
 }
 
 /// A registration's place: its slot, and the generation it holds there.
@@ -246,6 +242,12 @@ struct Key {
 /// The entries: a slab whose free slots are reused, linked in the order
 /// they registered (an intrusive list): adding one, taking one out by its
 /// key and stepping to the next are each a few slots' work.
+///
+/// A signal's value, written by `update` (which a check is refused on a
+/// live signal) and, while read, through `&`: those cells are the world's
+/// that made the registry ([`WorldCell`]), so a check reading a live
+/// registry counts no read, queues no removal and adds no visit to it
+/// (review r18, Codex nit, Opus plausible 1).
 struct Entries<T> {
     slots: Vec<Slot<T>>,
     free: Vec<usize>,
@@ -254,19 +256,29 @@ struct Entries<T> {
     /// The slots linked, those taken out while read included.
     linked: usize,
     /// Of those, the ones taken out while read ([`Slot::gone`]).
-    gone: Cell<usize>,
+    gone: WorldCell<usize>,
     /// Reads under way ([`Registry::with`], [`Registry::walk`]): a removal meanwhile
     /// waits for them.
-    readers: Cell<u32>,
+    readers: WorldCell<u32>,
     /// The removals that waited, applied as the last read ends.
-    queued: Cell<Vec<Key>>,
+    queued: WorldCell<Vec<Key>>,
     /// Slots stepped through, read or written: the measure of the work.
-    visits: Cell<u64>,
+    visits: WorldCell<u64>,
 }
 
 impl<T> Entries<T> {
+    /// One slot stepped through: counted in the registry's own world (a
+    /// check reading a live one leaves its count).
     fn visit(&self) {
-        self.visits.set(self.visits.get().saturating_add(1));
+        if self.visits.is_here() {
+            self.visits.set(self.visits.get().saturating_add(1));
+        }
+    }
+
+    /// Whether the running world made it: may count a read and queue a
+    /// removal through `&`.
+    fn is_here(&self) -> bool {
+        self.readers.is_here()
     }
 
     fn slot(&self, i: usize) -> Option<&Slot<T>> {
@@ -299,7 +311,7 @@ impl<T> Entries<T> {
                     generation: 0,
                     prev: tail,
                     next: NIL,
-                    gone: Cell::new(false),
+                    gone: WorldCell::new("a registry slot's removal mark (`holder::Slot::gone`)", false),
                 });
                 self.visit();
                 (self.slots.len().saturating_sub(1), 0)
@@ -427,23 +439,33 @@ impl<T: 'static> fmt::Debug for Registry<T> {
 }
 
 /// A read of a registry under way: removals wait until the last one ends.
-struct Reading<T: 'static>(Registry<T>);
+/// A check's read of a live registry is not counted: no removal of the
+/// check's reaches it (its `update` is refused), so none waits for it.
+struct Reading<T: 'static> {
+    registry: Registry<T>,
+    counted: bool,
+}
 
 impl<T: 'static> Reading<T> {
     fn begin(r: Registry<T>) -> Option<Self> {
         if !r.entries.is_alive() {
             return None;
         }
-        r.entries
-            .with_untracked(|e| e.readers.set(e.readers.get().saturating_add(1)));
-        Some(Self(r))
+        let counted = r.entries.with_untracked(|e| {
+            let here = e.is_here();
+            if here {
+                e.readers.set(e.readers.get().saturating_add(1));
+            }
+            here
+        });
+        Some(Self { registry: r, counted })
     }
 }
 
 impl<T: 'static> Drop for Reading<T> {
     fn drop(&mut self) {
-        let entries = self.0.entries;
-        if !entries.is_alive() {
+        let entries = self.registry.entries;
+        if !self.counted || !entries.is_alive() {
             return;
         }
         let due = entries.with_untracked(|e| {
@@ -482,10 +504,10 @@ impl<T: 'static> Registry<T> {
                 head: NIL,
                 tail: NIL,
                 linked: 0,
-                gone: Cell::new(0),
-                readers: Cell::new(0),
-                queued: Cell::new(Vec::new()),
-                visits: Cell::new(0),
+                gone: WorldCell::new("a registry's removal count (`holder::Entries::gone`)", 0),
+                readers: WorldCell::new("a registry's read count (`holder::Entries::readers`)", 0),
+                queued: WorldCell::new("a registry's waiting removals (`holder::Entries::queued`)", Vec::new()),
+                visits: WorldCell::new("a registry's work count (`holder::Entries::visits`)", 0),
             }),
         }
     }
@@ -516,6 +538,11 @@ impl<T: 'static> Registry<T> {
             return;
         }
         let waits = self.entries.with_untracked(|e| {
+            // Another world's registry: its write below is refused, as
+            // every write to another world's signal is.
+            if !e.is_here() {
+                return false;
+            }
             let reading = e.readers.get() > 0;
             if reading {
                 e.take_out_later(key);
@@ -659,21 +686,200 @@ impl<T: 'static> Registry<T> {
 /// on screen), or, for an owner that knows when its keys leave, until it
 /// lets go of them ([`Self::retain`]).
 pub struct Keyed<K: 'static, V: 'static> {
-    /// Its memo in [`MEMOS`], and which life of that slot it is.
-    slot: usize,
-    generation: u32,
+    /// Its memo in [`MEMOS`].
+    id: crate::engine::SlabId,
     ty: std::marker::PhantomData<fn() -> (K, V)>,
 }
 
 /// What a [`Keyed`] remembers: not reactive state, since nothing reads it
 /// tracked (an answer for a key never changes while it is kept).
-#[derive(Clone)]
 struct Memo<K, V> {
-    map: HashMap<K, Entry<V>>,
+    map: Layered<K, Entry<V>>,
     /// Map operations so far: the measure of the work, for tests.
     work: u64,
     /// The next entry's generation: a hold is of one entry, not of a key.
     next: u64,
+}
+
+/// A map whose copy costs O(1) and whose writes after a copy cost what
+/// they change: a fork's first write to a memo saves a copy of it
+/// ([`MEMOS`], ADR-0028 rule 4), and a memo of a million keys must not be
+/// copied for one insert (Codex 7, F1 review 6). A shared base, and the
+/// writes since in a layer of their own (`None`: taken out). The layer is
+/// folded into the base once it holds [`LAYER`] writes and nothing shares
+/// either, which is always so live (a write costs amortised O(1)). The
+/// persistent structures' path copying (Driscoll et al., 1989), at the one
+/// level a hash map needs.
+///
+/// A check's copy ([`Self::overlaid`]) shares the live base and layer
+/// read-only and writes an overlay of its own (ADR-0034, S7): its first
+/// write copies no live key, every key operation runs in the check's body
+/// (the [`Keyed`] method its code called), and its drain hands back the
+/// overlay one entry per box ([`Self::parts`], S9).
+struct Layered<K, V> {
+    base: Rc<HashMap<K, V>>,
+    layer: Rc<HashMap<K, Option<V>>>,
+    /// A check's writes over the live base and layer (`None` taken out);
+    /// `None` live, and in a memo a check made, which owns its maps.
+    over: Option<HashMap<K, Option<V>>>,
+    len: usize,
+}
+
+/// How many writes a [`Layered`] keeps beside its base before folding them in.
+const LAYER: usize = 64;
+
+impl<K: Eq + std::hash::Hash + Clone, V: Clone> Layered<K, V> {
+    fn new() -> Self {
+        Self {
+            base: Rc::default(),
+            layer: Rc::default(),
+            over: None,
+            len: 0,
+        }
+    }
+
+    /// A check's copy of a live map: its base and layer shared (O(1), no
+    /// key touched), its writes in an overlay of its own. Only a live map
+    /// is copied, which has no overlay.
+    fn overlaid(&self) -> Self {
+        Self {
+            base: Rc::clone(&self.base),
+            layer: Rc::clone(&self.layer),
+            over: Some(HashMap::new()),
+            len: self.len,
+        }
+    }
+
+    /// `k` as the base and layer have it.
+    fn lower(&self, k: &K) -> Option<&V> {
+        match self.layer.get(k) {
+            Some(v) => v.as_ref(),
+            None => self.base.get(k),
+        }
+    }
+
+    fn get(&self, k: &K) -> Option<&V> {
+        if let Some(o) = &self.over
+            && let Some(v) = o.get(k)
+        {
+            return v.as_ref();
+        }
+        self.lower(k)
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        let over = self.over.as_ref();
+        let layer = &self.layer;
+        let shown = move |k: &K| over.is_none_or(|o| !o.contains_key(k));
+        self.base
+            .iter()
+            .filter(move |(k, _)| !layer.contains_key(*k) && shown(k))
+            .chain(
+                layer
+                    .iter()
+                    .filter(move |(k, _)| shown(k))
+                    .filter_map(|(k, v)| v.as_ref().map(|v| (k, v))),
+            )
+            .chain(
+                over.into_iter()
+                    .flat_map(HashMap::iter)
+                    .filter_map(|(k, v)| v.as_ref().map(|v| (k, v))),
+            )
+    }
+
+    /// Where a write goes: a check's overlay; live, the layer (folded
+    /// first once full).
+    fn top(&mut self) -> &mut HashMap<K, Option<V>> {
+        if self.over.is_none() {
+            self.fold();
+        }
+        match &mut self.over {
+            Some(o) => o,
+            None => Rc::make_mut(&mut self.layer),
+        }
+    }
+
+    /// The layer folded into the base, once it is full and nothing shares
+    /// either (live: always so).
+    fn fold(&mut self) {
+        if self.layer.len() < LAYER {
+            return;
+        }
+        if let (Some(base), Some(layer)) = (Rc::get_mut(&mut self.base), Rc::get_mut(&mut self.layer)) {
+            for (k, v) in layer.drain() {
+                match v {
+                    Some(v) => base.insert(k, v),
+                    None => base.remove(&k),
+                };
+            }
+        }
+    }
+
+    fn write(&mut self, k: K, v: Option<V>) {
+        // A removal leaves a tombstone over what is under the top map.
+        let under = match self.over {
+            Some(_) => self.lower(&k).is_some(),
+            None => self.base.contains_key(&k),
+        };
+        let top = self.top();
+        if v.is_none() && !under {
+            top.remove(&k);
+        } else {
+            top.insert(k, v);
+        }
+    }
+
+    fn get_mut(&mut self, k: &K) -> Option<&mut V> {
+        let v = self.get(k)?.clone();
+        let top = self.top();
+        if !top.contains_key(k) {
+            top.insert(k.clone(), Some(v));
+        }
+        top.get_mut(k).and_then(Option::as_mut)
+    }
+
+    fn insert(&mut self, k: K, v: V) -> Option<V> {
+        let old = self.get(&k).cloned();
+        if old.is_none() {
+            self.len = self.len.saturating_add(1);
+        }
+        self.write(k, Some(v));
+        old
+    }
+
+    fn remove_entry(&mut self, k: &K) -> Option<(K, V)> {
+        let old = self.get(k)?.clone();
+        self.write(k.clone(), None);
+        self.len = self.len.saturating_sub(1);
+        Some((k.clone(), old))
+    }
+}
+
+impl<K: 'static, V: 'static> Layered<K, V> {
+    /// Taken apart for a check's drain (ADR-0034, S9): a map it owns, one
+    /// entry per box; one it shares with the live memo let go of here.
+    /// Shared, the handle's drop only counts down (another holds it, so no
+    /// key drops and no code runs); handed back instead, a runaway check
+    /// would set it aside, and it would pin the live maps shared for good,
+    /// so they would never fold again.
+    fn parts(self, out: &mut Vec<Box<dyn std::any::Any>>) {
+        use crate::engine::map_apart;
+        match Rc::try_unwrap(self.base) {
+            Ok(base) => map_apart(base, out),
+            Err(shared) => drop(shared),
+        }
+        match Rc::try_unwrap(self.layer) {
+            Ok(layer) => map_apart(layer, out),
+            Err(shared) => drop(shared),
+        }
+        if let Some(over) = self.over {
+            map_apart(over, out);
+        }
+    }
 }
 
 /// An identity kept for a key, and who holds it.
@@ -709,8 +915,12 @@ impl<K: Eq + std::hash::Hash + Clone, V: Copy> Memo<K, V> {
 /// A memo as the store holds it, its type erased.
 trait ErasedMemo {
     fn as_any(&self) -> &dyn std::any::Any;
-    /// A copy a fork writes in place of the live memo.
+    /// A check's copy, made on its first write to a live memo ([`MEMOS`]):
+    /// the live maps shared read-only and an empty overlay for the check's
+    /// writes ([`Layered::overlaid`]). O(1); no key is touched.
     fn fork_clone(&self) -> Rc<dyn ErasedMemo>;
+    /// Taken apart for a check's drain: one box per key the check wrote.
+    fn take_apart(self: Rc<Self>, out: &mut Vec<Box<dyn std::any::Any>>);
 }
 
 impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> ErasedMemo for std::cell::RefCell<Memo<K, V>> {
@@ -719,144 +929,58 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> ErasedMemo fo
     }
 
     fn fork_clone(&self) -> Rc<dyn ErasedMemo> {
-        Rc::new(std::cell::RefCell::new(self.borrow().clone()))
+        let m = self.borrow();
+        Rc::new(std::cell::RefCell::new(Memo {
+            map: m.map.overlaid(),
+            work: m.work,
+            next: m.next,
+        }))
+    }
+
+    fn take_apart(self: Rc<Self>, out: &mut Vec<Box<dyn std::any::Any>>) {
+        match Rc::try_unwrap(self) {
+            Ok(memo) => memo.into_inner().map.parts(out),
+            // Shared: a count-down, as in [`Layered::parts`].
+            Err(shared) => drop(shared),
+        }
     }
 }
 
-/// The memos of every [`Keyed`] on the thread, by slot, each held by its
-/// scope's life: freed as the scope that made it ends. Forked by the cold
-/// check as the rest of the engine's state is: a memo a fork writes is
-/// copied first and the copy is the fork's alone, a [`Keyed`] made in a
-/// fork has its memo in the fork, and all of it is dropped with the fork.
-/// Nothing here runs user code (a key's or a value's `Drop`) under the
-/// store's borrow: what leaves is handed back to be dropped after.
-#[derive(Default)]
-struct Memos {
-    slots: Vec<(u32, Option<Rc<dyn ErasedMemo>>)>,
-    free: Vec<usize>,
-    fork: Option<MemoFork>,
+/// A memo in the store. Its [`ForkClone`](crate::engine::ForkClone) is a
+/// check's overlay on the memo, not a copy of it, and the check's drain
+/// takes it apart ([`crate::engine::Parts`]).
+struct MemoBox(Rc<dyn ErasedMemo>);
+
+// A logged value (ADR-0034 S7, audited): through `&MemoBox` the memo is
+// only read; a write goes through the slab's own copy (`ForkClone`).
+crate::engine::fork_value_audited!(MemoBox);
+impl crate::engine::sealed::Sealed for MemoBox {}
+impl crate::engine::ForkClone for MemoBox {
+    fn fork_clone(&self) -> Self {
+        // An overlay on the memo, not the pointer (`Rc`'s own `ForkClone`).
+        Self(ErasedMemo::fork_clone(&*self.0))
+    }
 }
 
-/// What a fork of the store holds.
-struct MemoFork {
-    /// Live slots at `base` and beyond are the fork's own.
-    base: usize,
-    news: usize,
-    copies: HashMap<usize, (u32, Rc<dyn ErasedMemo>)>,
+impl crate::engine::parts_seal::Sealed for MemoBox {}
+impl crate::engine::Parts for MemoBox {
+    fn parts(self, out: &mut Vec<Box<dyn std::any::Any>>) {
+        let Self(memo) = self;
+        ErasedMemo::take_apart(memo, out);
+    }
 }
 
 crate::engine::engine_local! {
-    [Fork(log)] static MEMOS: std::cell::RefCell<Memos> = std::cell::RefCell::default();
-}
-
-/// How a write reaches a memo.
-enum Target {
-    Ready(Rc<dyn ErasedMemo>),
-    /// A live memo a fork has not copied yet.
-    Copy(Rc<dyn ErasedMemo>),
-}
-
-impl Memos {
-    /// The memo of `slot`, as the running frame sees it.
-    fn read(&self, slot: usize, generation: u32) -> Option<Rc<dyn ErasedMemo>> {
-        if let Some(f) = &self.fork {
-            if let Some((g, rc)) = f.copies.get(&slot) {
-                return (*g == generation).then(|| Rc::clone(rc));
-            }
-            if slot >= f.base {
-                return None;
-            }
-        }
-        let (g, memo) = self.slots.get(slot)?;
-        if *g == generation { memo.clone() } else { None }
-    }
-
-    fn target(&self, slot: usize, generation: u32) -> Option<Target> {
-        if let Some(f) = &self.fork
-            && let Some((g, rc)) = f.copies.get(&slot)
-        {
-            return (*g == generation).then(|| Target::Ready(Rc::clone(rc)));
-        }
-        let memo = self.read(slot, generation)?;
-        Some(if self.fork.is_some() {
-            Target::Copy(memo)
-        } else {
-            Target::Ready(memo)
-        })
-    }
-
-    /// The fork's copy of `slot`; `copy` too if one was made meanwhile
-    /// (to be dropped by the caller, outside the borrow).
-    fn install(
-        &mut self,
-        slot: usize,
-        generation: u32,
-        copy: Rc<dyn ErasedMemo>,
-    ) -> (Rc<dyn ErasedMemo>, Option<Rc<dyn ErasedMemo>>) {
-        let Some(f) = self.fork.as_mut() else {
-            return (copy, None);
-        };
-        if let Some((_, rc)) = f.copies.get(&slot) {
-            return (Rc::clone(rc), Some(copy));
-        }
-        f.copies.insert(slot, (generation, Rc::clone(&copy)));
-        (copy, None)
-    }
-
-    fn put(&mut self, memo: Rc<dyn ErasedMemo>) -> (usize, u32) {
-        if let Some(f) = self.fork.as_mut() {
-            let slot = f.base.saturating_add(f.news);
-            f.news = f.news.saturating_add(1);
-            f.copies.insert(slot, (0, memo));
-            return (slot, 0);
-        }
-        if let Some(i) = self.free.pop()
-            && let Some(s) = self.slots.get_mut(i)
-        {
-            s.1 = Some(memo);
-            return (i, s.0);
-        }
-        let i = self.slots.len();
-        self.slots.push((0, Some(memo)));
-        (i, 0)
-    }
-
-    /// Free `slot`; the memo, to be dropped by the caller.
-    fn release(&mut self, slot: usize, generation: u32) -> Option<Rc<dyn ErasedMemo>> {
-        if let Some(f) = self.fork.as_mut() {
-            // A fork frees only what it made: a live memo is its scope's.
-            return match f.copies.get(&slot) {
-                Some((g, _)) if *g == generation && slot >= f.base => f.copies.remove(&slot).map(|(_, rc)| rc),
-                _ => None,
-            };
-        }
-        let s = self.slots.get_mut(slot)?;
-        if s.0 != generation {
-            return None;
-        }
-        let memo = s.1.take()?;
-        s.0 = s.0.wrapping_add(1);
-        self.free.push(slot);
-        Some(memo)
-    }
-}
-
-impl crate::engine::Logged for Memos {
-    fn begin(&mut self) {
-        self.fork = Some(MemoFork {
-            base: self.slots.len(),
-            news: 0,
-            copies: HashMap::new(),
-        });
-    }
-
-    fn drain(&mut self) -> Box<dyn std::any::Any> {
-        Box::new(self.fork.as_mut().map(|f| std::mem::take(&mut f.copies)))
-    }
-
-    fn rollback(&mut self) -> Box<dyn std::any::Any> {
-        Box::new(self.fork.take().map(|f| f.copies))
-    }
+    /// The memos of every [`Keyed`] on the thread, each held by its scope's
+    /// life: freed as the scope that made it ends. A slab of handles, by
+    /// the one slot rule of every arena ([`crate::engine::Generations`],
+    /// ADR-0028 rule 3): a memo a fork writes is kept as it was and put
+    /// back, a [`Keyed`] a fork made is the fork's, and no `Keyed` a fork handed out
+    /// names a memo made after it. What leaves is handed back to be
+    /// dropped outside the store's borrow. A check's drain takes its memos
+    /// apart, one box per key (ADR-0034, S9).
+    [Fork(log)] static MEMOS: std::cell::RefCell<crate::engine::ForkSlab<MemoBox>> =
+        std::cell::RefCell::default();
 }
 
 impl<K: 'static, V: 'static> Clone for Keyed<K, V> {
@@ -882,17 +1006,20 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     #[expect(clippy::new_without_default, reason = "made where its owner is: no default one")]
     pub fn new() -> Self {
         let memo: Rc<dyn ErasedMemo> = Rc::new(std::cell::RefCell::new(Memo::<K, V> {
-            map: HashMap::new(),
+            map: Layered::new(),
             work: 0,
             next: 0,
         }));
-        let (slot, generation) = MEMOS.with(|m| m.borrow_mut().put(memo));
+        let id = crate::engine::allocate(&MEMOS, MemoBox(memo));
         // A fork frees what it made as it ends, and a cleanup it registers
-        // may run live, on an owner that outlives it.
-        if !crate::component::is_cold_render() {
-            if crate::reactive::has_owner() {
-                on_cleanup(move || {
-                    let freed = MEMOS.with(|m| m.borrow_mut().release(slot, generation));
+        // may run live, on an owner that outlives it. Making a handle: the
+        // engine's own bookkeeping, which a Shared init may reach, reads
+        // whether a fork runs unchecked and the owner through
+        // [`crate::engine::allocating`]: what it decides is not given back.
+        if !crate::engine::is_cold() {
+            if crate::engine::allocating(crate::reactive::has_owner) {
+                crate::reactive::on_release(move || {
+                    let freed = MEMOS.with(|m| m.borrow_mut().remove(id));
                     drop(freed);
                 });
             } else {
@@ -904,8 +1031,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
             }
         }
         Self {
-            slot,
-            generation,
+            id,
             ty: std::marker::PhantomData,
         }
     }
@@ -913,26 +1039,18 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
     /// The memo, as the running frame sees it, read by `f` (nothing of the
     /// caller's runs in it).
     fn read<R>(self, f: impl FnOnce(&Memo<K, V>) -> R) -> Option<R> {
-        let rc = MEMOS.with(|m| m.borrow().read(self.slot, self.generation))?;
+        let rc = MEMOS.with(|m| m.borrow().read(self.id, |b| Rc::clone(&b.0)))?;
         let cell = rc.as_any().downcast_ref::<std::cell::RefCell<Memo<K, V>>>()?;
         let memo = cell.borrow();
         Some(f(&memo))
     }
 
-    /// The memo written by `f`; in a fork, its copy (made first). What `f`
+    /// The memo written by `f`; in a check, its overlay on a live memo (made
+    /// on its first write, [`Layered::overlaid`]), the live one untouched. What `f`
     /// takes out of the memo is handed back, to be dropped by the caller
     /// with nothing borrowed.
     fn write<R>(self, f: impl FnOnce(&mut Memo<K, V>) -> R) -> Option<R> {
-        let target = MEMOS.with(|m| m.borrow().target(self.slot, self.generation))?;
-        let rc = match target {
-            Target::Ready(rc) => rc,
-            Target::Copy(live) => {
-                let copy = live.fork_clone();
-                let (rc, spare) = MEMOS.with(|m| m.borrow_mut().install(self.slot, self.generation, copy));
-                drop(spare);
-                rc
-            }
-        };
+        let rc = MEMOS.with(|m| m.borrow().write(self.id, |b| Rc::clone(&b.0)))?;
         let cell = rc.as_any().downcast_ref::<std::cell::RefCell<Memo<K, V>>>()?;
         let mut memo = cell.borrow_mut();
         Some(f(&mut memo))
@@ -997,7 +1115,7 @@ impl<K: Eq + std::hash::Hash + Clone + 'static, V: Copy + 'static> Keyed<K, V> {
             self.count(1);
             if let Some(generation) = self.write(|m| m.keep(key, v, 1).generation) {
                 let key = key.clone();
-                on_cleanup(move || self.release_hold(&key, generation));
+                crate::reactive::on_release(move || self.release_hold(&key, generation));
             }
             v
         })
@@ -1084,6 +1202,7 @@ mod tests {
     /// A mount that never ran its register (a cold re-render's, whose
     /// effects are dropped) never runs its undo either: a count it keeps
     /// stays as the live mounts left it.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_cold_setups_mount_neither_registers_nor_undoes() {
         let count = Rc::new(Cell::new(1_i32));
@@ -1108,6 +1227,7 @@ mod tests {
     /// the frame share an identity, as live ones do), `retain` lets go of
     /// nothing live, work is counted live only, and a `Keyed` made there
     /// has its memo in the frame.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_cold_frame_writes_a_copy_of_a_keyed_memo_and_the_live_one_is_untouched() {
         let owner = Scope::new();
@@ -1136,6 +1256,327 @@ mod tests {
         assert_eq!(keyed.peek(&"b"), None, "and has none of what the frame asked for");
         assert_eq!(made.len(), 0, "what the frame made is gone with it");
         owner.dispose();
+    }
+
+    /// Opus (F1 review 5): a `Keyed` a check made is the fork's: after it,
+    /// a live `Keyed` made in its slot is never what its handle reads, and
+    /// in the next check, which makes its own, the handle is still dead.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_keyed_a_check_made_names_nothing_after_it() {
+        let check = |key: &'static str| {
+            let _cold = crate::engine::ColdFrame::begin();
+            let k: Keyed<&'static str, u32> = Scope::new().run(Keyed::new);
+            assert_eq!(k.get(&key, || 1), 1);
+            k
+        };
+        let k1 = check("k1");
+        assert_eq!(k1.len(), 0, "dead after its check");
+        {
+            // The next check makes its own, in the slot k1 had.
+            let _cold = crate::engine::ColdFrame::begin();
+            let k2: Keyed<&'static str, u32> = Scope::new().run(Keyed::new);
+            assert_eq!(k2.get(&"k2", || 3), 3);
+            assert_eq!(k1.peek(&"k2"), None, "k1 reads none of the next fork's");
+            assert_eq!(k1.len(), 0, "dead in the next check");
+        }
+        let owner = Scope::new();
+        let live: Keyed<&'static str, u32> = owner.run(Keyed::new);
+        assert_eq!(live.get(&"live", || 2), 2);
+        assert_eq!(k1.peek(&"live"), None, "the fork's handle reads no live memo");
+        assert_eq!(k1.len(), 0);
+        owner.dispose();
+    }
+
+    /// Codex 7 (F1 review 6): a fork's write to a memo of a million keys
+    /// costs what it changes, not a copy of the memo; what it wrote is its
+    /// own, and the live memo is as it was after it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_forks_insert_into_a_memo_of_a_million_keys_copies_none_of_them() {
+        let owner = Scope::new();
+        let keyed: Keyed<u64, u64> = owner.run(Keyed::new);
+        let n = 1_000_000_u64;
+        for k in 0..n {
+            keyed.get(&k, || k);
+        }
+        {
+            let _cold = crate::engine::ColdFrame::begin();
+            let (got, bytes) = crate::heap::allocated_bytes(|| keyed.get(&n, || 7));
+            assert_eq!(got, 7);
+            assert!(bytes < 64 * 1024, "{bytes} bytes for one insert");
+            assert_eq!(keyed.peek(&n), Some(7));
+            assert_eq!(keyed.peek(&3), Some(3), "the fork reads the live keys");
+            assert_eq!(keyed.len(), 1_000_001);
+        }
+        assert_eq!(keyed.peek(&n), None, "the live memo has none of the fork's");
+        assert_eq!(keyed.len(), 1_000_000);
+        assert_eq!(keyed.peek(&999_999), Some(999_999));
+        owner.dispose();
+    }
+
+    /// A key whose clones are counted, in a probe the test holds (outside
+    /// the engine: a check neither forks nor puts it back); told apart by
+    /// its number alone. The probe is behind `Arc` and atomic: it is no
+    /// shared handle of the library's, so it is not held as one.
+    struct Counted(u32, Arc<AtomicU32>);
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+    impl PartialEq for Counted {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+
+    impl Eq for Counted {}
+
+    impl std::hash::Hash for Counted {
+        fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+            self.0.hash(h);
+        }
+    }
+
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Self(self.0, Arc::clone(&self.1))
+        }
+    }
+
+    /// ADR-0034 S7: a check's first write to a memo whose layer holds live
+    /// keys copies none of them (the check writes an overlay of its own,
+    /// over the live maps shared read-only): one clone, of the key it
+    /// wrote, in its body. The live memo is as it was after.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_checks_write_to_a_memo_clones_no_live_key() {
+        let clones = Arc::new(AtomicU32::new(0));
+        let key = |k: u32| Counted(k, Arc::clone(&clones));
+        let owner = Scope::new();
+        let keyed: Keyed<Counted, u32> = owner.run(Keyed::new);
+        // Fewer than a layer's worth: all of them in the live layer.
+        for k in 0..40 {
+            keyed.get(&key(k), || k);
+        }
+        clones.store(0, Ordering::Relaxed);
+        crate::engine::in_cold_frame(|| {
+            assert_eq!(keyed.get(&key(1000), || 7), 7);
+            assert_eq!(keyed.peek(&key(3)), Some(3), "it reads the live keys");
+            assert_eq!(keyed.len(), 41);
+        });
+        assert_eq!(clones.load(Ordering::Relaxed), 1, "the key written, and no live key");
+        assert_eq!(keyed.peek(&key(1000)), None, "none of the check's in the live memo");
+        assert_eq!((keyed.len(), keyed.peek(&key(39))), (40, Some(39)));
+        owner.dispose();
+    }
+
+    /// A key whose clones panic as they drop while armed (a probe the test
+    /// holds, outside the engine); told apart by its number alone.
+    struct Bomb(u32, bool, Arc<AtomicBool>);
+
+    impl PartialEq for Bomb {
+        fn eq(&self, o: &Self) -> bool {
+            self.0 == o.0
+        }
+    }
+
+    impl Eq for Bomb {}
+
+    impl std::hash::Hash for Bomb {
+        fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+            self.0.hash(h);
+        }
+    }
+
+    impl Clone for Bomb {
+        fn clone(&self) -> Self {
+            Self(self.0, true, Arc::clone(&self.2))
+        }
+    }
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            if self.1 && self.2.load(Ordering::Relaxed) {
+                panic!("key {}'s drop", self.0);
+            }
+        }
+    }
+
+    /// The message a check that faulted panics with.
+    fn said(p: &Box<dyn std::any::Any + Send>) -> String {
+        p.downcast_ref::<String>()
+            .cloned()
+            .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+            .unwrap_or_default()
+    }
+
+    /// ADR-0034 S7, S9 and S2 (review r16): two keys a check wrote to a
+    /// live memo, each panicking as it drops, are handed back one box per
+    /// key and both dropped: the first is the check's fault, the second
+    /// follows it, and the live memo is whole.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn two_panicking_keys_a_check_wrote_are_two_faults_in_one_report() {
+        let armed = Arc::new(AtomicBool::new(false));
+        let key = |k: u32| Bomb(k, false, Arc::clone(&armed));
+        let owner = Scope::new();
+        let keyed: Keyed<Bomb, u32> = owner.run(Keyed::new);
+        assert_eq!(keyed.get(&key(0), || 5), 5);
+        armed.store(true, Ordering::Relaxed);
+        let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::engine::in_cold_frame(|| {
+                keyed.get(&key(1), || 1);
+                keyed.get(&key(2), || 2);
+            });
+        }))
+        .expect_err("the check faults");
+        armed.store(false, Ordering::Relaxed);
+        let said = said(&p);
+        assert!(said.contains("a check faulted (Disposal of MEMOS"), "{said}");
+        assert_eq!(
+            said.matches("Disposal of MEMOS").count(),
+            2,
+            "both keys dropped: {said}"
+        );
+        assert!(said.contains("key 1's drop") && said.contains("key 2's drop"), "{said}");
+        assert_eq!(keyed.len(), 1, "the live memo is whole");
+        assert_eq!(keyed.peek(&key(0)), Some(5));
+        assert_eq!(keyed.peek(&key(1)), None);
+        owner.dispose();
+    }
+
+    /// ADR-0034 S9: a memo a check made holds its keys in two maps (its
+    /// base, and the layer of writes since it folded). Dropped whole, a
+    /// key panicking in the base's drop and another in the layer's, in the
+    /// same unwind, abort the process; taken apart one key per box, every
+    /// one is dropped (S2, review r16): the first is the check's fault and
+    /// each other follows it.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn panicking_keys_of_a_memo_a_check_made_are_each_dropped_in_one_report() {
+        let armed = Arc::new(AtomicBool::new(true));
+        let n = u32::try_from(LAYER).expect("a small number") + 1;
+        let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::engine::in_cold_frame(|| {
+                let made: Keyed<Bomb, u32> = Scope::new().run(Keyed::new);
+                for k in 0..n {
+                    made.get(&Bomb(k, false, Arc::clone(&armed)), || k);
+                }
+            });
+        }))
+        .expect_err("the check faults");
+        armed.store(false, Ordering::Relaxed);
+        let said = said(&p);
+        assert!(said.contains("a check faulted (Disposal of MEMOS"), "{said}");
+        let each = usize::try_from(n).expect("a small number");
+        assert_eq!(
+            said.matches("Disposal of MEMOS").count(),
+            each,
+            "every key dropped: {said}"
+        );
+    }
+
+    /// How many writes a live memo keeps beside its base, and whether
+    /// anything but it holds its base or layer.
+    fn layering(keyed: Keyed<u32, u32>) -> (usize, bool) {
+        keyed
+            .read(|m| {
+                let shared = Rc::strong_count(&m.map.base) > 1 || Rc::strong_count(&m.map.layer) > 1;
+                (m.map.layer.len(), shared)
+            })
+            .expect("a live memo")
+    }
+
+    /// A value whose drop panics: a check's, in a piece it enters after
+    /// [`MEMOS`], so it drops first and what the memos hand back drops
+    /// after its fault.
+    #[cfg(debug_assertions)]
+    struct Boom;
+
+    #[cfg(debug_assertions)]
+    impl crate::engine::FreshValue for Boom {}
+
+    #[cfg(debug_assertions)]
+    impl Drop for Boom {
+        fn drop(&mut self) {
+            panic!("a boom's drop");
+        }
+    }
+
+    crate::engine::engine_local! {
+        /// Booms a check queues.
+        #[cfg(debug_assertions)]
+        [Fresh] static BOOMS: std::cell::RefCell<Vec<Boom>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// ADR-0034 S2, S7: a check that wrote over a live memo shares its base
+    /// and layer; another value the check made faults as it drops. A shared
+    /// handle a runaway set aside would pin the live maps (shared, they
+    /// never fold again: every live write after grows the layer). The drain
+    /// lets such a handle go as it takes the memo apart (a count-down, which
+    /// runs no code), and the disposal goes on past the fault (review r16),
+    /// so the live memo folds as before.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_live_memo_a_faulted_check_wrote_folds_again() {
+        let owner = Scope::new();
+        let plain: Keyed<u32, u32> = owner.run(Keyed::new);
+        let n = u32::try_from(LAYER).expect("a small number");
+        for k in 0..n {
+            plain.get(&k, || k);
+        }
+        let p = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::engine::in_cold_frame(|| {
+                plain.get(&10_000, || 1);
+                BOOMS.with_borrow_mut(|b| b.push(Boom));
+            });
+        }))
+        .expect_err("the check faults");
+        assert!(said(&p).contains("a check faulted (Disposal of BOOMS"), "{}", said(&p));
+        assert!(!layering(plain).1, "nothing of the check's holds the live maps");
+        for k in n..n * 3 {
+            plain.get(&k, || k);
+        }
+        let (layer, shared) = layering(plain);
+        assert!(
+            layer <= LAYER && !shared,
+            "the live memo folds: {layer} writes beside its base"
+        );
+        assert_eq!((plain.len(), plain.peek(&10_000)), (LAYER * 3, None));
+        owner.dispose();
+    }
+
+    crate::engine::engine_local! {
+        /// A Shared memo a check asks for first.
+        #[cfg(debug_assertions)]
+        [Shared("a test of a Shared memo a fork touches first")]
+        static SHARED_MEMO: Keyed<&'static str, u32> = Keyed::new();
+    }
+
+    /// RC1 (F1 review 5), F1 review 9: a Shared `Keyed` a check asks for
+    /// first is the check's stand-in, gone with it (ADR-0028), never made
+    /// live by it; live code makes the live one at its first touch, which
+    /// a later check then shares, and which holds what live code asks.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_shared_keyed_a_check_asks_for_first_is_a_stand_in_and_made_live_later() {
+        std::thread::spawn(|| {
+            let stand_in = {
+                let _cold = crate::engine::ColdFrame::begin();
+                SHARED_MEMO.with(|k| *k)
+            };
+            let held = |k: Keyed<&'static str, u32>| MEMOS.with(|m| m.borrow().contains(k.id));
+            assert!(!held(stand_in), "the fork's stand-in is gone with it");
+            let live = SHARED_MEMO.with(|k| *k);
+            let kept = crate::engine::in_cold_frame(|| SHARED_MEMO.with(|k| *k));
+            assert!(kept.id == live.id && held(kept), "a later check shares the live one");
+            assert_eq!(kept.get(&"a", || 5), 5);
+            assert_eq!(kept.len(), 1, "it holds what live code asked");
+        })
+        .join()
+        .expect("a run");
     }
 
     /// A key whose `Drop` asks another `Keyed` does not panic as a scope
@@ -1320,17 +1761,20 @@ mod tests {
 
     /// A registry is given an entry as a part mounts and loses only that
     /// one as it leaves, whatever the value; a setup that never mounts (a
-    /// cold re-render's) gives it nothing.
+    /// cold re-render's, debug builds) gives it nothing.
     #[test]
     fn a_registry_holds_the_mounted_parts_entries_alone() {
         let owner = Scope::new();
         let registry: Registry<&'static str> = owner.run(Registry::new);
-        let cold = crate::engine::ColdFrame::begin();
-        let scope = Scope::new();
-        scope.run(|| crate::reactive::rendering("cold", || registry.register("cold")));
-        scope.dispose();
-        drop(cold);
-        assert_eq!(registry.len_untracked(), 0, "a setup that never mounts gives nothing");
+        #[cfg(debug_assertions)]
+        {
+            let cold = crate::engine::ColdFrame::begin();
+            let scope = Scope::new();
+            scope.run(|| crate::reactive::rendering("cold", || registry.register("cold")));
+            scope.dispose();
+            drop(cold);
+            assert_eq!(registry.len_untracked(), 0, "a setup that never mounts gives nothing");
+        }
         let (a, m, b) = (Scope::new(), Scope::new(), Scope::new());
         a.run(|| registry.register("same"));
         m.run(|| registry.register("marker"));

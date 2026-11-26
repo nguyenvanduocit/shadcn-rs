@@ -75,6 +75,11 @@ impl Autocomplete {
 struct TextAsChoice(Bound<String>);
 
 impl Held<Option<String>> for TextAsChoice {
+    /// A `Bound` text, itself written through its own `Held`, checked there.
+    fn fork_policy(&self) -> crate::listbox::HeldFork {
+        crate::listbox::HeldFork::Signals
+    }
+
     fn get(&self) -> Option<String> {
         Some(self.0.get()).filter(|t| !t.is_empty())
     }

@@ -20,6 +20,23 @@ use crate::color::Color;
 use crate::element::{Element, IntoElement, div, text};
 use crate::prelude::*;
 
+// ── Checks ───────────────────────────────────────────────────────────────────
+
+/// Run `f` in a check of this thread's engine, as a frame's check runs its
+/// build: for a test of another crate's per-thread state (ADR-0034, S10).
+/// The production operation is the pipeline's check of a frame, with a
+/// closed report ([`crate::engine::CheckReport`]); this hook is the only
+/// raw closure entry outside `gui`, and is for tests.
+///
+/// # Panics
+/// `f` panicked (its panic goes on, as a string); the check faulted, was
+/// dropped at a site that cannot answer in one, or the thread is poisoned.
+#[doc(hidden)]
+#[cfg(debug_assertions)]
+pub fn in_check<R>(f: impl FnOnce() -> R) -> R {
+    crate::engine::in_cold_frame(f)
+}
+
 // ── Seeds ────────────────────────────────────────────────────────────────────
 
 /// The seeds a randomized test or bench runs, in order: `0..iterations`

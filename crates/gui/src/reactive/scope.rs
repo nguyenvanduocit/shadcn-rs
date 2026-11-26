@@ -20,10 +20,12 @@ impl Scope {
     #[expect(clippy::new_without_default, reason = "a scope records where it was made")]
     pub fn new() -> Self {
         let created_at = Location::caller();
-        let id = runtime::with(|rt| {
-            let id = rt.alloc(Kind::Scope, flag::NONE, created_at);
-            rt.adopt(id);
-            id
+        let id = crate::engine::allocating(|| {
+            runtime::with(|rt| {
+                let id = rt.alloc(Kind::Scope, flag::NONE, created_at);
+                rt.adopt(id);
+                id
+            })
         });
         Self { id, created_at }
     }
@@ -32,7 +34,7 @@ impl Scope {
     #[track_caller]
     pub fn detached() -> Self {
         let created_at = Location::caller();
-        let id = runtime::with(|rt| rt.alloc(Kind::Scope, flag::NONE, created_at));
+        let id = crate::engine::allocating(|| runtime::with(|rt| rt.alloc(Kind::Scope, flag::NONE, created_at)));
         Self { id, created_at }
     }
 

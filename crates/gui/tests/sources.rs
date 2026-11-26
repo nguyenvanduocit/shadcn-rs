@@ -238,7 +238,12 @@ fn a_write_runs_exactly_the_mounts_that_read_it() {
         2 * n,
         "the width mounts alone run, of both kinds of node"
     );
-    let widths: Vec<f32> = t.frame().nodes.iter().map(|n| n.bounds.width).collect();
+    let widths: Vec<f32> = t
+        .frame()
+        .nodes
+        .iter()
+        .map(|n| n.bounds(gui::inspect::OUTSIDE).width)
+        .collect();
     assert!(
         widths.contains(&30.0) && widths.contains(&15.0),
         "and write: {widths:?}"

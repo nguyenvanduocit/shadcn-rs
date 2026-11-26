@@ -475,7 +475,7 @@ fn click_node(s: &mut Scenario, what: &str, pick: impl Fn(&[FrameNode], usize) -
     let b = (0..nodes.len())
         .find(|&i| pick(nodes, i))
         .and_then(|i| nodes.get(i))
-        .map(|n| n.bounds)
+        .map(|n| n.bounds(gui::inspect::OUTSIDE))
         .ok_or_else(|| ScenarioError::TextNotFound(what.to_owned()))?;
     s.click(b.x + b.width / 2.0, b.y + b.height / 2.0);
     Ok(())
@@ -582,16 +582,18 @@ fn sweep(s: &mut Scenario, nav: &Nav, catalog: &Catalog) -> Result<(), ScenarioE
                     matches!(p.name, Some("docs-preview" | component::PLAYGROUND)) && p.layer == n.layer
                 })
             });
-            let Some(box_) = preview.and_then(|p| nodes.get(p)).map(|p| p.bounds) else {
+            let outside = gui::inspect::OUTSIDE;
+            let Some(box_) = preview.and_then(|p| nodes.get(p)).map(|p| p.bounds(outside)) else {
                 continue;
             };
-            let past = n.bounds.x < box_.x - 1.0 || n.bounds.right() > box_.right() + 1.0;
+            let b = n.bounds(outside);
+            let past = b.x < box_.x - 1.0 || b.right() > box_.right() + 1.0;
             let demo = std::iter::successors(Some(i), |&p| nodes.get(p).and_then(|p| p.parent))
                 .find_map(|p| nodes.get(p).and_then(|p| p.name).filter(|name| name.ends_with(".vue")))
                 .or(Some("playground"));
             if past {
                 let line = format!("{}:{}", entry.page.name, demo.unwrap_or("?"));
-                let list = if n.clip.is_none() {
+                let list = if n.clip(outside).is_none() {
                     &mut overflowing
                 } else {
                     &mut scrolled
