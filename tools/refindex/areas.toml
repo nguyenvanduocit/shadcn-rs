@@ -1,0 +1,94 @@
+# Work areas of AGENTS.md mapped onto peer code. Each glob matches the lowercased
+# "repo/path" of a file (SQLite GLOB: * matches across directories). `refx ... --area <name>`
+# restricts results to these files. Edit freely; no reindex is needed.
+
+[reactive]
+about = "Reactive core and components: signals, effects, scopes, run-once components"
+globs = [
+  "alien-signals/*", "alien-signals-rs/*", "leptos/reactive_graph/*", "leptos/reactive_stores/*",
+  "leptos/tachys/*", "vuejs/packages/reactivity/*", "vuejs/packages/runtime-core/*",
+  "vue-minor/*", "dioxus/packages/signals/*", "dioxus/packages/hooks/*", "dioxus/packages/core/*",
+  "dioxus/packages/generational-box/*", "dioxus/packages/stores/*", "floem/reactive/*",
+  "androidx/compose/runtime/*", "xilem/xilem_core/*", "xilem/xilem/*", "flutter/*/widgets/framework.dart",
+  "flutter/*/foundation/change_notifier.dart", "zed/crates/gpui/src/app*", "zed/crates/gpui/src/subscription.rs",
+  "freya/*hooks*", "freya/*state*", "makepad/*live*",
+]
+
+[layout]
+about = "Layout on a retained tree, typed containers, incremental relayout"
+globs = [
+  "taffy/*", "yoga/*", "morphorm/*", "servo/components/layout/*", "chromium/third_party/blink/renderer/core/layout/*",
+  "webkit/*/layout/*", "webkit/*rendering*", "flutter/*/rendering/*", "androidx/compose/ui/*layout*",
+  "zed/crates/gpui/src/taffy.rs", "blitz/*layout*", "xilem/masonry*/*", "slint/*layout*", "iced/*layout*",
+  "freya/*layout*", "qtdeclarative/*layout*", "microsoft-ui-xaml/*layout*", "gtk/gtk/gtk*layout*",
+]
+
+[list]
+about = "Large lists and virtualisation: windowed rows, slivers, lazy lists, sum trees"
+globs = [
+  "*virtual*", "*sliver*", "*lazy*", "*/list*", "*_list*", "*listview*", "*recycler*",
+  "zed/crates/sum_tree/*", "zed/crates/gpui/src/elements/*list*", "flutter/*/widgets/scroll*",
+  "chromium/cc/trees/*", "gtk/gtk/gtklistview*", "gtk/gtk/gtklistbase*", "gtk/gtk/gtklistitemmanager*",
+]
+
+[paint]
+about = "Paint, GPU, compositor, property trees, retained chunks, paths, clips, charts"
+globs = [
+  "vello/*", "wgpu/*", "dawn/*", "skia/*", "rust-skia/*", "webrender/*", "pathfinder/*", "slug/*",
+  "grafo/*", "forma/*", "tileink/*", "mesa/*", "kwin/*", "rive-runtime/*", "rerun/*", "bevy/crates/bevy_render/*",
+  "bevy/crates/bevy_ui_render/*", "chromium/cc/*", "chromium/third_party/blink/renderer/core/paint/*",
+  "zed/crates/gpui_*", "zed/crates/gpui/src/scene.rs", "zed/crates/gpui/src/path*", "flutter/*/painting/*",
+  "makepad/*draw*", "makepad/*platform*", "vulkan-docs/*", "burin/*", "tessera/*", "blinc/*", "nsh/*",
+]
+
+[input]
+about = "Input, threads, clocks and presentation: event dispatch, scroll, vsync, frame pacing"
+globs = [
+  "winit/*", "alacritty/*", "wayland-protocols/*", "android-frameworks-native/*", "android-frameworks-base/*",
+  "chromium/ui/events/*", "chromium/cc/input/*", "chromium/cc/scheduler/*", "flutter/*/gestures/*",
+  "flutter/*/scheduler/*", "zed/crates/gpui/src/input.rs", "zed/crates/gpui/src/key_dispatch.rs",
+  "zed/crates/gpui/src/platform*", "zed/crates/gpui/src/executor.rs", "zed/crates/gpui/src/window*",
+  "*scroll*", "*vsync*", "*choreographer*", "*frame_timing*", "fuchsia/*",
+]
+
+[text]
+about = "Text shaping, layout, rasterisation, editing, IME"
+globs = [
+  "parley/*", "cosmic-text/*", "harfbuzz/*", "freetype/*", "zed/crates/gpui/src/text_system*",
+  "chromium/third_party/blink/renderer/core/layout/inline/*", "*text*", "*glyph*", "*font*", "*ime*",
+]
+
+[a11y]
+about = "Accessibility trees and deltas"
+globs = [
+  "accesskit/*", "chromium/ui/accessibility/*", "gtk/gtk/a11y/*", "gtk/gtk/gtkaccessible*",
+  "flutter/*/semantics/*", "servo/components/layout/accessibility/*", "zed/crates/gpui/src/_accessibility.rs",
+  "bevy/crates/bevy_a11y/*", "*semantics*", "*accessib*", "*a11y*",
+]
+
+[behaviour]
+about = "Primitives: behaviour and focus without styling, layer stack, focus scopes, overlays"
+globs = [
+  "reka-ui/*", "dioxus-components/*", "gpui-component/*", "*focus*", "*overlay*", "*popover*", "*popup*",
+  "*dialog*", "*menu*", "*tooltip*", "*dismiss*", "*roving*", "zed/crates/gpui/src/tab_stop.rs",
+  "bevy/crates/bevy_input_focus/*", "flutter/*/widgets/focus*", "flutter/*/widgets/overlay*",
+]
+
+[style]
+about = "Typed styles and themes, shadcn styled components"
+globs = [
+  "shadcn-ui/*", "reka-ui/*", "stylo/*", "flutter/*/material/*", "flutter/*/cupertino/*",
+  "androidx/compose/material3/*", "zed/crates/theme/*", "zed/crates/ui/*", "zed/crates/gpui/src/style*",
+  "gtk/gtk/css/*", "*theme*",
+]
+
+[verify]
+about = "Frame replay, determinism, fork and cold check, seeded and randomized tests"
+globs = [
+  "*replay*", "*record*", "*determinis*", "*randomized*", "*fuzz*", "*seed*", "*snapshot*",
+  "zed/crates/gpui/src/test.rs", "rerun/*", "dioxus/packages/oracle/*",
+]
+
+[ours]
+about = "This project's ADRs, plans, research notes and reports"
+globs = ["@docs/*", "@reports/*", "@research_notes/*"]
