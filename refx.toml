@@ -1,0 +1,227 @@
+# refx (peer-research index, https://github.com/nguyenvanduocit/refindex) for shadcn-rs.
+# Paths are relative to this file. `refx areas` and `refx concepts <word>` show what is loaded;
+# areas and concepts need no reindex after an edit.
+
+peers = "references"
+home = "target/refindex"
+own = ["docs", "reports", "research_notes"]
+xml_repos = ["wayland-protocols"]
+
+mcp_instructions = """Peer research for shadcn-rs (AGENTS.md 'Peer research'). Indexes the \
+peers in references/ and our own docs (@docs: ADRs, plan, research notes, failure classes), \
+@reports, @research_notes. Search is hybrid: BM25 + code embeddings + symbol graph, so it finds \
+code by meaning as well as by name. Workflow: ref_peers for how two or three peers solve a \
+contract (restrict with areas: reactive, layout, list, paint, input, text, a11y, behaviour, style, \
+verify); ref_failure_class N for peer tests and bug-linked code for a class of \
+docs/failure-classes.md; evidence=true to keep only tests, bug-citing code and definitions named \
+after failures; ref_related from a hit for what it uses, who uses it, its tests, cited bugs, and \
+which of our ADRs/notes already cite it. Hits print as `references/<repo>/<path>:a-b`, the citation \
+form research notes use. ref_def / ref_refs for exact symbols, ref_read to read. Use grep only for \
+exact strings."""
+
+[entities]
+adr_dir = "docs/adr"
+failure_classes = "docs/failure-classes.md"
+decisions = "docs/decisions.tsv"
+ledger = ".claude/guard/ledger.json"
+
+# Work areas of AGENTS.md mapped onto peer code. Each glob matches the lowercased
+# "repo/path" of a file (SQLite GLOB: * matches across directories). `refx ... --area <name>`
+# restricts results to these files.
+
+[areas.reactive]
+about = "Reactive core and components: signals, effects, scopes, run-once components"
+globs = [
+  "alien-signals/*", "alien-signals-rs/*", "leptos/reactive_graph/*", "leptos/reactive_stores/*",
+  "leptos/tachys/*", "vuejs/packages/reactivity/*", "vuejs/packages/runtime-core/*",
+  "vue-minor/*", "dioxus/packages/signals/*", "dioxus/packages/hooks/*", "dioxus/packages/core/*",
+  "dioxus/packages/generational-box/*", "dioxus/packages/stores/*", "floem/reactive/*",
+  "androidx/compose/runtime/*", "xilem/xilem_core/*", "xilem/xilem/*", "flutter/*/widgets/framework.dart",
+  "flutter/*/foundation/change_notifier.dart", "zed/crates/gpui/src/app*", "zed/crates/gpui/src/subscription.rs",
+  "freya/*hooks*", "freya/*state*", "makepad/*live*",
+]
+
+[areas.layout]
+about = "Layout on a retained tree, typed containers, incremental relayout"
+globs = [
+  "taffy/*", "yoga/*", "morphorm/*", "servo/components/layout/*", "chromium/third_party/blink/renderer/core/layout/*",
+  "webkit/*/layout/*", "webkit/*rendering*", "flutter/*/rendering/*", "androidx/compose/ui/*layout*",
+  "zed/crates/gpui/src/taffy.rs", "blitz/*layout*", "xilem/masonry*/*", "slint/*layout*", "iced/*layout*",
+  "freya/*layout*", "qtdeclarative/*layout*", "microsoft-ui-xaml/*layout*", "gtk/gtk/gtk*layout*",
+]
+
+[areas.list]
+about = "Large lists and virtualisation: windowed rows, slivers, lazy lists, sum trees"
+globs = [
+  "*virtual*", "*sliver*", "*lazy*", "*/list*", "*_list*", "*listview*", "*recycler*",
+  "zed/crates/sum_tree/*", "zed/crates/gpui/src/elements/*list*", "flutter/*/widgets/scroll*",
+  "chromium/cc/trees/*", "gtk/gtk/gtklistview*", "gtk/gtk/gtklistbase*", "gtk/gtk/gtklistitemmanager*",
+]
+
+[areas.paint]
+about = "Paint, GPU, compositor, property trees, retained chunks, paths, clips, charts"
+globs = [
+  "vello/*", "wgpu/*", "dawn/*", "skia/*", "rust-skia/*", "webrender/*", "pathfinder/*", "slug/*",
+  "grafo/*", "forma/*", "tileink/*", "mesa/*", "kwin/*", "rive-runtime/*", "rerun/*", "bevy/crates/bevy_render/*",
+  "bevy/crates/bevy_ui_render/*", "chromium/cc/*", "chromium/third_party/blink/renderer/core/paint/*",
+  "zed/crates/gpui_*", "zed/crates/gpui/src/scene.rs", "zed/crates/gpui/src/path*", "flutter/*/painting/*",
+  "makepad/*draw*", "makepad/*platform*", "vulkan-docs/*", "burin/*", "tessera/*", "blinc/*", "nsh/*",
+]
+
+[areas.input]
+about = "Input, threads, clocks and presentation: event dispatch, scroll, vsync, frame pacing"
+globs = [
+  "winit/*", "alacritty/*", "wayland-protocols/*", "android-frameworks-native/*", "android-frameworks-base/*",
+  "chromium/ui/events/*", "chromium/cc/input/*", "chromium/cc/scheduler/*", "flutter/*/gestures/*",
+  "flutter/*/scheduler/*", "zed/crates/gpui/src/input.rs", "zed/crates/gpui/src/key_dispatch.rs",
+  "zed/crates/gpui/src/platform*", "zed/crates/gpui/src/executor.rs", "zed/crates/gpui/src/window*",
+  "*scroll*", "*vsync*", "*choreographer*", "*frame_timing*", "fuchsia/*",
+]
+
+[areas.text]
+about = "Text shaping, layout, rasterisation, editing, IME"
+globs = [
+  "parley/*", "cosmic-text/*", "harfbuzz/*", "freetype/*", "zed/crates/gpui/src/text_system*",
+  "chromium/third_party/blink/renderer/core/layout/inline/*", "*text*", "*glyph*", "*font*", "*ime*",
+]
+
+[areas.a11y]
+about = "Accessibility trees and deltas"
+globs = [
+  "accesskit/*", "chromium/ui/accessibility/*", "gtk/gtk/a11y/*", "gtk/gtk/gtkaccessible*",
+  "flutter/*/semantics/*", "servo/components/layout/accessibility/*", "zed/crates/gpui/src/_accessibility.rs",
+  "bevy/crates/bevy_a11y/*", "*semantics*", "*accessib*", "*a11y*",
+]
+
+[areas.behaviour]
+about = "Primitives: behaviour and focus without styling, layer stack, focus scopes, overlays"
+globs = [
+  "reka-ui/*", "dioxus-components/*", "gpui-component/*", "*focus*", "*overlay*", "*popover*", "*popup*",
+  "*dialog*", "*menu*", "*tooltip*", "*dismiss*", "*roving*", "zed/crates/gpui/src/tab_stop.rs",
+  "bevy/crates/bevy_input_focus/*", "flutter/*/widgets/focus*", "flutter/*/widgets/overlay*",
+]
+
+[areas.style]
+about = "Typed styles and themes, shadcn styled components"
+globs = [
+  "shadcn-ui/*", "reka-ui/*", "stylo/*", "flutter/*/material/*", "flutter/*/cupertino/*",
+  "androidx/compose/material3/*", "zed/crates/theme/*", "zed/crates/ui/*", "zed/crates/gpui/src/style*",
+  "gtk/gtk/css/*", "*theme*",
+]
+
+[areas.verify]
+about = "Frame replay, determinism, fork and cold check, seeded and randomized tests"
+globs = [
+  "*replay*", "*record*", "*determinis*", "*randomized*", "*fuzz*", "*seed*", "*snapshot*",
+  "zed/crates/gpui/src/test.rs", "rerun/*", "dioxus/packages/oracle/*",
+]
+
+[areas.ours]
+about = "This project's ADRs, plans, research notes and reports"
+globs = ["@docs/*", "@reports/*", "@research_notes/*"]
+
+# Our vocabulary <-> the names peers use for the same thing. A query word or phrase that
+# matches any entry of a group also searches the group's other entries (BM25 only, at reduced
+# weight). Identifiers are matched whole (`markneedslayout`), phrases word by word.
+# `refx index` also learns links from the citations in docs/ (`refx concepts <word>` shows both).
+
+[concepts.invalidation]
+terms = ["invalidate", "invalidation", "dirty", "mark dirty", "markNeedsLayout", "markNeedsPaint",
+  "markNeedsBuild", "SetNeedsLayout", "SetNeedsPaintPropertyUpdate", "SetShouldDoFullPaintInvalidation",
+  "needs_layout", "request_layout", "mark_dirty", "setNeedsDisplay", "queue_resize", "queue_draw",
+  "requestLayout", "invalidateMeasurement", "invalidateDraw", "invalidateLayer", "needsRelayout"]
+
+[concepts.reactive]
+terms = ["signal", "effect", "computed", "memo", "derived", "subscriber", "dependency tracking",
+  "propagate", "check_dirty", "notify", "batch", "untrack", "untracked", "ReactiveEffect", "trackEffect",
+  "triggerEffects", "ReactiveNode", "Owner", "observer", "recompose", "Recomposer", "snapshotFlow",
+  "mutableStateOf", "ChangeNotifier", "ValueNotifier"]
+
+[concepts.run_once_component]
+terms = ["run once", "component runs once", "setup", "component function", "render once",
+  "fine-grained", "create_component", "setupComponent", "ComponentInternalInstance", "Scope", "Owner",
+  "dispose", "on_cleanup", "onCleanup", "onUnmounted"]
+
+[concepts.keyed_diff]
+terms = ["keyed", "key", "reconcile", "reconciliation", "diff children", "patchKeyedChildren",
+  "updateChildren", "diff_keyed_children", "longest increasing subsequence", "getSequence",
+  "GlobalKey", "ValueKey", "keyed_each", "For", "each"]
+
+[concepts.virtual_list]
+terms = ["virtual list", "virtualization", "virtualize", "windowed", "windowing", "viewport", "uniform_list",
+  "UniformList", "ListState", "SliverList", "SliverChildBuilderDelegate", "RenderSliver", "LazyColumn",
+  "LazyListState", "RecyclerView", "virtualizer", "visible range", "overscan", "cacheExtent", "sum_tree",
+  "SumTree"]
+
+[concepts.property_trees]
+terms = ["property tree", "property trees", "TransformTree", "ClipTree", "EffectTree", "ScrollTree",
+  "PropertyTreeState", "PaintPropertyNode", "TransformPaintPropertyNode", "ClipPaintPropertyNode",
+  "spatial tree", "SpatialTree", "spatial node", "clip chain", "ClipChain"]
+
+[concepts.paint_chunks]
+terms = ["paint chunk", "chunk", "display item", "DisplayItemList", "PaintChunk", "PaintArtifact",
+  "display list", "DisplayList", "retained", "raster cache", "picture", "SkPicture", "PaintRecord",
+  "scene", "Scene", "primitive", "batch"]
+
+[concepts.compositor]
+terms = ["compositor", "composite", "layer tree", "LayerTreeHost", "LayerTreeImpl", "cc layer",
+  "commit", "activation", "pending tree", "active tree", "frame sink", "CompositorFrame", "damage",
+  "damage rect", "occlusion"]
+
+[concepts.layer_stack]
+terms = ["layer stack", "overlay", "top layer", "TopLayer", "OverlayEntry", "OverlayState", "popover",
+  "portal", "Teleport", "DismissableLayer", "modal", "z-order", "stacking", "dismiss"]
+
+[concepts.focus_scope]
+terms = ["focus scope", "focus trap", "FocusScope", "FocusScopeNode", "FocusNode", "FocusManager",
+  "FocusTraversalPolicy", "FocusHandle", "tab_stop", "TabStop", "roving tabindex", "roving focus",
+  "RovingFocusGroup", "focus restore", "autofocus"]
+
+[concepts.presence]
+terms = ["presence", "exit animation", "unmount animation", "Presence", "AnimatePresence",
+  "AnimatedVisibility", "ExitTransition", "Transition", "leave transition", "onExitComplete"]
+
+[concepts.frame_timing]
+terms = ["vsync", "frame", "frame pacing", "presentation", "present", "swap", "BeginFrame",
+  "BeginFrameSource", "Choreographer", "SchedulerBinding", "scheduleFrame", "handleBeginFrame",
+  "request_animation_frame", "requestAnimationFrame", "CVDisplayLink", "CADisplayLink",
+  "presentation feedback", "frame timing", "deadline", "latency"]
+
+[concepts.scroll]
+terms = ["scroll", "scroll offset", "scroll anchoring", "ScrollAnchor", "overscroll", "fling",
+  "momentum", "ScrollPosition", "ScrollController", "ScrollOffset", "scroll_handle", "ScrollHandle",
+  "InputHandler", "scroll chaining", "rubber band"]
+
+[concepts.hit_test]
+terms = ["hit test", "hit testing", "hitTest", "hit_test", "HitTestResult", "HitTestRequest", "pick",
+  "picking", "pointer events", "event routing", "dispatch", "bubbling", "capture phase"]
+
+[concepts.layout_constraints]
+terms = ["constraints", "BoxConstraints", "Constraints", "measure", "intrinsic", "min_content",
+  "max_content", "MinContent", "MaxContent", "available space", "AvailableSpace", "LayoutInput",
+  "sizing", "ConstraintSpace", "LayoutResult"]
+
+[concepts.text_shaping]
+terms = ["shaping", "shape", "shaper", "ShapedRun", "glyph run", "GlyphRun", "line break", "line breaking",
+  "bidi", "BidiParagraph", "cluster", "inline layout", "InlineNode", "NGInlineNode", "ShapeResult",
+  "hb_shape", "harfbuzz"]
+
+[concepts.accessibility_tree]
+terms = ["accessibility", "a11y", "TreeUpdate", "AXTree", "AXNode", "AXObject", "SemanticsNode",
+  "SemanticsUpdate", "SemanticsOwner", "accessible", "accesskit", "role", "live region"]
+
+[concepts.cold_check]
+terms = ["cold check", "cold rebuild", "from scratch", "full rebuild", "oracle", "verify", "consistency check",
+  "DCHECK", "debug_assert", "invariant", "recompute everything"]
+
+[concepts.replay]
+terms = ["replay", "record", "recording", "deterministic", "determinism", "fork", "snapshot", "checkpoint",
+  "seed", "randomized", "rr", "time travel", "trace"]
+
+[concepts.mailbox]
+terms = ["mailbox", "outbox", "channel", "message queue", "post task", "PostTask", "task runner",
+  "TaskRunner", "executor", "spawn", "foreground executor", "BackgroundExecutor", "worker"]
+
+[concepts.disposal]
+terms = ["dispose", "disposal", "teardown", "cleanup", "drop", "unmount", "unsubscribe", "cancel",
+  "cancellation", "abort", "on_cleanup", "onCleanup", "Drop", "destroy", "detach"]

@@ -6,6 +6,13 @@ node_modules/
 .shadcn-vue/
 .photos/
 
+# refx lives in its own repo (github.com/nguyenvanduocit/refindex); its config is refx.toml.
+/tools/refindex/
+
+# Coordination notes are committed; bulky run output is not.
+/docs/m10/**/*.log
+/docs/m10/**/*.output
+
 # Orchestration guard runtime files
 /.claude/guard/log.tsv
 /.claude/guard/.lock
