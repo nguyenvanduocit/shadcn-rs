@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "refindex": {
+      "command": "refx",
+      "args": ["connect"]
+    }
+  }
+}
